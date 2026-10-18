@@ -1,0 +1,705 @@
+//! Compact references and public-policy reads for retained execution history.
+
+use super::{
+    events::{AdmissionProof, Event, EventCause, StoredTransport},
+    execution_handoff::*,
+    prepare::PrepareContext,
+    *,
+};
+use crate::signature_verification::{ScopedSignatureVerification, SignatureVerification};
+use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteExecutionHistoryKind {
+    ExecutionResult,
+    UnknownResolution,
+    TerminalReconciliation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteExecutionHistoryReference {
+    pub version: u16,
+    pub kind: RemoteExecutionHistoryKind,
+    pub actual_hash: ObjectHash,
+    pub expected_body_hash: ObjectHash,
+    pub expected_invocation_hash: ObjectHash,
+    pub account_invocation_hash: ObjectHash,
+    pub expected_binding_hash: Option<ObjectHash>,
+    pub account_admitted_at_ms: u64,
+    pub dispatch_ref: EventRef,
+    pub dispatch_envelope_hash: ObjectHash,
+    pub source: Signed<ProjectExecutionSource>,
+    pub old_submission: Signed<Invocation>,
+    pub target_public_key: PublicKey,
+    pub handoff_hash: ObjectHash,
+    pub resolution_hash: Option<ObjectHash>,
+    pub freshness_hash: Option<ObjectHash>,
+    pub result_hash: ObjectHash,
+}
+
+impl RemoteExecutionHistoryReference {
+    pub fn execution_resource(&self) -> &ResourceRef {
+        &self.old_submission.payload.resource
+    }
+    pub fn grant_leaf(&self) -> &ObjectHash {
+        &self.old_submission.payload.grant_leaf
+    }
+    pub fn target_public_key(&self) -> &PublicKey {
+        &self.target_public_key
+    }
+    pub fn context(&self) -> Result<PrepareContext> {
+        let mut context = self.old_submission.payload.context.clone();
+        require(
+            context.task.as_ref() == Some(&self.source.payload.task)
+                && context.execution_session.as_ref()
+                    == Some(&self.source.payload.execution_session)
+                && context.conversation.is_some()
+                && context.executor_kind.is_some(),
+            "historical reference changed its original task or session",
+        )?;
+        context.workspace_resource = Some(self.source.payload.project.resource.clone());
+        context.sdk_session = None;
+        Ok(PrepareContext {
+            context,
+            binding_generation: Some(self.source.payload.binding_generation),
+            canonical_cwd: None,
+            execution_target_public_key: Some(self.target_public_key.clone()),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteExecutionHistoryAcceptance {
+    ExecutionResult {
+        receipt: Signed<ExecutionHandoffAdmissionReceipt>,
+        freshness: ExecutionHandoffFreshness,
+        transport: StoredTransport,
+    },
+    UnknownResolution {
+        receipt: Signed<ExecutionHandoffResolutionReceipt>,
+        freshness: ExecutionHandoffResolutionFreshness,
+    },
+    TerminalReconciliation {
+        freshness: ExecutionHandoffResolutionFreshness,
+        observation_receipt: Signed<ExecutionHandoffReceipt>,
+    },
+}
+
+fn parse<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T> {
+    require(
+        json.len() <= MAX_EXECUTION_HANDOFF_BYTES,
+        "historical result is too large",
+    )?;
+    serde_json::from_str(json)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid historical result"))
+}
+
+fn carrier<T: Serialize>(value: &T) -> Result<()> {
+    require(
+        canonical(value)?.len() <= MAX_PROOF_BYTES,
+        "historical policy carrier is too large",
+    )
+}
+
+fn dispatch_proof(handoff: &ExecutionHandoff) -> Result<AdmissionProof> {
+    let event: Event = parse(&handoff.project_dispatch.canonical_body)?;
+    match event.cause {
+        EventCause::Invocation { admission } => Ok(admission),
+        _ => Err(AuthorizationError::InvalidProof(
+            "historical result has no original admission",
+        )),
+    }
+}
+
+pub(crate) fn derive_reference(
+    actual_json: &str,
+    body_json: &str,
+    invocation_json: &str,
+    binding_json: &str,
+) -> Result<RemoteExecutionHistoryReference> {
+    let _signatures = ScopedSignatureVerification::new();
+    let raw: Value = parse(actual_json)?;
+    let body: Value = parse(body_json)?;
+    let invocation: Signed<Invocation> = parse(invocation_json)?;
+    invocation.verify_signature()?;
+    let binding: Option<task_binding::SignedBinding> = if binding_json.trim().is_empty() {
+        None
+    } else {
+        parse(binding_json)?
+    };
+    let (kind, observation, old_submission, proof, resolution_hash, freshness_hash, result_hash) =
+        if raw.get("resolution").is_some() {
+            let actual: ExecutionHandoffResolutionResult = serde_json::from_value(raw.clone())
+                .map_err(|_| AuthorizationError::InvalidProof("invalid historical resolution"))?;
+            require(
+                binding.is_none(),
+                "resolution history cannot replace the original binding",
+            )?;
+            verify_execution_resolution_receipt_signature(&actual)?;
+            (
+                RemoteExecutionHistoryKind::UnknownResolution,
+                actual.resolution.resolution.observation.clone(),
+                actual.resolution.invocation.clone(),
+                actual.resolution.resolution.account_admission.clone(),
+                Some(actual.resolution.hash()?),
+                Some(ObjectHash::body(&actual.freshness)?),
+                ObjectHash::body(&actual.result)?,
+            )
+        } else if raw.get("reconciliation").is_some() {
+            let actual: ExecutionHandoffTerminalReconciliationResult =
+                serde_json::from_value(raw.clone()).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid historical reconciliation")
+                })?;
+            require(
+                binding.is_none()
+                    && actual.reconciliation.resolution.purpose
+                        == ExecutionResolutionPurpose::ReconcileTerminal,
+                "historical reconciliation changed its purpose or binding",
+            )?;
+            execution_resolution_account_facts(&actual.reconciliation.resolution)?;
+            (
+                RemoteExecutionHistoryKind::TerminalReconciliation,
+                actual.reconciliation.resolution.observation.clone(),
+                actual.reconciliation.invocation.clone(),
+                actual.reconciliation.resolution.account_admission.clone(),
+                Some(actual.reconciliation.hash()?),
+                Some(ObjectHash::body(&actual.freshness)?),
+                ObjectHash::body(&actual.reconciliation.resolution.observation.result)?,
+            )
+        } else {
+            let actual: ExecutionHandoffResult =
+                serde_json::from_value(raw.clone()).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid historical execution result")
+                })?;
+            let proof = dispatch_proof(&actual.handoff.handoff)?;
+            let binding = binding.as_ref().ok_or(AuthorizationError::InvalidProof(
+                "historical execution result requires its original binding",
+            ))?;
+            require(
+                body["request"]["binding"]
+                    == serde_json::to_value(binding).map_err(|_| {
+                        AuthorizationError::InvalidProof("invalid historical binding")
+                    })?,
+                "historical execution result changed its original binding",
+            )?;
+            (
+                RemoteExecutionHistoryKind::ExecutionResult,
+                actual.clone(),
+                actual.handoff.invocation.clone(),
+                proof,
+                None,
+                None,
+                ObjectHash::body(&actual.result)?,
+            )
+        };
+    require(
+        proof.source_body == body
+            && proof.invocation == invocation
+            && invocation.payload.body_hash == ObjectHash::body(&body)?,
+        "historical result changed its complete original Account request",
+    )?;
+    let handoff = &observation.handoff.handoff;
+    verify_execution_handoff_receipt_signature(
+        &observation.handoff,
+        &observation.receipt,
+        &observation.result,
+    )?;
+    old_submission.verify_signature()?;
+    let source = handoff
+        .source_attestation
+        .clone()
+        .ok_or(AuthorizationError::InvalidProof(
+            "historical result requires its original Project source attestation",
+        ))?;
+    source.verify_signature()?;
+    require(
+        source.payload == handoff.source_statement()?
+            && source.issuer == observation.handoff.invocation.issuer,
+        "historical result changed its original Project source",
+    )?;
+    if let Some(binding) = &binding {
+        task_binding::verify_binding(binding, source.issuer.as_str())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid original historical binding"))?;
+    }
+    let reference = RemoteExecutionHistoryReference {
+        version: AUTH_VERSION,
+        kind,
+        actual_hash: ObjectHash::body(&raw)?,
+        expected_body_hash: ObjectHash::body(&body)?,
+        expected_invocation_hash: ObjectHash::body(&invocation)?,
+        account_invocation_hash: invocation.hash()?,
+        expected_binding_hash: binding.as_ref().map(ObjectHash::body).transpose()?,
+        account_admitted_at_ms: proof.admitted_at_ms,
+        dispatch_ref: EventRef::parse(&handoff.project_dispatch.hash)?,
+        dispatch_envelope_hash: ObjectHash::body(&handoff.project_dispatch)?,
+        source,
+        old_submission,
+        target_public_key: handoff.target_public_key.clone(),
+        handoff_hash: observation.handoff.hash()?,
+        resolution_hash,
+        freshness_hash,
+        result_hash,
+    };
+    check_reference(&reference)?;
+    Ok(reference)
+}
+
+pub fn derive_remote_execution_history_reference(
+    actual_json: &str,
+    body_json: &str,
+    invocation_json: &str,
+    binding_json: &str,
+) -> crate::Result<String> {
+    serde_json::to_string(
+        &derive_reference(actual_json, body_json, invocation_json, binding_json)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|_| "historical reference encoding failed".into())
+}
+
+fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
+    carrier(reference)?;
+    reference.source.verify_signature()?;
+    reference.old_submission.verify_signature()?;
+    let submission = &reference.old_submission.payload;
+    let source = &reference.source.payload;
+    require(
+        reference.version == AUTH_VERSION
+            && source.version == AUTH_VERSION
+            && submission.version == AUTH_VERSION
+            && submission.actor
+                == Actor::Service(ServiceId::from_key(&reference.old_submission.issuer))
+            && submission.device == DeviceId::from_key(&reference.old_submission.issuer)
+            && submission.presenter == submission.device
+            && submission.audience.service == ServiceId::from_key(&reference.target_public_key)
+            && submission.audience.device == DeviceId::from_key(&reference.target_public_key)
+            && submission.context.task.as_ref() == Some(&source.task)
+            && submission.context.execution_session.as_ref() == Some(&source.execution_session)
+            && submission.context.workspace_resource.as_ref()
+                == Some(&submission.resource.resource)
+            && source.execution_session.target == submission.audience.device
+            && source.binding_generation > 0
+            && source.operation_id.len() <= 1_024
+            && !source.operation_id.is_empty()
+            && !submission.expected_policies.is_empty()
+            && submission.expected_policies.len() <= MAX_POLICY_DOMAINS
+            && submission
+                .expected_policies
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain)
+            && match reference.kind {
+                RemoteExecutionHistoryKind::ExecutionResult => {
+                    submission.action == Action::ExecutionSubmit
+                        && reference.expected_binding_hash.is_some()
+                        && reference.resolution_hash.is_none()
+                        && reference.freshness_hash.is_none()
+                        && reference.account_invocation_hash == source.original_invocation_hash
+                        && submission.operation_id == source.operation_id
+                        && reference.old_submission.issuer == reference.source.issuer
+                }
+                RemoteExecutionHistoryKind::UnknownResolution
+                | RemoteExecutionHistoryKind::TerminalReconciliation => {
+                    submission.action == Action::ExecutionResolve
+                        && reference.expected_binding_hash.is_none()
+                        && reference.resolution_hash.is_some()
+                        && reference.freshness_hash.is_some()
+                }
+            },
+        "historical policy reference changed its purpose, original signer or task",
+    )?;
+    reference.context()?;
+    Ok(())
+}
+
+pub struct VerifiedHistoryAcceptance {
+    decision_at_ms: u64,
+    heads: Vec<PolicyStamp>,
+    usage: ExecutionProofUsage,
+}
+
+impl VerifiedHistoryAcceptance {
+    pub fn decision_at_ms(&self) -> u64 {
+        self.decision_at_ms
+    }
+    pub fn heads(&self) -> &[PolicyStamp] {
+        &self.heads
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+}
+
+fn proof_time(
+    reference: &RemoteExecutionHistoryReference,
+    proof: &ExecutionHandoffResolutionFreshness,
+    observation: &Signed<ExecutionHandoffReceipt>,
+    now: u64,
+) -> Result<u64> {
+    let lower = proof
+        .receipts
+        .iter()
+        .map(|receipt| receipt.payload.issued_at_ms)
+        .fold(
+            reference
+                .account_admitted_at_ms
+                .max(reference.old_submission.payload.not_before_ms)
+                .max(proof.challenge.issued_at_ms)
+                .max(observation.payload.issued_at_ms),
+            u64::max,
+        );
+    let upper = proof
+        .receipts
+        .iter()
+        .map(|receipt| receipt.payload.expires_at_ms)
+        .fold(
+            reference
+                .old_submission
+                .payload
+                .expires_at_ms
+                .min(proof.challenge.expires_at_ms),
+            u64::min,
+        );
+    require(
+        lower < upper && lower <= now,
+        "historical reconciliation proof has no valid time intersection",
+    )?;
+    Ok(lower)
+}
+
+pub fn verify_remote_execution_history_acceptance(
+    state: &VerifiedPolicySet,
+    reference: &RemoteExecutionHistoryReference,
+    acceptance: &RemoteExecutionHistoryAcceptance,
+    local_c: &PublicKey,
+    now: u64,
+) -> Result<VerifiedHistoryAcceptance> {
+    let _signatures = ScopedSignatureVerification::new();
+    check_reference(reference)?;
+    carrier(acceptance)?;
+    require(
+        local_c == reference.target_public_key(),
+        "history reached another executor",
+    )?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(&reference.source)?;
+    usage.record_signed(&reference.old_submission)?;
+    usage.record_metadata(reference)?;
+    let (decision_at_ms, heads, challenge_hash, issued, expires, receipts) = match acceptance {
+        RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt,
+            freshness,
+            transport,
+        } => {
+            receipt.verify_signature()?;
+            let value = &receipt.payload;
+            let challenge = &freshness.challenge;
+            require(
+                reference.kind == RemoteExecutionHistoryKind::ExecutionResult
+                    && receipt.issuer == *local_c
+                    && value.version == AUTH_VERSION
+                    && value.handoff_hash == reference.handoff_hash
+                    && value.submission_invocation_hash == reference.old_submission.hash()?
+                    && value.original_invocation_hash
+                        == reference.source.payload.original_invocation_hash
+                    && value.original_request_hash == challenge.original_request_hash
+                    && value.admission_hash == ObjectHash::body(freshness)?
+                    && value.transport_hash == ObjectHash::body(transport)?
+                    && transport.clone().into_evidence()
+                        == TransportEvidence::VerifiedPeer {
+                            origin: reference.old_submission.payload.presenter.clone(),
+                        }
+                    && challenge.version == AUTH_VERSION
+                    && challenge.stage == CheckStage::Admit
+                    && challenge.handoff_hash == reference.handoff_hash
+                    && challenge.original_invocation_hash == value.original_invocation_hash
+                    && challenge.submission_invocation_hash == value.submission_invocation_hash
+                    && challenge.original_body_hash == reference.expected_body_hash
+                    && challenge.original_resource == reference.source.payload.project
+                    && challenge.execution_resource == *reference.execution_resource()
+                    && challenge.execution_audience == reference.old_submission.payload.audience
+                    && challenge.target_public_key == *local_c
+                    && challenge.project_presenter == reference.old_submission.payload.presenter
+                    && challenge.operation_id == reference.source.payload.operation_id
+                    && challenge.binding_hash == reference.source.payload.binding_hash
+                    && challenge.binding_generation == reference.source.payload.binding_generation
+                    && challenge.execution_session == reference.source.payload.execution_session,
+                "historical execution acceptance changed its original signed checkpoint",
+            )?;
+            usage.record_signed(receipt)?;
+            usage.record_metadata(freshness)?;
+            usage.record_metadata(transport)?;
+            (
+                value.admitted_at_ms,
+                challenge.policies.clone(),
+                challenge.hash()?,
+                challenge.issued_at_ms,
+                challenge.expires_at_ms,
+                &freshness.receipts,
+            )
+        }
+        RemoteExecutionHistoryAcceptance::UnknownResolution { receipt, freshness } => {
+            receipt.verify_signature()?;
+            let value = &receipt.payload;
+            require(
+                reference.kind == RemoteExecutionHistoryKind::UnknownResolution
+                    && receipt.issuer == *local_c
+                    && value.version == AUTH_VERSION
+                    && Some(&value.resolution_hash) == reference.resolution_hash.as_ref()
+                    && value.freshness_hash == ObjectHash::body(freshness)?,
+                "historical Unknown resolution changed its original executor receipt",
+            )?;
+            resolution_challenge(reference, freshness)?;
+            usage.record_signed(receipt)?;
+            usage.record_metadata(freshness)?;
+            (
+                value.issued_at_ms,
+                freshness.challenge.policies.clone(),
+                freshness.challenge.hash()?,
+                freshness.challenge.issued_at_ms,
+                freshness.challenge.expires_at_ms,
+                &freshness.receipts,
+            )
+        }
+        RemoteExecutionHistoryAcceptance::TerminalReconciliation {
+            freshness,
+            observation_receipt,
+        } => {
+            observation_receipt.verify_signature()?;
+            let observation = &observation_receipt.payload;
+            require(
+                reference.kind == RemoteExecutionHistoryKind::TerminalReconciliation
+                    && observation_receipt.issuer == *local_c
+                    && observation.version == AUTH_VERSION
+                    && observation.handoff_hash == reference.handoff_hash
+                    && observation.operation_id == reference.source.payload.operation_id
+                    && observation.original_space_id == reference.source.payload.project.space
+                    && observation.execution_space_id == reference.execution_resource().space
+                    && observation.target == DeviceId::from_key(local_c)
+                    && observation.session_id
+                        == reference.source.payload.execution_session.session_id
+                    && observation.binding_generation
+                        == reference.source.payload.binding_generation
+                    && observation.result_hash == reference.result_hash
+                    && matches!(
+                        observation.state,
+                        ExecutionHandoffState::Succeeded
+                            | ExecutionHandoffState::Failed
+                            | ExecutionHandoffState::Rejected
+                    ),
+                "historical terminal reconciliation changed its original executor result",
+            )?;
+            resolution_challenge(reference, freshness)?;
+            usage.record_signed(observation_receipt)?;
+            usage.record_metadata(freshness)?;
+            (
+                proof_time(reference, freshness, observation_receipt, now)?,
+                freshness.challenge.policies.clone(),
+                freshness.challenge.hash()?,
+                freshness.challenge.issued_at_ms,
+                freshness.challenge.expires_at_ms,
+                &freshness.receipts,
+            )
+        }
+    };
+    require(
+        decision_at_ms <= now
+            && reference.account_admitted_at_ms <= decision_at_ms
+            && !heads.is_empty()
+            && heads.len() <= MAX_POLICY_DOMAINS
+            && heads.windows(2).all(|pair| pair[0].domain < pair[1].domain)
+            && receipts.len() == heads.len(),
+        "historical policy proof changed its exact heads or decision time",
+    )?;
+    validate_window(issued, expires, decision_at_ms)?;
+    validate_window(
+        reference.old_submission.payload.not_before_ms,
+        reference.old_submission.payload.expires_at_ms,
+        decision_at_ms,
+    )?;
+    let known: Vec<_> = heads
+        .iter()
+        .filter(|head| state.head(&head.domain).is_some())
+        .cloned()
+        .collect();
+    let historical = remote_resolution_history::at_heads(state, &known)?;
+    let mut seen = BTreeSet::new();
+    for signed in receipts {
+        signed.verify_signature()?;
+        let receipt = &signed.payload;
+        require(
+            receipt.version == AUTH_VERSION
+                && receipt.challenge_hash == challenge_hash
+                && heads.contains(&receipt.current)
+                && seen.insert(receipt.current.domain.clone())
+                && receipt.issued_at_ms >= issued
+                && receipt.expires_at_ms <= expires,
+            "historical freshness changed its exact policy proof",
+        )?;
+        validate_window(receipt.issued_at_ms, receipt.expires_at_ms, decision_at_ms)?;
+        if historical.head(&receipt.current.domain).is_some() {
+            let authority = match &receipt.current.domain {
+                PolicyDomain::Account(account) => &historical.account(account).unwrap().authority,
+                PolicyDomain::Space(space) => &historical.space(space).unwrap().authority,
+            };
+            require(
+                signed.issuer == authority.public_key,
+                "historical freshness changed its known authority",
+            )?;
+        }
+        usage.record_signed(signed)?;
+    }
+    if let Some(counts) = SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()?;
+    Ok(VerifiedHistoryAcceptance {
+        decision_at_ms,
+        heads,
+        usage,
+    })
+}
+
+fn resolution_challenge(
+    reference: &RemoteExecutionHistoryReference,
+    freshness: &ExecutionHandoffResolutionFreshness,
+) -> Result<()> {
+    let challenge = &freshness.challenge;
+    require(
+        challenge.version == AUTH_VERSION
+            && Some(&challenge.resolution_hash) == reference.resolution_hash.as_ref()
+            && Some(ObjectHash::body(freshness)?) == reference.freshness_hash
+            && challenge.submission_invocation_hash == reference.old_submission.hash()?
+            && challenge.resolver_invocation_hash == reference.account_invocation_hash,
+        "historical resolution freshness changed its original signed invocation",
+    )
+}
+
+pub struct VerifiedHistoryPolicyRead {
+    heads: Vec<PolicyStamp>,
+    allowed_hashes: BTreeSet<ObjectHash>,
+    decision_at_ms: u64,
+    usage: ExecutionProofUsage,
+}
+impl VerifiedHistoryPolicyRead {
+    pub fn target_heads(&self) -> &[PolicyStamp] {
+        &self.heads
+    }
+    pub fn domains(&self) -> Vec<PolicyDomain> {
+        self.heads.iter().map(|head| head.domain.clone()).collect()
+    }
+    pub fn allowed_hashes(&self) -> &BTreeSet<ObjectHash> {
+        &self.allowed_hashes
+    }
+    pub fn allows_hash(&self, hash: &ObjectHash) -> bool {
+        self.allowed_hashes.contains(hash)
+    }
+    pub fn allows_entry(&self, entry: &JournalEntry) -> Result<bool> {
+        Ok(self.allows_hash(&policy_import::entry_hash(entry)?))
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+    pub fn decision_at_ms(&self) -> u64 {
+        self.decision_at_ms
+    }
+}
+
+pub fn verify_remote_execution_history_policy(
+    state: &VerifiedPolicySet,
+    reference: &RemoteExecutionHistoryReference,
+    acceptance: &RemoteExecutionHistoryAcceptance,
+    independent_pins: &[PolicyPin],
+    local_c: &PublicKey,
+    now: u64,
+) -> Result<VerifiedHistoryPolicyRead> {
+    let _signatures = ScopedSignatureVerification::new();
+    let accepted =
+        verify_remote_execution_history_acceptance(state, reference, acceptance, local_c, now)?;
+    let known: Vec<_> = accepted
+        .heads()
+        .iter()
+        .filter(|head| state.head(&head.domain).is_some())
+        .cloned()
+        .collect();
+    let historical = remote_resolution_history::at_heads(state, &known)?;
+    let mut budget = Budget::default();
+    let mut dependencies = BTreeMap::new();
+    let leaf = historical
+        .grant(reference.grant_leaf())
+        .ok_or(AuthorizationError::InvalidProof(
+            "historical execution grant is missing",
+        ))?;
+    let submission = &reference.old_submission.payload;
+    let resource = historical
+        .resource(&submission.resource.space, &submission.resource.resource)
+        .ok_or(AuthorizationError::InvalidProof(
+            "historical ExecutionService is missing",
+        ))?;
+    let target = historical.verify_service_device(
+        &submission.resource.space,
+        &DeviceId::from_key(local_c),
+        accepted.decision_at_ms(),
+    )?;
+    require(
+        resource.payload.kind == ResourceKind::ExecutionService
+            && resource.payload.host == submission.audience.service
+            && target.payload.public_key == *local_c
+            && target.payload.subject == Actor::Service(submission.audience.service.clone())
+            && leaf.payload.scope == ResourceScope::Exact(submission.resource.clone())
+            && leaf.payload.grantee == Grantee::Actor(submission.actor.clone())
+            && leaf.payload.audience == submission.audience
+            && leaf.payload.constraints.context == submission.context
+            && !leaf.payload.constraints.require_account_actor
+            && !leaf.payload.constraints.require_webauthn_uv
+            && leaf.payload.remaining_delegations == 0
+            && leaf.payload.expires_at_ms < u64::MAX
+            && leaf.payload.actions.contains(&submission.action)
+            && prepare::remote_actions(
+                &leaf.payload.actions,
+                reference.kind != RemoteExecutionHistoryKind::ExecutionResult,
+            ),
+        "historical policy read exceeds its original exact Service grant",
+    )?;
+    budget.verify(resource)?;
+    historical.validate_certificate(
+        target,
+        accepted.decision_at_ms(),
+        &mut budget,
+        &mut dependencies,
+        &mut BTreeSet::new(),
+    )?;
+    let chain = historical.grant_chain(Some(reference.grant_leaf()))?;
+    historical.verify_grant_path(
+        &chain,
+        accepted.decision_at_ms(),
+        &mut budget,
+        &mut dependencies,
+        true,
+    )?;
+    historical.expand_authorities(accepted.decision_at_ms(), &mut budget, &mut dependencies)?;
+    require(
+        dependencies.values().all(|head| {
+            accepted.heads().contains(head) && submission.expected_policies.contains(head)
+        }),
+        "historical grant changed its signed exact heads",
+    )?;
+    let required: Vec<_> = dependencies.into_values().collect();
+    let (heads, allowed_hashes) =
+        remote_execution_policy::reference_closure(state, &required, independent_pins)?;
+    let mut usage = accepted.usage;
+    usage.record_budget(&budget)?;
+    usage.record_chain_depth(chain.len());
+    if let Some(counts) = SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()?;
+    Ok(VerifiedHistoryPolicyRead {
+        heads,
+        allowed_hashes,
+        decision_at_ms: accepted.decision_at_ms,
+        usage,
+    })
+}
