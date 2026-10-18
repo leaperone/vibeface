@@ -546,7 +546,8 @@ class Client:
             context["execution_session"] = {"target": self.command("derive_authorization_id", kind="device", value=target_key),
                                             "session_id": request["session_id"]}
             context["executor_kind"] = executor
-            raw_context["binding_generation"] = binding["binding"]["generation"] if binding else None
+            raw_context["binding_generation"] = (body["binding_generation"] if method == "bind_execution"
+                                                  else binding["binding"]["generation"] if binding else None)
             raw_context["execution_target_public_key"] = target_key
             if binding:
                 raw_context["canonical_cwd"] = binding["binding"]["open_spec"]["cwd"]
@@ -645,7 +646,7 @@ class Client:
         response = self.rpc("bind_execution", conversation_id=conversation, task_id=task_id,
                             task_ref=task["task_ref"],
                             target_node=target.node_id, session_id=session_id,
-                            executor=open_spec["executor"], cwd=open_spec["cwd"], remote=remote)
+                            executor=open_spec["executor"], cwd=open_spec["cwd"], binding_generation=1, remote=remote)
         expected = {"space_id": self.scope["space_id"], "conversation_id": conversation,
                     "task_ref": task["task_ref"], "task_id": task_id,
                     "authority_node": task["authority_node"], "generation": 1,

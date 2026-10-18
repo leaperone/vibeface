@@ -591,6 +591,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const reply = await connection.rpcWithProof("bind_execution", {
         conversation_id: request.conversation_id, task_id: task.task_id, task_ref: creation.taskRef,
         target_node: request.target_node, session_id: request.session_id, executor: request.action.executor, cwd: request.action.cwd,
+        binding_generation: bindingGeneration,
         ...(remote ? remoteExecutionParams(remote) : {}),
       }, attempt => {
         if (pendingBinding.attempt && !same(pendingBinding.attempt, attempt)) throw new Error("绑定重试的签名与原请求不同，请先核对。")
