@@ -246,6 +246,16 @@ fn key(kind: &str, reference: &ObjectHash) -> String {
     format!("{PREFIX}:{kind}:{reference}")
 }
 
+fn task_approval_prefix(
+    project: &vibeface_secure::authorization::ResourceRef,
+    task: &vibeface_secure::authorization::EventRef,
+) -> Result<String> {
+    Ok(format!(
+        "{PREFIX}:task-approval:{}:",
+        ObjectHash::body(&(project, task))?
+    ))
+}
+
 fn value_in(connection: &Connection, key: &str) -> Result<Option<String>> {
     let bytes: Option<usize> = connection
         .query_row(
@@ -512,6 +522,22 @@ impl Store {
         )?;
         save_exact_in(&tx, &key("approval", &approval_ref), trust.approval())?;
         save_exact_in(&tx, &key("choice", &choice), &approval_ref)?;
+        let scope_task = intent
+            .payload
+            .context
+            .context
+            .task
+            .as_ref()
+            .context("Task approval has no Task")?;
+        save_exact_in(
+            &tx,
+            &format!(
+                "{}{}",
+                task_approval_prefix(&intent.payload.source_selection.resource, scope_task)?,
+                approval_ref
+            ),
+            &approval_ref,
+        )?;
         save_exact_in(&tx, &key("reader-intent", &envelope_hash), intent)?;
         save_exact_in(
             &tx,

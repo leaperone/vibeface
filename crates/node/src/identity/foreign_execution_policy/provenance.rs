@@ -498,6 +498,34 @@ pub(crate) fn task_policy_candidates_in(
             candidates.insert(selection, policy.clone());
         }
     }
+    if candidates.is_empty() {
+        let prefix = task_approval_prefix(project, task)?;
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key GLOB ? ORDER BY key LIMIT 1",
+                [format!("{prefix}*")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(encoded) = stored {
+            ensure!(
+                encoded.len() <= MAX_PROOF_BYTES,
+                "Task approval lookup is too large"
+            );
+            let reference: ObjectHash = serde_json::from_str(&encoded)?;
+            let trust = load_task_execution_trust_in(connection, source, &reference)?;
+            let original = &trust.original_intent().payload;
+            ensure!(
+                original.source_selection.resource == *project
+                    && original.context.context.task.as_ref() == Some(task)
+                    && original.context.binding_generation == Some(1),
+                "Task approval lookup changed its exact unbound scope"
+            );
+            anyhow::bail!(
+                "NeedPolicySync: approved foreign Task has no fresh policy for this exact action"
+            );
+        }
+    }
     Ok(candidates.into_values().collect())
 }
 
