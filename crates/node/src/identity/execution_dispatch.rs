@@ -1522,9 +1522,80 @@ impl Store {
         now_ms: u64,
     ) -> Result<vibeface_secure::authorization::execution_observation::SignedExecutionObservation>
     {
-        Ok(self
-            .prepare_task_execution_dispatch_observation(identity, request, transport, now_ms)?
-            .0)
+        use vibeface_secure::{
+            Identity,
+            authorization::{Actor, execution_handoff::SignedExecutionHandoff},
+        };
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let invocation = &request.payload.request;
+        let observed_presenter = match transport {
+            TransportEvidence::DirectNoise { device } => {
+                device == &invocation.device && device == &invocation.presenter
+            }
+            TransportEvidence::GatewayNoise { device, gateway } => {
+                device == &invocation.device
+                    && gateway == &invocation.presenter
+                    && gateway != device
+            }
+            TransportEvidence::VerifiedPeer { origin } => {
+                origin == &invocation.presenter && origin != &invocation.device
+            }
+            TransportEvidence::LocalAgentAdapter { .. } => false,
+        };
+        ensure!(
+            observed_presenter
+                && matches!(invocation.actor, Actor::Account(_))
+                && invocation.context.sdk_session.is_none(),
+            "execution observation requires the actual signed Noise presenter"
+        );
+        let target = &request.payload.intent.target;
+        let space = target.source.project.space.as_str();
+        let operation = &target.source.operation_id;
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let encoded: String = tx.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space, format!("project-execution-handoff:{operation}")],
+            |row| row.get(0),
+        )?;
+        let original: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+        let retained = retained_dispatch_from(&tx, identity, &original)?;
+        ensure!(
+            super::task_execution_context::OriginalAdmissionView::load(
+                &tx,
+                &current,
+                &retained.admission
+            )?
+            .task_policy()
+            .is_none(),
+            "foreign observation requires its dedicated Task readonly policy source"
+        );
+        ensure!(
+            retained.admission.invocation.payload.audience == invocation.audience,
+            "observation targets another Project host"
+        );
+        super::event_authorization::validate_retained_execution_scope_in(
+            &tx,
+            identity,
+            &retained.source,
+        )?;
+        let verified = current
+            .verified()
+            .verify_execution_observation_request(request, &original, now_ms)?;
+        check_destination_heads_in(&tx, verified.heads())?;
+        let signer =
+            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let wire = current.verified().sign_execution_observation(
+            request,
+            &original,
+            &signer,
+            now_ms,
+            verified.expires_at_ms(),
+        )?;
+        check_destination_heads_in(&tx, &wire.invocation.payload.expected_policies)?;
+        tx.commit()?;
+        Ok(wire)
     }
 
     pub(crate) fn prepare_task_execution_dispatch_observation(
