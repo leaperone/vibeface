@@ -215,7 +215,7 @@ jobs:
           import json, os, pathlib, subprocess, sys
           info = json.load(open(sys.argv[1]))
           assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
-          assert info["update_protocol"] == 2 and info["data_epoch"] == 2
+          assert info["update_protocol"] == 2 and info["data_epoch"] == 3
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
           binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
