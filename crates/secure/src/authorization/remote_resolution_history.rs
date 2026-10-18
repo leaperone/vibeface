@@ -83,7 +83,6 @@ fn load(
     }
     let mut usage = accepted.proof_usage().clone();
     usage.record_budget(&baseline.budget)?;
-    client_policy_import::record_confirmed_client_policy_metadata(reader, &mut usage)?;
     policy.record_metadata(&mut usage)?;
     if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts() {
         usage.record_actual_signature_counts(counts);
@@ -335,6 +334,7 @@ pub fn verify_remote_execution_result_history(
         usage.merge(verified.proof_usage());
         usage.record_historical_handoff(&actual.handoff)?;
         usage.record_signed(&actual.receipt)?;
+        usage.normalize_history_acceptance_metadata(freshness)?;
         if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts() {
             usage.record_actual_signature_counts(counts);
         }
@@ -342,4 +342,55 @@ pub fn verify_remote_execution_result_history(
         serde_json::to_string(&serde_json::json!({"historical":true,"state":actual.receipt.payload.state,"actual":actual}))
             .map_err(|_| AuthorizationError::InvalidProof("historical execution result encoding failed"))
     })().map_err(|error|error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_acceptance_metadata_keeps_all_signed_objects_and_budget_limits() {
+        let fixture = execution_observation::tests::retained_history_fixture();
+        let reference = remote_execution_history::derive_reference(
+            &serde_json::to_string(&fixture.actual).unwrap(),
+            &serde_json::to_string(&fixture.body).unwrap(),
+            &serde_json::to_string(&fixture.invocation).unwrap(),
+            &serde_json::to_string(&fixture.binding).unwrap(),
+        ).unwrap();
+        let accepted = remote_execution_history::verify_remote_execution_history_acceptance(
+            &fixture.state, &reference, &fixture.acceptance,
+            &PublicKey::of(&fixture.executor), 10_020,
+        ).unwrap();
+        let remote_execution_history::RemoteExecutionHistoryAcceptance::ExecutionResult {
+            freshness, receipt, ..
+        } = &fixture.acceptance else {
+            panic!("fixture requires its original execution acceptance");
+        };
+        let mut usage = accepted.proof_usage().clone();
+        let before = usage.counts();
+        usage.normalize_history_acceptance_metadata(freshness).unwrap();
+        let after = usage.counts();
+        assert_eq!(before.unique_signed_objects, after.unique_signed_objects);
+        assert_eq!(before.unique_signatures, after.unique_signatures);
+        assert!(after.authorization_bytes < before.authorization_bytes);
+        usage.enforce_limits().unwrap();
+        for offset in 1..=(MAX_PROOF_OBJECTS - after.unique_signed_objects) {
+            let mut another = receipt.payload.clone();
+            another.admitted_at_ms += offset as u64;
+            usage.record_signed(&Signed::sign(another, &fixture.executor).unwrap()).unwrap();
+        }
+        assert_eq!(usage.counts().unique_signed_objects, MAX_PROOF_OBJECTS);
+        usage.enforce_limits().unwrap();
+        let mut extra = receipt.payload.clone();
+        extra.admitted_at_ms += MAX_PROOF_OBJECTS as u64;
+        let extra = Signed::sign(extra, &fixture.executor).unwrap();
+        extra.verify_signature().unwrap();
+        usage.record_verified_object(&extra).unwrap();
+        usage.normalize_history_acceptance_metadata(freshness).unwrap();
+        let exceeded = usage.counts();
+        assert_eq!(exceeded.unique_signed_objects, MAX_PROOF_OBJECTS + 1);
+        assert_eq!(exceeded.unique_signatures, MAX_PROOF_SIGNATURES);
+        assert!(exceeded.authorization_bytes <= MAX_PROOF_BYTES);
+        assert!(matches!(usage.enforce_limits(), Err(AuthorizationError::BudgetExceeded)));
+    }
 }

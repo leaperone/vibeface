@@ -2317,6 +2317,23 @@ impl ExecutionProofUsage {
             .insert(ObjectHash::body(value)?, canonical(value)?.len());
         Ok(())
     }
+    pub(super) fn normalize_history_acceptance_metadata(
+        &mut self,
+        freshness: &ExecutionHandoffFreshness,
+    ) -> Result<()> {
+        let proof_hash = ObjectHash::body(freshness)?;
+        let mut receipt_hashes = Vec::with_capacity(freshness.receipts.len());
+        for receipt in &freshness.receipts {
+            self.record_signed(receipt)?;
+            receipt_hashes.push(ObjectHash::body(receipt)?);
+        }
+        self.metadata.remove(&proof_hash);
+        self.record_metadata(&serde_json::json!({
+            "history_acceptance_hash": proof_hash,
+            "challenge": freshness.challenge,
+            "receipt_hashes": receipt_hashes,
+        }))
+    }
     fn record_historical_wrapper<T: SignedObject>(&mut self, value: &Signed<T>) -> Result<()> {
         let hash = value.hash()?;
         let size = canonical(value)?.len();
