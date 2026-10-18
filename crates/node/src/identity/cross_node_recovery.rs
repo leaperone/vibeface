@@ -3,7 +3,9 @@ mod target_import;
 pub(crate) use target_import::TargetRecoveryImport;
 
 use super::{
-    bounded_recovery_context::{completed_recovery_read_in, recovery_read_reference_in},
+    bounded_recovery_context::{
+        completed_recovery_read_in, recovery_read_reference_in, store_source_proposal_approval_in,
+    },
     journal,
     policy::project_policy_in,
 };
@@ -239,26 +241,57 @@ impl Store {
             context.request == RecoveryReadRequest::CrossNode(request.request.clone()),
             "cross-node possession changed its source request"
         );
-        let source_proof =
-            context.source_proof_in(&tx, &self.policy, &PublicKey::of(&signer), now)?;
-        let proof = stream::sign_cross_node_recovery_source_possession_with_source_proof(
-            &request,
-            &context.request,
-            &context.snapshot,
-            &context.witness,
-            self.policy.verified(),
-            &source_proof,
-            &signer,
-            now,
-        )?;
+        let local = PublicKey::of(&signer);
+        let prefix = context.accepted_prefix_commitment_in(&tx, &self.policy)?;
         let key = possession_key(&request.context.snapshot_id);
-        if let Some(previous) = metadata(&tx, &key)? {
-            let previous: SourcePossession = serde_json::from_str(&previous)?;
+        let previous = metadata(&tx, &key)?;
+        let (proof, approval) = if let Some(previous) = &previous {
+            let previous: SourcePossession = serde_json::from_str(previous)?;
             ensure!(
-                previous.request == request && previous.proof == proof,
-                "source recovery was already bound to another proposal"
+                previous.request == request,
+                "source recovery already approved another proposal"
             );
+            let approval = context
+                .source_approval
+                .as_ref()
+                .context("source proposal approval is missing")?;
+            stream::verify_recovery_source_proposal_approval(
+                approval,
+                &context.request,
+                &request.context,
+                &ObjectHash::body(&request)?,
+                &request.node_request.account_recovery,
+                &previous.proof,
+                self.policy.verified(),
+                &local,
+                &prefix,
+                now,
+            )?;
+            (previous.proof, approval.clone())
         } else {
+            ensure!(
+                context.source_approval.is_none(),
+                "source proposal possession record is missing"
+            );
+            stream::approve_cross_node_recovery_source_proposal(
+                &request,
+                &context.request,
+                &context.snapshot,
+                &context.witness,
+                self.policy.verified(),
+                &signer,
+                &prefix,
+                now,
+            )?
+        };
+        let response = bounded(json!({"proof":proof}))?;
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_current_usage(self.policy.verified(), &mut usage)?;
+        usage.record_cross_possession(&request, self.policy.verified())?;
+        usage.record_source_proposal_approval(&approval)?;
+        usage.finish()?;
+        store_source_proposal_approval_in(&tx, &context, &approval, &prefix)?;
+        if previous.is_none() {
             let encoded = serde_json::to_string(&SourcePossession {
                 request: request.clone(),
                 proof: proof.clone(),
@@ -269,16 +302,6 @@ impl Store {
                 params![key, encoded],
             )?;
         }
-        let response = bounded(json!({"proof":proof}))?;
-        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
-        context.record_current_usage(self.policy.verified(), &mut usage)?;
-        source_proof.record_proof_usage_into(&mut usage);
-        usage.record_cross_possession_with_source_proof(
-            &request,
-            self.policy.verified(),
-            &source_proof,
-        )?;
-        usage.finish()?;
         tx.commit()?;
         Ok(response)
     }
@@ -363,14 +386,29 @@ impl Store {
                 )),
             "cross-node commit changed its approved source possession"
         );
-        let source_proof = context.source_proof_in(&tx, &self.policy, &local, now)?;
-        let verified = stream::verify_cross_node_recovery_stream_commit_with_source_proof(
+        let prefix = context.accepted_prefix_commitment_in(&tx, &self.policy)?;
+        let source_approval = stream::verify_recovery_source_proposal_approval(
+            context
+                .source_approval
+                .as_ref()
+                .context("source proposal approval is missing")?,
+            &context.request,
+            &input.possession.context,
+            &ObjectHash::body(&approved.request)?,
+            &approved.request.node_request.account_recovery,
+            &approved.proof,
+            self.policy.verified(),
+            &local,
+            &prefix,
+            now,
+        )?;
+        let verified = stream::verify_cross_node_recovery_stream_commit_with_source_approval(
             &input,
             &context.request,
             &context.snapshot,
             &context.witness,
             self.policy.verified(),
-            &source_proof,
+            &source_approval,
             &local,
             now,
         )?;
@@ -378,17 +416,7 @@ impl Store {
             verified.input_hash() == &status.input_hash,
             "cross-node commit changed its exact input hash"
         );
-        let update = self
-            .policy
-            .prepare_network_update(&input.journal_delta, now)?;
-        ensure!(
-            verified.committed_heads().len() == 2
-                && verified
-                    .committed_heads()
-                    .iter()
-                    .all(|head| { update.verified_after().head(&head.domain) == Some(head) }),
-            "cross-node update differs from the verified finite delta"
-        );
+        let committed_heads = verified.committed_heads().to_vec();
         let committed = stream::accept_cross_node_recovery_stream_commit(&verified, &signer, now)?;
         let response = bounded(json!({"committed":committed}))?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
@@ -396,6 +424,14 @@ impl Store {
         verified.record_proof_usage_into(&mut usage);
         usage.record_cross_completion(&committed.receipt)?;
         usage.finish()?;
+        let update = self.policy.prepare_cross_recovery_commit(verified, now)?;
+        ensure!(
+            committed_heads.len() == 2
+                && committed_heads
+                    .iter()
+                    .all(|head| update.verified_after().head(&head.domain) == Some(head)),
+            "cross-node update differs from its verified completion heads"
+        );
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
         let encoded = serde_json::to_string(&committed)?;
@@ -1106,6 +1142,73 @@ pub(crate) mod tests {
             f.target
                 .verify_bootstrap_capability(&f.capability.capability)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_proposal_rejects_a_new_device_without_a_policy_head_change() -> Result<()> {
+        let mut f = Fixture::new()?;
+        let (_, request) = f.commit_request()?;
+        let domains = [
+            PolicyDomain::Account(f.network.account.clone()),
+            PolicyDomain::Space(f.network.space.clone()),
+        ];
+        let heads = domains
+            .iter()
+            .map(|domain| {
+                f.source
+                    .authorization_state()
+                    .head(domain)
+                    .cloned()
+                    .context("head missing")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut independent = Store::open(f.network.directory.join("source.sqlite3"))?;
+        let before = journal_count(&independent)?;
+        let old_client = DeviceId::from_key(&PublicKey::of(&f.network.client));
+        let mut certificate = f
+            .network
+            .bundle
+            .journal
+            .iter()
+            .find_map(|entry| match entry {
+                JournalEntry::Device(certificate) if certificate.payload.device == old_client => {
+                    Some(certificate.payload.clone())
+                }
+                _ => None,
+            })
+            .context("original client certificate is missing")?;
+        certificate.public_key = PublicKey::of(&f.next_client);
+        certificate.device = DeviceId::from_key(&certificate.public_key);
+        certificate.nonce = Nonce::random()?;
+        certificate.possession = None;
+        certificate.prove_possession(&f.next_client)?;
+        independent.install_policy_journal(
+            &[JournalEntry::Device(Signed::sign(
+                certificate,
+                &f.network.root,
+            )?)],
+            now() + 1,
+        )?;
+        assert_eq!(journal_count(&independent)?, before + 1);
+        assert!(
+            heads
+                .iter()
+                .all(|head| independent.authorization_state().head(&head.domain) == Some(head))
+        );
+        assert!(f.source_commit(&request, now() + 2).is_err());
+        assert_eq!(journal_count(&f.source)?, before + 1);
+        let reference = f.reference.as_ref().context("reference missing")?;
+        assert!(
+            metadata(
+                &f.source.connection,
+                &completion_key(&reference.snapshot_id)
+            )?
+            .is_none()
+        );
+        assert_eq!(journal_count(&f.target)?, 0);
+        f.target
+            .verify_bootstrap_capability(&f.capability.capability)?;
         Ok(())
     }
 

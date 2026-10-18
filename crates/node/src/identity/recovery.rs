@@ -1,5 +1,7 @@
 use super::{
-    bounded_recovery_context::{completed_recovery_read_in, recovery_read_reference_in},
+    bounded_recovery_context::{
+        completed_recovery_read_in, recovery_read_reference_in, store_source_proposal_approval_in,
+    },
     journal,
     policy::project_policy_in,
 };
@@ -172,29 +174,58 @@ impl Store {
             matches!(&context.request, RecoveryReadRequest::Account(_)),
             "recovery possession belongs to another purpose"
         );
-        let proof = stream::sign_recovery_node_possession_in_state(
-            &request,
-            &context.request,
-            &context.snapshot,
-            &context.witness,
-            self.policy.verified(),
-            &signer,
-            &context.snapshot.payload.claim.payload.claim_nonce,
-            now_ms,
-        )?;
+        let local = PublicKey::of(&signer);
+        let prefix = context.accepted_prefix_commitment_in(&tx, &self.policy)?;
         let key = possession_key(&request.context.snapshot_id);
+        let previous = metadata(&tx, &key)?;
+        let (proof, approval) = if let Some(previous) = &previous {
+            let previous: ApprovedRecoveryPossession = serde_json::from_str(previous)?;
+            ensure!(
+                previous.request == request,
+                "recovery snapshot already approved another proposal"
+            );
+            let approval = context
+                .source_approval
+                .as_ref()
+                .context("source proposal approval is missing")?;
+            stream::verify_recovery_source_proposal_approval(
+                approval,
+                &context.request,
+                &request.context,
+                &ObjectHash::body(&request)?,
+                &request.request.account_recovery,
+                &previous.proof,
+                self.policy.verified(),
+                &local,
+                &prefix,
+                now_ms,
+            )?;
+            (previous.proof, approval.clone())
+        } else {
+            ensure!(
+                context.source_approval.is_none(),
+                "source proposal possession record is missing"
+            );
+            stream::approve_recovery_source_proposal(
+                &request,
+                &context.request,
+                &context.snapshot,
+                &context.witness,
+                self.policy.verified(),
+                &signer,
+                &context.snapshot.payload.claim.payload.claim_nonce,
+                &prefix,
+                now_ms,
+            )?
+        };
         let response = bounded(json!({"proof":proof}))?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         context.record_current_usage(self.policy.verified(), &mut usage)?;
         usage.record_node_request(&request, self.policy.verified())?;
+        usage.record_source_proposal_approval(&approval)?;
         usage.finish()?;
-        if let Some(previous) = metadata(&tx, &key)? {
-            let previous: ApprovedRecoveryPossession = serde_json::from_str(&previous)?;
-            ensure!(
-                previous.request == request && previous.proof == proof,
-                "recovery snapshot was already bound to another proposal"
-            );
-        } else {
+        store_source_proposal_approval_in(&tx, &context, &approval, &prefix)?;
+        if previous.is_none() {
             let encoded = serde_json::to_string(&ApprovedRecoveryPossession {
                 request,
                 proof: proof.clone(),
@@ -275,27 +306,44 @@ impl Store {
             )),
             "recovery commit changed its approved Node possession"
         );
-        let source_proof = context.source_proof_in(&tx, &self.policy, &local, now_ms)?;
-        let verified = stream::verify_recovery_stream_commit_with_source_proof(
+        let prefix = context.accepted_prefix_commitment_in(&tx, &self.policy)?;
+        let source_approval = stream::verify_recovery_source_proposal_approval(
+            context
+                .source_approval
+                .as_ref()
+                .context("source proposal approval is missing")?,
+            &context.request,
+            &input.context,
+            &ObjectHash::body(&approved.request)?,
+            &approved.request.request.account_recovery,
+            &approved.proof,
+            self.policy.verified(),
+            &local,
+            &prefix,
+            now_ms,
+        )?;
+        let verified = stream::verify_recovery_stream_commit_with_source_approval(
             &input,
             &approved.request,
             &context.request,
             self.policy.verified(),
-            &source_proof,
+            &source_approval,
             now_ms,
         )?;
         ensure!(
             verified.input_hash() == &input_hash,
             "recovery commit changed its exact input hash"
         );
+        let committed_heads = verified.committed_heads().to_vec();
+        let mut verified_usage = RecoveryProofUsage::new(0)?;
+        verified.record_proof_usage_into(&mut verified_usage);
         let update = self
             .policy
-            .prepare_network_update(&input.journal_delta, now_ms)?;
+            .prepare_account_recovery_update(verified, now_ms)?;
         let after = update.verified_after();
         ensure!(
-            verified.committed_heads().len() == 2
-                && verified
-                    .committed_heads()
+            committed_heads.len() == 2
+                && committed_heads
                     .iter()
                     .all(|head| after.head(&head.domain) == Some(head)),
             "recovery commit differs from its verified policy delta"
@@ -324,13 +372,8 @@ impl Store {
         let response = bounded(json!({"receipt":receipt}))?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         context.record_current_usage(self.policy.verified(), &mut usage)?;
-        source_proof.record_proof_usage_into(&mut usage);
-        usage.record_node_request_with_source_proof(
-            &approved.request,
-            self.policy.verified(),
-            &source_proof,
-        )?;
-        usage.record_commit_with_source_proof(&input, self.policy.verified(), &source_proof)?;
+        source_approval.record_proof_usage_into(&mut usage)?;
+        usage.merge(&verified_usage);
         usage.record_completion(&receipt)?;
         usage.finish()?;
         let state = journal::commit_in(&tx, &update)?;
@@ -345,5 +388,183 @@ impl Store {
         tx.commit()?;
         self.policy = state;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::test_support::{TestNetwork, now};
+    use vibeface_secure::authorization::bootstrap::recovery::{self, context};
+
+    #[test]
+    fn source_approval_survives_reopen_and_original_commit_reconciles_after_expiry() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let path = network.directory.join("ordinary-recovery.sqlite3");
+        let mut store = network.at(&path)?;
+        let client = Identity::generate().map_err(anyhow::Error::msg)?;
+        let root = Identity::generate().map_err(anyhow::Error::msg)?;
+        let material = recovery::build_account_recovery_material(
+            &network.created,
+            &network.root,
+            &network.recovery,
+            "https://node.example",
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let request_json = context::build_recovery_context_request(
+            &material,
+            &client,
+            &network.node.public_key_hex()?,
+            now() as f64,
+            (now() + 60_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let request: Signed<RecoveryContextRequest> = serde_json::from_str(&request_json)?;
+        let begin = store.recovery_context(
+            &network.node,
+            &client.public_key_hex(),
+            &json!({"request":request}),
+            now(),
+        )?;
+        let snapshot: Signed<stream::RecoveryContextSnapshot> =
+            serde_json::from_value(begin["snapshot"].clone())?;
+        let mut importer = stream::begin_recovery_context_import(
+            &material,
+            &request_json,
+            &serde_json::to_string(&snapshot)?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut cursor = None;
+        loop {
+            let response = store.recovery_context_page(&network.node, &client.public_key_hex(),
+                &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":cursor}), now())?;
+            let page: Signed<stream::RecoveryContextPage> =
+                serde_json::from_value(response["page"].clone())?;
+            cursor = page.payload.next_cursor.clone();
+            let complete = page.payload.complete;
+            importer.append(page, now())?;
+            if complete {
+                break;
+            }
+        }
+        let response = store.recovery_context_witness(&network.node, &client.public_key_hex(),
+            &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":null}), now())?;
+        let witness: Signed<stream::RecoveryContextWitness> =
+            serde_json::from_value(response["witness"].clone())?;
+        let verified = importer.finish_native(witness, now())?;
+        let prepared = recovery::prepare_account_recovery(
+            &material,
+            &verified,
+            &root,
+            &client,
+            (now() + 900_000) as f64,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let possession: Value =
+            serde_json::from_str(&prepared.node_request_json().map_err(anyhow::Error::msg)?)?;
+        let proof = store.recovery_node_possession(
+            &network.node,
+            &client.public_key_hex(),
+            &possession,
+            now(),
+        )?;
+        let key = format!("recovery-read:{}", snapshot.payload.snapshot_id);
+        let original = metadata(&store.connection, &key)?.context("source record is missing")?;
+        let raw: Value = serde_json::from_str(&original)?;
+        assert!(raw["source_approval"].is_object());
+        store = Store::open(&path)?;
+        assert_eq!(
+            store.recovery_node_possession(
+                &network.node,
+                &client.public_key_hex(),
+                &possession,
+                now() + 1
+            )?,
+            proof
+        );
+        assert!(metadata(&store.connection, &key)?.as_deref() == Some(original.as_str()));
+        let mut tampered = raw;
+        tampered["source_approval"]["payload"]["accepted_prefix_commitment"] =
+            json!(ObjectHash::body(&"wrong prefix")?);
+        store.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![serde_json::to_string(&tampered)?, key],
+        )?;
+        assert!(
+            store
+                .recovery_node_possession(
+                    &network.node,
+                    &client.public_key_hex(),
+                    &possession,
+                    now() + 1
+                )
+                .is_err()
+        );
+        store.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![original, key],
+        )?;
+        let recovered = recovery::finish_account_recovery(
+            &prepared,
+            &root,
+            proof["proof"].as_str().context("source proof is missing")?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let commit: Value = serde_json::from_str(
+            &prepared
+                .commit_json(&recovered)
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        let committed =
+            store.recover_account(&network.node, &client.public_key_hex(), &commit, now())?;
+        assert!(committed["receipt"].is_object());
+        assert!(committed.get("authorization").is_none());
+        let count: u64 =
+            store
+                .connection
+                .query_row("SELECT count(*) FROM policy_journal", [], |r| r.get(0))?;
+        store = Store::open(&path)?;
+        assert_eq!(
+            store.recover_account(
+                &network.node,
+                &client.public_key_hex(),
+                &commit,
+                now() + 200_000
+            )?,
+            committed
+        );
+        let status =
+            json!({"context":verified.reference()?,"input_hash":ObjectHash::body(&commit)?});
+        assert_eq!(
+            store.recovery_status(
+                &network.node,
+                &client.public_key_hex(),
+                &status,
+                now() + 200_000
+            )?["receipt"],
+            committed["receipt"]
+        );
+        assert!(
+            store
+                .recovery_status(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &status,
+                    now() + 200_000
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM policy_journal", [], |r| r
+                    .get::<_, u64>(0))?,
+            count
+        );
+        Ok(())
     }
 }

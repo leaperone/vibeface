@@ -28,6 +28,7 @@ struct RecoveryReadRecord {
     journal_snapshot: AcceptedJournalSnapshot,
     position: RecoveryReadPosition,
     witness: Option<Signed<RecoveryContextWitness>>,
+    source_approval: Option<Signed<RecoverySourceProposalApproval>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,33 +52,25 @@ pub(crate) struct CompletedRecoveryRead {
     pub(crate) request: RecoveryReadRequest,
     pub(crate) snapshot: Signed<RecoveryContextSnapshot>,
     pub(crate) witness: Signed<RecoveryContextWitness>,
+    pub(crate) source_approval: Option<Signed<RecoverySourceProposalApproval>>,
     journal_snapshot: AcceptedJournalSnapshot,
     last_page: Option<Signed<RecoveryContextPage>>,
 }
 
 impl CompletedRecoveryRead {
-    pub(crate) fn source_proof_in(
+    pub(crate) fn accepted_prefix_commitment_in(
         &self,
         connection: &Connection,
         policy: &PolicyState,
-        local: &PublicKey,
-        now: u64,
-    ) -> Result<VerifiedRecoverySourceProof> {
+    ) -> Result<ObjectHash> {
         policy.accepted_journal_page(
             connection,
             &self.journal_snapshot,
             None,
             &Default::default(),
         )?;
-        let prefix = policy.accepted_journal_prefix(&self.journal_snapshot)?;
-        Ok(verify_recovery_source_proof_prefix(
-            &self.request,
-            &self.snapshot,
-            &self.witness,
-            policy.verified(),
-            &prefix,
-            local,
-            now,
+        Ok(ObjectHash::body(
+            &policy.accepted_journal_snapshot(connection)?,
         )?)
     }
 
@@ -160,6 +153,7 @@ pub(crate) fn recovery_read_reference_in(
         request: record.request,
         snapshot: record.snapshot,
         witness: record.witness.context("recovery import is not complete")?,
+        source_approval: record.source_approval,
         journal_snapshot: record.journal_snapshot,
         last_page: None,
     })
@@ -186,9 +180,51 @@ pub(crate) fn completed_recovery_read_in(
         request: record.request,
         snapshot: record.snapshot,
         witness: record.witness.context("recovery import is not complete")?,
+        source_approval: record.source_approval,
         journal_snapshot: record.journal_snapshot,
         last_page: cached.map(|cached| cached.page),
     })
+}
+
+pub(crate) fn store_source_proposal_approval_in(
+    connection: &Connection,
+    context: &CompletedRecoveryRead,
+    approval: &Signed<RecoverySourceProposalApproval>,
+    accepted_prefix_commitment: &ObjectHash,
+) -> Result<()> {
+    let key = context_key(&context.snapshot.payload.snapshot_id);
+    let encoded = metadata(connection, &key)?.context("source recovery record is missing")?;
+    let mut record: RecoveryReadRecord = serde_json::from_str(&encoded)?;
+    ensure!(
+        record.request == context.request
+            && record.snapshot == context.snapshot
+            && record.witness.as_ref() == Some(&context.witness)
+            && approval.issuer == record.snapshot.issuer
+            && approval.payload.context.snapshot_id == record.snapshot.payload.snapshot_id
+            && approval.payload.context.request_hash == record.request.request_hash()?
+            && approval.payload.context.snapshot_hash == record.snapshot.hash()?
+            && approval.payload.context.witness_hash == context.witness.hash()?
+            && &approval.payload.accepted_prefix_commitment == accepted_prefix_commitment
+            && approval.payload.expected_heads == record.snapshot.payload.target_heads,
+        "source proposal approval changed its original accepted read"
+    );
+    approval.verify_signature()?;
+    if let Some(previous) = &record.source_approval {
+        ensure!(
+            previous == approval,
+            "source recovery already approved another proposal"
+        );
+        return Ok(());
+    }
+    record.source_approval = Some(approval.clone());
+    ensure!(
+        connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=? AND value=?",
+            params![encode_record(&record)?, key, encoded],
+        )? == 1,
+        "source recovery record changed concurrently"
+    );
+    Ok(())
 }
 
 fn context_key(id: &Nonce) -> String {
@@ -557,6 +593,7 @@ impl Store {
                 previous_page_hash: snapshot.hash()?,
             },
             witness: None,
+            source_approval: None,
         };
         check_read_usage(
             &self.policy,
