@@ -17,6 +17,7 @@ pub(crate) struct PolicyState {
     accepted: BTreeMap<ObjectHash, AcceptedEntry>,
     order: Vec<ObjectHash>,
     pub(crate) local_admissions: super::admission::AdmissionCheckpoints,
+    pub(crate) task_execution_policy: super::foreign_execution_policy::TaskExecutionPolicyProvenance,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1040,6 +1041,7 @@ impl PolicyState {
             accepted: BTreeMap::new(),
             order: Vec::new(),
             local_admissions: Default::default(),
+            task_execution_policy: Default::default(),
         };
         let mut additions = Vec::with_capacity(journal.len());
         for entry in journal {
