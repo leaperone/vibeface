@@ -962,7 +962,7 @@ mod tests {
 
     fn prepare_execution_registration(
         network: &TestNetwork,
-        store: &Store,
+        store: &mut Store,
         source: &ResourceRef,
         pins: &[PolicyPin],
         bundle: &ClientAuthorizationBundle,
@@ -975,28 +975,91 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
-        let owner = super::super::policy::authenticate_account_from(
-            &store.connection,
-            &store.policy,
-            &network.client.public_key_hex(),
-            &json!({"account_id":network.account,"space_id":network.space,
-                "device_public_key":network.client.public_key_hex(),"resource_id":network.resource,
-                "grant_leaf":network.bundle.grant_leaf}),
+        let source_auth = bounded_execution_authorization(
+            network,
+            store,
+            source,
+            &bundle.grant_leaf,
+            pins,
             now(),
         )?;
+        let owner_resource = ResourceRef {
+            space: network.space.clone(),
+            resource: network.resource.clone(),
+        };
+        let owner = bounded_execution_authorization(
+            network,
+            store,
+            &owner_resource,
+            &network.bundle.grant_leaf,
+            &network.pins,
+            now(),
+        )?;
+        let source_json = serde_json::to_string(source)?;
+        let target = network.node.public_key_hex()?;
+        let mut cursor = "null".to_owned();
+        let management = loop {
+            let page = execution_service::select_execution_service_management(
+                &source_auth,
+                &source_json,
+                &target,
+                &cursor,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            if let Some(selection) = page.selection() {
+                break selection;
+            }
+            let metadata: Value =
+                serde_json::from_str(&page.metadata_json().map_err(anyhow::Error::msg)?)?;
+            ensure!(
+                !metadata["next_cursor"].is_null(),
+                "source has no execution management grant"
+            );
+            cursor = serde_json::to_string(&metadata["next_cursor"])?;
+        };
         execution_service::prepare_execution_service_registration(
-            &serde_json::to_string(source)?,
+            &source_auth,
+            &management,
+            &owner,
             &material,
             &network.client,
-            &serde_json::to_string(pins)?,
-            &serde_json::to_string(bundle)?,
-            &serde_json::to_string(&owner["pins"])?,
-            &serde_json::to_string(&owner["authorization"])?,
-            &network.node.public_key_hex()?,
+            &target,
             now() as f64,
             (now() + 60_000) as f64,
         )
         .map_err(anyhow::Error::msg)
+    }
+
+    fn bounded_execution_authorization(
+        network: &TestNetwork,
+        store: &mut Store,
+        resource: &ResourceRef,
+        leaf: &ObjectHash,
+        pins: &[PolicyPin],
+        now: u64,
+    ) -> Result<VerifiedClientAuthorization> {
+        let audience = store
+            .policy
+            .verified()
+            .grant(leaf)
+            .context("selected client grant is missing")?
+            .payload
+            .audience
+            .clone();
+        super::super::client_policy_read::verified_client_policy_for_test(
+            store,
+            &network.node,
+            &network.client,
+            &network.account,
+            vibeface_secure::authorization::client_policy_import::AuthorizationSelection {
+                resource: resource.clone(),
+                audience,
+                grant_leaf: leaf.clone(),
+            },
+            pins,
+            now,
+        )
     }
 
     #[test]
@@ -1026,7 +1089,7 @@ mod tests {
                 )
             };
             let prepared =
-                prepare_execution_registration(&network, &store, &source, &pins, &bundle)?;
+                prepare_execution_registration(&network, &mut store, &source, &pins, &bundle)?;
             eprintln!(
                 "execution registration source={} phase=prepare usage={}",
                 if team_source { "team" } else { "personal" },
@@ -1072,14 +1135,24 @@ mod tests {
             );
             assert_eq!(verified.resource_id(), execution.resource.as_str());
             assert_eq!(verified.space_id(), execution.space.as_str());
-            let result_bundle: ClientAuthorizationBundle =
-                serde_json::from_str(&verified.bundle_json().map_err(anyhow::Error::msg)?)?;
+            let result_authorization = verified.authorization();
+            let result_pins: Vec<PolicyPin> =
+                serde_json::from_str(&verified.pins_json().map_err(anyhow::Error::msg)?)?;
+            let selection_authorization = bounded_execution_authorization(
+                &network,
+                &mut store,
+                &execution,
+                result_authorization.grant_leaf(),
+                &result_pins,
+                now(),
+            )?;
             let selection_params = json!({
                 "account_id": network.account,
                 "device_public_key": network.client.public_key_hex(),
                 "source_project": source,
                 "target_node_public_key": network.node.public_key_hex()?,
                 "execution_resource": execution,
+                "source_grant": bundle.grant_leaf,
             });
             let before_select = row_counts(&store)?;
             let selected = store.execution_service_select(
@@ -1092,24 +1165,28 @@ mod tests {
             assert_eq!(selected["selections"].as_array().unwrap().len(), 1);
             let selection: execution_service::ExecutionServiceSelection =
                 serde_json::from_value(selected["selections"][0].clone())?;
-            assert_eq!(selection.authorization.grant_leaf, result_bundle.grant_leaf);
+            assert_eq!(
+                &selection.management_parent,
+                result_authorization.grant_leaf()
+            );
             assert_eq!(selection.source_project, source);
             assert_eq!(selection.execution_resource, execution);
             let selection_json = serde_json::to_string(&selection)?;
             assert!(!selection_json.contains(network.project.to_str().unwrap()));
             assert!(!selection_json.contains("secret"));
             let native_selection = execution_service::verify_execution_service_selection(
+                &selection_authorization,
                 &selection_json,
-                &verified.pins_json().map_err(anyhow::Error::msg)?,
                 &serde_json::to_string(&source)?,
                 &serde_json::to_string(&execution)?,
-                network.account.as_str(),
-                &network.client.public_key_hex(),
                 &network.node.public_key_hex()?,
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)?;
-            assert_eq!(native_selection.grant_leaf(), &result_bundle.grant_leaf);
+            assert_eq!(
+                native_selection.grant_leaf(),
+                result_authorization.grant_leaf()
+            );
             for wrong_target in [
                 network.client.public_key_hex(),
                 Identity::generate()
@@ -1118,12 +1195,10 @@ mod tests {
             ] {
                 assert!(
                     execution_service::verify_execution_service_selection(
+                        &selection_authorization,
                         &selection_json,
-                        &verified.pins_json().map_err(anyhow::Error::msg)?,
                         &serde_json::to_string(&source)?,
                         &serde_json::to_string(&execution)?,
-                        network.account.as_str(),
-                        &network.client.public_key_hex(),
                         &wrong_target,
                         now() as f64,
                     )
@@ -1133,7 +1208,7 @@ mod tests {
             let parent = store
                 .policy
                 .verified()
-                .grant(&result_bundle.grant_leaf)
+                .grant(result_authorization.grant_leaf())
                 .context("execution management parent missing")?;
             assert_eq!(
                 parent.payload.scope,
@@ -1150,30 +1225,25 @@ mod tests {
                     .grant(&network.bundle.grant_leaf)
             );
             if team_source {
-                assert!(!result_bundle.journal.iter().any(|entry| match entry {
-                    JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) =>
-                        value.payload.space == source.space,
-                    JournalEntry::SpaceCommit(value) =>
-                        value.proposal.payload.space == source.space,
-                    _ => false,
-                }));
+                assert!(
+                    !result_authorization
+                        .policy_json()
+                        .map_err(anyhow::Error::msg)?
+                        .contains(source.space.as_str())
+                );
+                assert!(
+                    !verified
+                        .recovery_material_json()
+                        .contains(source.space.as_str())
+                );
             }
             bootstrap::recovery::inspect_account_recovery_material(
                 &verified.recovery_material_json(),
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)?;
-            let after = replay_policies(
-                &serde_json::from_str::<Vec<PolicyPin>>(
-                    &verified.pins_json().map_err(anyhow::Error::msg)?,
-                )?,
-                &serde_json::from_str::<ClientAuthorizationBundle>(
-                    &verified.bundle_json().map_err(anyhow::Error::msg)?,
-                )?
-                .journal,
-            )?;
             assert_eq!(
-                after.resource(&execution.space, &execution.resource),
+                result_authorization.resources().first(),
                 store
                     .policy
                     .verified()
@@ -1235,7 +1305,7 @@ mod tests {
             };
             let prepared = prepare_execution_registration(
                 &network,
-                &store,
+                &mut store,
                 &source,
                 &network.pins,
                 &network.bundle,
@@ -1259,9 +1329,8 @@ mod tests {
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)?;
-            let bundle: ClientAuthorizationBundle =
-                serde_json::from_str(&committed.bundle_json().map_err(anyhow::Error::msg)?)?;
-            let parent = bundle.grant_leaf;
+            let committed_authorization = committed.authorization();
+            let parent = committed_authorization.grant_leaf().clone();
             let mut other = store
                 .policy
                 .verified()
@@ -1307,45 +1376,48 @@ mod tests {
                 "account_id":network.account,"device_public_key":network.client.public_key_hex(),
                 "source_project":source,"target_node_public_key":network.node.public_key_hex()?,
                 "execution_resource":resource,
+                "source_grant":network.bundle.grant_leaf,
             });
             drop(store);
             let mut store = Store::open(&path)?;
-            let before = row_counts(&store)?;
-            let mut owner_params = json!({
-                "account_id":network.account,"space_id":network.space,
-                "device_public_key":network.client.public_key_hex(),"resource_id":source.resource,
-                "grant_leaf":network.bundle.grant_leaf,
-            });
-            let original_owner = store.authenticate_account(
-                &network.client.public_key_hex(),
-                &owner_params,
+            let original_owner = bounded_execution_authorization(
+                &network,
+                &mut store,
+                &source,
+                &network.bundle.grant_leaf,
+                &network.pins,
                 now() + 2,
             )?;
-            assert_eq!(
-                original_owner["authorization"]["grant_leaf"],
-                serde_json::to_value(&network.bundle.grant_leaf)?
-            );
-            owner_params["grant_leaf"] = serde_json::to_value(project_grant.hash()?)?;
-            let other_owner = store.authenticate_account(
-                &network.client.public_key_hex(),
-                &owner_params,
+            assert_eq!(original_owner.grant_leaf(), &network.bundle.grant_leaf);
+            let other_owner = bounded_execution_authorization(
+                &network,
+                &mut store,
+                &source,
+                &project_grant.hash()?,
+                &network.pins,
                 now() + 2,
             )?;
-            assert_eq!(
-                other_owner["authorization"]["grant_leaf"],
-                owner_params["grant_leaf"]
-            );
-            owner_params["grant_leaf"] =
-                serde_json::to_value(ObjectHash::body(&"unregistered owner grant")?)?;
+            assert_eq!(other_owner.grant_leaf(), &project_grant.hash()?);
             assert!(
-                store
-                    .authenticate_account(
-                        &network.client.public_key_hex(),
-                        &owner_params,
-                        now() + 2,
-                    )
-                    .is_err()
+                bounded_execution_authorization(
+                    &network,
+                    &mut store,
+                    &source,
+                    &ObjectHash::body(&"unregistered owner grant")?,
+                    &network.pins,
+                    now() + 2
+                )
+                .is_err()
             );
+            let selection_authorization = bounded_execution_authorization(
+                &network,
+                &mut store,
+                &resource,
+                &parent,
+                &network.pins,
+                now() + 2,
+            )?;
+            let before = row_counts(&store)?;
             let selected = store.execution_service_select(
                 &network.node,
                 &network.client.public_key_hex(),
@@ -1354,8 +1426,8 @@ mod tests {
             )?;
             let selection: execution_service::ExecutionServiceSelection =
                 serde_json::from_value(selected["selections"][0].clone())?;
-            assert_eq!(selection.authorization.grant_leaf, parent);
-            assert_ne!(selection.authorization.grant_leaf, other.hash()?);
+            assert_eq!(selection.management_parent, parent);
+            assert_ne!(selection.management_parent, other.hash()?);
             let mut list_params = params.clone();
             list_params
                 .as_object_mut()
@@ -1371,31 +1443,23 @@ mod tests {
                 selected
             );
             let verified = execution_service::verify_execution_service_selection(
+                &selection_authorization,
                 &serde_json::to_string(&selection)?,
-                &committed.pins_json().map_err(anyhow::Error::msg)?,
                 &serde_json::to_string(&source)?,
                 &serde_json::to_string(&resource)?,
-                network.account.as_str(),
-                &network.client.public_key_hex(),
                 &network.node.public_key_hex()?,
                 (now() + 2) as f64,
             )
             .map_err(anyhow::Error::msg)?;
             assert_eq!(verified.grant_leaf(), &parent);
             let mut wrong_leaf = selection.clone();
-            wrong_leaf.authorization.grant_leaf = other.hash()?;
-            wrong_leaf
-                .authorization
-                .journal
-                .push(JournalEntry::Grant(other));
+            wrong_leaf.management_parent = other.hash()?;
             assert!(
                 execution_service::verify_execution_service_selection(
+                    &selection_authorization,
                     &serde_json::to_string(&wrong_leaf)?,
-                    &committed.pins_json().map_err(anyhow::Error::msg)?,
                     &serde_json::to_string(&source)?,
                     &serde_json::to_string(&resource)?,
-                    network.account.as_str(),
-                    &network.client.public_key_hex(),
                     &network.node.public_key_hex()?,
                     (now() + 2) as f64,
                 )
@@ -1496,7 +1560,7 @@ mod tests {
         };
         let prepared = prepare_execution_registration(
             &network,
-            &store,
+            &mut store,
             &source,
             &network.pins,
             &network.bundle,
@@ -1602,7 +1666,7 @@ mod tests {
         };
         let prepared = prepare_execution_registration(
             &network,
-            &store,
+            &mut store,
             &source,
             &network.pins,
             &network.bundle,
@@ -1700,7 +1764,7 @@ mod tests {
         };
         let prepared = prepare_execution_registration(
             &network,
-            &store,
+            &mut store,
             &source,
             &network.pins,
             &network.bundle,
@@ -1821,6 +1885,7 @@ mod tests {
             service: ServiceId::from_key(&remote_key),
             device: DeviceId::from_key(&remote_key),
         };
+        grant.actions = vec![Action::ResourceManage];
         grant.issued_under = team_head.clone();
         grant.nonce = Nonce::random()?;
         let grant = Signed::sign(grant, &team_root)?;
@@ -1837,7 +1902,6 @@ mod tests {
         team.governance_grant = None;
         team.devices.push(certificate.hash()?);
         team.devices.sort();
-        team.grants.retain(|hash| hash != &team_bundle.grant_leaf);
         team.grants.push(grant.hash()?);
         team.grants.sort();
         local.install_policy_journal(
@@ -1859,7 +1923,7 @@ mod tests {
         drop(statement);
         let bundle = ClientAuthorizationBundle {
             journal,
-            grant_leaf: grant.hash()?,
+            grant_leaf: team_bundle.grant_leaf.clone(),
         };
         let remote_journal: Vec<_> = bundle
             .journal
@@ -1907,8 +1971,9 @@ mod tests {
         tx.commit()?;
         remote.policy = state;
         assert!(remote.policy.verified().space(&network.space).is_none());
+        let local_pins = local.policy.pins().to_vec();
         let prepared =
-            prepare_execution_registration(&network, &local, &source, local.policy.pins(), &bundle)
+            prepare_execution_registration(&network, &mut local, &source, &local_pins, &bundle)
                 .context("prepare remote Team source registration")?;
         eprintln!(
             "execution registration source=remote_team phase=prepare usage={}",
@@ -2017,24 +2082,33 @@ mod tests {
         };
         assert_eq!(source_root(&local.connection, &execution)?, network.project);
         assert!(remote.policy.verified().space(&network.space).is_none());
+        let finished_authorization = verified.authorization();
+        let finished_pins: Vec<PolicyPin> =
+            serde_json::from_str(&verified.pins_json().map_err(anyhow::Error::msg)?)?;
+        let selection_authorization = bounded_execution_authorization(
+            &network,
+            &mut local,
+            &execution,
+            finished_authorization.grant_leaf(),
+            &finished_pins,
+            now(),
+        )?;
         let before_select = row_counts(&local)?;
         let selection = local.execution_service_select(
             &network.node,
             &network.client.public_key_hex(),
             &json!({"account_id":network.account,"device_public_key":network.client.public_key_hex(),
                 "source_project":source,"target_node_public_key":network.node.public_key_hex()?,
-                "execution_resource":execution}),
+                "execution_resource":execution,"source_grant":grant.hash()?}),
             now(),
         )?;
         let selection: execution_service::ExecutionServiceSelection =
             serde_json::from_value(selection["selections"][0].clone())?;
         execution_service::verify_execution_service_selection(
+            &selection_authorization,
             &serde_json::to_string(&selection)?,
-            &verified.pins_json().map_err(anyhow::Error::msg)?,
             &serde_json::to_string(&source)?,
             &serde_json::to_string(&execution)?,
-            network.account.as_str(),
-            &network.client.public_key_hex(),
             &network.node.public_key_hex()?,
             now() as f64,
         )
