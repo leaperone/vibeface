@@ -90,7 +90,6 @@ impl TaskBusinessChallenge {
                     challenge.issued_at_ms,
                     challenge.expires_at_ms,
                 )?;
-                value.proof_usage().enforce_limits()?;
                 usage.merge(value.proof_usage());
                 (
                     value.dependencies(),
@@ -116,7 +115,6 @@ impl TaskBusinessChallenge {
                     challenge.issued_at_ms,
                     challenge.expires_at_ms,
                 )?;
-                value.proof_usage().enforce_limits()?;
                 usage.merge(value.proof_usage());
                 (
                     value.heads(),
@@ -141,7 +139,6 @@ impl TaskBusinessChallenge {
                     challenge.issued_at_ms,
                     challenge.expires_at_ms,
                 )?;
-                value.proof_usage().enforce_limits()?;
                 usage.merge(value.proof_usage());
                 (
                     value.dependencies(),

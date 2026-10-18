@@ -168,7 +168,8 @@ impl Store {
             now,
         )?;
         let mut usage = ExecutionProofUsage::default();
-        usage.record_signed(&header)?;
+        // This accepted SourceBegin is provenance; its signature is still verified above.
+        usage.record_metadata(&header)?;
         let receipts = sign_current_receipts(
             &tx,
             &self.policy,
