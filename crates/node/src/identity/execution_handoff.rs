@@ -4741,15 +4741,38 @@ pub(crate) mod tests {
             let mut payload = proof.invocation.payload.clone();
             payload.body_hash = ObjectHash::body(&proof.source_body)?;
             payload.nonce = Nonce::random()?;
+            let destination = store.policy.verified().verify_execution_destination(
+                &facts.resource,
+                &facts.audience,
+                &execution_resource,
+                &handoff.target_public_key,
+                &leaf.hash()?,
+                &facts.context,
+                facts.action,
+                now(),
+            )?;
+            payload
+                .expected_policies
+                .extend_from_slice(destination.heads());
+            payload
+                .expected_policies
+                .sort_by(|left, right| left.domain.cmp(&right.domain));
+            payload
+                .expected_policies
+                .dedup_by(|left, right| left.domain == right.domain);
             proof.invocation = Signed::sign(payload, &project.client)?;
             let mut final_facts = facts.clone();
             final_facts.body_hash = ObjectHash::body(&proof.source_body)?;
-            let final_auth = store.policy.verified().verify_invocation(
-                &proof.invocation,
-                &final_facts,
-                &source_transport,
-                now(),
-            )?;
+            let final_auth = store
+                .policy
+                .verified()
+                .verify_invocation_with_execution_destination(
+                    &proof.invocation,
+                    &final_facts,
+                    &source_transport,
+                    &destination,
+                    now(),
+                )?;
             proof.challenge = FreshnessChallenge::new(
                 &final_auth,
                 CheckStage::Admit,
@@ -4774,12 +4797,10 @@ pub(crate) mod tests {
                     .policy
                     .verified()
                     .admit_operation(&final_auth, &final_fresh, now())?;
-            let original_auth = store.policy.verified().verify_operation_authorization(
-                &final_admitted,
-                &final_facts,
-                &source_transport,
-                now(),
-            )?;
+            let original_auth = store
+                .policy
+                .verified()
+                .verify_admitted_operation_authorization(&final_admitted, &final_facts, now())?;
             event.cause = EventCause::Invocation { admission: proof };
             handoff.project_dispatch = project.node.sign_event(event)?;
             handoff.attest_source(&project_signer)?;
