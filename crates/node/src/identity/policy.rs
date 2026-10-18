@@ -632,6 +632,19 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_capability: String = tx.query_row(
+            "SELECT value FROM identity_meta WHERE key='bootstrap_capability_hash'",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_policy: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM policy_pins)", [], |row| {
+                row.get(0)
+            })?;
+        ensure!(
+            current_capability == crate::crypto::digest(capability.as_bytes()) && !has_policy,
+            "Node claim initialization changed before its transaction"
+        );
         let previous: Option<String> = tx
             .query_row(
                 "SELECT value FROM identity_meta WHERE key='node_claim'",
