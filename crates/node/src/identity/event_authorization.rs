@@ -1088,7 +1088,18 @@ pub(crate) fn persisted_admission_facts(
                 .any(|(body, blobs)| body == &stored.event.body && blobs == &stored.event.blobs),
             "accepted event business content differs from signed request"
         );
-        let state = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+        let current = policy.verified();
+        let retained = if proof
+            .challenge
+            .policies
+            .iter()
+            .all(|head| current.head(&head.domain) == Some(head))
+        {
+            None
+        } else {
+            Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
+        };
+        let state = retained.as_ref().unwrap_or(current);
         let ancestors = dependency_closure(&stored.event, &events)?
             .context("accepted event causal history is missing")?;
         let current = historical_facts(&state, &stored.event, &events, &ancestors)?

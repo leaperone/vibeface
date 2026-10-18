@@ -235,7 +235,11 @@ pub(crate) fn reconstruct_admission(
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
-    validate_admission_evidence(proof, transport)?;
+    if let Some(admitted) =
+        reconstruct_admission_at_current_heads(policy.verified(), proof, facts, transport)?
+    {
+        return Ok(admitted);
+    }
     let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
     reconstruct_admission_in_state(&historical, proof, facts, transport)
 }
@@ -472,7 +476,18 @@ fn persisted_admission_facts(
     let space = SpaceId::parse(manager_field(body, "space_id")?)?;
     let resource = ResourceId::parse(manager_field(body, "resource_id")?)?;
     let scope = manager_field(body, "conversation_id")?;
-    let state = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+    let current = policy.verified();
+    let retained = if proof
+        .challenge
+        .policies
+        .iter()
+        .all(|head| current.head(&head.domain) == Some(head))
+    {
+        None
+    } else {
+        Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
+    };
+    let state = retained.as_ref().unwrap_or(current);
     let record = state
         .resource(&space, &resource)
         .context("historical resource is missing")?;
@@ -1054,7 +1069,19 @@ fn verify_lease_record(
     stored: &StoredAdmission,
     lease: &LeaseRecord,
 ) -> Result<u64> {
-    let historical = policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?;
+    let current = policy.verified();
+    let retained = if lease
+        .proof
+        .challenge
+        .policies
+        .iter()
+        .all(|head| current.head(&head.domain) == Some(head))
+    {
+        None
+    } else {
+        Some(policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?)
+    };
+    let historical = retained.as_ref().unwrap_or(current);
     let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
     let auth = if lease.proof.challenge.stage == CheckStage::Admit {
         ensure!(

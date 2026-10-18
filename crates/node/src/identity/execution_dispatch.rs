@@ -1389,7 +1389,7 @@ pub(crate) mod tests {
             Self::from_networks(TestNetwork::new()?, TestNetwork::new()?, foreign)
         }
 
-        fn from_networks(project: TestNetwork, executor: TestNetwork, foreign: bool) -> Result<Self> {
+        pub(crate) fn from_networks(project: TestNetwork, executor: TestNetwork, foreign: bool) -> Result<Self> {
             let mut store = project.at(&project.directory.join("project.sqlite3"))?;
             if project.account == executor.account {
                 store.install_policy_journal(&executor.bundle.journal, now())?;
