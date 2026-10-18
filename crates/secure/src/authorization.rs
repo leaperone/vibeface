@@ -2397,9 +2397,8 @@ impl VerifiedPolicySet {
         require(
             matches!(signed.payload.actor, Actor::Account(_))
                 && signed.payload.action == Action::OperationResolve
-                && signed.payload.presenter == signed.payload.device
                 && signed.payload.context.sdk_session.is_none(),
-            "portable intent requires a self-presenting Account signer",
+            "portable intent requires an Account resolver signer",
         )?;
         self.verify_authorized_invocation_body(
             signed,
@@ -2531,6 +2530,13 @@ impl VerifiedPolicySet {
                     "agent session mismatch",
                 )?,
             }
+        } else if i.presenter != i.device {
+            self.validate_presenter(
+                &i.presenter,
+                now_ms,
+                &mut budget,
+                &mut dependencies,
+            )?;
         }
         transport_dependencies.extend(budget.dependencies.clone());
         budget.dependencies = prior_budget_dependencies;

@@ -132,7 +132,7 @@ impl ExecutionObservationTarget {
         })
     }
 
-    fn context(&self, workspace: &ResourceId) -> InvocationContext {
+    pub(super) fn context(&self, workspace: &ResourceId) -> InvocationContext {
         InvocationContext {
             conversation: Some(self.conversation_id.clone()),
             task: Some(self.source.task.clone()),
@@ -365,6 +365,58 @@ impl VerifiedExecutionObservationRead {
 }
 
 impl VerifiedPolicySet {
+    pub fn build_forwarded_execution_observation_request(
+        &self,
+        original: &SignedExecutionHandoff,
+        signer: &Identity,
+        account_grant: &ObjectHash,
+        execution_grant: &ObjectHash,
+        authorization_id: &str,
+        gateway: &PublicKey,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Signed<ExecutionObservationRequest>> {
+        require(
+            gateway != &PublicKey::of(signer),
+            "gateway cannot be the Account signer",
+        )?;
+        let direct = self.build_execution_observation_request(
+            original,
+            signer,
+            account_grant,
+            execution_grant,
+            authorization_id,
+            now_ms,
+            expires_at_ms,
+        )?;
+        let presenter = DeviceId::from_key(gateway);
+        if presenter == direct.payload.request.audience.device {
+            return Ok(direct);
+        }
+        let mut budget = Budget::default();
+        let mut dependencies = direct
+            .payload
+            .request
+            .expected_policies
+            .iter()
+            .map(|stamp| (stamp.domain.clone(), stamp.clone()))
+            .collect();
+        self.validate_presenter(&presenter, now_ms, &mut budget, &mut dependencies)?;
+        self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        require(
+            dependencies.len() <= MAX_POLICY_DOMAINS,
+            "observation has too many policy domains",
+        )?;
+        let mut payload = direct.payload;
+        payload.request.presenter = presenter;
+        payload.request.expected_policies = dependencies.into_values().collect();
+        payload.request.expires_at_ms = payload.request.expires_at_ms.min(budget.expires_at_ms);
+        validate_window(now_ms, payload.request.expires_at_ms, now_ms)?;
+        let signed = Signed::sign(payload, signer)?;
+        self.verify_execution_observation_request(&signed, original, now_ms)?;
+        Ok(signed)
+    }
+
     pub fn build_execution_observation_request(
         &self,
         original: &SignedExecutionHandoff,
@@ -891,107 +943,6 @@ impl VerifiedPolicySet {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signExecutionObservationRequest))]
-pub fn sign_execution_observation_request(
-    original_json: &str,
-    execution_grant: &str,
-    authorization_id: &str,
-    signer: &Identity,
-    project_pins_json: &str,
-    project_bundle_json: &str,
-    execution_pins_json: &str,
-    execution_bundle_json: &str,
-    now_ms: f64,
-) -> crate::Result<String> {
-    let build = || -> Result<Signed<ExecutionObservationRequest>> {
-        require(
-            original_json.len() <= MAX_EXECUTION_HANDOFF_BYTES
-                && project_pins_json.len() <= MAX_PROOF_BYTES
-                && project_bundle_json.len() <= 1_048_576
-                && execution_pins_json.len() <= MAX_PROOF_BYTES
-                && execution_bundle_json.len() <= 1_048_576,
-            "observation input is too large",
-        )?;
-        let original: SignedExecutionHandoff =
-            serde_json::from_str(original_json).map_err(shape_error)?;
-        let pins: Vec<PolicyPin> = serde_json::from_str(project_pins_json).map_err(shape_error)?;
-        let bundle: ClientAuthorizationBundle =
-            serde_json::from_str(project_bundle_json).map_err(shape_error)?;
-        require(
-            pins.len() <= MAX_POLICY_DOMAINS
-                && pins.windows(2).all(|pair| pair[0].domain < pair[1].domain)
-                && bundle.journal.len() <= 128,
-            "invalid observation policy bounds",
-        )?;
-        let project_state = replay_policies(&pins, &bundle.journal)?;
-        let target = ExecutionObservationTarget::from_original(&original)?;
-        let signer_key = PublicKey::of(signer);
-        let certificate = project_state.find_device(&DeviceId::from_key(&signer_key))?;
-        let Actor::Account(account) = &certificate.payload.subject else {
-            return Err(AuthorizationError::InvalidProof(
-                "observation signer is not an Account device",
-            ));
-        };
-        let auth = verify_client_authorization(
-            project_bundle_json,
-            project_pins_json,
-            account.as_str(),
-            target.source.project.space.as_str(),
-            signer_key.as_str(),
-            now_ms,
-        )
-        .map_err(|_| {
-            AuthorizationError::InvalidProof("invalid independent Project resolver proof")
-        })?;
-        let selection = serde_json::to_string(&serde_json::json!({
-            "execution_resource": target.execution_resource,
-            "target_public_key": target.target_public_key,
-            "execution_grant": ObjectHash::parse(execution_grant)?,
-        }))
-        .map_err(shape_error)?;
-        let context = serde_json::to_string(&prepare::PrepareContext {
-            context: target.context(&target.source.project.resource),
-            binding_generation: Some(target.source.binding_generation),
-            canonical_cwd: None,
-            execution_target_public_key: Some(target.target_public_key.clone()),
-        })
-        .map_err(shape_error)?;
-        let remote = prepare::verify_remote_execution(
-            &auth,
-            project_bundle_json,
-            project_pins_json,
-            execution_bundle_json,
-            execution_pins_json,
-            &selection,
-            &context,
-            "operation_resolve",
-            now_ms,
-        )
-        .map_err(|_| {
-            AuthorizationError::InvalidProof(
-                "independent executor proof is missing, stale, or conflicts with Project proof",
-            )
-        })?;
-        let now = bootstrap::timestamp(now_ms)?;
-        let expires =
-            now.checked_add(INVOCATION_MAX_AGE_MS)
-                .ok_or(AuthorizationError::InvalidProof(
-                    "observation expiry overflow",
-                ))?;
-        remote.policy_state().build_execution_observation_request(
-            &original,
-            signer,
-            &bundle.grant_leaf,
-            &ObjectHash::parse(execution_grant)?,
-            authorization_id,
-            now,
-            expires,
-        )
-    };
-    let signed = build().map_err(|error| error.to_string())?;
-    serde_json::to_string(&signed).map_err(|_| "observation request encoding failed".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,8 +951,115 @@ mod tests {
 
     const NOW: u64 = 10_000;
 
+    fn produce_observation_request(
+        original_json: &str,
+        execution_grant: &str,
+        authorization_id: &str,
+        signer: &Identity,
+        project_pins_json: &str,
+        project_bundle_json: &str,
+        execution_pins_json: &str,
+        execution_bundle_json: &str,
+        expected_gateway_public_key: &str,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        let original: SignedExecutionHandoff = serde_json::from_str(original_json).unwrap();
+        let target = ExecutionObservationTarget::from_original(&original).unwrap();
+        let bundle: ClientAuthorizationBundle = serde_json::from_str(project_bundle_json).unwrap();
+        let account = bundle
+            .journal
+            .iter()
+            .find_map(|entry| match entry {
+                JournalEntry::Device(certificate)
+                    if certificate.payload.public_key == PublicKey::of(signer) =>
+                {
+                    if let Actor::Account(account) = &certificate.payload.subject {
+                        Some(account.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .unwrap();
+        let source_meter = crate::signature_verification::SignatureVerification::new();
+        let source = source_meter.run(|| {
+            verify_client_authorization(
+                project_bundle_json,
+                project_pins_json,
+                account.as_str(),
+                target.source.project.space.as_str(),
+                &signer.public_key_hex(),
+                now_ms,
+            )
+        })?;
+        let selection = serde_json::to_string(&serde_json::json!({
+            "execution_resource":target.execution_resource,"target_public_key":target.target_public_key,
+            "execution_grant":execution_grant,
+        })).unwrap();
+        let context = serde_json::to_string(&prepare::PrepareContext {
+            context: target.context(&target.source.project.resource),
+            binding_generation: Some(target.source.binding_generation),
+            canonical_cwd: None,
+            execution_target_public_key: Some(target.target_public_key.clone()),
+        })
+        .unwrap();
+        let import_meter = crate::signature_verification::SignatureVerification::new();
+        let handle = import_meter.run(|| {
+            prepare::verify_remote_execution(
+                &source,
+                project_bundle_json,
+                project_pins_json,
+                execution_bundle_json,
+                execution_pins_json,
+                &selection,
+                &context,
+                "operation_resolve",
+                now_ms,
+            )
+        })?;
+        let sign_meter = crate::signature_verification::SignatureVerification::new();
+        let result = sign_meter.run(|| {
+            handle.sign_observation_request(
+                original_json,
+                authorization_id,
+                expected_gateway_public_key,
+                signer,
+                now_ms,
+            )
+        })?;
+        for meter in [&source_meter, &import_meter, &sign_meter] {
+            assert!(meter.counts().actual_verifications > 0);
+            assert!(meter.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        }
+        println!("observation_api_meters={}", serde_json::to_string(&json!({
+            "source":source_meter.counts(),"import":import_meter.counts(),"sign":sign_meter.counts(),
+        })).unwrap());
+        Ok(result)
+    }
+
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
+    }
+
+    fn write_test_vector(path: &str, vector: &Value) {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        file.write_all(serde_json::to_string(vector).unwrap().as_bytes())
+            .unwrap();
     }
 
     struct Network {
@@ -1090,6 +1148,7 @@ mod tests {
         resolver_grant: ObjectHash,
         execution_grant: ObjectHash,
         old_execution_grant: ObjectHash,
+        original_usage: ExecutionProofUsage,
     }
 
     fn receipts(
@@ -1267,6 +1326,10 @@ mod tests {
         }
 
         fn with_task_title(task_title: &str) -> Self {
+            Self::with_authorization_resources(task_title, &[])
+        }
+
+        fn with_authorization_resources(task_title: &str, resources: &[String]) -> Self {
             let mut project = Network::new(0);
             let mut executor = Network::new(20);
             let mut state = project.state.clone();
@@ -1399,7 +1462,7 @@ mod tests {
                     .unwrap(),
                 binding,
             };
-            let request = json!({"space_id":project.project.space,"conversation_id":"chat","operation_id":"original-open","task_id":"task","target_node":executor.node.node_id(),"session_id":"execution-session","binding":binding,"action":{"type":"open"}});
+            let request = json!({"space_id":project.project.space,"conversation_id":"chat","operation_id":"original-open","task_id":"task","target_node":executor.node.node_id(),"session_id":"execution-session","binding":binding,"action":{"type":"open"},"resources":resources});
             let body = json!({"method":"operate","space_id":project.project.space,"resource_id":project.project.resource,"authorization_id":"original-open","request":request,"execution_resource":execution_resource,"target_public_key":PublicKey::of(&executor.node),"execution_grant":old_execution_grant});
             let mut context = execution_context;
             context.workspace_resource = Some(project.project.resource.clone());
@@ -1471,7 +1534,7 @@ mod tests {
                 handoff,
                 invocation,
             };
-            state
+            let original_usage = state
                 .verify_execution_handoff(
                     &original,
                     &auth,
@@ -1481,7 +1544,9 @@ mod tests {
                     None,
                     NOW,
                 )
-                .unwrap();
+                .unwrap()
+                .proof_usage()
+                .clone();
             let mut resolver = state
                 .grant(&project.bundle.grant_leaf)
                 .unwrap()
@@ -1509,6 +1574,95 @@ mod tests {
                 resolver_grant,
                 execution_grant,
                 old_execution_grant,
+                original_usage,
+            }
+        }
+
+        fn observe_current(&self, at: u64) -> SignedExecutionObservation {
+            let intent = ExecutionObservationIntent {
+                version: AUTH_VERSION,
+                purpose: ExecutionObservationPurpose::Observe,
+                target: ExecutionObservationTarget::from_original(&self.original).unwrap(),
+                execution_grant: self.execution_grant.clone(),
+                authorization_id: "observe-current".into(),
+            };
+            let facts = self
+                .state
+                .observation_account_facts(&intent, &self.project.audience())
+                .unwrap();
+            let device = DeviceId::from_key(&PublicKey::of(&self.project.client));
+            let mut payload = ExecutionObservationRequest {
+                request: Invocation {
+                    version: AUTH_VERSION,
+                    actor: Actor::Account(self.project.account.clone()),
+                    device: device.clone(),
+                    initiator: Actor::Account(self.project.account.clone()),
+                    initiating_grant: None,
+                    resource: facts.resource,
+                    action: facts.action,
+                    audience: facts.audience,
+                    presenter: device,
+                    operation_id: facts.operation_id,
+                    body_hash: facts.body_hash,
+                    grant_leaf: self.resolver_grant.clone(),
+                    expected_policies: vec![],
+                    context: facts.context,
+                    nonce: Nonce::random().unwrap(),
+                    not_before_ms: at,
+                    expires_at_ms: at + 1_000,
+                },
+                intent,
+            };
+            let probe = Signed::sign(payload.clone(), &self.project.client).unwrap();
+            let AuthorizationError::NeedPolicySync(heads) = self
+                .state
+                .verify_execution_observation_current_request(&probe, at)
+                .unwrap_err()
+            else {
+                panic!("current observation must discover its real policy closure");
+            };
+            payload.request.expected_policies = heads;
+            let request = Signed::sign(payload, &self.project.client).unwrap();
+            let current = self
+                .state
+                .verify_execution_observation_current_request(&request, at)
+                .unwrap();
+            let facts = current.submission_facts();
+            let delegated = self
+                .state
+                .verify_service_grant(
+                    &self.project.audience().service,
+                    &self.execution_grant,
+                    facts,
+                    at,
+                )
+                .unwrap();
+            let invocation = Signed::sign(
+                Invocation {
+                    version: AUTH_VERSION,
+                    actor: Actor::Service(self.project.audience().service),
+                    device: delegated.device().clone(),
+                    initiator: delegated.initiator().clone(),
+                    initiating_grant: delegated.initiating_grant().cloned(),
+                    resource: facts.resource.clone(),
+                    action: facts.action,
+                    audience: facts.audience.clone(),
+                    presenter: delegated.device().clone(),
+                    operation_id: facts.operation_id.clone(),
+                    body_hash: facts.body_hash.clone(),
+                    grant_leaf: delegated.grant_leaf().clone(),
+                    expected_policies: delegated.heads().to_vec(),
+                    context: facts.context.clone(),
+                    nonce: Nonce::random().unwrap(),
+                    not_before_ms: at,
+                    expires_at_ms: at + 1_000,
+                },
+                &self.project.node,
+            )
+            .unwrap();
+            SignedExecutionObservation {
+                request,
+                invocation,
             }
         }
 
@@ -1564,6 +1718,271 @@ mod tests {
                 receipts,
             }
         }
+    }
+
+    fn add_gateway(fixture: &mut Fixture) -> (Network, Identity) {
+        let mut gateway = Network::new(40);
+        let device = key(48);
+        let key = PublicKey::of(&device);
+        let domain = PolicyDomain::Account(gateway.account.clone());
+        let mut certificate = DeviceCertificate {
+            version: AUTH_VERSION,
+            owner: domain.clone(),
+            subject: Actor::Service(ServiceId::from_key(&key)),
+            device: DeviceId::from_key(&key),
+            public_key: key,
+            uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+            possession: None,
+            enrollment_grant: None,
+            issued_under: gateway.state.head(&domain).unwrap().clone(),
+            nonce: Nonce::random().unwrap(),
+            not_before_ms: NOW,
+            expires_at_ms: NOW + 1_000_000,
+        };
+        certificate.prove_possession(&device).unwrap();
+        let certificate = Signed::sign(certificate, &gateway.root).unwrap();
+        let mut document = gateway.state.account(&gateway.account).unwrap().clone();
+        document.previous = gateway.state.head(&domain).cloned();
+        document.sequence += 1;
+        document.devices.push(certificate.hash().unwrap());
+        document.devices.sort();
+        let document = Signed::sign(document, &gateway.root).unwrap();
+        gateway.state.install_account(document.clone()).unwrap();
+        gateway
+            .state
+            .install_device(certificate.clone(), NOW)
+            .unwrap();
+        gateway.bundle.journal.push(JournalEntry::Account(document));
+        gateway
+            .bundle
+            .journal
+            .push(JournalEntry::Device(certificate));
+        fixture
+            .state
+            .accounts
+            .extend(gateway.state.accounts.clone());
+        fixture.state.spaces.extend(gateway.state.spaces.clone());
+        fixture.state.devices.extend(gateway.state.devices.clone());
+        fixture
+            .state
+            .resources
+            .extend(gateway.state.resources.clone());
+        fixture.state.grants.extend(gateway.state.grants.clone());
+        fixture.state.roots.extend(gateway.state.roots.clone());
+        fixture
+            .project
+            .bundle
+            .journal
+            .extend(gateway.bundle.journal.clone());
+        fixture.project.pins.extend(gateway.pins.clone());
+        fixture
+            .project
+            .pins
+            .sort_by(|left, right| left.domain.cmp(&right.domain));
+        fixture.project.bundle.grant_leaf = fixture.resolver_grant.clone();
+        fixture.executor.bundle.grant_leaf = fixture.execution_grant.clone();
+        (gateway, device)
+    }
+
+    #[test]
+    fn forwarded_observation_signs_gateway_heads_and_requires_its_current_authority() {
+        let mut fixture = Fixture::new();
+        let (gateway, gateway_device) = add_gateway(&mut fixture);
+        let encoded = produce_observation_request(
+            &serde_json::to_string(&fixture.original).unwrap(),
+            fixture.execution_grant.as_str(),
+            "observe-via-gateway",
+            &fixture.project.client,
+            &serde_json::to_string(&fixture.project.pins).unwrap(),
+            &serde_json::to_string(&fixture.project.bundle).unwrap(),
+            &serde_json::to_string(&fixture.executor.pins).unwrap(),
+            &serde_json::to_string(&fixture.executor.bundle).unwrap(),
+            &gateway_device.public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        let request: Signed<ExecutionObservationRequest> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            request.payload.request.presenter,
+            DeviceId::from_key(&PublicKey::of(&gateway_device))
+        );
+        let gateway_domain = PolicyDomain::Account(gateway.account.clone());
+        assert!(
+            request
+                .payload
+                .request
+                .expected_policies
+                .iter()
+                .any(|head| head.domain == gateway_domain)
+        );
+        let wire = fixture
+            .state
+            .sign_execution_observation(
+                &request,
+                &fixture.original,
+                &fixture.project.node,
+                NOW,
+                NOW + 1_000,
+            )
+            .unwrap();
+        let current = fixture
+            .state
+            .verify_execution_observation_current(&wire, &fixture.transport(), NOW)
+            .unwrap();
+        assert!(
+            current
+                .heads()
+                .iter()
+                .any(|head| head.domain == gateway_domain)
+        );
+        let challenge = ExecutionObservationChallenge::new(
+            &current,
+            Nonce::random().unwrap(),
+            NOW,
+            NOW + 1_000,
+        )
+        .unwrap();
+        let all = receipts(
+            &fixture.state,
+            current.heads(),
+            &challenge.hash().unwrap(),
+            NOW,
+            &[&fixture.project.node, &fixture.executor.node, &gateway.node],
+        );
+        let proof = ExecutionObservationFreshness {
+            challenge,
+            receipts: all,
+        };
+        let verification = crate::signature_verification::SignatureVerification::new();
+        let read = verification.run(|| {
+            let full = fixture
+                .state
+                .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
+                .unwrap();
+            fixture
+                .state
+                .verify_execution_observation_freshness(&full, &proof, NOW)
+                .unwrap()
+        });
+        assert_eq!(read.target().source.operation_id, "original-open");
+        assert!(verification.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        let mut missing = proof.clone();
+        missing
+            .receipts
+            .retain(|receipt| receipt.payload.current.domain != gateway_domain);
+        let full = fixture
+            .state
+            .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
+            .unwrap();
+        assert!(
+            fixture
+                .state
+                .verify_execution_observation_freshness(&full, &missing, NOW)
+                .is_err()
+        );
+
+        let mut changed = request.payload.clone();
+        changed
+            .request
+            .expected_policies
+            .retain(|head| head.domain != gateway_domain);
+        let changed = Signed::sign(changed, &fixture.project.client).unwrap();
+        assert!(matches!(
+            fixture
+                .state
+                .verify_execution_observation_request(&changed, &fixture.original, NOW),
+            Err(AuthorizationError::NeedPolicySync(_))
+        ));
+        let mut forged = request.clone();
+        forged.payload.request.presenter = fixture.executor.audience().device;
+        assert!(
+            fixture
+                .state
+                .verify_execution_observation_request(&forged, &fixture.original, NOW)
+                .is_err()
+        );
+        println!(
+            "forwarded_observation_usage={}",
+            serde_json::to_string(&read.proof_usage().counts()).unwrap()
+        );
+        if let Ok(path) = std::env::var("VIBEFACE_EXECUTION_OBSERVATION_GATEWAY_VECTOR") {
+            write_test_vector(
+                &path,
+                &json!({
+                    "original_json": serde_json::to_string(&fixture.original).unwrap(),
+                    "execution_grant": fixture.execution_grant,
+                    "authorization_id": "observe-via-gateway", "signer_fixture_key_byte": 3,
+                    "account_id": fixture.project.account, "project_space_id": fixture.project.project.space,
+                    "project_pins_json": serde_json::to_string(&fixture.project.pins).unwrap(),
+                    "project_bundle_json": serde_json::to_string(&fixture.project.bundle).unwrap(),
+                    "execution_pins_json": serde_json::to_string(&fixture.executor.pins).unwrap(),
+                    "execution_bundle_json": serde_json::to_string(&fixture.executor.bundle).unwrap(),
+                    "expected_gateway_public_key": gateway_device.public_key_hex(), "now": NOW,
+                    "reference_request": request, "reference_wire": wire, "reference_freshness": proof,
+                    "expected_target": current.target(), "expected_heads": current.heads(),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_observation_rejects_non_service_and_revoked_gateway() {
+        let mut fixture = Fixture::new();
+        let (gateway, gateway_device) = add_gateway(&mut fixture);
+        assert!(
+            fixture
+                .state
+                .build_forwarded_execution_observation_request(
+                    &fixture.original,
+                    &fixture.project.client,
+                    &fixture.resolver_grant,
+                    &fixture.execution_grant,
+                    "observe-bad-gateway",
+                    &PublicKey::of(&gateway.client),
+                    NOW,
+                    NOW + 1_000,
+                )
+                .is_err()
+        );
+        let request = fixture
+            .state
+            .build_forwarded_execution_observation_request(
+                &fixture.original,
+                &fixture.project.client,
+                &fixture.resolver_grant,
+                &fixture.execution_grant,
+                "observe-revoked-gateway",
+                &PublicKey::of(&gateway_device),
+                NOW,
+                NOW + 1_000,
+            )
+            .unwrap();
+        let mut document = fixture.state.account(&gateway.account).unwrap().clone();
+        document.previous = fixture
+            .state
+            .head(&PolicyDomain::Account(gateway.account.clone()))
+            .cloned();
+        document.sequence += 1;
+        let revoked = DeviceId::from_key(&PublicKey::of(&gateway_device));
+        document.revoked_devices.push(revoked.clone());
+        document.devices.retain(|hash| {
+            fixture
+                .state
+                .devices
+                .get(hash)
+                .is_none_or(|certificate| certificate.payload.device != revoked)
+        });
+        document.revoked_devices.sort();
+        fixture
+            .state
+            .install_account(Signed::sign(document, &gateway.root).unwrap())
+            .unwrap();
+        assert!(
+            fixture
+                .state
+                .verify_execution_observation_request(&request, &fixture.original, NOW)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1688,15 +2107,100 @@ mod tests {
     }
 
     #[test]
+    fn observation_keeps_large_task_payload_separate_from_authorization_metadata() {
+        let ordinary = Fixture::new();
+        let ordinary_wire = ordinary.observe(NOW);
+        let ordinary_read = ordinary
+            .state
+            .verify_execution_observation(
+                &ordinary_wire,
+                &ordinary.original,
+                &ordinary.transport(),
+                NOW,
+            )
+            .unwrap();
+        let title = "t".repeat(12_000);
+        let fixture = Fixture::with_task_title(&title);
+        let wire = fixture.observe(NOW);
+        let read = fixture
+            .state
+            .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
+            .unwrap();
+        let task: Event =
+            serde_json::from_str(&fixture.original.handoff.task_creation.canonical_body).unwrap();
+        assert!(
+            matches!(task.body, EventBody::TaskCreated { title: actual, .. } if actual == title)
+        );
+        let counts = read.proof_usage().counts();
+        assert_eq!(
+            counts.task_payload_bytes,
+            title.len() + "goal".len() + "acceptance".len()
+        );
+        assert!(counts.authorization_bytes < MAX_PROOF_BYTES);
+        assert!(
+            counts.authorization_bytes
+                < ordinary_read.proof_usage().counts().authorization_bytes + 64
+        );
+        println!(
+            "large_task_payload_observation_usage={}",
+            serde_json::to_string(&counts).unwrap()
+        );
+    }
+
+    #[test]
     fn observation_rejects_the_union_of_bounded_current_and_historical_proofs_over_64kib() {
-        let fixture = Fixture::with_task_title(&"t".repeat(12_000));
+        let ordinary = Fixture::new();
+        let mut remaining =
+            MAX_PROOF_BYTES - ordinary.original_usage.counts().authorization_bytes - 1_024;
+        assert!(remaining > 4_000);
+        let mut resources = Vec::new();
+        while remaining >= 32 {
+            let length = remaining.min(4_000);
+            let mut path = format!("/tmp/resource-{:03}/", resources.len());
+            let mut suffix = length - path.len();
+            while suffix > 200 {
+                path.push_str(&"p".repeat(199));
+                path.push('/');
+                suffix -= 200;
+            }
+            path.push_str(&"p".repeat(suffix));
+            assert_eq!(path.len(), length);
+            assert!(path.len() <= 4_096);
+            resources.push(path);
+            remaining -= length;
+        }
+        assert!(resources.len() <= 128);
+        let fixture = Fixture::with_authorization_resources("task", &resources);
+        assert!(fixture.original_usage.counts().authorization_bytes < MAX_PROOF_BYTES);
         let target = ExecutionObservationTarget::from_original(&fixture.original).unwrap();
         let history = fixture
             .state
             .observation_source_usage(&target, &fixture.original, NOW)
             .unwrap();
         assert!(history.counts().authorization_bytes < MAX_PROOF_BYTES);
-        assert!(canonical(&fixture.original).unwrap().len() < MAX_PROOF_BYTES);
+        let wire = fixture.observe_current(NOW);
+        let current = fixture
+            .state
+            .verify_execution_observation_current(&wire, &fixture.transport(), NOW)
+            .unwrap();
+        assert!(current.proof_usage().counts().authorization_bytes < MAX_PROOF_BYTES);
+        let mut union = current.proof_usage().clone();
+        union.merge(&history);
+        println!(
+            "observation_metadata_union_usage={}",
+            json!({"historical":history.counts(),"current":current.proof_usage().counts(),"union":union.counts()})
+        );
+        assert!(union.counts().authorization_bytes > MAX_PROOF_BYTES);
+        assert!(union.counts().unique_signed_objects <= MAX_PROOF_OBJECTS);
+        assert!(union.counts().unique_signatures <= MAX_PROOF_SIGNATURES);
+        assert!(union.counts().max_chain_depth <= MAX_DELEGATION_DEPTH);
+        assert_eq!(
+            fixture
+                .state
+                .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
+                .unwrap_err(),
+            AuthorizationError::BudgetExceeded
+        );
         let attempt = fixture.state.build_execution_observation_request(
             &fixture.original,
             &fixture.project.client,
@@ -1897,7 +2401,7 @@ mod tests {
         let project_bundle = serde_json::to_string(&fixture.project.bundle).unwrap();
         let execution_pins = serde_json::to_string(&fixture.executor.pins).unwrap();
         let execution_bundle = serde_json::to_string(&fixture.executor.bundle).unwrap();
-        let signed = sign_execution_observation_request(
+        let signed = produce_observation_request(
             &original,
             fixture.execution_grant.as_str(),
             "observe-wasm",
@@ -1906,6 +2410,7 @@ mod tests {
             &project_bundle,
             &execution_pins,
             &execution_bundle,
+            &fixture.project.node.public_key_hex(),
             NOW as f64,
         )
         .unwrap();
@@ -1915,7 +2420,6 @@ mod tests {
             .verify_execution_observation_request(&request, &fixture.original, NOW)
             .unwrap();
         if let Ok(path) = std::env::var("VIBEFACE_EXECUTION_OBSERVATION_VECTOR") {
-            use std::io::Write;
             let wire = fixture
                 .state
                 .sign_execution_observation(
@@ -1936,6 +2440,9 @@ mod tests {
                 "execution_grant": fixture.execution_grant,
                 "authorization_id": "observe-wasm",
                 "signer_fixture_key_byte": 3,
+                "account_id": fixture.project.account,
+                "project_space_id": fixture.project.project.space,
+                "expected_gateway_public_key": fixture.project.node.public_key_hex(),
                 "project_pins_json": project_pins,
                 "project_bundle_json": project_bundle,
                 "execution_pins_json": execution_pins,
@@ -1947,25 +2454,10 @@ mod tests {
                 "expected_target": verified.target(),
                 "expected_heads": verified.heads(),
             });
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(path).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
-            }
-            file.write_all(serde_json::to_string(&vector).unwrap().as_bytes())
-                .unwrap();
+            write_test_vector(&path, &vector);
         }
         assert!(
-            sign_execution_observation_request(
+            produce_observation_request(
                 &original,
                 fixture.execution_grant.as_str(),
                 "observe-no-trust",
@@ -1974,6 +2466,7 @@ mod tests {
                 &project_bundle,
                 "[]",
                 &execution_bundle,
+                &fixture.project.node.public_key_hex(),
                 NOW as f64
             )
             .is_err()

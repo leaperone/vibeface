@@ -400,7 +400,8 @@ pub fn verify_remote_execution(
             .map_err(|_| AuthorizationError::InvalidProof("invalid Project pins"))?;
         let execution_pins: Vec<PolicyPin> = serde_json::from_str(execution_pins_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid independent execution pins"))?;
-        let (pins, tail) = client_policy_tail(auth, &project, &project_pins, &execution, &execution_pins)?;
+        let (pins, tail) =
+            client_policy_tail(auth, &project, &project_pins, &execution, &execution_pins)?;
         let state = replay_policy_tail(auth.policy_snapshot.clone(), &pins, &tail)?;
         let baseline = revalidate_client_policy(auth, state.clone(), &project, &pins, now)?;
         let selection: RemoteExecutionSelection = serde_json::from_str(selection_json)
@@ -490,10 +491,6 @@ pub fn verify_remote_execution(
 }
 
 impl VerifiedRemoteExecution {
-    pub(super) fn policy_state(&self) -> &VerifiedPolicySet {
-        &self.state
-    }
-
     fn checked_observation(
         &self,
         actual_json: &str,
@@ -652,6 +649,80 @@ impl VerifiedRemoteExecution {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedRemoteExecution {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signObservationRequest))]
+    pub fn sign_observation_request(
+        &self,
+        original_json: &str,
+        authorization_id: &str,
+        expected_gateway_public_key: &str,
+        signer: &Identity,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
+        (|| -> Result<String> {
+            let now = client_time(now_ms)?;
+            require(
+                original_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
+                "observation handoff is too large",
+            )?;
+            let original: execution_handoff::SignedExecutionHandoff =
+                serde_json::from_str(original_json)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid original handoff"))?;
+            let target =
+                execution_observation::ExecutionObservationTarget::from_original(&original)?;
+            require(
+                self.action == Action::OperationResolve
+                    && now >= self.verified_at_ms
+                    && DeviceId::from_key(&PublicKey::of(signer)) == self.source.scope.device_id
+                    && target.source.project.space == self.source.scope.space_id
+                    && self.source.resources.iter().any(|record| {
+                        record.payload.space == target.source.project.space
+                            && record.payload.resource == target.source.project.resource
+                    })
+                    && target.execution_resource == self.selection.execution_resource
+                    && target.target_public_key == self.selection.target_public_key
+                    && self.context.context == target.context(&target.source.project.resource)
+                    && self.context.binding_generation == Some(target.source.binding_generation)
+                    && self.context.execution_target_public_key.as_ref()
+                        == Some(&target.target_public_key)
+                    && original
+                        .handoff
+                        .source_attestation
+                        .as_ref()
+                        .is_some_and(|source| source.issuer == self.source.audience_public_key),
+                "observation handle differs from its original operation or current signer",
+            )?;
+            let body = serde_json::json!({
+                "method": "resolve_unknown",
+                "space_id": target.source.project.space,
+                "resource_id": target.source.project.resource,
+                "execution_resource": self.selection.execution_resource,
+                "target_public_key": self.selection.target_public_key,
+                "execution_grant": self.selection.execution_grant,
+            });
+            self.signing_authorization(&self.source, &body, now)?;
+            let expires =
+                now.checked_add(INVOCATION_MAX_AGE_MS)
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "observation expiry overflow",
+                    ))?;
+            let signed = self.state.build_forwarded_execution_observation_request(
+                &original,
+                signer,
+                &self.source.grant_leaf,
+                &self.selection.execution_grant,
+                authorization_id,
+                &PublicKey::parse(expected_gateway_public_key)?,
+                now,
+                expires,
+            )?;
+            serde_json::to_string(&signed).map_err(|_| {
+                AuthorizationError::InvalidProof("observation request encoding failed")
+            })
+        })()
+        .map_err(|error| error.to_string())
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = resolutionResultJson))]
     pub fn resolution_result_json(
         &self,
