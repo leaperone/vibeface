@@ -8,7 +8,7 @@ use vibeface_secure::{
         execution_handoff::ExecutionProofUsage,
         node_execution_policy::ActualPolicyNoisePeer,
         task_business_policy::{
-            TaskBusinessPolicyImport, begin_task_business_policy_import,
+            TaskBusinessPolicyImport, TaskBusinessScopedView, begin_task_business_policy_import,
             task_business_primary_heads,
         },
     },
@@ -87,6 +87,36 @@ fn check_current(
 }
 
 impl Store {
+    pub(crate) fn task_business_policy_view(
+        &self,
+        identity: &LocalIdentity,
+        session: &TaskBusinessPolicySession,
+        wire: &TaskBusinessWire,
+        now: u64,
+    ) -> Result<TaskBusinessScopedView> {
+        let _signatures = ScopedSignatureVerification::new();
+        let local_c = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let mut usage = check_current(&tx, &self.policy, session.source.header(), &local_c, now)?;
+        session
+            .source
+            .check_saved_floors(&floors(&tx, session.source.pins())?)?;
+        let view = session
+            .source
+            .scoped_view(self.policy.verified(), &local_c, wire, now)?;
+        usage.merge(session.source.proof_usage());
+        if let Some(counts) = SignatureVerification::current_counts() {
+            ensure!(
+                counts.actual_verifications <= 32,
+                "Task business source view exceeded its crypto budget"
+            );
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        tx.commit()?;
+        Ok(view)
+    }
+
     pub(crate) fn begin_task_business_import(
         &mut self,
         identity: &LocalIdentity,
