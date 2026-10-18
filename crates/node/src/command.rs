@@ -222,7 +222,7 @@ impl ProcessGroup {
             if unsafe { libc::kill(-(self.0 as i32), signal) } == 0 {
                 return Ok(());
             }
-            return Err(io::Error::last_os_error());
+            Err(io::Error::last_os_error())
         }
         #[cfg(not(unix))]
         Err(io::Error::new(
