@@ -552,20 +552,55 @@ impl Runtime {
             .first()
             .context("prepared call has no request")?
             .operation_id;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.timeout_secs.clamp(1, 20));
         let mut operations = Vec::new();
         let mut ready = true;
         for request in &prepared.requests {
-            let (original, mut record) = self.agent_receipt(access, request).await?;
+            let (original, mut record) = match tokio::time::timeout_at(
+                deadline,
+                self.agent_receipt(access, request),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
+                    break;
+                }
+            };
             if record.is_none() && original.is_none() && dispatch && ready {
-                self.dispatch(access.clone(), request.clone()).await?;
-                record = self.agent_receipt(access, request).await?.1;
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.dispatch(access.clone(), request.clone()),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result?;
+                    }
+                    Err(_) => {
+                        operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
+                        break;
+                    }
+                }
+                record = match tokio::time::timeout_at(
+                    deadline,
+                    self.agent_receipt(access, request),
+                )
+                .await
+                {
+                    Ok(result) => result?.1,
+                    Err(_) => {
+                        operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
+                        break;
+                    }
+                };
             }
             if dispatch
                 && ((prepared.name == "delegate" && request.action["type"] == "open")
                     || prepared.name == "command")
             {
-                let deadline = tokio::time::Instant::now()
-                    + Duration::from_secs(self.config.timeout_secs.min(20));
                 while record.as_ref().is_some_and(|record| {
                     matches!(
                         record.state,
@@ -573,8 +608,21 @@ impl Runtime {
                     )
                 }) && tokio::time::Instant::now() < deadline
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    record = self.agent_receipt(access, request).await?.1;
+                    if tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::sleep(Duration::from_millis(100)),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    match tokio::time::timeout_at(deadline, self.agent_receipt(access, request))
+                        .await
+                    {
+                        Ok(result) => record = result?.1,
+                        Err(_) => break,
+                    }
                 }
             }
             let state = record
@@ -598,7 +646,7 @@ impl Runtime {
             }
         }
         Ok(
-            json!({"call_ref":reference,"work_ref":work_ref,"tool":prepared.name,"operations":operations,"all_dispatched":operations.len()==prepared.requests.len() && operations.iter().all(|operation| operation["state"] != "prepared"),"retry":"Reuse this call_ref with identical arguments. If a dispatch is unknown, query call_lookup and reconcile; never allocate another call to resend it."}),
+            json!({"call_ref":reference,"work_ref":work_ref,"tool":prepared.name,"operations":operations,"all_dispatched":operations.len()==prepared.requests.len() && operations.iter().all(|operation| operation["receipt"].is_object()),"retry":"Reuse this call_ref with identical arguments. If a dispatch is unknown, query call_lookup and reconcile; never allocate another call to resend it."}),
         )
     }
 
