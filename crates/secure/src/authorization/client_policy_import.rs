@@ -238,9 +238,10 @@ fn check_saved_domains(
     heads: &[PolicyStamp],
 ) -> Result<()> {
     for head in heads {
-        let pin = pins.iter().find(|pin| pin.domain == head.domain).ok_or(
-            AuthorizationError::InvalidProof("client policy requires independently saved trust"),
-        )?;
+        let pin = pins
+            .iter()
+            .find(|pin| pin.domain == head.domain)
+            .ok_or_else(|| AuthorizationError::NeedPolicySync(vec![head.clone()]))?;
         require(
             pin.genesis_root == pin_genesis(state, &head.domain)?
                 && pin
@@ -250,6 +251,61 @@ fn check_saved_domains(
             "client policy changed independent roots or saved exact heads",
         )?;
     }
+    Ok(())
+}
+
+fn verify_client_policy_source_node(
+    state: &VerifiedPolicySet,
+    local_node: &PublicKey,
+    now: u64,
+    budget: &mut Budget,
+    dependencies: &mut BTreeMap<PolicyDomain, PolicyStamp>,
+) -> Result<()> {
+    let certificate = state.find_device(&DeviceId::from_key(local_node))?;
+    require(
+        certificate.payload.device == DeviceId::from_key(local_node)
+            && certificate.payload.public_key == *local_node
+            && certificate.payload.subject == Actor::Service(ServiceId::from_key(local_node))
+            && certificate.payload.uses.contains(&DeviceUse::Noise)
+            && certificate
+                .payload
+                .uses
+                .contains(&DeviceUse::ServiceInvocation),
+        "client policy source is not its current Noise service",
+    )?;
+    state.validate_certificate(certificate, now, budget, dependencies, &mut BTreeSet::new())
+}
+
+pub(crate) fn bind_client_policy_source_node(
+    authorization: &mut VerifiedClientAuthorization,
+    local_node: &PublicKey,
+    now: u64,
+) -> Result<()> {
+    let mut dependencies: BTreeMap<_, _> = authorization
+        .heads
+        .iter()
+        .cloned()
+        .map(|head| (head.domain.clone(), head))
+        .collect();
+    verify_client_policy_source_node(
+        &authorization.policy_snapshot,
+        local_node,
+        now,
+        &mut authorization.budget,
+        &mut dependencies,
+    )?;
+    authorization.policy_snapshot.expand_authorities(
+        now,
+        &mut authorization.budget,
+        &mut dependencies,
+    )?;
+    let heads: Vec<_> = dependencies.into_values().collect();
+    check_saved_domains(
+        &authorization.policy_snapshot,
+        &authorization.policy_pins,
+        &heads,
+    )?;
+    authorization.heads = heads;
     Ok(())
 }
 
@@ -347,6 +403,7 @@ fn verify_client_policy_read_inner(
                 == Actor::Account(request.account.clone()),
         "client policy read requires this account's current client",
     )?;
+    verify_client_policy_source_node(state, local_node, now, &mut budget, &mut dependencies)?;
     state.expand_authorities(now, &mut budget, &mut dependencies)?;
     let mut usage = ExecutionProofUsage::default();
     let heads: Vec<PolicyStamp> = if let Some(selection) = selection {
@@ -842,6 +899,7 @@ impl ClientPolicyImport {
                 Some(&selection.resource),
                 now,
             )?;
+            bind_client_policy_source_node(&mut auth, &self.snapshot.issuer, now)?;
             require(
                 auth.heads == self.snapshot.payload.target_heads
                     && auth.audience == selection.audience,
@@ -1131,6 +1189,7 @@ pub fn verify_client_policy_server_session(
         Some(&receipt.selection.resource),
         now,
     )?;
+    bind_client_policy_source_node(&mut auth, local_node, now)?;
     usage.record_budget(&auth.budget)?;
     finish_usage(&mut usage)?;
     auth.client_policy_usage = Some(usage);
