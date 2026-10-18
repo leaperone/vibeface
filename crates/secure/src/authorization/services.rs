@@ -756,6 +756,7 @@ mod tests {
             document.sequence += 1;
             change(&mut document);
             document.grants.sort();
+            document.resources.sort();
             self.state
                 .install_space(Signed::sign(document, &self.root).unwrap())
                 .unwrap();
