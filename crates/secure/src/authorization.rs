@@ -2650,7 +2650,7 @@ impl VerifiedPolicySet {
         phase: AuthorizationPhase,
     ) -> Result<VerifiedAuthorization> {
         // Destination proof dependencies remain freshness inputs after checking the source heads.
-        let mut transport_dependencies = std::mem::take(&mut budget.dependencies);
+        let destination_dependencies = std::mem::take(&mut budget.dependencies);
         let i = &signed.payload;
         require(
             i.version == AUTH_VERSION
@@ -2724,6 +2724,7 @@ impl VerifiedPolicySet {
             !i.action.requires_account() || matches!(i.actor, Actor::Account(_)),
             "action requires account actor",
         )?;
+        let mut transport_dependencies = BTreeMap::new();
         let prior_budget_dependencies = budget.dependencies.clone();
         match transport {
             InvocationTransport::Existing(transport) => match transport {
@@ -2825,6 +2826,7 @@ impl VerifiedPolicySet {
                 }
             }
         }
+        self.expand_authorities(now_ms, &mut budget, &mut transport_dependencies)?;
         transport_dependencies.extend(budget.dependencies.clone());
         budget.dependencies = prior_budget_dependencies;
         let resource = self
@@ -2908,10 +2910,16 @@ impl VerifiedPolicySet {
         };
         require(i.initiator == expected_initiator, "forged initiator")?;
         self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        for head in &i.expected_policies {
+            if transport_dependencies.get(&head.domain) == Some(head) {
+                dependencies.insert(head.domain.clone(), head.clone());
+            }
+        }
         let signed_dependencies: Vec<_> = dependencies.values().cloned().collect();
         if phase == AuthorizationPhase::Admission && i.expected_policies != signed_dependencies {
             return Err(AuthorizationError::NeedPolicySync(signed_dependencies));
         }
+        transport_dependencies.extend(destination_dependencies);
         if transport_dependencies
             .iter()
             .any(|(domain, stamp)| dependencies.get(domain) != Some(stamp))

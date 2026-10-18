@@ -1343,7 +1343,8 @@ mod tests {
     -> Result<()> {
         use crate::identity::test_support::TestNetwork;
         use vibeface_secure::authorization::{
-            Actor, AuthorizationError, Invocation, TransportEvidence,
+            Actor, AuthorizationError, CheckStage, FreshnessChallenge, Invocation,
+            TransportEvidence,
             prepare::{PrepareIntent, verify_remote_execution},
             remote_execution_policy::begin_remote_execution_policy_import,
         };
@@ -1617,10 +1618,6 @@ mod tests {
                 "executor_account",
                 PolicyDomain::Account(fixture.executor.account.clone()),
             ),
-            (
-                "executor_space",
-                PolicyDomain::Space(fixture.executor.space.clone()),
-            ),
         ] {
             assert!(
                 signed_prepare
@@ -1632,6 +1629,21 @@ mod tests {
                 "signed prepare dropped the {kind} head",
             );
         }
+        let executor_domain = PolicyDomain::Space(fixture.executor.space.clone());
+        let executor_head = fixture
+            .store
+            .policy
+            .verified()
+            .head(&executor_domain)
+            .context("executor current head is missing")?;
+        assert!(
+            !signed_prepare
+                .payload
+                .request
+                .expected_policies
+                .iter()
+                .any(|head| head.domain == executor_domain)
+        );
         assert_eq!(signed_prepare.payload.request.presenter, gateway_device);
         assert_eq!(signed_prepare.payload.request.audience, fixture.audience);
         let peer = TransportEvidence::VerifiedPeer {
@@ -1656,7 +1668,13 @@ mod tests {
                 )
                 .map_err(anyhow::Error::from)
         })?;
-        assert!(checked_prepare.execution_destination().is_some());
+        assert!(
+            checked_prepare
+                .execution_destination()
+                .context("three-account prepare destination is missing")?
+                .heads()
+                .contains(executor_head)
+        );
         checked("gateway_verify_prepare", || {
             fixture
                 .store
@@ -1704,6 +1722,13 @@ mod tests {
             )
         })?;
         assert_eq!(accepted.signed_invocation(), &invocation);
+        assert!(accepted.dependencies().contains(executor_head));
+        assert!(
+            accepted
+                .dependencies()
+                .iter()
+                .any(|head| head.domain == gateway_domain)
+        );
         checked("gateway_body_aware_intake", || {
             fixture.store.authorize_request_for_body(
                 &invocation,
@@ -1713,12 +1738,55 @@ mod tests {
                 now(),
             )
         })?;
-        assert!(
+        let source_only = checked("project_source_intake", || {
             fixture
                 .store
-                .authorize_request(&invocation, facts.facts(), &peer, now(),)
-                .is_err()
-        );
+                .authorize_request(&invocation, facts.facts(), &peer, now())
+        })?;
+        assert!(!source_only.dependencies().contains(executor_head));
+        let challenge = FreshnessChallenge::new(
+            &accepted,
+            CheckStage::Admit,
+            Nonce::random()?,
+            now(),
+            now() + 10_000,
+        )?;
+        assert!(challenge.policies.contains(executor_head));
+        let mut receipts = Vec::new();
+        for identity in [
+            &fixture.project.node,
+            &fixture.executor.node,
+            &gateway_network.node,
+        ] {
+            receipts.extend(
+                fixture
+                    .store
+                    .sign_current_receipts(&challenge, identity, now())?,
+            );
+        }
+        checked("three_account_current_freshness", || {
+            fixture
+                .store
+                .policy
+                .verified()
+                .verify_freshness(&accepted, &challenge, &receipts, now())
+                .map_err(anyhow::Error::from)
+        })?;
+        let mut missing_executor = challenge;
+        missing_executor
+            .policies
+            .retain(|head| head.domain != executor_domain);
+        assert!(matches!(
+            fixture.store.policy.verified().verify_freshness(
+                &accepted,
+                &missing_executor,
+                &receipts,
+                now(),
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "freshness challenge mismatch"
+            ))
+        ));
         for wrong_transport in [
             TransportEvidence::GatewayNoise {
                 device: DeviceId::from_key(&PublicKey::of(&fixture.executor.client)),
@@ -1751,18 +1819,29 @@ mod tests {
                 .authorize_request_for_body(&invocation, facts.facts(), &wrong_peer, &body, now(),)
                 .is_err()
         );
-        for missing_domain in [
+        for invalid_domain in [
             gateway_domain.clone(),
-            PolicyDomain::Space(fixture.executor.space.clone()),
+            PolicyDomain::Account(fixture.executor.account.clone()),
+            executor_domain.clone(),
         ] {
-            let mut missing = signed_prepare.payload.clone();
-            missing
-                .request
-                .expected_policies
-                .retain(|head| head.domain != missing_domain);
+            let mut invalid_heads = signed_prepare.payload.request.expected_policies.clone();
+            if invalid_domain == gateway_domain {
+                invalid_heads
+                    .iter_mut()
+                    .find(|head| head.domain == invalid_domain)
+                    .context("signed Gateway head is missing")?
+                    .sequence += 1;
+            } else if invalid_domain == executor_domain {
+                invalid_heads.push(executor_head.clone());
+                invalid_heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+            } else {
+                invalid_heads.retain(|head| head.domain != invalid_domain);
+            }
+            let mut invalid = signed_prepare.payload.clone();
+            invalid.request.expected_policies = invalid_heads.clone();
             assert!(matches!(
                 fixture.store.policy.verified().verify_prepare_intent(
-                    &Signed::sign(missing, &fixture.project.client)?,
+                    &Signed::sign(invalid, &fixture.project.client)?,
                     &body,
                     Action::ExecutionOpen,
                     &fixture.audience,
@@ -1771,16 +1850,14 @@ mod tests {
                 ),
                 Err(AuthorizationError::NeedPolicySync(_))
             ));
-            let mut missing = invocation.payload.clone();
-            missing
-                .expected_policies
-                .retain(|head| head.domain != missing_domain);
-            let missing = Signed::sign(missing, &fixture.project.client)?;
+            let mut invalid = invocation.payload.clone();
+            invalid.expected_policies = invalid_heads;
+            let invalid = Signed::sign(invalid, &fixture.project.client)?;
             let error = fixture
                 .store
-                .authorize_request_for_body(&missing, facts.facts(), &peer, &body, now())
+                .authorize_request_for_body(&invalid, facts.facts(), &peer, &body, now())
                 .err()
-                .context("missing signed invocation policy head was accepted")?;
+                .context("invalid signed invocation policy heads were accepted")?;
             assert!(matches!(
                 error.downcast_ref::<AuthorizationError>(),
                 Some(AuthorizationError::NeedPolicySync(_))
