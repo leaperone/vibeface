@@ -882,43 +882,27 @@ fn dispatch_authorization_from(
     operation: &str,
     now_ms: u64,
 ) -> Result<(crate::model::SignedEvent, VerifiedAuthorization)> {
-    let proof = super::admission::admission_for_operation_from(connection, space, operation)?;
-    super::admission::validate_persisted_admission(connection, &proof)?;
-    let encoded: String = connection.query_row(
-        "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
-        params![space, operation], |row| row.get(0),
-    )?;
-    let request: OperationRequest = serde_json::from_str(&encoded)?;
-    ensure!(request.network_id == space && request.operation_id == operation
-            && proof.source_body["method"] == "operate"
-            && serde_json::from_value::<OperationRequest>(proof.source_body["request"].clone())? == request,
-        "dispatch source differs from its durable admitted operation");
-    let resource = &proof.invocation.payload.resource;
-    ensure!(resource.space.as_str() == space, "dispatch source belongs to another space");
-    let rows = connection.prepare(
-        "SELECT envelope FROM events WHERE space_id=? AND resource_id=? AND scope_id=? ORDER BY hash",
-    )?.query_map(params![space, resource.resource.as_str(), request.conversation_id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut matching = Vec::new();
-    for encoded in rows {
-        let envelope: crate::model::SignedEvent = serde_json::from_str(&encoded)?;
-        let event: crate::model::Event = serde_json::from_str(&envelope.canonical_body)?;
-        if matches!(&event.body, crate::model::EventBody::DispatchRecorded { operation_id, .. } if operation_id == operation) {
-            ensure!(matches!(&event.cause, crate::model::EventCause::Invocation { admission } if admission == &proof),
-                "dispatch event differs from its original accepted admission");
-            matching.push(envelope);
-        }
-    }
-    ensure!(matching.len() == 1, "operation has missing or conflicting admitted dispatches");
-    let source = matching.remove(0);
+    let source = super::event_authorization::retained_operation_dispatch_in(
+        connection, policy, space, operation,
+    )?
+    .context("operation has no ready admitted dispatch")?;
+    let event: crate::model::Event = serde_json::from_str(&source.canonical_body)?;
     let events = super::event_authorization::retained_event_dependencies_in(
-        connection, space, &resource.resource, &request.conversation_id, std::slice::from_ref(&source.hash),
+        connection,
+        space,
+        &event.resource_id,
+        &event.scope_id,
+        std::slice::from_ref(&source.hash),
     )?;
-    let retained = events.get(&source.hash).context("operation has no ready admitted dispatch")?;
-    ensure!(super::event_authorization::verify_event_envelope(policy, space, &source)? == retained.event,
-        "dispatch signature differs from its admitted event");
+    let retained = events
+        .get(&source.hash)
+        .context("operation has no ready admitted dispatch")?;
     let auth = super::event_authorization::current_event_authorization(
-        policy, connection, &retained.event, &events, now_ms,
+        policy,
+        connection,
+        &retained.event,
+        &events,
+        now_ms,
     )?;
     Ok((source, auth))
 }

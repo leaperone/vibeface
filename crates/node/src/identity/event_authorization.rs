@@ -15,7 +15,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use vibeface_secure::authorization::{
@@ -119,8 +119,22 @@ pub(crate) fn verify_event_envelope(
     );
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     let proof = admission(&event);
-    let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
-    crypto::verify_signed_event(space, envelope, audience_key(&historical, proof)?.as_str())
+    let current = policy.verified();
+    let historical = if proof
+        .challenge
+        .policies
+        .iter()
+        .all(|head| current.head(&head.domain) == Some(head))
+    {
+        None
+    } else {
+        Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
+    };
+    crypto::verify_signed_event(
+        space,
+        envelope,
+        audience_key(historical.as_ref().unwrap_or(current), proof)?.as_str(),
+    )
 }
 
 fn source_scope(body: &Value) -> Result<&str> {
@@ -929,18 +943,101 @@ pub(crate) fn event_authorization_in_view(
     events: &BTreeMap<String, StoredEvent>,
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
+    let proof = admission(event);
+    let current = policy.verified();
+    let current_heads = proof
+        .challenge
+        .policies
+        .iter()
+        .all(|head| current.head(&head.domain) == Some(head));
+    let retained = if current_heads {
+        None
+    } else {
+        Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
+    };
+    let historical = retained.as_ref().unwrap_or(current);
     ensure!(
-        validate_event_evidence(policy, connection, event, events)? == EventEvidenceStatus::Valid,
+        validate_event_evidence_in_state(
+            policy,
+            connection,
+            historical,
+            event,
+            events,
+            current_heads,
+        )? == EventEvidenceStatus::Valid,
         "event has incomplete authorization evidence"
     );
-    let proof = admission(event);
-    let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
     let ancestors = dependency_closure(event, events)?.context("event history is incomplete")?;
-    let facts = historical_facts(&historical, event, events, &ancestors)?
+    let facts = historical_facts(historical, event, events, &ancestors)?
         .context("event resource history is incomplete")?;
     let transport = proof.transport.clone().into_evidence();
-    let admitted = reconstruct_admission(policy, proof, &facts, &transport)?;
+    let admitted = if current_heads {
+        reconstruct_admission_at_current_heads(current, proof, &facts, &transport)?
+            .context("retained event admission policy changed")?
+    } else {
+        reconstruct_admission(policy, proof, &facts, &transport)?
+    };
     Ok(state.verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
+}
+
+pub(super) fn retained_operation_dispatch_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    operation_id: &str,
+) -> Result<Option<SignedEvent>> {
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+            params![space, operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let request: OperationRequest = serde_json::from_str(&encoded)?;
+    let proof = super::admission::admission_for_operation_from(connection, space, operation_id)?;
+    super::admission::validate_persisted_admission(connection, &proof)?;
+    let resource = &proof.invocation.payload.resource;
+    ensure!(
+        request.network_id == space
+            && request.operation_id == operation_id
+            && resource.space.as_str() == space
+            && proof.source_body["method"] == "operate"
+            && serde_json::from_value::<OperationRequest>(proof.source_body["request"].clone())?
+                == request,
+        "dispatch source differs from its durable admitted operation"
+    );
+    check_retained_scope_resource_indexes_in(connection, space, &request.conversation_id)?;
+    let candidates = retained_scope_event_rows_in(
+        connection,
+        space,
+        &resource.resource,
+        &request.conversation_id,
+    )?;
+    let matching = candidates.values().filter(|stored| {
+        matches!(&stored.event.body, EventBody::DispatchRecorded { operation_id: id, .. } if id == operation_id)
+    }).collect::<Vec<_>>();
+    ensure!(
+        matching.len() <= 1,
+        "operation has conflicting admitted dispatches"
+    );
+    let Some(stored) = matching.first() else {
+        return Ok(None);
+    };
+    ensure!(
+        matches!(&stored.event.cause, EventCause::Invocation { admission } if admission == &proof)
+            && matches!(&stored.event.body, EventBody::DispatchRecorded { action, .. }
+                if *action == serde_json::to_value(&request)?),
+        "dispatch event differs from its original accepted admission"
+    );
+    validate_retained_event_dependencies_in(connection, &stored.envelope)?;
+    ensure!(
+        verify_event_envelope(policy, space, &stored.envelope)? == stored.event,
+        "dispatch signature differs from its admitted event"
+    );
+    Ok(Some(stored.envelope.clone()))
 }
 
 pub(crate) fn persisted_admission_facts(
@@ -1949,14 +2046,15 @@ impl Store {
         space: &str,
         operation_id: &str,
     ) -> Result<Option<SignedEvent>> {
-        let mut found = None;
-        for stored in load_events_from(&self.connection, space)?.values() {
-            if stored.status == "ready"
-                && matches!(&stored.event.body, EventBody::DispatchRecorded { operation_id: id, .. } if id == operation_id)
-            {
-                ensure!(found.is_none(), "operation has conflicting dispatches");
-                found = Some(stored.envelope.clone());
-            }
+        let snapshot = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let found =
+            retained_operation_dispatch_in(&self.connection, &self.policy, space, operation_id)?;
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
         }
         Ok(found)
     }
