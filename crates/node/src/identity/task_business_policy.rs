@@ -3,14 +3,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vibeface_secure::authorization::{
-    ObjectHash, Signed,
+    FreshnessReceipt, ObjectHash, Signed,
     task_business_policy::{
         TaskBusinessPolicyHeader, TaskBusinessPolicyPage, TaskBusinessPolicyWitness,
-        TaskBusinessWire, VerifiedTaskBusinessSource,
+        TaskBusinessWire, VerifiedTaskBusinessSource, receipt::TaskBusinessChallenge,
     },
 };
 
 mod ingress;
+mod receipt;
 mod source;
 mod storage;
 pub(crate) use ingress::{TaskBusinessPolicyImportContext, check_task_business_policy_view_in};
@@ -34,6 +35,15 @@ pub(crate) enum TaskBusinessRequest {
         witness: Signed<TaskBusinessPolicyWitness>,
     },
     Business(TaskBusinessWire),
+    Status {
+        wire: TaskBusinessWire,
+    },
+    Receipts {
+        source_context: ObjectHash,
+        business_wire_hash: ObjectHash,
+        challenge_hash: ObjectHash,
+        receipts: Vec<Signed<FreshnessReceipt>>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,7 +65,13 @@ pub(crate) enum TaskBusinessResponse {
     SourceFinished {
         context_hash: ObjectHash,
     },
+    Challenge {
+        source_context: ObjectHash,
+        business_wire_hash: ObjectHash,
+        challenge: TaskBusinessChallenge,
+    },
     Business(Value),
+    Status(Value),
 }
 
 pub(crate) struct TaskBusinessPolicySession {

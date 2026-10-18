@@ -213,7 +213,7 @@ pub(super) fn source_originals_in(
     Ok((header, wire))
 }
 
-fn current_task(
+pub(super) fn current_task(
     connection: &Connection,
     scope: &TaskBusinessScope,
     usage: &mut ExecutionProofUsage,
@@ -270,7 +270,9 @@ fn usage(mut usage: ExecutionProofUsage, request: &TaskBusinessRequest) -> Resul
         TaskBusinessRequest::SourceFinish { witness } => TaskBusinessResponse::SourceFinished {
             context_hash: witness.payload.header_hash.clone(),
         },
-        TaskBusinessRequest::Business(_) => {
+        TaskBusinessRequest::Business(_)
+        | TaskBusinessRequest::Status { .. }
+        | TaskBusinessRequest::Receipts { .. } => {
             anyhow::bail!("Task business source cannot export a business request")
         }
     };
