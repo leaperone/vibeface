@@ -154,6 +154,7 @@ fn authorization(
     node: &PublicKey,
     now: u64,
     budget: &mut Budget,
+    require_personal_owner: bool,
 ) -> Result<VerifiedExecutionServiceRegistrationRequest> {
     let personal = SpaceId::personal(account);
     let client = state.find_device(&DeviceId::from_key(signer))?;
@@ -180,7 +181,7 @@ fn authorization(
         budget,
     )?;
     let target = state.find_device(&DeviceId::from_key(node))?;
-    for space in [&personal, &source.space] {
+    for space in std::iter::once(&source.space).chain(require_personal_owner.then_some(&personal)) {
         state.ensure_personal_current(
             state
                 .space(space)
@@ -213,13 +214,17 @@ fn authorization(
         &PolicyDomain::Space(source.space.clone()),
         &mut dependencies,
     )?;
-    state.dependency(&PolicyDomain::Space(personal.clone()), &mut dependencies)?;
+    if require_personal_owner {
+        state.dependency(&PolicyDomain::Space(personal.clone()), &mut dependencies)?;
+    }
     state.expand_authorities(now, budget, &mut dependencies)?;
     let all_dependencies = budget.dependencies.clone();
     budget.dependencies.clear();
     let mut commit_heads = BTreeMap::new();
-    state.dependency(&PolicyDomain::Space(personal), &mut commit_heads)?;
-    state.expand_authorities(now, budget, &mut commit_heads)?;
+    if require_personal_owner {
+        state.dependency(&PolicyDomain::Space(personal), &mut commit_heads)?;
+        state.expand_authorities(now, budget, &mut commit_heads)?;
+    }
     budget.dependencies = all_dependencies;
     Ok(VerifiedExecutionServiceRegistrationRequest {
         expected_heads: dependencies.into_values().collect(),
@@ -250,6 +255,7 @@ pub fn verify_execution_service_source_management(
         node,
         now,
         &mut Budget::default(),
+        false,
     )
 }
 
@@ -528,6 +534,7 @@ pub fn verify_execution_service_registration(
         local_node,
         now,
         &mut budget,
+        true,
     )?;
     require(
         intent.expected_heads == verified.expected_heads
@@ -874,6 +881,7 @@ pub fn select_execution_service_management(
                 &target,
                 now,
                 &mut candidate_budget,
+                false,
             );
             usage.record_budget(&candidate_budget)?;
             match checked {
@@ -1029,6 +1037,7 @@ pub fn prepare_execution_service_registration(
             &target,
             now,
             &mut Budget::default(),
+            true,
         )?;
         let mut usage = ExecutionProofUsage::default();
         usage.record_budget(&source_current.budget)?;

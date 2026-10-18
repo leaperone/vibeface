@@ -899,10 +899,27 @@ pub fn build_client_policy_auth_confirm_request(
         let expiry = bootstrap::timestamp(expires_at_ms)?;
         window(now, expiry, now)?;
         require(
-            expiry <= provenance.request.payload.expires_at_ms,
+            expiry <= provenance.request.payload.expires_at_ms
+                && expiry <= provenance.snapshot.payload.expires_at_ms
+                && expiry <= provenance.witness.payload.expires_at_ms,
             "client policy confirmation outlives the original read",
         )?;
-        Signed::sign(
+        let snapshot = authorization
+            .imported_snapshot
+            .as_ref()
+            .ok_or(AuthorizationError::PolicyConflict)?;
+        let current = verify_client_policy_read(
+            snapshot.state(),
+            &provenance.request,
+            &provenance.request.payload.node_public_key,
+            &PublicKey::of(own),
+            now,
+        )?;
+        require(
+            current.heads == authorization.heads,
+            "client policy confirmation changed its current dependency heads",
+        )?;
+        let confirmation = Signed::sign(
             ClientPolicyAuthConfirmRequest {
                 version: AUTH_VERSION,
                 context: provenance_reference(provenance)?,
@@ -913,7 +930,11 @@ pub fn build_client_policy_auth_confirm_request(
                 expires_at_ms: expiry,
             },
             own,
-        )
+        )?;
+        let mut usage = current.usage;
+        usage.record_signed(&confirmation)?;
+        finish_usage(&mut usage)?;
+        Ok(confirmation)
     };
     encode(&build().map_err(|error| error.to_string())?)
 }
