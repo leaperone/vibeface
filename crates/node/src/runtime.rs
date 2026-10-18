@@ -3,7 +3,10 @@ mod observation;
 
 mod dispatch;
 
-use crate::identity::{policy::FreshnessProof, task_execution_context::TaskScopedAuthorization};
+use crate::identity::{
+    policy::{FreshnessProof, RequestTransport},
+    task_execution_context::TaskScopedAuthorization,
+};
 use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
@@ -30,6 +33,7 @@ use vibeface_secure::authorization::{
     INVOCATION_MAX_AGE_MS, Invocation, Nonce, ObjectHash, PolicyDomain, PublicKey, ResourceId,
     ResourceRef, ServiceId, Signed, SpaceId, TransportEvidence, VerifiedAuthorization,
     VerifiedClientAuthorization,
+    gateway_forward::GatewayOriginal,
     node_execution_policy::VerifiedTaskCurrentPolicy,
     prepare::{PrepareIntent, VerifiedPrepareAuthorization},
 };
@@ -41,7 +45,7 @@ pub struct Access {
     pub conversation_id: Option<String>,
     authorization: TaskScopedAuthorization,
     freshness: FreshnessProof,
-    transport: TransportEvidence,
+    transport: RequestTransport,
     body: Value,
     verification: SignatureVerification,
 }
@@ -50,7 +54,7 @@ struct TaskScopedPrepareAuthorization {
     intent: Signed<PrepareIntent>,
     authorization: VerifiedPrepareAuthorization,
     task_policy: Option<VerifiedTaskCurrentPolicy>,
-    transport: TransportEvidence,
+    transport: RequestTransport,
 }
 
 impl TaskScopedPrepareAuthorization {
@@ -61,7 +65,7 @@ impl TaskScopedPrepareAuthorization {
         intent: Signed<PrepareIntent>,
         body: &Value,
         audience: &Audience,
-        transport: TransportEvidence,
+        transport: RequestTransport,
         now: u64,
     ) -> Result<Self> {
         let task_policy =
@@ -71,14 +75,34 @@ impl TaskScopedPrepareAuthorization {
         let state = task_policy
             .as_ref()
             .map_or(policy.verified(), |task| task.state());
-        let authorization = state.verify_prepare_intent(
-            &intent,
-            body,
-            authorization_action(body)?,
-            audience,
-            &transport,
-            now,
-        )?;
+        let authorization = match &transport {
+            RequestTransport::Existing(transport) => state.verify_prepare_intent(
+                &intent,
+                body,
+                authorization_action(body)?,
+                audience,
+                transport,
+                now,
+            )?,
+            RequestTransport::DirectedGateway { verified, original } => {
+                ensure!(
+                    matches!(
+                        original,
+                        GatewayOriginal::Prepare { body: raw, intent: signed }
+                            if raw == body && signed == &intent
+                    ),
+                    "gateway prepare differs from its original"
+                );
+                state.verify_gateway_prepare_intent(
+                    &intent,
+                    body,
+                    authorization_action(body)?,
+                    audience,
+                    verified,
+                    now,
+                )?
+            }
+        };
         let mut usage = authorization.proof_usage().clone();
         if let Some(task) = &task_policy {
             usage.merge(task.proof_usage());
@@ -3042,7 +3066,7 @@ impl Runtime {
                         intent.clone(),
                         &body,
                         &local,
-                        transport,
+                        RequestTransport::Existing(transport),
                         now_ms() as u64,
                     )?;
                     snapshot.commit()?;
@@ -3248,14 +3272,16 @@ impl Runtime {
     async fn freshness_scoped_with_verification(
         &self,
         authorization: &TaskScopedAuthorization,
-        transport: &TransportEvidence,
+        transport: &RequestTransport,
         stage: CheckStage,
         verification: &SignatureVerification,
     ) -> Result<FreshnessProof> {
         let now = now_ms() as u64;
         let challenge = {
             let mut store = self.store.lock().await;
-            verification.run(|| store.issue_scoped_freshness(authorization, stage, now))?
+            verification.run(|| {
+                store.issue_scoped_freshness_for_transport(authorization, transport, stage, now)
+            })?
         };
         self.collect_freshness_challenge_in_scope_with_verification(
             authorization.resource().space.as_str(), &challenge, Some((authorization, transport)), verification,
@@ -3288,7 +3314,7 @@ impl Runtime {
         &self,
         space: &str,
         challenge: &FreshnessChallenge,
-        authorization: Option<(&TaskScopedAuthorization, &TransportEvidence)>,
+        authorization: Option<(&TaskScopedAuthorization, &RequestTransport)>,
         verification: &SignatureVerification,
     ) -> Result<FreshnessProof> {
         let (mut receipts, authorities) = {
@@ -3398,6 +3424,22 @@ impl Runtime {
         transport: TransportEvidence,
         verification: SignatureVerification,
     ) -> Result<Access> {
+        self.authorize_rpc_for_transport(
+            body,
+            invocation,
+            RequestTransport::Existing(transport),
+            verification,
+        )
+        .await
+    }
+
+    async fn authorize_rpc_for_transport(
+        &self,
+        body: Value,
+        invocation: Signed<Invocation>,
+        transport: RequestTransport,
+        verification: SignatureVerification,
+    ) -> Result<Access> {
         let space = SpaceId::parse(field(&body, "space_id")?)?;
         let audience = self.audience()?;
         self.check_execution_actor(&body, &invocation.payload)?;
@@ -3418,7 +3460,7 @@ impl Runtime {
                     body_hash: ObjectHash::body(&body)?,
                     context: invocation.payload.context.clone(),
                 };
-                let raw_authorization = store.authorize_scoped_request_for_body(
+                let raw_authorization = store.authorize_scoped_request_for_transport(
                     &self.identity,
                     &invocation,
                     &raw,
@@ -3429,7 +3471,7 @@ impl Runtime {
                 let facts = self
                     .authorization_facts_in_scope(&store, &raw_authorization, &body, &audience, now_ms() as u64)
                     .map_err(|_| anyhow::anyhow!("request facts do not match authorization"))?;
-                store.authorize_scoped_request_for_body(
+                store.authorize_scoped_request_for_transport(
                     &self.identity,
                     &invocation,
                     &facts,
@@ -3469,7 +3511,7 @@ impl Runtime {
         );
         let mut store = self.store.lock().await;
         let _verification = access.verification.enter();
-        store.authorize_read(
+        store.authorize_request_read(
             &access.authorization,
             &access.freshness,
             &access.transport,
@@ -3479,10 +3521,11 @@ impl Runtime {
 
     pub async fn refresh_subscription(&self, access: &Access) -> Result<Access> {
         let current = self
-            .authorize_rpc(
+            .authorize_rpc_for_transport(
                 access.body.clone(),
                 access.authorization.signed_invocation().clone(),
                 access.transport.clone(),
+                SignatureVerification::new(),
             )
             .await?;
         self.validate_subscription(&current).await?;
@@ -3501,7 +3544,10 @@ impl Runtime {
             match store.authorize_request(
                 access.authorization.signed_invocation(),
                 &facts,
-                &access.transport,
+                access
+                    .transport
+                    .existing()
+                    .context("subscription requires an ordinary client transport")?,
                 now_ms() as u64,
             ) {
                 Ok(authorization) => authorization,
@@ -3518,7 +3564,7 @@ impl Runtime {
         let mut store = self.store.lock().await;
         let _verification = verification.enter();
         if store
-            .authorize_read(
+            .authorize_request_read(
                 &authorization,
                 &freshness,
                 &access.transport,
@@ -3834,7 +3880,7 @@ impl Runtime {
         let event = {
             let mut store = self.store.lock().await;
             access.verification.run(|| {
-                store.append_authorized_event(
+                store.append_request_authorized_event(
                     &self.identity,
                     &access.authorization,
                     &access.freshness,
@@ -4164,7 +4210,7 @@ impl Runtime {
             let _verification = access.verification.enter();
             let facts =
                 self.authorization_facts_in_scope(&store, &access.authorization, &input, &self.audience()?, now_ms() as u64)?;
-            store.authorize_scoped_request_for_body(
+            store.authorize_scoped_request_for_transport(
                 &self.identity,
                 access.authorization.signed_invocation(),
                 &facts,
@@ -4188,7 +4234,7 @@ impl Runtime {
                 );
                 let store = self.store.lock().await;
                 access.verification.run(|| {
-                    store.authorize_read(
+                    store.authorize_request_read(
                         &access.authorization,
                         &access.freshness,
                         &access.transport,
@@ -4205,7 +4251,7 @@ impl Runtime {
             "nodes" => {
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4222,7 +4268,7 @@ impl Runtime {
             "conversations" => {
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4272,7 +4318,7 @@ impl Runtime {
                 let scope = scope.context("conversation_id is required")?;
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4297,7 +4343,7 @@ impl Runtime {
                 let scope = scope.context("conversation_id is required")?;
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4386,7 +4432,7 @@ impl Runtime {
                         );
                         old.event_hash
                     } else {
-                        let event = store.append_authorized_event(
+                        let event = store.append_request_authorized_event(
                             &self.identity,
                             &access.authorization,
                             &access.freshness,
@@ -4486,7 +4532,7 @@ impl Runtime {
                 let appended = if events.is_empty() {
                     Vec::new()
                 } else {
-                    store.append_authorized_events(
+                    store.append_request_authorized_events(
                         &self.identity,
                         &access.authorization,
                         &access.freshness,
@@ -4529,7 +4575,7 @@ impl Runtime {
                     let mut store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     require_task_write(&store, network, &scope, &task_id, access.account_actor())?;
-                    store.append_authorized_event(
+                    store.append_request_authorized_event(
                         &self.identity,
                         &access.authorization,
                         &access.freshness,
@@ -4604,7 +4650,7 @@ impl Runtime {
                 let appended = {
                     let mut store = self.store.lock().await;
                     access.verification.run(|| {
-                        store.append_authorized_events(
+                        store.append_request_authorized_events(
                             &self.identity,
                             &access.authorization,
                             &access.freshness,
@@ -4630,7 +4676,7 @@ impl Runtime {
                         access.authorization.audience(),
                         now_ms() as u64,
                     )?;
-                    store.bind_execution_dispatch(
+                    store.bind_execution_request_dispatch(
                         &self.identity,
                         &dispatch,
                         &access.authorization,
@@ -4640,7 +4686,7 @@ impl Runtime {
                         now_ms() as u64,
                     )?
                 } else {
-                    store.bind_task_authorized(
+                    store.bind_task_request_authorized(
                         &self.identity,
                         &access.authorization,
                         &access.freshness,
@@ -4655,7 +4701,7 @@ impl Runtime {
                 let seal = {
                     let mut store = self.store.lock().await;
                     access.verification.run(|| {
-                        store.seal_task_authorized(
+                        store.seal_task_request_authorized(
                             &self.identity,
                             &access.authorization,
                             &access.freshness,
@@ -4671,7 +4717,7 @@ impl Runtime {
             "remote_execution_seal_status" => {
                 let store = self.store.lock().await;
                 let seal = access.verification.run(|| {
-                    store.remote_execution_seal_status_authorized(
+                    store.remote_execution_seal_status_request_authorized(
                         &self.identity,
                         &access.authorization,
                         &access.freshness,
@@ -4702,7 +4748,7 @@ impl Runtime {
                 );
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4723,7 +4769,7 @@ impl Runtime {
                 );
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4738,7 +4784,7 @@ impl Runtime {
                 );
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4788,7 +4834,7 @@ impl Runtime {
                 let scope = scope.context("conversation_id is required")?;
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -4801,7 +4847,7 @@ impl Runtime {
                 {
                     let store = self.store.lock().await;
                     access.verification.run(|| {
-                        store.authorize_read(
+                        store.authorize_request_read(
                             &access.authorization,
                             &access.freshness,
                             &access.transport,
@@ -5094,7 +5140,10 @@ impl Runtime {
         self.store.lock().await.claim_authorized_manager(
             &access.authorization,
             &access.freshness,
-            &access.transport,
+            access
+                .transport
+                .existing()
+                .context("manager admission requires a local adapter transport")?,
             &access.body,
             boot,
             sdk_config,
@@ -5212,7 +5261,7 @@ impl Runtime {
                         access.authorization.audience(),
                         now,
                     )?;
-                    store.rebind_execution_dispatch_authorized(
+                    store.rebind_execution_dispatch_request_authorized(
                         &self.identity,
                         &dispatch,
                         &access.authorization,
@@ -5222,7 +5271,7 @@ impl Runtime {
                         now,
                     )
                 } else {
-                    store.rebind_task_authorized(
+                    store.rebind_task_request_authorized(
                         &self.identity,
                         &access.authorization,
                         &access.freshness,
@@ -5387,7 +5436,7 @@ impl Runtime {
                 old.request == request,
                 "operation ID reused with different body"
             );
-            let operation = store.accept_authorized_operation(
+            let operation = store.accept_request_authorized_operation(
                 &self.identity,
                 &access.authorization,
                 &access.freshness,
@@ -5398,7 +5447,7 @@ impl Runtime {
             )?;
             return Ok(json!({"operation":operation}));
         }
-        let operation = store.accept_authorized_operation(
+        let operation = store.accept_request_authorized_operation(
             &self.identity,
             &access.authorization,
             &access.freshness,
@@ -6190,7 +6239,7 @@ impl Runtime {
                         intent,
                         &body,
                         &audience,
-                        TransportEvidence::VerifiedPeer { origin },
+                        RequestTransport::Existing(TransportEvidence::VerifiedPeer { origin }),
                         now_ms() as u64,
                     )?;
                     snapshot.commit()?;
@@ -6234,7 +6283,7 @@ impl Runtime {
             );
             let store = self.store.lock().await;
             let _verification = verification.enter();
-            store.authorize_read(
+            store.authorize_request_read(
                 &access.authorization,
                 &access.freshness,
                 &access.transport,
@@ -6256,7 +6305,7 @@ impl Runtime {
             .await?;
             let mut store = self.store.lock().await;
             let _verification = verification.enter();
-            store.authorize_read(
+            store.authorize_request_read(
                 &access.authorization,
                 &access.freshness,
                 &access.transport,
@@ -6436,7 +6485,7 @@ impl Runtime {
         let operation = {
             let mut store = self.store.lock().await;
             access.verification.run(|| {
-                store.resolve_authorized_operation(
+                store.resolve_request_authorized_operation(
                     &self.identity,
                     &access.authorization,
                     &access.freshness,
