@@ -384,7 +384,7 @@ mod linux {
                     "command sandbox requires an unprivileged node user",
                 ));
             }
-            // ABI 6 adds signal and abstract-socket scoping; older ABIs cannot contain host IPC.
+            // ABI 6 adds signal and abstract-socket scoping.
             let abi = unsafe {
                 libc::syscall(
                     libc::SYS_landlock_create_ruleset,
@@ -565,6 +565,18 @@ mod linux {
                 libc::SYS_keyctl,
                 libc::SYS_request_key,
                 libc::SYS_add_key,
+                libc::SYS_shmget,
+                libc::SYS_shmat,
+                libc::SYS_shmctl,
+                libc::SYS_shmdt,
+                libc::SYS_msgget,
+                libc::SYS_msgsnd,
+                libc::SYS_msgrcv,
+                libc::SYS_msgctl,
+                libc::SYS_semget,
+                libc::SYS_semop,
+                libc::SYS_semtimedop,
+                libc::SYS_semctl,
                 libc::SYS_io_uring_setup,
                 libc::SYS_io_uring_enter,
                 libc::SYS_io_uring_register,
@@ -618,6 +630,72 @@ mod linux {
             filter.push(statement(0x06, libc::SECCOMP_RET_ALLOW));
             Ok(filter)
         }
+    }
+
+    #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[test]
+    fn seccomp_denies_access_to_host_sysv_shared_memory() {
+        struct Segment(i32);
+        impl Drop for Segment {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::shmctl(self.0, libc::IPC_RMID, std::ptr::null_mut());
+                }
+            }
+        }
+
+        let segment =
+            Segment(unsafe { libc::shmget(libc::IPC_PRIVATE, 4096, libc::IPC_CREAT | 0o600) });
+        assert!(segment.0 >= 0, "cannot create private test shared memory");
+        let memory = unsafe { libc::shmat(segment.0, std::ptr::null(), 0) };
+        assert_ne!(
+            memory as isize, -1,
+            "host must be able to attach its test segment"
+        );
+        unsafe {
+            memory.cast::<u8>().write(0x5a);
+        }
+        assert_eq!(unsafe { memory.cast::<u8>().read() }, 0x5a);
+        assert_eq!(unsafe { libc::shmdt(memory) }, 0);
+
+        let filter = syscall_filter().unwrap();
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "cannot fork the seccomp test probe");
+        if child == 0 {
+            let installed = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0
+                && unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, &program) } == 0;
+            if !installed {
+                unsafe {
+                    libc::_exit(120);
+                }
+            }
+            let attached = unsafe { libc::shmat(segment.0, std::ptr::null(), 0) };
+            let denied =
+                attached as isize == -1 && unsafe { *libc::__errno_location() } == libc::EPERM;
+            unsafe {
+                libc::_exit(if denied { 0 } else { 121 });
+            }
+        }
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(child, &mut status, 0) };
+            if result == child {
+                break;
+            }
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+        }
+        assert_eq!(
+            status, 0,
+            "seccomp must reject attaching same-UID 0600 host shared memory"
+        );
+        let memory = unsafe { libc::shmat(segment.0, std::ptr::null(), 0) };
+        assert_ne!(memory as isize, -1);
+        assert_eq!(unsafe { memory.cast::<u8>().read() }, 0x5a);
+        assert_eq!(unsafe { libc::shmdt(memory) }, 0);
     }
 }
 
