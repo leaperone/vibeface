@@ -36,6 +36,7 @@ pub struct RemoteExecutionHistoryReference {
     pub handoff_hash: ObjectHash,
     pub resolution_hash: Option<ObjectHash>,
     pub freshness_hash: Option<ObjectHash>,
+    pub terminal_freshness: Option<ExecutionHandoffResolutionFreshness>,
     pub result_hash: ObjectHash,
 }
 
@@ -224,6 +225,15 @@ pub(crate) fn derive_reference(
         task_binding::verify_binding(binding, source.issuer.as_str())
             .map_err(|_| AuthorizationError::InvalidProof("invalid original historical binding"))?;
     }
+    let terminal_freshness = if kind == RemoteExecutionHistoryKind::TerminalReconciliation {
+        Some(
+            serde_json::from_value(raw["freshness"].clone()).map_err(|_| {
+                AuthorizationError::InvalidProof("invalid original terminal freshness")
+            })?,
+        )
+    } else {
+        None
+    };
     let reference = RemoteExecutionHistoryReference {
         version: AUTH_VERSION,
         kind,
@@ -241,6 +251,7 @@ pub(crate) fn derive_reference(
         handoff_hash: observation.handoff.hash()?,
         resolution_hash,
         freshness_hash,
+        terminal_freshness,
         result_hash,
     };
     check_reference(&reference)?;
@@ -296,6 +307,7 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
                         && reference.expected_binding_hash.is_some()
                         && reference.resolution_hash.is_none()
                         && reference.freshness_hash.is_none()
+                        && reference.terminal_freshness.is_none()
                         && reference.account_invocation_hash == source.original_invocation_hash
                         && submission.operation_id == source.operation_id
                         && reference.old_submission.issuer == reference.source.issuer
@@ -306,6 +318,14 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
                         && reference.expected_binding_hash.is_none()
                         && reference.resolution_hash.is_some()
                         && reference.freshness_hash.is_some()
+                        && if reference.kind == RemoteExecutionHistoryKind::TerminalReconciliation {
+                            reference.terminal_freshness.as_ref().is_some_and(|proof| {
+                                ObjectHash::body(proof).ok().as_ref()
+                                    == reference.freshness_hash.as_ref()
+                            })
+                        } else {
+                            reference.terminal_freshness.is_none()
+                        }
                 }
             },
         "historical policy reference changed its purpose, original signer or task",
@@ -471,6 +491,7 @@ pub fn verify_remote_execution_history_acceptance(
             let observation = &observation_receipt.payload;
             require(
                 reference.kind == RemoteExecutionHistoryKind::TerminalReconciliation
+                    && reference.terminal_freshness.as_ref() == Some(freshness)
                     && observation_receipt.issuer == *local_c
                     && observation.version == AUTH_VERSION
                     && observation.handoff_hash == reference.handoff_hash
