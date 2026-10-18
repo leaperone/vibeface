@@ -170,3 +170,48 @@ pub fn signed_invocation_hash(invocation_json: &str) -> crate::Result<String> {
     })()
     .map_err(|error| error.to_string())
 }
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyRemoteExecutionSeal))]
+pub fn verify_remote_execution_seal(
+    binding_json: &str,
+    seal_json: &str,
+    expected_project_public_key: &str,
+    expected_execution_public_key: &str,
+    expected_revision_json: &str,
+) -> crate::Result<String> {
+    let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
+    (|| -> Result<String> {
+        require(binding_json.len().saturating_add(seal_json.len()) <= MAX_PROOF_BYTES,
+            "remote seal proof is too large")?;
+        let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid old binding JSON"))?;
+        let seal: task_binding::SignedSeal = serde_json::from_str(seal_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid executor seal JSON"))?;
+        let project_key = PublicKey::parse(expected_project_public_key)?;
+        let execution_key = PublicKey::parse(expected_execution_public_key)?;
+        task_binding::verify_binding(&binding, project_key.as_str())
+            .map_err(|_| AuthorizationError::InvalidProof("old binding has another Project authority"))?;
+        task_binding::verify_seal(&seal, execution_key.as_str())
+            .map_err(|_| AuthorizationError::InvalidProof("seal has another executor authority"))?;
+        require(expected_revision_json.len() <= 32, "invalid final revision")?;
+        let revision: u64 = serde_json::from_str(expected_revision_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid final revision"))?;
+        require(revision <= 9_007_199_254_740_991, "unsafe final revision")?;
+        require(
+            binding.binding.target_node == node_fingerprint(execution_key.as_str())
+                .map_err(|_| AuthorizationError::InvalidProof("invalid old executor pin"))?
+                && seal.seal.network_id == binding.binding.network_id
+                && seal.seal.target_node == binding.binding.target_node
+                && seal.seal.binding_hash == task_binding::binding_hash(&binding.binding)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid old binding"))?
+                && seal.seal.final_revision == revision,
+            "executor seal changed the old binding or final revision",
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_binding(&binding)?;
+        usage.record_metadata(&seal)?;
+        usage.enforce_limits()?;
+        serde_json::to_string(&seal)
+            .map_err(|_| AuthorizationError::InvalidProof("executor seal encoding failed"))
+    })().map_err(|error|error.to_string())
+}

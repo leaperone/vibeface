@@ -3963,6 +3963,197 @@ pub(crate) mod tests {
             )?;
             Ok(proof)
         }
+
+        fn remote_seal_body(&self) -> Result<Value> {
+            let observed = self.store.execution_handoff_status(
+                &self.executor.node, self.executor.space.as_str(),
+                self.project.space.as_str(), "original-operation", now() + 20,
+            )?;
+            Ok(json!({"method":"seal_remote_execution","space_id":self.executor.space,
+                "resource_id":self.wire.handoff.execution_resource.resource,
+                "authorization_id":"seal-generation-one","original_space_id":self.project.space,
+                "operation_id":"original-operation","binding":request(&self.wire)?.binding,
+                "execution_receipt":observed.receipt.context("C receipt is missing")?}))
+        }
+
+        fn executor_seal_grant(&mut self, body: &Value) -> Result<ObjectHash> {
+            let key = PublicKey::parse(&self.executor.node.public_key_hex()?)?;
+            let (facts, _) = execution_binding_seal::execution_binding_seal_facts(
+                body, &self.wire.handoff.execution_audience, &key,
+            )?;
+            let previous = self.store.policy.verified()
+                .head(&PolicyDomain::Space(self.executor.space.clone())).unwrap().clone();
+            let grant = Signed::sign(Grant {
+                version:AUTH_VERSION, owner_space:self.executor.space.clone(),
+                scope:ResourceScope::Exact(facts.resource),
+                grantee:Grantee::Actor(Actor::Account(self.executor.account.clone())),
+                actions:vec![Action::ExecutionRebind,Action::OperationStatusRead],
+                audience:facts.audience,
+                constraints:GrantConstraints {context:facts.context,..Default::default()},
+                parent:None,remaining_delegations:0,issued_under:previous.clone(),
+                not_before_ms:now(),expires_at_ms:now()+100_000,nonce:Nonce::random()?,
+            },&self.executor.root)?;
+            let leaf = grant.hash()?;
+            let mut document = self.store.policy.verified().space(&self.executor.space).unwrap().clone();
+            document.previous=Some(previous);document.sequence+=1;
+            document.grants.push(leaf.clone());document.grants.sort();
+            self.store.install_policy_journal(&[
+                JournalEntry::Grant(grant),JournalEntry::Space(Signed::sign(document,&self.executor.root)?),
+            ],now()+20)?;
+            Ok(leaf)
+        }
+
+        fn authorize_executor_seal(
+            &mut self, body: &Value, leaf: &ObjectHash,
+        ) -> Result<(VerifiedAuthorization,super::super::policy::FreshnessProof,TransportEvidence)> {
+            let audience = self.wire.handoff.execution_audience.clone();
+            let facts = self.store.remote_execution_seal_facts(body,&audience,now()+21)?;
+            let device = DeviceId::from_key(&PublicKey::of(&self.executor.client));
+            let mut heads = [PolicyDomain::Account(self.executor.account.clone()),
+                PolicyDomain::Space(self.executor.space.clone())].iter()
+                .map(|domain| self.store.policy.verified().head(domain).unwrap().clone())
+                .collect::<Vec<_>>();
+            heads.sort_by(|left,right|left.domain.cmp(&right.domain));
+            let invocation = Signed::sign(Invocation {
+                version:AUTH_VERSION,actor:Actor::Account(self.executor.account.clone()),
+                device:device.clone(),initiator:Actor::Account(self.executor.account.clone()),
+                initiating_grant:None,resource:facts.resource.clone(),action:facts.action,
+                audience,presenter:device.clone(),operation_id:facts.operation_id.clone(),
+                body_hash:facts.body_hash.clone(),grant_leaf:leaf.clone(),expected_policies:heads,
+                context:facts.context.clone(),nonce:Nonce::random()?,not_before_ms:now()+21,
+                expires_at_ms:now()+10_000,
+            },&self.executor.client)?;
+            let transport=TransportEvidence::DirectNoise{device};
+            let auth=self.store.authorize_request(&invocation,&facts,&transport,now()+21)?;
+            let challenge=self.store.issue_freshness(&auth,CheckStage::Admit,now()+21)?;
+            let receipts=self.store.sign_current_receipts(&challenge,&self.executor.node,now()+21)?;
+            Ok((auth,super::super::policy::FreshnessProof{challenge,receipts},transport))
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_remote_seal_requires_current_exact_authority_and_persists_one_generation_fence() -> Result<()> {
+        use super::super::execution_binding_seal::RemoteExecutionSealPreflight;
+        let mut fixture=Fixture::new()?;
+        fixture.accept()?;
+        let start=fixture.freshness(CheckStage::Start,now()+3)?;
+        let execution=fixture.store.execution_handoff_authorization(fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),"original-operation",now()+4)?;
+        fixture.store.claim_execution_handoff(&fixture.executor.node,&execution,&start,now()+4)?;
+        let project=ResourceRef{space:fixture.project.space.clone(),resource:fixture.project.resource.clone()};
+        let mut session=fixture.store.execution_handoff_session(fixture.executor.space.as_str(),&project,
+            &fixture.executor.node.node_id()?,"same-session")?.context("C session is missing")?;
+        session.state="idle".into();session.native_session_id=Some("private-native-session".into());
+        fixture.store.finish_execution_handoff(&fixture.executor.node,fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),"original-operation",OperationState::Succeeded,
+            json!({"done":true}),Some(&session),now()+5)?;
+        let body=fixture.remote_seal_body()?;
+        assert!(body.get("execution_observation").is_none());
+        let broad=fixture.executor.bundle.grant_leaf.clone();
+        let (auth,proof,transport)=fixture.authorize_executor_seal(&body,&broad)?;
+        let before=fixture.store.connection.total_changes();
+        assert!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+            &auth,&proof,&transport,&body,now()+22).is_err());
+        assert_eq!(fixture.store.connection.total_changes(),before);
+        let leaf=fixture.executor_seal_grant(&body)?;
+        let (auth,proof,transport)=fixture.authorize_executor_seal(&body,&leaf)?;
+        fixture.store.connection.execute("INSERT INTO execution_handoff_reservations(execution_space_id,original_space_id,operation_id,target_node,resource) VALUES(?,?,?,?,?)",
+            params![fixture.executor.space.as_str(),fixture.project.space.as_str(),"original-operation",fixture.executor.node.node_id()?,fixture.executor.project.to_str().unwrap()])?;
+        let before=fixture.store.connection.total_changes();
+        assert!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+            &auth,&proof,&transport,&body,now()+22).is_err());
+        assert_eq!(fixture.store.connection.total_changes(),before);
+        fixture.store.connection.execute("DELETE FROM execution_handoff_reservations WHERE operation_id='original-operation'",[])?;
+        assert!(matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+            &auth,&proof,&transport,&body,now()+22)?,RemoteExecutionSealPreflight::Fence(_)));
+        let wrong_stop=fixture.fence("another-operation").await?;
+        assert!(fixture.store.seal_remote_execution_authorized(&fixture.executor.node,
+            &auth,&proof,&transport,&body,&wrong_stop,now()+22).is_err());
+        let stopped=fixture.fence("original-operation").await?;
+        fixture.store.connection.execute_batch("CREATE TRIGGER reject_generation_seal BEFORE INSERT ON execution_binding_seals BEGIN SELECT RAISE(ABORT,'injected seal failure'); END")?;
+        let failure=fixture.store.seal_remote_execution_authorized(&fixture.executor.node,
+            &auth,&proof,&transport,&body,&stopped,now()+22).expect_err("seal persistence must roll back");
+        assert!(format!("{failure:#}").contains("injected seal failure"),"{failure:#}");
+        let retained=fixture.store.execution_handoff_session(fixture.executor.space.as_str(),&project,
+            &fixture.executor.node.node_id()?,"same-session")?.unwrap();
+        assert_eq!(retained.state,"idle");
+        assert_eq!(retained.native_session_id.as_deref(),Some("private-native-session"));
+        assert_eq!(fixture.store.connection.query_row("SELECT COUNT(*) FROM execution_binding_seals",[],|row|row.get::<_,u64>(0))?,0);
+        fixture.store.connection.execute_batch("DROP TRIGGER reject_generation_seal")?;
+        let usage=vibeface_secure::signature_verification::SignatureVerification::new();
+        usage.run(|| -> Result<()> {
+            let facts=fixture.store.remote_execution_seal_facts(&body,&fixture.wire.handoff.execution_audience,now()+22)?;
+            fixture.store.authorize_request(auth.signed_invocation(),&facts,&transport,now()+22)?;
+            assert!(matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+                &auth,&proof,&transport,&body,now()+22)?,RemoteExecutionSealPreflight::Fence(_)));
+            Ok(())
+        })?;
+        let seal=usage.run(||fixture.store.seal_remote_execution_authorized(&fixture.executor.node,
+            &auth,&proof,&transport,&body,&stopped,now()+22))?;
+        println!("REMOTE_SEAL_SIGNATURE_USAGE {}",serde_json::to_string(&usage.counts())?);
+        binding::verify_seal(&seal,&fixture.executor.node.public_key_hex()?)?;
+        let verify=|revision:&str,project_key:&str,execution_key:&str| {
+            execution_binding_seal::verify_remote_execution_seal(&body["binding"].to_string(),
+                &serde_json::to_string(&seal).unwrap(),project_key,execution_key,revision)
+        };
+        let project_key=fixture.project.node.public_key_hex()?;
+        let execution_key=fixture.executor.node.public_key_hex()?;
+        assert_eq!(serde_json::from_str::<binding::SignedSeal>(&verify(&seal.seal.final_revision.to_string(),
+            &project_key,&execution_key).map_err(anyhow::Error::msg)?)?,seal);
+        assert!(verify(&(seal.seal.final_revision+1).to_string(),&project_key,&execution_key).is_err());
+        assert!(verify(&seal.seal.final_revision.to_string(),&execution_key,&execution_key).is_err());
+        assert!(verify(&seal.seal.final_revision.to_string(),&project_key,&project_key).is_err());
+        assert!(verify("9007199254740992",&project_key,&execution_key).is_err());
+        assert!(verify("1.5",&project_key,&execution_key).is_err());
+        let closed=fixture.store.execution_handoff_session(fixture.executor.space.as_str(),&project,
+            &fixture.executor.node.node_id()?,"same-session")?.unwrap();
+        assert_eq!(closed.state,"closed");assert_eq!(closed.native_session_id,None);
+        let before=fixture.store.connection.total_changes();
+        assert!(matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+            &auth,&proof,&transport,&body,now()+23)?,RemoteExecutionSealPreflight::Existing(ref saved) if saved==&seal));
+        assert_eq!(fixture.store.connection.total_changes(),before);
+        let (replacement,replacement_proof,replacement_transport)=fixture.authorize_executor_seal(&body,&leaf)?;
+        assert!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+            &replacement,&replacement_proof,&replacement_transport,&body,now()+23).is_err());
+        let mut status=body.clone();status["method"]=json!("remote_execution_seal_status");
+        status["authorization_id"]=json!("read-seal-generation-one");
+        status["seal_invocation_hash"]=json!(auth.signed_invocation().hash()?);
+        let (reader,reader_proof,reader_transport)=fixture.authorize_executor_seal(&status,&leaf)?;
+        assert_eq!(fixture.store.remote_execution_seal_status_authorized(&fixture.executor.node,
+            &reader,&reader_proof,&reader_transport,&status,now()+23)?,Some(seal.clone()));
+        let mut wrong_status=status.clone();wrong_status["seal_invocation_hash"]=json!(replacement.signed_invocation().hash()?);
+        let (wrong_reader,wrong_proof,wrong_transport)=fixture.authorize_executor_seal(&wrong_status,&leaf)?;
+        assert!(fixture.store.remote_execution_seal_status_authorized(&fixture.executor.node,
+            &wrong_reader,&wrong_proof,&wrong_transport,&wrong_status,now()+23).is_err());
+        let mut replacement=fixture.wire.clone();
+        let mut invocation=replacement.invocation.payload.clone();
+        for head in &mut invocation.expected_policies {
+            *head=fixture.store.policy.verified().head(&head.domain).unwrap().clone();
+        }
+        invocation.nonce=Nonce::random()?;
+        let signer=Identity::from_secret_hex(&fixture.project.node.secret_key_hex).map_err(anyhow::Error::msg)?;
+        replacement.invocation=Signed::sign(invocation,&signer)?;
+        let failure=fixture.store.issue_execution_handoff_challenge(&replacement,&fixture.transport,
+            CheckStage::Admit,now()+23).expect_err("sealed generation cannot issue another challenge");
+        assert!(format!("{failure:#}").contains("generation is sealed"),"{failure:#}");
+        assert!(fixture.store.renew_execution_handoff(&fixture.executor.node,&execution,&start,now()+23).is_err());
+        fixture.executor.revoke_client(&mut fixture.store)?;
+        let before=fixture.store.connection.total_changes();
+        assert!(fixture.store.remote_execution_seal_status_authorized(&fixture.executor.node,
+            &reader,&reader_proof,&reader_transport,&status,now()+23).is_err());
+        assert_eq!(fixture.store.connection.total_changes(),before);
+
+        let mut uncertain=Fixture::new()?;
+        uncertain.start_unknown()?;
+        let body=uncertain.remote_seal_body()?;
+        let leaf=uncertain.executor_seal_grant(&body)?;
+        let (auth,proof,transport)=uncertain.authorize_executor_seal(&body,&leaf)?;
+        let before=uncertain.store.connection.total_changes();
+        assert!(uncertain.store.authorize_remote_execution_seal_fence(&uncertain.executor.node,
+            &auth,&proof,&transport,&body,now()+22).is_err());
+        assert_eq!(uncertain.store.connection.total_changes(),before);
+        assert_eq!(uncertain.store.connection.query_row("SELECT COUNT(*) FROM execution_binding_seals",[],|row|row.get::<_,u64>(0))?,0);
+        Ok(())
     }
 
     #[test]
