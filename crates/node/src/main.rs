@@ -23,6 +23,7 @@ use vibeface::{
     update::{self, Update},
 };
 
+mod cli_client;
 mod service;
 
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4790);
@@ -48,11 +49,15 @@ enum Action {
     /// Start this node with its configured roles.
     Serve(DataDir),
     /// Check this local node through its private maintenance socket.
-    Status(Access),
+    Status(Inspection),
     /// Manage this user's installed node service and update timer.
     Service(service::Service),
     /// Display this node's trusted entry for account setup or enrollment.
     Access(Access),
+    /// Enroll an independent local CLI client identity.
+    Client(cli_client::ClientCommand),
+    /// Create and approve device invitations with an enrolled CLI identity.
+    Invite(cli_client::InviteCommand),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
     /// Call a node tool from a locally managed SDK process.
@@ -123,6 +128,20 @@ struct Init {
 struct Access {
     #[command(flatten)]
     data: DataDir,
+    #[arg(long, conflicts_with = "out")]
+    json: bool,
+    /// Reach this node through the given HTTPS relay origin.
+    #[arg(long)]
+    via: Option<String>,
+    /// Save a connection file without overwriting an existing file.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct Inspection {
+    #[command(flatten)]
+    data: DataDir,
     #[arg(long)]
     json: bool,
 }
@@ -156,7 +175,9 @@ async fn main() -> Result<()> {
                 result = maintenance::serve(runtime, options.data_dir) => result,
             }
         }
-        Action::Access(options) => access(options),
+        Action::Access(options) => access(options).await,
+        Action::Client(options) => options.run().await,
+        Action::Invite(options) => options.run().await,
         Action::Status(options) => status(options).await,
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
@@ -182,7 +203,7 @@ fn prepare_start(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn status(options: Access) -> Result<()> {
+async fn status(options: Inspection) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
@@ -579,7 +600,7 @@ fn network_url(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn access(options: Access) -> Result<()> {
+async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     config::verify_data_format(dir)?;
     let configuration = Config::load(dir)?;
@@ -610,19 +631,124 @@ fn access(options: Access) -> Result<()> {
         };
         url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
-    let entry = json!({"url":url.origin().ascii_serialization(),"node_id":identity.node_id()?,"node_public_key":identity.public_key_hex()?,"relay":false,"claim_nonce":capability,"capability":capability});
-    if options.json {
-        println!("{}", serde_json::to_string(&entry)?);
-    } else {
-        if capability.is_some() {
-            url.set_fragment(Some(&format!(
-                "bootstrap={}",
-                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&entry)?)
-            )));
+    let public_key = identity.public_key_hex()?;
+    let route = if let Some(via) = &options.via {
+        let route = vibeface_secure::connection::ConnectionRoute::new(via, &public_key, true)
+            .map_err(anyhow::Error::msg)?;
+        verify_access_route(&route).await?;
+        route
+    } else if is_loopback(&url) && !configuration.network.bootstrap_urls.is_empty() {
+        let mut available = None;
+        for candidate in &configuration.network.bootstrap_urls {
+            let Ok(mut candidate) = Url::parse(candidate) else {
+                continue;
+            };
+            let scheme = match candidate.scheme() {
+                "wss" | "https" => "https",
+                "ws" | "http" => "http",
+                _ => continue,
+            };
+            if candidate.set_scheme(scheme).is_err() {
+                continue;
+            }
+            candidate.set_path("/");
+            let Ok(route) = vibeface_secure::connection::ConnectionRoute::new(
+                &candidate.origin().ascii_serialization(),
+                &public_key,
+                true,
+            ) else {
+                continue;
+            };
+            if verify_access_route(&route).await.is_ok() {
+                available = Some(route);
+                break;
+            }
         }
+        match available {
+            Some(route) => route,
+            None if options.out.is_some() => bail!(
+                "no configured relay can reach this node; start the node or select a reachable relay with --via"
+            ),
+            None => vibeface_secure::connection::ConnectionRoute::new(
+                &url.origin().ascii_serialization(),
+                &public_key,
+                false,
+            )
+            .map_err(anyhow::Error::msg)?,
+        }
+    } else {
+        ensure!(
+            options.out.is_none() || !is_loopback(&url),
+            "a localhost connection file cannot reach this node from your phone; configure a relay or use --via"
+        );
+        vibeface_secure::connection::ConnectionRoute::new(
+            &url.origin().ascii_serialization(),
+            &public_key,
+            false,
+        )
+        .map_err(anyhow::Error::msg)?
+    };
+    let entry = vibeface_secure::connection::NodeConnectionCard::new(
+        &route.endpoint,
+        &public_key,
+        route.relay,
+        capability.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let encoded = serde_json::to_vec(&entry)?;
+    if let Some(path) = options.out {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        create_private(&path, &encoded)?;
+        println!("Connection file: {}", path.display());
+        println!("Node: {}", route.node_id().map_err(anyhow::Error::msg)?);
+        println!(
+            "Route: {} ({})",
+            route.endpoint,
+            if route.relay { "relay" } else { "direct" }
+        );
+        return Ok(());
+    }
+    if options.json {
+        println!("{}", String::from_utf8(encoded)?);
+    } else {
+        url = origin(&route.endpoint)?;
+        url.set_fragment(Some(&format!(
+            "{}={}",
+            if capability.is_some() {
+                "bootstrap"
+            } else {
+                "connect"
+            },
+            URL_SAFE_NO_PAD.encode(encoded)
+        )));
         println!("{url}");
     }
     Ok(())
+}
+
+async fn verify_access_route(route: &vibeface_secure::connection::ConnectionRoute) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let node_id = route.node_id().map_err(anyhow::Error::msg)?;
+        let mut client = vibeface::client::Client::connect(
+            &route.endpoint,
+            &LocalIdentity::generate(),
+            &node_id,
+            route.relay,
+        )
+        .await?;
+        let info = client.call("info", json!({})).await?;
+        ensure!(
+            info["node_id"] == node_id && info["public_key"] == route.node_public_key.as_str(),
+            "relay returned another node identity"
+        );
+        Ok(())
+    })
+    .await
+    .context("relay route verification timed out")?
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
