@@ -296,6 +296,7 @@ def verify_direct_start(run, binary):
         if attempt == 0:
             configuration["listen"] = f"127.0.0.1:{available_port()}"
             configuration["public_url"] = "http://" + configuration["listen"]
+            configuration["local_access"]["listen"] = f"127.0.0.1:{available_port()}"
             private_json(directory / "config.json", configuration)
             protected = {path: file_sha256(directory / path)
                          for path in ("identity.json", "config.json", "bootstrap.json", "data-epoch.json")}
