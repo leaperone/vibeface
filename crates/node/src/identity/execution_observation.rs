@@ -383,10 +383,10 @@ impl Store {
         }
         let mut currents = Vec::new();
         for stamp in &challenge.policies {
-            if let HandoffPolicy::TaskBusiness(view) = policy {
-                if !view.primary_heads().contains(stamp) {
-                    continue;
-                }
+            if let HandoffPolicy::TaskBusiness(view) = policy
+                && !view.primary_heads().contains(stamp)
+            {
+                continue;
             }
             let authority = match &stamp.domain {
                 PolicyDomain::Account(id) => self

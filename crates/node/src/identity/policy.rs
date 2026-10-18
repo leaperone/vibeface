@@ -3,17 +3,19 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
+use vibeface_secure::authorization::AccountId;
 use vibeface_secure::authorization::bootstrap::{self, NodeClaim};
 use vibeface_secure::authorization::gateway_forward::{GatewayOriginal, VerifiedDirectedGateway};
 use vibeface_secure::authorization::{
-    AccountId, Actor, Audience, CheckStage, ClientAuthorizationBundle, DeviceId,
-    FreshnessChallenge, FreshnessReceipt, Invocation, InvocationContext, JournalEntry, ObjectHash,
-    PolicyDomain, PolicyPin, PublicKey, RequestFacts, ResourceId, ResourceKind, ResourceRef,
-    ServiceId, SessionRef, Signed, SpaceId, TransportEvidence, VerifiedAuthorization,
-    VerifiedPolicySet,
+    Actor, Audience, CheckStage, ClientAuthorizationBundle, DeviceId, FreshnessChallenge,
+    FreshnessReceipt, Invocation, InvocationContext, JournalEntry, ObjectHash, PolicyDomain,
+    PolicyPin, PublicKey, RequestFacts, ResourceId, ResourceKind, ResourceRef, ServiceId,
+    SessionRef, Signed, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
 };
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RequestTransport {
     Existing(TransportEvidence),
     DirectedGateway {
@@ -716,6 +718,7 @@ fn resource_root_from(
     Ok(root)
 }
 
+#[cfg(test)]
 pub(crate) fn authenticate_account_from(
     connection: &Connection,
     policy: &super::journal::PolicyState,
@@ -813,6 +816,7 @@ pub(crate) fn authenticate_account_from(
 }
 
 impl Store {
+    #[cfg(test)]
     pub(crate) fn authenticate_account(
         &self,
         principal: &str,
@@ -1363,6 +1367,7 @@ impl Store {
     }
 }
 
+#[cfg(test)]
 fn bundle_pins(pins: &[PolicyPin], bundle: &ClientAuthorizationBundle) -> Vec<PolicyPin> {
     let domains: std::collections::BTreeSet<_> = bundle
         .journal

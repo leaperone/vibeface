@@ -477,10 +477,10 @@ impl Store {
         );
         let (verified, cached, mut usage) =
             verify_record(&tx, &self.policy, &record, &local, principal, now)?;
-        if let Some(cached) = cached {
-            if cached.payload.request_cursor == request.cursor {
-                return finish_response(json!({"page":cached}), usage);
-            }
+        if let Some(cached) = cached
+            && cached.payload.request_cursor == request.cursor
+        {
+            return finish_response(json!({"page":cached}), usage);
         }
         ensure!(
             record.witness.is_none() && request.cursor == record.position.cursor,

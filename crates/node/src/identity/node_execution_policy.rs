@@ -27,6 +27,7 @@ use vibeface_secure::{
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NodeReadRequest {
     Prepare(NodeExecutionPolicyReadRequest),
     Page(RemoteExecutionPolicyPageRequest),
@@ -41,6 +42,7 @@ pub(crate) enum NodeReadRequest {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NodeReadResponse {
     Snapshot(Signed<RemoteExecutionPolicySnapshot>),
     Page(Signed<RemoteExecutionPolicyPage>),

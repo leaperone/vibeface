@@ -24,6 +24,7 @@ pub(super) struct CachedImport {
     pub(super) ready_for_finish: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CompletedPolicy {
     Current(VerifiedTaskCurrentPolicy),
     History(VerifiedTaskHistoryPolicy),

@@ -39,12 +39,6 @@ pub(crate) struct TaskBusinessOriginalRecovery {
     finished: bool,
 }
 
-impl TaskBusinessOriginalRecovery {
-    pub(crate) fn next_page_index(&self) -> u64 {
-        self.importer.next_page_index()
-    }
-}
-
 fn association_in(
     connection: &Connection,
     wire_hash: &ObjectHash,

@@ -4,6 +4,8 @@ use super::{
     policy::{FreshnessProof, RequestTransport},
     task_execution_context::{OriginalAdmissionView, TaskScopedAuthorization},
 };
+#[cfg(test)]
+use crate::store::load_events_from;
 use crate::{
     crypto::{self, LocalIdentity},
     model::{
@@ -11,7 +13,7 @@ use crate::{
         SignedEvent, StoredTransport, WIRE_VERSION,
     },
     store::{
-        Store, StoredEvent, closure_hashes, has_blob_from, heads_from_events, load_events_from,
+        Store, StoredEvent, closure_hashes, has_blob_from, heads_from_events,
         rebuild_admitted_projections_from,
     },
 };
@@ -497,6 +499,7 @@ fn accepted_conversation_open_from_history(
     Ok(accepted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn historical_dispatch_origin(
     connection: &Connection,
     policy: &PolicyState,
@@ -598,6 +601,7 @@ pub(super) fn project_dispatch_origin_in(
     .context("execution origin is incomplete")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn historical_operation_context(
     connection: &Connection,
     policy: &PolicyState,
@@ -1746,7 +1750,7 @@ pub(crate) fn append_admitted_dispatch_in(
     let body = expected_events(&proof.source_body, &proof.invocation, &proof.transport)?.remove(0);
     Ok(append_admitted_events_in(
         tx,
-        &policy,
+        policy,
         identity,
         proof,
         vec![(request.conversation_id.clone(), body.0, body.1)],
@@ -1755,6 +1759,7 @@ pub(crate) fn append_admitted_dispatch_in(
     .remove(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_admitted_resolution_in(
     tx: &Transaction<'_>,
     policy: &PolicyState,
@@ -1806,7 +1811,7 @@ pub(crate) fn append_admitted_resolution_in(
     );
     Ok(append_admitted_events_in(
         tx,
-        &policy,
+        policy,
         identity,
         proof,
         vec![(request.conversation_id.clone(), expected.0, expected.1)],
@@ -1815,6 +1820,7 @@ pub(crate) fn append_admitted_resolution_in(
     .remove(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_execution_handoff_observation_in(
     connection: &Connection,
     policy: &PolicyState,

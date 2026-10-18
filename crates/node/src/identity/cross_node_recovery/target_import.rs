@@ -71,6 +71,7 @@ fn require_approval_binding_in(
     Ok(())
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TargetImportState {
     Reading(RecoveryContextImport),
     Ready(VerifiedRecoveryPolicyContext),

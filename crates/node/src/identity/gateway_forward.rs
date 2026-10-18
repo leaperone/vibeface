@@ -31,6 +31,7 @@ pub(crate) struct GatewayPolicyCache {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum CachedSource {
     Pending(SourceRecord, GatewayClientPolicyImport),
     Complete(SourceRecord, VerifiedGatewayClientSource),
@@ -703,6 +704,7 @@ impl Store {
         Ok(progress(reference.clone(), &record))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_gateway_source(
         &mut self,
         identity: &LocalIdentity,

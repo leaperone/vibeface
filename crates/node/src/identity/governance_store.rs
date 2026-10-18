@@ -479,33 +479,31 @@ impl Store {
         );
         if let Some(existing) =
             receipt::<Signed<FreshnessChallenge>>(&tx, &key, &request_hash, &principal)?
+            && existing.payload.issued_at_ms <= now_ms
+            && now_ms < existing.payload.expires_at_ms
+            && existing
+                .payload
+                .expires_at_ms
+                .saturating_sub(existing.payload.issued_at_ms)
+                <= EXECUTION_LEASE_MS
+            && existing.payload.version == challenge.payload.version
+            && existing.payload.stage == challenge.payload.stage
+            && existing.payload.invocation_hash == challenge.payload.invocation_hash
+            && existing.payload.operation_id
+                == format!("execution-service-install:{}", existing.payload.nonce)
+            && existing.payload.body_hash == challenge.payload.body_hash
+            && existing.payload.policies == challenge.payload.policies
         {
-            if existing.payload.issued_at_ms <= now_ms
-                && now_ms < existing.payload.expires_at_ms
-                && existing
-                    .payload
-                    .expires_at_ms
-                    .saturating_sub(existing.payload.issued_at_ms)
-                    <= EXECUTION_LEASE_MS
-                && existing.payload.version == challenge.payload.version
-                && existing.payload.stage == challenge.payload.stage
-                && existing.payload.invocation_hash == challenge.payload.invocation_hash
-                && existing.payload.operation_id
-                    == format!("execution-service-install:{}", existing.payload.nonce)
-                && existing.payload.body_hash == challenge.payload.body_hash
-                && existing.payload.policies == challenge.payload.policies
-            {
-                existing.verify_signature()?;
-                ensure!(
-                    existing.issuer == PublicKey::of(&signer)
-                        && existing.payload.audience == challenge.payload.audience
-                        && existing.payload.presenter == challenge.payload.presenter,
-                    "stored installation challenge changed"
-                );
-                tx.commit()?;
-                self.policy = policy;
-                return Ok(serde_json::to_value(existing)?);
-            }
+            existing.verify_signature()?;
+            ensure!(
+                existing.issuer == PublicKey::of(&signer)
+                    && existing.payload.audience == challenge.payload.audience
+                    && existing.payload.presenter == challenge.payload.presenter,
+                "stored installation challenge changed"
+            );
+            tx.commit()?;
+            self.policy = policy;
+            return Ok(serde_json::to_value(existing)?);
         }
         tx.execute("DELETE FROM identity_meta WHERE key=?", [&key])?;
         tx.execute("DELETE FROM identity_meta WHERE key LIKE ? AND json_extract(value,'$.response.payload.expires_at_ms')<=?",

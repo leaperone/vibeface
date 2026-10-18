@@ -20,6 +20,7 @@ use vibeface_secure::{
     signature_verification::{ScopedSignatureVerification, SignatureVerification},
 };
 
+#[allow(clippy::too_many_arguments)]
 fn sign_current_receipts<T: Serialize>(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -104,6 +105,7 @@ impl Store {
         Ok(receipts)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn task_business_challenge_receipts(
         &self,
         identity: &LocalIdentity,

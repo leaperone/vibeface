@@ -125,6 +125,7 @@ fn finish_reader_response(
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 enum PolicyReadRequest {
     Client(RemoteExecutionPolicyReadRequest),
     Node(NodeExecutionPolicyReadRequest),
@@ -178,6 +179,7 @@ impl PolicyReadRequest {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum VerifiedRead {
     Client(VerifiedRemoteExecutionPolicyRead),
     Node(VerifiedNodeExecutionPolicyRead),
@@ -908,10 +910,10 @@ impl Store {
         let (verified, cached, mut usage) =
             verify_record(&tx, &self.policy, &record, &local, principal, now)?;
         usage.record_metadata(&request)?;
-        if let Some(cached) = cached {
-            if cached.payload.request_cursor == request.cursor {
-                return finish_reader_response(params, json!({"page":cached}), usage, node_reader);
-            }
+        if let Some(cached) = cached
+            && cached.payload.request_cursor == request.cursor
+        {
+            return finish_reader_response(params, json!({"page":cached}), usage, node_reader);
         }
         ensure!(
             record.witness.is_none() && request.cursor == record.position.cursor,

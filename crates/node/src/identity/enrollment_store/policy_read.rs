@@ -25,6 +25,7 @@ use vibeface_secure::{
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 enum ReadCredential {
     BrowserDevice(Signed<EnrollmentOffer>),
     AccountNode(AccountNodeEnrollmentCredential),
@@ -470,10 +471,10 @@ impl Store {
             "enrollment policy page request changed"
         );
         let (cached, mut usage) = verify_record(&tx, &self.policy, &record, &local, &noise, now)?;
-        if let Some(cached) = cached {
-            if cached.page.payload.request_cursor == request.cursor {
-                return response(json!({"page":cached.page}), usage, params);
-            }
+        if let Some(cached) = cached
+            && cached.page.payload.request_cursor == request.cursor
+        {
+            return response(json!({"page":cached.page}), usage, params);
         }
         ensure!(
             record.witness.is_none() && request.cursor == record.position.cursor,
@@ -520,7 +521,7 @@ impl Store {
         let page = Signed::sign(
             EnrollmentPolicyPage {
                 version: AUTH_VERSION,
-                purpose: snapshot.purpose.clone(),
+                purpose: snapshot.purpose,
                 credential_hash: snapshot.credential_hash.clone(),
                 request_hash: snapshot.request_hash.clone(),
                 snapshot_id: snapshot.snapshot_id.clone(),
@@ -543,7 +544,7 @@ impl Store {
             let witness = Signed::sign(
                 EnrollmentPolicyWitness {
                     version: AUTH_VERSION,
-                    purpose: snapshot.purpose.clone(),
+                    purpose: snapshot.purpose,
                     credential_hash: snapshot.credential_hash.clone(),
                     request_hash: snapshot.request_hash.clone(),
                     snapshot_id: snapshot.snapshot_id.clone(),

@@ -410,6 +410,7 @@ impl Store {
             .transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_agent_session(
         &self,
         space: &str,

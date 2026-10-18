@@ -4,7 +4,7 @@ use super::{
 use crate::{crypto::LocalIdentity, model::*, store::Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::{Value, json};
+use serde_json::json;
 use vibeface_secure::authorization::{
     AUTH_VERSION, DeviceId, EventRef, ObjectHash, PublicKey, ResourceRef, Signed, SpaceId,
     execution_handoff::{

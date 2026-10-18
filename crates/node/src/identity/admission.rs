@@ -14,8 +14,8 @@ use crate::{
     scheduler,
     scheduling::{JobState, ManagerAttempt, SchedulerJob, scheduler_key},
     store::{
-        Store, canonical_resource, closure_hashes, has_blob_from, heads_from_events,
-        load_events_from, paths_overlap, validate_operation_binding_from,
+        Store, canonical_resource, closure_hashes, heads_from_events,
+        validate_operation_binding_from,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -418,6 +418,7 @@ fn source_matches(auth: &VerifiedAuthorization, source_body: &Value) -> Result<(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn consume_authorization_in(
     tx: &Transaction<'_>,
     policy: &PolicyState,
@@ -440,6 +441,7 @@ pub(crate) fn consume_authorization_in(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn consume_request_authorization_in(
     tx: &Transaction<'_>,
     policy: &PolicyState,
@@ -465,30 +467,7 @@ pub(crate) fn consume_request_authorization_in(
     )
 }
 
-pub(crate) fn consume_execution_dispatch_in(
-    tx: &Transaction<'_>,
-    policy: &PolicyState,
-    scoped: &TaskScopedAuthorization,
-    proof: &FreshnessProof,
-    transport: &TransportEvidence,
-    source_body: &Value,
-    operation_id: Option<&str>,
-    now_ms: u64,
-    dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
-) -> Result<AdmissionProof> {
-    consume_execution_request_dispatch_in(
-        tx,
-        policy,
-        scoped,
-        proof,
-        &RequestTransport::Existing(transport.clone()),
-        source_body,
-        operation_id,
-        now_ms,
-        dispatch,
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn consume_execution_request_dispatch_in(
     tx: &Transaction<'_>,
     policy: &PolicyState,
@@ -516,6 +495,7 @@ pub(crate) fn consume_execution_request_dispatch_in(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_authorization_with_facts_in(
     tx: &Transaction<'_>,
     policy: &PolicyState,
@@ -622,6 +602,7 @@ fn consume_authorization_with_facts_in(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn reconstruct_admission(
     connection: &Connection,
     policy: &PolicyState,
@@ -654,6 +635,7 @@ pub(crate) fn reconstruct_stored_admission(
     reconstruct_stored_admission_uncached(connection, policy, proof, facts)
 }
 
+#[cfg(test)]
 pub(crate) fn reconstruct_admission_uncached(
     connection: &Connection,
     policy: &PolicyState,
@@ -689,21 +671,7 @@ pub(crate) fn reconstruct_stored_admission_uncached(
     Ok(original.state().verify_original_admission(proof, facts)?)
 }
 
-pub(super) fn reconstruct_admission_at_current_heads(
-    policy: &PolicyState,
-    proof: &AdmissionProof,
-    facts: &RequestFacts,
-    transport: &TransportEvidence,
-) -> Result<Option<VerifiedAdmission>> {
-    validate_admission_evidence(proof, transport)?;
-    if !policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
-        return Ok(None);
-    }
-    Ok(Some(
-        policy.verified().verify_original_admission(proof, facts)?,
-    ))
-}
-
+#[cfg(test)]
 fn validate_admission_evidence(
     proof: &AdmissionProof,
     transport: &TransportEvidence,
@@ -956,9 +924,7 @@ pub(super) fn persisted_admission_facts(
         record.payload.host == proof.invocation.payload.audience.service,
         "historical request targets another resource host"
     );
-    let reference = if method == "agent_start" {
-        manager_field(body, "trigger")?
-    } else if manager_control {
+    let reference = if method == "agent_start" || manager_control {
         manager_field(body, "trigger")?
     } else if manager_output {
         manager_field(&body["sdk_session"], "session_id")?
@@ -1022,7 +988,7 @@ pub(super) fn persisted_admission_facts(
         let origin = super::services::resolve_agent_origin(
             policy,
             connection,
-            &state,
+            state,
             &events,
             reference,
             &heads,
@@ -1131,7 +1097,7 @@ pub(super) fn persisted_admission_facts(
         let origin = super::services::resolve_agent_origin(
             policy,
             connection,
-            &state,
+            state,
             &events,
             &session.session_id,
             &heads,
@@ -1165,6 +1131,7 @@ pub(super) fn persisted_admission_facts(
     Ok(facts)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_persisted_authorizations(
     connection: &Connection,
     policy: &PolicyState,
@@ -2384,6 +2351,7 @@ impl Store {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn claim_authorized_manager(
         &mut self,
         auth: &VerifiedAuthorization,
@@ -2645,6 +2613,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn accept_authorized_operation(
         &mut self,
         identity: &LocalIdentity,
@@ -2666,6 +2635,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_request_authorized_operation(
         &mut self,
         identity: &LocalIdentity,

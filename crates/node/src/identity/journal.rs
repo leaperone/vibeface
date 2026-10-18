@@ -46,8 +46,10 @@ pub(crate) struct AcceptedJournalCursor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AcceptedRecoveryEntry {
+    #[cfg(test)]
     pub(crate) entry_hash: ObjectHash,
     pub(crate) entry: JournalEntry,
+    #[cfg(test)]
     pub(crate) accepted_at_ms: u64,
 }
 
@@ -372,6 +374,7 @@ impl PolicyState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_journal_prefix(
         &self,
         snapshot: &AcceptedJournalSnapshot,
@@ -501,8 +504,10 @@ impl PolicyState {
             scanned += 1;
             if entry_matches_domains(&accepted.entry, domains) {
                 entry = Some(AcceptedRecoveryEntry {
+                    #[cfg(test)]
                     entry_hash: expected.clone(),
                     entry: accepted.entry.clone(),
+                    #[cfg(test)]
                     accepted_at_ms: accepted.received_at_ms,
                 });
                 break;
@@ -1678,7 +1683,7 @@ mod tests {
             .clone();
         assert!(
             PolicyState::default()
-                .prepare_network_update(&[genesis.clone()], NOW)
+                .prepare_network_update(std::slice::from_ref(&genesis), NOW)
                 .is_err()
         );
         let wrong = PolicyPin {
@@ -1688,7 +1693,7 @@ mod tests {
         };
         assert!(
             PolicyState::default()
-                .prepare_bootstrap(&[wrong.clone()], &[genesis], NOW)
+                .prepare_bootstrap(std::slice::from_ref(&wrong), &[genesis], NOW)
                 .is_err()
         );
         assert!(fixture.state.prepare_bootstrap(&[wrong], &[], NOW).is_err());
@@ -1724,7 +1729,7 @@ mod tests {
     fn commit_nonce_cannot_bind_another_proposal_or_commit_body() {
         let mut fixture = Fixture::new();
         let first = fixture.space_commit(7);
-        fixture.accept(&[first.clone()], NOW).unwrap();
+        fixture.accept(std::slice::from_ref(&first), NOW).unwrap();
         assert!(
             fixture
                 .state
@@ -1775,7 +1780,7 @@ mod tests {
         let entry = fixture.space_commit(7);
         let prepared = fixture
             .state
-            .prepare_network_update(&[entry.clone()], NOW)
+            .prepare_network_update(std::slice::from_ref(&entry), NOW)
             .unwrap();
         let transaction = fixture.connection.transaction().unwrap();
         let first = commit_in(&transaction, &prepared).unwrap();
@@ -1961,7 +1966,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .prepare_network_update(&[change.clone()], NOW + 100_000)
+                .prepare_network_update(std::slice::from_ref(&change), NOW + 100_000)
                 .is_err()
         );
         fixture.accept(&[change], NOW).unwrap();

@@ -10,8 +10,8 @@ use vibeface_secure::{
     Identity,
     authorization::{
         AUTH_VERSION, AccountDocument, AccountId, AccountRight, AuthenticatorManagementIntent,
-        AuthenticatorRecord, DeviceId, JournalEntry, Nonce, ObjectHash, PolicyDomain, PolicyStamp,
-        PublicKey, Signed, VerifiedPolicySet,
+        AuthenticatorRecord, DeviceId, JournalEntry, Nonce, ObjectHash, PolicyDomain, PublicKey,
+        Signed, VerifiedPolicySet,
         authenticator_management::authenticator_proposal_hash,
         enrollment::{
             AuthenticatorEnrollmentIntent, DeviceEnrollmentIntent, verify_authenticator_enrollment,
@@ -1569,8 +1569,8 @@ mod tests {
         Identity,
         authorization::{
             Actor, AuthorityBinding, Committed, DeviceCertificate, DeviceUse, FreshnessReceipt,
-            PasskeyClientEnrollment, PolicyCommit, PolicyPin, PublicKey, RecoveryPolicy,
-            enrollment::PasskeyEnrollmentProof,
+            PasskeyClientEnrollment, PolicyCommit, PolicyPin, PolicyStamp, PublicKey,
+            RecoveryPolicy, enrollment::PasskeyEnrollmentProof,
         },
     };
 

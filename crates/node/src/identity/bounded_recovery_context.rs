@@ -643,20 +643,20 @@ impl Store {
             "recovery request changed"
         );
         let cached = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
-        if let Some(cached) = &cached {
-            if cached.request_cursor == request.cursor {
-                let response = bounded_value(json!({"page":cached.page}))?;
-                check_read_usage(
-                    &self.policy,
-                    &record,
-                    Some(cached),
-                    None,
-                    serde_json::to_vec(params)?
-                        .len()
-                        .max(serde_json::to_vec(&response)?.len()),
-                )?;
-                return Ok(response);
-            }
+        if let Some(cached) = &cached
+            && cached.request_cursor == request.cursor
+        {
+            let response = bounded_value(json!({"page":cached.page}))?;
+            check_read_usage(
+                &self.policy,
+                &record,
+                Some(cached),
+                None,
+                serde_json::to_vec(params)?
+                    .len()
+                    .max(serde_json::to_vec(&response)?.len()),
+            )?;
+            return Ok(response);
         }
         ensure!(
             record.witness.is_none() && request.cursor == record.position.cursor,

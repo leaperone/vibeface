@@ -17,11 +17,10 @@ use serde_json::{Value, json};
 use vibeface_secure::{
     Identity,
     authorization::{
-        AUTH_VERSION, DeviceId, JournalEntry, Nonce, ObjectHash, PolicyDomain, PublicKey,
-        Signature, Signed,
+        AUTH_VERSION, JournalEntry, Nonce, ObjectHash, PublicKey, Signature, Signed,
         bootstrap::{
             NodeClaim,
-            recovery::cross_node::{self, CrossNodeRecoveryRequest},
+            recovery::cross_node::CrossNodeRecoveryRequest,
             recovery::stream::{self, *},
         },
     },
@@ -459,9 +458,12 @@ pub(crate) mod tests {
         test_support::{TestNetwork, now},
     };
     use vibeface_secure::authorization::{
-        AUTH_VERSION, Actor, Audience, CheckStage, Invocation, Nonce, ResourceRef, ServiceId,
-        TransportEvidence,
-        bootstrap::{self, VerifiedNodeClaim, recovery},
+        AUTH_VERSION, Actor, Audience, CheckStage, DeviceId, Invocation, Nonce, PolicyDomain,
+        ResourceRef, ServiceId, TransportEvidence,
+        bootstrap::{
+            self, VerifiedNodeClaim,
+            recovery::{self, cross_node},
+        },
         client_policy_import::AuthorizationSelection,
     };
 

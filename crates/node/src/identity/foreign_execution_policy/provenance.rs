@@ -8,10 +8,7 @@ use vibeface_secure::authorization::{
         VerifiedTaskCurrentPolicy, VerifiedTaskHistoryPolicy, VerifiedTaskOriginalAdmissionPolicy,
         begin_task_policy_import, from_task_original_admission, task_policy_source_from_retained,
     },
-    remote_execution_policy::{
-        RemoteExecutionPolicyReadRequest, RemoteExecutionPolicySnapshot,
-        RemoteExecutionPolicyWitness,
-    },
+    remote_execution_policy::{RemoteExecutionPolicySnapshot, RemoteExecutionPolicyWitness},
 };
 
 #[derive(Clone, Default)]
@@ -312,6 +309,7 @@ fn remote_body(body: &Value) -> bool {
         .any(|field| body.get(*field).is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn task_policy_for_binding_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -425,6 +423,7 @@ fn facts(invocation: &Signed<Invocation>, body: &Value) -> Result<RequestFacts> 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn task_policy_candidates_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -1357,6 +1356,7 @@ fn ensure_actual_budget() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_retained_import_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,

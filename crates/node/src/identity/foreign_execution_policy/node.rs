@@ -14,9 +14,7 @@ use vibeface_secure::authorization::{
         NodeTaskExecutionPolicyImport, TaskExecutionPolicyImport, VerifiedTaskCurrentPolicy,
         VerifiedTaskHistoryPolicy, VerifiedTaskOriginalAdmissionPolicy,
     },
-    remote_execution_policy::{
-        RemoteExecutionPolicyPage, RemoteExecutionPolicyPageRequest, RemoteExecutionPolicyWitness,
-    },
+    remote_execution_policy::{RemoteExecutionPolicyPage, RemoteExecutionPolicyWitness},
 };
 
 pub(crate) struct PendingNodeTaskRead {
@@ -105,6 +103,7 @@ fn current_node_source_in(
     Ok(raw)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn current_trust_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -202,6 +201,7 @@ impl Store {
         Ok((project, selection, context))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_node_task_policy_read(
         &mut self,
         identity: &LocalIdentity,
@@ -576,12 +576,6 @@ impl TaskPolicyImport {
             Self::Node(value) => value.append_page(page, now)?,
         };
         Ok(())
-    }
-    pub(super) fn page_request(&self) -> Result<RemoteExecutionPolicyPageRequest> {
-        Ok(match self {
-            Self::Account(value) => value.page_request()?,
-            Self::Node(value) => value.page_request(),
-        })
     }
     pub(super) fn finish_current(
         self,

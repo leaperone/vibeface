@@ -4,6 +4,7 @@ use vibeface_secure::authorization::{
     prepare::PrepareContext, remote_execution_policy::RemoteExecutionPolicySelection,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn current_execution_readonly_policy_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,

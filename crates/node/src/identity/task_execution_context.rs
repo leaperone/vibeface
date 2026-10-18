@@ -21,9 +21,11 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::{borrow::Cow, ops::Deref};
+#[cfg(test)]
+use vibeface_secure::authorization::TransportEvidence;
 use vibeface_secure::authorization::{
     Action, Actor, CheckStage, DeviceId, FreshnessChallenge, Invocation, Nonce, PublicKey,
-    RequestFacts, ServiceId, Signed, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
+    RequestFacts, ServiceId, Signed, VerifiedAuthorization, VerifiedPolicySet,
     node_execution_policy::{VerifiedTaskCurrentPolicy, VerifiedTaskOriginalAdmissionPolicy},
     prepare::PrepareContext,
     remote_execution_policy::{RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection},
@@ -386,16 +388,13 @@ impl<'a> OriginalAdmissionView<'a> {
             .map_or(self.primary.as_ref(), |task| task.state())
     }
 
-    pub(crate) fn primary_state(&self) -> &VerifiedPolicySet {
-        self.primary.as_ref()
-    }
-
     pub(crate) fn task_policy(&self) -> Option<&VerifiedTaskOriginalAdmissionPolicy> {
         self.task_policy.as_ref()
     }
 }
 
 impl Store {
+    #[cfg(test)]
     pub(crate) fn authorize_scoped_request_for_body(
         &self,
         identity: &LocalIdentity,
@@ -444,6 +443,7 @@ impl Store {
         Ok(scoped)
     }
 
+    #[cfg(test)]
     pub(crate) fn issue_scoped_freshness(
         &mut self,
         scoped: &TaskScopedAuthorization,

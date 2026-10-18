@@ -1099,6 +1099,7 @@ mod tests {
             })
         }
 
+        #[allow(clippy::type_complexity)]
         fn snapshot(&self) -> Result<(BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>, Value)> {
             let tables = self.store.connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?
                 .query_map([],|row| row.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;

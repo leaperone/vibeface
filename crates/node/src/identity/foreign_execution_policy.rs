@@ -395,6 +395,7 @@ pub(crate) fn approved_execution_trust_in(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn approved_execution_trust_with_pins_in(
     connection: &Connection,
     source: &PublicKey,
