@@ -2602,6 +2602,8 @@ impl VerifiedPolicySet {
         now_ms: u64,
         phase: AuthorizationPhase,
     ) -> Result<VerifiedAuthorization> {
+        // Destination proof dependencies remain freshness inputs after checking the source heads.
+        let mut transport_dependencies = std::mem::take(&mut budget.dependencies);
         let i = &signed.payload;
         require(
             i.version == AUTH_VERSION
@@ -2675,7 +2677,6 @@ impl VerifiedPolicySet {
             !i.action.requires_account() || matches!(i.actor, Actor::Account(_)),
             "action requires account actor",
         )?;
-        let mut transport_dependencies = BTreeMap::new();
         let prior_budget_dependencies = budget.dependencies.clone();
         match transport {
             InvocationTransport::Existing(transport) => match transport {
@@ -2871,6 +2872,7 @@ impl VerifiedPolicySet {
             dependencies.extend(transport_dependencies);
             self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
         }
+        budget.dependencies.extend(dependencies.clone());
         let dependencies = dependencies.into_values().collect();
         if let InvocationTransport::DirectedGateway { proof, .. } = transport {
             let mut usage = proof.proof_usage().clone();

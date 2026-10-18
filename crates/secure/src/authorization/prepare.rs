@@ -808,18 +808,21 @@ pub fn verify_remote_execution(
             .cloned()
             .map(|head| (head.domain.clone(), head))
             .collect();
-        for head in destination.heads() {
-            if let Some(previous) = heads.insert(head.domain.clone(), head.clone()) {
-                require(
-                    previous == *head,
-                    "remote policy dependencies have conflicting exact heads",
-                )?;
-            }
+        let mut budget = baseline.budget.clone();
+        if let Some(session) = &context.context.execution_session {
+            state.validate_certificate(
+                state.find_device(&session.target)?,
+                now,
+                &mut budget,
+                &mut heads,
+                &mut BTreeSet::new(),
+            )?;
         }
+        state.expand_authorities(now, &mut budget, &mut heads)?;
         let mut usage = execution_handoff::ExecutionProofUsage::default();
         client_policy_import::record_confirmed_client_policy_metadata(auth, &mut usage)?;
         execution.record_metadata(&mut usage)?;
-        usage.record_budget(&baseline.budget)?;
+        usage.record_budget(&budget)?;
         usage.record_budget(&destination.budget)?;
         usage.record_chain_depth(destination.grant_depth);
         usage.record_chain_depth(state.grant_chain(Some(&baseline.grant_leaf))?.len());
