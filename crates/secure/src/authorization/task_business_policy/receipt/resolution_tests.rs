@@ -2,6 +2,7 @@ use super::tests::{readonly_policy, revoke_writer};
 use super::*;
 use crate::authorization::{
     client_policy_import::require_confirmed_client_policy,
+    events::{AdmissionProof, StoredTransport},
     execution_handoff::{
         ExecutionHandoffResolution, ExecutionHandoffResolutionFreshness,
         ExecutionResolutionPurpose, execution_resolution_account_facts, execution_resolution_facts,
