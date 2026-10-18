@@ -452,10 +452,10 @@ impl PolicyProof<'_> {
                 if let Grantee::MembersOf(selector) = &grant.payload.grantee {
                     self.selector(selector, &actor)?;
                 }
-            }
-            for hash in &document.grants {
-                if !previous.payload.grants.contains(hash) {
-                    self.grant(hash, 1)?;
+                for hash in &document.grants {
+                    if !previous.payload.grants.contains(hash) {
+                        self.grant(hash, 1)?;
+                    }
                 }
             }
         }
@@ -752,5 +752,52 @@ mod tests {
             policy_entry_usage(&state, &entry),
             Err(AuthorizationError::BudgetExceeded)
         ));
+    }
+
+    #[test]
+    fn root_registration_meters_cached_grant_metadata_after_its_issuer_is_revoked() {
+        let mut fixture = Fixture::new();
+        let space = SpaceId::personal(&fixture.account);
+        let parent_hash = fixture.state.space(&space).unwrap().grants[0].clone();
+        let mut grant = fixture.state.grants[&parent_hash].payload.clone();
+        grant.parent = Some(parent_hash);
+        grant.remaining_delegations -= 1;
+        grant.issued_under = fixture
+            .state
+            .head(&PolicyDomain::Space(space.clone()))
+            .unwrap()
+            .clone();
+        grant.nonce = Nonce::from_bytes([71; 32]);
+        let user = Identity::from_secret_hex(&hex::encode([4; 32])).unwrap();
+        let child = fixture
+            .state
+            .install_grant(Signed::sign(grant, &user).unwrap(), 1000)
+            .unwrap();
+        let device = DeviceId::from_key(&PublicKey::of(&user));
+        let mut account = next(&fixture);
+        account
+            .devices
+            .retain(|hash| fixture.state.devices[hash].payload.device != device);
+        account.revoked_devices.push(device.clone());
+        account.revoked_devices.sort();
+        fixture
+            .state
+            .install_account(Signed::sign(account, &fixture.root).unwrap())
+            .unwrap();
+        assert!(fixture.state.find_device(&device).is_err());
+        let mut document = fixture.state.space(&space).unwrap().clone();
+        document.previous = fixture.state.head(&PolicyDomain::Space(space)).cloned();
+        document.sequence += 1;
+        document.grants.push(child);
+        document.grants.sort();
+        let proposal = Signed::sign(document, &fixture.root).unwrap();
+        let entry = JournalEntry::Space(proposal.clone());
+        let scope = SignatureVerification::new();
+        let usage = scope
+            .run(|| policy_entry_usage(&fixture.state, &entry))
+            .unwrap();
+        assert_eq!(scope.counts().actual_verifications, 0);
+        assert_eq!(usage.counts().unique_signed_objects, 6);
+        fixture.state.install_space(proposal).unwrap();
     }
 }
