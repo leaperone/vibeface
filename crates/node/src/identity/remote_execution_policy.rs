@@ -747,12 +747,15 @@ mod tests {
         Ok(result)
     }
 
-    fn read_intent(fixture: &Fixture) -> Result<Signed<RemoteExecutionPolicyReadIntent>> {
-        let mut gateway = fixture.project.memory()?;
-        let gateway_identity = LocalIdentity::generate();
+    fn read_intent(fixture: &mut Fixture) -> Result<Signed<RemoteExecutionPolicyReadIntent>> {
+        let gateway_network = fixture.project.same_account_node()?;
+        fixture
+            .store
+            .install_policy_journal(&gateway_network.bundle.journal, now())?;
+        let mut gateway = gateway_network.memory()?;
         let source = verified_client_policy_for_test(
             &mut gateway,
-            &gateway_identity,
+            &gateway_network.node,
             &fixture.project.client,
             &fixture.project.account,
             AuthorizationSelection {
@@ -825,7 +828,7 @@ mod tests {
     fn remote_policy_delegates_from_current_b_without_its_gateway_context_and_streams_only_c_references()
     -> Result<()> {
         let mut fixture = Fixture::new()?;
-        let intent = read_intent(&fixture)?;
+        let intent = read_intent(&mut fixture)?;
         assert!(
             metadata(
                 &fixture.store.connection,
@@ -1067,7 +1070,7 @@ mod tests {
     fn remote_policy_source_rejects_wrong_noise_pending_task_and_oversized_current_binding()
     -> Result<()> {
         let mut fixture = Fixture::new()?;
-        let intent = read_intent(&fixture)?;
+        let intent = read_intent(&mut fixture)?;
         let params = serde_json::to_value(&intent)?;
         let key = delegation_key(&intent);
         assert!(
@@ -1125,7 +1128,7 @@ mod tests {
     fn remote_policy_source_rechecks_the_current_binding_and_client_after_a_delegation()
     -> Result<()> {
         let mut fixture = Fixture::new()?;
-        let mut intent = read_intent(&fixture)?.payload;
+        let mut intent = read_intent(&mut fixture)?.payload;
         intent.expected_action = Action::ExecutionSend;
         let event: crate::model::Event = serde_json::from_str(&fixture.task.canonical_body)?;
         let crate::model::EventBody::TaskCreated { task_id, .. } = event.body else {
@@ -1203,7 +1206,7 @@ mod tests {
         )?;
         assert!(fixture.task.canonical_body.len() > MAX_PROOF_BYTES);
         assert!(fixture.task.canonical_body.len() < crate::model::MAX_EVENT_BYTES);
-        let intent = read_intent(&fixture)?;
+        let intent = read_intent(&mut fixture)?;
         let local = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
         let mut usage = ExecutionProofUsage::default();
         carrier(|| check_source_task(&fixture.store.connection, &intent, &local, &mut usage))?;
