@@ -369,7 +369,7 @@ impl TaskBusinessOperationCheck {
             .expires_at_ms
             .min(self.authorization.expires_at_ms());
         require(now < expires, "Task operation receipt authority expired")?;
-        let mut receipts = Vec::new();
+        let mut currents = Vec::new();
         let hash = challenge.hash()?;
         for head in &self.primary_heads {
             require(
@@ -389,18 +389,23 @@ impl TaskBusinessOperationCheck {
                         && authority.service == ServiceId::from_key(&local_c),
                     "Task operation executor authority changed its service or device",
                 )?;
-                receipts.push(Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: head.clone(),
-                        challenge_hash: hash.clone(),
-                        issued_at_ms: now,
-                        expires_at_ms: expires,
-                    },
-                    identity,
-                )?);
+                currents.push(head.clone());
             }
         }
+        let receipts = if currents.is_empty() {
+            Vec::new()
+        } else {
+            currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+            let receipt = FreshnessReceipt {
+                version: AUTH_VERSION,
+                currents,
+                challenge_hash: hash,
+                issued_at_ms: now,
+                expires_at_ms: expires,
+            };
+            receipt.validate_currents()?;
+            vec![Signed::sign(receipt, identity)?]
+        };
         carrier(&receipts)?;
         let mut usage = self.usage.clone();
         usage.record_metadata(challenge)?;
@@ -592,21 +597,29 @@ mod tests {
         now: u64,
         expires: u64,
     ) -> Vec<Signed<FreshnessReceipt>> {
-        heads
-            .iter()
-            .map(|head| {
-                let authority = match &head.domain {
-                    PolicyDomain::Account(id) => &state.account(id).unwrap().authority,
-                    PolicyDomain::Space(id) => &state.space(id).unwrap().authority,
-                };
+        let mut batches: BTreeMap<PublicKey, Vec<PolicyStamp>> = BTreeMap::new();
+        for head in heads {
+            let authority = match &head.domain {
+                PolicyDomain::Account(id) => &state.account(id).unwrap().authority,
+                PolicyDomain::Space(id) => &state.space(id).unwrap().authority,
+            };
+            batches
+                .entry(authority.public_key.clone())
+                .or_default()
+                .push(head.clone());
+        }
+        batches
+            .into_iter()
+            .map(|(key, mut currents)| {
+                currents.sort_by(|left, right| left.domain.cmp(&right.domain));
                 let signer = [&fixture.project_node, &fixture.executor]
                     .into_iter()
-                    .find(|identity| PublicKey::of(identity) == authority.public_key)
+                    .find(|identity| PublicKey::of(identity) == key)
                     .unwrap();
                 Signed::sign(
                     FreshnessReceipt {
                         version: AUTH_VERSION,
-                        current: head.clone(),
+                        currents,
                         challenge_hash: challenge_hash.clone(),
                         issued_at_ms: now,
                         expires_at_ms: expires,
@@ -797,7 +810,12 @@ mod tests {
                 .unwrap();
             assert!(!local.is_empty());
             assert!(local.iter().all(|receipt| {
-                receipt.issuer == c_key && check.primary_heads().contains(&receipt.payload.current)
+                receipt.issuer == c_key
+                    && receipt
+                        .payload
+                        .currents
+                        .iter()
+                        .all(|head| check.primary_heads().contains(head))
             }));
             let mut all = receipts(
                 state.state(),

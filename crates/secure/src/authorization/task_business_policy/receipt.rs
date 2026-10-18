@@ -498,22 +498,19 @@ impl VerifiedTaskBusinessReceiptAuthority {
                 && now < self.expires_at_ms,
             "Task business receipts require their freshly verified source authority",
         )?;
-        let receipts = self
-            .signing_heads
-            .iter()
-            .map(|head| {
-                Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: head.clone(),
-                        challenge_hash: self.challenge_hash.clone(),
-                        issued_at_ms: now,
-                        expires_at_ms: self.expires_at_ms,
-                    },
-                    identity,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let receipts = if self.signing_heads.is_empty() {
+            Vec::new()
+        } else {
+            let receipt = FreshnessReceipt {
+                version: AUTH_VERSION,
+                currents: self.signing_heads.clone(),
+                challenge_hash: self.challenge_hash.clone(),
+                issued_at_ms: now,
+                expires_at_ms: self.expires_at_ms,
+            };
+            receipt.validate_currents()?;
+            vec![Signed::sign(receipt, identity)?]
+        };
         carrier(&receipts)?;
         let mut usage = self.usage.clone();
         for receipt in &receipts {
@@ -740,7 +737,7 @@ mod tests {
                     Signed::sign(
                         FreshnessReceipt {
                             version: AUTH_VERSION,
-                            current: head.clone(),
+                            currents: vec![head.clone()],
                             challenge_hash: challenge.hash().unwrap(),
                             issued_at_ms: now,
                             expires_at_ms: authority.expires_at_ms(),
@@ -917,7 +914,7 @@ mod tests {
                     Signed::sign(
                         FreshnessReceipt {
                             version: AUTH_VERSION,
-                            current: head.clone(),
+                            currents: vec![head.clone()],
                             challenge_hash: challenge.hash().unwrap(),
                             issued_at_ms: now,
                             expires_at_ms: authority.expires_at_ms(),

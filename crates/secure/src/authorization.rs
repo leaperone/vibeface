@@ -853,12 +853,25 @@ impl CheckStage {
 #[serde(deny_unknown_fields)]
 pub struct FreshnessReceipt {
     pub version: u16,
-    pub current: PolicyStamp,
+    pub currents: Vec<PolicyStamp>,
     pub challenge_hash: ObjectHash,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
 }
-signed_object!(FreshnessReceipt, "freshness-v2");
+signed_object!(FreshnessReceipt, "freshness-batch-v2");
+impl FreshnessReceipt {
+    pub fn validate_currents(&self) -> Result<()> {
+        require(
+            !self.currents.is_empty()
+                && self.currents.len() <= MAX_POLICY_DOMAINS
+                && self
+                    .currents
+                    .windows(2)
+                    .all(|pair| pair[0].domain < pair[1].domain),
+            "invalid freshness batch policy set",
+        )
+    }
+}
 
 /// Construct from the parsed method and database-owned resource mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3070,46 +3083,61 @@ impl VerifiedPolicySet {
             "write requires execution freshness",
         )?;
         let challenge_hash = challenge.hash()?;
-        if receipts.len() != auth.dependencies.len() {
-            return Err(AuthorizationError::NeedFreshness(
-                auth.dependencies.iter().map(|s| s.domain.clone()).collect(),
-            ));
-        }
         let mut seen = BTreeSet::new();
         let mut expires_at_ms = challenge.expires_at_ms.min(auth.expires_at_ms());
         let mut budget = auth.budget.clone();
         for signed in receipts {
             budget.verify(signed)?;
             let r = &signed.payload;
+            r.validate_currents()?;
             require(
-                r.version == AUTH_VERSION
-                    && r.challenge_hash == challenge_hash
-                    && auth.dependencies.contains(&r.current)
-                    && seen.insert(r.current.domain.clone()),
+                r.version == AUTH_VERSION && r.challenge_hash == challenge_hash,
                 "freshness receipt mismatch",
             )?;
-            let authority = match &r.current.domain {
-                PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
-                PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
-            }
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing freshness authority",
-            ))?;
-            if self
-                .devices
-                .values()
-                .any(|c| c.payload.device == authority.device)
-            {
-                self.find_device(&authority.device)?;
+            for current in &r.currents {
+                require(
+                    auth.dependencies.contains(current)
+                        && self.head(&current.domain) == Some(current)
+                        && seen.insert(current.domain.clone()),
+                    "freshness receipt mismatch",
+                )?;
+                let authority = match &current.domain {
+                    PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
+                    PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+                }
+                .ok_or(AuthorizationError::InvalidProof(
+                    "missing freshness authority",
+                ))?;
+                if self
+                    .devices
+                    .values()
+                    .any(|c| c.payload.device == authority.device)
+                {
+                    let certificate = self.find_device(&authority.device)?;
+                    require(
+                        certificate.payload.subject == Actor::Service(authority.service.clone()),
+                        "authority certificate is not its service",
+                    )?;
+                }
+                require(
+                    signed.issuer == authority.public_key
+                        && authority.device == DeviceId::from_key(&signed.issuer)
+                        && authority.service == ServiceId::from_key(&signed.issuer),
+                    "receipt is not from current authority",
+                )?;
             }
             require(
-                signed.issuer == authority.public_key
-                    && r.issued_at_ms >= challenge.issued_at_ms
+                r.issued_at_ms >= challenge.issued_at_ms
                     && r.expires_at_ms <= challenge.expires_at_ms,
                 "receipt is not from current authority",
             )?;
             validate_window(r.issued_at_ms, r.expires_at_ms, now_ms)?;
             expires_at_ms = expires_at_ms.min(r.expires_at_ms);
+        }
+        if seen.len() != auth.dependencies.len() {
+            return Err(AuthorizationError::NeedFreshness(
+                auth.dependencies.iter().map(|s| s.domain.clone()).collect(),
+            ));
         }
         require(
             match auth.phase {
@@ -3519,24 +3547,19 @@ mod tests {
             commit: Signed<PolicyCommit>,
         ) -> Committed<SpaceDocument> {
             let challenge = commit.challenge_hash().unwrap();
-            let receipts = commit
-                .payload
-                .dependencies
-                .iter()
-                .map(|current| {
-                    Signed::sign(
-                        FreshnessReceipt {
-                            version: AUTH_VERSION,
-                            current: current.clone(),
-                            challenge_hash: challenge.clone(),
-                            issued_at_ms: NOW,
-                            expires_at_ms: NOW + 10_000,
-                        },
-                        &self.authority,
-                    )
-                    .unwrap()
-                })
-                .collect();
+            let receipts = vec![
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        currents: commit.payload.dependencies.clone(),
+                        challenge_hash: challenge,
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 10_000,
+                    },
+                    &self.authority,
+                )
+                .unwrap(),
+            ];
             Committed {
                 proposal,
                 commit,
@@ -3548,22 +3571,19 @@ mod tests {
             auth: &VerifiedAuthorization,
             challenge: &FreshnessChallenge,
         ) -> Vec<Signed<FreshnessReceipt>> {
-            auth.dependencies()
-                .iter()
-                .map(|stamp| {
-                    Signed::sign(
-                        FreshnessReceipt {
-                            version: AUTH_VERSION,
-                            current: stamp.clone(),
-                            challenge_hash: challenge.hash().unwrap(),
-                            issued_at_ms: NOW,
-                            expires_at_ms: NOW + 10_000,
-                        },
-                        &self.authority,
-                    )
-                    .unwrap()
-                })
-                .collect()
+            vec![
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        currents: auth.dependencies().to_vec(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 10_000,
+                    },
+                    &self.authority,
+                )
+                .unwrap(),
+            ]
         }
     }
     #[test]
@@ -4045,7 +4065,7 @@ mod tests {
             .unwrap()
             .first()
             .unwrap();
-        changed[0].payload.current = account_stamp(old).unwrap();
+        changed[0].payload.currents[0] = account_stamp(old).unwrap();
         changed[0] = Signed::sign(changed[0].payload.clone(), &f.authority).unwrap();
         assert_eq!(
             f.state
@@ -4061,6 +4081,145 @@ mod tests {
                 .unwrap_err(),
             AuthorizationError::InvalidProof("invalid validity interval")
         );
+    }
+    #[test]
+    fn freshness_batches_require_exact_sorted_heads_and_each_current_authority() {
+        let mut f = Fixture::new();
+        let auth = f.check(f.invocation(), &f.user, NOW).unwrap();
+        let challenge = FreshnessChallenge::new(
+            &auth,
+            CheckStage::Admit,
+            Nonce::from_bytes([11; 32]),
+            NOW,
+            NOW + 10_000,
+        )
+        .unwrap();
+        let receipts = f.receipts(&auth, &challenge);
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].payload.currents.len() > 1);
+        let verified = f
+            .state
+            .verify_freshness(&auth, &challenge, &receipts, NOW)
+            .unwrap();
+        assert_eq!(verified.dependencies(), auth.dependencies());
+        assert_eq!(
+            verified.usage.counts().unique_signatures,
+            auth.budget.signatures.len() + auth.budget.external_signatures.len() + 1
+        );
+        let sign = |currents| {
+            Signed::sign(
+                FreshnessReceipt {
+                    currents,
+                    ..receipts[0].payload.clone()
+                },
+                &f.authority,
+            )
+            .unwrap()
+        };
+        let heads = &receipts[0].payload.currents;
+        for invalid in [
+            Vec::new(),
+            vec![heads[0].clone(); MAX_POLICY_DOMAINS + 1],
+            heads.iter().rev().cloned().collect(),
+            vec![heads[0].clone(), heads[0].clone()],
+        ] {
+            assert!(matches!(
+                f.state
+                    .verify_freshness(&auth, &challenge, &[sign(invalid)], NOW),
+                Err(AuthorizationError::InvalidProof(
+                    "invalid freshness batch policy set"
+                ))
+            ));
+        }
+        let missing = sign(heads[1..].to_vec());
+        assert!(matches!(
+            f.state.verify_freshness(&auth, &challenge, &[missing], NOW),
+            Err(AuthorizationError::NeedFreshness(_))
+        ));
+        let duplicate = sign(vec![heads[0].clone()]);
+        assert_eq!(
+            f.state
+                .verify_freshness(&auth, &challenge, &[receipts[0].clone(), duplicate], NOW)
+                .unwrap_err(),
+            AuthorizationError::InvalidProof("freshness receipt mismatch")
+        );
+        let mut extra = heads.clone();
+        let mut foreign = heads[0].clone();
+        foreign.domain = PolicyDomain::Account(AccountId::from_root(&PublicKey::of(&key(24))));
+        extra.push(foreign);
+        extra.sort_by(|left, right| left.domain.cmp(&right.domain));
+        assert_eq!(
+            f.state
+                .verify_freshness(&auth, &challenge, &[sign(extra)], NOW)
+                .unwrap_err(),
+            AuthorizationError::InvalidProof("freshness receipt mismatch")
+        );
+        let mut tampered = receipts.clone();
+        tampered[0].payload.currents[0].sequence += 1;
+        assert!(
+            f.state
+                .verify_freshness(&auth, &challenge, &tampered, NOW)
+                .is_err()
+        );
+        let mut legacy_domain = receipts.clone();
+        legacy_domain[0].signature = Signature::parse(
+            &f.authority
+                .sign("freshness-v2", &legacy_domain[0].signing_bytes().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            f.state
+                .verify_freshness(&auth, &challenge, &legacy_domain, NOW)
+                .is_err()
+        );
+
+        let other_authority = key(25);
+        f.update_space(|document| {
+            document.authority = AuthorityBinding::from_key(PublicKey::of(&other_authority));
+            document.authority_epoch += 1;
+            document.sequence = 0;
+        });
+        let auth = f.check(f.invocation(), &f.user, NOW).unwrap();
+        let challenge = FreshnessChallenge::new(
+            &auth,
+            CheckStage::Admit,
+            Nonce::from_bytes([12; 32]),
+            NOW,
+            NOW + 10_000,
+        )
+        .unwrap();
+        let mixed = f.receipts(&auth, &challenge);
+        assert_eq!(
+            f.state
+                .verify_freshness(&auth, &challenge, &mixed, NOW)
+                .unwrap_err(),
+            AuthorizationError::InvalidProof("receipt is not from current authority")
+        );
+        let split = auth
+            .dependencies()
+            .iter()
+            .map(|head| {
+                let identity = match head.domain {
+                    PolicyDomain::Account(_) => &f.authority,
+                    PolicyDomain::Space(_) => &other_authority,
+                };
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        currents: vec![head.clone()],
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 10_000,
+                    },
+                    identity,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        f.state
+            .verify_freshness(&auth, &challenge, &split, NOW)
+            .unwrap();
     }
     #[test]
     fn root_governance_cannot_be_replaced_by_authority_or_recovery_self_assignment() {
@@ -5290,7 +5449,7 @@ mod tests {
         let receipt = Signed::sign(
             FreshnessReceipt {
                 version: AUTH_VERSION,
-                current: head,
+                currents: vec![head],
                 challenge_hash: commit.challenge_hash().unwrap(),
                 issued_at_ms: NOW,
                 expires_at_ms: NOW + 10_000,
@@ -5377,23 +5536,19 @@ mod tests {
             now + 10_000,
         )
         .unwrap();
-        let receipts: Vec<_> = renewed
-            .dependencies()
-            .iter()
-            .map(|current| {
-                Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: current.clone(),
-                        challenge_hash: challenge.hash().unwrap(),
-                        issued_at_ms: now,
-                        expires_at_ms: now + 10_000,
-                    },
-                    &f.authority,
-                )
-                .unwrap()
-            })
-            .collect();
+        let receipts = vec![
+            Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    currents: renewed.dependencies().to_vec(),
+                    challenge_hash: challenge.hash().unwrap(),
+                    issued_at_ms: now,
+                    expires_at_ms: now + 10_000,
+                },
+                &f.authority,
+            )
+            .unwrap(),
+        ];
         assert_eq!(
             f.state
                 .verify_freshness(&renewed, &challenge, &receipts, now)
@@ -6533,36 +6688,45 @@ impl VerifiedPolicySet {
             commit.payload.dependencies == expected,
             "policy commit dependency set mismatch",
         )?;
-        if receipts.len() != expected.len() {
-            return Err(AuthorizationError::NeedFreshness(
-                expected.into_iter().map(|s| s.domain).collect(),
-            ));
-        }
         let hash = commit.challenge_hash()?;
         let mut seen = BTreeSet::new();
         for signed in receipts {
             budget.verify(signed)?;
             let r = &signed.payload;
+            r.validate_currents()?;
             require(
                 r.version == AUTH_VERSION
                     && r.challenge_hash == hash
-                    && expected.contains(&r.current)
-                    && seen.insert(r.current.domain.clone())
                     && r.issued_at_ms >= commit.payload.issued_at_ms
                     && r.issued_at_ms <= commit.payload.accepted_at_ms
                     && r.expires_at_ms <= commit.payload.expires_at_ms,
                 "policy freshness receipt mismatch",
             )?;
             validate_window(r.issued_at_ms, r.expires_at_ms, now_ms)?;
-            let authority = match &r.current.domain {
-                PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
-                PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+            for current in &r.currents {
+                require(
+                    expected.contains(current)
+                        && self.head(&current.domain) == Some(current)
+                        && seen.insert(current.domain.clone()),
+                    "policy freshness receipt mismatch",
+                )?;
+                let authority = match &current.domain {
+                    PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
+                    PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+                }
+                .ok_or(AuthorizationError::PolicyConflict)?;
+                require(
+                    signed.issuer == authority.public_key
+                        && authority.device == DeviceId::from_key(&signed.issuer)
+                        && authority.service == ServiceId::from_key(&signed.issuer),
+                    "policy receipt is not from current authority",
+                )?;
             }
-            .ok_or(AuthorizationError::PolicyConflict)?;
-            require(
-                signed.issuer == authority.public_key,
-                "policy receipt is not from current authority",
-            )?;
+        }
+        if seen.len() != expected.len() {
+            return Err(AuthorizationError::NeedFreshness(
+                expected.into_iter().map(|s| s.domain).collect(),
+            ));
         }
         Ok(())
     }
