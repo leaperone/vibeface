@@ -1,4 +1,7 @@
-use super::{admission::reconstruct_admission, journal::PolicyState, policy::FreshnessProof};
+use super::{
+    admission::reconstruct_admission, journal::PolicyState, policy::FreshnessProof,
+    task_execution_context::OriginalAdmissionView,
+};
 use crate::{
     crypto::{self, LocalIdentity},
     model::{
@@ -105,6 +108,7 @@ fn execution_device(
 }
 
 pub(crate) fn verify_event_envelope(
+    connection: &Connection,
     policy: &PolicyState,
     space: &str,
     envelope: &SignedEvent,
@@ -115,16 +119,11 @@ pub(crate) fn verify_event_envelope(
     );
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     let proof = admission(&event);
-    let current = policy.verified();
-    let historical = if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
-        None
-    } else {
-        Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
-    };
+    let original = OriginalAdmissionView::load(connection, policy, proof)?;
     crypto::verify_signed_event(
         space,
         envelope,
-        audience_key(historical.as_ref().unwrap_or(current), proof)?.as_str(),
+        audience_key(original.state(), proof)?.as_str(),
     )
 }
 
@@ -799,25 +798,8 @@ pub(crate) fn validate_event_evidence(
     events: &BTreeMap<String, StoredEvent>,
 ) -> Result<EventEvidenceStatus> {
     let proof = admission(event);
-    let state = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
-    validate_event_evidence_in_state(policy, connection, &state, event, events, false)
-}
-
-fn validate_local_event_evidence(
-    policy: &PolicyState,
-    connection: &Connection,
-    event: &Event,
-    events: &BTreeMap<String, StoredEvent>,
-) -> Result<EventEvidenceStatus> {
-    let state = policy.verified();
-    if policy.current_heads_at(
-        &admission(event).challenge.policies,
-        admission(event).admitted_at_ms,
-    )? {
-        validate_event_evidence_in_state(policy, connection, state, event, events, true)
-    } else {
-        validate_event_evidence(policy, connection, event, events)
-    }
+    let original = OriginalAdmissionView::load(connection, policy, proof)?;
+    validate_event_evidence_in_state(policy, connection, original.state(), event, events)
 }
 
 fn validate_event_evidence_in_state(
@@ -826,19 +808,18 @@ fn validate_event_evidence_in_state(
     state: &VerifiedPolicySet,
     event: &Event,
     events: &BTreeMap<String, StoredEvent>,
-    current_heads: bool,
 ) -> Result<EventEvidenceStatus> {
     let proof = admission(event);
     let now = u64::try_from(event.created_at_ms).context("event creation time is negative")?;
     ensure!(now >= proof.admitted_at_ms, "event predates admission");
     ensure!(
-        event.author == crypto::fingerprint(audience_key(&state, proof)?.as_str())?,
+        event.author == crypto::fingerprint(audience_key(state, proof)?.as_str())?,
         "event author is not the admitted audience"
     );
     let Some(ancestors) = dependency_closure(event, events)? else {
         return Ok(EventEvidenceStatus::Pending);
     };
-    let Some(facts) = historical_facts(&state, event, events, &ancestors)? else {
+    let Some(facts) = historical_facts(state, event, events, &ancestors)? else {
         return Ok(EventEvidenceStatus::Pending);
     };
     let transport = proof.transport.clone().into_evidence();
@@ -928,23 +909,11 @@ pub(crate) fn event_authorization_in_view(
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
     let proof = admission(event);
-    let current = policy.verified();
-    let current_heads = policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)?;
-    let retained = if current_heads {
-        None
-    } else {
-        Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
-    };
-    let historical = retained.as_ref().unwrap_or(current);
+    let original = OriginalAdmissionView::load(connection, policy, proof)?;
+    let historical = original.state();
     ensure!(
-        validate_event_evidence_in_state(
-            policy,
-            connection,
-            historical,
-            event,
-            events,
-            current_heads,
-        )? == EventEvidenceStatus::Valid,
+        validate_event_evidence_in_state(policy, connection, historical, event, events)?
+            == EventEvidenceStatus::Valid,
         "event has incomplete authorization evidence"
     );
     let ancestors = dependency_closure(event, events)?.context("event history is incomplete")?;
@@ -1009,7 +978,7 @@ pub(super) fn retained_operation_dispatch_in(
     );
     validate_retained_event_dependencies_in(connection, &stored.envelope)?;
     ensure!(
-        verify_event_envelope(policy, space, &stored.envelope)? == stored.event,
+        verify_event_envelope(connection, policy, space, &stored.envelope)? == stored.event,
         "dispatch signature differs from its admitted event"
     );
     Ok(Some(stored.envelope.clone()))
@@ -1049,8 +1018,12 @@ pub(crate) fn persisted_admission_facts(
             continue;
         }
         ensure!(
-            verify_event_envelope(policy, &stored.event.network_id, &stored.envelope)?
-                == stored.event,
+            verify_event_envelope(
+                connection,
+                policy,
+                &stored.event.network_id,
+                &stored.envelope
+            )? == stored.event,
             "accepted event evidence differs from signed envelope"
         );
         let expected = expected_events(
@@ -1064,19 +1037,13 @@ pub(crate) fn persisted_admission_facts(
                 .any(|(body, blobs)| body == &stored.event.body && blobs == &stored.event.blobs),
             "accepted event business content differs from signed request"
         );
-        let current = policy.verified();
-        let retained =
-            if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
-                None
-            } else {
-                Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
-            };
-        let state = retained.as_ref().unwrap_or(current);
+        let original = OriginalAdmissionView::load(connection, policy, proof)?;
+        let state = original.state();
         let ancestors = dependency_closure(&stored.event, &events)?
             .context("accepted event causal history is missing")?;
-        let current = historical_facts(&state, &stored.event, &events, &ancestors)?
+        let current = historical_facts(state, &stored.event, &events, &ancestors)?
             .context("accepted event resource history is missing")?;
-        validate_sdk_parent(policy, connection, &state, &stored.event, &events, &current)?;
+        validate_sdk_parent(policy, connection, state, &stored.event, &events, &current)?;
         ensure!(
             facts.as_ref().is_none_or(|facts| facts == &current),
             "accepted events disagree about original request facts"
@@ -1150,8 +1117,10 @@ pub(super) fn historical_event_dependencies_in(
     )?;
     if events.values().any(|stored| stored.status != "ready") {
         for stored in events.values() {
-            ensure!(verify_event_envelope(policy, space, &stored.envelope)? == stored.event,
-                "historical event differs from its signed envelope");
+            ensure!(
+                verify_event_envelope(connection, policy, space, &stored.envelope)? == stored.event,
+                "historical event differs from its signed envelope"
+            );
         }
     }
     Ok(events)
@@ -1177,7 +1146,12 @@ fn retained_event_dependencies_at_readiness_in(
             "retained request history belongs to another resource or scope"
         );
         ready_observation_dependencies_in(
-            connection, &source.envelope, "", "", vec![source.envelope.hash.clone()], require_ready,
+            connection,
+            &source.envelope,
+            "",
+            "",
+            vec![source.envelope.hash.clone()],
+            require_ready,
         )?;
     }
     let selected = closure_hashes(&events, roots);
@@ -1224,7 +1198,8 @@ fn append_admitted_events_in(
                 "task creation has incomplete authorization evidence"
             );
             ensure!(
-                verify_event_envelope(policy, space, &created.envelope)? == created.event,
+                verify_event_envelope(connection, policy, space, &created.envelope)?
+                    == created.event,
                 "task creation envelope differs from its admitted event"
             );
             expected.remove(0);
@@ -1252,7 +1227,8 @@ fn append_admitted_events_in(
                         continue;
                     }
                     ensure!(
-                        verify_event_envelope(policy, space, &prior.envelope)? == prior.event
+                        verify_event_envelope(connection, policy, space, &prior.envelope)?
+                            == prior.event
                             && validate_event_evidence(policy, connection, &prior.event, &events)?
                                 == EventEvidenceStatus::Valid,
                         "existing task decision has incomplete authorization evidence"
@@ -1382,8 +1358,7 @@ fn append_event_in(
     let envelope = identity.sign_event(event)?;
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     ensure!(
-        validate_local_event_evidence(policy, connection, &event, &events)?
-            == EventEvidenceStatus::Valid,
+        validate_event_evidence(policy, connection, &event, &events)? == EventEvidenceStatus::Valid,
         "event has incomplete authorization evidence"
     );
     connection.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'ready')",
@@ -2457,6 +2432,7 @@ mod tests {
         resign(&mut fixture)?;
         let message = append_fixture(&mut fixture)?.remove(0);
         let event = verify_event_envelope(
+            &fixture.connection,
             &fixture.policy,
             fixture.auth.resource().space.as_str(),
             &message,
@@ -2499,6 +2475,7 @@ mod tests {
         let forged = outsider.sign_event(changed)?;
         assert!(
             verify_event_envelope(
+                &fixture.connection,
                 &fixture.policy,
                 fixture.auth.resource().space.as_str(),
                 &forged
@@ -2523,11 +2500,11 @@ mod tests {
         let changed = append_fixture(&mut fixture)?.remove(0);
         let event: Event = serde_json::from_str(&changed.canonical_body)?;
         let events = load_events_from(&fixture.connection, &event.network_id)?;
-        let historical = fixture
-            .policy
-            .historical(&admission(&event).challenge.policies, NOW)?;
+        let original_view =
+            OriginalAdmissionView::load(&fixture.connection, &fixture.policy, admission(&event))?;
+        let historical = original_view.state();
         let facts = historical_facts(
-            &historical,
+            historical,
             &event,
             &events,
             &dependency_closure(&event, &events)?.unwrap(),
@@ -2653,14 +2630,18 @@ mod tests {
             NOW,
         )?;
         tx.commit()?;
-        let dispatch_event =
-            verify_event_envelope(&fixture.policy, &request.network_id, &dispatch)?;
+        let dispatch_event = verify_event_envelope(
+            &fixture.connection,
+            &fixture.policy,
+            &request.network_id,
+            &dispatch,
+        )?;
         let dispatch_events = load_events_from(&fixture.connection, &request.network_id)?;
-        let historical = fixture
-            .policy
-            .historical(&original.challenge.policies, NOW)?;
+        let original_view =
+            OriginalAdmissionView::load(&fixture.connection, &fixture.policy, &original)?;
+        let historical = original_view.state();
         let dispatch_facts = historical_facts(
-            &historical,
+            historical,
             &dispatch_event,
             &dispatch_events,
             &dependency_closure(&dispatch_event, &dispatch_events)?.unwrap(),
@@ -2764,7 +2745,12 @@ mod tests {
             NOW,
         )?;
         tx.commit()?;
-        let event = verify_event_envelope(&fixture.policy, &request.network_id, &resolved)?;
+        let event = verify_event_envelope(
+            &fixture.connection,
+            &fixture.policy,
+            &request.network_id,
+            &resolved,
+        )?;
         assert!(matches!(&event.cause, EventCause::Invocation { .. }));
         assert_eq!(
             admission(&event).invocation.hash()?,
@@ -2883,7 +2869,12 @@ mod tests {
             "message_id":"m1","text":"local only","scheduler_node":fixture.node.node_id()?});
         resign(&mut fixture)?;
         let message = append_fixture(&mut fixture)?.remove(0);
-        let mut event = verify_event_envelope(&fixture.policy, space.as_str(), &message)?;
+        let mut event = verify_event_envelope(
+            &fixture.connection,
+            &fixture.policy,
+            space.as_str(),
+            &message,
+        )?;
         let all = load_events_from(&fixture.connection, space.as_str())?;
         let project_events = all
             .iter()
@@ -3082,7 +3073,12 @@ mod tests {
             },
             blobs: vec![],
         })?;
-        let event = verify_event_envelope(&store.policy, network.space.as_str(), &envelope)?;
+        let event = verify_event_envelope(
+            &store.connection,
+            &store.policy,
+            network.space.as_str(),
+            &envelope,
+        )?;
         let events = load_events_from(&store.connection, network.space.as_str())?;
         assert_eq!(
             validate_event_evidence(&store.policy, &store.connection, &event, &events)?,
@@ -3094,9 +3090,9 @@ mod tests {
         );
         assert_eq!(facts.context.sdk_session, Some(session));
         assert!(facts.context.execution_session.is_none());
-        let historical = store
-            .policy
-            .historical(&admission(&event).challenge.policies, now())?;
+        let original_view =
+            OriginalAdmissionView::load(&store.connection, &store.policy, admission(&event))?;
+        let historical = original_view.state();
         let ancestors = dependency_closure(&event, &events)?.unwrap();
         let mut changed = event.clone();
         match &mut changed.cause {
@@ -3106,7 +3102,7 @@ mod tests {
             }
             _ => bail!("expected SDK invocation event"),
         }
-        assert!(historical_facts(&historical, &changed, &events, &ancestors).is_err());
+        assert!(historical_facts(historical, &changed, &events, &ancestors).is_err());
         let mut tampered_parent_events = events.clone();
         let trigger_event = tampered_parent_events
             .get_mut(&facts.context.sdk_session.as_ref().unwrap().session_id)
