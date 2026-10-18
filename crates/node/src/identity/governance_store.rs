@@ -318,6 +318,14 @@ impl Store {
             now_ms,
         )?;
         super::client_policy_read::check_heads_in(&tx, &self.policy, source.expected_heads())?;
+        let personal_head = state
+            .head(&PolicyDomain::Space(personal.clone()))
+            .context("unknown execution owner personal space")?;
+        super::client_policy_read::check_heads_in(
+            &tx,
+            &self.policy,
+            std::slice::from_ref(personal_head),
+        )?;
         let root = source_root(&tx, &params.source_project)?;
         let mapping = if let Some(resource) = &params.execution_resource {
             ensure!(

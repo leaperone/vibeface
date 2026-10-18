@@ -348,7 +348,7 @@ fn verify_client_policy_read_inner(
     )?;
     state.expand_authorities(now, &mut budget, &mut dependencies)?;
     let mut usage = ExecutionProofUsage::default();
-    let heads = if let Some(selection) = selection {
+    let heads: Vec<PolicyStamp> = if let Some(selection) = selection {
         require(
             selection.resource.space == request.space,
             "client policy selection changed space",
