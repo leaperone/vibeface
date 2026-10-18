@@ -771,7 +771,7 @@ impl Runtime {
         }
         let report_results = input["report_results"]
             .as_bool()
-            .unwrap_or_else(|| previous.as_ref().map_or(true, |(_, report)| *report));
+            .unwrap_or_else(|| previous.as_ref().is_none_or(|(_, report)| *report));
         let text = field(input, "text")?.to_owned();
         let (event, receipt) = {
             let mut store = self.store.lock().await;

@@ -28,7 +28,7 @@ pub enum EventBody {
         instructions: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<BotProject>,
-        membership_role_proof: crate::identity::NetworkState,
+        membership_role_proof: Box<crate::identity::NetworkState>,
     },
     MessagePosted {
         message_id: String,
@@ -144,6 +144,16 @@ pub struct Context {
 pub struct BotProject {
     pub target_node: NodeId,
     pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BotCreateSpec {
+    pub bot_id: String,
+    pub conversation_id: ScopeId,
+    pub name: String,
+    pub instructions: String,
+    pub project: Option<BotProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

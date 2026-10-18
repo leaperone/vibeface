@@ -698,7 +698,7 @@ mod tests {
                 name: "Bot".into(),
                 instructions: format!("{}{}", "\"".repeat(3650), "x".repeat(4542)),
                 project: None,
-                membership_role_proof: proof,
+                membership_role_proof: proof.into(),
             },
         ));
         context.events.push(make(
@@ -755,7 +755,7 @@ mod tests {
                     target_node: "executor".into(),
                     cwd: "/project".into(),
                 }),
-                membership_role_proof: role_proof.clone(),
+                membership_role_proof: role_proof.clone().into(),
             },
             blobs: vec![],
         };

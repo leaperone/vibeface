@@ -228,14 +228,14 @@ impl Runtime {
         let requests = match name {
             "command" | "delegate" => {
                 let mut resolved = intent.clone();
-                if resolved.get("cwd").is_none() || resolved.get("target_node").is_none() {
-                    if let Some(project) = self.agent_project(access).await? {
-                        if resolved.get("cwd").is_none() {
-                            resolved["cwd"] = json!(project.cwd);
-                        }
-                        if resolved.get("target_node").is_none() {
-                            resolved["target_node"] = json!(project.target_node);
-                        }
+                if (resolved.get("cwd").is_none() || resolved.get("target_node").is_none())
+                    && let Some(project) = self.agent_project(access).await?
+                {
+                    if resolved.get("cwd").is_none() {
+                        resolved["cwd"] = json!(project.cwd);
+                    }
+                    if resolved.get("target_node").is_none() {
+                        resolved["target_node"] = json!(project.target_node);
                     }
                 }
                 ensure!(
@@ -731,13 +731,13 @@ impl Runtime {
 }
 
 fn active_turn(status: &Value) -> Option<&str> {
-    if let Some(turn) = status["actual"]["last_turn"].as_object() {
-        if matches!(
+    if let Some(turn) = status["actual"]["last_turn"].as_object()
+        && matches!(
             turn.get("status").and_then(Value::as_str),
             Some("inProgress" | "in_progress" | "running")
-        ) {
-            return turn.get("id").and_then(Value::as_str);
-        }
+        )
+    {
+        return turn.get("id").and_then(Value::as_str);
     }
     let thread = &status["actual"]["thread"];
     let turns = thread["thread"]["turns"]

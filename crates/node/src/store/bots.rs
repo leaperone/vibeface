@@ -219,13 +219,14 @@ impl Store {
         &mut self,
         identity: &LocalIdentity,
         network: &str,
-        conversation: &str,
-        bot_id: &str,
-        name: &str,
-        instructions: &str,
-        project: Option<BotProject>,
+        spec: &BotCreateSpec,
         created_at_ms: i64,
     ) -> Result<Bot> {
+        let conversation = spec.conversation_id.as_str();
+        let bot_id = spec.bot_id.as_str();
+        let name = spec.name.as_str();
+        let instructions = spec.instructions.as_str();
+        let project = spec.project.clone();
         validate_definition(bot_id, conversation, name, instructions, project.as_ref())?;
         let tx = self
             .connection
@@ -276,7 +277,7 @@ impl Store {
                 name: name.into(),
                 instructions: instructions.into(),
                 project,
-                membership_role_proof,
+                membership_role_proof: Box::new(membership_role_proof),
             },
             vec![],
             created_at_ms,
@@ -334,11 +335,13 @@ mod tests {
         let legitimate = store.create_bot(
             &owner,
             &network,
-            "legitimate-history",
-            "legitimate-bot",
-            "Assistant",
-            "Review changes",
-            None,
+            &BotCreateSpec {
+                conversation_id: "legitimate-history".into(),
+                bot_id: "legitimate-bot".into(),
+                name: "Assistant".into(),
+                instructions: "Review changes".into(),
+                project: None,
+            },
             1,
         )?;
         let message = store.append_event(
@@ -373,7 +376,7 @@ mod tests {
                 name: "Impostor".into(),
                 instructions: "discard history".into(),
                 project: None,
-                membership_role_proof: state,
+                membership_role_proof: state.into(),
             },
             vec![],
             4,
@@ -414,7 +417,7 @@ mod tests {
                 name: "Invalid descendant".into(),
                 instructions: String::new(),
                 project: None,
-                membership_role_proof: store.trust_bundle(&network)?.unwrap(),
+                membership_role_proof: store.trust_bundle(&network)?.unwrap().into(),
             },
             blobs: vec![],
         })?;
@@ -440,11 +443,13 @@ mod tests {
                 .create_bot(
                     &owner,
                     &network,
-                    "oversized-history",
-                    "oversized-bot",
-                    "Oversized",
-                    &"x".repeat(60000),
-                    None,
+                    &BotCreateSpec {
+                        conversation_id: "oversized-history".into(),
+                        bot_id: "oversized-bot".into(),
+                        name: "Oversized".into(),
+                        instructions: "x".repeat(60000),
+                        project: None
+                    },
                     1
                 )
                 .is_err()
@@ -456,11 +461,13 @@ mod tests {
                 .create_bot(
                     &owner,
                     &network,
-                    "bounded-history",
-                    "bounded-bot",
-                    "Bounded",
-                    &"x".repeat(8192),
-                    None,
+                    &BotCreateSpec {
+                        conversation_id: "bounded-history".into(),
+                        bot_id: "bounded-bot".into(),
+                        name: "Bounded".into(),
+                        instructions: "x".repeat(8192),
+                        project: None
+                    },
                     2
                 )
                 .is_ok()
@@ -480,21 +487,25 @@ mod tests {
         let first = store.create_bot(
             &owner,
             &network,
-            "first-history",
-            "first-bot",
-            "First",
-            "Review changes",
-            project.clone(),
+            &BotCreateSpec {
+                conversation_id: "first-history".into(),
+                bot_id: "first-bot".into(),
+                name: "First".into(),
+                instructions: "Review changes".into(),
+                project: project.clone(),
+            },
             1,
         )?;
         let retry = store.create_bot(
             &owner,
             &network,
-            "first-history",
-            "first-bot",
-            "First",
-            "Review changes",
-            project.clone(),
+            &BotCreateSpec {
+                conversation_id: "first-history".into(),
+                bot_id: "first-bot".into(),
+                name: "First".into(),
+                instructions: "Review changes".into(),
+                project: project.clone(),
+            },
             9,
         )?;
         assert_eq!(first.event_hash, retry.event_hash);
@@ -519,12 +530,14 @@ mod tests {
                     .create_bot(
                         &owner,
                         &network,
-                        scope,
-                        "first-bot",
-                        name,
-                        instructions,
-                        project,
-                        10,
+                        &BotCreateSpec {
+                            conversation_id: scope.to_owned(),
+                            bot_id: "first-bot".into(),
+                            name: name.to_owned(),
+                            instructions: instructions.to_owned(),
+                            project
+                        },
+                        10
                     )
                     .is_err()
             );
@@ -534,23 +547,27 @@ mod tests {
                 .create_bot(
                     &owner,
                     &network,
-                    "first-history",
-                    "second-bot",
-                    "Second",
-                    "",
-                    None,
-                    11,
+                    &BotCreateSpec {
+                        conversation_id: "first-history".into(),
+                        bot_id: "second-bot".into(),
+                        name: "Second".into(),
+                        instructions: "".into(),
+                        project: None
+                    },
+                    11
                 )
                 .is_err()
         );
         let second = store.create_bot(
             &owner,
             &network,
-            "second-history",
-            "second-bot",
-            "Second",
-            "",
-            None,
+            &BotCreateSpec {
+                conversation_id: "second-history".into(),
+                bot_id: "second-bot".into(),
+                name: "Second".into(),
+                instructions: "".into(),
+                project: None,
+            },
             12,
         )?;
         assert_ne!(first.conversation_id, second.conversation_id);
@@ -599,12 +616,14 @@ mod tests {
                 .create_bot(
                     &owner,
                     &network,
-                    "existing-history",
-                    "adopted-bot",
-                    "New assistant",
-                    "Continue this discussion",
-                    None,
-                    3,
+                    &BotCreateSpec {
+                        conversation_id: "existing-history".into(),
+                        bot_id: "adopted-bot".into(),
+                        name: "New assistant".into(),
+                        instructions: "Continue this discussion".into(),
+                        project: None
+                    },
+                    3
                 )
                 .unwrap_err()
                 .to_string()
@@ -628,11 +647,13 @@ mod tests {
         let original = source.create_bot(
             &owner,
             &network,
-            "history",
-            "bot",
-            "Assistant",
-            "Preserve signed responsibilities",
-            None,
+            &BotCreateSpec {
+                conversation_id: "history".into(),
+                bot_id: "bot".into(),
+                name: "Assistant".into(),
+                instructions: "Preserve signed responsibilities".into(),
+                project: None,
+            },
             1,
         )?;
         let mut retired = owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?;
@@ -694,7 +715,7 @@ mod tests {
                     name: "Invalid".into(),
                     instructions: "".into(),
                     project: None,
-                    membership_role_proof: proof,
+                    membership_role_proof: proof.into(),
                 },
                 vec![],
                 2,
@@ -725,11 +746,13 @@ mod tests {
                 .create_bot(
                     &replica,
                     &network,
-                    "history",
-                    "bot",
-                    "Assistant",
-                    "",
-                    None,
+                    &BotCreateSpec {
+                        conversation_id: "history".into(),
+                        bot_id: "bot".into(),
+                        name: "Assistant".into(),
+                        instructions: "".into(),
+                        project: None
+                    },
                     1
                 )
                 .is_err()

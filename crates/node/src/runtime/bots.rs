@@ -39,11 +39,13 @@ impl Runtime {
         let bot = self.store.lock().await.create_bot(
             &self.identity,
             &access.network_id,
-            &scope,
-            &bot_id,
-            name,
-            instructions,
-            project,
+            &BotCreateSpec {
+                conversation_id: scope.clone(),
+                bot_id,
+                name: name.to_owned(),
+                instructions: instructions.to_owned(),
+                project,
+            },
             now_ms(),
         )?;
         self.publish_changed(&access.network_id, &scope, &bot.event_hash);
