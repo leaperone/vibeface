@@ -21,7 +21,14 @@ fn validate_definition(
         !name.trim().is_empty() && name.len() <= 512 && !name.chars().any(char::is_control),
         "invalid Bot name"
     );
-    ensure!(instructions.len() <= 65536, "Bot instructions are too long");
+    ensure!(
+        instructions.len() <= 8192,
+        "Bot instructions must be at most 8192 bytes"
+    );
+    ensure!(
+        serde_json::to_vec(&(name, instructions, project))?.len() <= 12000,
+        "Bot definition is too large for the assistant context"
+    );
     if let Some(project) = project {
         ensure!(
             valid_id(&project.target_node),
@@ -150,14 +157,6 @@ pub(super) fn validate_bot_projections_from(
         else {
             unreachable!()
         };
-        identifiers
-            .entry(bot.bot_id.clone())
-            .or_default()
-            .push(hash.clone());
-        scopes
-            .entry(bot.conversation_id.clone())
-            .or_default()
-            .push(hash.clone());
         let dependencies = dependencies(&stored.event).cloned().collect::<Vec<_>>();
         let ancestors = closure_hashes(events, &dependencies);
         let conversation_exists = ancestors.iter().any(|ancestor| {
@@ -185,7 +184,16 @@ pub(super) fn validate_bot_projections_from(
             .is_err()
         {
             invalid.insert(hash.clone());
+            continue;
         }
+        identifiers
+            .entry(bot.bot_id.clone())
+            .or_default()
+            .push(hash.clone());
+        scopes
+            .entry(bot.conversation_id.clone())
+            .or_default()
+            .push(hash.clone());
     }
     for hashes in identifiers.values().chain(scopes.values()) {
         if hashes.len() > 1 {
@@ -320,6 +328,130 @@ mod tests {
             )?,
         )?;
         Ok(store)
+    }
+
+    #[test]
+    fn invalid_bot_collisions_do_not_poison_a_legitimate_definition_or_history() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let replica = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = Store::open(":memory:")?;
+        let state = owner.sign_network_fixture(
+            1,
+            vec![
+                owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
+                replica.certificate(vec![NodeRole::Replica])?,
+            ],
+        )?;
+        store.install_trust_bundle(&network, &state)?;
+        let legitimate = store.create_bot(
+            &owner,
+            &network,
+            "legitimate-history",
+            "legitimate-bot",
+            "Assistant",
+            "Review changes",
+            None,
+            1,
+        )?;
+        let message = store.append_event(
+            &owner,
+            &network,
+            "legitimate-history",
+            EventBody::MessagePosted {
+                message_id: "human".into(),
+                role: "user".into(),
+                text: "keep this history".into(),
+                scheduler_node: None,
+            },
+            vec![],
+            2,
+        )?;
+        store.append_event(
+            &replica,
+            &network,
+            "attacker-history",
+            EventBody::ConversationCreated {
+                title: "attacker".into(),
+            },
+            vec![],
+            3,
+        )?;
+        let invalid = store.append_event(
+            &replica,
+            &network,
+            "attacker-history",
+            EventBody::BotCreated {
+                bot_id: "legitimate-bot".into(),
+                name: "Impostor".into(),
+                instructions: "discard history".into(),
+                project: None,
+                membership_role_proof: state,
+            },
+            vec![],
+            4,
+        )?;
+        assert_eq!(store.bots(&network)?, vec![legitimate.clone()]);
+        assert_eq!(
+            store.bot_for_conversation(&network, "legitimate-history")?,
+            Some(legitimate)
+        );
+        assert!(
+            store
+                .context(&network, "legitimate-history", &[])?
+                .missing
+                .is_complete()
+        );
+        assert_eq!(store.messages(&network, "legitimate-history")?.len(), 1);
+        assert_eq!(
+            store.messages(&network, "legitimate-history")?[0].event_hash,
+            message.hash
+        );
+        let invalid_status: String = store.connection.query_row(
+            "SELECT status FROM events WHERE network_id=? AND hash=?",
+            params![network, invalid.hash],
+            |row| row.get(0),
+        )?;
+        assert_eq!(invalid_status, "invalid");
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_bot_instructions_are_rejected_before_creating_history() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner)?;
+        assert!(
+            store
+                .create_bot(
+                    &owner,
+                    &network,
+                    "oversized-history",
+                    "oversized-bot",
+                    "Oversized",
+                    &"x".repeat(60000),
+                    None,
+                    1
+                )
+                .is_err()
+        );
+        assert!(store.conversations(&network)?.is_empty());
+        assert!(store.bots(&network)?.is_empty());
+        assert!(
+            store
+                .create_bot(
+                    &owner,
+                    &network,
+                    "bounded-history",
+                    "bounded-bot",
+                    "Bounded",
+                    &"x".repeat(8192),
+                    None,
+                    2
+                )
+                .is_ok()
+        );
+        Ok(())
     }
 
     #[test]

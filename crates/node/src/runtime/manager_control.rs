@@ -217,6 +217,9 @@ impl Runtime {
                 task_id: Some(task),
                 ..
             } => Ok(store.followup_policy(network, scope, task)?.target_node),
+            EventBody::ExecutionObserved { task_id: None, .. } => Ok(store
+                .execution_result_policy(network, scope, trigger)?
+                .target_node),
             _ => anyhow::bail!("event is not a management trigger"),
         }
     }
