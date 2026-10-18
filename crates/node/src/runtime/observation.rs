@@ -476,14 +476,6 @@ impl Runtime {
             }
             return Err(error);
         }
-        if !self
-            .hub
-            .online(&stream.network)
-            .await
-            .contains(&stream.source)
-        {
-            return Ok(());
-        }
         let cursor = {
             let state = self
                 .observation

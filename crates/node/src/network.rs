@@ -11,11 +11,12 @@ use futures_util::{
     Sink, SinkExt, Stream, StreamExt,
     stream::{self, BoxStream, FuturesUnordered},
 };
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{DaemonEvent, DaemonStatus, IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, MutexGuard},
@@ -50,6 +51,14 @@ const CIRCUIT_LIFETIME: Duration = Duration::from_secs(1800);
 const CIRCUIT_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 const CIRCUIT_BYTES_PER_SECOND: usize = 2 * 1024 * 1024;
 const SERVICE_TYPE: &str = "_vibeface._tcp.local.";
+const MAX_MDNS_SOURCES: usize = 256;
+const MDNS_VERIFY_INTERVAL: Duration = Duration::from_secs(1);
+const MDNS_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
+const MDNS_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MDNS_COMMAND_RETRY: Duration = Duration::from_millis(25);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+const DIRECT_HEAD_START: Duration = Duration::from_millis(250);
+const MAX_DIAL_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -302,6 +311,7 @@ pub struct NetworkHub {
     config: NetworkConfig,
     state: Mutex<State>,
     relay: Arc<StdMutex<RelayState>>,
+    mdns: Arc<StdMutex<MdnsSources>>,
     incoming: mpsc::Sender<IncomingSocket>,
     admission: Arc<Admission>,
     relay_changes: watch::Sender<u64>,
@@ -315,6 +325,10 @@ struct TestHooks {
     publish_started: Option<oneshot::Sender<()>>,
     before_attachment_receive: Option<TestPause>,
     forward: Option<ForwardFixture>,
+    mdns_started: Option<oneshot::Sender<(u64, ServiceDaemon)>>,
+    mdns_fail: Option<oneshot::Receiver<()>>,
+    mdns_closed: Option<oneshot::Sender<()>>,
+    mdns_dropped: Option<oneshot::Sender<Result<DaemonStatus>>>,
 }
 
 #[cfg(test)]
@@ -334,9 +348,151 @@ async fn test_pause(pause: Option<TestPause>) {
 struct State {
     records: HashMap<String, Reachability>,
     resolved: HashMap<String, Reachability>,
-    candidates: HashMap<String, Vec<String>>,
     active_relays: HashSet<String>,
-    failed_routes: HashMap<(String, String), Instant>,
+    paths: HashMap<(String, String), PathHistory>,
+}
+
+#[derive(Clone)]
+struct MdnsSource {
+    fullname: String,
+    node_id: String,
+    urls: Vec<String>,
+}
+
+#[derive(Default)]
+struct MdnsSources {
+    epoch: u64,
+    sources: HashMap<String, MdnsSource>,
+    verify: VecDeque<String>,
+}
+
+fn mdns_lock(state: &StdMutex<MdnsSources>) -> MutexGuard<'_, MdnsSources> {
+    state.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+struct MdnsLease {
+    state: Arc<StdMutex<MdnsSources>>,
+    epoch: u64,
+}
+
+impl Drop for MdnsLease {
+    fn drop(&mut self) {
+        let mut sources = mdns_lock(&self.state);
+        if sources.epoch == self.epoch {
+            sources.reset("owner_stopped");
+        }
+    }
+}
+
+impl MdnsSources {
+    fn reset(&mut self, reason: &str) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        for (_, source) in self.sources.drain() {
+            tracing::debug!(epoch = self.epoch, fullname = ?source.fullname, target = %source.node_id, urls = ?source.urls, event = "removed", reason, "mdns source changed");
+        }
+        self.verify.clear();
+        tracing::debug!(epoch = self.epoch, reason, "mdns daemon reset");
+        self.epoch
+    }
+
+    fn resolved(&mut self, epoch: u64, info: &ServiceInfo, local_id: &str) -> bool {
+        if epoch != self.epoch {
+            return false;
+        }
+        let fullname = info.get_fullname();
+        let key = fullname.to_ascii_lowercase();
+        let target = info.get_property_val_str("node_id").unwrap_or_default();
+        let mut urls: Vec<_> = info
+            .get_addresses()
+            .iter()
+            .filter(|ip| {
+                !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
+            })
+            .map(|ip| {
+                format!(
+                    "ws://{}/api/network/ws",
+                    SocketAddr::new(*ip, info.get_port())
+                )
+            })
+            .collect();
+        urls.sort();
+        urls.dedup();
+        urls.truncate(MAX_URLS);
+        if check_id(target).is_err()
+            || target == local_id
+            || info.get_port() == 0
+            || urls.is_empty()
+        {
+            self.removed(epoch, fullname, "invalid_update");
+            return false;
+        }
+        if !self.sources.contains_key(&key) {
+            if self.sources.len() >= MAX_MDNS_SOURCES {
+                tracing::debug!(
+                    epoch,
+                    ?fullname,
+                    target,
+                    reason = "source_capacity",
+                    "mdns source rejected"
+                );
+                return false;
+            }
+            self.verify.push_back(key.clone());
+        }
+        tracing::debug!(
+            epoch,
+            ?fullname,
+            target,
+            ?urls,
+            event = "resolved",
+            reason = "dns",
+            "mdns source changed"
+        );
+        self.sources.insert(
+            key,
+            MdnsSource {
+                fullname: fullname.to_owned(),
+                node_id: target.to_owned(),
+                urls,
+            },
+        );
+        true
+    }
+
+    fn removed(&mut self, epoch: u64, fullname: &str, reason: &str) -> bool {
+        if epoch != self.epoch {
+            return false;
+        }
+        let key = fullname.to_ascii_lowercase();
+        self.verify.retain(|entry| entry != &key);
+        if let Some(source) = self.sources.remove(&key) {
+            tracing::debug!(epoch, fullname = ?source.fullname, target = %source.node_id, urls = ?source.urls, event = "removed", reason, "mdns source changed");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn urls(&self, target: &str) -> Vec<String> {
+        let mut urls: Vec<_> = self
+            .sources
+            .values()
+            .filter(|source| source.node_id == target)
+            .flat_map(|source| source.urls.iter().cloned())
+            .collect();
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
+    fn next_verify(&mut self) -> Option<MdnsSource> {
+        let key = self.verify.pop_front()?;
+        let source = self.sources.get(&key)?.clone();
+        self.verify.push_back(key);
+        Some(source)
+    }
 }
 struct Reservation {
     id: String,
@@ -471,10 +627,122 @@ enum PublishOutcome {
     Accepted,
     Full,
 }
+#[derive(Clone)]
+struct PathHistory {
+    authenticated_at: Option<Instant>,
+    failed_until: Option<Instant>,
+    updated_at: Instant,
+}
+
+pub(crate) enum AuthenticationFailure {
+    Path(anyhow::Error),
+    Terminal(anyhow::Error),
+    Busy(anyhow::Error),
+    SourceGone,
+    Cancelled,
+}
+
+struct ActivePath {
+    relay: bool,
+    started_at: Instant,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Clone)]
+struct PathCandidate {
+    url: String,
+    relay: bool,
+    mdns: bool,
+    record_expires_at: Option<i64>,
+}
+impl PathCandidate {
+    fn route(&self) -> String {
+        format!(
+            "{}:{}",
+            if self.relay { "relay" } else { "direct" },
+            self.url
+        )
+    }
+    fn live(&self, hub: &NetworkHub, target: &str) -> bool {
+        self.record_expires_at
+            .is_some_and(|expires| now_secs().is_ok_and(|now| expires > now))
+            || (self.mdns && mdns_lock(&hub.mdns).urls(target).contains(&self.url))
+    }
+}
+
 #[derive(Default)]
-struct PathAttempts {
-    seen: HashSet<String>,
-    used: usize,
+struct PathQueue {
+    pending: Vec<PathCandidate>,
+    tried: HashSet<String>,
+    direct: usize,
+    relay: usize,
+}
+impl PathQueue {
+    fn insert(&mut self, candidate: PathCandidate) {
+        let route = candidate.route();
+        if self.tried.contains(&route) {
+            return;
+        }
+        if let Some(existing) = self.pending.iter_mut().find(|other| other.route() == route) {
+            existing.mdns |= candidate.mdns;
+            existing.record_expires_at =
+                existing.record_expires_at.max(candidate.record_expires_at);
+            return;
+        }
+        let (used, max) = if candidate.relay {
+            (&mut self.relay, MAX_URLS)
+        } else {
+            (&mut self.direct, MAX_URLS * 2)
+        };
+        if *used >= max {
+            return;
+        }
+        *used += 1;
+        self.pending.push(candidate);
+    }
+    fn record(&mut self, record: Reachability) {
+        for (relay, urls) in [(false, record.direct_urls), (true, record.relay_urls)] {
+            for url in urls {
+                self.insert(PathCandidate {
+                    url,
+                    relay,
+                    mdns: false,
+                    record_expires_at: Some(record.expires_at),
+                });
+            }
+        }
+    }
+    fn pop(
+        &mut self,
+        history: &HashMap<String, PathHistory>,
+        prefer_relay: bool,
+    ) -> Option<PathCandidate> {
+        let now = Instant::now();
+        let index = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                !history
+                    .get(&candidate.route())
+                    .is_some_and(|record| record.failed_until.is_some_and(|until| until > now))
+            })
+            .min_by_key(|(_, candidate)| {
+                (
+                    candidate.relay != prefer_relay,
+                    std::cmp::Reverse(
+                        history
+                            .get(&candidate.route())
+                            .and_then(|record| record.authenticated_at),
+                    ),
+                    std::cmp::Reverse(candidate.record_expires_at),
+                    candidate.route(),
+                )
+            })
+            .map(|(index, _)| index)?;
+        let candidate = self.pending.remove(index);
+        Some(candidate)
+    }
 }
 
 impl NetworkHub {
@@ -489,6 +757,7 @@ impl NetworkHub {
                 config,
                 state: Mutex::new(State::default()),
                 relay: Arc::new(StdMutex::new(RelayState::default())),
+                mdns: Arc::new(StdMutex::new(MdnsSources::default())),
                 incoming,
                 admission: Arc::new(Admission::default()),
                 relay_changes: watch::channel(0).0,
@@ -824,113 +1093,251 @@ impl NetworkHub {
             })
             .boxed())
     }
-    pub async fn dial(&self, target: &str, service: Service) -> Result<NetworkSocket> {
-        check_id(target)?;
-        let known = self.known_records(target).await?;
-        let (cached, failures) = {
-            let mut state = self.state.lock().await;
-            state
-                .failed_routes
-                .retain(|_, at| at.elapsed() < Duration::from_secs(30));
-            let urls = state.candidates.get(target).cloned().unwrap_or_default();
-            (urls, state.failed_routes.clone())
-        };
-        let mut direct = PathAttempts::default();
-        if let Some(socket) =
-            dial_direct(self, cached, target, service, &failures, &mut direct, None).await
-        {
-            return Ok(socket);
-        }
-        for record in &known {
-            if let Some(socket) = dial_direct(
-                self,
-                record.direct_urls.clone(),
-                target,
-                service,
-                &failures,
-                &mut direct,
-                Some(record.expires_at),
-            )
+    pub(crate) async fn dial_authenticated<T, F, Fut>(
+        &self,
+        target: &str,
+        service: Service,
+        authenticate: F,
+    ) -> Result<(NetworkSocket, T)>
+    where
+        F: Fn(NetworkSocket) -> Fut,
+        Fut: Future<Output = std::result::Result<(NetworkSocket, T), AuthenticationFailure>>,
+    {
+        tokio::time::timeout(DIAL_TIMEOUT, self.race_paths(target, service, authenticate))
             .await
-            {
-                return Ok(socket);
-            }
-        }
-        let mut records = self.resolve(target).await?;
-        direct.used = 0;
-        for record in known {
-            if let Some(socket) = dial_direct(
-                self,
-                record.direct_urls,
-                target,
-                service,
-                &failures,
-                &mut direct,
-                Some(record.expires_at),
-            )
-            .await
-            {
-                return Ok(socket);
-            }
-        }
-        let mut relays = HashSet::new();
-        let mut relay_attempts = 0;
-        while let Some(record) = records.next().await {
-            if record.expires_at <= now_secs()? {
-                continue;
-            }
-            if let Some(socket) = dial_direct(
-                self,
-                record.direct_urls,
-                target,
-                service,
-                &failures,
-                &mut direct,
-                Some(record.expires_at),
-            )
-            .await
-            {
-                return Ok(socket);
-            }
-            for url in record.relay_urls {
-                if record.expires_at <= now_secs()? {
-                    break;
-                }
-                if relay_attempts >= MAX_URLS || !relays.insert(url.clone()) {
-                    continue;
-                }
-                relay_attempts += 1;
-                let route = format!("relay:{url}");
-                if failures.contains_key(&(target.to_owned(), route.clone())) {
-                    continue;
-                }
-                if let Ok(socket) = self
-                    .connect_path(
-                        &url,
-                        Control::Dial {
-                            target: target.to_owned(),
-                            service,
-                        },
-                    )
-                    .await
-                {
-                    return Ok(NetworkSocket::Routed(Box::new(socket), route));
-                }
-            }
-        }
-        bail!("node has no reachable direct or relay path")
+            .context("authenticated node dial deadline exceeded")?
     }
-    pub async fn report_failure(&self, target: &str, route: Option<String>) {
-        if let Some(route) = route {
+
+    async fn race_paths<T, F, Fut>(
+        &self,
+        target: &str,
+        service: Service,
+        authenticate: F,
+    ) -> Result<(NetworkSocket, T)>
+    where
+        F: Fn(NetworkSocket) -> Fut,
+        Fut: Future<Output = std::result::Result<(NetworkSocket, T), AuthenticationFailure>>,
+    {
+        check_id(target)?;
+        let mut queue = PathQueue::default();
+        for url in mdns_lock(&self.mdns).urls(target) {
+            queue.insert(PathCandidate {
+                url,
+                relay: false,
+                mdns: true,
+                record_expires_at: None,
+            });
+        }
+        for record in self.known_records(target).await? {
+            queue.record(record);
+        }
+        let history = {
             let mut state = self.state.lock().await;
             state
-                .failed_routes
-                .retain(|_, at| at.elapsed() < Duration::from_secs(30));
-            if state.failed_routes.len() < 1024 {
-                state
-                    .failed_routes
-                    .insert((target.to_owned(), route), Instant::now());
+                .paths
+                .retain(|_, record| record.updated_at.elapsed() < Duration::from_secs(300));
+            state
+                .paths
+                .iter()
+                .filter(|((node, _), _)| node == target)
+                .map(|((_, route), record)| (route.clone(), record.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        let mut records = self.resolve(target).await?;
+        let mut records_done = false;
+        let mut active = FuturesUnordered::new();
+        let mut active_direct = 0;
+        let mut active_relay = 0;
+        let mut running: HashMap<String, ActivePath> = HashMap::new();
+        let mut lead_until = None;
+        let mut first_attempt = true;
+        let mut last_busy = None;
+        loop {
+            let relay_waiting = queue.pending.iter().any(|candidate| {
+                candidate.relay
+                    && candidate.live(self, target)
+                    && !history.get(&candidate.route()).is_some_and(|record| {
+                        record
+                            .failed_until
+                            .is_some_and(|until| until > Instant::now())
+                    })
+            });
+            if active.len() == MAX_DIAL_ATTEMPTS
+                && active_relay == 0
+                && relay_waiting
+                && !running.values().any(|attempt| attempt.cancel.is_none())
+                && let Some((route, attempt)) = running
+                    .iter_mut()
+                    .filter(|(_, attempt)| !attempt.relay)
+                    .min_by_key(|(_, attempt)| attempt.started_at)
+                && let Some(cancel) = attempt.cancel.take()
+            {
+                let _ = cancel.send(());
+                tracing::debug!(
+                    target,
+                    route,
+                    reason = "relay_slot",
+                    "authenticated path cancellation requested"
+                );
             }
+            while active.len() < MAX_DIAL_ATTEMPTS
+                && (active.is_empty()
+                    || lead_until.is_none_or(|until| until <= tokio::time::Instant::now()))
+            {
+                let Some(candidate) = queue.pop(&history, active_direct > 0 && active_relay == 0)
+                else {
+                    break;
+                };
+                if !candidate.live(self, target) {
+                    if candidate.relay {
+                        queue.relay -= 1;
+                    } else {
+                        queue.direct -= 1;
+                    }
+                    continue;
+                }
+                queue.tried.insert(candidate.route());
+                if first_attempt
+                    && !candidate.relay
+                    && history
+                        .get(&candidate.route())
+                        .is_some_and(|record| record.authenticated_at.is_some())
+                {
+                    lead_until = Some(tokio::time::Instant::now() + DIRECT_HEAD_START);
+                }
+                first_attempt = false;
+                if candidate.relay {
+                    active_relay += 1;
+                } else {
+                    active_direct += 1;
+                }
+                tracing::debug!(target, route=%candidate.route(), active=active.len() + 1, "authenticated path attempt started");
+                let (cancel, cancelled) = oneshot::channel();
+                running.insert(
+                    candidate.route(),
+                    ActivePath {
+                        relay: candidate.relay,
+                        started_at: Instant::now(),
+                        cancel: Some(cancel),
+                    },
+                );
+                let cancelled_candidate = candidate.clone();
+                let authenticate = &authenticate;
+                active.push(async move {
+                    tokio::select! {
+                        biased;
+                        result = self.attempt_path(candidate, target, service, authenticate) => result,
+                        _ = cancelled => (cancelled_candidate, Err(AuthenticationFailure::Cancelled)),
+                    }
+                });
+            }
+            if active.is_empty() && records_done {
+                break;
+            }
+            tokio::select! {
+                biased;
+                result = active.next(), if !active.is_empty() => {
+                    let (candidate, result) = result.context("path attempt missing")?;
+                    running.remove(&candidate.route());
+                    if candidate.relay { active_relay -= 1; } else { active_direct -= 1; }
+                    if active.is_empty() { lead_until = None; }
+                    match result {
+                        Ok(winner) => {
+                            self.record_path(target, &candidate.route(), true).await;
+                            tracing::debug!(target, route=%candidate.route(), cancelled=active.len(), "authenticated path selected");
+                            return Ok(winner);
+                        }
+                        Err(AuthenticationFailure::Terminal(error)) => return Err(error),
+                        Err(AuthenticationFailure::Busy(error)) => last_busy = Some(error),
+                        Err(AuthenticationFailure::SourceGone) => {
+                            queue.tried.remove(&candidate.route());
+                            if candidate.relay { queue.relay -= 1; } else { queue.direct -= 1; }
+                        }
+                        Err(AuthenticationFailure::Cancelled) => {
+                            tracing::debug!(target, route=%candidate.route(), reason="relay_slot", "authenticated path cancelled");
+                        }
+                        Err(AuthenticationFailure::Path(error)) => {
+                            self.record_path(target, &candidate.route(), false).await;
+                            tracing::debug!(target, route=%candidate.route(), %error, "authenticated path rejected");
+                        }
+                    }
+                }
+                record = records.next(), if !records_done => {
+                    match record { Some(record) => queue.record(record), None => records_done = true }
+                }
+                _ = tokio::time::sleep_until(lead_until.unwrap_or_else(tokio::time::Instant::now)), if lead_until.is_some() => {
+                    lead_until = None;
+                }
+            }
+        }
+        if let Some(error) = last_busy {
+            return Err(error);
+        }
+        bail!("node has no authenticated direct or relay path")
+    }
+
+    async fn attempt_path<T, F, Fut>(
+        &self,
+        candidate: PathCandidate,
+        target: &str,
+        service: Service,
+        authenticate: &F,
+    ) -> (
+        PathCandidate,
+        std::result::Result<(NetworkSocket, T), AuthenticationFailure>,
+    )
+    where
+        F: Fn(NetworkSocket) -> Fut,
+        Fut: Future<Output = std::result::Result<(NetworkSocket, T), AuthenticationFailure>>,
+    {
+        if !candidate.live(self, target) {
+            return (candidate, Err(AuthenticationFailure::SourceGone));
+        }
+        let control = if candidate.relay {
+            Control::Dial {
+                target: target.to_owned(),
+                service,
+            }
+        } else {
+            Control::Direct { service }
+        };
+        let result = match self.connect_path(&candidate.url, control).await {
+            Ok(socket) => {
+                authenticate(NetworkSocket::Routed(Box::new(socket), candidate.route())).await
+            }
+            Err(error) if error.downcast_ref::<Denied>().is_some() => {
+                Err(AuthenticationFailure::Busy(error))
+            }
+            Err(error) => Err(AuthenticationFailure::Path(error)),
+        };
+        (candidate, result)
+    }
+
+    async fn record_path(&self, target: &str, route: &str, authenticated: bool) {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let key = (target.to_owned(), route.to_owned());
+        if !state.paths.contains_key(&key)
+            && state.paths.len() >= 1024
+            && let Some(oldest) = state
+                .paths
+                .iter()
+                .min_by_key(|(_, record)| record.updated_at)
+                .map(|(key, _)| key.clone())
+        {
+            state.paths.remove(&oldest);
+        }
+        let record = state.paths.entry(key).or_insert(PathHistory {
+            authenticated_at: None,
+            failed_until: None,
+            updated_at: now,
+        });
+        record.updated_at = now;
+        if authenticated {
+            record.authenticated_at = Some(now);
+            record.failed_until = None;
+        } else {
+            record.failed_until = Some(now + Duration::from_secs(30));
         }
     }
 
@@ -1345,78 +1752,238 @@ impl NetworkHub {
             .map_err(|_| anyhow::anyhow!("network service queue full"))
     }
     async fn mdns(&self, listen: SocketAddr) -> Result<()> {
-        let daemon = MdnsGuard(ServiceDaemon::new()?);
         let node_id = self.identity.node_id()?;
-        if !listen.ip().is_loopback() {
-            daemon.0.register(mdns_service(&node_id, listen.port())?)?;
-        }
-        let events = daemon.0.browse(SERVICE_TYPE)?;
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
-            interval.tick().await;
-            while let Ok(event) = events.try_recv() {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        let Some(target) = info.get_property_val_str("node_id") else {
-                            continue;
-                        };
-                        if check_id(target).is_err() || target == node_id {
-                            continue;
-                        }
-                        let urls: Vec<_> = info
-                            .get_addresses()
-                            .iter()
-                            .filter(|ip| !ip.is_unspecified())
-                            .take(MAX_URLS)
-                            .map(|ip| {
-                                format!(
-                                    "ws://{}/api/network/ws",
-                                    SocketAddr::new(*ip, info.get_port())
-                                )
-                            })
-                            .collect();
-                        let mut state = self.state.lock().await;
-                        if state.candidates.len() < 256 || state.candidates.contains_key(target) {
-                            state.candidates.insert(target.to_owned(), urls);
-                        }
-                    }
-                    ServiceEvent::ServiceRemoved(_, name) => {
-                        let Some(target) = name.strip_suffix(&format!(".{SERVICE_TYPE}")) else {
-                            continue;
-                        };
-                        if target.len() == 32 && target.bytes().all(|b| b.is_ascii_hexdigit()) {
-                            self.state
-                                .lock()
-                                .await
-                                .candidates
-                                .retain(|id, _| !id.starts_with(target));
-                        }
-                    }
-                    _ => {}
+            let epoch = mdns_lock(&self.mdns).reset("start");
+            let _lease = MdnsLease {
+                state: self.mdns.clone(),
+                epoch,
+            };
+            let daemon = match ServiceDaemon::new() {
+                Ok(daemon) => MdnsGuard::new(daemon),
+                Err(error) => {
+                    tracing::debug!(epoch, %error, "mdns restart pending");
+                    tokio::time::sleep(MDNS_RETRY_INTERVAL).await;
+                    continue;
                 }
+            };
+            #[cfg(test)]
+            let mut daemon = daemon;
+            #[cfg(test)]
+            {
+                daemon.completed = self.test_hooks.lock().unwrap().mdns_dropped.take();
+            }
+            let outcome = async {
+                if listen.ip().is_unspecified() {
+                    daemon.get().disable_interface(if listen.is_ipv4() { IfKind::IPv6 } else { IfKind::IPv4 })?;
+                }
+                let monitor = daemon.get().monitor()?;
+                let events = daemon.get().browse(SERVICE_TYPE)?;
+                if let Some(service) = mdns_service(&node_id, listen)? {
+                    tracing::debug!(epoch, %listen, fullname = ?service.get_fullname(), addr_auto = service.is_addr_auto(), addresses = ?service.get_addresses(), "mdns service registered");
+                    daemon.get().register(service)?;
+                }
+                #[cfg(test)]
+                if let Some(started) = self.test_hooks.lock().unwrap().mdns_started.take() {
+                    let _ = started.send((epoch, daemon.get().clone()));
+                }
+                #[cfg(test)]
+                let failure = self.test_hooks.lock().unwrap().mdns_fail.take();
+                #[cfg(test)]
+                let failure = async {
+                    match failure {
+                        Some(failure) => { let _ = failure.await; }
+                        None => futures_util::future::pending().await,
+                    }
+                };
+                #[cfg(not(test))]
+                let failure = futures_util::future::pending::<()>();
+                tokio::pin!(failure);
+                let mut verify = tokio::time::interval(MDNS_VERIFY_INTERVAL);
+                verify.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = &mut failure => bail!("mdns injected generation error"),
+                        event = events.recv_async() => match event.context("mdns browse stopped")? {
+                            ServiceEvent::ServiceResolved(info) => {
+                                mdns_lock(&self.mdns).resolved(epoch, &info, &node_id);
+                            }
+                            ServiceEvent::ServiceRemoved(_, fullname) => {
+                                mdns_lock(&self.mdns).removed(epoch, &fullname, "dns");
+                            }
+                            _ => {}
+                        },
+                        event = monitor.recv_async() => match event.context("mdns monitor stopped")? {
+                            DaemonEvent::IpAdd(ip) | DaemonEvent::IpDel(ip) => {
+                                tracing::debug!(epoch, %ip, %listen, "mdns interface changed");
+                                return Ok::<_, anyhow::Error>("interface_reset");
+                            }
+                            DaemonEvent::NameChange(change) => {
+                                tracing::debug!(epoch, original = ?change.original, fullname = ?change.new_name, interface = ?change.intf_name, rr_type = %change.rr_type, "mdns name changed");
+                            }
+                            DaemonEvent::Error(error) => return Err(error.into()),
+                            _ => {}
+                        },
+                        _ = verify.tick() => {
+                            let source = mdns_lock(&self.mdns).next_verify();
+                            if let Some(source) = source {
+                                daemon.get().verify(source.fullname.clone(), MDNS_VERIFY_TIMEOUT)?;
+                                tracing::debug!(epoch, fullname = ?source.fullname, target = %source.node_id, urls = ?source.urls, timeout_ms = MDNS_VERIFY_TIMEOUT.as_millis(), "mdns source verify");
+                            }
+                        }
+                    }
+                }
+            }.await;
+            mdns_lock(&self.mdns).reset(outcome.as_ref().copied().unwrap_or("daemon_error"));
+            daemon.shutdown().await?;
+            #[cfg(test)]
+            if let Some(closed) = self.test_hooks.lock().unwrap().mdns_closed.take() {
+                let _ = closed.send(());
+            }
+            if let Err(error) = outcome {
+                tracing::debug!(epoch, %error, "mdns restart pending");
+                tokio::time::sleep(MDNS_RETRY_INTERVAL).await;
             }
         }
     }
 }
 
-struct MdnsGuard(ServiceDaemon);
-impl Drop for MdnsGuard {
-    fn drop(&mut self) {
-        let _ = self.0.shutdown();
+struct MdnsGuard {
+    daemon: Option<ServiceDaemon>,
+    #[cfg(test)]
+    force_again: usize,
+    #[cfg(test)]
+    completed: Option<oneshot::Sender<Result<DaemonStatus>>>,
+}
+impl MdnsGuard {
+    fn new(daemon: ServiceDaemon) -> Self {
+        Self {
+            daemon: Some(daemon),
+            #[cfg(test)]
+            force_again: 0,
+            #[cfg(test)]
+            completed: None,
+        }
+    }
+
+    fn get(&self) -> &ServiceDaemon {
+        self.daemon.as_ref().expect("mdns daemon already shut down")
+    }
+
+    fn request_shutdown(&mut self) -> mdns_sd::Result<mdns_sd::Receiver<DaemonStatus>> {
+        #[cfg(test)]
+        if self.force_again > 0 {
+            self.force_again -= 1;
+            return Err(mdns_sd::Error::Again);
+        }
+        self.get().shutdown()
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        tokio::time::timeout(CONNECT_TIMEOUT, async {
+            loop {
+                match self.request_shutdown() {
+                    Ok(closed) => {
+                        ensure!(
+                            closed.recv_async().await? == DaemonStatus::Shutdown,
+                            "mdns daemon did not shut down"
+                        );
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    Err(mdns_sd::Error::Again) => tokio::time::sleep(MDNS_COMMAND_RETRY).await,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })
+        .await
+        .context("mdns shutdown timed out")??;
+        self.daemon.take();
+        tracing::debug!(mode = "owner", status = "shutdown", "mdns daemon cleanup");
+        Ok(())
     }
 }
-fn mdns_service(node_id: &str, port: u16) -> Result<ServiceInfo> {
+impl Drop for MdnsGuard {
+    fn drop(&mut self) {
+        if self.daemon.is_none() {
+            return;
+        }
+        let shutdown = self.request_shutdown();
+        let daemon = self.daemon.take().expect("checked mdns daemon missing");
+        #[cfg(test)]
+        let completed = self.completed.take();
+        match shutdown {
+            Ok(closed) => {
+                tracing::debug!(mode = "drop", status = "exit_queued", "mdns daemon cleanup");
+                #[cfg(test)]
+                if let Some(completed) = completed {
+                    std::thread::spawn(move || {
+                        let _ = completed
+                            .send(closed.recv_timeout(CONNECT_TIMEOUT).map_err(Into::into));
+                    });
+                }
+                #[cfg(not(test))]
+                drop(closed);
+            }
+            Err(mdns_sd::Error::Again) => {
+                let reaper = std::thread::Builder::new().name("mdns-cleanup".into()).spawn(move || {
+                    let deadline = Instant::now() + CONNECT_TIMEOUT;
+                    while Instant::now() < deadline {
+                        match daemon.shutdown() {
+                            Ok(closed) => {
+                                let status = closed.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                                if matches!(status, Ok(DaemonStatus::Shutdown)) {
+                                    tracing::debug!(mode = "reaper", status = "shutdown", "mdns daemon cleanup");
+                                } else {
+                                    tracing::warn!(mode = "reaper", status = ?status, deadline_seconds = CONNECT_TIMEOUT.as_secs(), "mdns daemon exit unconfirmed");
+                                }
+                                #[cfg(test)]
+                                if let Some(completed) = completed {
+                                    let _ = completed.send(status.map_err(Into::into));
+                                }
+                                return;
+                            }
+                            Err(mdns_sd::Error::Again) => std::thread::sleep(MDNS_COMMAND_RETRY),
+                            Err(error) => {
+                                tracing::warn!(mode = "reaper", %error, "mdns daemon cleanup failed");
+                                return;
+                            }
+                        }
+                    }
+                    tracing::warn!(mode = "reaper", "mdns daemon cleanup timed out");
+                });
+                if let Err(error) = reaper {
+                    tracing::warn!(%error, "mdns cleanup thread could not start");
+                }
+            }
+            Err(error) => tracing::warn!(mode = "drop", %error, "mdns daemon exit unconfirmed"),
+        }
+    }
+}
+
+fn mdns_service(node_id: &str, listen: SocketAddr) -> Result<Option<ServiceInfo>> {
     check_id(node_id)?;
+    if listen.ip().is_loopback() {
+        return Ok(None);
+    }
     let properties = [("node_id", node_id), ("path", "/api/network/ws")];
-    Ok(ServiceInfo::new(
+    let address = if listen.ip().is_unspecified() {
+        String::new()
+    } else {
+        listen.ip().to_string()
+    };
+    let service = ServiceInfo::new(
         SERVICE_TYPE,
         &node_id[..32],
         &format!("vf-{}.local.", &node_id[..16]),
-        "",
-        port,
+        address.as_str(),
+        listen.port(),
         &properties[..],
-    )?
-    .enable_addr_auto())
+    )?;
+    Ok(Some(if listen.ip().is_unspecified() {
+        service.enable_addr_auto()
+    } else {
+        service
+    }))
 }
 
 #[derive(Default)]
@@ -1800,35 +2367,6 @@ async fn forward_ciphertext(
     forward.observe("closed", 1);
     result
 }
-async fn dial_direct(
-    hub: &NetworkHub,
-    urls: Vec<String>,
-    target: &str,
-    service: Service,
-    failures: &HashMap<(String, String), Instant>,
-    attempts: &mut PathAttempts,
-    expires_at: Option<i64>,
-) -> Option<NetworkSocket> {
-    for url in urls {
-        if attempts.used >= MAX_URLS * 2
-            || expires_at.is_some_and(|expires| !now_secs().is_ok_and(|now| expires > now))
-        {
-            break;
-        }
-        if !attempts.seen.insert(url.clone()) {
-            continue;
-        }
-        attempts.used += 1;
-        let route = format!("direct:{url}");
-        if failures.contains_key(&(target.to_owned(), route.clone())) {
-            continue;
-        }
-        if let Ok(socket) = hub.connect_path(&url, Control::Direct { service }).await {
-            return Some(NetworkSocket::Routed(Box::new(socket), route));
-        }
-    }
-    None
-}
 
 pub async fn connect_direct(url: &str, service: Service) -> Result<NetworkSocket> {
     connect_service(url, Control::Direct { service }).await
@@ -1970,6 +2508,25 @@ mod tests {
         clients: Vec<NetworkSocket>,
         servers: Vec<NetworkSocket>,
         urls: Vec<String>,
+    }
+
+    fn seed_mdns_urls(hub: &NetworkHub, target: &str, urls: Vec<String>) {
+        let mut sources = mdns_lock(&hub.mdns);
+        for (index, chunk) in urls.chunks(MAX_URLS).enumerate() {
+            let fullname = format!("fixture-{index}.{SERVICE_TYPE}");
+            let key = fullname.to_ascii_lowercase();
+            if !sources.sources.contains_key(&key) {
+                sources.verify.push_back(key.clone());
+            }
+            sources.sources.insert(
+                key,
+                MdnsSource {
+                    fullname,
+                    node_id: target.to_owned(),
+                    urls: chunk.to_vec(),
+                },
+            );
+        }
     }
 
     struct AcceptedTask {
@@ -3955,6 +4512,15 @@ mod tests {
     ) -> Result<()> {
         let (mut client, mut server) =
             noise_channels(caller_identity, target_identity, caller, target).await?;
+        encrypted_round_trip(&mut client, &mut server, caller, target).await
+    }
+
+    async fn encrypted_round_trip(
+        client: &mut vibeface_secure::Channel,
+        server: &mut vibeface_secure::Channel,
+        caller: &mut NetworkSocket,
+        target: &mut NetworkSocket,
+    ) -> Result<()> {
         for encrypted in client
             .seal_message(b"fixed-target canary")
             .map_err(anyhow::Error::msg)?
@@ -3982,6 +4548,91 @@ mod tests {
             b"complete"
         );
         Ok(())
+    }
+
+    async fn dial_test_noise(
+        hub: &NetworkHub,
+        caller_identity: &LocalIdentity,
+        target_identity: &LocalIdentity,
+        service: Service,
+        incoming: &mut mpsc::Receiver<IncomingSocket>,
+        domain: &'static [u8],
+    ) -> Result<(
+        NetworkSocket,
+        vibeface_secure::Channel,
+        IncomingSocket,
+        vibeface_secure::Channel,
+    )> {
+        let target_id = target_identity.node_id()?;
+        let dial = hub.dial_authenticated(&target_id, service, |mut socket| async move {
+            let result = async {
+                let mut handshake = Handshake::new(
+                    true,
+                    &caller_identity.secret_key_hex,
+                    Some(target_identity.node_id()?),
+                    domain,
+                )
+                .map_err(anyhow::Error::msg)?;
+                send_frame(
+                    &mut socket,
+                    Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                )
+                .await?;
+                assert!(
+                    handshake
+                        .read(&next_binary(&mut socket).await?)
+                        .map_err(anyhow::Error::msg)?
+                        .is_empty()
+                );
+                send_frame(
+                    &mut socket,
+                    Message::Binary(
+                        handshake
+                            .write(b"authenticated caller")
+                            .map_err(anyhow::Error::msg)?
+                            .into(),
+                    ),
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((socket, handshake.finish().map_err(anyhow::Error::msg)?))
+            }
+            .await;
+            result.map_err(AuthenticationFailure::Path)
+        });
+        let accept = async {
+            let mut accepted = incoming
+                .recv()
+                .await
+                .context("missing authenticated target socket")?;
+            assert_eq!(accepted.service, service);
+            let mut handshake = Handshake::new(
+                false,
+                &target_identity.secret_key_hex,
+                Some(caller_identity.node_id()?),
+                domain,
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert!(
+                handshake
+                    .read(&next_binary(&mut accepted.socket).await?)
+                    .map_err(anyhow::Error::msg)?
+                    .is_empty()
+            );
+            send_frame(
+                &mut accepted.socket,
+                Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+            )
+            .await?;
+            assert_eq!(
+                handshake
+                    .read(&next_binary(&mut accepted.socket).await?)
+                    .map_err(anyhow::Error::msg)?,
+                b"authenticated caller"
+            );
+            Ok::<_, anyhow::Error>((accepted, handshake.finish().map_err(anyhow::Error::msg)?))
+        };
+        let ((socket, client), (accepted, server)) = tokio::try_join!(dial, accept)?;
+        Ok((socket, client, accepted, server))
     }
 
     async fn next_binary(
@@ -4311,7 +4962,8 @@ mod tests {
     #[test]
     fn mdns_uses_valid_dns_labels_and_retains_the_full_identity() -> Result<()> {
         let node_id = LocalIdentity::generate().node_id()?;
-        let service = mdns_service(&node_id, 4790)?;
+        let service = mdns_service(&node_id, "0.0.0.0:4790".parse()?)?
+            .context("wildcard registration missing")?;
         assert!(
             service
                 .get_fullname()
@@ -4323,6 +4975,328 @@ mod tests {
             Some(node_id.as_str())
         );
         assert_eq!(service.get_port(), 4790);
+        Ok(())
+    }
+
+    fn mdns_info(instance: &str, node_id: &str, addresses: &str) -> Result<ServiceInfo> {
+        let properties = [("node_id", node_id), ("path", "/api/network/ws")];
+        Ok(ServiceInfo::new(
+            SERVICE_TYPE,
+            instance,
+            "fixture.local.",
+            addresses,
+            4790,
+            &properties[..],
+        )?)
+    }
+
+    #[test]
+    fn m4_mdns_fullname_sources_survive_exact_removal_and_replace_invalid_updates() -> Result<()> {
+        let target = format!("{}{}", "a".repeat(32), "b".repeat(32));
+        let neighbor = format!("{}{}", "a".repeat(32), "c".repeat(32));
+        let local = "0".repeat(64);
+        let mut sources = MdnsSources::default();
+        let epoch = sources.reset("fixture");
+        let first = mdns_info("Device", &target, "192.0.2.1")?;
+        let renamed = mdns_info("Device (2)", &target, "192.0.2.2")?;
+        let same_url = mdns_info("Device (3)", &target, "192.0.2.1")?;
+        let shared_prefix = mdns_info("Other", &neighbor, "192.0.2.3")?;
+        for info in [&first, &renamed, &same_url, &shared_prefix] {
+            assert!(sources.resolved(epoch, info, &local));
+        }
+        assert_eq!(sources.urls(&target).len(), 2);
+        assert!(sources.removed(epoch, &renamed.get_fullname().to_ascii_uppercase(), "dns"));
+        assert_eq!(
+            sources.urls(&target),
+            vec!["ws://192.0.2.1:4790/api/network/ws"]
+        );
+        assert!(sources.removed(epoch, first.get_fullname(), "dns"));
+        assert_eq!(sources.urls(&target).len(), 1);
+        assert!(sources.removed(epoch, same_url.get_fullname(), "dns"));
+        assert!(sources.urls(&target).is_empty());
+        assert_eq!(
+            sources.urls(&neighbor),
+            vec!["ws://192.0.2.3:4790/api/network/ws"]
+        );
+        let updated = mdns_info("Other", &target, "192.0.2.4")?;
+        assert!(sources.resolved(epoch, &updated, &local));
+        assert!(sources.urls(&neighbor).is_empty());
+        assert_eq!(
+            sources.urls(&target),
+            vec!["ws://192.0.2.4:4790/api/network/ws"]
+        );
+        assert!(!sources.resolved(epoch, &mdns_info("Other", "invalid", "192.0.2.4")?, &local));
+        assert!(sources.urls(&target).is_empty());
+        assert!(sources.verify.is_empty());
+        assert!(sources.resolved(epoch, &updated, &local));
+        assert!(!sources.resolved(epoch, &mdns_info("Other", &target, "fe80::1")?, &local));
+        assert!(sources.urls(&target).is_empty());
+        assert!(sources.resolved(epoch, &updated, &local));
+        assert!(!sources.resolved(epoch, &mdns_info("Other", &local, "192.0.2.4")?, &local));
+        assert!(sources.sources.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn m4_mdns_source_capacity_verify_rotation_and_old_epoch_cleanup_are_bounded() -> Result<()> {
+        let target = "1".repeat(64);
+        let local = "0".repeat(64);
+        let state = Arc::new(StdMutex::new(MdnsSources::default()));
+        let epoch = mdns_lock(&state).reset("fixture");
+        let old_lease = MdnsLease {
+            state: state.clone(),
+            epoch,
+        };
+        for index in 0..MAX_MDNS_SOURCES {
+            assert!(mdns_lock(&state).resolved(
+                epoch,
+                &mdns_info(&format!("Source-{index}"), &target, "192.0.2.1")?,
+                &local
+            ));
+        }
+        assert!(!mdns_lock(&state).resolved(
+            epoch,
+            &mdns_info("Overflow", &target, "192.0.2.2")?,
+            &local
+        ));
+        assert!(mdns_lock(&state).resolved(
+            epoch,
+            &mdns_info("Source-0", &target, "192.0.2.3")?,
+            &local
+        ));
+        let mut verified = HashSet::new();
+        for _ in 0..MAX_MDNS_SOURCES {
+            verified.insert(mdns_lock(&state).next_verify().unwrap().fullname);
+        }
+        assert_eq!(verified.len(), MAX_MDNS_SOURCES);
+        assert!(
+            verified
+                .iter()
+                .any(|fullname| fullname.starts_with("Source-0."))
+        );
+        assert_eq!(mdns_lock(&state).verify.len(), MAX_MDNS_SOURCES);
+        let current = mdns_lock(&state).reset("interface_reset");
+        assert!(!mdns_lock(&state).resolved(
+            epoch,
+            &mdns_info("Stale", &target, "192.0.2.1")?,
+            &local
+        ));
+        assert!(mdns_lock(&state).resolved(
+            current,
+            &mdns_info("Current", &target, "192.0.2.4")?,
+            &local
+        ));
+        drop(old_lease);
+        assert_eq!(
+            mdns_lock(&state).urls(&target),
+            vec!["ws://192.0.2.4:4790/api/network/ws"]
+        );
+        let current_lease = MdnsLease {
+            state: state.clone(),
+            epoch: current,
+        };
+        drop(current_lease);
+        assert!(mdns_lock(&state).urls(&target).is_empty());
+        assert!(mdns_lock(&state).sources.is_empty());
+        assert!(mdns_lock(&state).verify.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn m4_mdns_registration_matches_fixed_wildcard_and_loopback_listeners() -> Result<()> {
+        let node_id = LocalIdentity::generate().node_id()?;
+        for address in ["192.0.2.7:4790", "[2001:db8::7]:4790"] {
+            let listen: SocketAddr = address.parse()?;
+            let service = mdns_service(&node_id, listen)?.unwrap();
+            assert!(!service.is_addr_auto());
+            assert_eq!(
+                service
+                    .get_addresses()
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([listen.ip()])
+            );
+        }
+        for address in ["0.0.0.0:4790", "[::]:4790"] {
+            let service = mdns_service(&node_id, address.parse()?)?.unwrap();
+            assert!(service.is_addr_auto());
+            assert!(service.get_addresses().is_empty());
+        }
+        for address in ["127.0.0.1:4790", "[::1]:4790"] {
+            assert!(mdns_service(&node_id, address.parse()?)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_mdns_cleanup_waits_for_real_exit_ack_after_drop_and_again_fixture() -> Result<()> {
+        for force_again in [0, 1] {
+            let mut normal = MdnsGuard::new(ServiceDaemon::new()?);
+            normal.force_again = force_again;
+            normal.shutdown().await?;
+            let (completed, closed) = oneshot::channel();
+            let mut cancelled = MdnsGuard::new(ServiceDaemon::new()?);
+            cancelled.force_again = force_again;
+            cancelled.completed = Some(completed);
+            drop(cancelled);
+            assert_eq!(
+                tokio::time::timeout(CONNECT_TIMEOUT, closed).await???,
+                DaemonStatus::Shutdown
+            );
+        }
+        eprintln!(
+            "NET1_M4 mdns_cleanup_owner_actual_ack=true drop_actual_ack=true again_fixture=one_local_command_rejection native_reaper_actual_ack=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_mdns_owner_restarts_only_after_exit_ack_and_abort_withdraws_sources() -> Result<()>
+    {
+        let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let (first_started, first) = oneshot::channel();
+        let (fail, failure) = oneshot::channel();
+        hub.test_hooks.lock().unwrap().mdns_started = Some(first_started);
+        hub.test_hooks.lock().unwrap().mdns_fail = Some(failure);
+        let owner = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.mdns("127.0.0.1:4790".parse()?).await }
+        });
+        let (old_epoch, _old_daemon) = tokio::time::timeout(CONNECT_TIMEOUT, first).await??;
+        let target = "1".repeat(64);
+        assert!(mdns_lock(&hub.mdns).resolved(
+            old_epoch,
+            &mdns_info("Old", &target, "192.0.2.1")?,
+            &hub.identity.node_id()?
+        ));
+        let (closed, old_closed) = oneshot::channel();
+        let (next_started, next) = oneshot::channel();
+        let (dropped, current_closed) = oneshot::channel();
+        hub.test_hooks.lock().unwrap().mdns_closed = Some(closed);
+        hub.test_hooks.lock().unwrap().mdns_started = Some(next_started);
+        hub.test_hooks.lock().unwrap().mdns_dropped = Some(dropped);
+        fail.send(())
+            .map_err(|_| anyhow::anyhow!("old generation already stopped"))?;
+        tokio::time::timeout(CONNECT_TIMEOUT, old_closed).await??;
+        let (current_epoch, _current_daemon) =
+            tokio::time::timeout(CONNECT_TIMEOUT, next).await??;
+        assert!(current_epoch > old_epoch);
+        assert!(mdns_lock(&hub.mdns).urls(&target).is_empty());
+        assert!(!mdns_lock(&hub.mdns).resolved(
+            old_epoch,
+            &mdns_info("Late", &target, "192.0.2.1")?,
+            &hub.identity.node_id()?
+        ));
+        assert!(mdns_lock(&hub.mdns).resolved(
+            current_epoch,
+            &mdns_info("Current", &target, "192.0.2.2")?,
+            &hub.identity.node_id()?
+        ));
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        assert!(mdns_lock(&hub.mdns).urls(&target).is_empty());
+        assert_eq!(
+            tokio::time::timeout(CONNECT_TIMEOUT, current_closed).await???,
+            DaemonStatus::Shutdown
+        );
+        eprintln!(
+            "NET1_M4 injected_generation_error=true old_actual_exit_ack_before_new=true old_epoch_rejected=true owner_abort_sources=0 current_native_actual_exit_ack=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local multicast IPv4; run explicitly for NET-1"]
+    async fn m4_mdns_healthy_unchanged_service_survives_real_verify_refresh() -> Result<()> {
+        let publisher = MdnsGuard::new(ServiceDaemon::new()?);
+        let browser = MdnsGuard::new(ServiceDaemon::new()?);
+        publisher.get().disable_interface(IfKind::IPv6)?;
+        browser.get().disable_interface(IfKind::IPv6)?;
+        let target = LocalIdentity::generate().node_id()?;
+        let service =
+            mdns_info(&format!("NET1-{}", &target[..12]), &target, "")?.enable_addr_auto();
+        let expected = service.get_fullname().to_owned();
+        let events = browser.get().browse(SERVICE_TYPE)?;
+        publisher.get().register(service)?;
+        let mut sources = MdnsSources::default();
+        let epoch = sources.reset("real_fixture");
+        let mut resolved = 0;
+        tokio::time::timeout(CONNECT_TIMEOUT, async {
+            loop {
+                if let ServiceEvent::ServiceResolved(info) = events.recv_async().await?
+                    && info.get_fullname() == expected
+                {
+                    assert!(sources.resolved(epoch, &info, &"0".repeat(64)));
+                    resolved += 1;
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let settle = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(settle);
+        loop {
+            tokio::select! {
+                _ = &mut settle => break,
+                event = events.recv_async() => if let ServiceEvent::ServiceResolved(info) = event?
+                    && info.get_fullname() == expected
+                {
+                    assert!(sources.resolved(epoch, &info, &"0".repeat(64)));
+                    resolved += 1;
+                },
+            }
+        }
+        let initial = resolved;
+        let mut refresh_resolved = 0;
+        for _ in 0..3 {
+            browser
+                .get()
+                .verify(expected.clone(), MDNS_VERIFY_TIMEOUT)?;
+            let waited = tokio::time::sleep(MDNS_VERIFY_TIMEOUT + Duration::from_millis(400));
+            tokio::pin!(waited);
+            loop {
+                tokio::select! {
+                    _ = &mut waited => break,
+                    event = events.recv_async() => match event? {
+                        ServiceEvent::ServiceRemoved(_, fullname) if fullname.eq_ignore_ascii_case(&expected) => bail!("healthy unchanged service expired during actual verify refresh"),
+                        ServiceEvent::ServiceResolved(info) if info.get_fullname() == expected => {
+                            assert!(sources.resolved(epoch, &info, &"0".repeat(64)));
+                            refresh_resolved += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(!sources.urls(&target).is_empty());
+        }
+        assert_eq!(
+            refresh_resolved, 0,
+            "fixture changed while checking unchanged refresh"
+        );
+        publisher.shutdown().await?;
+        browser
+            .get()
+            .verify(expected.clone(), MDNS_VERIFY_TIMEOUT)?;
+        tokio::time::timeout(CONNECT_TIMEOUT, async {
+            loop {
+                if let ServiceEvent::ServiceRemoved(_, fullname) = events.recv_async().await?
+                    && fullname.eq_ignore_ascii_case(&expected)
+                {
+                    assert!(sources.removed(epoch, &fullname, "dns"));
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        assert!(sources.urls(&target).is_empty());
+        drop(events);
+        browser.shutdown().await?;
+        eprintln!(
+            "NET1_M4 real_mdns_initial_resolved={initial} verify_rounds=3 verify_timeout_ms=2000 refresh_resolved=0 healthy_source_retained=true publisher_stop_then_verify_exact_removed=true actual_native_exit_ack=true"
+        );
         Ok(())
     }
 
@@ -4636,18 +5610,16 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].signature, record.signature);
         assert!(resolver.lookup_local(&record.node_id).await?.is_none());
-        let mut socket = resolver.dial(&record.node_id, Service::Client).await?;
-        let mut accepted = incoming
-            .recv()
-            .await
-            .context("full cache lost valid target")?;
-        noise_round_trip(
+        let (mut socket, mut client, mut accepted, mut server) = dial_test_noise(
+            &resolver,
             &caller_identity,
             &target_identity,
-            &mut socket,
-            &mut accepted.socket,
+            Service::Client,
+            &mut incoming,
+            b"test:directory",
         )
         .await?;
+        encrypted_round_trip(&mut client, &mut server, &mut socket, &mut accepted.socket).await?;
         let state = resolver.state.lock().await;
         assert_eq!(state.records.len(), MAX_RECORDS);
         assert_eq!(state.resolved.len(), MAX_RESOLVED);
@@ -4765,61 +5737,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dial_direct_budgets_are_shared_across_records_and_deduplicated_across_phases()
-    -> Result<()> {
+    async fn authenticated_dial_budgets_are_shared_across_all_candidate_sources() -> Result<()> {
         let identity = LocalIdentity::generate();
         let target = identity.node_id()?;
         let mut tasks = JoinSet::new();
         let (reject_url, mut attempts) = serve_directory(None, None, &mut tasks).await?;
-        let mut directories = Vec::new();
-        for group in 0..3 {
-            let mut record = signed_record(&identity, now_secs()? - group)?;
-            record.direct_urls = (0..8)
-                .map(|index| format!("{reject_url}/directory-{group}-{index}"))
-                .collect();
-            record.relay_urls = (0..8)
-                .map(|index| format!("{reject_url}/relay-{group}-{index}"))
-                .collect();
-            record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
-            directories.push(serve_directory(Some(record), None, &mut tasks).await?.0);
-        }
-        let (resolver, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                bootstrap_urls: directories,
-                ..Default::default()
-            },
-        );
-        resolver.state.lock().await.candidates.insert(
-            target.clone(),
-            (0..16)
-                .map(|index| format!("{reject_url}/known-{index}"))
-                .collect(),
-        );
-        assert!(resolver.dial(&target, Service::Peer).await.is_err());
-        let mut count = 0;
-        let mut relays = 0;
-        while let Ok(control) = attempts.try_recv() {
-            match control {
-                DirectoryObservation::Request(Control::Direct { .. }) => count += 1,
-                DirectoryObservation::Request(Control::Dial { .. }) => relays += 1,
-                _ => bail!("unexpected path attempt"),
+        for relay_only in [false, true] {
+            let mut directories = Vec::new();
+            for group in 0..3 {
+                let mut record = signed_record(&identity, now_secs()? - group)?;
+                let urls = (0..8)
+                    .map(|index| format!("{reject_url}/group-{group}-{index}"))
+                    .collect::<Vec<_>>();
+                if relay_only {
+                    record.relay_urls = urls;
+                } else {
+                    record.direct_urls = urls;
+                }
+                record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
+                directories.push(serve_directory(Some(record), None, &mut tasks).await?.0);
             }
+            let (resolver, _) = NetworkHub::new(
+                LocalIdentity::generate(),
+                NetworkConfig {
+                    bootstrap_urls: directories,
+                    ..Default::default()
+                },
+            );
+            if !relay_only {
+                seed_mdns_urls(
+                    &resolver,
+                    &target,
+                    (0..16)
+                        .map(|index| format!("{reject_url}/known-{index}"))
+                        .collect(),
+                );
+            }
+            let authenticated = std::sync::atomic::AtomicUsize::new(0);
+            assert!(
+                resolver
+                    .dial_authenticated::<(), _, _>(&target, Service::Peer, |_| {
+                        authenticated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        async {
+                            Err(AuthenticationFailure::Path(anyhow::anyhow!(
+                                "control rejection must not authenticate"
+                            )))
+                        }
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(authenticated.load(std::sync::atomic::Ordering::Relaxed), 0);
+            let mut direct = 0;
+            let mut relays = 0;
+            while let Ok(control) = attempts.try_recv() {
+                match control {
+                    DirectoryObservation::Request(Control::Direct { .. }) => direct += 1,
+                    DirectoryObservation::Request(Control::Dial { .. }) => relays += 1,
+                    _ => bail!("unexpected path attempt"),
+                }
+            }
+            if relay_only {
+                assert_eq!(
+                    (direct, relays),
+                    (0, 8),
+                    "one relay budget shared by all records"
+                );
+            } else {
+                assert_eq!(
+                    (direct, relays),
+                    (16, 0),
+                    "one direct budget shared across mDNS and all directories"
+                );
+            }
+            assert_eq!(resolver.admission.snapshot().total, 0);
+            eprintln!(
+                "NET1_M4 D1 relay_only={relay_only} direct_attempts={direct} relay_attempts={relays} control_only=true noise_calls=0"
+            );
         }
-        assert_eq!(
-            count, 32,
-            "known phase 16 plus directory phase 16, not 16 per record"
-        );
-        assert_eq!(relays, 8, "relay budget is shared across every record");
-        assert_eq!(resolver.admission.snapshot().total, 0);
-        eprintln!(
-            "NET1_D1 direct_attempts={count} known_limit=16 directory_limit=16 relay_attempts={relays} relay_limit=8"
-        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn known_direct_beyond_first_phase_precedes_any_known_relay() -> Result<()> {
+    async fn known_direct_and_relay_compete_with_one_shared_candidate_budget() -> Result<()> {
         let target_identity = LocalIdentity::generate();
         let caller_identity = LocalIdentity::generate();
         let (target, mut incoming) =
@@ -4829,7 +5829,7 @@ mod tests {
         let (reject_url, mut attempts) = serve_directory(None, None, &mut tasks).await?;
         let (caller, _) = NetworkHub::new(caller_identity.clone(), NetworkConfig::default());
         let mut public = signed_record(&target_identity, now_secs()?)?;
-        public.direct_urls = (0..8)
+        public.direct_urls = (0..4)
             .map(|index| format!("{reject_url}/public-{index}"))
             .collect();
         public.relay_urls.push(format!("{reject_url}/relay"));
@@ -4839,37 +5839,35 @@ mod tests {
         private.signature = target_identity.sign_payload("reachability", &private.unsigned()?)?;
         assert_eq!(caller.publish(public).await?, PublishOutcome::Accepted);
         assert!(caller.remember(private.clone()).await?);
-        caller.state.lock().await.candidates.insert(
-            private.node_id.clone(),
+        seed_mdns_urls(
+            &caller,
+            &private.node_id,
             (0..8)
                 .map(|index| format!("{reject_url}/mdns-{index}"))
                 .collect(),
         );
-        let mut socket = caller.dial(&private.node_id, Service::Client).await?;
-        assert_eq!(socket.route(), Some(format!("direct:{target_url}")));
-        let mut rejected = 0;
-        while let Ok(control) = attempts.try_recv() {
-            ensure!(
-                matches!(
-                    control,
-                    DirectoryObservation::Request(Control::Direct { .. })
-                ),
-                "known relay attempted before known direct"
-            );
-            rejected += 1;
-        }
-        assert_eq!(rejected, 16);
-        let mut accepted = incoming
-            .recv()
-            .await
-            .context("known target direct not accepted")?;
-        noise_round_trip(
+        let (mut socket, mut client, mut accepted, mut server) = dial_test_noise(
+            &caller,
             &caller_identity,
             &target_identity,
-            &mut socket,
-            &mut accepted.socket,
+            Service::Client,
+            &mut incoming,
+            b"test:directory",
         )
         .await?;
+        assert_eq!(socket.route(), Some(format!("direct:{target_url}")));
+        let mut direct_attempts = 0;
+        let mut relay_attempts = 0;
+        while let Ok(control) = attempts.try_recv() {
+            match control {
+                DirectoryObservation::Request(Control::Direct { .. }) => direct_attempts += 1,
+                DirectoryObservation::Request(Control::Dial { .. }) => relay_attempts += 1,
+                _ => bail!("unexpected candidate control"),
+            }
+        }
+        assert!(direct_attempts <= 12);
+        assert!(relay_attempts <= 1);
+        encrypted_round_trip(&mut client, &mut server, &mut socket, &mut accepted.socket).await?;
         Ok(())
     }
 
@@ -5352,11 +6350,15 @@ mod tests {
             }
         })
         .await?;
-        let mut caller_socket = caller.dial(&target_id, Service::Client).await?;
-        let mut incoming = target_incoming
-            .recv()
-            .await
-            .context("missing reverse relay socket")?;
+        let (mut caller_socket, mut client, mut incoming, mut server) = dial_test_noise(
+            &caller,
+            &caller_identity,
+            &target_identity,
+            Service::Client,
+            &mut target_incoming,
+            b"test:relay",
+        )
+        .await?;
         tokio::task::yield_now().await;
         assert_eq!(
             (
@@ -5376,39 +6378,6 @@ mod tests {
         assert_ne!(relay_identity.node_id()?, target_id);
         assert_ne!(relay_identity.node_id()?, caller_identity.node_id()?);
 
-        let mut client = Handshake::new(
-            true,
-            &caller_identity.secret_key_hex,
-            Some(target_id),
-            b"test:relay",
-        )
-        .map_err(anyhow::Error::msg)?;
-        let mut server = Handshake::new(
-            false,
-            &target_identity.secret_key_hex,
-            Some(caller_identity.node_id()?),
-            b"test:relay",
-        )
-        .map_err(anyhow::Error::msg)?;
-        let first = client.write(&[]).map_err(anyhow::Error::msg)?;
-        send_frame(&mut caller_socket, Message::Binary(first.into())).await?;
-        let first = next_binary(&mut incoming.socket).await?;
-        server.read(&first).map_err(anyhow::Error::msg)?;
-        let second = server.write(&[]).map_err(anyhow::Error::msg)?;
-        send_frame(&mut incoming.socket, Message::Binary(second.into())).await?;
-        let second = next_binary(&mut caller_socket).await?;
-        assert_eq!(client.read(&second).map_err(anyhow::Error::msg)?, b"");
-        let third = client
-            .write(b"authenticated caller")
-            .map_err(anyhow::Error::msg)?;
-        send_frame(&mut caller_socket, Message::Binary(third.into())).await?;
-        let third = next_binary(&mut incoming.socket).await?;
-        assert_eq!(
-            server.read(&third).map_err(anyhow::Error::msg)?,
-            b"authenticated caller"
-        );
-        let mut client = client.finish().map_err(anyhow::Error::msg)?;
-        let mut server = server.finish().map_err(anyhow::Error::msg)?;
         let canary = b"private context canary across an unrelated relay";
         for encrypted in client.seal_message(canary).map_err(anyhow::Error::msg)? {
             assert!(
@@ -5461,6 +6430,694 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m4_wrong_noise_path_loses_and_healthy_relay_beats_a_stalled_direct() -> Result<()> {
+        let mut tasks = JoinSet::new();
+        let target_identity = LocalIdentity::generate();
+        let caller_identity = LocalIdentity::generate();
+        let wrong_identity = LocalIdentity::generate();
+        let (wrong, mut wrong_incoming) =
+            NetworkHub::new(wrong_identity.clone(), NetworkConfig::default());
+        let wrong_url = serve(wrong, &mut tasks).await?;
+        let (wrong_done, wrong_observed) = oneshot::channel();
+        tasks.spawn(async move {
+            let result = async {
+                let mut accepted = wrong_incoming
+                    .recv()
+                    .await
+                    .context("wrong endpoint not attempted")?;
+                let mut handshake = Handshake::new(
+                    false,
+                    &wrong_identity.secret_key_hex,
+                    None,
+                    b"test:directory",
+                )
+                .map_err(anyhow::Error::msg)?;
+                handshake
+                    .read(&next_binary(&mut accepted.socket).await?)
+                    .map_err(anyhow::Error::msg)?;
+                send_frame(
+                    &mut accepted.socket,
+                    Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                )
+                .await?;
+                let _ = wrong_done.send(());
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+        });
+        let (slow, mut slow_incoming) =
+            NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let slow_url = serve(slow, &mut tasks).await?;
+        let (relay, _) = NetworkHub::new(
+            LocalIdentity::generate(),
+            NetworkConfig {
+                relay_enabled: true,
+                ..Default::default()
+            },
+        );
+        let relay_url = serve(relay.clone(), &mut tasks).await?;
+        let (target, mut target_incoming) = NetworkHub::new(
+            target_identity.clone(),
+            NetworkConfig {
+                bootstrap_urls: vec![relay_url.clone()],
+                advertise_urls: vec![wrong_url.clone(), slow_url.clone()],
+                ..Default::default()
+            },
+        );
+        let runner = target.clone();
+        tasks.spawn(async move {
+            let _ = runner.run("127.0.0.1:0".parse().unwrap()).await;
+        });
+        let target_id = target_identity.node_id()?;
+        let record = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = relay.lookup_local(&target_id).await?
+                    && !record.relay_urls.is_empty()
+                {
+                    break Ok::<_, anyhow::Error>(record);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        let (caller, _) = NetworkHub::new(caller_identity.clone(), NetworkConfig::default());
+        assert!(caller.remember(record).await?);
+        // Seed only ordering history: the actual wrong endpoint must still pass
+        // target-pinned Noise before it can win, and is rejected below.
+        caller
+            .record_path(&target_id, &format!("direct:{wrong_url}"), true)
+            .await;
+        let (forward, mut accepted) = mpsc::channel(1);
+        let (slow_seen, slow_observed) = oneshot::channel();
+        tasks.spawn(async move {
+            let stalled = slow_incoming
+                .recv()
+                .await
+                .expect("slow direct was not started");
+            let _ = slow_seen.send(stalled);
+            let target = target_incoming.recv().await.expect("relay target missing");
+            forward.send(target).await.expect("relay responder dropped");
+        });
+        let started = Instant::now();
+        let (mut socket, mut client, mut incoming, mut server) = tokio::time::timeout(
+            Duration::from_secs(5),
+            dial_test_noise(
+                &caller,
+                &caller_identity,
+                &target_identity,
+                Service::Client,
+                &mut accepted,
+                b"test:directory",
+            ),
+        )
+        .await??;
+        wrong_observed.await?;
+        let stalled = slow_observed.await?;
+        assert_eq!(socket.route(), Some(format!("relay:{relay_url}")));
+        assert!(started.elapsed() < CONNECT_TIMEOUT);
+        assert_eq!(
+            caller.admission.snapshot().total,
+            1,
+            "losing local socket permits must drop before winner returns"
+        );
+        let state = caller.state.lock().await;
+        assert!(
+            state.paths[&(target_id.clone(), format!("direct:{wrong_url}"))]
+                .failed_until
+                .is_some()
+        );
+        assert!(
+            !state
+                .paths
+                .contains_key(&(target_id.clone(), format!("direct:{slow_url}"))),
+            "cancelled loser is not a failed route"
+        );
+        assert!(
+            state.paths[&(target_id, format!("relay:{relay_url}"))]
+                .authenticated_at
+                .is_some()
+        );
+        drop(state);
+        encrypted_round_trip(&mut client, &mut server, &mut socket, &mut incoming.socket).await?;
+        drop(socket);
+        assert_eq!(caller.admission.snapshot().total, 0);
+        drop(stalled);
+        eprintln!(
+            "NET1_M4 wrong_noise_identity_rejected=true slow_direct_started=true healthy_relay_authenticated=true local_loser_permits_released=true cancelled_loser_not_penalized=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_peer_revocation_during_target_noise_is_terminal_and_does_not_penalize_path()
+    -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let target_identity = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let roles = vec![
+            crate::model::NodeRole::Replica,
+            crate::model::NodeRole::Relay,
+        ];
+        let mut store = crate::store::Store::open(":memory:")?;
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(
+                1,
+                vec![
+                    owner.certificate(roles.clone())?,
+                    target_identity.certificate(roles.clone())?,
+                ],
+            )?,
+        )?;
+        let store = Arc::new(Mutex::new(store));
+        let (peer, _) = crate::peer::PeerHub::new(owner.clone(), store.clone(), &roles);
+        let (target, mut incoming) =
+            NetworkHub::new(target_identity.clone(), NetworkConfig::default());
+        let mut tasks = JoinSet::new();
+        let url = serve(target, &mut tasks).await?;
+        let (transport, _) = NetworkHub::new(owner.clone(), NetworkConfig::default());
+        let mut record = signed_record(&target_identity, now_secs()?)?;
+        record.direct_urls.push(url);
+        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        assert!(transport.remember(record).await?);
+        let (entered, observed) = oneshot::channel();
+        let (resume, gate) = oneshot::channel();
+        let (closed, closed_observed) = oneshot::channel();
+        let server_owner = owner.clone();
+        let server_identity = target_identity.clone();
+        tasks.spawn(async move {
+            let result = async {
+                let mut accepted = incoming.recv().await.context("target path missing")?;
+                let mut handshake = Handshake::new(
+                    false,
+                    &server_identity.secret_key_hex,
+                    Some(server_owner.node_id()?),
+                    b"vibeface:peer:v1",
+                )
+                .map_err(anyhow::Error::msg)?;
+                assert!(
+                    handshake
+                        .read(&next_binary(&mut accepted.socket).await?)
+                        .map_err(anyhow::Error::msg)?
+                        .is_empty()
+                );
+                let _ = entered.send(());
+                gate.await?;
+                send_frame(
+                    &mut accepted.socket,
+                    Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                )
+                .await?;
+                let rejected_before_third = next_binary(&mut accepted.socket).await.is_err();
+                let _ = closed.send(rejected_before_third);
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+        });
+        let driver_peer = peer.clone();
+        let driver_network = network.clone();
+        let driver_target = target_identity.node_id()?;
+        let driver_transport = transport.clone();
+        let driver = tokio::spawn(async move {
+            driver_peer
+                .connect_target(
+                    driver_network,
+                    driver_target,
+                    driver_transport,
+                    None,
+                    tokio::time::Instant::now() + DIAL_TIMEOUT,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), observed).await??;
+        let mut revoked = target_identity.certificate(roles.clone())?;
+        revoked.revoked = true;
+        store.lock().await.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(2, vec![owner.certificate(roles)?, revoked])?,
+        )?;
+        resume
+            .send(())
+            .map_err(|_| anyhow::anyhow!("target handshake gate dropped"))?;
+        let error = tokio::time::timeout(Duration::from_secs(2), driver)
+            .await??
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::peer::AuthorizationDenied>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), closed_observed).await??);
+        assert!(peer.online(&network).await.is_empty());
+        assert_eq!(transport.admission.snapshot().total, 0);
+        assert!(
+            transport.state.lock().await.paths.is_empty(),
+            "current membership denial is terminal, not a route penalty"
+        );
+        eprintln!(
+            "NET1_M4 real_peer_noise_started=true store_target_revoked_before_response=true typed_authorization_terminal=true no_link_installed=true local_admission_released=true no_path_penalty=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_total_dial_deadline_cancels_a_stalled_callback_and_releases_socket() -> Result<()> {
+        let target_identity = LocalIdentity::generate();
+        let (target, mut incoming) =
+            NetworkHub::new(target_identity.clone(), NetworkConfig::default());
+        let mut tasks = JoinSet::new();
+        let url = serve(target, &mut tasks).await?;
+        let (caller, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        seed_mdns_urls(&caller, &target_identity.node_id()?, vec![url]);
+        let (entered, mut entered_rx) = mpsc::unbounded_channel();
+        let started = Instant::now();
+        let target_id = target_identity.node_id()?;
+        let mut dial = Box::pin(caller.dial_authenticated::<(), _, _>(
+            &target_id,
+            Service::Client,
+            |socket| {
+                let entered = entered.clone();
+                async move {
+                    let _ = entered.send(());
+                    std::future::pending::<()>().await;
+                    Ok((socket, ()))
+                }
+            },
+        ));
+        tokio::select! {
+            signal = entered_rx.recv() => assert!(signal.is_some()),
+            _ = &mut dial => panic!("dial completed before stalled callback"),
+        }
+        let accepted = incoming
+            .recv()
+            .await
+            .context("stalled callback socket missing")?;
+        assert_eq!(caller.admission.snapshot().total, 1);
+        let error = dial.await.err().expect("stalled callback unexpectedly won");
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(started.elapsed() >= DIAL_TIMEOUT);
+        assert_eq!(caller.admission.snapshot().total, 0);
+        assert!(
+            caller.state.lock().await.paths.is_empty(),
+            "deadline cancellation is not a path failure"
+        );
+        drop(accepted);
+        eprintln!(
+            "NET1_M4 deadline_seconds=15 fixture_callback_stalled=true local_socket_released=true cancelled_path_not_penalized=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_withdrawn_source_is_rechecked_when_the_attempt_is_first_polled() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let target = identity.node_id()?;
+        let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let url = "ws://127.0.0.1:1/api/network/ws".to_owned();
+        seed_mdns_urls(&hub, &target, vec![url.clone()]);
+        let candidate = PathCandidate {
+            url,
+            relay: false,
+            mdns: true,
+            record_expires_at: None,
+        };
+        assert!(candidate.live(&hub, &target));
+        async fn authenticate(
+            _: NetworkSocket,
+        ) -> std::result::Result<(NetworkSocket, ()), AuthenticationFailure> {
+            panic!("withdrawn source must not open a socket or authenticate");
+        }
+        let attempt = hub.attempt_path(candidate, &target, Service::Peer, &authenticate);
+        mdns_lock(&hub.mdns).sources.clear();
+        assert!(matches!(
+            attempt.await.1,
+            Err(AuthenticationFailure::SourceGone)
+        ));
+        assert_eq!(hub.admission.snapshot().total, 0);
+        assert!(hub.state.lock().await.paths.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_fast_directory_direct_authenticates_while_known_noise_and_other_directory_stall()
+    -> Result<()> {
+        let mut tasks = JoinSet::new();
+        let target_identity = LocalIdentity::generate();
+        let caller_identity = LocalIdentity::generate();
+        let (target, mut incoming) =
+            NetworkHub::new(target_identity.clone(), NetworkConfig::default());
+        let url = serve(target, &mut tasks).await?;
+        let (stalled, mut stalled_incoming) =
+            NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let stalled_url = serve(stalled, &mut tasks).await?;
+        let mut record = signed_record(&target_identity, now_secs()?)?;
+        record.direct_urls.push(url.clone());
+        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        let fast_gate = Arc::new(Semaphore::new(0));
+        let slow_gate = Arc::new(Semaphore::new(0));
+        let (fast_url, mut fast_requests) =
+            serve_directory(Some(record), Some(fast_gate.clone()), &mut tasks).await?;
+        let (slow_url, mut slow_requests) =
+            serve_directory(None, Some(slow_gate.clone()), &mut tasks).await?;
+        let (caller, _) = NetworkHub::new(
+            caller_identity.clone(),
+            NetworkConfig {
+                bootstrap_urls: vec![fast_url, slow_url],
+                ..Default::default()
+            },
+        );
+        let target_id = target_identity.node_id()?;
+        seed_mdns_urls(&caller, &target_id, vec![stalled_url.clone()]);
+        let release_fast = async {
+            let mut stalled = stalled_incoming
+                .recv()
+                .await
+                .context("known direct missing")?;
+            let _actual_noise_first = next_binary(&mut stalled.socket).await?;
+            assert!(matches!(
+                fast_requests.recv().await,
+                Some(DirectoryObservation::Request(Control::Lookup { .. }))
+            ));
+            assert!(matches!(
+                slow_requests.recv().await,
+                Some(DirectoryObservation::Request(Control::Lookup { .. }))
+            ));
+            fast_gate.add_permits(1);
+            Ok::<_, anyhow::Error>(stalled)
+        };
+        let dial = dial_test_noise(
+            &caller,
+            &caller_identity,
+            &target_identity,
+            Service::Client,
+            &mut incoming,
+            b"test:directory",
+        );
+        let ((mut socket, mut client, mut accepted, mut server), stalled) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(dial, release_fast)
+            })
+            .await??;
+        assert_eq!(socket.route(), Some(format!("direct:{url}")));
+        assert_eq!(
+            slow_gate.available_permits(),
+            0,
+            "slow directory never opened"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), slow_requests.recv()).await?,
+            Some(DirectoryObservation::Closed)
+        ));
+        assert_eq!(caller.admission.snapshot().total, 1);
+        assert!(
+            !caller
+                .state
+                .lock()
+                .await
+                .paths
+                .contains_key(&(target_id, format!("direct:{stalled_url}")))
+        );
+        encrypted_round_trip(&mut client, &mut server, &mut socket, &mut accepted.socket).await?;
+        drop(stalled);
+        eprintln!(
+            "NET1_M4 known_direct_noise_stalled=true slow_directory_gate_closed=true fast_directory_healthy_direct_noise_complete=true did_not_wait_for_slow_directory=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_late_relay_preempts_one_of_two_stalled_direct_attempts() -> Result<()> {
+        let mut tasks = JoinSet::new();
+        let target_identity = LocalIdentity::generate();
+        let caller_identity = LocalIdentity::generate();
+        let mut stalled_receivers = Vec::new();
+        let mut stalled_urls = Vec::new();
+        for _ in 0..2 {
+            let (hub, receive) =
+                NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+            stalled_urls.push(serve(hub, &mut tasks).await?);
+            stalled_receivers.push(receive);
+        }
+        let (relay, _) = NetworkHub::new(
+            LocalIdentity::generate(),
+            NetworkConfig {
+                relay_enabled: true,
+                ..Default::default()
+            },
+        );
+        let relay_url = serve(relay.clone(), &mut tasks).await?;
+        let (target, mut incoming) = NetworkHub::new(
+            target_identity.clone(),
+            NetworkConfig {
+                bootstrap_urls: vec![relay_url.clone()],
+                advertise_urls: stalled_urls.clone(),
+                ..Default::default()
+            },
+        );
+        let runner = target.clone();
+        tasks.spawn(async move {
+            let _ = runner.run("127.0.0.1:0".parse().unwrap()).await;
+        });
+        let target_id = target_identity.node_id()?;
+        let record = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = relay.lookup_local(&target_id).await?
+                    && !record.relay_urls.is_empty()
+                {
+                    break Ok::<_, anyhow::Error>(record);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        let gate = Arc::new(Semaphore::new(0));
+        let (directory, mut requests) =
+            serve_directory(Some(record), Some(gate.clone()), &mut tasks).await?;
+        let (caller, _) = NetworkHub::new(
+            caller_identity.clone(),
+            NetworkConfig {
+                bootstrap_urls: vec![directory],
+                ..Default::default()
+            },
+        );
+        let held_capacity = (0..MAX_ESTABLISHED - 2)
+            .map(|_| caller.outbound(SocketClass::Data))
+            .collect::<Result<Vec<_>>>()?;
+        seed_mdns_urls(&caller, &target_id, stalled_urls.clone());
+        let release_relay = async {
+            let mut stalled = Vec::new();
+            for receive in &mut stalled_receivers {
+                let mut accepted = receive
+                    .recv()
+                    .await
+                    .context("second slow direct never started")?;
+                let _actual_noise_first = next_binary(&mut accepted.socket).await?;
+                stalled.push(accepted);
+            }
+            assert_eq!(
+                caller.admission.snapshot().long,
+                MAX_ESTABLISHED,
+                "two real data attempts occupy both slots before relay arrival"
+            );
+            assert!(matches!(
+                requests.recv().await,
+                Some(DirectoryObservation::Request(Control::Lookup { .. }))
+            ));
+            gate.add_permits(1);
+            Ok::<_, anyhow::Error>(stalled)
+        };
+        let dial = dial_test_noise(
+            &caller,
+            &caller_identity,
+            &target_identity,
+            Service::Client,
+            &mut incoming,
+            b"test:directory",
+        );
+        let ((mut socket, mut client, mut accepted, mut server), stalled) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(dial, release_relay)
+            })
+            .await??;
+        assert_eq!(socket.route(), Some(format!("relay:{relay_url}")));
+        assert_eq!(caller.admission.snapshot().total, MAX_ESTABLISHED - 1);
+        drop(held_capacity);
+        assert_eq!(caller.admission.snapshot().total, 1);
+        let state = caller.state.lock().await;
+        for url in &stalled_urls {
+            assert!(
+                !state
+                    .paths
+                    .contains_key(&(target_id.clone(), format!("direct:{url}"))),
+                "preempted/cancelled directs cannot be penalized"
+            );
+        }
+        drop(state);
+        encrypted_round_trip(&mut client, &mut server, &mut socket, &mut accepted.socket).await?;
+        drop(stalled);
+        eprintln!(
+            "NET1_M4 two_direct_noise_attempts_held=true late_directory_relay_arrived=true one_direct_cancelled_before_relay_slot=true healthy_relay_noise_complete=true local_losers_released=true logical_capacity_fixture=110 real_attempt_slots=2 relay_could_not_acquire_before_cancelled_socket_drop=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_target_noise_with_wrong_hello_claim_is_path_failure_and_healthy_target_still_wins()
+    -> Result<()> {
+        let mut tasks = JoinSet::new();
+        let owner = LocalIdentity::generate();
+        let target_identity = LocalIdentity::generate();
+        let untrusted = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let roles = vec![
+            crate::model::NodeRole::Replica,
+            crate::model::NodeRole::Relay,
+        ];
+        let mut store = crate::store::Store::open(":memory:")?;
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(
+                1,
+                vec![
+                    owner.certificate(roles.clone())?,
+                    target_identity.certificate(roles.clone())?,
+                ],
+            )?,
+        )?;
+        let store = Arc::new(Mutex::new(store));
+        let (peer, _) = crate::peer::PeerHub::new(owner.clone(), store.clone(), &roles);
+        let (healthy_peer, mut messages) =
+            crate::peer::PeerHub::new(target_identity.clone(), store, &roles);
+        let (bad, mut bad_incoming) =
+            NetworkHub::new(target_identity.clone(), NetworkConfig::default());
+        let bad_url = serve(bad, &mut tasks).await?;
+        let (healthy, mut healthy_incoming) =
+            NetworkHub::new(target_identity.clone(), NetworkConfig::default());
+        let healthy_url = serve(healthy, &mut tasks).await?;
+        let (bad_rejected, rejected) = oneshot::channel();
+        let bad_identity = target_identity.clone();
+        let bad_owner = owner.clone();
+        let bad_network = network.clone();
+        tasks.spawn(async move {
+            let result = async {
+                let mut accepted = bad_incoming.recv().await.context("malformed Hello path missing")?;
+                let mut handshake = Handshake::new(false, &bad_identity.secret_key_hex,
+                    Some(bad_owner.node_id()?), b"vibeface:peer:v1").map_err(anyhow::Error::msg)?;
+                assert!(handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?.is_empty());
+                send_frame(&mut accepted.socket, Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into())).await?;
+                let hello: serde_json::Value = serde_json::from_slice(&handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?)?;
+                assert_eq!(hello["node_id"], bad_owner.node_id()?);
+                let mut channel = handshake.finish().map_err(anyhow::Error::msg)?;
+                let malformed = serde_json::to_vec(&serde_json::json!({
+                    "version":crate::model::WIRE_VERSION,"network_id":bad_network,"node_id":untrusted.node_id()?
+                }))?;
+                for record in channel.seal_message(&malformed).map_err(anyhow::Error::msg)? {
+                    send_frame(&mut accepted.socket, Message::Binary(record.into())).await?;
+                }
+                ensure!(next_binary(&mut accepted.socket).await.is_err(), "wrong Hello path was not rejected");
+                let _ = bad_rejected.send(());
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            assert!(result.is_ok(), "{result:?}");
+        });
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let server_stop = stop.clone();
+        let server_peer = healthy_peer.clone();
+        tasks.spawn(async move {
+            rejected.await.expect("malformed path did not close");
+            let accepted = healthy_incoming
+                .recv()
+                .await
+                .expect("healthy target path missing");
+            tokio::select! {
+                _ = server_peer.accept_transport(accepted.socket) => {},
+                _ = server_stop.notified() => {},
+            }
+        });
+        let response_peer = healthy_peer.clone();
+        tasks.spawn(async move {
+            let request = messages.recv().await.expect("healthy target query missing");
+            assert_eq!(
+                request.payload,
+                serde_json::json!({"type":"classification_probe"})
+            );
+            response_peer
+                .respond(&request, serde_json::json!({"ok":true}))
+                .await
+                .expect("healthy target response failed");
+        });
+        let (transport, _) = NetworkHub::new(owner.clone(), NetworkConfig::default());
+        let target_id = target_identity.node_id()?;
+        let mut record = signed_record(&target_identity, now_secs()?)?;
+        record.direct_urls = vec![bad_url.clone(), healthy_url.clone()];
+        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        assert!(transport.remember(record).await?);
+        transport
+            .record_path(&target_id, &format!("direct:{bad_url}"), true)
+            .await;
+        let driver_peer = peer.clone();
+        let driver_network = network.clone();
+        let driver_target = target_id.clone();
+        let driver_transport = transport.clone();
+        let mut driver = tokio::spawn(async move {
+            driver_peer
+                .connect_target(
+                    driver_network,
+                    driver_target,
+                    driver_transport,
+                    None,
+                    tokio::time::Instant::now() + DIAL_TIMEOUT,
+                )
+                .await
+        });
+        tokio::select! {
+            result = &mut driver => bail!("malformed Hello terminated the flight: {result:?}"),
+            ready = tokio::time::timeout(Duration::from_secs(5), async {
+                while !peer.online(&network).await.contains(&target_id) { tokio::task::yield_now().await; }
+            }) => ready?,
+        }
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                peer.request(
+                    &network,
+                    &target_id,
+                    serde_json::json!({"type":"classification_probe"})
+                )
+            )
+            .await??,
+            serde_json::json!({"ok":true})
+        );
+        let state = transport.state.lock().await;
+        assert!(
+            state.paths[&(target_id.clone(), format!("direct:{bad_url}"))]
+                .failed_until
+                .is_some()
+        );
+        assert!(
+            state.paths[&(target_id.clone(), format!("direct:{healthy_url}"))]
+                .authenticated_at
+                .is_some()
+        );
+        drop(state);
+        stop.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), driver)
+                .await??
+                .is_err()
+        );
+        assert!(peer.online(&network).await.is_empty());
+        assert_eq!(transport.admission.snapshot().total, 0);
+        eprintln!(
+            "NET1_M4 actual_target_noise_complete=true malformed_hello_claim_untrusted=true classified_path_failure=true healthy_same_target_noise_hello_authorization_wins=true encrypted_query_response=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn public_socket_capacity_is_held_until_the_application_channel_drops() -> Result<()> {
         let mut tasks = JoinSet::new();
         let (hub, mut incoming) =
@@ -5504,24 +7161,23 @@ mod tests {
         let (target, mut incoming) =
             NetworkHub::new(target_identity.clone(), NetworkConfig::default());
         let target_url = serve(target.clone(), &mut tasks).await?;
-        let (caller, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
-        caller
-            .state
-            .lock()
-            .await
-            .candidates
-            .insert(target_identity.node_id()?, vec![target_url.clone()]);
-        let _socket = caller
-            .dial(&target_identity.node_id()?, Service::Peer)
-            .await?;
-        assert_eq!(
-            incoming
-                .recv()
-                .await
-                .context("missing direct socket")?
-                .service,
-            Service::Peer
+        let caller_identity = LocalIdentity::generate();
+        let (caller, _) = NetworkHub::new(caller_identity.clone(), NetworkConfig::default());
+        seed_mdns_urls(
+            &caller,
+            &target_identity.node_id()?,
+            vec![target_url.clone()],
         );
+        let (mut socket, mut client, mut accepted, mut server) = dial_test_noise(
+            &caller,
+            &caller_identity,
+            &target_identity,
+            Service::Peer,
+            &mut incoming,
+            b"test:directory",
+        )
+        .await?;
+        encrypted_round_trip(&mut client, &mut server, &mut socket, &mut accepted.socket).await?;
         let (mut socket, nonce) = open_control(&target_url).await?;
         let identity = LocalIdentity::generate();
         let node_id = identity.node_id()?;

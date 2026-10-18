@@ -15,6 +15,7 @@ Add --net1-lane 2 to check interrupted and crashed 32 MiB and 64 MiB relay downl
 Add --net1-lane 3 to verify a 100001-event closure across three authorized replicas.
 Add --net1-lane 4 to check production discovery through isolated directory sources.
 Add --net1-lane 5 or 6 to check reservation generations and real-source quotas.
+Add --net1-lane 7 to check actual mDNS sources and intermediate-route recovery.
 """
 
 import argparse
@@ -228,13 +229,16 @@ def verify_direct_start(run, binary):
 
 
 class RelayCapture:
-    def __init__(self, upstream_port, *, retain_payloads=True):
+    def __init__(self, upstream_port, *, retain_payloads=True, listen_host="127.0.0.1", upstream_host="127.0.0.1"):
         self.port = available_port()
-        self.url = f"http://127.0.0.1:{self.port}"
+        require(ipaddress.ip_address(listen_host).version == ipaddress.ip_address(upstream_host).version == 4,
+                "capture fixture endpoints use explicit IPv4 addresses")
+        self.url = f"http://{listen_host}:{self.port}"
         self.upstream_port = upstream_port
+        self.upstream_host = upstream_host
         self.listener = socket.socket()
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listener.bind(("127.0.0.1", self.port))
+        self.listener.bind((listen_host, self.port))
         self.listener.listen(32)
         self.listener.settimeout(0.2)
         self.stopped = threading.Event()
@@ -265,7 +269,7 @@ class RelayCapture:
                 if self.paused.is_set():
                     client.close()
                     continue
-                server = socket.create_connection(("127.0.0.1", self.upstream_port), timeout=5)
+                server = socket.create_connection((self.upstream_host, self.upstream_port), timeout=5)
                 client.settimeout(None)
                 server.settimeout(None)
             except socket.timeout:
@@ -778,6 +782,14 @@ class Node:
         configuration.update(values)
         private_json(path, configuration)
 
+    def set_url(self, host, *, listen=None):
+        require(self.process is None, f"{self.name}: listener changes require a stopped process")
+        address = ipaddress.ip_address(host)
+        authority = f"[{address}]" if address.version == 6 else str(address)
+        self.url = self.client.url = f"http://{authority}:{self.port}"
+        self.configure(listen=listen or f"{authority}:{self.port}", public_url=self.url,
+                       allow_insecure_lan=not address.is_loopback)
+
     def start(self, *, env=None):
         require(self.process is None, f"{self.name}: process is stopped before start")
         self.log = (self.directory / "process.log").open("ab")
@@ -901,7 +913,6 @@ def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
         if probe.process is not None and deadline - time.monotonic() <= 5:
             probe.process.kill()
         probe.close()
-
 
 
 class Events:
@@ -1051,10 +1062,118 @@ def websocket_send(stream, value):
     websocket_send_frame(stream, json.dumps(value).encode())
 
 
+def network_mdns_interfaces():
+    require(sys.platform == "darwin" and Path("/usr/bin/dns-sd").is_file(),
+            "Lane 7 mDNS driver requires the macOS DNS-SD observer")
+    result = subprocess.run(["/sbin/ifconfig", "-a"], capture_output=True, text=True, timeout=5)
+    require(result.returncode == 0, "read-only interface enumeration succeeds")
+    interfaces = []
+    for block in re.split(r"(?=^\S+: flags=)", result.stdout, flags=re.MULTILINE):
+        name = re.match(r"(en\d+): flags=.*MULTICAST", block)
+        if not name or not re.search(r"^\s*status: active\s*$", block, re.MULTILINE):
+            continue
+        addresses = [str(ipaddress.ip_address(value)) for value in re.findall(r"^\s*inet (\S+)", block, re.MULTILINE)
+                     if not ipaddress.ip_address(value).is_loopback and not ipaddress.ip_address(value).is_link_local]
+        if addresses:
+            interfaces.append({"name": name[1], "ipv4": addresses})
+    require(interfaces, "an already-active multicast interface has an IPv4 address without changing host networking")
+    return interfaces
+
+
+def network_dns_name(value):
+    unescaped = re.sub(r"\\([0-9]{3}|.)", lambda match: chr(int(match[1])) if match[1].isdigit() else match[1], value)
+    return unescaped.rstrip(".").lower() + "."
+
+
+class NetworkDnsSd:
+    def __init__(self, run, name, interface, arguments, *, timeout=180):
+        require(1 <= timeout <= 300 and arguments[0] in ("-B", "-R", "-L", "-Q"),
+                "bounded DNS-SD fixture operation")
+        self.path = run / f"{name}.log"
+        self.log = self.path.open("xb")
+        self.path.chmod(0o600)
+        self.command = ["/usr/bin/dns-sd", "-i", interface, "-t", str(timeout), *map(str, arguments)]
+        self.started = time.monotonic()
+        self.stopped = None
+        self.returncode = None
+        try:
+            self.process = subprocess.Popen(self.command, stdin=subprocess.DEVNULL, stdout=self.log,
+                                            stderr=subprocess.STDOUT, start_new_session=True)
+        except BaseException:
+            self.log.close()
+            raise
+
+    def text(self):
+        require(self.path.stat().st_size <= 1024 * 1024, "DNS-SD fixture output stays bounded")
+        return self.path.read_text(errors="replace")
+
+    def browse_records(self):
+        records = []
+        pattern = r"^\s*(\d\d:\d\d:\d\d\.\d+)\s+(Add|Rmv)\s+([0-9A-Fa-f]+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$"
+        for index, line in enumerate(self.text().splitlines()):
+            match = re.match(pattern, line)
+            if match:
+                stamp, action, flags, interface, domain, service, instance = match.groups()
+                records.append({"line": index + 1, "timestamp": stamp, "action": action, "flags": int(flags, 16),
+                                "interface_index": int(interface), "domain": domain, "service": service,
+                                "instance": instance, "canonical_fullname": network_dns_name(f"{instance}.{service}{domain}")})
+        return records
+
+    def resolutions(self):
+        records = []
+        pattern = r"^\s*(\d\d:\d\d:\d\d\.\d+)\s+(.+?\._vibeface\._tcp\.local\.) can be reached at (\S+):(\d+) \(interface (\d+)\)"
+        lines = self.text().splitlines()
+        for index, line in enumerate(lines):
+            match = re.match(pattern, line)
+            if match:
+                stamp, fullname, hostname, port, interface = match.groups()
+                records.append({"line": index + 1, "timestamp": stamp, "fullname": fullname,
+                                "canonical_fullname": network_dns_name(fullname),
+                                "hostname": hostname, "port": int(port), "interface_index": int(interface),
+                                "txt_lines": lines[index + 1:index + 3]})
+        return records
+
+    def addresses(self, hostname):
+        records = []
+        for index, line in enumerate(self.text().splitlines()):
+            columns = line.split()
+            if len(columns) < 7 or columns[1] != "Add" or hostname.casefold().rstrip(".") not in [value.casefold().rstrip(".") for value in columns]:
+                continue
+            try:
+                address = ipaddress.ip_address(columns[-1])
+            except ValueError:
+                continue
+            records.append({"line": index + 1, "address": str(address), "family": address.version,
+                            "interface_index": int(columns[3]), "raw": line})
+        return records
+
+    def snapshot(self):
+        return {"command": self.command, "log": str(self.path), "log_sha256": file_sha256(self.path),
+                "log_bytes": self.path.stat().st_size, "started_monotonic": self.started,
+                "stopped_monotonic": self.stopped, "returncode": self.returncode,
+                "process_running": self.process is not None and self.process.poll() is None}
+
+    def close(self):
+        if self.process is not None:
+            try:
+                if self.process.poll() is None:
+                    self.process.send_signal(signal.SIGINT)
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            self.returncode = self.process.returncode
+            self.stopped = time.monotonic()
+            self.process = None
+            self.log.close()
+        self.text()
+
+
 class NetworkDirectoryFixture:
     """Bounded public-Control fixture; never forwards Publish or Reserve upstream."""
-    def __init__(self, name, *, record=None, record_factory=None):
+    def __init__(self, name, *, record=None, record_factory=None, retain_publications=False):
         self.name, self.record, self.record_factory = name, record, record_factory
+        self.publications = {} if retain_publications else None
         self.port = available_port()
         self.url = f"ws://127.0.0.1:{self.port}/api/network/ws"
         self.lock = threading.Lock()
@@ -1087,6 +1206,10 @@ class NetworkDirectoryFixture:
                     "active_sockets": len(self.streams), "accepted_connections": self.next_connection,
                     "fixture_capacity_rejections": self.rejected_connections,
                     "fixture_scope": "original public Control only; Publish ACK is local, Reserve is refused, no upstream forwarding"}
+
+    def published(self, target):
+        with self.lock:
+            return copy.deepcopy((self.publications or {}).get(target))
 
     def accept(self):
         while not self.stopped.is_set():
@@ -1145,6 +1268,13 @@ class NetworkDirectoryFixture:
                 while not self.publish_gate.wait(.1):
                     if self.stopped.is_set():
                         return
+                if self.publications is not None:
+                    record = control["record"]
+                    target = record["node_id"]
+                    require(re.fullmatch(r"[0-9a-f]{64}", target), "published fixture record names a complete Node identity")
+                    with self.lock:
+                        require(len(self.publications) < 16 or target in self.publications, "bounded fixture public record capture")
+                        self.publications[target] = copy.deepcopy(record)
                 websocket_send(stream, {"type": "published"})
                 self.note("publish_acknowledged_locally", connection)
             elif kind == "reserve":
@@ -1157,6 +1287,11 @@ class NetworkDirectoryFixture:
                 if self.stopped.is_set():
                     return
                 record = self.record_factory(control["target"]) if self.record_factory else copy.deepcopy(self.record)
+                while not self.reply_gate.wait(.1):
+                    if self.stopped.is_set() or time.monotonic() >= deadline:
+                        return
+                if self.stopped.is_set():
+                    return
                 self.note("record_send_started", connection, target=control["target"],
                           record_node_id=record.get("node_id") if record else None,
                           issued_at=record.get("issued_at") if record else None, expires_at=record.get("expires_at") if record else None,
@@ -2165,6 +2300,7 @@ def wait_for_command_target(run, observer, target, cwd, *, reason):
 
     return wait_for("fixed command target advertises authorized capability roots", ready,
                     timeout=max(0, deadline - time.monotonic()))
+
 
 
 def chat_agent_checks(run, workspace, a, b, c, network, passed):
@@ -3747,7 +3883,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
 
 def network_trace_records(node, offset=0, *, messages=None):
     result = []
-    names = "source|class|target|reason|generation|previous|previous_source|previous_authenticated_secs|current|removed_pending|directory|outcome|cached|error|circuit|event|direction|queued_frames|queued_bytes|reader_held_bytes|writer_held_bytes|accepted_bytes|window_bytes|held_bytes|bytes|active"
+    names = "source|class|target|reason|generation|previous|previous_source|previous_authenticated_secs|current|removed_pending|directory|outcome|cached|error|circuit|event|direction|queued_frames|queued_bytes|reader_held_bytes|writer_held_bytes|accepted_bytes|window_bytes|held_bytes|bytes|active|network|peer|neighbor|next_hop|link_id|flight_id|selection|request_id|origin|method|operation_id|request_type|delivered|fullname|epoch|urls|listen|addr_auto|addresses|original|new_name|interface|state|signed_at_ms|remaining_ms|removed_sources|remaining_sources|removed_routes|outbound|path|kind|trigger|timeout_ms|rr_type|ip|mode|status|deadline_seconds|route|route_kind|cancelled"
     path = node.directory / "process.log"
     if not path.exists():
         return result
@@ -3760,12 +3896,45 @@ def network_trace_records(node, offset=0, *, messages=None):
             line = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode(errors="replace")).strip()
             end = position + len(raw)
             if messages is None or any(message in line for message in messages):
-                fields = {key: value.strip().strip('"') for key, value in re.findall(rf'\b({names})=("(?:\\.|[^"\\])*"|Some\([^)]*\)|[^\s,}}]+)', line)}
+                fields = {}
+                for key, value in re.findall(rf'\b({names})=("(?:\\.|[^"\\])*"|\[(?:"(?:\\.|[^"\\])*"|[^\]"])*\]|\{{[^}}]*\}}|Some\([^)]*\)|[^\s,}}]+)', line):
+                    value = value.strip()
+                    if key in ("target", "request_type", "operation_id", "trigger") and value.startswith("Some(") and value.endswith(")"):
+                        value = value[5:-1]
+                    fields[key] = json.loads(value) if value.startswith('"') else value
                 stamp = re.search(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", line)
                 result.append({"log_offset": position, "log_end": end, "fields": fields, "message": line,
                                "wall_time": datetime.fromisoformat(stamp.group().replace("Z", "+00:00")).timestamp() if stamp else None})
             position = end
     return result
+
+
+def network_peer_read_evidence(caller, target, network, operation_id, caller_offset, target_offset,
+                               *, next_hop, link_id, route_kind):
+    def handled_reads():
+        return [entry for entry in network_trace_records(target, target_offset, messages=["peer business request handled"])
+                if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.node_id
+                and entry["fields"].get("request_type") == "operation" and entry["fields"].get("operation_id") == operation_id]
+
+    handled = wait_for("the original target handles this exact operation read", handled_reads)
+    require(len(handled) == 1 and handled[0]["fields"].get("outcome") == "ok",
+            "one actual original-target operation read succeeds")
+    request_id = handled[0]["fields"]["request_id"]
+    queued = wait_for("the same operation request is queued to the expected current next hop", lambda: [
+        entry for entry in network_trace_records(caller, caller_offset, messages=["peer packet queued"])
+        if entry["fields"].get("network") == network and entry["fields"].get("request_id") == request_id
+        and entry["fields"].get("kind") == "Request"])
+    require(len(queued) == 1 and queued[0]["fields"].get("target") == target.node_id
+            and queued[0]["fields"].get("next_hop") == next_hop and queued[0]["fields"].get("link_id") == link_id
+            and queued[0]["fields"].get("route_kind") == route_kind,
+            "the exact read uses only its expected next-hop link generation")
+    response = wait_for("the caller accepts the matching original-target signed response", lambda: next(
+        (entry for entry in network_trace_records(caller, caller_offset, messages=["peer response matched"])
+         if entry["fields"].get("network") == network and entry["fields"].get("request_id") == request_id
+         and entry["fields"].get("origin") == target.node_id and entry["fields"].get("delivered") == "true"), None))
+    require(len(handled_reads()) == 1, "the exact operation read is handled once")
+    return {"operation_id": operation_id, "request_id": request_id, "target_handled": handled[0],
+            "caller_queued": queued[0], "caller_response": response}
 
 
 def network_core_evidence(evidence_dir, slice_name, tests):
@@ -4712,6 +4881,477 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         require(directory_capture is None or not directory_capture.errors, "Lane 4 actual-directory capture remains valid")
 
 
+def network_reliability_mdns(run, binary, workspace, fixture, helper, module, report, nodes):
+    trace_env = {**os.environ, "RUST_LOG": "vibeface::network=debug,vibeface::peer=debug,vibeface::runtime=debug,vibeface::api=debug", "NO_COLOR": "1"}
+    interfaces = network_mdns_interfaces()
+    interface, address = interfaces[0]["name"], interfaces[0]["ipv4"][0]
+    case = {"status": "running", "interfaces_observed_read_only": interfaces, "selected_interface": interface,
+            "advertisements": {}, "source_lifecycle": {},
+            "not_checked": ["actual interface IP add/delete", "IPv6 listener advertisement", "other host interfaces beyond the selected DNS-SD interface"],
+            "fixture_scope": "task-owned DNS-SD registrations and Node data directories; existing host interfaces are only observed"}
+    report["cases"]["mdns_lifecycle"] = case
+    owned_nodes, observers, captures, clients = [], [], [], []
+
+    def node(name):
+        value = Node(run, name, binary, workspace, fixture, helper, module)
+        value.configure(manager=None, codex_socket=str(run / "unused-codex.sock"),
+                        network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        nodes.append(value)
+        owned_nodes.append(value)
+        return value
+
+    def observe(name, arguments):
+        value = NetworkDnsSd(run, name, interface, arguments)
+        observers.append(value)
+        return value
+
+    def resolution(name, instance, port, target):
+        value = observe(name, ["-L", instance, "_vibeface._tcp", "local"])
+        result = wait_for("actual DNS-SD fullname, SRV port and complete TXT identity",
+                          lambda: next((item for item in value.resolutions()
+                                        if item["port"] == port and any(f"node_id={target}" in line for line in item["txt_lines"])), None))
+        return {"instance": instance, **result}
+
+    def source_state(value):
+        sources, epoch = {}, None
+        entries = [entry for entry in network_trace_records(value, messages=["mdns source changed", "mdns daemon reset"])
+                   if "mdns daemon reset" in entry["message"] or entry["fields"].get("target") == b.node_id]
+        for entry in entries:
+            fields = entry["fields"]
+            actual_epoch = int(fields["epoch"])
+            if epoch is not None and actual_epoch < epoch:
+                continue
+            if epoch is None or actual_epoch > epoch:
+                sources.clear()
+                epoch = actual_epoch
+            if "mdns daemon reset" in entry["message"]:
+                sources.clear()
+            elif fields.get("event") == "resolved":
+                sources[network_dns_name(fields["fullname"])] = entry
+            elif fields.get("event") == "removed":
+                sources.pop(network_dns_name(fields["fullname"]), None)
+        return {"epoch": epoch, "sources": sources, "entries": entries}
+
+    try:
+        browse = observe("mdns-browse", ["-B", "_vibeface._tcp", "local"])
+        for name, wildcard in (("mdns-fixed", False), ("mdns-wildcard", True)):
+            target = node(name)
+            expected_id = target.node_id
+            target.configure(roles=["relay"], network={"bootstrap_urls": [], "advertise_urls": [], "mdns": True, "relay_enabled": False})
+            target.set_url(address, listen=f"0.0.0.0:{target.port}" if wildcard else None)
+            target.start(env=trace_env)
+            require(target.node_id == expected_id, "HTTP listener retains the initialized temporary Node identity")
+            advertisement = wait_for("actual Node DNS-SD service advertisement", lambda: next(
+                (item for item in browse.browse_records() if item["action"] == "Add" and item["instance"].startswith(expected_id[:32])), None))
+            resolved = resolution(name + "-resolve", advertisement["instance"], target.port, expected_id)
+            addresses = observe(name + "-a", ["-Q", resolved["hostname"], "A", "IN"])
+            ipv6 = observe(name + "-aaaa", ["-Q", resolved["hostname"], "AAAA", "IN"])
+            require(ipv6.process.poll() is None, "AAAA observer is running before its observation window")
+            records = wait_for("independent DNS-SD A records", lambda: addresses.addresses(resolved["hostname"]))
+            observed = sorted({item["address"] for item in records})
+            assigned = {item for value in interfaces for item in value["ipv4"]}
+            require((set(observed) <= assigned if wildcard else observed == [address]),
+                    "advertised IPv4 addresses match the real wildcard or fixed listener")
+            accepted = []
+            for advertised in observed:
+                client = Client(f"http://{advertised}:{target.port}", helper, module)
+                clients.append(client)
+                info = client.request("/api/info")
+                require(info["node_id"] == expected_id, "each observed address reaches the original HTTP Node")
+                client.connect(expected_id)
+                encrypted = client.call("info")
+                require(encrypted["node_id"] == expected_id, "each observed address completes pinned Noise and encrypted info")
+                accepted.append({"address": advertised, "http_node_id": info["node_id"], "encrypted_node_id": encrypted["node_id"]})
+                client.close()
+            time.sleep(1)
+            require(ipv6.process.poll() is None and "DNSServiceQueryRecord failed" not in ipv6.text(),
+                    "empty AAAA observation is backed by a live query without a command error")
+            require(not ipv6.addresses(resolved["hostname"]), "IPv4 listener has no observed AAAA advertisement during the positive A observation")
+            registered = wait_for("Node reports its actual mDNS registration", lambda: network_trace_records(target, messages=["mdns service registered"]))
+            require(registered[-1]["fields"]["addr_auto"] == str(wildcard).lower(), "fixed and wildcard address automation match listener configuration")
+            case["advertisements"][name] = {"node_id": expected_id, "listen": json.loads((target.directory / "config.json").read_text())["listen"],
+                                           "browse": advertisement, "resolve": resolved, "a_records": records,
+                                           "aaaa_records": [], "aaaa_observer": ipv6.snapshot(),
+                                           "accepted_addresses": accepted, "registration": registered[-1],
+                                           "scope": "the selected existing IPv4 interface; empty AAAA is a bounded observation with a positive A control"}
+            target.stop()
+
+        a, b = node("mdns-A"), node("mdns-B")
+        a.configure(roles=["gateway", "replica"], network={"bootstrap_urls": [], "advertise_urls": [], "mdns": True, "relay_enabled": False})
+        a.start(env=trace_env)
+        network = a.bootstrap()
+        b.pair(a, network)
+        b.configure(roles=["gateway", "replica"])
+        b.set_url(address)
+        proxy = RelayCapture(b.port, retain_payloads=False, listen_host=address, upstream_host=address)
+        captures.append(proxy)
+        b.configure(allowed_origins=[proxy.url])
+        b.start(env=trace_env)
+        b.client.connect(b.node_id)
+        instance = b.node_id[:32]
+        registrations = {b.port: observe("mdns-register-first", ["-R", instance, "_vibeface._tcp", "local", b.port,
+                                                                 f"node_id={b.node_id}", "path=/api/network/ws"])}
+        first = wait_for("first real DNS-SD registration", lambda: next(
+            (item for item in browse.browse_records() if item["action"] == "Add" and item["instance"] == instance), None))
+        first_resolution = resolution("mdns-first-resolve", first["instance"], b.port, b.node_id)
+        registrations[proxy.port] = observe("mdns-register-second", ["-R", instance, "_vibeface._tcp", "local", proxy.port,
+                                                                    f"node_id={b.node_id}", "path=/api/network/ws"])
+        conflict = wait_for("actual DNS-SD conflict rename", lambda: next(
+            (item for item in browse.browse_records() if item["action"] == "Add" and item["instance"].startswith(instance)
+             and item["instance"] != first["instance"]), None))
+        conflict_lookup = observe("mdns-conflict-resolve", ["-L", conflict["instance"], "_vibeface._tcp", "local"])
+        renamed = wait_for("actual renamed instance resolves to one of the two owned listener ports", lambda: next(
+            (item for item in conflict_lookup.resolutions() if item["port"] in registrations and any(f"node_id={b.node_id}" in line for line in item["txt_lines"])), None))
+        require(renamed["canonical_fullname"] != first_resolution["canonical_fullname"], "actual conflict fullname differs from the original registration")
+        remaining_port = next(port for port in registrations if port != renamed["port"])
+        current_original = resolution("mdns-original-after-conflict", first["instance"], remaining_port, b.node_id)
+        observed_sources = wait_for("both actual fullnames contribute to the original target", lambda: (
+            state if len([entry for entry in state["sources"].values() if entry["fields"].get("target") == b.node_id]) == 2 else None)
+            if (state := source_state(a)) else None)
+        target_sources = {key: entry for key, entry in observed_sources["sources"].items() if entry["fields"]["target"] == b.node_id}
+        require(renamed["canonical_fullname"] in target_sources and first_resolution["canonical_fullname"] in target_sources,
+                "Node source keys match the independently observed actual DNS-SD fullnames")
+        wait_for("mDNS target's previously paired client grant", lambda: b.client.authenticate(network))
+        verify_offset = (a.directory / "process.log").stat().st_size
+        verified = wait_for("new real DNS cache verify of the renamed instance", lambda: next(
+            (entry for entry in network_trace_records(a, verify_offset, messages=["mdns source verify"])
+             if entry["fields"].get("target") == b.node_id
+             and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
+             and network_dns_name(entry["fields"]["fullname"]) == renamed["canonical_fullname"]), None))
+        time.sleep(min(int(verified["fields"]["timeout_ms"]) / 1000 + .2, 5))
+        healthy = source_state(a)
+        verify_changes = network_trace_records(a, verify_offset, messages=["mdns source changed", "mdns daemon reset"])
+        require(not any("mdns daemon reset" in entry["message"] or (
+            entry["fields"].get("target") == b.node_id and entry["fields"].get("event") == "removed"
+            and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
+            and network_dns_name(entry["fields"]["fullname"]) in target_sources) for entry in verify_changes),
+                "neither actual target source is removed or reset during the new verify window")
+        require(healthy["epoch"] == observed_sources["epoch"] and all(key in healthy["sources"] for key in target_sources),
+                "both healthy sources survive the real verify timeout in the same daemon epoch")
+        resolved_in_window = [entry for entry in verify_changes if entry["fields"].get("target") == b.node_id
+                              and entry["fields"].get("event") == "resolved"]
+        before = a.client.rpc("operation", target_node=b.node_id, operation_id="net1-lane7-mdns-read-only")
+        require(before == {"operation": None}, "original target answers a real read before source removal")
+        removal_offset = (a.directory / "process.log").stat().st_size
+        removal_browse_line = len(browse.text().splitlines())
+        registrations[renamed["port"]].close()
+        removed = wait_for("browser observes actual renamed instance removal", lambda: next(
+            (item for item in browse.browse_records() if item["line"] > removal_browse_line
+             and item["action"] == "Rmv" and item["canonical_fullname"] == renamed["canonical_fullname"]), None))
+        survivor = wait_for("Node removes exactly the actual conflict fullname while retaining its other source", lambda: (
+            state if state["epoch"] == observed_sources["epoch"] and renamed["canonical_fullname"] not in state["sources"]
+            and len([entry for entry in state["sources"].values() if entry["fields"].get("target") == b.node_id]) == 1 else None)
+            if (state := source_state(a)) else None)
+        surviving = next(entry for entry in survivor["sources"].values() if entry["fields"].get("target") == b.node_id)
+        require(any(entry["fields"].get("event") == "removed" and entry["fields"].get("target") == b.node_id
+                    and entry["log_offset"] >= removal_offset
+                    and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
+                    and network_dns_name(entry["fields"]["fullname"]) == renamed["canonical_fullname"] for entry in survivor["entries"]),
+                "actual Node removal log identifies the same target, fullname and daemon epoch")
+        old_link = wait_for("original target has an installed peer link before its restart", lambda: next(
+            (entry for entry in reversed(network_trace_records(a, messages=["peer link ready"]))
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.node_id), None))
+        restart_offset = (a.directory / "process.log").stat().st_size
+        b.stop()
+        old_removed = wait_for("the current original peer link is actually removed", lambda: next(
+            (entry for entry in network_trace_records(a, restart_offset, messages=["peer link removed"])
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.node_id
+             and entry["fields"].get("link_id") == old_link["fields"]["link_id"]
+             and entry["fields"].get("current") == "true"), None))
+        b.start(env=trace_env)
+        read_offset = (a.directory / "process.log").stat().st_size
+        target_read_offset = (b.directory / "process.log").stat().st_size
+        after = a.client.rpc("operation", target_node=b.node_id, operation_id="net1-lane7-mdns-read-only")
+        read_end = (a.directory / "process.log").stat().st_size
+        require(after == {"operation": None}, "original target remains readable after its peer connection and one discovery source are removed")
+        surviving_urls = json.loads(surviving["fields"]["urls"])
+        selected = wait_for("a new authenticated path uses an actual surviving mDNS endpoint", lambda: next(
+            (entry for entry in network_trace_records(a, restart_offset, messages=["authenticated path selected"])
+             if entry["fields"].get("target") == b.node_id
+             and entry["log_end"] <= read_end
+             and entry["fields"].get("route") in ["direct:" + url for url in surviving_urls]), None))
+        new_link = wait_for("the restarted original target installs a distinct peer link", lambda: next(
+            (entry for entry in network_trace_records(a, restart_offset, messages=["peer link ready"])
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.node_id
+             and entry["fields"].get("link_id") != old_link["fields"]["link_id"]
+             and entry["fields"].get("outbound") == "true" and entry["log_end"] <= read_end
+             and entry["log_offset"] > selected["log_offset"]), None))
+        read_evidence = network_peer_read_evidence(a, b, network, "net1-lane7-mdns-read-only", read_offset, target_read_offset,
+                                                   next_hop=b.node_id, link_id=new_link["fields"]["link_id"], route_kind="direct")
+        require(source_state(a)["epoch"] == observed_sources["epoch"], "reconnecting the target does not reset the observer's mDNS epoch")
+        last_removal_offset = (a.directory / "process.log").stat().st_size
+        last_removal_browse_line = len(browse.text().splitlines())
+        registrations[remaining_port].close()
+        remaining_fullname = network_dns_name(surviving["fields"]["fullname"])
+        last_browser_removed = wait_for("browser observes removal of the exact final fullname", lambda: next(
+            (item for item in browse.browse_records() if item["line"] > last_removal_browse_line and item["action"] == "Rmv"
+             and item["canonical_fullname"] == remaining_fullname), None))
+        empty = wait_for("last actual source is removed from the target", lambda: (
+            state if state["epoch"] == observed_sources["epoch"] and not state["sources"]
+            and any(entry["fields"].get("event") == "removed" and entry["fields"].get("target") == b.node_id
+                    and entry["log_offset"] >= last_removal_offset
+                    and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
+                    and network_dns_name(entry["fields"]["fullname"]) == remaining_fullname for entry in state["entries"]) else None)
+            if (state := source_state(a)) else None)
+        registration_mapping = [{"port": port, "registration": registration.snapshot(),
+                                 "resolved_fullname": renamed["canonical_fullname"] if port == renamed["port"] else remaining_fullname}
+                                for port, registration in registrations.items()]
+        case["source_lifecycle"] = {"target": b.node_id, "network": network, "first_resolution": first_resolution,
+                                    "original_resolution_after_conflict": current_original,
+                                    "actual_conflict": {"browse": conflict, "resolve": renamed}, "initial_sources": target_sources,
+                                    "owned_registration_mapping": registration_mapping,
+                                    "epoch": observed_sources["epoch"], "verify": verified, "verify_log_offset": verify_offset,
+                                    "verify_window_resolved_count": len(resolved_in_window), "verify_window_changes": verify_changes,
+                                    "after_verify": healthy,
+                                    "removal_log_offset": removal_offset, "removal_browse_line": removal_browse_line,
+                                    "browser_removed": removed, "after_exact_removal": survivor, "surviving_source": surviving,
+                                    "read_before": before, "read_after_target_restart": after,
+                                    "target_restart": {"log_offset": restart_offset, "old_link": old_link,
+                                                       "old_removed": old_removed, "selected_path": selected, "new_link": new_link,
+                                                       "read_log_offset": read_offset, "read_log_end": read_end,
+                                                       "target_read_log_offset": target_read_offset, "read_evidence": read_evidence},
+                                    "last_removal_log_offset": last_removal_offset, "last_removal_browse_line": last_removal_browse_line,
+                                    "last_browser_removed": last_browser_removed, "after_last_removal": empty}
+        require(not invocations(run), "mDNS lifecycle uses no fixture executor or paid model")
+        case["status"] = "passed"
+    except BaseException as error:
+        case["status"] = "failed"
+        case["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        original_error = sys.exc_info()[1]
+        errors = []
+        for kind, values in (("dns_sd", observers), ("client", clients), ("node_client", [value.client for value in owned_nodes]),
+                             ("node", owned_nodes), ("capture", captures)):
+            for value in reversed(values):
+                try:
+                    value.stop() if kind == "node" else value.close()
+                except Exception as error:
+                    errors.append({"kind": kind, "error_type": type(error).__name__})
+        ports = []
+        endpoints = [(value.name, urllib.parse.urlsplit(value.url).hostname, value.port) for value in owned_nodes]
+        endpoints += [("capture", urllib.parse.urlsplit(value.url).hostname, value.port) for value in captures]
+        for name, host, port in endpoints:
+            try:
+                with socket.socket() as probe:
+                    probe.settimeout(.3)
+                    ports.append({"name": name, "host": host, "port": port, "closed": probe.connect_ex((host, port)) != 0})
+            except Exception as error:
+                errors.append({"kind": "port_probe", "name": name, "error_type": type(error).__name__})
+        case["dns_sd"] = []
+        for value in observers:
+            try:
+                case["dns_sd"].append(value.snapshot())
+            except Exception as error:
+                errors.append({"kind": "dns_sd_snapshot", "error_type": type(error).__name__})
+        case["cleanup"] = {"errors": errors, "ports": ports, "remaining_owned_nodes": sum(value.process is not None for value in owned_nodes),
+                           "remaining_owned_clients": sum(value.process is not None for value in [*clients, *[node.client for node in owned_nodes]])}
+        if errors or not all(item["closed"] for item in ports) or any(value["process_running"] for value in case["dns_sd"]) or case["cleanup"]["remaining_owned_nodes"] or case["cleanup"]["remaining_owned_clients"]:
+            case["status"] = "failed"
+        if original_error is None:
+            require(case["status"] == "passed", "mDNS lifecycle and all owned process cleanup passed")
+
+
+def network_reliability_routes(run, binary, workspace, fixture, helper, module, report, nodes):
+    run = run / "route-lifecycle"
+    run.mkdir(mode=0o700)
+    trace_env = {**os.environ, "RUST_LOG": "vibeface::network=debug,vibeface::peer=debug,vibeface::runtime=debug,vibeface::api=debug", "NO_COLOR": "1"}
+    case = {"status": "running", "fixture_scope": "four isolated Nodes; original signed directory publications; one disabled next-hop proxy; read-only operation queries"}
+    report["cases"]["route_lifecycle"] = case
+    owned_nodes, directories, captures = [], [], {}
+    allowed, by_target = {}, {}
+    adjacency_lock = threading.Lock()
+
+    def record_for(owner, target):
+        with adjacency_lock:
+            permitted = target in allowed.get(owner, set())
+        return by_target[target].published(target) if permitted and target in by_target else None
+
+    def links(value):
+        current = {}
+        for entry in network_trace_records(value, messages=["peer link ready", "peer link removed"]):
+            fields = entry["fields"]
+            if fields.get("network") != network:
+                continue
+            peer = fields["peer"]
+            if "peer link ready" in entry["message"]:
+                current[peer] = entry
+            elif peer in current and current[peer]["fields"]["link_id"] == fields["link_id"]:
+                current.pop(peer)
+        return current
+
+    def online_snapshot():
+        snapshot = a.client.rpc("nodes")
+        by_id = {item["node_id"]: item for item in snapshot["nodes"]}
+        return snapshot if t.node_id in by_id and not by_id[t.node_id]["online"] and by_id.get(u.node_id, {}).get("online") else None
+
+    try:
+        for name in ("route-A", "route-M", "route-T", "route-U"):
+            value = Node(run, name, binary, workspace, fixture, helper, module)
+            nodes.append(value)
+            owned_nodes.append(value)
+            directory = NetworkDirectoryFixture(name + "-directory", retain_publications=True,
+                                                record_factory=lambda target, owner=value.node_id: record_for(owner, target))
+            directories.append(directory)
+            by_target[value.node_id] = directory
+            advertise_urls = []
+            if name != "route-A":
+                capture = RelayCapture(value.port, retain_payloads=False)
+                captures[value.node_id] = capture
+                advertise_urls = [capture.url.replace("http:", "ws:") + "/api/network/ws"]
+                value.configure(allowed_origins=[capture.url])
+            value.configure(manager=None, codex_socket=str(run / "unused-codex.sock"),
+                            network={"bootstrap_urls": [directory.url], "advertise_urls": advertise_urls,
+                                     "mdns": False, "relay_enabled": False})
+        a, middle, t, u = owned_nodes
+        with adjacency_lock:
+            allowed.update({a.node_id: {middle.node_id, u.node_id}, middle.node_id: {t.node_id}, t.node_id: set(), u.node_id: set()})
+        a.configure(roles=["gateway", "replica"])
+        a.start(env=trace_env)
+        network = a.bootstrap()
+        for value in (middle, t, u):
+            value.pair(a, network)
+            value.client.close()
+            value.configure(roles=["gateway", "replica", "relay"] if value is middle else ["gateway", "replica"])
+        for value in (t, u, middle):
+            value.start(env=trace_env)
+        publications = {}
+        for value in (middle, t, u):
+            publication = wait_for("real signed target publication at its own isolated directory",
+                                   lambda value=value: by_target[value.node_id].published(value.node_id))
+            require(publication["node_id"] == value.node_id
+                    and publication["direct_urls"] == [captures[value.node_id].url.replace("http:", "ws:") + "/api/network/ws"]
+                    and not publication["relay_urls"] and publication["expires_at"] > time.time(),
+                    "directory returns the unmodified original target's live direct-only publication")
+            publications[value.node_id] = publication
+        initial_a_links = wait_for("A installs only its two allowed neighbor links", lambda: (
+            state if middle.node_id in state and u.node_id in state and t.node_id not in state else None)
+            if (state := links(a)) else None)
+        initial_m_links = wait_for("M installs its independent target link", lambda: (
+            state if t.node_id in state else None) if (state := links(middle)) else None)
+        presence = wait_for("the original target is reached through the authenticated M link generation", lambda: next(
+            (entry for entry in network_trace_records(a, messages=["peer presence route observed"])
+             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.node_id
+             and entry["fields"].get("neighbor") == middle.node_id
+             and entry["fields"].get("link_id") == initial_a_links[middle.node_id]["fields"]["link_id"]), None))
+        initial_request_offset = (a.directory / "process.log").stat().st_size
+        initial_target_offset = (t.directory / "process.log").stat().st_size
+        initial_query = a.client.rpc("operation", target_node=t.node_id, operation_id="net1-lane7-via-middle-read-only")
+        require(initial_query == {"operation": None}, "the fixed target answers the initial read across its live intermediate neighbor")
+        initial_read = network_peer_read_evidence(a, t, network, "net1-lane7-via-middle-read-only", initial_request_offset, initial_target_offset,
+                                                  next_hop=middle.node_id, link_id=initial_a_links[middle.node_id]["fields"]["link_id"], route_kind="presence")
+        require(t.node_id not in links(a), "the initial target read has no direct A-T peer link")
+        cut_offset = (a.directory / "process.log").stat().st_size
+        middle_cut_offset = (middle.directory / "process.log").stat().st_size
+        cut = captures[middle.node_id].pause()
+        removed = wait_for("A revokes the exact current M link and its learned routes", lambda: next(
+            (entry for entry in network_trace_records(a, cut_offset, messages=["peer link removed"])
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == middle.node_id
+             and entry["fields"].get("link_id") == initial_a_links[middle.node_id]["fields"]["link_id"]
+             and entry["fields"].get("current") == "true" and int(entry["fields"]["removed_routes"]) > 0), None))
+        offline = wait_for("the target loses indirect online status while unrelated U stays online", online_snapshot)
+        require(links(a)[u.node_id]["fields"]["link_id"] == initial_a_links[u.node_id]["fields"]["link_id"]
+                and links(middle)[t.node_id]["fields"]["link_id"] == initial_m_links[t.node_id]["fields"]["link_id"],
+                "cutting only the M listener preserves the existing A-U and M-T link generations")
+        recovery_directory = by_target[a.node_id]
+        recovery_directory.reply_gate.clear()
+        gate_started = time.monotonic()
+        request_offset = (a.directory / "process.log").stat().st_size
+        target_offset = (t.directory / "process.log").stat().st_size
+        with adjacency_lock:
+            allowed[a.node_id].add(t.node_id)
+        operation_id = "net1-lane7-original-target-query"
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            request = pool.submit(a.client.rpc, "operation", target_node=t.node_id, operation_id=operation_id)
+            try:
+                on_demand = wait_for("the single read starts or joins the target's shared connection flight", lambda: next(
+                    (entry for entry in network_trace_records(a, request_offset, messages=["peer route flight started", "peer route flight joined"])
+                     if entry["fields"].get("network") == network and entry["fields"].get("target") == t.node_id
+                     and entry["fields"].get("trigger") == "on_demand"
+                     and entry["fields"].get("request_type") == "operation"
+                     and entry["fields"].get("operation_id") == operation_id), None), timeout=8)
+            finally:
+                gate_released = recovery_directory.release()
+            recovered = request.result(timeout=25)
+        request_end = (a.directory / "process.log").stat().st_size
+        require(recovered == {"operation": None}, "the single new read returns the original target's operation result")
+        restored = wait_for("the original target installs a new direct link within the single read", lambda: next(
+            (entry for entry in network_trace_records(a, request_offset, messages=["peer link ready"])
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == t.node_id
+             and entry["fields"].get("outbound") == "true" and entry["log_end"] <= request_end), None))
+        ready = wait_for("the same shared flight reports the installed target link ready", lambda: next(
+            (entry for entry in network_trace_records(a, request_offset, messages=["peer route flight ready"])
+             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.node_id
+             and entry["fields"].get("flight_id") == on_demand["fields"]["flight_id"]
+             and entry["fields"].get("link_id") == restored["fields"]["link_id"] and entry["fields"].get("state") == "ready"), None))
+        selected = wait_for("the alternate path authenticates the actual original target endpoint", lambda: next(
+            (entry for entry in network_trace_records(a, request_offset, messages=["authenticated path selected"])
+             if entry["fields"].get("target") == t.node_id
+             and entry["fields"].get("route") == "direct:" + captures[t.node_id].url.replace("http:", "ws:") + "/api/network/ws"
+             and entry["log_end"] <= restored["log_offset"]), None))
+        recovered_read = network_peer_read_evidence(a, t, network, operation_id, request_offset, target_offset,
+                                                    next_hop=t.node_id, link_id=restored["fields"]["link_id"], route_kind="direct")
+        require(middle.node_id not in links(a), "the disabled original next hop is not silently restored")
+        require(links(a)[u.node_id]["fields"]["link_id"] == initial_a_links[u.node_id]["fields"]["link_id"]
+                and links(middle)[t.node_id]["fields"]["link_id"] == initial_m_links[t.node_id]["fields"]["link_id"],
+                "alternate recovery leaves both unaffected link generations intact")
+        case.update(network=network, targets={value.name: value.node_id for value in owned_nodes}, publications=publications,
+                    initial_a_links=initial_a_links, initial_m_links=initial_m_links, presence=presence,
+                    initial_query=initial_query, initial_read_evidence=initial_read,
+                    cut=cut, cut_log_offset=cut_offset, middle_cut_log_offset=middle_cut_offset,
+                    removed=removed, offline_snapshot=offline, operation_id=operation_id, recovered=recovered,
+                    request_log_offset=request_offset, target_log_offset=target_offset, request_log_end=request_end,
+                    restored_link=restored, recovered_read_evidence=recovered_read,
+                    recovery_flight={"on_demand": on_demand, "ready": ready, "selected_path": selected,
+                                     "directory_gate_started_monotonic": gate_started, "directory_gate_released": gate_released},
+                    unaffected_links_after_recovery={"A_to_U": links(a)[u.node_id], "M_to_T": links(middle)[t.node_id]})
+        require(not invocations(run.parent), "route recovery invokes no executor or paid model")
+        case["status"] = "passed"
+    except BaseException as error:
+        case["status"] = "failed"
+        case["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        original_error = sys.exc_info()[1]
+        errors = []
+        for capture in captures.values():
+            try:
+                capture.pause()
+            except Exception as error:
+                errors.append({"kind": "capture_pause", "error_type": type(error).__name__})
+        for kind, values in (("client", [value.client for value in owned_nodes]), ("node", owned_nodes),
+                             ("directory", directories), ("capture", list(captures.values()))):
+            for value in values if kind == "node" else reversed(values):
+                try:
+                    value.stop() if kind == "node" else value.close()
+                except Exception as error:
+                    errors.append({"kind": kind, "error_type": type(error).__name__})
+        case["directory_fixtures"] = []
+        for directory in directories:
+            try:
+                case["directory_fixtures"].append(directory.snapshot())
+            except Exception as error:
+                errors.append({"kind": "directory_snapshot", "error_type": type(error).__name__})
+        endpoints = [(value.name, value.port) for value in owned_nodes]
+        endpoints += [(directory.name, directory.port) for directory in directories]
+        endpoints += [("capture", capture.port) for capture in captures.values()]
+        ports = []
+        for name, port in endpoints:
+            try:
+                with socket.socket() as probe:
+                    probe.settimeout(.3)
+                    ports.append({"name": name, "port": port, "closed": probe.connect_ex(("127.0.0.1", port)) != 0})
+            except Exception as error:
+                errors.append({"kind": "port_probe", "name": name, "error_type": type(error).__name__})
+        case["cleanup"] = {"errors": errors, "ports": ports,
+                           "remaining_owned_nodes": sum(value.process is not None for value in owned_nodes),
+                           "remaining_owned_clients": sum(value.client.process is not None for value in owned_nodes)}
+        if errors or not all(item["closed"] for item in ports) or any(value["active_sockets"] or value["errors"] or value["fixture_capacity_rejections"] for value in case["directory_fixtures"]) or any(capture.errors for capture in captures.values()) or case["cleanup"]["remaining_owned_nodes"] or case["cleanup"]["remaining_owned_clients"]:
+            case["status"] = "failed"
+        if original_error is None:
+            require(case["status"] == "passed", "route lifecycle and all owned process cleanup passed")
+
+
 def network_reliability_acceptance(options):
     binary = options.binary.resolve(strict=True)
     repository = Path(__file__).resolve().parents[1]
@@ -4724,7 +5364,7 @@ def network_reliability_acceptance(options):
     artifacts.mkdir(parents=True, exist_ok=True)
     lane = options.net1_lane
     baseline_report = None
-    run = artifacts / ({1: "lane-1-noop-", 2: "lane-2-resume-", 3: "lane-3-closure-", 4: "lane-4-directory-", 5: "lane-5-generations-", 6: "lane-6-budgets-"}.get(lane, "m0-baseline-") + uuid.uuid4().hex[:10])
+    run = artifacts / ({1: "lane-1-noop-", 2: "lane-2-resume-", 3: "lane-3-closure-", 4: "lane-4-directory-", 5: "lane-5-generations-", 6: "lane-6-budgets-", 7: "lane-7-routes-"}.get(lane, "m0-baseline-") + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
@@ -4743,6 +5383,21 @@ def network_reliability_acceptance(options):
                               "attachment crash recovery and 64 MiB completion", "rendered browser UI", "production networks"]}
     nodes, capture = [], None
     try:
+        if lane == 7:
+            report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
+            report["tracked_diff_sha256"] = hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--", "crates/node", "scripts/verify-node.py", "scripts/crypto-client.mjs"], cwd=repository)).hexdigest()
+            report["verification_scripts"] = {name: file_sha256(repository / "scripts" / name) for name in ("verify-node.py", "crypto-client.mjs")}
+            report["not_checked"] = ["actual host interface IP add/delete", "IPv6 listener advertisement", "other NET-1 lanes", "rendered browser UI", "production networks"]
+            network_reliability_mdns(run, binary, workspace, fixture, helper, module, report, nodes)
+            network_reliability_routes(run, binary, workspace, fixture, helper, module, report, nodes)
+            require(all(case["status"] == "passed" for case in report["cases"].values()), "both mDNS and route lifecycle cases and their cleanup pass")
+            require(file_sha256(binary) == report["binary_sha256"], "Lane 7 uses one unchanged frozen binary")
+            require(all(file_sha256(repository / "scripts" / name) == digest for name, digest in report["verification_scripts"].items()), "Lane 7 uses unchanged verification scripts")
+            require(not invocations(run), "Lane 7 performs only read-only peer queries without an executor or model")
+            verify_no_model_budget(nodes)
+            report["status"] = "passed"
+            report["fixture_invocations"] = 0
+            return
         if lane in (5, 6):
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
             report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production networks"]
@@ -5001,7 +5656,7 @@ def network_reliability_acceptance(options):
         private_json(run / "report.json", report)
         if options.evidence_dir:
             options.evidence_dir.mkdir(parents=True, exist_ok=True)
-            evidence_path = options.evidence_dir / {1: "live/01-noop-sync.json", 2: "live/02-resume-blob.json", 3: "live/03-closure-progress.json", 4: "live/04-directory-isolation.json", 5: "live/05-reservation-generation.json", 6: "live/06-budget-and-duplex.json"}.get(lane, "m0-baseline.json")
+            evidence_path = options.evidence_dir / {1: "live/01-noop-sync.json", 2: "live/02-resume-blob.json", 3: "live/03-closure-progress.json", 4: "live/04-directory-isolation.json", 5: "live/05-reservation-generation.json", 6: "live/06-budget-and-duplex.json", 7: "live/07-route-lifecycle.json"}.get(lane, "m0-baseline.json")
             evidence_path.parent.mkdir(parents=True, exist_ok=True)
             private_json(evidence_path, report)
 
@@ -5056,7 +5711,7 @@ if __name__ == "__main__":
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
         parser.add_argument("--evidence-dir", type=Path, help="save compact NET-1 reports in the task evidence directory")
-        parser.add_argument("--net1-lane", type=int, choices=[1, 2, 3, 4, 5, 6], help="run one focused NET-1 process lane")
+        parser.add_argument("--net1-lane", type=int, choices=[1, 2, 3, 4, 5, 6, 7], help="run one focused NET-1 process lane")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run taskless tools, command isolation and startup subscription process checks")

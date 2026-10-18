@@ -9,6 +9,37 @@ const MAX_WATCH_JOBS: usize = 128;
 const MAX_STATUS_JOBS: usize = 512;
 const WATCH_LEASE_MS: i64 = 120_000;
 
+#[derive(Debug, PartialEq, Eq)]
+enum SchedulePresence {
+    Present,
+    NotFound { revision: u64 },
+    Stale,
+}
+
+fn durable_outbox(store: &Store, entry: &OutboxEntry) -> Result<OutboxEntry> {
+    let key = crate::scheduling::scheduler_key(
+        "outbox",
+        &entry.conversation_id,
+        &entry.target_node,
+        &entry.trigger,
+    );
+    let durable: OutboxEntry = serde_json::from_value(
+        store
+            .local_value(&entry.network_id, &key)?
+            .context("original scheduling outbox is missing")?,
+    )?;
+    ensure!(
+        durable.version == SCHEDULING_VERSION
+            && durable.version == entry.version
+            && durable.network_id == entry.network_id
+            && durable.conversation_id == entry.conversation_id
+            && durable.target_node == entry.target_node
+            && durable.trigger == entry.trigger,
+        "original scheduling outbox identity mismatch"
+    );
+    Ok(durable)
+}
+
 fn watch_key(scope: &str) -> String {
     format!("scheduler:v1:watch:{}", crypto::digest(scope.as_bytes()))
 }
@@ -982,6 +1013,13 @@ impl Runtime {
         acknowledge: bool,
         force: bool,
     ) -> Result<()> {
+        let current;
+        let entry = if acknowledge {
+            current = durable_outbox(&*self.store.lock().await, entry)?;
+            &current
+        } else {
+            entry
+        };
         let key = remote_key(entry);
         if !force
             && entry.delivered
@@ -1009,21 +1047,64 @@ impl Runtime {
                 == Some(u64::from(SCHEDULING_VERSION)),
             "target does not support reliable scheduling protocol 1; upgrade the original target"
         );
-        let request = if entry.delivered || !acknowledge {
-            json!({"type":"manager_status","conversation_id":entry.conversation_id,"trigger":entry.trigger})
-        } else {
-            let basis = self
-                .store
-                .lock()
-                .await
-                .heads(&entry.network_id, &entry.conversation_id)?;
-            ensure!(basis.len() <= 256, "too many scheduling proof heads");
-            json!({"type":"schedule","version":SCHEDULING_VERSION,"target_node":entry.target_node,
-                "conversation_id":entry.conversation_id,"trigger":entry.trigger,"basis_heads":basis})
-        };
-        let reply = self
-            .read_peer(&entry.network_id, &entry.target_node, request)
+        let reply = self.read_peer(&entry.network_id, &entry.target_node,
+            json!({"type":"manager_status","conversation_id":entry.conversation_id,"trigger":entry.trigger})).await?;
+        let presence = self
+            .process_scheduler_reply(entry, reply, acknowledge)
             .await?;
+        let SchedulePresence::NotFound { revision } = presence else {
+            return Ok(());
+        };
+        if !acknowledge || entry.delivered {
+            return Ok(());
+        }
+        let basis = {
+            let store = self.store.lock().await;
+            ensure!(
+                !durable_outbox(&store, entry)?.delivered,
+                "original scheduling outbox was acknowledged while reconciling"
+            );
+            ensure!(
+                store
+                    .local_value(&entry.network_id, &remote_key(entry))?
+                    .is_none_or(|value| value["sequence"].as_u64().unwrap_or(0) == 0),
+                "scheduler absence contradicts a previously observed durable job"
+            );
+            let session = store
+                .local_value(
+                    &entry.network_id,
+                    &remote_session_key(&entry.conversation_id, &entry.target_node),
+                )?
+                .context("scheduler absence observation is missing")?;
+            ensure!(
+                session["status_revision"].as_u64() == Some(revision),
+                "scheduler absence observation was superseded"
+            );
+            store.heads(&entry.network_id, &entry.conversation_id)?
+        };
+        ensure!(basis.len() <= 256, "too many scheduling proof heads");
+        tracing::debug!(network=%entry.network_id, target=%entry.target_node, scope=%entry.conversation_id,
+            trigger=%entry.trigger, revision, "scheduler reconciled not found before original admission");
+        let reply = self.read_peer(&entry.network_id, &entry.target_node,
+            json!({"type":"schedule","version":SCHEDULING_VERSION,"target_node":entry.target_node,
+                "conversation_id":entry.conversation_id,"trigger":entry.trigger,"basis_heads":basis})).await?;
+        ensure!(
+            matches!(
+                self.process_scheduler_reply(entry, reply, true).await?,
+                SchedulePresence::Present
+            ),
+            "original target did not confirm durable scheduling admission"
+        );
+        Ok(())
+    }
+
+    async fn process_scheduler_reply(
+        &self,
+        entry: &OutboxEntry,
+        reply: Value,
+        acknowledge: bool,
+    ) -> Result<SchedulePresence> {
+        let key = remote_key(entry);
         ensure!(
             reply["version"] == SCHEDULING_VERSION
                 && reply["network_id"] == entry.network_id
@@ -1036,7 +1117,14 @@ impl Runtime {
             .as_u64()
             .filter(|v| *v > 0)
             .context("scheduler status revision is required")?;
-        let primary = if !acknowledge && reply["state"] == "not_found" {
+        let primary = if reply["state"] == "not_found" {
+            ensure!(
+                matches!(reply.get("accepted"), None | Some(Value::Bool(false)))
+                    && matches!(reply.get("queued"), None | Some(Value::Bool(false)))
+                    && reply["job"].is_null()
+                    && reply["receipt"].is_null(),
+                "scheduler absence contradicts durable admission"
+            );
             None
         } else {
             Some(validate_reply(entry, &reply)?)
@@ -1047,19 +1135,18 @@ impl Runtime {
             "too many observed scheduler jobs"
         );
         ensure!(
+            primary.is_some() || !jobs.iter().any(|job| job.trigger == entry.trigger),
+            "scheduler absence includes the original durable job"
+        );
+        let presence = if primary.is_some() {
+            SchedulePresence::Present
+        } else {
+            SchedulePresence::NotFound { revision }
+        };
+        ensure!(
             reply["write_frozen"].is_boolean(),
             "scheduler omitted its write-frozen state"
         );
-        if acknowledge {
-            let receipt = &primary
-                .as_ref()
-                .context("scheduling admission receipt is missing")?
-                .0;
-            self.store
-                .lock()
-                .await
-                .acknowledge_outbox(&entry.network_id, receipt)?;
-        }
         {
             let wanted: Vec<String> = serde_json::from_value(reply["heads"].clone())?;
             ensure!(wanted.len() <= 256, "too many result proof heads");
@@ -1098,17 +1185,28 @@ impl Runtime {
             )?;
             let session_key = remote_session_key(&entry.conversation_id, &entry.target_node);
             let previous = store.local_value(&entry.network_id, &session_key)?;
+            let mut observed = jobs
+                .iter()
+                .map(|job| observed_job_value(&store, entry, job))
+                .collect::<Result<Vec<_>>>()?;
+            let primary_value = primary
+                .as_ref()
+                .map(|(_, job)| observed_job_value(&store, entry, job))
+                .transpose()?;
+            if acknowledge && let Some((receipt, _)) = &primary {
+                store.acknowledge_outbox(&entry.network_id, receipt)?;
+            }
             if previous
                 .as_ref()
                 .and_then(|value| value["status_revision"].as_u64())
                 .is_some_and(|previous| previous >= revision)
             {
-                return Ok(());
+                return Ok(if primary.is_some() {
+                    SchedulePresence::Present
+                } else {
+                    SchedulePresence::Stale
+                });
             }
-            let mut observed = jobs
-                .iter()
-                .map(|job| observed_job_value(&store, entry, job))
-                .collect::<Result<Vec<_>>>()?;
             for value in &mut observed {
                 value["status_revision"] = json!(revision);
                 value["freshness"] = json!("observed");
@@ -1120,8 +1218,7 @@ impl Runtime {
                 previous["status_revision"] = session["status_revision"].clone();
                 previous != session
             });
-            if let Some((_, job)) = primary {
-                let mut value = observed_job_value(&store, entry, &job)?;
+            if let Some(mut value) = primary_value {
                 value["manager"] = reply["manager"].clone();
                 value["write_frozen"] = reply["write_frozen"].clone();
                 value["freshness"] = json!("observed");
@@ -1142,7 +1239,7 @@ impl Runtime {
         if changed {
             self.publish_changed(&entry.network_id, &entry.conversation_id, &entry.trigger);
         }
-        Ok(())
+        Ok(presence)
     }
 
     pub(super) async fn scheduler_snapshot_jobs(
@@ -1340,6 +1437,493 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::scheduling::TriggerKind;
+
+    struct DeliveryFixture {
+        source: Arc<Runtime>,
+        target: Arc<Runtime>,
+        entry: OutboxEntry,
+        target_dir: PathBuf,
+        replies: Arc<Mutex<Option<Value>>>,
+        requests: Arc<Mutex<Vec<Value>>>,
+        drop_schedule_response: Arc<std::sync::atomic::AtomicBool>,
+        tasks: tokio::task::JoinSet<()>,
+    }
+
+    impl Drop for DeliveryFixture {
+        fn drop(&mut self) {
+            self.tasks.abort_all();
+        }
+    }
+
+    impl DeliveryFixture {
+        async fn open(text: impl FnOnce(&Path, &str) -> String) -> Result<Self> {
+            use axum::{
+                Router,
+                extract::{State, WebSocketUpgrade},
+                routing::get,
+            };
+            async fn upgrade(
+                State(hub): State<Arc<PeerHub>>,
+                ws: WebSocketUpgrade,
+            ) -> impl axum::response::IntoResponse {
+                ws.on_upgrade(|socket| async move {
+                    let _ = hub.accept(socket).await;
+                })
+            }
+            let source_dir = crate::runtime::tests::fixture_under("network-reliability")?;
+            let target_dir = crate::runtime::tests::fixture_under("network-reliability")?;
+            let workspace = target_dir.join("workspace");
+            config::private_dir(&workspace)?;
+            let workspace = workspace.canonicalize()?;
+            let script = target_dir.join("fixture-manager.py");
+            let verifier = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/verify-node.py")
+                .canonicalize()?;
+            config::private_write(&script, format!(
+                "import os\nfd=os.open({},os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\nos.dup2(fd,2)\nos.close(fd)\nos.execv('/usr/bin/python3',['/usr/bin/python3',{},'--fixture-manager','--fixture-root',{}])\n",
+                json!(target_dir.join("fixture-manager.stderr.log").to_string_lossy()),
+                json!(verifier.to_string_lossy()), json!(target_dir.to_string_lossy()),
+            ).as_bytes())?;
+            let mut cfg = Config::load(&target_dir)?;
+            cfg.listen = "127.0.0.1:0".parse()?;
+            cfg.codex_bin = "/usr/bin/true".into();
+            cfg.manager = Some(config::ManagerSettings {
+                provider: "codex_sdk".into(),
+                workspace: workspace.canonicalize()?,
+                model: "controlled-fixture".into(),
+                cursor_sdk_bin: "unused-fixture".into(),
+                node_bin: "/usr/bin/python3".into(),
+                codex_sdk_script: script,
+            });
+            cfg.save(&target_dir)?;
+            let source = Arc::new(Runtime::open(&source_dir).await?);
+            let target = Arc::new(Runtime::open(&target_dir).await?);
+            let owner = LocalIdentity::generate();
+            let membership = owner.sign_network_fixture(
+                1,
+                vec![
+                    source.identity.certificate(source.config.roles.clone())?,
+                    target.identity.certificate(target.config.roles.clone())?,
+                ],
+            )?;
+            let network = membership.genesis.network_id.clone();
+            source.install_membership(membership.clone()).await?;
+            target.install_membership(membership).await?;
+            let local = source.identity.node_id()?;
+            let target_id = target.identity.node_id()?;
+            let entry = {
+                let mut store = source.store.lock().await;
+                store.append_event(
+                    &source.identity,
+                    &network,
+                    "chat",
+                    EventBody::ConversationCreated {
+                        title: "delivery fixture".into(),
+                    },
+                    vec![],
+                    now_ms(),
+                )?;
+                store.accept_message(
+                    &source.identity,
+                    &network,
+                    "chat",
+                    EventBody::MessagePosted {
+                        message_id: "net1-original-message".into(),
+                        role: "user".into(),
+                        text: text(&workspace, &target_id),
+                        scheduler_node: Some(target_id.clone()),
+                    },
+                    vec![],
+                    now_ms(),
+                    &local,
+                    &target_id,
+                    false,
+                )?;
+                let snapshot = store.export_snapshot(&network, "chat")?;
+                target
+                    .store
+                    .lock()
+                    .await
+                    .import_snapshot(&network, &snapshot)?;
+                store
+                    .scheduler_outbox(&network)?
+                    .pop()
+                    .context("fixture outbox missing")?
+            };
+            let mut tasks = tokio::task::JoinSet::new();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("ws://{}/peer", listener.local_addr()?);
+            let router = Router::new()
+                .route("/peer", get(upgrade))
+                .with_state(target.hub.clone());
+            tasks.spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            let hub = source.hub.clone();
+            let scope = network.clone();
+            tasks.spawn(async move {
+                let _ = hub.connect(scope, url).await;
+            });
+            let replies = Arc::new(Mutex::new(None::<Value>));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let drop_schedule_response = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut inbound = target
+                .peer_rx
+                .lock()
+                .await
+                .take()
+                .context("fixture receiver missing")?;
+            let responder = target.clone();
+            let overrides = replies.clone();
+            let observed = requests.clone();
+            let drop_response = drop_schedule_response.clone();
+            tasks.spawn(async move {
+                while let Some(message) = inbound.recv().await {
+                    observed.lock().await.push(message.payload.clone());
+                    let override_reply = if message.payload["type"] == "manager_status" {
+                        overrides.lock().await.clone()
+                    } else {
+                        None
+                    };
+                    let value = match override_reply {
+                        Some(value) => value,
+                        None => responder
+                            .handle_peer(&message)
+                            .await
+                            .unwrap_or_else(|error| json!({"error":format!("{error:#}")})),
+                    };
+                    if message.payload["type"] == "schedule"
+                        && drop_response.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        assert!(
+                            value.get("error").is_none(),
+                            "fixture schedule failed: {value}"
+                        );
+                        continue;
+                    }
+                    let _ = responder.hub.respond(&message, value).await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !source.hub.online(&network).await.contains(&target_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            Ok(Self {
+                source,
+                target,
+                entry,
+                target_dir: target_dir.clone(),
+                replies,
+                requests,
+                drop_schedule_response,
+                tasks,
+            })
+        }
+
+        async fn absence(&self, revision: u64) -> Result<Value> {
+            let mut value = self
+                .target
+                .manager_status(
+                    &self.entry.network_id,
+                    &self.entry.conversation_id,
+                    &self.entry.trigger,
+                )
+                .await?;
+            value["status_revision"] = json!(revision);
+            Ok(value)
+        }
+
+        async fn schedules(&self) -> Vec<Value> {
+            self.requests
+                .lock()
+                .await
+                .iter()
+                .filter(|value| value["type"] == "schedule")
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn m4_schedule_absence_requires_fresh_complete_status_and_durable_unacked_outbox()
+    -> Result<()> {
+        let fixture = DeliveryFixture::open(|_, _| "query first".into()).await?;
+        let absence = fixture.absence(10).await?;
+        let mut invalid = Vec::new();
+        for field in ["accepted", "queued"] {
+            for bad in [json!(true), json!("false"), json!(0), Value::Null] {
+                let mut reply = absence.clone();
+                reply[field] = bad;
+                invalid.push((format!("invalid {field}"), reply));
+            }
+        }
+        for field in ["receipt", "job"] {
+            let mut reply = absence.clone();
+            reply[field] = json!({});
+            invalid.push((format!("contradictory {field}"), reply));
+        }
+        for field in [
+            "version",
+            "heads",
+            "jobs",
+            "write_frozen",
+            "status_revision",
+        ] {
+            let mut reply = absence.clone();
+            reply.as_object_mut().unwrap().remove(field);
+            invalid.push((format!("missing {field}"), reply));
+        }
+        let mut wrong_scope = absence.clone();
+        wrong_scope["conversation_id"] = json!("other");
+        invalid.push(("wrong scope".into(), wrong_scope));
+        let job = SchedulerJob {
+            version: 1,
+            conversation_id: "chat".into(),
+            trigger: fixture.entry.trigger.clone(),
+            target_node: fixture.entry.target_node.clone(),
+            kind: TriggerKind::Human,
+            sequence: 1,
+            basis_heads: vec![fixture.entry.trigger.clone()],
+            message_id: "reply".into(),
+            state: JobState::Queued,
+        };
+        let mut contradicting_jobs = absence.clone();
+        contradicting_jobs["jobs"] = json!([job]);
+        invalid.push(("absence includes original job".into(), contradicting_jobs));
+        for (label, reply) in invalid {
+            *fixture.replies.lock().await = Some(reply);
+            assert!(
+                fixture
+                    .source
+                    .deliver_schedule(&fixture.entry)
+                    .await
+                    .is_err(),
+                "accepted {label}"
+            );
+            assert!(
+                fixture.schedules().await.is_empty(),
+                "scheduled after {label}"
+            );
+            assert!(
+                !durable_outbox(&*fixture.source.store.lock().await, &fixture.entry)?.delivered
+            );
+        }
+        let session_key = remote_session_key("chat", &fixture.entry.target_node);
+        fixture.source.store.lock().await.local_set(
+            &fixture.entry.network_id,
+            &session_key,
+            &json!({"status_revision":10}),
+        )?;
+        for revision in [9, 10] {
+            let mut reply = absence.clone();
+            reply["status_revision"] = json!(revision);
+            *fixture.replies.lock().await = Some(reply);
+            fixture.source.deliver_schedule(&fixture.entry).await?;
+            assert!(fixture.schedules().await.is_empty());
+        }
+        fixture
+            .source
+            .store
+            .lock()
+            .await
+            .local_delete(&fixture.entry.network_id, &session_key)?;
+        *fixture.replies.lock().await = None;
+        fixture.source.deliver_schedule(&fixture.entry).await?;
+        let sent = fixture.schedules().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["trigger"], fixture.entry.trigger);
+        assert_eq!(sent[0]["target_node"], fixture.entry.target_node);
+        assert_eq!(sent[0]["conversation_id"], fixture.entry.conversation_id);
+        assert!(durable_outbox(&*fixture.source.store.lock().await, &fixture.entry)?.delivered);
+        let mut absence = absence;
+        absence["status_revision"] = json!(100);
+        *fixture.replies.lock().await = Some(absence);
+        fixture.source.deliver_schedule(&fixture.entry).await?;
+        assert_eq!(
+            fixture.schedules().await.len(),
+            1,
+            "stale false clone resent acknowledged outbox"
+        );
+        println!(
+            "NET1_M4 malformed_absence_rejected=true stale_equal_absence_no_schedule=true fresh_absence_original_schedule_once=true durable_ack_overrides_stale_false=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_observed_unknown_job_acknowledges_without_schedule() -> Result<()> {
+        let fixture =
+            DeliveryFixture::open(|_, _| "unknown remains on original target".into()).await?;
+        let mut reply = fixture.absence(10).await?;
+        let job = SchedulerJob {
+            version: 1,
+            conversation_id: fixture.entry.conversation_id.clone(),
+            trigger: fixture.entry.trigger.clone(),
+            target_node: fixture.entry.target_node.clone(),
+            kind: TriggerKind::Human,
+            sequence: 1,
+            basis_heads: vec![fixture.entry.trigger.clone()],
+            message_id: "unknown-reply".into(),
+            state: JobState::Unknown {
+                attempt: crate::scheduling::ManagerAttempt {
+                    id: "original-attempt".into(),
+                    boot: "original-boot".into(),
+                    read_only: false,
+                    permission_version: 1,
+                    followup_version: None,
+                },
+                detail: "outcome needs reconciliation".into(),
+                fenced: false,
+            },
+        };
+        reply["state"] = json!("unknown");
+        reply["accepted"] = json!(true);
+        reply["queued"] = json!(true);
+        reply["write_frozen"] = json!(true);
+        reply["receipt"] = json!(job.receipt(&fixture.entry.network_id));
+        reply["job"] = json!(job);
+        reply["jobs"] = json!([job]);
+        *fixture.replies.lock().await = Some(reply);
+        fixture.source.deliver_schedule(&fixture.entry).await?;
+        assert!(fixture.schedules().await.is_empty());
+        assert!(durable_outbox(&*fixture.source.store.lock().await, &fixture.entry)?.delivered);
+        let observed = fixture
+            .source
+            .store
+            .lock()
+            .await
+            .local_value(&fixture.entry.network_id, &remote_key(&fixture.entry))?
+            .unwrap();
+        assert_eq!(observed["state"], "unknown");
+        assert_eq!(observed["write_frozen"], true);
+        println!(
+            "NET1_M4 valid_observed_unknown_job_acknowledged=true schedule_packets=0 write_frozen_preserved=true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_lost_schedule_response_reconciles_original_job_without_replaying_real_command()
+    -> Result<()> {
+        let mut fixture = DeliveryFixture::open(|workspace, target| {
+            json!({"phase1":true,"label":"net1-lost-ack","tools":[{
+            "name":"command","call_ref":"net1-effect","wait_terminal":true,
+            "arguments":{"command":"printf once >> marker","cwd":workspace,
+                "target_node":target,"timeout_secs":10}}]})
+            .to_string()
+        })
+        .await?;
+        let workspace = fixture.target_dir.join("workspace").canonicalize()?;
+        let access = Access {
+            network_id: fixture.entry.network_id.clone(),
+            human: false,
+            conversation_id: Some(fixture.entry.conversation_id.clone()),
+            manager: None,
+        };
+        fixture
+            .drop_schedule_response
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = fixture
+            .source
+            .deliver_schedule(&fixture.entry)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RequestFailure>(),
+            Some(&RequestFailure::Unknown)
+        );
+        assert!(!durable_outbox(&*fixture.source.store.lock().await, &fixture.entry)?.delivered);
+        assert!(
+            fixture
+                .target
+                .store
+                .lock()
+                .await
+                .scheduler_job(
+                    &fixture.entry.network_id,
+                    "chat",
+                    &fixture.entry.trigger,
+                    &fixture.entry.target_node
+                )?
+                .is_some()
+        );
+        let api = fixture.target.clone();
+        fixture.tasks.spawn(async move {
+            let _ = crate::api::serve(api).await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.target.tool_url.get().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let result = crate::scheduler::run(
+            fixture.target.clone(),
+            access.clone(),
+            "chat".into(),
+            fixture.entry.trigger.clone(),
+        )
+        .await?;
+        assert_eq!(
+            result["state"],
+            "completed",
+            "{result}; fixture stderr={}; fixture tool errors={}",
+            std::fs::read_to_string(fixture.target_dir.join("fixture-manager.stderr.log"))
+                .unwrap_or_default(),
+            std::fs::read_to_string(fixture.target_dir.join("manager-tool-errors.jsonl"))
+                .unwrap_or_default()
+        );
+        fixture.source.deliver_schedule(&fixture.entry).await?;
+        crate::scheduler::run(
+            fixture.target.clone(),
+            access,
+            "chat".into(),
+            fixture.entry.trigger.clone(),
+        )
+        .await?;
+        assert_eq!(fixture.schedules().await.len(), 1);
+        let requests = fixture.requests.lock().await;
+        let scheduling: Vec<_> = requests
+            .iter()
+            .filter(|value| matches!(value["type"].as_str(), Some("manager_status" | "schedule")))
+            .collect();
+        assert_eq!(
+            scheduling
+                .iter()
+                .map(|value| value["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["manager_status", "schedule", "manager_status"]
+        );
+        for request in &scheduling {
+            assert_eq!(request["conversation_id"], fixture.entry.conversation_id);
+            assert_eq!(request["trigger"], fixture.entry.trigger);
+        }
+        assert_eq!(scheduling[1]["target_node"], fixture.entry.target_node);
+        drop(requests);
+        assert!(durable_outbox(&*fixture.source.store.lock().await, &fixture.entry)?.delivered);
+        let records =
+            std::fs::read_to_string(fixture.target_dir.join("manager-invocations.jsonl"))?;
+        assert_eq!(records.lines().count(), 1);
+        assert_eq!(std::fs::read(workspace.join("marker"))?, b"once");
+        let operations = fixture
+            .target
+            .store
+            .lock()
+            .await
+            .operations(&fixture.entry.network_id)?;
+        let commands: Vec<_> = operations
+            .iter()
+            .filter(|record| record.request.action["type"] == "command")
+            .collect();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].state, OperationState::Succeeded);
+        println!(
+            "NET1_M4 real_noise_lost_schedule_response=true original_durable_job_reconciled=true schedule_packets=1 sdk_invocations=1 actual_node_command_marker=once command_operation=succeeded outbox_delivered=true"
+        );
+        Ok(())
+    }
 
     #[test]
     fn remote_ack_requires_the_original_complete_durable_identity() -> Result<()> {

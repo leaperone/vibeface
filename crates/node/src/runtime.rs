@@ -6,7 +6,7 @@ use crate::{
     maintenance::{Busy, Gate},
     model::*,
     network::{IncomingSocket, NetworkHub, Service},
-    peer::{Inbound, PeerHub},
+    peer::{AuthorizationDenied, Inbound, PeerHub, RequestFailure},
     store::Store,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 mod agent_tools;
 mod blob_transfer;
@@ -89,6 +89,174 @@ mod tests {
         .await?;
         Ok(view.network_id)
     }
+    #[tokio::test]
+    async fn m4_route_flight_survives_cancelled_waiter_and_never_sends_its_payload() -> Result<()> {
+        let source_dir = fixture_under("network-reliability")?;
+        let target_dir = fixture_under("network-reliability")?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let endpoint = format!("ws://{address}/api/network/ws");
+        let mut target_config = Config::load(&target_dir)?;
+        target_config.listen = address;
+        target_config.public_url = format!("http://{address}");
+        target_config.network.advertise_urls = vec![endpoint.clone()];
+        target_config.save(&target_dir)?;
+        let mut source_config = Config::load(&source_dir)?;
+        source_config.network.bootstrap_urls = vec![endpoint];
+        source_config.save(&source_dir)?;
+        let source = Arc::new(Runtime::open(&source_dir).await?);
+        let target = Arc::new(Runtime::open(&target_dir).await?);
+        let owner = test_owner(&source)?;
+        let membership = owner.sign_network_fixture(
+            1,
+            vec![
+                source.identity.certificate(source.config.roles.clone())?,
+                target.identity.certificate(target.config.roles.clone())?,
+            ],
+        )?;
+        let network = membership.genesis.network_id.clone();
+        source.install_membership(membership.clone()).await?;
+        target.install_membership(membership).await?;
+        let target_id = target.identity.node_id()?;
+        let mut tasks = tokio::task::JoinSet::new();
+        let router = crate::api::router(target.clone());
+        tasks.spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_gate = gate.clone();
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let server_stop = stop.clone();
+        let mut sockets = target
+            .network_rx
+            .lock()
+            .await
+            .take()
+            .context("missing network receiver")?;
+        let hub = target.hub.clone();
+        let (entered, observed) = oneshot::channel();
+        let (closed, closed_observed) = oneshot::channel();
+        tasks.spawn(async move {
+            let socket = sockets.recv().await.expect("target connection missing");
+            assert_eq!(socket.service, Service::Peer);
+            let _ = entered.send(());
+            let _permit = server_gate.acquire().await.expect("handshake gate closed");
+            tokio::select! {
+                _ = hub.accept_transport(socket.socket) => {},
+                _ = server_stop.notified() => {},
+            }
+            let mut additional = 0;
+            while sockets.try_recv().is_ok() {
+                additional += 1;
+            }
+            let _ = closed.send(additional);
+        });
+        let mut inbound = target
+            .peer_rx
+            .lock()
+            .await
+            .take()
+            .context("missing peer receiver")?;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        let responder = target.clone();
+        tasks.spawn(async move {
+            while let Some(message) = inbound.recv().await {
+                requests.lock().await.push(message.payload.clone());
+                let value = responder
+                    .handle_peer(&message)
+                    .await
+                    .unwrap_or_else(|error| json!({"error":error.to_string()}));
+                let _ = responder.hub.respond(&message, value).await;
+            }
+        });
+        let cancelled_node = source.clone();
+        let cancelled_network = network.clone();
+        let cancelled_target = target_id.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_node
+                .raw_peer_request(
+                    &cancelled_network,
+                    &cancelled_target,
+                    json!({"type":"cancelled_write_probe","operation_id":"never-send"}),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), observed).await??;
+        let survivor_node = source.clone();
+        let survivor_network = network.clone();
+        let survivor_target = target_id.clone();
+        let survivor = tokio::spawn(async move {
+            survivor_node
+                .raw_peer_request(
+                    &survivor_network,
+                    &survivor_target,
+                    json!({"type":"capabilities"}),
+                )
+                .await
+        });
+        let mut background = source
+            .route_flight(&network, &target_id, "background", None, None)
+            .await?;
+        let flight_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let flights = source.route_flights.lock().await;
+                assert_eq!(flights.len(), 1);
+                let flight = &flights[&(network.clone(), target_id.clone())];
+                if flight.state.receiver_count() >= 3 {
+                    break flight.id.clone();
+                }
+                drop(flights);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(seen.lock().await.is_empty());
+        assert!(matches!(*background.borrow(), RouteFlightState::Connecting));
+        gate.add_permits(1);
+        loop {
+            if matches!(*background.borrow(), RouteFlightState::Ready(_)) {
+                break;
+            }
+            tokio::time::timeout(Duration::from_secs(2), background.changed()).await??;
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(2), survivor).await???;
+        assert_eq!(reply, target.capabilities());
+        assert_eq!(*seen.lock().await, vec![json!({"type":"capabilities"})]);
+        assert_eq!(
+            source.route_flights.lock().await[&(network.clone(), target_id.clone())].id,
+            flight_id
+        );
+        stop.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), closed_observed).await??,
+            0,
+            "background and concurrent demand must share one actual peer data connection"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !source.route_flights.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(!source.hub.has_route(&network, &target_id).await);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        drop((source, target));
+        std::fs::remove_dir_all(source_dir)?;
+        std::fs::remove_dir_all(target_dir)?;
+        eprintln!(
+            "NET1_M4 one_actual_peer_data_connection=true background_and_demand_share_flight=true cancelled_waiter_did_not_cancel_owner=true cancelled_payload_never_sent=true survivor_capabilities_response=true flight_removed_after_disconnect=true"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn net1_bad_prefix_rotates_from_the_first_source_and_empty_blob_falls_back() -> Result<()>
     {
@@ -3719,6 +3887,39 @@ fn save_sync_progress(
     Ok(())
 }
 
+const MAX_ROUTE_FLIGHTS: usize = 128;
+
+#[derive(Clone, Debug)]
+enum RouteFailure {
+    Denied(AuthorizationDenied),
+    Busy,
+    Unavailable(String),
+}
+impl RouteFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        if let Some(error) = error.downcast_ref::<AuthorizationDenied>() {
+            Self::Denied(error.clone())
+        } else if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy)
+            || error.downcast_ref::<crate::network::Denied>().is_some()
+        {
+            Self::Busy
+        } else {
+            Self::Unavailable(format!("{error:#}"))
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RouteFlightState {
+    Connecting,
+    Ready(String),
+    Failed(RouteFailure),
+}
+struct RouteFlight {
+    id: String,
+    state: watch::Sender<RouteFlightState>,
+}
+
 pub struct Runtime {
     pub config: Config,
     pub identity: LocalIdentity,
@@ -3726,6 +3927,7 @@ pub struct Runtime {
     pub identities: Arc<IdentityStore>,
     pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
+    route_flights: Arc<Mutex<HashMap<(String, String), RouteFlight>>>,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
@@ -3920,6 +4122,7 @@ impl Runtime {
             agent_blobs: Mutex::new(HashMap::new()),
             blob_staging,
             schedule_workers: Mutex::new(BTreeSet::new()),
+            route_flights: Arc::new(Mutex::new(HashMap::new())),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
@@ -4040,6 +4243,15 @@ impl Runtime {
                 let n = node.clone();
                 tokio::spawn(async move {
                     let response = n.handle_peer(&message).await;
+                    let request_type = message.payload["type"].as_str();
+                    let operation_id = message.payload["operation_id"]
+                        .as_str()
+                        .or_else(|| message.payload["request"]["operation_id"].as_str());
+                    let trigger = message.payload["trigger"].as_str();
+                    tracing::debug!(network=%message.network_id, origin=%message.origin,
+                        request_id=%message.request_id, request_type, operation_id, trigger,
+                        outcome=if response.is_ok() { "ok" } else { "error" },
+                        "peer business request handled");
                     if !message.broadcast {
                         let value = response.unwrap_or_else(|e| json!({"error":format!("{e:#}")}));
                         let _ = n.hub.respond(&message, value).await;
@@ -4093,7 +4305,6 @@ impl Runtime {
         });
         let node = self.clone();
         tokio::spawn(async move {
-            let connecting = Arc::new(Mutex::new(BTreeSet::new()));
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tick.tick().await;
@@ -4110,23 +4321,18 @@ impl Runtime {
                     {
                         continue;
                     }
-                    let key = (view.network_id.clone(), member.subject_id.clone());
-                    if !connecting.lock().await.insert(key.clone()) {
-                        continue;
+                    if let Err(error) = node
+                        .route_flight(
+                            &view.network_id,
+                            &member.subject_id,
+                            "background",
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::debug!(%error, "personal peer reconnect pending");
                     }
-                    let node = node.clone();
-                    let connecting = connecting.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = node
-                            .hub
-                            .clone()
-                            .connect_target(key.0.clone(), key.1.clone(), node.network.clone())
-                            .await
-                        {
-                            tracing::debug!(%error,"personal peer reconnect pending");
-                        }
-                        connecting.lock().await.remove(&key);
-                    });
                 }
             }
         });
@@ -4301,8 +4507,120 @@ impl Runtime {
             .authorize_node(network, &self.identity.node_id()?, Some(role))?;
         Ok(())
     }
+    async fn route_flight(
+        &self,
+        network: &str,
+        target: &str,
+        trigger: &'static str,
+        request_type: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Result<watch::Receiver<RouteFlightState>> {
+        let key = (network.to_owned(), target.to_owned());
+        let mut flights = self.route_flights.lock().await;
+        if let Some(existing) = flights.get(&key) {
+            let state = existing.state.borrow().clone();
+            let current = match &state {
+                RouteFlightState::Ready(id) => self.hub.link_matches(network, target, id).await,
+                _ => true,
+            };
+            if current {
+                tracing::debug!(network, target, flight_id=%existing.id, trigger, request_type, operation_id,
+                    state=?state, "peer route flight joined");
+                return Ok(existing.state.subscribe());
+            }
+            flights.remove(&key);
+        }
+        ensure!(flights.len() < MAX_ROUTE_FLIGHTS, RequestFailure::Busy);
+        let id = uuid::Uuid::new_v4().to_string();
+        let deadline = tokio::time::Instant::now() + crate::network::DIAL_TIMEOUT;
+        let (state, receive) = watch::channel(RouteFlightState::Connecting);
+        flights.insert(
+            key.clone(),
+            RouteFlight {
+                id: id.clone(),
+                state: state.clone(),
+            },
+        );
+        tracing::debug!(network, target, flight_id=%id, trigger, request_type, operation_id, "peer route flight started");
+        let hub = self.hub.clone();
+        let transport = self.network.clone();
+        let registry = self.route_flights.clone();
+        tokio::spawn(async move {
+            let (ready, receive_ready) = oneshot::channel();
+            let connection = hub.connect_target(
+                key.0.clone(),
+                key.1.clone(),
+                transport,
+                Some(ready),
+                deadline,
+            );
+            tokio::pin!(connection);
+            let result = tokio::select! {
+                ready = receive_ready => {
+                    if let Ok(link_id) = ready {
+                        state.send_replace(RouteFlightState::Ready(link_id.clone()));
+                        tracing::debug!(network=%key.0, target=%key.1, flight_id=%id, link_id,
+                            state="ready", "peer route flight ready");
+                    }
+                    connection.await
+                }
+                result = &mut connection => result,
+            };
+            let failure = match result {
+                Err(error) => RouteFailure::from_error(&error),
+                Ok(()) => RouteFailure::Unavailable("peer connection closed".to_owned()),
+            };
+            tracing::debug!(network=%key.0, target=%key.1, flight_id=%id,
+                state=?failure, "peer route flight finished");
+            state.send_replace(RouteFlightState::Failed(failure));
+            let mut flights = registry.lock().await;
+            if flights.get(&key).is_some_and(|entry| entry.id == id) {
+                flights.remove(&key);
+            }
+        });
+        Ok(receive)
+    }
+
+    async fn raw_peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
+        let local = self.identity.node_id()?;
+        self.hub.authorize(network, &local).await?;
+        self.hub.authorize(network, target).await?;
+        if target != local && !self.hub.has_route(network, target).await {
+            let request_type = payload["type"].as_str();
+            let operation_id = payload["operation_id"]
+                .as_str()
+                .or_else(|| payload["request"]["operation_id"].as_str());
+            let mut receive = self
+                .route_flight(network, target, "on_demand", request_type, operation_id)
+                .await?;
+            loop {
+                let state = receive.borrow().clone();
+                match state {
+                    RouteFlightState::Connecting => receive
+                        .changed()
+                        .await
+                        .map_err(|_| RequestFailure::NoRoute)?,
+                    RouteFlightState::Ready(_) => break,
+                    RouteFlightState::Failed(RouteFailure::Denied(error)) => {
+                        return Err(error.into());
+                    }
+                    RouteFlightState::Failed(RouteFailure::Busy) => {
+                        return Err(RequestFailure::Busy.into());
+                    }
+                    RouteFlightState::Failed(RouteFailure::Unavailable(error)) => {
+                        tracing::debug!(network, target, %error, "peer route unavailable before first send");
+                        break;
+                    }
+                }
+            }
+        }
+        self.hub.authorize(network, &local).await?;
+        self.hub.authorize(network, target).await?;
+        self.hub.request(network, target, payload).await
+    }
+
     async fn peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
-        let reply = self.hub.request(network, target, payload).await?;
+        let reply = self.raw_peer_request(network, target, payload).await?;
         if let Some(error) = reply["error"].as_str() {
             bail!("{error}");
         }
@@ -4370,7 +4688,7 @@ impl Runtime {
             self.peer_request(network, target, payload),
         )
         .await
-        .context("history peer is currently unreachable")?
+        .map_err(|_| RequestFailure::Unknown)?
     }
     async fn history_response(
         &self,
@@ -4385,10 +4703,10 @@ impl Runtime {
             .authorize_node(network, target, Some(NodeRole::Replica))?;
         let value = tokio::time::timeout(
             Duration::from_secs(5),
-            self.hub.request(network, target, payload),
+            self.raw_peer_request(network, target, payload),
         )
         .await
-        .context("history peer is currently unreachable")??;
+        .map_err(|_| RequestFailure::Unknown)??;
         budget.response(&value)?;
         self.store
             .lock()
