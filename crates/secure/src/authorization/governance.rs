@@ -4,6 +4,7 @@ use super::*;
 use super::{
     client_policy_import::require_confirmed_client_policy, policy_import::VerifiedPolicySnapshot,
 };
+use crate::signature_verification::{ScopedSignatureVerification, SignatureVerification};
 use zeroize::Zeroize;
 
 fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
@@ -1833,7 +1834,7 @@ impl VerifiedTeamCreation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::authorization::bootstrap::*;
 
@@ -1842,11 +1843,14 @@ mod tests {
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
     }
-    fn confirmed_authorization(
+    pub(crate) fn confirmed_authorization(
         state: &VerifiedPolicySet,
         pins: &[PolicyPin],
         bundle: &ClientAuthorizationBundle,
         resource: &ResourceRef,
+        own: &Identity,
+        node: &Identity,
+        now: u64,
     ) -> VerifiedClientAuthorization {
         use client_policy_import::*;
         let domains: BTreeSet<_> = verify_client_policy_state_selected(
@@ -1854,7 +1858,7 @@ mod tests {
             bundle,
             pins,
             match &state
-                .find_device(&DeviceId::from_key(&PublicKey::of(&key(3))))
+                .find_device(&DeviceId::from_key(&PublicKey::of(own)))
                 .unwrap()
                 .payload
                 .subject
@@ -1863,9 +1867,9 @@ mod tests {
                 _ => unreachable!(),
             },
             resource.space.clone(),
-            PublicKey::of(&key(3)),
+            PublicKey::of(own),
             Some(resource),
-            NOW,
+            now,
         )
         .unwrap()
         .heads
@@ -1916,8 +1920,6 @@ mod tests {
                 .collect(),
         };
         let pins = pins.as_slice();
-        let own = key(3);
-        let node = key(4);
         let audience = state
             .grant(&bundle.grant_leaf)
             .unwrap()
@@ -1925,7 +1927,7 @@ mod tests {
             .audience
             .clone();
         let account = match &state
-            .find_device(&DeviceId::from_key(&PublicKey::of(&own)))
+            .find_device(&DeviceId::from_key(&PublicKey::of(own)))
             .unwrap()
             .payload
             .subject
@@ -1941,21 +1943,21 @@ mod tests {
         let request_json = build_client_policy_read_request(
             account.as_str(),
             resource.space.as_str(),
-            &own,
-            &node.public_key_hex(),
+            own,
+            node.public_key_hex(),
             &json(&pins).unwrap(),
             &json(&Some(&selection)).unwrap(),
-            NOW as f64,
-            NOW as f64 + 60_000.0,
+            now as f64,
+            now as f64 + 60_000.0,
         )
         .unwrap();
         let request: Signed<ClientPolicyReadRequest> = parse(&request_json).unwrap();
         let current = verify_client_policy_read(
             state,
             &request,
-            &PublicKey::of(&node),
-            &PublicKey::of(&own),
-            NOW as u64,
+            &PublicKey::of(node),
+            &PublicKey::of(own),
+            now as u64,
         )
         .unwrap();
         let snapshot = Signed::sign(
@@ -1966,20 +1968,20 @@ mod tests {
                 saved_pins_hash: client_policy_saved_pins_hash(pins).unwrap(),
                 target_heads: current.heads().to_vec(),
                 selection: selection.clone(),
-                source_node_public_key: PublicKey::of(&node),
-                issued_at_ms: NOW as u64,
-                expires_at_ms: NOW as u64 + 60_000,
+                source_node_public_key: PublicKey::of(node),
+                issued_at_ms: now as u64,
+                expires_at_ms: now as u64 + 60_000,
             },
-            &node,
+            node,
         )
         .unwrap();
         let mut import = begin_client_policy_import(
             &json(&pins).unwrap(),
             &request_json,
             &json(&snapshot).unwrap(),
-            &own,
-            &node.public_key_hex(),
-            NOW as f64,
+            own,
+            node.public_key_hex(),
+            now as f64,
         )
         .unwrap();
         let mut previous = snapshot.hash().unwrap();
@@ -2001,12 +2003,12 @@ mod tests {
                     },
                     complete,
                 },
-                &node,
+                node,
             )
             .unwrap();
             previous = page.hash().unwrap();
             import
-                .append_page(&json(&page).unwrap(), NOW as f64)
+                .append_page(&json(&page).unwrap(), now as f64)
                 .unwrap();
         }
         let witness = Signed::sign(
@@ -2019,25 +2021,25 @@ mod tests {
                 page_count: bundle.journal.len() as u64,
                 entry_count: bundle.journal.len() as u64,
                 snapshot_hash: snapshot.hash().unwrap(),
-                source_node_public_key: PublicKey::of(&node),
-                issued_at_ms: NOW as u64,
-                expires_at_ms: NOW as u64 + 60_000,
+                source_node_public_key: PublicKey::of(node),
+                issued_at_ms: now as u64,
+                expires_at_ms: now as u64 + 60_000,
             },
-            &node,
+            node,
         )
         .unwrap();
         let authorization = import
             .finish(
                 &json(&witness).unwrap(),
                 &json(&selection).unwrap(),
-                NOW as f64,
+                now as f64,
             )
             .unwrap();
         let confirmation_request_json = build_client_policy_auth_confirm_request(
             &authorization,
-            &own,
-            NOW as f64,
-            NOW as f64 + 30_000.0,
+            own,
+            now as f64,
+            now as f64 + 30_000.0,
         )
         .unwrap();
         let confirmation_request: Signed<ClientPolicyAuthConfirmRequest> =
@@ -2048,9 +2050,9 @@ mod tests {
             &snapshot,
             &witness,
             &confirmation_request,
-            &PublicKey::of(&node),
-            &PublicKey::of(&own),
-            NOW as u64,
+            &PublicKey::of(node),
+            &PublicKey::of(own),
+            now as u64,
         )
         .unwrap();
         let confirmation = Signed::sign(
@@ -2060,19 +2062,19 @@ mod tests {
                 confirmation_request_hash: confirmation_request.hash().unwrap(),
                 selection,
                 target_heads: current.heads().to_vec(),
-                device_public_key: PublicKey::of(&own),
-                source_node_public_key: PublicKey::of(&node),
-                accepted_at_ms: NOW as u64,
+                device_public_key: PublicKey::of(own),
+                source_node_public_key: PublicKey::of(node),
+                accepted_at_ms: now as u64,
             },
-            &node,
+            node,
         )
         .unwrap();
         confirm_client_policy_authorization(
             &authorization,
             &confirmation_request_json,
             &json(&confirmation).unwrap(),
-            &node.public_key_hex(),
-            NOW as f64,
+            node.public_key_hex(),
+            now as f64,
         )
         .unwrap()
     }
@@ -2144,6 +2146,9 @@ mod tests {
                         .clone(),
                     resource: self.project.clone(),
                 },
+                &key(3),
+                &key(4),
+                NOW,
             )
         }
         fn prepare_team(&self, root: &Identity) -> crate::Result<PreparedTeamCreation> {
@@ -2385,7 +2390,7 @@ mod tests {
                 .iter_mut()
                 .find(|pin| pin.domain == head.domain)
                 .unwrap()
-                .minimum_head = Some(head);
+                .minimum_head = Some(head.clone());
         }
         assert!(personal.bundle.journal.len() > 122);
         let confirmed = personal.authorization();
@@ -2463,6 +2468,15 @@ mod tests {
                 JournalEntry::Space(Signed::sign(document, &key(11)).unwrap()),
             ])
             .unwrap();
+        let original_retry = newer.with_created_team(&prepared.approved).unwrap();
+        assert_eq!(original_retry.heads(), newer.heads());
+        assert_eq!(original_retry.journal(), newer.journal());
+        let mut incomplete = prepared.approved.clone();
+        incomplete.source_heads.pop();
+        assert!(newer.with_created_team(&incomplete).is_err());
+        let mut forged = prepared.approved.clone();
+        forged.source_heads[0].sequence += 999;
+        assert!(newer.with_created_team(&forged).is_err());
         let mut approved = prepared.approved.clone();
         approved.source_heads = newer.heads().to_vec();
         let repeated = newer.with_created_team(&approved).unwrap();
