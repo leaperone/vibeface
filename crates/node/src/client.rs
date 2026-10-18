@@ -1627,6 +1627,674 @@ mod tests {
         Ok(())
     }
 
+    fn task_business_checked<T>(phase: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let signatures = vibeface_secure::signature_verification::SignatureVerification::new();
+        let result = signatures.run(action).with_context(|| phase.to_owned())?;
+        ensure!(
+            signatures.counts().actual_verifications <= 32,
+            "Task business {phase} exceeded its crypto budget"
+        );
+        Ok(result)
+    }
+
+    async fn task_business_operation_current(
+        b: &Arc<Runtime>,
+        c: &Arc<Runtime>,
+        original: &VerifiedTaskBusinessOriginalSource,
+        stage: CheckStage,
+    ) -> Result<vibeface_secure::authorization::task_business_policy::original_operation::VerifiedTaskBusinessOperationCurrent>{
+        use crate::runtime::now_ms;
+        use vibeface_secure::{
+            Identity,
+            authorization::{
+                AUTH_VERSION, INVOCATION_MAX_AGE_MS, Nonce,
+                execution_handoff::ExecutionHandoffFreshness,
+            },
+        };
+        let mut context = {
+            let mut store = c.store.lock().await;
+            task_business_checked("operation begin", || {
+                store.begin_task_business_operation_check(
+                    &c.identity,
+                    original,
+                    original.wire(),
+                    original.acceptance(),
+                    stage,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        let now = now_ms() as u64;
+        let signer =
+            Identity::from_secret_hex(&c.identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let request = Signed::sign(
+            TaskBusinessReceiptRead {
+                version: AUTH_VERSION,
+                source_header_hash: original.header().hash()?,
+                business_wire_hash: original.wire_hash().clone(),
+                challenge: TaskBusinessChallenge::Submit(context.challenge().clone()),
+                acceptance: Some(original.acceptance().clone()),
+                nonce: Nonce::random()?,
+                issued_at_ms: now,
+                expires_at_ms: (now + INVOCATION_MAX_AGE_MS).min(context.challenge().expires_at_ms),
+            },
+            &signer,
+        )?;
+        let mut reader =
+            TaskBusinessReceiptClient::connect_original(&c.network, &c.identity, original).await?;
+        let mut receipts = context.local_receipts().to_vec();
+        let foreign = reader.read(&request).await?;
+        ensure!(
+            !foreign.is_empty(),
+            "B returned no current operation receipts"
+        );
+        let source_key = b.identity.public_key_hex()?;
+        assert!(
+            foreign
+                .iter()
+                .all(|receipt| receipt.issuer.as_str() == source_key)
+        );
+        receipts.extend(foreign);
+        for method in [
+            "authenticate",
+            "rpc",
+            TASK_BUSINESS_METHOD,
+            NODE_POLICY_READ_METHOD,
+        ] {
+            let error = reader
+                .client
+                .call(method, json!({}))
+                .await
+                .err()
+                .context("receipt reader changed purpose")?;
+            assert!(
+                error.to_string().contains("cannot change purpose"),
+                "{error}"
+            );
+        }
+        let proof = ExecutionHandoffFreshness {
+            challenge: context.challenge().clone(),
+            receipts,
+        };
+        let store = c.store.lock().await;
+        task_business_checked("operation finish", || {
+            store.finish_task_business_operation_check(
+                &c.identity,
+                &mut context,
+                &proof,
+                now_ms() as u64,
+            )
+        })
+    }
+
+    async fn task_business_rpc(
+        client: &mut TaskBusinessClient,
+        b: &Runtime,
+        source: &crate::identity::task_business_policy::TaskBusinessPolicySourceContext,
+        authorization: &vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
+        business: &TaskBusinessWire,
+        submit: bool,
+    ) -> Result<vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult> {
+        use vibeface_secure::authorization::task_business_policy::TaskBusinessAuthorization;
+        let header_hash = source.header().hash()?;
+        let wire_hash = business.hash()?;
+        let request = if submit {
+            TaskBusinessRequest::Business(business.clone())
+        } else {
+            TaskBusinessRequest::Status {
+                wire: business.clone(),
+            }
+        };
+        let TaskBusinessResponse::Challenge {
+            source_context,
+            business_wire_hash,
+            challenge,
+        } = client.exchange(&request).await?
+        else {
+            anyhow::bail!("Task business omitted its genuine current challenge");
+        };
+        assert_eq!(source_context, header_hash);
+        assert_eq!(business_wire_hash, wire_hash);
+        let TaskBusinessChallenge::Submit(typed) = &challenge else {
+            anyhow::bail!("Submit changed its typed challenge");
+        };
+        assert_eq!(
+            typed.stage,
+            if submit {
+                CheckStage::Admit
+            } else {
+                CheckStage::RemoteRead
+            }
+        );
+        let receipts = {
+            let store = b.store.lock().await;
+            task_business_checked("B challenge receipts", || {
+                store.task_business_challenge_receipts(
+                    &b.identity,
+                    source.current_policy(),
+                    TaskBusinessAuthorization::Submit(authorization),
+                    business,
+                    &header_hash,
+                    &challenge,
+                    crate::runtime::now_ms() as u64,
+                )
+            })?
+        };
+        let response = client
+            .exchange(&TaskBusinessRequest::Receipts {
+                source_context: header_hash,
+                business_wire_hash: wire_hash,
+                challenge_hash: challenge.hash()?,
+                receipts,
+            })
+            .await?;
+        let value = match response {
+            TaskBusinessResponse::Business(value) if submit => value,
+            TaskBusinessResponse::Status(value) if !submit => value,
+            _ => anyhow::bail!("Task business changed its terminal response purpose"),
+        };
+        Ok(serde_json::from_value(value)?)
+    }
+
+    async fn task_business_noise_lifecycle(revoke: bool) -> Result<()> {
+        use crate::{
+            config::{self, Config},
+            identity::{
+                execution_dispatch::tests::Fixture,
+                foreign_execution_policy::tests::{
+                    admit_unseeded_dispatch, import_current_policy, unseeded_fixture_with_source,
+                },
+                test_support::{TestNetwork, now},
+            },
+            model::OperationState,
+            network::{MAX_FRAME_BYTES, NetworkConfig},
+            runtime::now_ms,
+            store::Store,
+        };
+        use axum::{
+            Router,
+            extract::{State as AxumState, WebSocketUpgrade},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, task::JoinSet};
+        use vibeface_secure::authorization::{
+            EventRef, ExecutionSourcePolicy, InvocationContext, JournalEntry, PolicyDomain,
+            ResourceRef, SessionRef,
+            execution_handoff::{ExecutionHandoffResult, ExecutionHandoffState},
+            prepare::PrepareContext,
+        };
+
+        fn primary_counts(store: &Store) -> Result<(u64, u64, u64)> {
+            Ok(store.connection.query_row(
+                "SELECT (SELECT count(*) FROM policy_pins), (SELECT count(*) FROM policy_journal), (SELECT count(*) FROM current_policy_heads)",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        }
+        async fn upgrade(
+            AxumState(hub): AxumState<Arc<NetworkHub>>,
+            ws: WebSocketUpgrade,
+        ) -> impl axum::response::IntoResponse {
+            ws.max_message_size(MAX_FRAME_BYTES)
+                .max_frame_size(MAX_FRAME_BYTES)
+                .on_upgrade(|socket| async move {
+                    let _ = hub.accept(socket).await;
+                })
+        }
+        async fn runtime(
+            network: &TestNetwork,
+            store: Store,
+            peer: &str,
+            own: &str,
+        ) -> Result<Arc<Runtime>> {
+            let dir = &network.directory;
+            config::private_write(
+                &dir.join("data-epoch.json"),
+                &serde_json::to_vec(&config::data_format())?,
+            )?;
+            let mut cfg = Config::local(
+                "127.0.0.1:4790".parse()?,
+                vec![network.project.clone()],
+                false,
+            );
+            cfg.codex_socket = Some(dir.join("unavailable.sock"));
+            cfg.codex_bin = dir.join("missing-codex");
+            cfg.claude_bin = dir.join("missing-claude");
+            cfg.network.bootstrap_urls = vec![peer.into()];
+            cfg.network.advertise_urls = vec![own.into()];
+            cfg.save(dir)?;
+            config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&network.node)?,
+            )?;
+            drop(network.at(&dir.join("node.sqlite3"))?);
+            let value = Arc::new(Runtime::open(dir).await?);
+            *value.store.lock().await = store;
+            Ok(value)
+        }
+        let project = TestNetwork::new()?;
+        let executor = TestNetwork::new()?;
+        let creator = TestNetwork::new()?;
+        assert_ne!(creator.account, project.account);
+        assert_ne!(creator.account, executor.account);
+        let mut store = project.at(&project.directory.join("foreign-approval.sqlite3"))?;
+        project.conversation(&mut store, "conversation")?;
+        creator.install(&mut store)?;
+        let task = Fixture::foreign_account_task(&project, &creator, &mut store)?.0;
+        let target = PublicKey::parse(&executor.node.public_key_hex()?)?;
+        let context = PrepareContext {
+            context: InvocationContext {
+                conversation: Some("conversation".into()),
+                task: Some(EventRef::parse(&task.hash)?),
+                execution_session: Some(SessionRef {
+                    target: DeviceId::from_key(&target),
+                    session_id: "remote-session".into(),
+                }),
+                executor_kind: Some("codex".into()),
+                workspace_resource: Some(project.resource.clone()),
+                sdk_session: None,
+            },
+            binding_generation: Some(1),
+            canonical_cwd: Some(executor.project.to_string_lossy().into_owned()),
+            execution_target_public_key: Some(target),
+        };
+        let mut pins = project.pins.clone();
+        pins.extend(creator.pins.clone());
+        pins.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let approved_source = ExecutionSourcePolicy {
+            project: ResourceRef {
+                space: project.space.clone(),
+                resource: project.resource.clone(),
+            },
+            node_public_key: PublicKey::parse(&project.node.public_key_hex()?)?,
+            pins,
+        };
+        let mut fixture = unseeded_fixture_with_source(
+            project,
+            executor,
+            store,
+            context,
+            false,
+            Some(approved_source),
+        )?;
+        let remote = import_current_policy(&mut fixture)?;
+        let wire = admit_unseeded_dispatch(&mut fixture, &remote)?;
+        let business = TaskBusinessWire::Submit(wire.clone());
+        let (mut source, authorization) = task_business_checked("source factory", || {
+            fixture
+                .store
+                .prepare_execution_dispatch_task_business_source(
+                    &fixture.project.node,
+                    &wire,
+                    now_ms() as u64,
+                )
+        })?
+        .context("unseeded dispatch bypassed its Task source factory")?;
+        let before_c = primary_counts(&fixture.target)?;
+        assert!(
+            fixture
+                .target
+                .authorization_state()
+                .account(&fixture.project.account)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .target
+                .authorization_state()
+                .account(&creator.account)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .authorization_state()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        let execution = fixture.intent.payload.selection.execution_resource.clone();
+        fixture.target.local_set(
+            fixture.executor.space.as_str(),
+            &format!("resource-root:{}", execution.resource),
+            &json!(fixture.executor.project),
+        )?;
+        let b_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let c_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let b_url = format!("ws://{}/api/network/ws", b_listener.local_addr()?);
+        let c_url = format!("ws://{}/api/network/ws", c_listener.local_addr()?);
+        let b = runtime(&fixture.project, fixture.store, &c_url, &b_url).await?;
+        let c = runtime(&fixture.executor, fixture.target, &b_url, &c_url).await?;
+        fn start_server(
+            tasks: &mut JoinSet<()>,
+            node: Arc<Runtime>,
+            listener: TcpListener,
+            own: String,
+            peer: String,
+        ) {
+            let (hub, mut incoming) = NetworkHub::new(
+                node.identity.clone(),
+                NetworkConfig {
+                    advertise_urls: vec![own],
+                    bootstrap_urls: vec![peer],
+                    ..Default::default()
+                },
+            );
+            let router = Router::new()
+                .route("/api/network/ws", get(upgrade))
+                .with_state(hub);
+            tasks.spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            tasks.spawn(async move {
+                let mut clients = JoinSet::new();
+                while let Some(incoming) = incoming.recv().await {
+                    assert_eq!(incoming.service, Service::Client);
+                    let node = node.clone();
+                    clients.spawn(async move {
+                        let _ = serve(node, incoming.socket).await;
+                    });
+                }
+            });
+        }
+        let mut tasks = JoinSet::new();
+        start_server(
+            &mut tasks,
+            c.clone(),
+            c_listener,
+            c_url.clone(),
+            b_url.clone(),
+        );
+        let mut client =
+            TaskBusinessClient::connect(&b.network, &b.identity, source.export()).await?;
+        client
+            .exchange(&TaskBusinessRequest::SourceBegin {
+                header: source.header().clone(),
+            })
+            .await?;
+        let mut pages = 0;
+        loop {
+            let chunk = {
+                let mut store = b.store.lock().await;
+                task_business_checked("source page", || {
+                    store.next_task_business_source(&b.identity, &mut source, now_ms() as u64)
+                })?
+            };
+            if let Some(page) = chunk.page {
+                pages += 1;
+                client
+                    .exchange(&TaskBusinessRequest::SourcePage { page })
+                    .await?;
+            }
+            if let Some(witness) = chunk.witness {
+                client
+                    .exchange(&TaskBusinessRequest::SourceFinish { witness })
+                    .await?;
+                break;
+            }
+            ensure!(pages < 128, "Task source did not finish");
+        }
+        assert!(pages > 0);
+        for method in [
+            "authenticate",
+            "rpc",
+            TASK_RECEIPT_READ_METHOD,
+            NODE_POLICY_READ_METHOD,
+        ] {
+            let error = client
+                .client
+                .call(method, json!({}))
+                .await
+                .err()
+                .context("Task business upgraded its session")?;
+            assert!(
+                error.to_string().contains("cannot change purpose"),
+                "{error}"
+            );
+        }
+        let response = client
+            .exchange(&TaskBusinessRequest::Status {
+                wire: business.clone(),
+            })
+            .await?;
+        assert!(
+            matches!(response, TaskBusinessResponse::Status(value) if value == json!({"state":"not_found"}))
+        );
+        assert_eq!(
+            c.store.lock().await.connection.query_row(
+                "SELECT count(*) FROM execution_handoffs",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        let admitted =
+            task_business_rpc(&mut client, &b, &source, &authorization, &business, true).await?;
+        assert_eq!(admitted.handoff, wire);
+        assert_eq!(
+            admitted.receipt.payload.state,
+            ExecutionHandoffState::Accepted
+        );
+        let start_guard = c.hold_handoff_resolution_for_test().await;
+        start_server(&mut tasks, b.clone(), b_listener, b_url, c_url);
+        while Arc::strong_count(&c.maintenance) == 1 {
+            tokio::task::yield_now().await;
+        }
+        let (acceptance, mut recovery) = {
+            let store = c.store.lock().await;
+            let (_, acceptance) = store.execution_handoff_original_acceptance(
+                execution.space.as_str(),
+                fixture.project.space.as_str(),
+                &wire.invocation.payload.operation_id,
+            )?;
+            let recovery = task_business_checked("accepted original begin", || {
+                store.begin_task_business_original_recovery(
+                    &c.identity,
+                    &business,
+                    &acceptance,
+                    now_ms() as u64,
+                )
+            })?;
+            (acceptance, recovery)
+        };
+        let original = loop {
+            let recovered = {
+                let store = c.store.lock().await;
+                task_business_checked("accepted original page", || {
+                    store.advance_task_business_original_recovery(&mut recovery)
+                })?
+            };
+            if let Some(original) = recovered {
+                break original;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(original.acceptance(), &acceptance);
+        let start = task_business_operation_current(&b, &c, &original, CheckStage::Start).await?;
+        start.proof_usage().enforce_limits()?;
+        let (running, fresh, first_deadline) = {
+            let mut store = c.store.lock().await;
+            task_business_checked("Start consume", || {
+                store.claim_execution_handoff_operation_current(
+                    &c.identity,
+                    &start,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        assert!(fresh);
+        assert_eq!(running.state, OperationState::Running);
+        let renewed = task_business_operation_current(&b, &c, &original, CheckStage::Renew).await?;
+        let deadline = {
+            let mut store = c.store.lock().await;
+            task_business_checked("Renew consume", || {
+                store.renew_execution_handoff_operation_current(
+                    &c.identity,
+                    &renewed,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        assert!(deadline >= first_deadline);
+        if revoke {
+            fixture.project.revoke_client(&mut b.store.lock().await)?;
+            assert!(
+                task_business_operation_current(&b, &c, &original, CheckStage::Renew)
+                    .await
+                    .is_err()
+            );
+            let mut store = c.store.lock().await;
+            let domain = PolicyDomain::Space(fixture.executor.space.clone());
+            let mut document = store
+                .authorization_state()
+                .space(&fixture.executor.space)
+                .context("C space missing")?
+                .clone();
+            document.previous = store.authorization_state().head(&domain).cloned();
+            document.sequence += 1;
+            document
+                .grants
+                .retain(|grant| grant != &wire.invocation.payload.grant_leaf);
+            task_business_checked("C current grant revocation", || {
+                store.install_policy_journal(
+                    &[JournalEntry::Space(Signed::sign(
+                        document,
+                        &fixture.executor.root,
+                    )?)],
+                    now() + 1,
+                )
+            })?;
+            assert!(
+                store
+                    .begin_task_business_operation_check(
+                        &c.identity,
+                        &original,
+                        &business,
+                        &acceptance,
+                        CheckStage::Renew,
+                        now_ms() as u64
+                    )
+                    .is_err()
+            );
+        }
+        let completed = {
+            let mut store = c.store.lock().await;
+            task_business_checked("Result consume", || {
+                store.finish_execution_handoff_operation_current(
+                    &c.identity,
+                    &renewed,
+                    OperationState::Succeeded,
+                    json!({"protocol_fixture":true}),
+                    running.execution_session.as_ref(),
+                    now_ms() as u64,
+                )
+            })?
+        };
+        assert_eq!(
+            completed.state,
+            if revoke {
+                OperationState::Unknown
+            } else {
+                OperationState::Succeeded
+            }
+        );
+        if !revoke {
+            let result = ExecutionHandoffResult {
+                handoff: wire.clone(),
+                receipt: completed
+                    .receipt
+                    .clone()
+                    .context("completed C result has no receipt")?,
+                result: completed.result.clone(),
+            };
+            let mut store = b.store.lock().await;
+            let applied = task_business_checked("B result acceptance", || {
+                store.apply_execution_handoff_receipt(&b.identity, &result, now_ms() as u64)
+            })?;
+            assert_eq!(applied.state, OperationState::Succeeded);
+        }
+        let c_store = c.store.lock().await;
+        if !revoke {
+            assert_eq!(primary_counts(&c_store)?, before_c);
+        }
+        assert_eq!(
+            c_store
+                .connection
+                .query_row("SELECT count(*) FROM events", [], |row| row
+                    .get::<_, u64>(0))?,
+            0
+        );
+        assert!(
+            c_store
+                .authorization_state()
+                .account(&fixture.project.account)
+                .is_none()
+        );
+        assert!(
+            c_store
+                .authorization_state()
+                .account(&creator.account)
+                .is_none()
+        );
+        assert_eq!(
+            c_store.connection.query_row(
+                "SELECT count(*) FROM node_certificates WHERE node_id=?",
+                [fixture.project.node.node_id()?],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        assert!(
+            c_store
+                .authorize_transport_node(&fixture.project.node.node_id()?, now_ms() as u64)
+                .is_err()
+        );
+        let reservations: u64 = c_store.connection.query_row(
+            "SELECT count(*) FROM execution_handoff_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations > 0, revoke);
+        drop(c_store);
+        drop(start_guard);
+        if !revoke {
+            let status =
+                task_business_rpc(&mut client, &b, &source, &authorization, &business, false)
+                    .await?;
+            assert_eq!(status.handoff, wire);
+            assert_eq!(
+                status.receipt.payload.state,
+                ExecutionHandoffState::Succeeded
+            );
+        }
+        drop(client);
+        while Arc::strong_count(&c.maintenance) > 1 {
+            tokio::task::yield_now().await;
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_business_noise_uses_scoped_source_and_real_operation_receipts() -> Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            Box::pin(task_business_noise_lifecycle(false)),
+        )
+        .await
+        .context("Task business lifecycle timed out")?
+    }
+
+    #[tokio::test]
+    async fn task_business_noise_rejects_revoked_current_and_preserves_unknown_locks() -> Result<()>
+    {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            Box::pin(task_business_noise_lifecycle(true)),
+        )
+        .await
+        .context("Task business revocation timed out")?
+    }
+
     #[test]
     fn node_policy_reader_sessions_cannot_upgrade_to_other_methods() -> Result<()> {
         let mut purpose = SessionPurpose::Client;

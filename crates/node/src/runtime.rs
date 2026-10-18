@@ -164,6 +164,12 @@ pub(crate) mod tests {
     use crate::identity::test_support::TestNetwork;
     use vibeface_secure::authorization::{ResourceId, SessionRef};
 
+    impl Runtime {
+        pub(crate) async fn hold_handoff_resolution_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+            self.handoff_resolution_lock.lock().await
+        }
+    }
+
     fn fixture() -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
