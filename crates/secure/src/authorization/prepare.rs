@@ -319,7 +319,7 @@ impl VerifiedPolicySet {
             now_ms,
             &mut current.budget,
         )?;
-        self.verify_authorized_invocation_body(
+        let mut auth = self.verify_authorized_invocation_body(
             signed,
             hash,
             current.budget,
@@ -327,7 +327,11 @@ impl VerifiedPolicySet {
             transport,
             now_ms,
             phase,
-        )
+        )?;
+        auth.destination = Some(AdmittedDestination {
+            resource: destination.resource.clone(), public_key: destination.public_key.clone(), grant_leaf: destination.grant_leaf.clone(),
+        });
+        Ok(auth)
     }
 
     fn retain_execution_transport_dependencies(
@@ -2855,7 +2859,7 @@ mod tests {
             body_hash: gateway_invocation.payload.body_hash.clone(),
             context: gateway_invocation.payload.context.clone(),
         };
-        f.state
+        let gateway_authorized = f.state
             .verify_gateway_invocation_with_execution_destination(
                 &gateway_invocation,
                 &body,
@@ -2865,6 +2869,38 @@ mod tests {
                 NOW,
             )
             .unwrap();
+        let challenge = FreshnessChallenge::new(&gateway_authorized, CheckStage::Admit, Nonce::from_bytes([92;32]), NOW, NOW+1_000).unwrap();
+        let authority = Identity::from_secret_hex(&hex::encode([3;32])).unwrap();
+        let receipts: Vec<_> = gateway_authorized.dependencies().iter().map(|head| Signed::sign(FreshnessReceipt {
+            version:AUTH_VERSION,current:head.clone(),challenge_hash:challenge.hash().unwrap(),issued_at_ms:NOW,expires_at_ms:NOW+1_000,
+        }, &authority).unwrap()).collect();
+        let proof = events::AdmissionProof {
+            invocation:gateway_invocation.clone(),source_body:body.clone(),challenge,receipts,admitted_at_ms:NOW,
+            transport:events::StoredTransport::DirectedGateway{header:invocation_proof.header().clone()},
+        };
+        let original = f.state.verify_original_admission(&proof,&gateway_facts).unwrap();
+        f.state.verify_admitted_operation_authorization(&original,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).unwrap();
+        let existing_transport = TransportEvidence::DirectNoise { device: final_invocation.payload.device.clone() };
+        let existing_auth = f.state.verify_invocation_with_execution_destination(&final_invocation,&gateway_facts,&existing_transport,destination,NOW).unwrap();
+        let existing_challenge=FreshnessChallenge::new(&existing_auth,CheckStage::Admit,Nonce::from_bytes([93;32]),NOW,NOW+1_000).unwrap();
+        let existing_receipts:Vec<_>=existing_auth.dependencies().iter().map(|head| Signed::sign(FreshnessReceipt {
+            version:AUTH_VERSION,current:head.clone(),challenge_hash:existing_challenge.hash().unwrap(),issued_at_ms:NOW,expires_at_ms:NOW+1_000,
+        },&authority).unwrap()).collect();
+        let existing_proof=events::AdmissionProof { invocation:final_invocation.clone(),source_body:body.clone(),challenge:existing_challenge,
+            receipts:existing_receipts,admitted_at_ms:NOW,transport:events::StoredTransport::from(&existing_transport) };
+        let existing_admission=f.state.verify_original_admission(&existing_proof,&gateway_facts).unwrap();
+        f.state.verify_admitted_operation_authorization(&existing_admission,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).unwrap();
+        let mut revoked_destination=f.state.clone();
+        let mut document=revoked_destination.space(&space).unwrap().clone();
+        document.previous=revoked_destination.head(&PolicyDomain::Space(space.clone())).cloned();
+        document.sequence+=1;
+        document.grants.retain(|hash| hash != &leaf);
+        revoked_destination.install_space(Signed::sign(document,&f.root).unwrap()).unwrap();
+        let original=revoked_destination.verify_original_admission(&proof,&gateway_facts).unwrap();
+        assert!(revoked_destination.verify_admitted_operation_authorization(&original,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).is_err());
+        let existing_admission=revoked_destination.verify_original_admission(&existing_proof,&gateway_facts).unwrap();
+        assert!(revoked_destination.verify_admitted_operation_authorization(&existing_admission,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).is_err());
+
         let mut missing_executor = f.state.clone();
         missing_executor
             .devices

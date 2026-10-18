@@ -10,7 +10,7 @@ pub mod client_policy_import;
 pub mod gateway_forward;
 pub mod gateway_client;
 pub mod gateway_original;
-use gateway_original::{AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
+use gateway_original::{AdmittedDestination, AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
 pub mod directory;
 pub mod enrollment;
 pub mod enrollment_policy_import;
@@ -900,6 +900,7 @@ pub struct VerifiedAdmission {
     origin: AdmissionOrigin,
     usage: execution_handoff::ExecutionProofUsage,
     admission_expires_at_ms: u64,
+    destination: Option<AdmittedDestination>,
 }
 impl VerifiedAdmission {
     pub fn signed_invocation(&self) -> &Signed<Invocation> {
@@ -919,6 +920,7 @@ pub struct VerifiedAuthorization {
     phase: AuthorizationPhase,
     verified_at_ms: u64,
     origin: RequestOrigin,
+    destination: Option<AdmittedDestination>,
 }
 impl VerifiedAuthorization {
     pub fn signed_invocation(&self) -> &Signed<Invocation> {
@@ -2455,6 +2457,7 @@ impl VerifiedPolicySet {
             invocation: auth.invocation.clone(), admitted_at_ms: now_ms, origin,
             usage: gateway_original::admission_usage(auth, freshness)?,
             admission_expires_at_ms: auth.expires_at_ms().min(freshness.expires_at_ms),
+            destination: auth.destination.clone(),
         })
     }
     pub fn verify_operation_authorization(
@@ -2811,6 +2814,7 @@ impl VerifiedPolicySet {
             budget,
             phase,
             verified_at_ms: now_ms,
+            destination: None,
             origin: match transport {
                 InvocationTransport::Existing(transport) => RequestOrigin::Existing(transport.clone()),
                 InvocationTransport::DirectedGateway { proof, original } => RequestOrigin::Gateway(OriginalGatewayTransport { header: proof.header().clone(), original: original.clone() }),

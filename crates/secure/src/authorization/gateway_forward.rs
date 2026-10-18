@@ -453,7 +453,13 @@ impl GatewayOriginal {
         }
     }
     pub fn hash(&self) -> Result<ObjectHash> {
-        ObjectHash::body(self)
+        let signed_hash = match self {
+            Self::Prepare { intent, .. } => intent.hash()?,
+            Self::Invoke { invocation, .. } | Self::Status { invocation, .. } => {
+                invocation.hash()?
+            }
+        };
+        original_commitment(self.purpose(), &signed_hash, &self.request().body_hash)
     }
     fn verify(&self, usage: &mut ExecutionProofUsage, now: u64) -> Result<()> {
         require(
@@ -514,6 +520,43 @@ impl GatewayOriginal {
         }
         Ok(())
     }
+}
+
+fn original_commitment(
+    purpose: GatewayForwardPurpose,
+    signed_hash: &ObjectHash,
+    body_hash: &ObjectHash,
+) -> Result<ObjectHash> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        version: u16,
+        purpose: GatewayForwardPurpose,
+        signed_hash: &'a ObjectHash,
+        body_hash: &'a ObjectHash,
+    }
+    Ok(ObjectHash(format!(
+        "h2_{}",
+        digest(
+            "gateway-original-commitment-v3",
+            &canonical(&Commitment {
+                version: 3,
+                purpose,
+                signed_hash,
+                body_hash,
+            })?
+        )
+    )))
+}
+
+pub fn gateway_invocation_original_hash(
+    purpose: GatewayForwardPurpose,
+    invocation: &Signed<Invocation>,
+) -> Result<ObjectHash> {
+    require(
+        purpose != GatewayForwardPurpose::Prepare,
+        "an Invocation cannot be a Prepare original",
+    )?;
+    original_commitment(purpose, &invocation.hash()?, &invocation.payload.body_hash)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2151,5 +2194,213 @@ mod tests {
                 .unwrap_err(),
             AuthorizationError::BudgetExceeded
         );
+    }
+
+    #[test]
+    fn accepted_gateway_survives_header_expiry_but_rechecks_current_revocation() {
+        use super::super::events::{AdmissionProof, StoredTransport};
+        let b = account_fixture(30);
+        let gateway = key(40);
+        let (original, facts) = current_business_request(&b, &gateway);
+        let GatewayOriginal::Invoke { body, invocation } = &original else {
+            unreachable!()
+        };
+        let signed_header = header(&original, &gateway, &b.node);
+        let transport = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &signed_header,
+            &original,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        let auth = b
+            .state
+            .verify_gateway_invocation(invocation, body, &facts, &transport, NOW)
+            .unwrap();
+        let challenge = FreshnessChallenge::new(
+            &auth,
+            CheckStage::Admit,
+            Nonce::from_bytes([41; 32]),
+            NOW,
+            NOW + 1_000,
+        )
+        .unwrap();
+        let receipts: Vec<_> = auth
+            .dependencies()
+            .iter()
+            .map(|head| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 1_000,
+                    },
+                    &b.node,
+                )
+                .unwrap()
+            })
+            .collect();
+        let fresh = b
+            .state
+            .verify_freshness(&auth, &challenge, &receipts, NOW)
+            .unwrap();
+        let live = b.state.admit_operation(&auth, &fresh, NOW).unwrap();
+        let proof = AdmissionProof {
+            invocation: invocation.clone(),
+            source_body: body.clone(),
+            challenge,
+            receipts,
+            admitted_at_ms: NOW,
+            transport: StoredTransport::DirectedGateway {
+                header: signed_header.clone(),
+            },
+        };
+        let restored = b.state.verify_original_admission(&proof, &facts).unwrap();
+        assert_eq!(restored.signed_invocation(), live.signed_invocation());
+        assert_eq!(restored.admission_expires_at_ms(), NOW + 1_000);
+        assert!(restored.proof_usage().counts().unique_signatures > 2);
+        let later = NOW + 65_000;
+        assert!(
+            verify_directed_gateway(
+                &PublicKey::of(&gateway),
+                &signed_header,
+                &original,
+                &PublicKey::of(&b.node),
+                later
+            )
+            .is_err()
+        );
+        let current = b
+            .state
+            .verify_admitted_operation_authorization(&restored, &facts, later)
+            .unwrap();
+        let start = FreshnessChallenge::new(
+            &current,
+            CheckStage::Start,
+            Nonce::from_bytes([42; 32]),
+            later,
+            later + 1_000,
+        )
+        .unwrap();
+        let receipts: Vec<_> = current
+            .dependencies()
+            .iter()
+            .map(|head| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: start.hash().unwrap(),
+                        issued_at_ms: later,
+                        expires_at_ms: later + 1_000,
+                    },
+                    &b.node,
+                )
+                .unwrap()
+            })
+            .collect();
+        let fresh = b
+            .state
+            .verify_freshness(&current, &start, &receipts, later)
+            .unwrap();
+        assert!(b.state.admit_operation(&current, &fresh, later).is_err());
+        assert!(proof.transport.existing_evidence().is_err());
+        assert!(
+            b.state
+                .verify_operation_authorization(
+                    &restored,
+                    &facts,
+                    &TransportEvidence::GatewayNoise {
+                        device: invocation.payload.device.clone(),
+                        gateway: invocation.payload.presenter.clone(),
+                    },
+                    later
+                )
+                .is_err()
+        );
+        let mut revoked = b.state.clone();
+        let account = AccountId::from_root(&PublicKey::of(&b.root));
+        let mut document = revoked.account(&account).unwrap().clone();
+        document.previous = revoked
+            .head(&PolicyDomain::Account(account.clone()))
+            .cloned();
+        document.sequence += 1;
+        document
+            .revoked_devices
+            .push(invocation.payload.device.clone());
+        document.revoked_devices.sort();
+        revoked
+            .install_account(Signed::sign(document, &b.root).unwrap())
+            .unwrap();
+        let historical = revoked.verify_original_admission(&proof, &facts).unwrap();
+        assert!(
+            revoked
+                .verify_admitted_operation_authorization(&historical, &facts, later)
+                .is_err()
+        );
+        let mut changed = proof.clone();
+        changed.source_body["text"] = json!("replaced after acceptance");
+        assert!(b.state.verify_original_admission(&changed, &facts).is_err());
+        let mut changed = proof;
+        if let StoredTransport::DirectedGateway { header } = &mut changed.transport {
+            header.payload.original_hash = ObjectHash::body(&"different original").unwrap();
+            *header = Signed::sign(header.payload.clone(), &gateway).unwrap();
+        }
+        assert!(b.state.verify_original_admission(&changed, &facts).is_err());
+    }
+
+    #[test]
+    fn original_commitment_binds_purpose_signed_identity_and_body_hash() {
+        let user = key(50);
+        let gateway = key(51);
+        let target = key(52);
+        let original = original(&user, &gateway, &target, false);
+        let GatewayOriginal::Invoke { body, invocation } = &original else {
+            unreachable!()
+        };
+        let hash = original.hash().unwrap();
+        assert_eq!(
+            hash,
+            gateway_invocation_original_hash(GatewayForwardPurpose::Invoke, invocation).unwrap()
+        );
+        assert_ne!(
+            hash,
+            gateway_invocation_original_hash(GatewayForwardPurpose::Status, invocation).unwrap()
+        );
+        assert!(
+            gateway_invocation_original_hash(GatewayForwardPurpose::Prepare, invocation).is_err()
+        );
+        let mut changed = invocation.payload.clone();
+        changed.body_hash = ObjectHash::body(&"different body").unwrap();
+        let changed = Signed::sign(changed, &user).unwrap();
+        assert_ne!(
+            hash,
+            gateway_invocation_original_hash(GatewayForwardPurpose::Invoke, &changed).unwrap()
+        );
+        let other = Signed::sign(invocation.payload.clone(), &key(53)).unwrap();
+        assert_ne!(
+            hash,
+            gateway_invocation_original_hash(GatewayForwardPurpose::Invoke, &other).unwrap()
+        );
+        let changed = GatewayOriginal::Invoke {
+            body: json!({"text":"unsigned replacement"}),
+            invocation: invocation.clone(),
+        };
+        assert_eq!(hash, changed.hash().unwrap());
+        let header = header(&original, &gateway, &target);
+        assert!(
+            verify_directed_gateway(
+                &PublicKey::of(&gateway),
+                &header,
+                &changed,
+                &PublicKey::of(&target),
+                NOW
+            )
+            .is_err()
+        );
+        let _ = body;
     }
 }

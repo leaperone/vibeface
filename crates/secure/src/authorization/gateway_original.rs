@@ -9,6 +9,13 @@ use super::{
 use crate::signature_verification::{ScopedSignatureVerification, SignatureVerification};
 
 #[derive(Clone, Debug)]
+pub(super) struct AdmittedDestination {
+    pub(super) resource: ResourceRef,
+    pub(super) public_key: PublicKey,
+    pub(super) grant_leaf: ObjectHash,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct OriginalGatewayTransport {
     pub(super) header: Signed<GatewayForwardHeader>,
     pub(super) original: GatewayOriginal,
@@ -53,6 +60,7 @@ impl VerifiedAdmission {
             origin: AdmissionOrigin::Existing(transport),
             usage,
             admission_expires_at_ms,
+            destination: None,
         })
     }
 }
@@ -122,13 +130,36 @@ impl VerifiedPolicySet {
             "operation clock moved backwards",
         )?;
         match &admission.origin {
-            AdmissionOrigin::Existing(transport) => self.verify_invocation_inner(
-                &admission.invocation,
-                facts,
-                transport,
-                now_ms,
-                AuthorizationPhase::Operation,
-            ),
+            AdmissionOrigin::Existing(transport) => {
+                if let Some(retained) = &admission.destination {
+                    let destination = self.verify_execution_destination(
+                        &facts.resource,
+                        &facts.audience,
+                        &retained.resource,
+                        &retained.public_key,
+                        &retained.grant_leaf,
+                        &facts.context,
+                        facts.action,
+                        now_ms,
+                    )?;
+                    self.verify_invocation_with_execution_transport(
+                        &admission.invocation,
+                        facts,
+                        InvocationTransport::Existing(transport),
+                        &destination,
+                        now_ms,
+                        AuthorizationPhase::Operation,
+                    )
+                } else {
+                    self.verify_invocation_inner(
+                        &admission.invocation,
+                        facts,
+                        transport,
+                        now_ms,
+                        AuthorizationPhase::Operation,
+                    )
+                }
+            }
             AdmissionOrigin::Gateway(original) => self.verify_original_request_for_body(
                 &admission.invocation,
                 original.original.body(),
