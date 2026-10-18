@@ -3198,6 +3198,82 @@ fn validate_session_ownership_from(
             );
         }
     }
+    let events = load_events_from(connection, network)?;
+    for (hash, stored) in &events {
+        if stored.status != "ready" {
+            continue;
+        }
+        let EventBody::ExecutionObserved {
+            operation_id,
+            task_id,
+            target_node,
+            session_id,
+            status,
+            ..
+        } = &stored.event.body
+        else {
+            continue;
+        };
+        if stored.event.author != target
+            || target_node != target
+            || session_id.as_deref() != Some(session)
+            || !matches!(
+                status.as_str(),
+                "running"
+                    | "unknown"
+                    | "succeeded"
+                    | "failed"
+                    | "rejected"
+                    | "needs_input"
+                    | "progress"
+                    | "completed"
+                    | "interrupted"
+            )
+        {
+            continue;
+        }
+        let acknowledged = closure_hashes(&events, std::slice::from_ref(hash))
+            .iter()
+            .any(|ancestor| {
+                let Some(dispatch) = events.get(ancestor) else {
+                    return false;
+                };
+                let EventBody::DispatchRecorded {
+                    operation_id: original_id,
+                    task_id: original_task,
+                    target_node: original_target,
+                    session_id: original_session,
+                    action,
+                } = &dispatch.event.body
+                else {
+                    return false;
+                };
+                if dispatch.status != "ready"
+                    || dispatch.event.scope_id != stored.event.scope_id
+                    || original_id != operation_id
+                    || original_task != task_id
+                    || original_target != target_node
+                    || original_session != session_id
+                {
+                    return false;
+                }
+                let Ok(request) = serde_json::from_value::<OperationRequest>(action.clone()) else {
+                    return false;
+                };
+                request.network_id == network
+                    && request.conversation_id == stored.event.scope_id
+                    && request.operation_id == *operation_id
+                    && request.task_id == *task_id
+                    && request.target_node == target
+                    && request.session_id.as_deref() == Some(session)
+            });
+        if acknowledged {
+            ensure!(
+                stored.event.scope_id == conversation,
+                "execution session acknowledged by its executor belongs to another conversation"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -5842,6 +5918,204 @@ mod tests {
                 .unwrap()
                 .revision,
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_executor_acknowledgement_prevents_gateway_binding_pollution() -> Result<()> {
+        let gateway = LocalIdentity::generate();
+        let executor = LocalIdentity::generate();
+        let network = gateway.fixture_network_id()?;
+        let target = executor.node_id()?;
+        let mut entry = memory(&gateway, Some(&executor))?;
+        let mut execution = memory(&gateway, Some(&executor))?;
+        let creation = conversation(&mut entry, &gateway)?;
+        execution.ingest_event(&network, &creation)?;
+        let mut original = OperationRequest {
+            operation_id: "remote-open".into(),
+            network_id: network.clone(),
+            conversation_id: "conversation".into(),
+            task_id: None,
+            target_node: target.clone(),
+            session_id: Some("remote-native".into()),
+            expected_revision: 0,
+            basis_heads: entry.heads(&network, "conversation")?,
+            action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
+            resources: vec![],
+            binding: None,
+            manager_authority: None,
+        };
+        for (operation_id, revision, action) in [
+            (
+                "remote-open",
+                0,
+                json!({"type":"open","executor":"codex","cwd":"/tmp"}),
+            ),
+            ("remote-send", 1, json!({"type":"send","text":"Bot A work"})),
+        ] {
+            original.operation_id = operation_id.into();
+            original.expected_revision = revision;
+            original.action = action;
+            original.basis_heads = entry.heads(&network, "conversation")?;
+            let dispatch = entry.append_event(
+                &gateway,
+                &network,
+                "conversation",
+                EventBody::DispatchRecorded {
+                    operation_id: original.operation_id.clone(),
+                    task_id: None,
+                    target_node: target.clone(),
+                    session_id: original.session_id.clone(),
+                    action: json!(original),
+                },
+                vec![],
+                3,
+            )?;
+            execution.ingest_event(&network, &dispatch)?;
+            execution.accept_operation(&network, &original)?;
+            if revision == 0 {
+                execution.upsert_session(
+                    &network,
+                    &ExecutionSession {
+                        network_id: network.clone(),
+                        target_node: target.clone(),
+                        session_id: "remote-native".into(),
+                        revision: 0,
+                        state: "idle".into(),
+                        executor: "codex".into(),
+                        cwd: "/tmp".into(),
+                        native_session_id: Some("actual-native".into()),
+                    },
+                )?;
+            }
+            execution.claim_operation(&network, operation_id)?;
+            execution.finish_operation(
+                &network,
+                operation_id,
+                OperationState::Succeeded,
+                json!({"done":true}),
+            )?;
+            let acknowledgement = execution.append_event(
+                &executor,
+                &network,
+                "conversation",
+                EventBody::ExecutionObserved {
+                    operation_id: operation_id.into(),
+                    task_id: None,
+                    target_node: target.clone(),
+                    session_id: original.session_id.clone(),
+                    status: "succeeded".into(),
+                    detail: json!({"done":true}),
+                },
+                vec![],
+                4,
+            )?;
+            entry.ingest_event(&network, &acknowledgement)?;
+        }
+        assert!(entry.operations(&network)?.is_empty());
+        assert!(entry.sessions(&network)?.is_empty());
+        entry.append_event(
+            &gateway,
+            &network,
+            "other-chat",
+            EventBody::ConversationCreated {
+                title: "Bot B".into(),
+            },
+            vec![],
+            5,
+        )?;
+        let task = entry.append_event(
+            &gateway,
+            &network,
+            "other-chat",
+            EventBody::TaskCreated {
+                task_id: "task-b".into(),
+                title: "B".into(),
+                goal: "B".into(),
+                acceptance: "Check".into(),
+            },
+            vec![],
+            6,
+        )?;
+        let binding = crate::binding::TaskBinding {
+            network_id: network.clone(),
+            conversation_id: "other-chat".into(),
+            task_ref: task.hash.clone(),
+            task_id: "task-b".into(),
+            authority_node: gateway.node_id()?,
+            generation: 1,
+            target_node: target.clone(),
+            session_id: "remote-native".into(),
+            open_spec: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        assert!(
+            entry
+                .bind_task(&gateway, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("another conversation")
+        );
+        let proof = crate::binding::sign_binding(&gateway, &binding)?;
+        assert!(
+            entry
+                .install_binding(&proof)
+                .unwrap_err()
+                .to_string()
+                .contains("another conversation")
+        );
+        assert!(entry.task_binding(&network, &task.hash)?.is_none());
+        let mut rejected = original.clone();
+        rejected.operation_id = "rejected-b".into();
+        rejected.conversation_id = "other-chat".into();
+        rejected.task_id = Some("task-b".into());
+        rejected.binding = Some(proof.clone());
+        rejected.expected_revision = 2;
+        rejected.basis_heads = entry.heads(&network, "other-chat")?;
+        entry.append_event(
+            &gateway,
+            &network,
+            "other-chat",
+            EventBody::DispatchRecorded {
+                operation_id: rejected.operation_id.clone(),
+                task_id: rejected.task_id.clone(),
+                target_node: target.clone(),
+                session_id: rejected.session_id.clone(),
+                action: json!(rejected),
+            },
+            vec![],
+            7,
+        )?;
+        for envelope in entry.export_snapshot(&network, "other-chat")?.events {
+            execution.ingest_event(&network, &envelope)?;
+        }
+        assert!(execution.install_binding(&proof).is_err());
+        assert!(execution.accept_operation(&network, &rejected).is_err());
+        original.operation_id = "continue-a".into();
+        original.expected_revision = 2;
+        original.basis_heads = entry.heads(&network, "conversation")?;
+        original.action = json!({"type":"send","text":"continue Bot A"});
+        entry.validate_operation_binding(&original)?;
+        let continuation = entry.append_event(
+            &gateway,
+            &network,
+            "conversation",
+            EventBody::DispatchRecorded {
+                operation_id: original.operation_id.clone(),
+                task_id: None,
+                target_node: target,
+                session_id: original.session_id.clone(),
+                action: json!(original),
+            },
+            vec![],
+            8,
+        )?;
+        execution.ingest_event(&network, &continuation)?;
+        assert_eq!(
+            execution.accept_operation(&network, &original)?.state,
+            OperationState::Accepted
         );
         Ok(())
     }
