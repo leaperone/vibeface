@@ -816,7 +816,9 @@ pub(crate) mod tests {
                     &self.request.payload.saved_pins,
                     now(),
                 )?;
-            let mut body = self.network.body(method, "archive");
+            let original: crate::model::Event =
+                serde_json::from_str(&self.original_event.canonical_body)?;
+            let mut body = self.network.body(method, &original.scope_id);
             if method == "message" {
                 body["text"] = json!("denied write");
                 body["message_id"] = json!(uuid::Uuid::new_v4().to_string());
