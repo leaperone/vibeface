@@ -230,6 +230,11 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
+      - name: Verify bot tools and startup event recovery
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
       - name: Verify packaged SDK lockfile without model calls
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: ${{ steps.unpack.outputs.package }}/sidecars
