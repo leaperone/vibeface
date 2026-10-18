@@ -648,6 +648,18 @@ mod tests {
         NodeExecutionPolicyReadRequest,
         Identity,
     ) {
+        fixture_with_message("run this")
+    }
+
+    fn fixture_with_message(
+        text: &str,
+    ) -> (
+        VerifiedPolicySet,
+        SdkPolicySourceProvenance,
+        VerifiedAuthorization,
+        NodeExecutionPolicyReadRequest,
+        Identity,
+    ) {
         let root = key(1);
         let recovery = key(2);
         let user = key(3);
@@ -729,7 +741,7 @@ mod tests {
         let device = DeviceId::from_key(&PublicKey::of(&user));
         let source_body = json!({"method":"message","space_id":resource.space,
             "resource_id":resource.resource,"conversation_id":"chat","authorization_id":"parent",
-            "text":"run this"});
+            "text":text});
         let invocation = Signed::sign(
             Invocation {
                 version: AUTH_VERSION,
@@ -1002,6 +1014,51 @@ mod tests {
             .is_err()
         );
         assert!(restore_sdk_source_provenance(&state, &record, &request, NOW + 200).is_err());
+    }
+
+    #[test]
+    fn large_original_message_preserves_its_body_without_using_authorization_budget() {
+        let text = "x".repeat(MAX_PROOF_BYTES + 1);
+        let (state, record, parent, _, _) = fixture_with_message(&text);
+        assert_eq!(
+            record.origin.source_body["text"].as_str(),
+            Some(text.as_str())
+        );
+        assert!(text.len() > MAX_PROOF_BYTES);
+        assert_eq!(
+            ObjectHash::body(&record.origin.source_body).unwrap(),
+            record.origin.invocation.payload.body_hash,
+        );
+        let facts = record.child_facts.request_facts();
+        let verified = verify_sdk_source_provenance(
+            &state,
+            &parent,
+            &record,
+            &record.session.service,
+            &record.service_grant,
+            &facts,
+            None,
+            NOW + 20,
+        )
+        .unwrap();
+        let counts = verified.proof_usage().counts();
+        assert!(counts.authorization_bytes <= MAX_PROOF_BYTES);
+        assert!(counts.authorization_bytes < text.len());
+        let mut changed = record.clone();
+        changed.origin.source_body["text"] = json!("changed large original message");
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &changed,
+                &record.session.service,
+                &record.service_grant,
+                &facts,
+                None,
+                NOW + 20,
+            )
+            .is_err()
+        );
     }
 
     #[test]
