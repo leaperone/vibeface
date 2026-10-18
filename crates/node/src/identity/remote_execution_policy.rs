@@ -62,6 +62,8 @@ struct DelegationRecord {
 }
 
 fn finish_response(input: &Value, output: Value, mut usage: ExecutionProofUsage) -> Result<Value> {
+    #[cfg(test)]
+    let before_wire_metadata = usage.counts();
     ensure!(
         serde_json::to_vec(input)?.len() + serde_json::to_vec(&output)?.len() <= MAX_PROOF_BYTES,
         "remote execution policy input and output exceed 64 KiB"
@@ -77,7 +79,17 @@ fn finish_response(input: &Value, output: Value, mut usage: ExecutionProofUsage)
         );
         usage.record_actual_signature_counts(counts);
     }
-    usage.enforce_limits()?;
+    let checked = usage.enforce_limits();
+    #[cfg(test)]
+    if checked.is_err() {
+        eprintln!(
+            "remote_policy_budget before_wire={before_wire_metadata:?} total={:?} input_bytes={} output_bytes={}",
+            usage.counts(),
+            serde_json::to_vec(input)?.len(),
+            serde_json::to_vec(&output)?.len(),
+        );
+    }
+    checked?;
     Ok(output)
 }
 
