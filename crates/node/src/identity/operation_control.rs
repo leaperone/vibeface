@@ -9,7 +9,7 @@ use crate::{
         AdmissionProof, EventBody, ExecutionSession, OperationRecord, OperationRequest,
         OperationState, StoredTransport,
     },
-    store::{Store, canonical_resource, load_events_from},
+    store::{Store, canonical_resource},
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -370,15 +370,30 @@ impl Store {
         let pending: Vec<(String,String)> = tx.prepare("SELECT o.operation_id,o.state FROM operations o JOIN local_values v ON v.space_id=o.space_id AND v.key='completion:' || o.operation_id WHERE o.space_id=? AND o.target_node=? AND o.session_id=?")?
             .query_map(params![binding.binding.network_id,binding.binding.target_node,binding.binding.session_id],|row| Ok((row.get(0)?,row.get(1)?)))?.collect::<std::result::Result<_,_>>()?;
         if !pending.is_empty() {
-            let events = load_events_from(&tx, &binding.binding.network_id)?;
+            let events = super::event_authorization::retained_scope_events_in(
+                &tx,
+                &binding.binding.network_id,
+                &auth.resource().resource,
+                &binding.binding.conversation_id,
+            )?;
             for (id, state) in pending {
                 let state: OperationState = serde_json::from_str(&state)?;
                 let status = serde_json::to_value(&state)?;
-                ensure!(events.values().any(|stored| stored.status == "ready" && stored.event.author == binding.binding.target_node
+                let completions = events.values().filter(|stored| stored.status == "ready" && stored.event.author == binding.binding.target_node
                     && stored.event.scope_id == binding.binding.conversation_id
                     && matches!(&stored.event.body, EventBody::ExecutionObserved {operation_id,target_node,session_id,status:actual,..}
-                        if operation_id == &id && target_node == &binding.binding.target_node && session_id == &binding.binding.session_id && Some(actual.as_str()) == status.as_str())),
+                        if operation_id == &id && target_node == &binding.binding.target_node && session_id == &binding.binding.session_id && Some(actual.as_str()) == status.as_str())).collect::<Vec<_>>();
+                ensure!(completions.len() == 1,
                     "execution completion is not durable");
+                let completion = completions[0];
+                ensure!(
+                    super::event_authorization::verify_event_envelope(
+                        &self.policy,
+                        &binding.binding.network_id,
+                        &completion.envelope,
+                    )? == completion.event,
+                    "execution completion signature differs from its retained event"
+                );
             }
         }
         let session: Option<(u64,String)> = tx.query_row("SELECT revision,record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",
