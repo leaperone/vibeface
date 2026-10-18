@@ -616,6 +616,86 @@ impl Store {
         Ok(response)
     }
 
+    pub(super) fn cross_node_recovery_install_status(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+    ) -> Result<Value> {
+        let committed: StreamedCrossNodeRecoveryCommitted = serde_json::from_value(params.clone())?;
+        let original = &committed.request.possession.request;
+        require_principal(original, principal)?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        ensure!(
+            original.payload.target_claim.payload.node_public_key == local,
+            "target recovery status belongs to another local Node"
+        );
+        let completion_hash = ObjectHash::body(&committed)?;
+        let tx = self.connection.transaction()?;
+        let cache = UntrustedTargetRecoveryCache::new(
+            original,
+            &committed.request.possession.context.snapshot_id,
+        )?;
+        cache.check_committed(&tx, &committed)?;
+        if let Some(saved) = cache.load_committed(&tx)? {
+            ensure!(
+                saved == committed,
+                "target recovery status conflicts with its saved source completion"
+            );
+        }
+        let approved = cache
+            .load_approval(&tx)?
+            .context("original target approval is missing")?;
+        let header = cache
+            .load_header(&tx)?
+            .context("target recovery header is missing")?;
+        require_approval_binding_in(&tx, principal, &header.snapshot, &approved)?;
+        let accepted = committed.receipt.payload.accepted_at_ms;
+        ensure!(
+            approved.approval.payload.approved_at_ms <= accepted
+                && accepted <= approved.approval.payload.expires_at_ms
+                && accepted <= original.payload.expires_at_ms
+                && accepted <= header.snapshot.payload.expires_at_ms
+                && accepted <= now,
+            "target recovery status changed its original source approval window"
+        );
+        let response = if let Some(previous) = metadata(&tx, "cross_node_recovery_installation")? {
+            let previous: Value = serde_json::from_str(&previous)?;
+            ensure!(
+                previous["completion_hash"] == completion_hash.as_str()
+                    && previous["principal"] == principal,
+                "target Node already installed another recovery completion"
+            );
+            let installed = &previous["response"];
+            ensure!(
+                installed["installed"] == true
+                    && installed["account_id"] == original.payload.account.as_str()
+                    && installed["node_public_key"] == local.as_str()
+                    && installed["pins"] == json!(committed.request.pins),
+                "target recovery status changed its saved installation result"
+            );
+            json!({"state":"installed","installed":installed})
+        } else {
+            check_claim_in(&tx, &original.payload.target_claim, &local)?;
+            let certificate = &committed.request.possession.node_request.node_certificate;
+            ensure!(
+                certificate.not_before_ms <= now && now < certificate.expires_at_ms,
+                "uninstalled target recovery certificate is expired"
+            );
+            json!({"state":"not_installed"})
+        };
+        let response = bounded(response)?;
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        usage.record_request(&header.request)?;
+        usage.record_snapshot(&header.snapshot)?;
+        usage.record_cross_committed_carrier(&committed)?;
+        usage.record_cross_approval(&approved.approval)?;
+        record_cached_completion_binding(&cache, &tx, &mut usage)?;
+        usage.finish()?;
+        Ok(response)
+    }
+
     pub(super) fn cross_node_recovery_install(
         &mut self,
         identity: &LocalIdentity,

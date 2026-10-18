@@ -435,7 +435,7 @@ impl UntrustedTargetRecoveryCache {
         Ok(())
     }
 
-    fn check_committed(
+    pub(crate) fn check_committed(
         &self,
         connection: &Connection,
         committed: &StreamedCrossNodeRecoveryCommitted,

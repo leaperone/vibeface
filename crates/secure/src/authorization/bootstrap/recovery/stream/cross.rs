@@ -1525,6 +1525,34 @@ mod tests {
         assert!(canonical(&input).unwrap().len() <= MAX_PROOF_BYTES);
         let committed = fixture.accept(&input, &source_approval);
         assert!(canonical(&committed).unwrap().len() <= MAX_PROOF_BYTES);
+        assert!(
+            cross_node::finish_cross_node_recovery_commit(
+                &pending,
+                &encode(&committed).unwrap(),
+                NOW as f64,
+            )
+            .is_err()
+        );
+        for mutation in 0..5 {
+            let mut payload = committed.receipt.payload.clone();
+            match mutation {
+                0 => payload.input_hash = ObjectHash::body(&"another input").unwrap(),
+                1 => payload.expected_space_head.sequence += 1,
+                2 => payload.committed_account_head.sequence += 1,
+                3 => payload.target_node_public_key = PublicKey::of(&key(99)),
+                _ => {}
+            }
+            let receipt =
+                Signed::sign(payload, &if mutation == 4 { key(99) } else { key(4) }).unwrap();
+            assert!(
+                cross_node::finish_cross_node_recovery_commit(
+                    &pending,
+                    &encode(&receipt).unwrap(),
+                    NOW as f64,
+                )
+                .is_err()
+            );
+        }
         let context = fixture.import(approval.payload.approved_at_ms);
         let token = checked("target_install", || {
             verify_cross_node_recovery_stream_installation(
@@ -1708,7 +1736,7 @@ mod tests {
         let result = checked("client_receipt", || {
             cross_node::finish_cross_node_recovery_commit(
                 &restored,
-                &encode(&committed).unwrap(),
+                &encode(&committed.receipt).unwrap(),
                 (EXPIRY + 1) as f64,
             )
         });
@@ -1873,7 +1901,7 @@ mod tests {
         assert!(
             cross_node::finish_cross_node_recovery_commit(
                 &pending,
-                &encode(&committed).unwrap(),
+                &encode(&committed.receipt).unwrap(),
                 (NOW - 1) as f64,
             )
             .is_err()
@@ -1881,7 +1909,7 @@ mod tests {
         let completed = checked("client_receipt", || {
             cross_node::finish_cross_node_recovery_commit(
                 &pending,
-                &encode(&committed).unwrap(),
+                &encode(&committed.receipt).unwrap(),
                 NOW as f64,
             )
         });

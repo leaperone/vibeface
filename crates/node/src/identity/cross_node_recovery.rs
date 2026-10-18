@@ -187,6 +187,9 @@ impl Store {
             "cross_node_recovery_install" => {
                 self.cross_node_recovery_install(identity, principal, params, now)
             }
+            "cross_node_recovery_install_status" => {
+                self.cross_node_recovery_install_status(identity, principal, params, now)
+            }
             _ => bail!("unknown cross-Node recovery method"),
         }
     }
@@ -314,7 +317,7 @@ impl Store {
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
         let tx = self.connection.transaction()?;
         if let Some(committed) = completed_in(&tx, &local, principal, &request)? {
-            let response = bounded(json!({"state":"committed","committed":committed}))?;
+            let response = bounded(json!({"state":"committed","receipt":committed.receipt}))?;
             let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
             usage.record_cross_committed_carrier(&committed)?;
             usage.finish()?;
@@ -352,7 +355,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(committed) = completed_in(&tx, &local, principal, &status)? {
-            let response = bounded(json!({"committed":committed}))?;
+            let response = bounded(json!({"receipt":committed.receipt}))?;
             let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
             usage.record_cross_committed_carrier(&committed)?;
             usage.finish()?;
@@ -416,7 +419,7 @@ impl Store {
         );
         let committed_heads = verified.committed_heads().to_vec();
         let committed = stream::accept_cross_node_recovery_stream_commit(&verified, &signer, now)?;
-        let response = bounded(json!({"committed":committed}))?;
+        let response = bounded(json!({"receipt":committed.receipt}))?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         context.record_current_usage(self.policy.verified(), &mut usage)?;
         verified.record_proof_usage_into(&mut usage);
@@ -931,13 +934,17 @@ pub(crate) mod tests {
         }
 
         fn source_commit(&mut self, request: &Value, at: u64) -> Result<Value> {
-            self.source.cross_node_recovery_command(
+            let response = self.source.cross_node_recovery_command(
                 &self.network.node,
                 &self.next_client.public_key_hex(),
                 "cross_node_recovery_commit",
                 request,
                 at,
-            )
+            )?;
+            let total_bytes = carrier_bytes(request, &response)?;
+            assert!(total_bytes <= vibeface_secure::authorization::MAX_PROOF_BYTES);
+            eprintln!("cross_recovery_commit total_bytes={total_bytes}");
+            Ok(response)
         }
 
         fn install(&mut self, committed: &Value, at: u64) -> Result<Value> {
@@ -948,6 +955,20 @@ pub(crate) mod tests {
                 committed,
                 at,
             )
+        }
+
+        fn install_status(&mut self, committed: &Value, at: u64) -> Result<Value> {
+            let response = self.target.cross_node_recovery_command(
+                &self.target_node,
+                &self.next_client.public_key_hex(),
+                "cross_node_recovery_install_status",
+                committed,
+                at,
+            )?;
+            let total_bytes = carrier_bytes(committed, &response)?;
+            assert!(total_bytes <= vibeface_secure::authorization::MAX_PROOF_BYTES);
+            eprintln!("cross_recovery_install_status total_bytes={total_bytes}");
+            Ok(response)
         }
 
         fn read_invocation(
@@ -1040,9 +1061,10 @@ pub(crate) mod tests {
         historical_event: crate::model::SignedEvent,
     ) -> Result<(TestNetwork, Store, Store)> {
         let mut fixture = Fixture::from_source(network, source, historical_event)?;
-        let (_, request) = fixture.commit_request()?;
+        let (prepared, request) = fixture.commit_request()?;
         let response = fixture.source_commit(&request, now())?;
-        fixture.install(&response["committed"], now())?;
+        let committed = installation(&prepared, &response, now())?;
+        fixture.install(&committed, now())?;
         let (read, facts, transport) = fixture.read_invocation("conversation")?;
         fixture
             .source
@@ -1056,6 +1078,22 @@ pub(crate) mod tests {
             "source read grant authorized a fresh message"
         );
         Ok((fixture.network, fixture.source, fixture.target))
+    }
+
+    fn installation(
+        prepared: &cross_node::PreparedCrossNodeRecoveryCommit,
+        response: &Value,
+        at: u64,
+    ) -> Result<Value> {
+        let verified = cross_node::finish_cross_node_recovery_commit(
+            prepared,
+            &serde_json::to_string(&response["receipt"])?,
+            at as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok(serde_json::from_str(
+            &verified.installation_json().map_err(anyhow::Error::msg)?,
+        )?)
     }
 
     fn journal_count(store: &Store) -> Result<u64> {
@@ -1229,12 +1267,19 @@ pub(crate) mod tests {
         let response = f.source_commit(&request, now())?;
         let confirmed = cross_node::finish_cross_node_recovery_commit(
             &prepared,
-            &serde_json::to_string(&response["committed"])?,
+            &serde_json::to_string(&response["receipt"])?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
         let installation: Value =
             serde_json::from_str(&confirmed.installation_json().map_err(anyhow::Error::msg)?)?;
+        let repeated_bytes = carrier_bytes(&request, &json!({"committed":installation}))?;
+        assert!(RecoveryProofUsage::new(repeated_bytes).is_err());
+        eprintln!("cross_recovery_repeated_request total_bytes={repeated_bytes}");
+        assert_eq!(
+            f.install_status(&installation, now())?["state"],
+            "not_installed"
+        );
         let committed_entries = journal_count(&f.source)?;
         f.target = Store::open(f.network.directory.join("target.sqlite3"))?;
         f.resume_target(&installation, now() + 200_000)?;
@@ -1246,6 +1291,11 @@ pub(crate) mod tests {
             f.target_node.public_key_hex()?
         );
         assert_eq!(journal_count(&f.target)?, committed_entries);
+        let changes = f.target.connection.total_changes();
+        let installed_status = f.install_status(&installation, now() + 200_000)?;
+        assert_eq!(installed_status["state"], "installed");
+        assert_eq!(installed_status["installed"], installed);
+        assert_eq!(f.target.connection.total_changes(), changes);
         assert_eq!(f.install(&installation, now() + 200_000)?, installed);
         let completed = f.source.cross_node_recovery_command(
             &f.network.node,
@@ -1255,7 +1305,10 @@ pub(crate) mod tests {
             now() + 200_000,
         )?;
         assert_eq!(completed["state"], "committed");
-        assert_eq!(completed["committed"], response["committed"]);
+        assert_eq!(completed["receipt"], response["receipt"]);
+        assert!(
+            carrier_bytes(&status, &completed)? <= vibeface_secure::authorization::MAX_PROOF_BYTES
+        );
         assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
         assert_eq!(journal_count(&f.source)?, committed_entries);
         let (read, facts, transport) = f.read_invocation("conversation")?;
@@ -1289,11 +1342,82 @@ pub(crate) mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
-        let (_, request) = f.commit_prepared(prepared)?;
+        let (prepared, request) = f.commit_prepared(prepared)?;
         let response = f.source_commit(&request, now())?;
-        assert_eq!(f.install(&response["committed"], now())?["installed"], true);
+        let committed = installation(&prepared, &response, now())?;
+        assert_eq!(f.install(&committed, now())?["installed"], true);
         assert_eq!(journal_count(&f.target)?, journal_count(&f.source)?);
         assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
+        Ok(())
+    }
+
+    #[test]
+    fn installation_status_reads_the_original_result_without_consuming_or_retrying_install()
+    -> Result<()> {
+        let mut f = Fixture::new()?;
+        let (prepared, request) = f.commit_request()?;
+        let response = f.source_commit(&request, now())?;
+        let committed = installation(&prepared, &response, now())?;
+        let before = f.target.connection.total_changes();
+        assert_eq!(
+            f.install_status(&committed, now())?,
+            json!({"state":"not_installed"})
+        );
+        assert_eq!(f.target.connection.total_changes(), before);
+        assert_eq!(journal_count(&f.target)?, 0);
+        f.target
+            .verify_bootstrap_capability(&f.capability.capability)?;
+        let mut wrong = committed.clone();
+        wrong["receipt"]["payload"]["input_hash"] = json!(ObjectHash::body(&"other input")?);
+        assert!(f.install_status(&wrong, now()).is_err());
+        assert!(
+            f.target
+                .cross_node_recovery_command(
+                    &f.target_node,
+                    &f.network.client.public_key_hex(),
+                    "cross_node_recovery_install_status",
+                    &committed,
+                    now(),
+                )
+                .is_err()
+        );
+        assert_eq!(f.target.connection.total_changes(), before);
+        let installed = f.install(&committed, now())?;
+        f.target = Store::open(f.network.directory.join("target.sqlite3"))?;
+        let before = f.target.connection.total_changes();
+        let status = f.install_status(&committed, now() + 20_000_000)?;
+        assert_eq!(status, json!({"state":"installed","installed":installed}));
+        assert_eq!(f.target.connection.total_changes(), before);
+        assert_eq!(journal_count(&f.target)?, journal_count(&f.source)?);
+        assert!(
+            f.target
+                .verify_bootstrap_capability(&f.capability.capability)
+                .is_err()
+        );
+        let mut conflicting: StreamedCrossNodeRecoveryCommitted =
+            serde_json::from_value(committed.clone())?;
+        conflicting.request.grant_leaf = ObjectHash::body(&"other grant")?;
+        let mut payload = conflicting.receipt.payload.clone();
+        payload.input_hash = ObjectHash::body(&conflicting.request)?;
+        payload.grant_leaf = conflicting.request.grant_leaf.clone();
+        let signer = Identity::from_secret_hex(&f.network.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        conflicting.receipt = Signed::sign(payload, &signer)?;
+        assert!(
+            f.install_status(&json!(conflicting), now() + 20_000_000)
+                .is_err()
+        );
+        let saved = metadata(&f.target.connection, "cross_node_recovery_installation")?
+            .context("installation receipt missing")?;
+        let mut changed: Value = serde_json::from_str(&saved)?;
+        changed["principal"] = json!(f.network.client.public_key_hex());
+        f.target.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key='cross_node_recovery_installation'",
+            [serde_json::to_string(&changed)?],
+        )?;
+        let before = f.target.connection.total_changes();
+        assert!(f.install_status(&committed, now() + 20_000_000).is_err());
+        assert_eq!(f.target.connection.total_changes(), before);
         Ok(())
     }
 
@@ -1308,7 +1432,7 @@ pub(crate) mod tests {
         );
         let result = cross_node::finish_cross_node_recovery_commit(
             &prepared,
-            &serde_json::to_string(&response["committed"])?,
+            &serde_json::to_string(&response["receipt"])?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -1633,7 +1757,7 @@ pub(crate) mod tests {
     fn committed_recovery_rebuilds_from_durable_pages_after_target_restart_and_expiry() -> Result<()>
     {
         let mut f = Fixture::new()?;
-        let (_, request) = f.commit_request()?;
+        let (prepared, request) = f.commit_request()?;
         let reference = f.reference.clone().context("reference missing")?;
         let status = json!({"context":reference,"input_hash":ObjectHash::body(&request)?});
         let pending = f.source.cross_node_recovery_command(
@@ -1645,7 +1769,8 @@ pub(crate) mod tests {
         )?;
         assert_eq!(pending["state"], "not_committed");
         let response = f.source_commit(&request, now())?;
-        let committed = &response["committed"];
+        let confirmed = installation(&prepared, &response, now())?;
+        let committed = &confirmed;
         let source_count = journal_count(&f.source)?;
         f.target = Store::open(f.network.directory.join("target.sqlite3"))?;
         assert!(f.install(committed, now() + 200_000).is_err());
@@ -1708,7 +1833,7 @@ pub(crate) mod tests {
             now() + 200_000,
         )?;
         assert_eq!(completed["state"], "committed");
-        assert_eq!(completed["committed"], *committed);
+        assert_eq!(completed["receipt"], committed["receipt"]);
         assert_eq!(journal_count(&f.source)?, source_count);
         assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
         Ok(())
@@ -1717,7 +1842,7 @@ pub(crate) mod tests {
     #[test]
     fn receipt_and_install_failures_roll_back_and_reconcile_after_request_expiry() -> Result<()> {
         let mut f = Fixture::new()?;
-        let (_, request) = f.commit_request()?;
+        let (prepared, request) = f.commit_request()?;
         let before = journal_count(&f.source)?;
         f.source.connection.execute_batch("CREATE TEMP TRIGGER fail_cross_commit BEFORE INSERT ON identity_meta WHEN NEW.key GLOB 'cross-node-recovery-completed:*' BEGIN SELECT RAISE(ABORT,'expected source receipt failure'); END;")?;
         assert!(f.source_commit(&request, now()).is_err());
@@ -1741,7 +1866,8 @@ pub(crate) mod tests {
             ObjectHash::body(&f.source_commit(&request, now() + 200_000)?)?,
             ObjectHash::body(&response)?
         );
-        let committed = &response["committed"];
+        let confirmed = installation(&prepared, &response, now())?;
+        let committed = &confirmed;
         let mut forged = committed.clone();
         forged["receipt"]["payload"]["input_hash"] = json!(ObjectHash::body(&"forged transition")?);
         assert!(f.install(&forged, now()).is_err());

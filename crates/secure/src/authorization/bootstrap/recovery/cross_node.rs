@@ -1305,25 +1305,28 @@ impl Drop for VerifiedCrossNodeRecoveryResult {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = finishCrossNodeRecoveryCommit))]
 pub fn finish_cross_node_recovery_commit(
     prepared: &PreparedCrossNodeRecoveryCommit,
-    committed_json: &str,
+    receipt_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedCrossNodeRecoveryResult> {
     let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let finish = || -> Result<VerifiedCrossNodeRecoveryResult> {
         require(
-            committed_json.len() <= MAX_PROOF_BYTES,
+            receipt_json.len() <= MAX_PROOF_BYTES,
             "cross-node recovery receipt too large",
         )?;
-        let committed: stream::StreamedCrossNodeRecoveryCommitted =
-            serde_json::from_str(committed_json).map_err(|_| {
+        let receipt: Signed<stream::StreamedCrossNodeRecoveryCommitReceipt> =
+            serde_json::from_str(receipt_json).map_err(|_| {
                 AuthorizationError::InvalidProof("invalid streamed cross-node receipt")
             })?;
-        require(
-            committed.request == prepared.request,
-            "cross-node receipt belongs to another original operation",
-        )?;
+        let committed = stream::StreamedCrossNodeRecoveryCommitted {
+            request: prepared.request.clone(),
+            receipt,
+        };
+        let mut usage = stream::RecoveryProofUsage::new(canonical(&committed)?.len())?;
+        usage.record_cross_committed_carrier(&committed)?;
         let now = timestamp(now_ms)?;
         stream::cross::verify_receipt_binding(&committed, now)?;
+        usage.finish()?;
         Ok(VerifiedCrossNodeRecoveryResult {
             committed,
             created: prepared.created.clone(),
