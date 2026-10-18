@@ -16,7 +16,7 @@ use tokio::{
     sync::{RwLock, mpsc, oneshot},
     time::{Instant, timeout},
 };
-use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
+use tokio_tungstenite::{client_async, tungstenite::Message};
 use vibeface_protocol::{Command, RpcId, now_ms};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -477,7 +477,8 @@ async fn connection_loop(
         };
         let reason = match result {
             Ok(stream) => {
-                let reason = run_session(stream, &mut commands, &cache, &events).await;
+                let (sink, reader) = stream.split();
+                let reason = run_transport(sink, reader, &mut commands, &cache, &events).await;
                 if cache.read().await.connection["state"] == "connected" {
                     backoff = 1;
                 }
@@ -500,16 +501,6 @@ async fn connection_loop(
         }
         backoff = (backoff * 2).min(30);
     }
-}
-
-async fn run_session(
-    stream: WebSocketStream<UnixStream>,
-    commands: &mut mpsc::UnboundedReceiver<Execute>,
-    cache: &Arc<RwLock<Cache>>,
-    events: &mpsc::UnboundedSender<Value>,
-) -> String {
-    let (sink, reader) = stream.split();
-    run_transport(sink, reader, commands, cache, events).await
 }
 
 async fn process_session(
@@ -1032,7 +1023,8 @@ mod tests {
                 cache: cache.clone(),
             };
             let task = tokio::spawn(async move {
-                run_session(websocket, &mut receiver, &cache, &events).await
+                let (sink, reader) = websocket.split();
+                run_transport(sink, reader, &mut receiver, &cache, &events).await
             });
             let mut server = server.unwrap();
             let initialize: Value =
@@ -1210,7 +1202,8 @@ printf '%s\n' '{"id":"vibeface-2","result":{"thread":{"id":"t","status":{"type":
             let cache = Arc::new(RwLock::new(Cache::default()));
             let client = CodexClient { commands, cache: cache.clone() };
             let session = tokio::spawn(async move {
-                run_session(websocket, &mut receiver, &cache, &events).await
+                let (sink, reader) = websocket.split();
+                run_transport(sink, reader, &mut receiver, &cache, &events).await
             });
             let mut server = server.unwrap();
             let initialize: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
