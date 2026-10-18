@@ -81,7 +81,7 @@ struct ConfirmedClientPolicyReference {
     confirmation_hash: ObjectHash,
 }
 
-fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
+pub(super) fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
     let length: Option<usize> = connection
         .query_row(
             "SELECT length(CAST(value AS BLOB)) FROM identity_meta WHERE key=?",
@@ -102,7 +102,7 @@ fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
-fn encode<T: Serialize>(value: &T) -> Result<String> {
+pub(super) fn encode<T: Serialize>(value: &T) -> Result<String> {
     let encoded = serde_json::to_string(value)?;
     ensure!(
         encoded.len() <= MAX_STORED_BYTES,
@@ -111,7 +111,7 @@ fn encode<T: Serialize>(value: &T) -> Result<String> {
     Ok(encoded)
 }
 
-fn bounded(value: Value) -> Result<Value> {
+pub(super) fn bounded(value: Value) -> Result<Value> {
     ensure!(
         serde_json::to_vec(&value)?.len() <= MAX_PROOF_BYTES,
         "client policy carrier exceeds 64 KiB"
@@ -119,7 +119,7 @@ fn bounded(value: Value) -> Result<Value> {
     Ok(value)
 }
 
-fn finish_response(value: Value, mut usage: ExecutionProofUsage) -> Result<Value> {
+pub(super) fn finish_response(value: Value, mut usage: ExecutionProofUsage) -> Result<Value> {
     if let Some(counts) =
         vibeface_secure::signature_verification::SignatureVerification::current_counts()
     {
@@ -137,7 +137,7 @@ fn signed_usage<T: SignedObject>(value: &Signed<T>) -> Result<ExecutionProofUsag
     Ok(usage)
 }
 
-fn signer(identity: &LocalIdentity) -> Result<Identity> {
+pub(super) fn signer(identity: &LocalIdentity) -> Result<Identity> {
     Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)
 }
 
