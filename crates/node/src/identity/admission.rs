@@ -235,6 +235,35 @@ pub(crate) fn reconstruct_admission(
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
+    validate_admission_evidence(proof, transport)?;
+    let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+    reconstruct_admission_in_state(&historical, proof, facts, transport)
+}
+
+pub(super) fn reconstruct_admission_at_current_heads(
+    state: &VerifiedPolicySet,
+    proof: &AdmissionProof,
+    facts: &RequestFacts,
+    transport: &TransportEvidence,
+) -> Result<Option<VerifiedAdmission>> {
+    validate_admission_evidence(proof, transport)?;
+    if proof
+        .challenge
+        .policies
+        .iter()
+        .any(|head| state.head(&head.domain) != Some(head))
+    {
+        return Ok(None);
+    }
+    Ok(Some(reconstruct_admission_in_state(
+        state, proof, facts, transport,
+    )?))
+}
+
+fn validate_admission_evidence(
+    proof: &AdmissionProof,
+    transport: &TransportEvidence,
+) -> Result<()> {
     ensure!(
         proof.challenge.stage == CheckStage::Admit,
         "stored admission has incorrect freshness stage"
@@ -243,17 +272,25 @@ pub(crate) fn reconstruct_admission(
         proof.transport.clone().into_evidence() == *transport,
         "admission transport differs from captured evidence"
     );
-    let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+    Ok(())
+}
+
+fn reconstruct_admission_in_state(
+    state: &VerifiedPolicySet,
+    proof: &AdmissionProof,
+    facts: &RequestFacts,
+    transport: &TransportEvidence,
+) -> Result<VerifiedAdmission> {
     let auth =
-        historical.verify_invocation(&proof.invocation, facts, transport, proof.admitted_at_ms)?;
+        state.verify_invocation(&proof.invocation, facts, transport, proof.admitted_at_ms)?;
     source_matches(&auth, &proof.source_body)?;
-    let freshness = historical.verify_freshness(
+    let freshness = state.verify_freshness(
         &auth,
         &proof.challenge,
         &proof.receipts,
         proof.admitted_at_ms,
     )?;
-    Ok(historical.admit_operation(&auth, &freshness, proof.admitted_at_ms)?)
+    Ok(state.admit_operation(&auth, &freshness, proof.admitted_at_ms)?)
 }
 
 struct StoredAdmission {

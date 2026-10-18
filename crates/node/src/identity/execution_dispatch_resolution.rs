@@ -1,7 +1,8 @@
 use super::{
     admission::{
         admission_for_operation_from, check_operation_reservations_in,
-        consume_execution_dispatch_in,
+        consume_execution_dispatch_in, reconstruct_admission_at_current_heads,
+        validate_persisted_admission,
     },
     execution_dispatch::{VerifiedDispatchFacts, check_destination_heads_in},
     execution_handoff::resolution_resolver_from,
@@ -470,7 +471,18 @@ impl Store {
             DeviceId::from_key(&local) == account.invocation.payload.audience.device,
             "resolution acknowledgement targets another Project host"
         );
-        let resolver = resolution_resolver_from(&current, current.verified(), wire, now_ms)?;
+        validate_persisted_admission(&tx, account)?;
+        let facts = execution_resolution_account_facts(&wire.resolution)?;
+        let transport = account.transport.clone().into_evidence();
+        let resolver = if let Some(admitted) =
+            reconstruct_admission_at_current_heads(current.verified(), account, &facts, &transport)?
+        {
+            current
+                .verified()
+                .verify_operation_authorization(&admitted, &facts, &transport, now_ms)?
+        } else {
+            resolution_resolver_from(&current, current.verified(), wire, now_ms)?
+        };
         let verified = match result {
             ResolutionResult::Unknown(result) => {
                 let verified = current
