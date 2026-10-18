@@ -11,7 +11,9 @@ use super::{
 use crate::{
     crypto::LocalIdentity,
     model::{AdmissionProof, EventCause, OperationRecord, OperationRequest, OperationState},
-    store::{Store, validate_operation_binding_from},
+    store::{
+        Store, validate_operation_binding_from, validate_released_operation_reservations_from,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -283,6 +285,19 @@ impl Store {
                         == *auth.signed_invocation(),
                 "resolution authorization was already used for another request"
             );
+            if saved.result.is_some() {
+                validate_released_operation_reservations_from(
+                    &tx,
+                    space,
+                    &saved
+                        .wire
+                        .resolution
+                        .observation
+                        .receipt
+                        .payload
+                        .operation_id,
+                )?;
+            }
             tx.commit()?;
             self.policy = current;
             return Ok((saved.wire, false));
@@ -430,6 +445,7 @@ impl Store {
                 previous_wire == *wire,
                 "completed resolution belongs to another Account decision"
             );
+            validate_released_operation_reservations_from(&tx, space, operation)?;
             tx.commit()?;
             self.policy = current;
             return Ok(stored);

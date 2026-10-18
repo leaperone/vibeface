@@ -1596,6 +1596,23 @@ fn authorize_node_from(
     })
 }
 
+pub(crate) fn validate_released_operation_reservations_from(
+    connection: &Connection,
+    space: &str,
+    operation: &str,
+) -> Result<()> {
+    let remaining: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resource_reservations WHERE space_id=? AND operation_id=?)",
+        params![space, operation],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !remaining,
+        "completed operation still has resource reservations"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,

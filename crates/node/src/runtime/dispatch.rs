@@ -28,6 +28,7 @@ fn completed_execution_resolution(
         ExecutionHandoffResolutionResult, ExecutionHandoffTerminalReconciliationResult,
         ExecutionResolutionPurpose,
     };
+    let tx = store.connection.unchecked_transaction()?;
     let operation = store
         .operation(
             wire.resolution
@@ -59,6 +60,12 @@ fn completed_execution_resolution(
         &recorded == wire,
         "completed operation belongs to another resolution authorization"
     );
+    crate::store::validate_released_operation_reservations_from(
+        &tx,
+        &operation.request.network_id,
+        &operation.request.operation_id,
+    )?;
+    tx.commit()?;
     Ok(Some(operation))
 }
 
