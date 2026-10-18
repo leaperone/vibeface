@@ -26,6 +26,7 @@ pub(crate) mod recovery;
 pub(crate) mod remote_share_policy;
 pub(crate) mod remote_execution_policy;
 pub mod services;
+pub(crate) mod task_execution_context;
 pub mod webauthn;
 
 #[cfg(test)]
