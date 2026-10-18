@@ -1965,6 +1965,107 @@ pub(crate) mod tests {
             body["request"] = serde_json::to_value(&request)?;
             Ok((body, request))
         }
+
+        fn confirmed_project_client(&mut self, at: u64) -> Result<VerifiedClientAuthorization> {
+            super::super::client_policy_read::verified_client_policy_for_test(
+                &mut self.store,
+                &self.project.node,
+                &self.project.client,
+                &self.project.account,
+                vibeface_secure::authorization::client_policy_import::AuthorizationSelection {
+                    resource: ResourceRef {
+                        space: self.project.space.clone(),
+                        resource: self.project.resource.clone(),
+                    },
+                    audience: self.audience.clone(),
+                    grant_leaf: self.project.bundle.grant_leaf.clone(),
+                },
+                &self.project.pins,
+                at,
+            )
+        }
+
+        fn imported_execution_policy(
+            &mut self,
+            source: &VerifiedClientAuthorization,
+            selection: &Value,
+            context: &vibeface_secure::authorization::prepare::PrepareContext,
+            action: Action,
+            purpose: vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose,
+            independent_pins: &[PolicyPin],
+            at: u64,
+        ) -> Result<
+            vibeface_secure::authorization::remote_execution_policy::VerifiedRemoteExecutionPolicy,
+        > {
+            use vibeface_secure::authorization::remote_execution_policy::{
+                RemoteExecutionPolicyPage, begin_remote_execution_policy_import,
+                build_remote_execution_policy_read_intent,
+            };
+            let principal = self.project.client.public_key_hex();
+            let target = self.executor.node.public_key_hex()?;
+            let intent = build_remote_execution_policy_read_intent(
+                source,
+                &json!({"selection":selection,"context":context,"expected_action":action,
+                    "purpose":purpose,"execution_pins":independent_pins})
+                .to_string(),
+                &self.project.client,
+                at as f64,
+                (at + 60_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let delegation = self.store.remote_execution_policy_delegate(
+                &self.project.node,
+                &principal,
+                &serde_json::from_str(&intent)?,
+                at,
+            )?;
+            let request = json!({"intent":serde_json::from_str::<Value>(&intent)?,
+                "delegation":delegation["delegation"]});
+            let mut c = self.executor.memory()?;
+            c.install_policy_journal(&self.journal, at)?;
+            let prepared =
+                c.remote_execution_policy_prepare(&self.executor.node, &principal, &request, at)?;
+            assert!(prepared.get("authorization").is_none());
+            let mut importer = begin_remote_execution_policy_import(
+                source,
+                &request.to_string(),
+                &prepared["snapshot"].to_string(),
+                &serde_json::to_string(independent_pins)?,
+                &target,
+                at as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let mut page_count = 0;
+            loop {
+                let params = serde_json::from_str(
+                    &importer.page_request_json().map_err(anyhow::Error::msg)?,
+                )?;
+                let response =
+                    c.remote_execution_policy_page(&self.executor.node, &principal, &params, at)?;
+                assert!(response.get("authorization").is_none());
+                let page: Signed<RemoteExecutionPolicyPage> =
+                    serde_json::from_value(response["page"].clone())?;
+                importer
+                    .append_page(&serde_json::to_string(&page)?, at as f64)
+                    .map_err(anyhow::Error::msg)?;
+                page_count += 1;
+                ensure!(
+                    page_count <= 4096,
+                    "execution policy fixture did not complete"
+                );
+                if page.payload.complete {
+                    break;
+                }
+            }
+            let params =
+                serde_json::from_str(&importer.page_request_json().map_err(anyhow::Error::msg)?)?;
+            let response =
+                c.remote_execution_policy_finish(&self.executor.node, &principal, &params, at)?;
+            assert!(response.get("authorization").is_none());
+            importer
+                .finish(&response["witness"].to_string(), at as f64)
+                .map_err(anyhow::Error::msg)
+        }
     }
 
     #[test]
@@ -1972,41 +2073,81 @@ pub(crate) mod tests {
         use vibeface_secure::authorization::prepare::*;
         let mut f = Fixture::new_same_account_nodes()?;
         assert_eq!(f.project.account, f.executor.account);
-        assert_ne!(f.project.node.public_key_hex()?, f.executor.node.public_key_hex()?);
+        assert_ne!(
+            f.project.node.public_key_hex()?,
+            f.executor.node.public_key_hex()?
+        );
         let binding = f.bind_at(f.executor.project.to_str().unwrap().to_owned())?;
-        let principal = PublicKey::of(&f.project.client);
-        let project = f.store.authenticate_account(principal.as_str(), &json!({
-            "account_id":f.project.account,"space_id":f.project.space,"resource_id":f.project.resource,
-            "device_public_key":principal,"audience":f.audience,
-        }), now()+1)?;
-        let client = verify_client_authorization(&project["authorization"].to_string(),
-            &project["pins"].to_string(), f.project.account.as_str(), f.project.space.as_str(),
-            principal.as_str(), (now()+1) as f64).map_err(anyhow::Error::msg)?;
-        let mut execution = f.executor.bundle.clone();
-        execution.journal.extend(f.journal.clone());
-        execution.grant_leaf = f.grant.clone();
+        let client = f.confirmed_project_client(now() + 1)?;
         let selection = json!({"execution_resource":f.execution,"target_public_key":f.executor.node.public_key_hex()?,"execution_grant":f.grant});
         let context = PrepareContext {
-            context: f.store.policy.verified().grant(&f.grant).unwrap().payload.constraints.context.clone(),
-            binding_generation: Some(1),canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
-            execution_target_public_key:Some(PublicKey::parse(&f.executor.node.public_key_hex()?)?),
+            context: f
+                .store
+                .policy
+                .verified()
+                .grant(&f.grant)
+                .unwrap()
+                .payload
+                .constraints
+                .context
+                .clone(),
+            binding_generation: Some(1),
+            canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
+            execution_target_public_key: Some(PublicKey::parse(
+                &f.executor.node.public_key_hex()?,
+            )?),
         };
         let mut context = context;
         context.context.workspace_resource = Some(f.project.resource.clone());
-        let handle = verify_remote_execution(&client, &project["authorization"].to_string(),
-            &project["pins"].to_string(), &serde_json::to_string(&execution)?,
-            &serde_json::to_string(f.store.trusted_policy_pins())?, &selection.to_string(),
-            &serde_json::to_string(&context)?, "execution_open",(now()+1) as f64)
+        let independent = f.store.trusted_policy_pins().to_vec();
+        let execution = f.imported_execution_policy(&client, &selection, &context,
+            Action::ExecutionOpen,
+            vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+            &independent, now() + 1)?;
+        let handle = verify_remote_execution(&client, &execution, (now() + 1) as f64)
             .map_err(anyhow::Error::msg)?;
-        let (body,request) = f.operation(binding.clone(),"same-account-remote-open")?;
-        let prepared: Value = serde_json::from_str(&handle.prepare(&client, &body.to_string(),
-            &serde_json::to_string(&context)?, "execution_open", "same-account-remote-open",
-            &f.project.node.public_key_hex()?, &f.project.client, (now()+1) as f64).map_err(anyhow::Error::msg)?)?;
-        assert_eq!(prepared["payload"]["request"]["context"]["execution_session"]["target"],serde_json::to_value(DeviceId::from_key(&PublicKey::parse(&f.executor.node.public_key_hex()?)?))?);
-        let (facts, auth, fresh, transport) = f.authorize_at(&body, now()+1)?;
-        f.store.accept_execution_dispatch(&f.project.node,&facts,&auth,&fresh,&transport,&body,&request,now()+1)?;
-        let (wire,_) = f.store.prepare_execution_dispatch_handoff(&f.project.node,f.project.space.as_str(),&request.operation_id,now()+1)?;
-        assert_eq!(wire.handoff.target_public_key.as_str(),f.executor.node.public_key_hex()?);
+        let (body, request) = f.operation(binding.clone(), "same-account-remote-open")?;
+        let prepared: Value = serde_json::from_str(
+            &handle
+                .prepare(
+                    &client,
+                    &body.to_string(),
+                    &serde_json::to_string(&context)?,
+                    "execution_open",
+                    "same-account-remote-open",
+                    &f.project.node.public_key_hex()?,
+                    &f.project.client,
+                    (now() + 1) as f64,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(
+            prepared["payload"]["request"]["context"]["execution_session"]["target"],
+            serde_json::to_value(DeviceId::from_key(&PublicKey::parse(
+                &f.executor.node.public_key_hex()?
+            )?))?
+        );
+        let (facts, auth, fresh, transport) = f.authorize_at(&body, now() + 1)?;
+        f.store.accept_execution_dispatch(
+            &f.project.node,
+            &facts,
+            &auth,
+            &fresh,
+            &transport,
+            &body,
+            &request,
+            now() + 1,
+        )?;
+        let (wire, _) = f.store.prepare_execution_dispatch_handoff(
+            &f.project.node,
+            f.project.space.as_str(),
+            &request.operation_id,
+            now() + 1,
+        )?;
+        assert_eq!(
+            wire.handoff.target_public_key.as_str(),
+            f.executor.node.public_key_hex()?
+        );
         Ok(())
     }
 
@@ -2177,15 +2318,7 @@ pub(crate) mod tests {
                 )?
                 .is_none()
         );
-        let client = verify_client_authorization(
-            &serde_json::to_string(&f.project.bundle)?,
-            &serde_json::to_string(&f.project.pins)?,
-            f.project.account.as_str(),
-            f.project.space.as_str(),
-            PublicKey::of(&f.project.client).as_str(),
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let client = f.confirmed_project_client(now())?;
         let raw = PrepareContext {
             context: dispatch.facts.context.clone(),
             binding_generation: Some(1),
@@ -2198,18 +2331,13 @@ pub(crate) mod tests {
         cb.journal.extend(f.journal.clone());
         cb.grant_leaf = f.grant.clone();
         let selection = json!({"execution_resource":f.execution,"execution_grant":f.grant,"target_public_key":f.executor.node.public_key_hex()?});
-        let handle = verify_remote_execution(
-            &client,
-            &serde_json::to_string(&f.project.bundle)?,
-            &serde_json::to_string(&f.project.pins)?,
-            &serde_json::to_string(&cb)?,
-            &serde_json::to_string(&f.executor.pins)?,
-            &selection.to_string(),
-            &serde_json::to_string(&raw)?,
-            "execution_open",
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let independent = f.executor.pins.clone();
+        let execution = f.imported_execution_policy(&client, &selection, &raw,
+            Action::ExecutionOpen,
+            vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+            &independent, now())?;
+        let handle = verify_remote_execution(&client, &execution, now() as f64)
+            .map_err(anyhow::Error::msg)?;
         let verified_result: Value = serde_json::from_str(
             &handle
                 .result_json(
@@ -2249,18 +2377,12 @@ pub(crate) mod tests {
         resolver_bundle.grant_leaf = resolver_grant.clone();
         let resolver_selection = json!({"execution_resource":f.execution,"execution_grant":resolver_grant,
             "target_public_key":f.executor.node.public_key_hex()?});
-        let resolver = verify_remote_execution(
-            &client,
-            &serde_json::to_string(&f.project.bundle)?,
-            &serde_json::to_string(&f.project.pins)?,
-            &serde_json::to_string(&resolver_bundle)?,
-            &serde_json::to_string(&f.executor.pins)?,
-            &resolver_selection.to_string(),
-            &serde_json::to_string(&raw)?,
-            "operation_resolve",
-            (now() + 3) as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let resolver_policy = f.imported_execution_policy(&client, &resolver_selection, &raw,
+            Action::OperationResolve,
+            vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::Resolver,
+            &independent, now() + 3)?;
+        let resolver = verify_remote_execution(&client, &resolver_policy, (now() + 3) as f64)
+            .map_err(anyhow::Error::msg)?;
         let intent: Value = serde_json::from_str(
             &resolver
                 .resolution_body_json(
@@ -2567,7 +2689,10 @@ pub(crate) mod tests {
             EventRef::parse(&large_task.hash)?
         );
         assert_eq!(compact.task_creation.payload.task_id, "large-share-task");
-        assert_eq!(compact.task_creation.payload.conversation_id, "conversation");
+        assert_eq!(
+            compact.task_creation.payload.conversation_id,
+            "conversation"
+        );
         assert_eq!(compact.requester, f.executor.account);
         assert_ne!(compact.requester, f.project.account);
         assert_eq!(compact.requester_device, invocation.payload.device);
@@ -2599,37 +2724,21 @@ pub(crate) mod tests {
                 &f.executor.node.public_key_hex()?,
             )?),
         };
-        let auth = verify_client_authorization(
-            &serde_json::to_string(&f.project.bundle)?,
-            &serde_json::to_string(&f.project.pins)?,
-            f.project.account.as_str(),
-            f.project.space.as_str(),
-            PublicKey::of(&f.project.client).as_str(),
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let mut c_bundle = f.executor.bundle.clone();
-        c_bundle.journal.extend(f.journal.clone());
-        c_bundle.grant_leaf = f.grant.clone();
+        let auth = f.confirmed_project_client(now())?;
         let selection = json!({"execution_resource":f.execution,"target_public_key":f.executor.node.public_key_hex()?,"execution_grant":f.grant});
-        let verify = |pins: &[PolicyPin]| {
-            verify_remote_execution(
-                &auth,
-                &serde_json::to_string(&f.project.bundle).unwrap(),
-                &serde_json::to_string(&f.project.pins).unwrap(),
-                &serde_json::to_string(&c_bundle).unwrap(),
-                &serde_json::to_string(pins).unwrap(),
-                &selection.to_string(),
-                &serde_json::to_string(&raw).unwrap(),
-                "execution_open",
-                now() as f64,
-            )
+        let independent = f.executor.pins.clone();
+        let mut wrong_pins = independent.clone();
+        wrong_pins[0].genesis_root = PublicKey::of(&f.project.root);
+        let mut verify = |pins: &[PolicyPin]| -> Result<_> {
+            let policy = f.imported_execution_policy(&auth, &selection, &raw,
+                Action::ExecutionOpen,
+                vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+                pins, now())?;
+            verify_remote_execution(&auth, &policy, now() as f64).map_err(anyhow::Error::msg)
         };
         assert!(verify(&[]).is_err());
-        let mut wrong_pins = f.executor.pins.clone();
-        wrong_pins[0].genesis_root = PublicKey::of(&f.project.root);
         assert!(verify(&wrong_pins).is_err());
-        let handle = verify(&f.executor.pins).map_err(anyhow::Error::msg)?;
+        let handle = verify(&independent)?;
         let prepared = handle
             .prepare(
                 &auth,
