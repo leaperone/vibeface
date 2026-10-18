@@ -1819,6 +1819,7 @@ pub(crate) mod tests {
             .iter()
             .map(|domain| store.policy.verified().head(domain).unwrap().clone())
             .collect::<Vec<_>>();
+            heads.extend_from_slice(dispatch.destination().heads());
             heads.sort_by(|left, right| left.domain.cmp(&right.domain));
             heads.dedup();
             let invocation = Signed::sign(
@@ -2028,7 +2029,7 @@ pub(crate) mod tests {
             let transport = TransportEvidence::DirectNoise { device };
             let auth = self
                 .store
-                .authorize_request(&invocation, facts, &transport, at)?;
+                .authorize_request_for_body(&invocation, facts, &transport, body, at)?;
             let challenge = self.store.issue_freshness(&auth, CheckStage::Admit, at)?;
             let mut receipts =
                 self.store

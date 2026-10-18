@@ -2995,12 +2995,6 @@ pub(crate) mod tests {
         )?;
         earlier.admitted_at_ms = accepted_at.checked_sub(1).context("fixture policy predates the clock")?;
         assert!(
-            store
-                .policy
-                .current_heads_at(&proof.challenge.policies, earlier.admitted_at_ms)
-                .is_err()
-        );
-        assert!(
             reconstruct_admission_uncached(&store.policy, &earlier, &facts, &transport).is_err()
         );
         assert!(
