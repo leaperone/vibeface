@@ -250,8 +250,7 @@ impl Runtime {
                     let maximum_timeout = self
                         .config
                         .timeout_secs
-                        .min(crate::command::MAX_TIMEOUT_SECS)
-                        .max(1);
+                        .clamp(1, crate::command::MAX_TIMEOUT_SECS);
                     let timeout = intent["timeout_secs"]
                         .as_u64()
                         .unwrap_or(maximum_timeout)
