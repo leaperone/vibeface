@@ -2,7 +2,13 @@
 
 use crate::{
     crypto::LocalIdentity,
-    identity::node_execution_policy::{NodeReadRequest, NodeReadResponse},
+    identity::{
+        node_execution_policy::{NodeReadRequest, NodeReadResponse},
+        task_business_policy::{
+            TaskBusinessPolicyImportContext, TaskBusinessPolicySession, TaskBusinessRequest,
+            TaskBusinessResponse,
+        },
+    },
     network::{NetworkHub, NetworkSocket, Service},
     runtime::{Access, Runtime},
 };
@@ -20,10 +26,11 @@ use std::{
     time::{Duration, Instant},
 };
 use vibeface_secure::authorization::{
-    Actor, DeviceId, Invocation, MAX_PROOF_BYTES, PublicKey, Signed, TransportEvidence,
+    Actor, DeviceId, Invocation, MAX_PROOF_BYTES, ObjectHash, PublicKey, Signed, TransportEvidence,
     VerifiedClientAuthorization,
     execution_observation::ExecutionObservationRequest,
     node_execution_policy::{ActualPolicyNoisePeer, VerifiedTaskExecutionTrust},
+    task_business_policy::TaskBusinessPolicyExport,
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -32,6 +39,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const NODE_POLICY_READ_METHOD: &str = "node_policy_read";
+const TASK_BUSINESS_METHOD: &str = "task_business";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,28 +60,114 @@ struct Response {
 }
 struct Session {
     public_key: String,
-    node_policy_read_only: bool,
+    noise_peer: ActualPolicyNoisePeer,
+    purpose: SessionPurpose,
     authorization: Option<VerifiedClientAuthorization>,
     subscription: Option<Access>,
     remote_subscription: Option<RemoteSubscription>,
 }
-impl Session {
-    fn select_method(&mut self, method: &str) -> Result<()> {
-        if method == NODE_POLICY_READ_METHOD {
-            ensure!(
-                self.authorization.is_none()
-                    && self.subscription.is_none()
-                    && self.remote_subscription.is_none(),
-                "node policy reads require an independent unauthenticated session"
-            );
-            self.node_policy_read_only = true;
-        } else {
-            ensure!(
-                !self.node_policy_read_only,
+enum SessionPurpose {
+    Client,
+    NodePolicyRead,
+    TaskBusiness(TaskBusinessPhase),
+}
+enum TaskBusinessPhase {
+    AwaitingBegin,
+    Importing(TaskBusinessPolicyImportContext),
+    Ready(TaskBusinessPolicySession),
+}
+impl SessionPurpose {
+    fn select_method(&mut self, method: &str, authenticated: bool) -> Result<()> {
+        match self {
+            Self::Client if matches!(method, NODE_POLICY_READ_METHOD | TASK_BUSINESS_METHOD) => {
+                ensure!(
+                    !authenticated,
+                    "policy transports require an independent unauthenticated session"
+                );
+                *self = if method == NODE_POLICY_READ_METHOD {
+                    Self::NodePolicyRead
+                } else {
+                    Self::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
+                };
+            }
+            Self::NodePolicyRead => ensure!(
+                method == NODE_POLICY_READ_METHOD,
                 "node policy reader sessions cannot change purpose"
-            );
+            ),
+            Self::TaskBusiness(_) => ensure!(
+                method == TASK_BUSINESS_METHOD,
+                "task business sessions cannot change purpose"
+            ),
+            Self::Client => {}
         }
         Ok(())
+    }
+}
+impl Session {
+    fn select_method(&mut self, method: &str) -> Result<()> {
+        self.purpose.select_method(
+            method,
+            self.authorization.is_some()
+                || self.subscription.is_some()
+                || self.remote_subscription.is_some(),
+        )
+    }
+
+    async fn task_business(
+        &mut self,
+        node: &Arc<Runtime>,
+        request: TaskBusinessRequest,
+    ) -> Result<Value> {
+        let SessionPurpose::TaskBusiness(phase) = &mut self.purpose else {
+            bail!("task business session purpose is missing");
+        };
+        let now = crate::runtime::now_ms() as u64;
+        match request {
+            TaskBusinessRequest::SourceBegin { header } => {
+                ensure!(
+                    matches!(phase, TaskBusinessPhase::AwaitingBegin),
+                    "task business source has already begun"
+                );
+                let (context, response) = node.store.lock().await.begin_task_business_import(
+                    &node.identity,
+                    &self.noise_peer,
+                    &header,
+                    now,
+                )?;
+                *phase = TaskBusinessPhase::Importing(context);
+                Ok(response)
+            }
+            TaskBusinessRequest::SourcePage { page } => {
+                let TaskBusinessPhase::Importing(context) = phase else {
+                    bail!("task business page requires an unfinished source import");
+                };
+                node.store
+                    .lock()
+                    .await
+                    .append_task_business_policy(context, &page, now)
+            }
+            TaskBusinessRequest::SourceFinish { witness } => {
+                let TaskBusinessPhase::Importing(context) = phase else {
+                    bail!("task business finish requires an unfinished source import");
+                };
+                let (ready, response) = node
+                    .store
+                    .lock()
+                    .await
+                    .finish_task_business_policy(context, &witness, now)?;
+                *phase = TaskBusinessPhase::Ready(ready);
+                Ok(response)
+            }
+            TaskBusinessRequest::Business(wire) => {
+                let TaskBusinessPhase::Ready(ready) = phase else {
+                    bail!("finish the exact task business source before executing business");
+                };
+                let response = node.task_business(ready, &self.noise_peer, wire).await?;
+                Ok(serde_json::to_value(TaskBusinessResponse::Business(
+                    response,
+                ))?)
+            }
+        }
     }
 }
 struct RemoteSubscription {
@@ -90,6 +184,157 @@ pub struct Client {
 pub(crate) struct NodePolicyReadClient {
     client: Client,
     noise_peer: ActualPolicyNoisePeer,
+}
+
+pub(crate) struct TaskBusinessClient {
+    client: Client,
+    header_hash: ObjectHash,
+    wire_hash: ObjectHash,
+    phase: TaskBusinessClientPhase,
+}
+
+enum TaskBusinessClientPhase {
+    AwaitingBegin,
+    Importing,
+    Ready,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskBusinessReply {
+    id: String,
+    result: Option<TaskBusinessResponse>,
+    error: Option<String>,
+}
+
+impl TaskBusinessClient {
+    pub(crate) async fn connect(
+        network: &NetworkHub,
+        identity: &LocalIdentity,
+        source: &TaskBusinessPolicyExport,
+    ) -> Result<Self> {
+        let target = source.target_public_key();
+        let target_node_id = crate::crypto::fingerprint(target.as_str())?;
+        let socket = network.dial(&target_node_id, Service::Client).await?;
+        let (client, peer) =
+            Client::from_socket_with_policy_peer(socket, identity, &target_node_id).await?;
+        ensure!(
+            peer.public_key() == target,
+            "task business Noise target changed"
+        );
+        Ok(Self {
+            client,
+            header_hash: source.header().hash()?,
+            wire_hash: source.scope().business_wire_hash.clone(),
+            phase: TaskBusinessClientPhase::AwaitingBegin,
+        })
+    }
+
+    pub(crate) async fn exchange(
+        &mut self,
+        request: &TaskBusinessRequest,
+    ) -> Result<TaskBusinessResponse> {
+        match (&self.phase, request) {
+            (
+                TaskBusinessClientPhase::AwaitingBegin,
+                TaskBusinessRequest::SourceBegin { header },
+            ) => {
+                ensure!(
+                    header.hash()? == self.header_hash,
+                    "task business header changed"
+                );
+            }
+            (TaskBusinessClientPhase::Importing, TaskBusinessRequest::SourcePage { page }) => {
+                ensure!(
+                    page.payload.header_hash == self.header_hash,
+                    "task business page changed context"
+                );
+            }
+            (TaskBusinessClientPhase::Importing, TaskBusinessRequest::SourceFinish { witness }) => {
+                ensure!(
+                    witness.payload.header_hash == self.header_hash,
+                    "task business witness changed context"
+                );
+            }
+            (TaskBusinessClientPhase::Ready, TaskBusinessRequest::Business(wire)) => {
+                ensure!(wire.hash()? == self.wire_hash, "task business wire changed");
+            }
+            _ => bail!("task business request is out of order"),
+        }
+        let policy = !matches!(request, TaskBusinessRequest::Business(_));
+        let id = uuid::Uuid::new_v4().to_string();
+        let wire = serde_json::to_vec(&Request {
+            id: id.clone(),
+            method: TASK_BUSINESS_METHOD.to_owned(),
+            params: serde_json::to_value(request)?,
+            invocation: None,
+        })?;
+        if policy {
+            require_node_policy_carrier(wire.len(), 0)?;
+        }
+        let response = tokio::time::timeout(CALL_TIMEOUT, async {
+            for record in secure(self.client.channel.seal_message(&wire))? {
+                send_frame(&mut self.client.socket, record).await?;
+            }
+            let bytes = receive_value(&mut self.client.socket, &mut self.client.channel).await?;
+            if policy {
+                require_node_policy_carrier(wire.len(), bytes.len())?;
+            }
+            serde_json::from_slice::<UniqueJsonKeys>(&bytes)?;
+            let reply: TaskBusinessReply = serde_json::from_slice(&bytes)?;
+            ensure!(
+                reply.id == id,
+                "task business response changed its request ID"
+            );
+            match (reply.result, reply.error) {
+                (Some(response), None) => Ok(response),
+                (None, Some(error)) => bail!("{error}"),
+                _ => bail!("invalid task business response"),
+            }
+        })
+        .await
+        .context("task business response timed out; reconcile before retrying business")??;
+        match (request, &response) {
+            (
+                TaskBusinessRequest::SourceBegin { .. },
+                TaskBusinessResponse::SourceBegun { context_hash },
+            ) => {
+                ensure!(
+                    *context_hash == self.header_hash,
+                    "task business response changed context"
+                );
+                self.phase = TaskBusinessClientPhase::Importing;
+            }
+            (
+                TaskBusinessRequest::SourcePage { page },
+                TaskBusinessResponse::SourcePageAccepted {
+                    context_hash,
+                    next_page_index,
+                    complete,
+                },
+            ) => {
+                ensure!(
+                    *context_hash == self.header_hash
+                        && page.payload.page_index.checked_add(1) == Some(*next_page_index)
+                        && page.payload.complete == *complete,
+                    "task business response changed page progress"
+                );
+            }
+            (
+                TaskBusinessRequest::SourceFinish { .. },
+                TaskBusinessResponse::SourceFinished { context_hash },
+            ) => {
+                ensure!(
+                    *context_hash == self.header_hash,
+                    "task business response changed context"
+                );
+                self.phase = TaskBusinessClientPhase::Ready;
+            }
+            (TaskBusinessRequest::Business(_), TaskBusinessResponse::Business(_)) => {}
+            _ => bail!("task business response changed its request stage"),
+        }
+        Ok(response)
+    }
 }
 
 #[derive(Deserialize)]
@@ -251,7 +496,7 @@ impl Client {
 }
 
 pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> {
-    let (mut channel, public_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (mut channel, noise_peer) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut handshake = secure(Handshake::new(
             false,
             &node.identity.secret_key_hex,
@@ -267,16 +512,15 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
             secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
             "unexpected final client payload"
         );
-        let public_key = handshake
-            .remote_public_key()
-            .context("client public key missing")?;
-        Ok::<_, anyhow::Error>((secure(handshake.finish())?, public_key))
+        let noise_peer = ActualPolicyNoisePeer::from_finished_handshake(&handshake)?;
+        Ok::<_, anyhow::Error>((secure(handshake.finish())?, noise_peer))
     })
     .await
     .context("client handshake timed out")??;
     let mut session = Session {
-        public_key,
-        node_policy_read_only: false,
+        public_key: noise_peer.public_key().as_str().to_owned(),
+        noise_peer,
+        purpose: SessionPurpose::Client,
         authorization: None,
         subscription: None,
         remote_subscription: None,
@@ -298,7 +542,9 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                             partial_started = None;
                             let request = parse_request(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            if request.method == NODE_POLICY_READ_METHOD {
+                            let policy_carrier = request.method == NODE_POLICY_READ_METHOD
+                                || (request.method == TASK_BUSINESS_METHOD && request.params["stage"] != "business");
+                            if policy_carrier {
                                 require_node_policy_carrier(plaintext.len(), 0)?;
                             }
                             let result = dispatch(&node, &mut session, request).await;
@@ -307,7 +553,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                                 Ok(result) => Response { id, result, error: None },
                                 Err(error) => Response { id, result: Value::Null, error: Some(error.to_string()) },
                             };
-                            if session.node_policy_read_only {
+                            if policy_carrier || matches!(session.purpose, SessionPurpose::NodePolicyRead) {
                                 require_node_policy_carrier(plaintext.len(), serde_json::to_vec(&response)?.len())?;
                             }
                             send_value(&mut socket, &mut channel, &response).await?;
@@ -394,6 +640,15 @@ async fn dispatch_request(
 ) -> Result<Value> {
     session.select_method(method)?;
     match method {
+        TASK_BUSINESS_METHOD => {
+            ensure!(
+                invocation.is_none(),
+                "task business transport does not accept an outer Invocation"
+            );
+            session
+                .task_business(node, serde_json::from_value(params)?)
+                .await
+        }
         NODE_POLICY_READ_METHOD => {
             ensure!(
                 invocation.is_none(),
@@ -861,6 +1116,7 @@ mod tests {
             ("authenticate", json!({})),
             ("rpc", json!({})),
             ("identity", json!({"method":"status","params":{}})),
+            (TASK_BUSINESS_METHOD, json!({})),
         ] {
             let error = reader
                 .client
@@ -957,16 +1213,10 @@ mod tests {
 
     #[test]
     fn node_policy_reader_sessions_cannot_upgrade_to_other_methods() -> Result<()> {
-        let mut session = Session {
-            public_key: String::new(),
-            node_policy_read_only: false,
-            authorization: None,
-            subscription: None,
-            remote_subscription: None,
-        };
-        session.select_method("info")?;
-        session.select_method(NODE_POLICY_READ_METHOD)?;
-        session.select_method(NODE_POLICY_READ_METHOD)?;
+        let mut purpose = SessionPurpose::Client;
+        purpose.select_method("info", false)?;
+        purpose.select_method(NODE_POLICY_READ_METHOD, false)?;
+        purpose.select_method(NODE_POLICY_READ_METHOD, false)?;
         for method in [
             "info",
             "authenticate",
@@ -974,13 +1224,38 @@ mod tests {
             "rpc",
             "subscribe",
             "identity",
+            TASK_BUSINESS_METHOD,
             "unknown",
         ] {
-            assert!(session.select_method(method).is_err(), "{method}");
+            assert!(purpose.select_method(method, false).is_err(), "{method}");
         }
-        assert!(session.authorization.is_none());
-        assert!(session.subscription.is_none());
-        assert!(session.remote_subscription.is_none());
+        assert!(matches!(purpose, SessionPurpose::NodePolicyRead));
+        Ok(())
+    }
+
+    #[test]
+    fn task_business_sessions_stay_separate_from_client_authorization() -> Result<()> {
+        for method in [NODE_POLICY_READ_METHOD, TASK_BUSINESS_METHOD] {
+            let mut authenticated = SessionPurpose::Client;
+            assert!(authenticated.select_method(method, true).is_err());
+            assert!(matches!(authenticated, SessionPurpose::Client));
+        }
+        let mut purpose = SessionPurpose::Client;
+        purpose.select_method(TASK_BUSINESS_METHOD, false)?;
+        purpose.select_method(TASK_BUSINESS_METHOD, false)?;
+        for method in [
+            "authenticate",
+            "rpc",
+            "identity",
+            "subscribe",
+            NODE_POLICY_READ_METHOD,
+        ] {
+            assert!(purpose.select_method(method, false).is_err(), "{method}");
+        }
+        assert!(matches!(
+            purpose,
+            SessionPurpose::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
+        ));
         Ok(())
     }
 
