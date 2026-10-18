@@ -351,6 +351,31 @@ impl PolicyState {
         })
     }
 
+    pub(crate) fn accepted_journal_prefix(
+        &self,
+        snapshot: &AcceptedJournalSnapshot,
+    ) -> Result<Vec<JournalEntry>> {
+        ensure!(
+            snapshot.accepted_len <= self.order.len()
+                && snapshot.last_hash.as_ref()
+                    == snapshot
+                        .accepted_len
+                        .checked_sub(1)
+                        .and_then(|index| self.order.get(index))
+                && snapshot.last_ordinal.is_some() == (snapshot.accepted_len != 0),
+            "accepted policy prefix differs from its completed read"
+        );
+        self.order[..snapshot.accepted_len]
+            .iter()
+            .map(|hash| {
+                self.accepted
+                    .get(hash)
+                    .map(|entry| entry.entry.clone())
+                    .context("accepted policy prefix has a missing entry")
+            })
+            .collect()
+    }
+
     // The caller keeps this read and its recovery cursor update in one transaction.
     pub(crate) fn accepted_journal_page(
         &self,
