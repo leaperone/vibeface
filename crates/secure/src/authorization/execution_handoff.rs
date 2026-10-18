@@ -2627,6 +2627,56 @@ impl ExecutionProofUsage {
             .insert(ObjectHash::body(value)?, canonical(value)?.len());
         Ok(())
     }
+    pub(super) fn normalize_completed_task_policy_transport(
+        &mut self,
+        current: &node_execution_policy::VerifiedTaskCurrentPolicy,
+    ) -> Result<()> {
+        fn closed_carrier<T: SignedObject>(
+            usage: &mut ExecutionProofUsage,
+            value: &Signed<T>,
+        ) -> Result<()> {
+            let hash = value.hash()?;
+            let bytes = canonical(value)?.len();
+            if let Some(recorded) = usage.objects.remove(&hash) {
+                require(
+                    recorded == bytes,
+                    "completed Task policy carrier changed its recorded bytes",
+                )?;
+            }
+            usage.metadata.remove(&hash);
+            usage.historical_wrappers.insert(hash.clone(), bytes);
+            usage.record_metadata(&serde_json::json!({
+                "completed_task_policy_carrier": {
+                    "domain": T::DOMAIN,
+                    "hash": hash,
+                    "envelope_hash": ObjectHash::body(value)?,
+                    "issuer": value.issuer,
+                    "encoded_bytes": bytes,
+                },
+            }))
+        }
+
+        // Current retains the completed reads and their exact originals; its approval stays live.
+        closed_carrier(self, current.trust().original_intent())?;
+        match current.request() {
+            node_execution_policy::TaskExecutionPolicyRequest::Account(request) => {
+                closed_carrier(self, &request.intent)?;
+                closed_carrier(self, &request.delegation)?;
+            }
+            node_execution_policy::TaskExecutionPolicyRequest::Node(request) => match request {
+                node_execution_policy::NodeExecutionPolicyReadRequest::Current(value) => {
+                    closed_carrier(self, value)?;
+                }
+                node_execution_policy::NodeExecutionPolicyReadRequest::History(_) => {
+                    return Err(AuthorizationError::InvalidProof(
+                        "completed Current cannot carry a History request",
+                    ));
+                }
+            },
+        }
+        closed_carrier(self, current.snapshot())?;
+        closed_carrier(self, current.witness())
+    }
     pub(super) fn normalize_history_acceptance_metadata(
         &mut self,
         freshness: &ExecutionHandoffFreshness,

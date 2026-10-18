@@ -398,7 +398,10 @@ fn authorize_inner(
     now: u64,
     mut usage: ExecutionProofUsage,
 ) -> Result<VerifiedTaskBusinessReceiptAuthority> {
-    usage.merge(current.proof_usage());
+    let mut current_usage = current.proof_usage().clone();
+    current_usage.enforce_limits()?;
+    current_usage.normalize_completed_task_policy_transport(current)?;
+    usage.merge(&current_usage);
     usage.enforce_limits()?;
     let scope = wire.scope()?;
     require(
@@ -716,7 +719,30 @@ mod tests {
         .unwrap();
         let counts = authority.proof_usage().counts();
         let mut merged = authority.proof_usage().clone();
-        merged.merge(readonly.proof_usage());
+        let raw_current_counts = readonly.proof_usage().counts();
+        readonly.proof_usage().enforce_limits().unwrap();
+        let mut completed_current = readonly.proof_usage().clone();
+        completed_current
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
+        let normalized = completed_current.counts();
+        assert!(normalized.authorization_bytes < raw_current_counts.authorization_bytes);
+        assert_eq!(
+            normalized.unique_signatures,
+            raw_current_counts.unique_signatures
+        );
+        completed_current
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
+        assert_eq!(
+            completed_current.counts().authorization_bytes,
+            normalized.authorization_bytes
+        );
+        assert_eq!(
+            completed_current.counts().unique_signatures,
+            normalized.unique_signatures
+        );
+        merged.merge(&completed_current);
         assert_eq!(
             merged.counts().authorization_bytes,
             counts.authorization_bytes
@@ -726,6 +752,17 @@ mod tests {
             counts.unique_signed_objects
         );
         assert_eq!(merged.counts().unique_signatures, counts.unique_signatures);
+        let mut oversized = completed_current.clone();
+        oversized
+            .record_metadata(&"x".repeat(MAX_PROOF_BYTES))
+            .unwrap();
+        oversized
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
+        assert!(matches!(
+            oversized.enforce_limits(),
+            Err(AuthorizationError::BudgetExceeded)
+        ));
         assert!(
             counts.unique_signed_objects > business.proof_usage().counts().unique_signed_objects
         );
@@ -842,6 +879,15 @@ mod tests {
             &fixture.executor,
         )
         .unwrap();
+        let completed_bytes = completed_current.counts().authorization_bytes;
+        completed_current.record_signed(&read).unwrap();
+        completed_current
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
+        assert_eq!(
+            completed_current.counts().authorization_bytes,
+            completed_bytes + canonical(&read).unwrap().len()
+        );
         verify_task_business_receipt_read(
             source.state(),
             &readonly,
