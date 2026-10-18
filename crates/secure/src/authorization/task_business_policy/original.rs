@@ -44,7 +44,7 @@ fn accepted_anchor(
                 accepted_at_ms,
             )?;
             require(
-                transport.clone().into_evidence()
+                transport.existing_evidence()?
                     == TransportEvidence::VerifiedPeer {
                         origin: wire.invocation.payload.presenter.clone(),
                     },
@@ -246,13 +246,8 @@ fn original_account_authorization(
     facts: &RequestFacts,
     now: u64,
 ) -> Result<VerifiedAuthorization> {
-    let admitted = remote_resolution_history::admitted(state, proof, facts)?;
-    state.verify_operation_authorization(
-        &admitted,
-        facts,
-        &proof.transport.clone().into_evidence(),
-        now,
-    )
+    let admitted = state.verify_original_admission(proof, facts)?;
+    state.verify_admitted_operation_authorization(&admitted, facts, now)
 }
 
 impl TaskBusinessOriginalPolicyImport {
@@ -318,7 +313,7 @@ impl TaskBusinessOriginalPolicyImport {
                 let verified = state.verify_execution_handoff(
                     wire,
                     &original,
-                    &transport.clone().into_evidence(),
+                    &transport.existing_evidence()?,
                     None,
                     self.accepted_at_ms,
                 )?;

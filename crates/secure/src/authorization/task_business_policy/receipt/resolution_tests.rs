@@ -241,7 +241,7 @@ fn task_business_resolution_receipts_keep_typed_hash_after_writer_revocation() {
         .verify_execution_handoff(
             &fixture.actual.handoff,
             &original,
-            &transport.clone().into_evidence(),
+            &transport.existing_evidence().unwrap(),
             Some(&admitted),
             admitted_at,
         )

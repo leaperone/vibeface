@@ -38,7 +38,7 @@ fn accepted_handoff_at(
     carrier(acceptance)?;
     let (receipt, freshness, transport) = submit_acceptance(acceptance)?;
     require(
-        transport.clone().into_evidence()
+        transport.existing_evidence()?
             == TransportEvidence::VerifiedPeer {
                 origin: wire.invocation.payload.presenter.clone(),
             },
@@ -59,17 +59,12 @@ fn accepted_handoff_at(
         ));
     };
     let facts = request_facts(&admission.invocation.payload);
-    let admitted = remote_resolution_history::admitted(state, &admission, &facts)?;
-    let original = state.verify_operation_authorization(
-        &admitted,
-        &facts,
-        &admission.transport.clone().into_evidence(),
-        now,
-    )?;
+    let admitted = state.verify_original_admission(&admission, &facts)?;
+    let original = state.verify_admitted_operation_authorization(&admitted, &facts, now)?;
     let verified = state.verify_execution_handoff(
         wire,
         &original,
-        &transport.clone().into_evidence(),
+        &transport.existing_evidence()?,
         Some(&checkpoint),
         now,
     )?;
@@ -633,7 +628,7 @@ mod tests {
             .verify_execution_handoff(
                 &fixture.actual.handoff,
                 &original,
-                &transport.clone().into_evidence(),
+                &transport.existing_evidence().unwrap(),
                 None,
                 now,
             )

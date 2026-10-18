@@ -1365,17 +1365,9 @@ mod tests {
             panic!("fixture lacks original admission")
         };
         let facts = request_facts(&admission.invocation.payload);
-        let historical =
-            remote_resolution_history::at_heads(state, &admission.challenge.policies).unwrap();
-        let admitted =
-            remote_resolution_history::admitted(&historical, &admission, &facts).unwrap();
+        let admitted = state.verify_original_admission(&admission, &facts).unwrap();
         state
-            .verify_operation_authorization(
-                &admitted,
-                &facts,
-                &admission.transport.into_evidence(),
-                now,
-            )
+            .verify_admitted_operation_authorization(&admitted, &facts, now)
             .unwrap()
     }
 
