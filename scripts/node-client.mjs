@@ -21,9 +21,6 @@ let recoveryRequest;
 let recoveryPreparation;
 let nodeEnrollment;
 let nodeEnrollmentCommit;
-let crossNodeRequest;
-let crossNodePreparation;
-let crossNodeCommit;
 function sealedRecovery(material, password) {
   const plaintext = encoder.encode(material);
   try { return Buffer.from(crypto.recoverySeal(plaintext, password)).toString('hex'); }
@@ -210,23 +207,116 @@ async function connect(input) {
   };
 }
 
-function installAuthorization(response, connection, expectedHostPublicKey) {
-  if (!trust) throw new Error('authorization requires independently saved pins');
-  const verified = crypto.verifyClientAuthorization(JSON.stringify(response.authorization), JSON.stringify(trust.pins), trust.scope.account_id, trust.scope.space_id, identity().publicKeyHex(), Date.now());
+function boundedCarrier(request, response) {
+  assert(Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(response)) <= 65_536,
+    'identity carrier exceeds 64 KiB');
+}
+
+async function identityRequest(connection, method, params) {
+  boundedCarrier(params, {});
+  const response = await connection.request('identity', { method, params });
+  boundedCarrier(params, response);
+  if (response.error) {
+    const error = new Error(`identity ${method} rejected`);
+    error.rpcMethod = method;
+    throw error;
+  }
+  assert(response.result && typeof response.result === 'object', 'identity response has no result');
+  return response.result;
+}
+
+function checkedAuthorization(verified, expectedHostPublicKey) {
+  const scope = JSON.parse(verified.scopeJson());
+  const policy = JSON.parse(verified.policyJson());
+  assert.deepEqual(scope, trust.scope, 'authorization changed the independently saved scope');
+  assert.equal(policy.audience_public_key, expectedHostPublicKey, 'authorization changed the selected Project host');
+  assert(Array.isArray(policy.resources) && policy.resources.length === 1, 'authorization must select one Project');
+  return { scope, policy, resources: policy.resources };
+}
+
+async function authenticate(input, connectionName) {
+  assert(trust, 'authorization requires independently saved pins');
+  authorizations.get(connectionName)?.verified.free();
+  authorizations.delete(connectionName);
+  const connection = connections.get(connectionName);
+  const source = connection.nodePublicKey;
+  const expectedHost = input.expected_host_public_key || source;
+  assert.match(expectedHost, /^[a-f0-9]{64}$/);
+  const pins = JSON.stringify(trust.pins);
+  const buildRequest = selection => JSON.parse(crypto.buildClientPolicyReadRequest(
+    trust.scope.account_id, trust.scope.space_id, identity(), source, pins,
+    JSON.stringify(selection), Date.now(), Date.now() + 60_000,
+  ));
+  const catalogRequest = buildRequest(null);
+  let catalog = await identityRequest(connection, 'begin_client_policy_read', catalogRequest);
+  let selection;
+  const visited = new Set();
+  let catalogContext;
+  for (;;) {
+    const page = JSON.parse(crypto.verifyClientPolicySelections(
+      pins, JSON.stringify(catalogRequest), JSON.stringify(catalog.selections), identity(), source, Date.now(),
+    ));
+    const context = JSON.stringify([page.snapshot_id, page.request_hash]);
+    if (catalogContext === undefined) catalogContext = context;
+    assert.equal(context, catalogContext, 'selection page changed its original catalog');
+    for (const choice of page.selections) {
+      const matches = (!input.resource_id || choice.resource.resource === input.resource_id)
+        && choice.audience.service === crypto.deriveAuthorizationId('service', expectedHost)
+        && choice.audience.device === crypto.deriveAuthorizationId('device', expectedHost)
+        && (!input.audience || (choice.audience.service === input.audience.service && choice.audience.device === input.audience.device));
+      if (matches && !selection) selection = choice;
+    }
+    if (selection || page.next_cursor === null) break;
+    assert(!visited.has(page.next_cursor), 'selection cursor repeated');
+    visited.add(page.next_cursor);
+    catalog = await identityRequest(connection, 'client_policy_selections', {
+      snapshot_id: page.snapshot_id, request_hash: page.request_hash, cursor: page.next_cursor,
+    });
+  }
+  assert(selection, 'no verified selection matches the independently selected Project host');
+  const request = buildRequest(selection);
+  const begin = await identityRequest(connection, 'begin_client_policy_read', request);
+  let importer = crypto.beginClientPolicyImport(pins, JSON.stringify(request), JSON.stringify(begin.snapshot), identity(), source, Date.now());
+  let imported;
+  let confirmed;
   try {
-    const scope = JSON.parse(verified.scopeJson());
-    const policy = JSON.parse(verified.policyJson());
-    assert.deepEqual(response.scope, scope);
-    const gatewayPublicKey = connections.get(connection).nodePublicKey;
-    assert.equal(policy.audience_public_key, expectedHostPublicKey || gatewayPublicKey);
-    const resources = policy.resources;
-    assert(Array.isArray(resources));
-    assert.deepEqual(response.resources, resources);
-    authorizations.get(connection)?.verified.free();
-    authorizations.set(connection, { verified, scope, policy, bundle: structuredClone(response.authorization), forwarded: policy.audience_public_key !== gatewayPublicKey });
-    trust.pins = trust.pins.map(pin => ({ ...pin, minimum_head: policy.heads.find(head => head.domain.kind === pin.domain.kind && head.domain.id === pin.domain.id) || pin.minimum_head }));
-    return { scope, policy, resources };
-  } catch (error) { verified.free(); throw error; }
+    for (;;) {
+      const params = JSON.parse(importer.pageRequestJson());
+      const response = await identityRequest(connection, 'client_policy_page', params);
+      importer.appendPage(JSON.stringify(response.page), Date.now());
+      if (response.page.payload.complete) break;
+    }
+    const witness = await identityRequest(connection, 'client_policy_witness', {
+      snapshot_id: begin.snapshot.payload.snapshot_id, request_hash: begin.snapshot.payload.request_hash, cursor: null,
+    });
+    const completed = importer;
+    importer = undefined;
+    imported = completed.finish(JSON.stringify(witness.witness), JSON.stringify(selection), Date.now());
+    const confirmRequest = JSON.parse(crypto.buildClientPolicyAuthConfirmRequest(
+      imported, identity(), Date.now(), Math.min(request.payload.expires_at_ms, begin.snapshot.payload.expires_at_ms, witness.witness.payload.expires_at_ms),
+    ));
+    const receipt = await identityRequest(connection, 'confirm_client_policy_auth', confirmRequest);
+    confirmed = crypto.confirmClientPolicyAuthorization(imported, JSON.stringify(confirmRequest), JSON.stringify(receipt.confirmation), source, Date.now());
+    const checked = checkedAuthorization(confirmed, expectedHost);
+    const session = JSON.parse(confirmed.clientPolicyContextJson());
+    const response = await connection.request('authenticate', session);
+    boundedCarrier(session, response);
+    if (response.error) {
+      const error = new Error('confirmed client authentication rejected');
+      error.rpcMethod = 'authenticate';
+      throw error;
+    }
+    assert.deepEqual(response.result.scope, checked.scope, 'session changed the verified scope');
+    assert.deepEqual(response.result.policy, checked.policy, 'session changed the verified policy');
+    assert.deepEqual(response.result.resources, checked.resources, 'session changed the verified Project');
+    authorizations.set(connectionName, { verified: confirmed, ...checked, selection,
+      forwarded: checked.policy.audience_public_key !== source });
+    confirmed = undefined;
+    trust.pins = trust.pins.map(pin => ({ ...pin,
+      minimum_head: checked.policy.heads.find(head => head.domain.kind === pin.domain.kind && head.domain.id === pin.domain.id) || pin.minimum_head,
+    }));
+    return { ...checked, selection };
+  } finally { importer?.free(); imported?.free(); confirmed?.free(); }
 }
 
 async function command(input) {
@@ -234,6 +324,16 @@ async function command(input) {
   if (input.op === 'identity') return exposed(identity(input.identity));
   if (input.op === 'derive_authorization_id') return crypto.deriveAuthorizationId(input.kind, input.value);
   if (input.op === 'sign') return identity(input.identity).sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
+  if (input.op === 'verify_space_fixture') {
+    const { payload, issuer, signature } = input.signed;
+    const prepared = JSON.parse(crypto.prepareAuthorizationSigning('space_document', JSON.stringify(payload), issuer));
+    assert.equal(prepared.object_hash, input.head.head, 'fixture differs from the verified policy head');
+    assert.equal(payload.space, trust.scope.space_id);
+    assert.equal(payload.authority_epoch, input.head.authority_epoch);
+    assert.equal(payload.sequence, input.head.sequence);
+    crypto.verify(issuer, prepared.domain, encoder.encode(prepared.signing_bytes), signature);
+    return payload;
+  }
   if (input.op === 'sign_resource_fixture') {
     assert(['resource', 'space_document'].includes(input.kind));
     const root = identity('root');
@@ -276,40 +376,54 @@ async function command(input) {
     return recoveryRequest;
   }
   if (input.op === 'prepare_recovery') {
-    const now = Date.now();
-    const claim = crypto.verifyNodeClaim(JSON.stringify(input.claim), input.node_public_key, recoveryRequest.payload.nonce, now);
+    assert(openedRecoveryMaterial && recoveryRequest && !recoveryPreparation, 'recovery requires its original private material and an unprepared request');
+    const connection = connections.get(connectionName);
+    assert.equal(connection.nodePublicKey, recoveryRequest.payload.node_public_key, 'recovery changed the independently pinned Noise source');
+    const begin = await identityRequest(connection, 'recovery_context', { request: recoveryRequest });
+    let importer = crypto.beginRecoveryContextImport(openedRecoveryMaterial, JSON.stringify(recoveryRequest), JSON.stringify(begin.snapshot), Date.now());
+    let verified;
     try {
-      recoveryPreparation?.free();
-      recoveryPreparation = crypto.prepareAccountRecovery(openedRecoveryMaterial, JSON.stringify(input.authorization), identity('root'), identity(), claim, now + 86_400_000, now);
+      const params = { snapshot_id: begin.snapshot.payload.snapshot_id, request_hash: begin.snapshot.payload.request_hash, cursor: null };
+      for (;;) {
+        const response = await identityRequest(connection, 'recovery_context_page', params);
+        const progress = JSON.parse(importer.appendPage(JSON.stringify(response.page), Date.now()));
+        params.cursor = progress.cursor;
+        if (progress.complete) break;
+      }
+      const witness = await identityRequest(connection, 'recovery_context_witness', { ...params, cursor: null });
+      const completed = importer;
+      importer = undefined;
+      verified = completed.finish(JSON.stringify(witness.witness), Date.now());
+      const now = Date.now();
+      recoveryPreparation = crypto.prepareAccountRecovery(openedRecoveryMaterial, verified, identity('root'), identity(), now + 86_400_000, now);
       return JSON.parse(recoveryPreparation.nodeRequestJson());
-    } finally { claim.free(); }
+    } finally { importer?.free(); verified?.free(); }
   }
   if (input.op === 'finish_recovery') {
     const created = crypto.finishAccountRecovery(recoveryPreparation, identity('root'), input.proof, Date.now());
     try {
       const material = crypto.buildRecoveredAccountRecoveryMaterial(created, identity('root'), openedRecoveryMaterial, input.endpoint, Date.now());
       trust = { pins: JSON.parse(created.pinsJson()), scope: JSON.parse(created.scopeJson()) };
-      return { pins: trust.pins, scope: trust.scope, authorization: JSON.parse(created.bundleJson()),
+      return { pins: trust.pins, scope: trust.scope,
         commit: JSON.parse(recoveryPreparation.commitJson(created)), recovery_envelope: sealedRecovery(material, input.password) };
     } finally { created.free(); recoveryPreparation.free(); recoveryPreparation = undefined; openedRecoveryMaterial = undefined; recoveryRequest = undefined; }
   }
   if (input.op === 'prepare_node_enrollment') {
-    nodeEnrollment?.free(); nodeEnrollment = undefined;
-    nodeEnrollmentCommit?.free(); nodeEnrollmentCommit = undefined;
+    assert(!nodeEnrollment && !nodeEnrollmentCommit, 'the original Node enrollment must finish before preparing another');
     const auth = authorizations.get(input.authority_connection || 'main');
     assert(auth && trust && openedRecoveryMaterial, 'Node enrollment requires current verified authority and local root material');
     const now = Date.now();
     const claim = crypto.verifyNodeClaim(JSON.stringify(input.claim), input.node_public_key, input.claim_nonce, now);
     try {
       nodeEnrollment = crypto.prepareAccountNodeEnrollment(
-        openedRecoveryMaterial, JSON.stringify(trust.pins), JSON.stringify(auth.bundle), identity(), claim,
+        openedRecoveryMaterial, auth.verified, identity(), claim,
         now + 86_400_000, now,
       );
       return JSON.parse(nodeEnrollment.requestJson());
     } finally { claim.free(); }
   }
   if (input.op === 'prepare_node_enrollment_commit') {
-    nodeEnrollmentCommit?.free(); nodeEnrollmentCommit = undefined;
+    assert(nodeEnrollment && !nodeEnrollmentCommit, 'Node enrollment commit requires its original uncommitted preparation');
     nodeEnrollmentCommit = crypto.prepareAccountNodeEnrollmentCommit(
       nodeEnrollment, openedRecoveryMaterial, input.possession_signature, Date.now(),
     );
@@ -319,82 +433,11 @@ async function command(input) {
     const verified = crypto.finishAccountNodeEnrollment(nodeEnrollmentCommit, JSON.stringify(input.journal), Date.now());
     try {
       trust.pins = JSON.parse(verified.pinsJson());
-      return { pins: trust.pins, authorization: JSON.parse(verified.bundleJson()), installation: JSON.parse(verified.installationJson()) };
+      return { pins: trust.pins, installation: JSON.parse(verified.installationJson()) };
     } finally {
       verified.free(); nodeEnrollmentCommit.free(); nodeEnrollmentCommit = undefined;
       nodeEnrollment.free(); nodeEnrollment = undefined; openedRecoveryMaterial = undefined;
     }
-  }
-  if (input.op === 'cross_recovery_sources') {
-    return JSON.parse(crypto.inspectCrossNodeRecoverySources(openedRecoveryMaterial, Date.now()));
-  }
-  if (input.op === 'build_cross_recovery') {
-    assert(openedRecoveryMaterial, 'cross-Node recovery requires locally opened recovery material');
-    assert(!crossNodeRequest && !crossNodePreparation && !crossNodeCommit, 'cross-Node recovery already has an original request');
-    const now = Date.now();
-    const claim = crypto.verifyNodeClaim(JSON.stringify(input.claim), input.node_public_key, input.claim_nonce, now);
-    try {
-      const resources = input.source_projects || JSON.parse(crypto.inspectCrossNodeRecoverySources(openedRecoveryMaterial, now)).source_projects;
-      crossNodeRequest = JSON.parse(crypto.buildCrossNodeRecoveryRequest(
-        openedRecoveryMaterial, identity('root'), identity(), claim, JSON.stringify(resources),
-        now + 3_600_000, now, Math.min(now + 60_000, input.claim.payload.expires_at_ms),
-      ));
-      return crossNodeRequest;
-    } finally { claim.free(); }
-  }
-  if (input.op === 'prepare_cross_recovery') {
-    assert(crossNodeRequest && !crossNodePreparation && !crossNodeCommit, 'cross-Node preparation requires the saved original request');
-    const now = Date.now();
-    const verified = crypto.verifyCrossNodeRecoveryContext(JSON.stringify(input.context), JSON.stringify(crossNodeRequest), now);
-    try {
-      crossNodePreparation = crypto.prepareCrossNodeAccountRecovery(
-        openedRecoveryMaterial, verified, identity('root'), identity(), now + 86_400_000, now,
-      );
-      return JSON.parse(crossNodePreparation.possessionRequestJson());
-    } finally { verified.free(); }
-  }
-  if (input.op === 'finish_cross_preparation') {
-    assert(crossNodePreparation && !crossNodeCommit, 'cross-Node completion requires the saved preparation');
-    const now = Date.now();
-    crossNodeCommit = crypto.finishCrossNodeAccountRecovery(
-      crossNodePreparation, identity('root'), input.target_proof, input.source_proof, now,
-    );
-    const pending = crossNodeCommit.recoveryMaterialJson(identity('root'), openedRecoveryMaterial, input.endpoint, now);
-    return { request: JSON.parse(crossNodeCommit.requestJson()), review: JSON.parse(crossNodeCommit.publicReviewJson()),
-      pending_envelope: sealedRecovery(pending, input.password) };
-  }
-  if (input.op === 'restore_cross_preparation') {
-    assert(connections.size === 0 && !crossNodeRequest && !crossNodePreparation && !crossNodeCommit,
-      'pending cross-Node recovery restores before any new connection or request');
-    const plaintext = crypto.recoveryOpen(Uint8Array.from(Buffer.from(input.pending_envelope, 'hex')), input.password);
-    try {
-      crossNodeCommit = crypto.restorePreparedCrossNodeRecoveryCommit(decoder.decode(plaintext), Date.now());
-      const client = crossNodeCommit.clientIdentity();
-      keys.get('client').free(); keys.set('client', client);
-      return { request: JSON.parse(crossNodeCommit.requestJson()), review: JSON.parse(crossNodeCommit.publicReviewJson()),
-        resume: JSON.parse(crossNodeCommit.resumeContextJson()), identity: exposed(client) };
-    } finally { plaintext.fill(0); }
-  }
-  if (input.op === 'finish_cross_recovery') {
-    assert(crossNodeCommit, 'cross-Node recovery requires the saved original commit preparation');
-    const now = Date.now();
-    const verified = crypto.finishCrossNodeRecoveryCommit(crossNodeCommit, JSON.stringify(input.committed), now);
-    try {
-      const pins = JSON.parse(verified.pinsJson());
-      const scope = JSON.parse(verified.scopeJson());
-      const review = JSON.parse(crossNodeCommit.publicReviewJson());
-      const sourceReadsCurrent = scope !== null && now < review.source_read_expires_at_ms;
-      const result = { pins, scope, authorization: JSON.parse(verified.bundleJson()),
-        installation: JSON.parse(verified.installationJson()),
-        source_reads_current: sourceReadsCurrent,
-        source_read_selections: sourceReadsCurrent ? JSON.parse(verified.sourceReadSelectionsJson()) : null,
-        recovery_envelope: sealedRecovery(verified.finalRecoveryMaterialJson(input.endpoint, now), input.password) };
-      trust = scope ? { pins, scope } : undefined;
-      crossNodeCommit.free(); crossNodeCommit = undefined;
-      crossNodePreparation?.free(); crossNodePreparation = undefined;
-      crossNodeRequest = undefined; openedRecoveryMaterial = undefined;
-      return result;
-    } finally { verified.free(); }
   }
   if (input.op === 'trust') {
     assert(!trust, 'local account trust is already established');
@@ -420,7 +463,12 @@ async function command(input) {
   }
   const connection = connections.get(connectionName);
   if (!connection) throw new Error('no connection');
-  if (input.op === 'authorize') return installAuthorization(input.response, connectionName, input.expected_host_public_key);
+  if (input.op === 'authenticate') return authenticate(input, connectionName);
+  if (input.op === 'check_authorization_host') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'no confirmed authorization');
+    return checkedAuthorization(auth.verified, input.expected_host_public_key);
+  }
   if (input.op === 'request') return connection.request(input.method, input.params || {}, input.invocation);
   if (input.op === 'signed_request' || input.op === 'prepare_signed') {
     const auth = authorizations.get(connectionName);
@@ -461,7 +509,7 @@ async function command(input) {
 
 for await (const line of createInterface({ input: process.stdin })) {
   try { process.stdout.write(`${JSON.stringify({ ok: true, result: await command(JSON.parse(line)) })}\n`); }
-  catch (error) { process.stdout.write(`${JSON.stringify({ ok: false, error: String(error) })}\n`); }
+  catch (error) { process.stdout.write(`${JSON.stringify({ ok: false, error: String(error), ...(error.rpcMethod ? { rpc_method: error.rpcMethod } : {}) })}\n`); }
 }
 for (const connection of connections.values()) connection.close();
 for (const auth of authorizations.values()) auth.verified.free();
@@ -469,6 +517,4 @@ creation?.free();
 recoveryPreparation?.free();
 nodeEnrollment?.free();
 nodeEnrollmentCommit?.free();
-crossNodePreparation?.free();
-crossNodeCommit?.free();
 for (const key of keys.values()) key.free();

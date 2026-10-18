@@ -397,7 +397,6 @@ class Client:
         self.module = module
         self.scope = None
         self.policy = None
-        self.authorization = None
         self.resource_id = None
         self.process = None
         self.node_id = None
@@ -432,8 +431,15 @@ class Client:
                             node_public_key=self.node_public_key, relay=relay, connection=connection)
 
     def call(self, method, params=None, *, status=200, connection="main", invocation=None):
+        if method in {"identity", "authenticate"}:
+            require(len(json.dumps(params or {}, separators=(",", ":"), ensure_ascii=False).encode()) <= 65536,
+                    "identity request stays within 64 KiB")
         response = self.command("request", method=method, params=params or {},
                                 invocation=invocation, connection=connection)
+        if method in {"identity", "authenticate"}:
+            require(sum(len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+                        for value in (params or {}, response)) <= 65536,
+                    "complete identity carrier stays within 64 KiB")
         error = response.get("error")
         if status == 200:
             require(not error, f"encrypted {method} rejected: {error}")
@@ -448,22 +454,13 @@ class Client:
                          status=status, connection=connection)
 
     def authenticate(self, *, resource_id=None, audience=None, host_public_key=None, connection="main"):
-        own = self.command("identity")
-        params = {"account_id": self.scope["account_id"], "space_id": self.scope["space_id"],
-                  "device_public_key": own["public_key"]}
         selected_resource = resource_id or self.resource_id
         selected_audience = audience or self.audience
-        if selected_resource is not None:
-            params["resource_id"] = selected_resource
-        if selected_audience is not None:
-            params["audience"] = selected_audience
         expected_host = host_public_key or self.host_public_key or self.node_public_key
-        result = self.call("authenticate", params, connection=connection)
-        verified = self.command("authorize", response=result, expected_host_public_key=expected_host,
-                                connection=connection)
+        verified = self.command("authenticate", resource_id=selected_resource, audience=selected_audience,
+                                expected_host_public_key=expected_host, connection=connection)
         require(verified["scope"] == self.scope, "client authenticates the pinned account, space and device")
         self.policy = verified["policy"]
-        self.authorization = result["authorization"]
         require(self.policy["audience_public_key"] == expected_host,
                 "verified authorization targets the independently pinned resource host")
         self.host_public_key = expected_host
@@ -478,11 +475,15 @@ class Client:
             self.resource_id = resources[0]["payload"]["resource"]
         require(self.resource_id in {item["payload"]["resource"] for item in resources},
                 "selected Project belongs to the verified resource projection")
-        return result
+        return verified
 
     def rpc(self, method, *, status=200, connection="main", **arguments):
         body = {"method": method, "space_id": self.scope["space_id"],
                 "resource_id": self.resource_id, **arguments}
+        if body["resource_id"] not in {item["payload"]["resource"] for item in self.policy["resources"]}:
+            default_resource = self.resource_id
+            self.authenticate(resource_id=body["resource_id"], connection=connection)
+            self.resource_id = default_resource
         body.setdefault("authorization_id", body["request"]["operation_id"]
                         if method == "operate" else uuid.uuid4().hex)
         original = None
@@ -546,13 +547,19 @@ class Client:
             self.operations[(body["space_id"], body["resource_id"], body["request"]["operation_id"])] = copy.deepcopy(body["request"])
         return response.get("result") if status == 200 else response
 
-    def add_project_fixture(self):
+    def add_project_fixture(self, authority):
         stamp = next(head for head in self.policy["heads"]
                      if head["domain"] == {"kind": "space", "id": self.scope["space_id"]})
-        document = next(entry["value"]["payload"] for entry in reversed(self.authorization["journal"])
-                        if entry["kind"] in {"space", "space_genesis"}
-                        and entry["value"]["payload"]["space"] == self.scope["space_id"]
-                        and entry["value"]["payload"]["sequence"] == stamp["sequence"])
+        with sqlite3.connect(f"file:{authority.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            row = database.execute("SELECT entry FROM policy_journal WHERE entry_hash=?", (stamp["head"],)).fetchone()
+        require(row is not None, "fixture reads the exact independently verified current space head")
+        entry = json.loads(row[0])
+        document = entry["value"]["payload"]
+        require(entry["kind"] in {"space", "space_genesis"}
+                and document["space"] == self.scope["space_id"]
+                and document["sequence"] == stamp["sequence"],
+                "fixture space document matches the verified selected policy")
+        document = self.command("verify_space_fixture", signed=entry["value"], head=stamp)
         resource_id = "res2_" + os.urandom(32).hex()
         resource = self.command("sign_resource_fixture", kind="resource", payload={
             "version": 2, "space": self.scope["space_id"], "resource": resource_id,
@@ -566,9 +573,11 @@ class Client:
         self.identity_call("policy_commit", {"journal": [
             {"kind": "resource", "value": resource["signed"]},
             {"kind": "space", "value": signed["signed"]}]})
-        self.authenticate()
+        default_resource = self.resource_id
+        self.authenticate(resource_id=resource_id)
         require(resource_id in {item["payload"]["resource"] for item in self.policy["resources"]},
                 "root-signed Project is visible only after its signed space policy is installed")
+        self.authenticate(resource_id=default_resource)
         return resource_id
 
     def create_task(self, authority, conversation, task_id, *, title, goal, acceptance):
@@ -1095,10 +1104,8 @@ def recover_same_node(node):
         require(context["scope"] == previous.scope and context["entry"]["node_public_key"] == node.node_public_key,
                 "encrypted recovery material independently pins the original account, space and Node")
         restored.connect(node.node_id, node_public_key=node.node_public_key)
-        request = restored.command("recovery_context_request", node_public_key=node.node_public_key)
-        current = restored.identity_call("recovery_context", {"request": request})
-        prepared = restored.command("prepare_recovery", claim=current["claim"], authorization=current["authorization"],
-                                    node_public_key=node.node_public_key)
+        restored.command("recovery_context_request", node_public_key=node.node_public_key)
+        prepared = restored.command("prepare_recovery")
         proof = restored.identity_call("recovery_node_possession", prepared)
         created = restored.command("finish_recovery", proof=proof["proof"], endpoint=node.url,
                                    password=node.backup_password)
@@ -1111,12 +1118,11 @@ def recover_same_node(node):
         restored.scope = created["scope"]
         restored.resource_id = previous.resource_id
         restored.authenticate()
-        own = previous.command("identity")
-        rejected = previous.command("request", method="authenticate", params={
-            "account_id": previous.scope["account_id"], "space_id": previous.scope["space_id"],
-            "device_public_key": own["public_key"]}, check=False)
-        require(not rejected["ok"] or rejected["result"].get("error"),
-                "the pre-recovery device no longer authenticates")
+        rejected = previous.command("authenticate", resource_id=previous.resource_id, audience=previous.audience,
+                                    expected_host_public_key=node.node_public_key, check=False)
+        require(not rejected["ok"] and rejected.get("rpc_method") in {
+                    "begin_client_policy_read", "confirm_client_policy_auth", "authenticate"},
+                "the pre-recovery device is rejected by the current bounded authentication protocol")
         inspected = restored.command("open_recovery", envelope=created["recovery_envelope"], password=node.backup_password)
         require(inspected["scope"] == restored.scope,
                 "the new encrypted recovery material represents the recovered account and device")
@@ -1159,15 +1165,30 @@ def enroll_account_node(authority, candidate):
     prepared = client.command("prepare_node_enrollment", claim=claim["claim"],
                               node_public_key=candidate.node_public_key,
                               claim_nonce=candidate.access["claim_nonce"])
-    possession = client.identity_call("account_node_possession", prepared, connection=connection)
-    require(client.identity_call("account_node_possession", prepared, connection=connection) == possession,
-            "the same additional-Node possession request returns its persisted proof")
+    snapshot = client.identity_call("enrollment_policy_read_begin", prepared)
+    begin = {**prepared, "snapshot": snapshot["snapshot"]}
+    progress = client.identity_call("account_node_import_begin", begin, connection=connection)
+    require(client.identity_call("account_node_import_begin", begin, connection=connection) == progress,
+            "the original additional-Node import begin is idempotent")
+    import_context = progress["context"]
+    while not progress.get("proof"):
+        page = client.identity_call("enrollment_policy_page", progress["page_request"])
+        progress = client.identity_call("account_node_import_page", {
+            "context": import_context, "page": page["page"]}, connection=connection)
+        require(progress["context"] == import_context, "additional-Node import preserves its original purpose context")
+        if page["page"]["payload"]["complete"]:
+            break
+    witness = client.identity_call("enrollment_policy_witness", progress["page_request"])
+    finish = {"context": import_context, "witness": witness["witness"]}
+    possession = client.identity_call("account_node_import_finish", finish, connection=connection)
+    require(client.identity_call("account_node_import_finish", finish, connection=connection) == possession,
+            "the original additional-Node import returns its persisted possession proof")
     commit = client.command("prepare_node_enrollment_commit", possession_signature=possession["proof"])
     committed = client.identity_call("account_node_commit", commit)
     require(client.identity_call("account_node_commit", commit) == committed,
             "the existing account authority returns the same enrollment receipt")
     verified = client.command("finish_node_enrollment", journal=committed["journal_delta"])
-    installation = verified["installation"]
+    installation = {"context": import_context, "installation": verified["installation"]}
     installed = client.identity_call("account_node_install", installation, connection=connection)
     require(installed["installed"] is True and installed["account_id"] == scope["account_id"]
             and installed["node_public_key"] == candidate.node_public_key
@@ -1196,9 +1217,9 @@ def verify_account_gateway(authority, gateway, conversation, other_resource):
     connection = "gateway-" + gateway.name
     client.command("connect", url=gateway.url, node_id=gateway.node_id,
                    node_public_key=gateway.node_public_key, connection=connection)
-    authorization = wait_for("Gateway authenticates the original Project host", lambda: client.authenticate(
+    wait_for("Gateway authenticates the original Project host", lambda: client.authenticate(
         connection=connection, host_public_key=authority.node_public_key))
-    wrong_host = client.command("authorize", response=authorization,
+    wrong_host = client.command("check_authorization_host",
                                 expected_host_public_key=gateway.node_public_key,
                                 connection=connection, check=False)
     require(not wrong_host["ok"], "Gateway transport pin cannot replace the independently pinned Project host")
@@ -1309,7 +1330,7 @@ def acceptance(options):
         passed("two-stage account creation, pinned Noise v2, channel attacks, maintenance and packaged web assets")
 
         first = client.resource_id
-        second = client.add_project_fixture()
+        second = client.add_project_fixture(a)
         require(first != second, "one space contains two independently signed Projects")
         report["topology"]["resources"] = [first, second]
         for resource, conversation in ((first, "scope-first"), (second, "scope-second")):
@@ -1321,6 +1342,7 @@ def acceptance(options):
         for method in ("conversation", "context", "export"):
             client.rpc(method, resource_id=second, conversation_id=conversation, status=400)
             foreign.rpc(method, conversation_id=conversation, status=400)
+        client.authenticate(resource_id=first)
         body = {"method": "conversations", "space_id": client.scope["space_id"],
                 "resource_id": first, "authorization_id": uuid.uuid4().hex}
         prepared = client.command("prepare_signed", body=body)
