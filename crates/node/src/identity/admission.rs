@@ -2640,6 +2640,7 @@ pub(crate) mod tests {
             connection: fixture.connection,
             policy: fixture.policy,
             target_recovery_import: None,
+            account_node_enrollment_import: None,
         };
         store.authorize_read(&auth, &proof, &fixture.transport, NOW)?;
         store.authorize_read(&auth, &proof, &fixture.transport, NOW + 1)?;

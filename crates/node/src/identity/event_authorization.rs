@@ -2326,6 +2326,7 @@ mod tests {
             connection: fixture.connection,
             policy: fixture.policy,
             target_recovery_import: None,
+            account_node_enrollment_import: None,
         };
         assert!(
             store
@@ -2759,6 +2760,7 @@ mod tests {
             connection: fixture.connection,
             policy: fixture.policy,
             target_recovery_import: None,
+            account_node_enrollment_import: None,
         };
         assert!(
             store

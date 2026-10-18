@@ -997,20 +997,41 @@ impl PolicyState {
         verified: vibeface_secure::authorization::bootstrap::recovery::stream::VerifiedCrossNodeRecoveryInstallation,
         now_ms: u64,
     ) -> Result<PreparedPolicyUpdate> {
+        let prefix_len = verified.accepted_prefix_len();
+        let (state, pins, journal) = verified.into_store_parts();
+        self.prepare_verified_initial_installation(state, pins, journal, prefix_len, now_ms)
+    }
+
+    pub(crate) fn prepare_account_node_installation(
+        &self,
+        verified: vibeface_secure::authorization::bootstrap::recovery::node_enrollment::VerifiedAccountNodeInstallation,
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
+        let prefix_len = verified.accepted_prefix_len();
+        let (state, pins, journal) = verified.into_store_parts();
+        self.prepare_verified_initial_installation(state, pins, journal, prefix_len, now_ms)
+    }
+
+    fn prepare_verified_initial_installation(
+        &self,
+        state: VerifiedPolicySet,
+        mut pins: Vec<PolicyPin>,
+        journal: Vec<JournalEntry>,
+        prefix_len: usize,
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
         ensure!(
             self.accepted.is_empty() && self.order.is_empty() && self.pins.is_empty(),
-            "cross-node recovery installation requires an unclaimed Node"
+            "verified policy installation requires an unclaimed Node"
         );
-        let prefix_len = verified.accepted_prefix_len();
-        let (state, mut pins, journal) = verified.into_store_parts();
         ensure!(
             prefix_len != 0 && prefix_len < journal.len(),
-            "cross-node recovery installation has no accepted prefix or delta"
+            "verified policy installation has no accepted prefix or delta"
         );
         pins.sort_by(|left, right| left.domain.cmp(&right.domain));
         ensure!(
             pins.windows(2).all(|pair| pair[0].domain != pair[1].domain),
-            "cross-node recovery installation has duplicate pins"
+            "verified policy installation has duplicate pins"
         );
         let mut after = Self {
             state,
@@ -1028,7 +1049,7 @@ impl PolicyState {
             };
             ensure!(
                 !after.accepted.contains_key(&hash),
-                "cross-node recovery installation repeats a journal object"
+                "verified policy installation repeats a journal object"
             );
             after.order.push(hash.clone());
             after.accepted.insert(hash.clone(), accepted.clone());

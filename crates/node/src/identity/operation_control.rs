@@ -615,6 +615,7 @@ mod tests {
                 connection: fixture.connection,
                 policy: fixture.policy,
                 target_recovery_import: None,
+            account_node_enrollment_import: None,
             };
             store.append_authorized_event(
                 &fixture.node,

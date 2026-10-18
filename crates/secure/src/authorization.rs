@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod client_policy_import;
 pub mod directory;
 pub mod enrollment;
+pub mod enrollment_policy_import;
 pub mod execution_handoff;
 pub mod execution_binding_seal;
 pub mod execution_observation;

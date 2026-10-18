@@ -20,6 +20,8 @@ pub struct Store {
     pub(crate) policy: crate::identity::journal::PolicyState,
     pub(crate) target_recovery_import:
         Option<crate::identity::cross_node_recovery::TargetRecoveryImport>,
+    pub(crate) account_node_enrollment_import:
+        Option<vibeface_secure::authorization::bootstrap::recovery::node_enrollment::AccountNodeEnrollmentImport>,
 }
 fn verify_schema(connection: &Connection) -> Result<()> {
     let metadata: (String, u32, u32, String, String) = connection.query_row(
@@ -350,6 +352,7 @@ impl Store {
             connection,
             policy,
             target_recovery_import: None,
+            account_node_enrollment_import: None,
         })
     }
 
@@ -408,6 +411,7 @@ impl Store {
             connection,
             policy,
             target_recovery_import: None,
+            account_node_enrollment_import: None,
         };
         store
             .connection

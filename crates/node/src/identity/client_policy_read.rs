@@ -1213,7 +1213,7 @@ pub(crate) fn verified_client_policy_for_test(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::identity::test_support::{TestNetwork, now};
     use vibeface_secure::{

@@ -1437,7 +1437,27 @@ impl crate::runtime::Runtime {
             | "account_device_commit" => {
                 store.enrollment_command(&self.identity, noise_public_key, method, params, now_ms)
             }
-            "account_node_possession" | "account_node_commit" | "account_node_install" => store
+            "enrollment_policy_read_begin" => store.begin_enrollment_policy_read(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "enrollment_policy_read_page" => store.enrollment_policy_page(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "enrollment_policy_read_witness" => store.enrollment_policy_witness(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "execution_share_policy_prepare" => store.execution_share_policy_prepare(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "execution_share_policy_page" => store.execution_share_policy_page(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "execution_share_policy_finish" => store.execution_share_policy_finish(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "account_node_import_begin" | "account_node_import_page"
+            | "account_node_import_finish" | "account_node_import_resume"
+            | "account_node_commit" | "account_node_install" | "account_node_status" => store
                 .node_enrollment_command(&self.identity, noise_public_key, method, params, now_ms),
             "team_create" | "space_policy_commit" => {
                 store.governance_command(&self.identity, noise_public_key, method, params, now_ms)

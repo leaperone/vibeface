@@ -927,7 +927,7 @@ impl VerifiedAccountNodeEnrollment {
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
-        encode(self.snapshot.pins())
+        encode(&self.snapshot.pins())
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = installationJson))]
     pub fn installation_json(&self) -> crate::Result<String> {
