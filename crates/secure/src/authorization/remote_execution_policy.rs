@@ -554,12 +554,16 @@ pub fn build_remote_execution_history_policy_read_intent(
 #[derive(Clone)]
 pub struct VerifiedRemoteExecutionPolicySourceIntent {
     intent: Signed<RemoteExecutionPolicyReadIntent>,
+    current: VerifiedClientAuthorization,
     source_node_public_key: PublicKey,
     source_heads: Vec<PolicyStamp>,
     verified_at_ms: u64,
     usage: ExecutionProofUsage,
 }
 impl VerifiedRemoteExecutionPolicySourceIntent {
+    pub(super) fn authorization(&self) -> &VerifiedClientAuthorization {
+        &self.current
+    }
     pub fn intent(&self) -> &Signed<RemoteExecutionPolicyReadIntent> {
         &self.intent
     }
@@ -630,8 +634,9 @@ pub fn verify_remote_execution_policy_delegation_source(
     finish_usage(&mut usage)?;
     Ok(VerifiedRemoteExecutionPolicySourceIntent {
         intent: intent.clone(),
-        source_node_public_key: current.audience_public_key,
-        source_heads: current.heads,
+        source_node_public_key: current.audience_public_key.clone(),
+        source_heads: current.heads.clone(),
+        current,
         verified_at_ms: now,
         usage,
     })
@@ -1108,6 +1113,15 @@ pub struct VerifiedRemoteExecutionPolicy {
 }
 
 impl VerifiedRemoteExecutionPolicy {
+    pub(super) fn native_request(&self) -> &RemoteExecutionPolicyReadRequest {
+        &self.request
+    }
+    pub(super) fn native_header(&self) -> &Signed<RemoteExecutionPolicySnapshot> {
+        &self.header
+    }
+    pub(super) fn native_witness(&self) -> &Signed<RemoteExecutionPolicyWitness> {
+        &self.witness
+    }
     pub(crate) fn snapshot(&self) -> &VerifiedPolicySnapshot {
         &self.snapshot
     }
@@ -1194,81 +1208,122 @@ fn begin_import_inner(
         let request: RemoteExecutionPolicyReadRequest = parse(request_json)?;
         let header: Signed<RemoteExecutionPolicySnapshot> = parse(snapshot_json)?;
         let independent: Vec<PolicyPin> = parse(independent_execution_pins_json)?;
-        require(
-            history == (request.intent.payload.purpose == RemoteExecutionPolicyPurpose::History)
-                && history == header.payload.history.is_some(),
-            "policy import changed its independent historical purpose",
-        )?;
-        pins(&independent)?;
-        check_request(&request, now)?;
         let current = check_source_intent(source, &request.intent, now)?;
-        header.verify_signature()?;
-        window(
-            header.payload.issued_at_ms,
-            header.payload.expires_at_ms,
-            now,
-        )?;
         let expected = PublicKey::parse(expected_c_noise_key)?;
         require(
             independent == request.intent.payload.execution_pins
-                && request.delegation.issuer == current.audience_public_key
-                && header.issuer == expected
-                && header.payload.source_node_public_key == expected
-                && expected == request.intent.payload.selection.target_public_key
-                && header.payload.version == AUTH_VERSION
-                && header.payload.request_hash == ObjectHash::body(&request)?
-                && header.payload.saved_pins_hash == ObjectHash::body(&independent)?
-                && header.payload.issued_at_ms >= request.delegation.payload.issued_at_ms
-                && header.payload.expires_at_ms <= request.delegation.payload.expires_at_ms
-                && !header.payload.target_heads.is_empty()
-                && header.payload.target_heads.len() <= MAX_POLICY_DOMAINS
-                && header
-                    .payload
-                    .target_heads
-                    .windows(2)
-                    .all(|pair| pair[0].domain < pair[1].domain),
+                && request.delegation.issuer == current.audience_public_key,
             "execution policy snapshot changed its source, independent pins or exact request",
         )?;
-        let selected: Vec<_> = independent
-            .into_iter()
-            .filter(|pin| {
-                header
-                    .payload
-                    .target_heads
-                    .iter()
-                    .any(|head| head.domain == pin.domain)
-            })
-            .collect();
-        require(
-            selected.len() == header.payload.target_heads.len(),
-            "execution policy snapshot introduced an independently untrusted domain",
-        )?;
-        let required = selected
-            .iter()
-            .filter_map(|pin| pin.minimum_head.clone())
-            .collect();
-        let import = BoundedPolicyImport::new(selected, required)?;
         let mut usage = ExecutionProofUsage::default();
         record_confirmed_client_policy_metadata(source, &mut usage)?;
-        usage.record_signed(&request.intent)?;
-        usage.record_signed(&request.delegation)?;
-        usage.record_signed(&header)?;
         usage.record_budget(&current.budget)?;
-        finish_usage(&mut usage)?;
-        Ok(RemoteExecutionPolicyImport {
-            request,
-            previous_page_hash: header.hash()?,
-            header,
-            import,
-            next_cursor: None,
-            last_page: None,
-            page_count: 0,
-            entry_count: 0,
-            complete: false,
-            usage,
-        })
+        begin_native_execution_policy_import(
+            &request,
+            &header,
+            &independent,
+            &expected,
+            &usage,
+            now,
+            history,
+        )
     })()
     .map_err(|error| error.to_string())
+}
+
+/// The caller must independently verify the current local source and its saved trust.
+pub(super) fn begin_native_execution_policy_import(
+    request: &RemoteExecutionPolicyReadRequest,
+    header: &Signed<RemoteExecutionPolicySnapshot>,
+    effective_independent_pins: &[PolicyPin],
+    expected_c_key: &PublicKey,
+    source_usage: &ExecutionProofUsage,
+    now: u64,
+    history: bool,
+) -> Result<RemoteExecutionPolicyImport> {
+    let _scope = ScopedSignatureVerification::new();
+    require(
+        history == (request.intent.payload.purpose == RemoteExecutionPolicyPurpose::History)
+            && history == header.payload.history.is_some(),
+        "policy import changed its independent historical purpose",
+    )?;
+    check_request(request, now)?;
+    pins(effective_independent_pins)?;
+    carrier(header)?;
+    header.verify_signature()?;
+    window(header.payload.issued_at_ms, header.payload.expires_at_ms, now)?;
+    let original_pins = &request.intent.payload.execution_pins;
+    require(
+        effective_independent_pins.len() == original_pins.len()
+            && effective_independent_pins
+                .iter()
+                .zip(original_pins)
+                .all(|(effective, original)| {
+                    effective.domain == original.domain
+                        && effective.genesis_root == original.genesis_root
+                        && original.minimum_head.as_ref().is_none_or(|minimum| {
+                            effective.minimum_head.as_ref().is_some_and(|current| {
+                                (current.authority_epoch, current.sequence)
+                                    > (minimum.authority_epoch, minimum.sequence)
+                                    || current == minimum
+                            })
+                        })
+                })
+            && &header.issuer == expected_c_key
+            && &header.payload.source_node_public_key == expected_c_key
+            && expected_c_key == &request.intent.payload.selection.target_public_key
+            && header.payload.version == AUTH_VERSION
+            && header.payload.request_hash == ObjectHash::body(request)?
+            && header.payload.saved_pins_hash == ObjectHash::body(original_pins)?
+            && header.payload.issued_at_ms >= request.delegation.payload.issued_at_ms
+            && header.payload.expires_at_ms <= request.delegation.payload.expires_at_ms
+            && !header.payload.target_heads.is_empty()
+            && header.payload.target_heads.len() <= MAX_POLICY_DOMAINS
+            && header
+                .payload
+                .target_heads
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain),
+        "execution policy snapshot changed its source, independent pins or exact request",
+    )?;
+    let selected: Vec<_> = effective_independent_pins
+        .iter()
+        .filter(|pin| {
+            header
+                .payload
+                .target_heads
+                .iter()
+                .any(|head| head.domain == pin.domain)
+        })
+        .cloned()
+        .collect();
+    require(
+        selected.len() == header.payload.target_heads.len(),
+        "execution policy snapshot introduced an independently untrusted domain",
+    )?;
+    let required = original_pins
+        .iter()
+        .filter(|pin| selected.iter().any(|saved| saved.domain == pin.domain))
+        .filter_map(|pin| pin.minimum_head.clone())
+        .collect();
+    let import = BoundedPolicyImport::new(selected, required)?;
+    let mut usage = source_usage.clone();
+    usage.record_signed(&request.intent)?;
+    usage.record_signed(&request.delegation)?;
+    usage.record_signed(header)?;
+    finish_usage(&mut usage)?;
+    Ok(RemoteExecutionPolicyImport {
+        request: request.clone(),
+        previous_page_hash: header.hash()?,
+        header: header.clone(),
+        import,
+        next_cursor: None,
+        last_page: None,
+        page_count: 0,
+        entry_count: 0,
+        complete: false,
+        usage,
+    })
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
@@ -1292,53 +1347,8 @@ impl RemoteExecutionPolicyImport {
         let _scope = ScopedSignatureVerification::new();
         (|| -> Result<()> {
             let now = bootstrap::timestamp(now_ms)?;
-            window(
-                self.header.payload.issued_at_ms,
-                self.header.payload.expires_at_ms,
-                now,
-            )?;
             let page: Signed<RemoteExecutionPolicyPage> = parse(page_json)?;
-            page.verify_signature()?;
-            require(
-                page.issuer == self.header.issuer
-                    && page.payload.version == AUTH_VERSION
-                    && page.payload.request_hash == self.header.payload.request_hash
-                    && page.payload.snapshot_id == self.header.payload.snapshot_id
-                    && page.payload.target_heads_hash
-                        == ObjectHash::body(&self.header.payload.target_heads)?,
-                "execution policy page changed its source or snapshot",
-            )?;
-            let mut usage = ExecutionProofUsage::default();
-            usage.record_signed(&page)?;
-            if self.last_page.as_ref() == Some(&page) {
-                finish_usage(&mut usage)?;
-                self.usage = usage;
-                return Ok(());
-            }
-            require(
-                !self.complete
-                    && page.payload.page_index == self.page_count
-                    && page.payload.request_cursor == self.next_cursor
-                    && page.payload.previous_page_hash == self.previous_page_hash
-                    && page.payload.complete == page.payload.next_cursor.is_none(),
-                "execution policy page is missing, duplicated or out of order",
-            )?;
-            let mut staged = self.import.clone();
-            if let Some(entry) = &page.payload.entry {
-                usage.merge(&policy_proof::policy_entry_usage(staged.state(), entry)?);
-                usage.enforce_limits()?;
-                staged.apply_entry(entry.clone())?;
-            }
-            finish_usage(&mut usage)?;
-            self.import = staged;
-            self.previous_page_hash = page.hash()?;
-            self.next_cursor = page.payload.next_cursor.clone();
-            self.page_count += 1;
-            self.entry_count += u64::from(page.payload.entry.is_some());
-            self.complete = page.payload.complete;
-            self.last_page = Some(page);
-            self.usage = usage;
-            Ok(())
+            self.append_native_page(&page, now)
         })()
         .map_err(|error| error.to_string())
     }
@@ -1352,6 +1362,61 @@ impl RemoteExecutionPolicyImport {
 }
 
 impl RemoteExecutionPolicyImport {
+    pub(super) fn append_native_page(
+        &mut self,
+        page: &Signed<RemoteExecutionPolicyPage>,
+        now: u64,
+    ) -> Result<()> {
+        let _scope = ScopedSignatureVerification::new();
+        carrier(page)?;
+        window(
+            self.header.payload.issued_at_ms,
+            self.header.payload.expires_at_ms,
+            now,
+        )?;
+        page.verify_signature()?;
+        require(
+            page.issuer == self.header.issuer
+                && page.payload.version == AUTH_VERSION
+                && page.payload.request_hash == self.header.payload.request_hash
+                && page.payload.snapshot_id == self.header.payload.snapshot_id
+                && page.payload.target_heads_hash
+                    == ObjectHash::body(&self.header.payload.target_heads)?,
+            "execution policy page changed its source or snapshot",
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(page)?;
+        if self.last_page.as_ref() == Some(page) {
+            finish_usage(&mut usage)?;
+            self.usage = usage;
+            return Ok(());
+        }
+        require(
+            !self.complete
+                && page.payload.page_index == self.page_count
+                && page.payload.request_cursor == self.next_cursor
+                && page.payload.previous_page_hash == self.previous_page_hash
+                && page.payload.complete == page.payload.next_cursor.is_none(),
+            "execution policy page is missing, duplicated or out of order",
+        )?;
+        let mut staged = self.import.clone();
+        if let Some(entry) = &page.payload.entry {
+            usage.merge(&policy_proof::policy_entry_usage(staged.state(), entry)?);
+            usage.enforce_limits()?;
+            staged.apply_entry(entry.clone())?;
+        }
+        finish_usage(&mut usage)?;
+        self.import = staged;
+        self.previous_page_hash = page.hash()?;
+        self.next_cursor = page.payload.next_cursor.clone();
+        self.page_count += 1;
+        self.entry_count += u64::from(page.payload.entry.is_some());
+        self.complete = page.payload.complete;
+        self.last_page = Some(page.clone());
+        self.usage = usage;
+        Ok(())
+    }
+
     fn finish_inner(
         self,
         witness_json: &str,
@@ -1361,91 +1426,102 @@ impl RemoteExecutionPolicyImport {
         let _scope = ScopedSignatureVerification::new();
         (|| -> Result<VerifiedRemoteExecutionPolicy> {
             let now = bootstrap::timestamp(now_ms)?;
-            require(
-                history
-                    == (self.request.intent.payload.purpose
-                        == RemoteExecutionPolicyPurpose::History)
-                    && history == self.header.payload.history.is_some(),
-                "policy completion changed its independent historical purpose",
-            )?;
             let witness: Signed<RemoteExecutionPolicyWitness> = parse(witness_json)?;
-            witness.verify_signature()?;
-            window(
-                witness.payload.issued_at_ms,
-                witness.payload.expires_at_ms,
-                now,
-            )?;
-            window(
-                self.header.payload.issued_at_ms,
-                self.header.payload.expires_at_ms,
-                now,
-            )?;
-            require(
-                self.complete
-                    && witness.issuer == self.header.issuer
-                    && witness.payload.version == AUTH_VERSION
-                    && witness.payload.source_node_public_key == self.header.issuer
-                    && witness.payload.request_hash == self.header.payload.request_hash
-                    && witness.payload.snapshot_id == self.header.payload.snapshot_id
-                    && witness.payload.target_heads == self.header.payload.target_heads
-                    && witness.payload.snapshot_hash == self.header.hash()?
-                    && witness.payload.final_page_hash == self.previous_page_hash
-                    && witness.payload.page_count == self.page_count
-                    && witness.payload.entry_count == self.entry_count
-                    && witness.payload.issued_at_ms >= self.header.payload.issued_at_ms
-                    && witness.payload.expires_at_ms <= self.header.payload.expires_at_ms,
-                "execution policy witness changed its completed stream",
-            )?;
-            let snapshot = self.import.finish(&self.header.payload.target_heads)?;
-            let verified = if let Some(acceptance) = &self.header.payload.history {
-                verify_remote_execution_history_policy_read(
-                    snapshot.state(),
-                    &self.request,
-                    acceptance,
-                    &self.header.issuer,
-                    &self.request.intent.issuer,
-                    now,
-                )?
-            } else {
-                verify_remote_execution_policy_read(
-                    snapshot.state(),
-                    &self.request,
-                    &self.header.issuer,
-                    &self.request.intent.issuer,
-                    now,
-                )?
-            };
-            require(
-                verified.target_heads() == self.header.payload.target_heads
-                    && snapshot.journal().iter().all(|entry| {
-                        policy_import::entry_hash(entry)
-                            .is_ok_and(|hash| verified.allows_hash(&hash))
-                    }),
-                "execution policy stream contains objects outside its necessary reference closure",
-            )?;
-            let advanced: Vec<_> = snapshot
-                .pins()
-                .iter()
-                .cloned()
-                .map(|mut pin| {
-                    pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
-                    pin
-                })
-                .collect();
-            let snapshot = snapshot.with_independent_pins(&advanced)?;
-            let mut usage = ExecutionProofUsage::default();
-            usage.record_signed(&witness)?;
-            usage.merge(verified.proof_usage());
-            finish_usage(&mut usage)?;
-            Ok(VerifiedRemoteExecutionPolicy {
-                request: self.request,
-                header: self.header,
-                witness,
-                snapshot,
-                usage,
-            })
+            self.finish_native(&witness, now, history)
         })()
         .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn finish_native(
+        self,
+        witness: &Signed<RemoteExecutionPolicyWitness>,
+        now: u64,
+        history: bool,
+    ) -> Result<VerifiedRemoteExecutionPolicy> {
+        let _scope = ScopedSignatureVerification::new();
+        carrier(witness)?;
+        require(
+            history
+                == (self.request.intent.payload.purpose
+                    == RemoteExecutionPolicyPurpose::History)
+                && history == self.header.payload.history.is_some(),
+            "policy completion changed its independent historical purpose",
+        )?;
+        witness.verify_signature()?;
+        window(
+            witness.payload.issued_at_ms,
+            witness.payload.expires_at_ms,
+            now,
+        )?;
+        window(
+            self.header.payload.issued_at_ms,
+            self.header.payload.expires_at_ms,
+            now,
+        )?;
+        require(
+            self.complete
+                && witness.issuer == self.header.issuer
+                && witness.payload.version == AUTH_VERSION
+                && witness.payload.source_node_public_key == self.header.issuer
+                && witness.payload.request_hash == self.header.payload.request_hash
+                && witness.payload.snapshot_id == self.header.payload.snapshot_id
+                && witness.payload.target_heads == self.header.payload.target_heads
+                && witness.payload.snapshot_hash == self.header.hash()?
+                && witness.payload.final_page_hash == self.previous_page_hash
+                && witness.payload.page_count == self.page_count
+                && witness.payload.entry_count == self.entry_count
+                && witness.payload.issued_at_ms >= self.header.payload.issued_at_ms
+                && witness.payload.expires_at_ms <= self.header.payload.expires_at_ms,
+            "execution policy witness changed its completed stream",
+        )?;
+        let snapshot = self.import.finish(&self.header.payload.target_heads)?;
+        let verified = if let Some(acceptance) = &self.header.payload.history {
+            verify_remote_execution_history_policy_read(
+                snapshot.state(),
+                &self.request,
+                acceptance,
+                &self.header.issuer,
+                &self.request.intent.issuer,
+                now,
+            )?
+        } else {
+            verify_remote_execution_policy_read(
+                snapshot.state(),
+                &self.request,
+                &self.header.issuer,
+                &self.request.intent.issuer,
+                now,
+            )?
+        };
+        require(
+            verified.target_heads() == self.header.payload.target_heads
+                && snapshot.journal().iter().all(|entry| {
+                    policy_import::entry_hash(entry)
+                        .is_ok_and(|hash| verified.allows_hash(&hash))
+                }),
+            "execution policy stream contains objects outside its necessary reference closure",
+        )?;
+        let advanced: Vec<_> = snapshot
+            .pins()
+            .iter()
+            .cloned()
+            .map(|mut pin| {
+                pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
+                pin
+            })
+            .collect();
+        let snapshot = snapshot.with_independent_pins(&advanced)?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(witness)?;
+        usage.merge(verified.proof_usage());
+        finish_usage(&mut usage)?;
+        Ok(VerifiedRemoteExecutionPolicy {
+            request: self.request,
+            header: self.header,
+            witness: witness.clone(),
+            snapshot,
+            usage,
+        })
     }
 }
 
