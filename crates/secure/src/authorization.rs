@@ -5384,6 +5384,9 @@ pub struct PolicyCommit {
     pub expires_at_ms: u64,
     pub nonce: Nonce,
     pub dependencies: Vec<PolicyStamp>,
+}
+signed_object!(PolicyCommit, "policy-commit-v2");
+impl Signed<PolicyCommit> {
     pub fn challenge_hash(&self) -> Result<ObjectHash> {
         let mut payload = self.payload.clone();
         payload.accepted_at_ms = 0;
