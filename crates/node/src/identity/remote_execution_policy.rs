@@ -1231,12 +1231,12 @@ mod tests {
         assert_eq!(verified["state"], "accepted");
         assert_eq!(verified["actual"], serde_json::to_value(&actual)?);
         assert_eq!(write_counts(&target)?, before_writes);
-        let unapplied: Option<String> = fixture.store.connection.query_row(
+        let unapplied: String = fixture.store.connection.query_row(
             "SELECT result FROM operations WHERE space_id=? AND operation_id=?",
             params![fixture.project.space.as_str(), operation.operation_id],
             |row| row.get(0),
         )?;
-        assert_eq!(unapplied, None);
+        assert_eq!(serde_json::from_str::<Value>(&unapplied)?, Value::Null);
         fixture.project.revoke_client(&mut fixture.store)?;
         assert!(
             fixture
