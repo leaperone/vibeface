@@ -301,6 +301,80 @@ pub(crate) fn persisted_resolution_facts(
 }
 
 impl Store {
+    pub(crate) fn current_task_business_resolve(
+        &self,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionHandoffResolution,
+        now_ms: u64,
+    ) -> Result<(
+        vibeface_secure::authorization::node_execution_policy::VerifiedTaskCurrentPolicy,
+        VerifiedExecutionResolution,
+    )> {
+        use vibeface_secure::authorization::{
+            prepare::PrepareContext,
+            remote_execution_policy::{
+                RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection,
+            },
+        };
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let account = &wire.resolution.account_admission.invocation;
+        let saved = pending_from(
+            &tx,
+            account.payload.resource.space.as_str(),
+            &account.payload.operation_id,
+        )?
+        .context("resolution has no immutable pending local outbox")?;
+        ensure!(
+            saved.wire == *wire,
+            "resolution differs from its immutable local outbox"
+        );
+        let (operation, _) = check_original_in(&tx, identity, &wire.resolution.observation)?;
+        let binding = operation
+            .request
+            .binding
+            .as_ref()
+            .context("resolution original has no Task binding")?;
+        let body = &wire.resolution.account_admission.source_body;
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: serde_json::from_value(body["execution_resource"].clone())?,
+            target_public_key: serde_json::from_value(body["target_public_key"].clone())?,
+            execution_grant: serde_json::from_value(body["execution_grant"].clone())?,
+        };
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let scope = super::foreign_execution_policy::current_task_readonly_policy_in(
+            &tx,
+            &current,
+            &local,
+            binding,
+            &selection,
+            RemoteExecutionPolicyPurpose::Resolver,
+            &account.payload,
+            &account.issuer,
+            &PrepareContext {
+                context: account.payload.context.clone(),
+                binding_generation: Some(binding.binding.generation),
+                canonical_cwd: None,
+                execution_target_public_key: Some(selection.target_public_key.clone()),
+            },
+            now_ms,
+        )?;
+        let transport = TransportEvidence::VerifiedPeer {
+            origin: DeviceId::from_key(&local),
+        };
+        let resolver = scope
+            .state()
+            .verify_execution_resolution_account_checkpoint(wire, &transport, now_ms)?;
+        let strong = scope
+            .state()
+            .verify_execution_resolution(wire, &resolver, &transport, None, now_ms)?;
+        super::foreign_execution_policy::check_task_policy_heads_in(&tx, &scope)?;
+        tx.commit()?;
+        Ok((scope, strong))
+    }
+
     pub fn execution_dispatch_resolution(
         &self,
         space: &str,

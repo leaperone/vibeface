@@ -1502,6 +1502,24 @@ impl Store {
         now_ms: u64,
     ) -> Result<vibeface_secure::authorization::execution_observation::SignedExecutionObservation>
     {
+        Ok(self
+            .prepare_task_execution_dispatch_observation(identity, request, transport, now_ms)?
+            .0)
+    }
+
+    pub(crate) fn prepare_task_execution_dispatch_observation(
+        &self,
+        identity: &LocalIdentity,
+        request: &vibeface_secure::authorization::Signed<
+            vibeface_secure::authorization::execution_observation::ExecutionObservationRequest,
+        >,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<(
+        vibeface_secure::authorization::execution_observation::SignedExecutionObservation,
+        vibeface_secure::authorization::node_execution_policy::VerifiedTaskCurrentPolicy,
+        vibeface_secure::authorization::execution_observation::VerifiedExecutionObservationCurrent,
+    )> {
         use vibeface_secure::{
             Identity,
             authorization::{Actor, execution_handoff::SignedExecutionHandoff},
@@ -1546,24 +1564,171 @@ impl Store {
             "observation targets another Project host"
         );
         super::event_authorization::validate_retained_execution_scope_in(
-            &tx, identity, &retained.source,
+            &tx,
+            identity,
+            &retained.source,
         )?;
-        let verified = current
-            .verified()
+        let binding = retained
+            .request
+            .binding
+            .as_ref()
+            .context("observation original has no Task binding")?;
+        let scope = super::foreign_execution_policy::current_task_readonly_policy_in(
+            &tx, &current, &vibeface_secure::authorization::PublicKey::parse(&identity.public_key_hex()?)?,
+            binding,
+            &vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicySelection {
+                execution_resource: target.execution_resource.clone(),
+                target_public_key: target.target_public_key.clone(),
+                execution_grant: request.payload.intent.execution_grant.clone(),
+            },
+            vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead,
+            invocation, &request.issuer,
+            &vibeface_secure::authorization::prepare::PrepareContext {
+                context: invocation.context.clone(), binding_generation: Some(binding.binding.generation),
+                canonical_cwd: None, execution_target_public_key: Some(target.target_public_key.clone()),
+            }, now_ms,
+        )?;
+        let verified = scope
+            .state()
             .verify_execution_observation_request(request, &original, now_ms)?;
-        check_destination_heads_in(&tx, verified.heads())?;
+        super::foreign_execution_policy::check_task_policy_heads_in(&tx, &scope)?;
         let signer =
             Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
-        let wire = current.verified().sign_execution_observation(
-            request,
-            &original,
-            &signer,
+        let outbox_key = format!("task-business-observation:{}", request.hash()?);
+        let saved: Option<String> = tx.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
+            params![space, outbox_key, vibeface_secure::authorization::MAX_PROOF_BYTES], |row| row.get(0),
+        ).optional()?;
+        let wire = if let Some(saved) = saved {
+            let wire: vibeface_secure::authorization::execution_observation::SignedExecutionObservation = serde_json::from_str(&saved)?;
+            ensure!(
+                wire.request == *request,
+                "observation outbox changed its original request"
+            );
+            wire
+        } else {
+            let wire = scope.state().sign_execution_observation(
+                request,
+                &original,
+                &signer,
+                now_ms,
+                verified.expires_at_ms().min(scope.expires_at_ms()),
+            )?;
+            let encoded = serde_json::to_string(&wire)?;
+            ensure!(
+                encoded.len() <= vibeface_secure::authorization::MAX_PROOF_BYTES,
+                "observation outbox exceeds its carrier bound"
+            );
+            tx.execute(
+                "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+                params![space, outbox_key, encoded],
+            )?;
+            wire
+        };
+        let strong = scope.state().verify_execution_observation_current(
+            &wire,
+            &TransportEvidence::VerifiedPeer {
+                origin: vibeface_secure::authorization::DeviceId::from_key(
+                    &vibeface_secure::authorization::PublicKey::of(&signer),
+                ),
+            },
             now_ms,
-            verified.expires_at_ms(),
         )?;
-        check_destination_heads_in(&tx, &wire.invocation.payload.expected_policies)?;
+        super::foreign_execution_policy::check_task_policy_heads_in(&tx, &scope)?;
         tx.commit()?;
-        Ok(wire)
+        Ok((wire, scope, strong))
+    }
+
+    pub(crate) fn current_task_business_observe(
+        &self,
+        identity: &LocalIdentity,
+        wire: &vibeface_secure::authorization::execution_observation::SignedExecutionObservation,
+        now_ms: u64,
+    ) -> Result<(
+        vibeface_secure::authorization::node_execution_policy::VerifiedTaskCurrentPolicy,
+        vibeface_secure::authorization::execution_observation::VerifiedExecutionObservationCurrent,
+    )> {
+        use vibeface_secure::authorization::{
+            DeviceId, PublicKey,
+            execution_handoff::SignedExecutionHandoff,
+            prepare::PrepareContext,
+            remote_execution_policy::{
+                RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection,
+            },
+        };
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let request = &wire.request;
+        let target = &request.payload.intent.target;
+        let space = target.source.project.space.as_str();
+        let saved: String = tx.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
+            params![space,format!("task-business-observation:{}",request.hash()?),vibeface_secure::authorization::MAX_PROOF_BYTES], |row| row.get(0),
+        )?;
+        ensure!(
+            serde_json::from_str::<
+                vibeface_secure::authorization::execution_observation::SignedExecutionObservation,
+            >(&saved)?
+                == *wire,
+            "observation differs from its immutable local outbox"
+        );
+        let encoded: String = tx.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![
+                space,
+                format!("project-execution-handoff:{}", target.source.operation_id)
+            ],
+            |row| row.get(0),
+        )?;
+        let original: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+        let retained = retained_dispatch_from(&tx, identity, &original)?;
+        super::event_authorization::validate_retained_execution_scope_in(
+            &tx,
+            identity,
+            &retained.source,
+        )?;
+        let binding = retained
+            .request
+            .binding
+            .as_ref()
+            .context("observation original has no Task binding")?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let scope = super::foreign_execution_policy::current_task_readonly_policy_in(
+            &tx,
+            &current,
+            &local,
+            binding,
+            &RemoteExecutionPolicySelection {
+                execution_resource: target.execution_resource.clone(),
+                target_public_key: target.target_public_key.clone(),
+                execution_grant: request.payload.intent.execution_grant.clone(),
+            },
+            RemoteExecutionPolicyPurpose::ObservationRead,
+            &request.payload.request,
+            &request.issuer,
+            &PrepareContext {
+                context: request.payload.request.context.clone(),
+                binding_generation: Some(binding.binding.generation),
+                canonical_cwd: None,
+                execution_target_public_key: Some(target.target_public_key.clone()),
+            },
+            now_ms,
+        )?;
+        scope
+            .state()
+            .verify_execution_observation_request(request, &original, now_ms)?;
+        let strong = scope.state().verify_execution_observation_current(
+            wire,
+            &TransportEvidence::VerifiedPeer {
+                origin: DeviceId::from_key(&local),
+            },
+            now_ms,
+        )?;
+        super::foreign_execution_policy::check_task_policy_heads_in(&tx, &scope)?;
+        tx.commit()?;
+        Ok((scope, strong))
     }
 
     pub fn prepare_execution_dispatch_handoff(
