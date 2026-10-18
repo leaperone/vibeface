@@ -1571,7 +1571,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     b.client.connect()
     b.client.authenticate()
     wait_for("interrupted command remains unknown", lambda:
-        (lambda row: row if row and row["state"] == "unknown" else None)(operation(a.client, b, operation_id)))
+        (lambda row: row if row and row["state"] == "unknown" else None)(local_operation(b, network, operation_id)))
     require_quiet("restart never reruns the unknown command", lambda: marker.read_text() == "once")
     require(local_operation(b, network, operation_id)["request"]["session_id"] is None,
             "unknown command recovery does not create an SDK session")
