@@ -6027,6 +6027,7 @@ pub fn verify_client_authorization(
     expected_device_public_key: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedClientAuthorization> {
+    let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
     fn verify(
         bundle_json: &str,
         pins_json: &str,

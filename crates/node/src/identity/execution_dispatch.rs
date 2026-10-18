@@ -1017,12 +1017,25 @@ impl Store {
         let _signatures =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let invocation = &request.payload.request;
+        let observed_presenter = match transport {
+            TransportEvidence::DirectNoise { device } => {
+                device == &invocation.device && device == &invocation.presenter
+            }
+            TransportEvidence::GatewayNoise { device, gateway } => {
+                device == &invocation.device
+                    && gateway == &invocation.presenter
+                    && gateway != device
+            }
+            TransportEvidence::VerifiedPeer { origin } => {
+                origin == &invocation.presenter && origin != &invocation.device
+            }
+            TransportEvidence::LocalAgentAdapter { .. } => false,
+        };
         ensure!(
-            matches!(transport, TransportEvidence::DirectNoise { device }
-                if device == &invocation.device && device == &invocation.presenter)
+            observed_presenter
                 && matches!(invocation.actor, Actor::Account(_))
                 && invocation.context.sdk_session.is_none(),
-            "execution observation requires the actual Account device Noise origin"
+            "execution observation requires the actual signed Noise presenter"
         );
         let target = &request.payload.intent.target;
         let space = target.source.project.space.as_str();
