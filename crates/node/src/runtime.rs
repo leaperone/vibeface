@@ -1576,13 +1576,11 @@ pub(crate) mod tests {
         use crate::{
             binding::SignedBinding,
             identity::{
-                client_policy_read::verified_client_policy_for_test,
                 execution_dispatch::tests::Fixture,
                 foreign_execution_policy::{
-                    current_task_prepare_policy_in,
+                    current_task_prepare_policy_in, task_policy_for_binding_in,
                     tests::{
-                        UnseededFixture, import_current_policy, import_current_policy_in,
-                        unseeded_fixture_with_context,
+                        UnseededFixture, import_current_policy, unseeded_fixture_with_context,
                     },
                 },
                 test_support::now as fixture_now,
@@ -1591,13 +1589,10 @@ pub(crate) mod tests {
         };
         use vibeface_secure::authorization::{
             Action, EventRef, InvocationContext, JournalEntry,
-            client_policy_import::AuthorizationSelection,
             execution_handoff::*,
-            node_execution_policy::VerifiedTaskExecutionTrust,
+            node_execution_policy::{PolicyCarrierOrigin, SdkPolicySourceProvenance},
             prepare::{PrepareContext, PrepareIntent, VerifiedRemoteExecution},
-            remote_execution_policy::{
-                RemoteExecutionPolicyPurpose, build_remote_execution_policy_read_intent,
-            },
+            remote_execution_policy::RemoteExecutionPolicySelection,
         };
 
         fn checked<T>(phase: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -1625,8 +1620,6 @@ pub(crate) mod tests {
             node: Arc<Runtime>,
             c: Arc<Mutex<Store>>,
             c_runtime: Arc<Runtime>,
-            context: PrepareContext,
-            trust: VerifiedTaskExecutionTrust,
             task_creator: Option<TestNetwork>,
             project: TestNetwork,
             executor: TestNetwork,
@@ -1637,7 +1630,7 @@ pub(crate) mod tests {
 
         impl Remote {
             async fn new() -> Result<Self> {
-                Self::from_fixture(false).await
+                Box::pin(Self::from_fixture(false)).await
             }
 
             async fn from_fixture(foreign_task: bool) -> Result<Self> {
@@ -1674,14 +1667,6 @@ pub(crate) mod tests {
                 let mut fixture =
                     unseeded_fixture_with_context(project, executor, store, context.clone(), true)?;
                 let remote = import_current_policy(&mut fixture)?;
-                let trust = checked("load original Task approval", || {
-                    fixture.store.approve_task_execution_policy(
-                        &fixture.project.node,
-                        &fixture.project.client.public_key_hex(),
-                        &fixture.intent,
-                        fixture_now(),
-                    )
-                })?;
                 let binding = Self::bind(&mut fixture, &remote)?;
                 assert!(
                     fixture
@@ -1739,8 +1724,6 @@ pub(crate) mod tests {
                     node,
                     c: c_runtime.store.clone(),
                     c_runtime,
-                    context,
-                    trust,
                     task_creator,
                     project,
                     executor,
@@ -1748,7 +1731,7 @@ pub(crate) mod tests {
                     grant,
                     binding,
                 };
-                value.refresh_policies().await?;
+                value.assert_cold_current(Action::ExecutionOpen).await?;
                 value.connect(listener).await?;
                 Ok(value)
             }
@@ -1909,64 +1892,76 @@ pub(crate) mod tests {
                 )
             }
 
-            async fn refresh_policies(&self) -> Result<()> {
-                let mut store = self.node.store.lock().await;
-                let source = verified_client_policy_for_test(
-                    &mut store,
-                    &self.project.node,
-                    &self.project.client,
-                    &self.project.account,
-                    AuthorizationSelection {
-                        resource: ResourceRef {
-                            space: self.project.space.clone(),
-                            resource: self.project.resource.clone(),
-                        },
-                        audience: self.node.audience()?,
-                        grant_leaf: self.project.bundle.grant_leaf.clone(),
-                    },
-                    &self.project.pins,
-                    fixture_now(),
-                )?;
-                let mut target = self.c.lock().await;
-                for action in [Action::ExecutionOpen, Action::ExecutionSend] {
-                    let intent = checked("refresh native intent", || {
-                        build_remote_execution_policy_read_intent(
-                            &source,
-                            &json!({
-                                "selection":{
-                                    "execution_resource":self.execution,
-                                    "target_public_key":self.executor.node.public_key_hex()?,
-                                    "execution_grant":self.grant,
-                                },
-                                "context":self.context,
-                                "expected_action":action,
-                                "purpose":RemoteExecutionPolicyPurpose::Execution,
-                                "execution_pins":self.executor.pins,
-                            })
-                            .to_string(),
-                            &self.project.client,
-                            fixture_now() as f64,
-                            (fixture_now() + 60_000) as f64,
-                        )
-                        .map_err(anyhow::Error::msg)
-                    })?;
-                    import_current_policy_in(
-                        &self.project,
-                        &self.executor,
-                        &mut store,
-                        &mut target,
-                        &source,
-                        &serde_json::from_str(&intent)?,
-                        Some(&self.trust),
-                    )?;
-                }
+            async fn assert_cold_current(&self, action: Action) -> Result<()> {
+                let store = self.node.store.lock().await;
                 assert!(
                     store
                         .authorization_state()
                         .account(&self.executor.account)
                         .is_none()
                 );
+                let error = checked("cold Task Current lookup", || {
+                    task_policy_for_binding_in(
+                        &store.connection,
+                        &store.policy,
+                        &PublicKey::parse(&self.project.node.public_key_hex()?)?,
+                        &self.binding,
+                        &ResourceRef {
+                            space: self.project.space.clone(),
+                            resource: self.project.resource.clone(),
+                        },
+                        &RemoteExecutionPolicySelection {
+                            execution_resource: self.execution.clone(),
+                            target_public_key: PublicKey::parse(
+                                &self.executor.node.public_key_hex()?,
+                            )?,
+                            execution_grant: self.grant.clone(),
+                        },
+                        action,
+                        now_ms() as u64,
+                    )
+                })
+                .err()
+                .context("reopened SDK fixture unexpectedly restored Task Current")?;
+                assert!(
+                    error
+                        .root_cause()
+                        .to_string()
+                        .starts_with("NeedPolicySync:")
+                );
                 Ok(())
+            }
+
+            fn primary_journal(store: &Store) -> Result<Vec<String>> {
+                let mut query = store
+                    .connection
+                    .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
+                Ok(query
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            }
+
+            fn sdk_sources(
+                store: &Store,
+                sdk: &AgentSession,
+                operation_id: &str,
+                body_hash: Option<&ObjectHash>,
+            ) -> Result<usize> {
+                let mut query = store.connection.prepare(
+                    "SELECT value FROM identity_meta WHERE key GLOB 'task-execution-policy-v2:sdk-source:*'",
+                )?;
+                let mut count = 0;
+                for value in query.query_map([], |row| row.get::<_, String>(0))? {
+                    let source: SdkPolicySourceProvenance = serde_json::from_str(&value?)?;
+                    if source.session.sdk_session == sdk.sdk_session
+                        && source.child_facts.context.sdk_session.as_ref() == Some(&sdk.sdk_session)
+                        && source.child_facts.operation_id == operation_id
+                        && body_hash.is_none_or(|hash| source.child_facts.body_hash == *hash)
+                    {
+                        count += 1;
+                    }
+                }
+                Ok(count)
             }
 
             async fn close(&mut self) {
@@ -2089,10 +2084,44 @@ pub(crate) mod tests {
                     body["execution_session_receipt"] = json!(previous.receipt);
                 }
                 self.sync_policy().await?;
-                self.refresh_policies().await?;
+                let (pins, journal) = {
+                    let store = self.node.store.lock().await;
+                    assert!(
+                        store
+                            .authorization_state()
+                            .account(&self.executor.account)
+                            .is_none()
+                    );
+                    assert_eq!(Self::sdk_sources(&store, sdk, id, None)?, 0);
+                    (store.policy.pins().to_vec(), Self::primary_journal(&store)?)
+                };
                 let access = self.node.authorize_agent(sdk, body).await?;
                 let mut store = self.node.store.lock().await;
-                access.verification.run(|| {
+                assert_eq!(store.policy.pins(), pins.as_slice());
+                assert_eq!(Self::primary_journal(&store)?, journal);
+                assert!(
+                    store
+                        .authorization_state()
+                        .account(&self.executor.account)
+                        .is_none()
+                );
+                let task = access
+                    .authorization
+                    .task_policy()
+                    .context("SDK authorization did not refresh a Task Current policy")?;
+                assert!(task.request().node_request().is_some());
+                let target = PublicKey::parse(&self.executor.node.public_key_hex()?)?;
+                assert!(matches!(
+                    task.carrier_origin(),
+                    PolicyCarrierOrigin::DirectNoise(peer) if peer.public_key() == &target
+                ));
+                assert_eq!(task.snapshot().issuer, target);
+                assert_eq!(task.witness().issuer, target);
+                assert!(!task.original_page_envelope_hashes().is_empty());
+                assert!(
+                    Self::sdk_sources(&store, sdk, id, Some(&ObjectHash::body(&access.body)?))? > 0
+                );
+                let wire = access.verification.run(|| {
                     let dispatch = store.execution_dispatch_facts_in_scope(
                         &access.authorization,
                         &access.body,
@@ -2117,7 +2146,12 @@ pub(crate) mod tests {
                     )?;
                     ensure!(fresh, "SDK fixture did not create a new production handoff");
                     Ok(wire)
-                })
+                })?;
+                ensure!(
+                    access.verification.counts().actual_verifications <= 32,
+                    "native SDK authorization exceeded its crypto budget"
+                );
+                Ok(wire)
             }
 
             async fn c_freshness(
@@ -2177,7 +2211,7 @@ pub(crate) mod tests {
                 Ok(())
             }
 
-            async fn execute(
+            async fn execute_manual_c_fixture(
                 &self,
                 wire: SignedExecutionHandoff,
             ) -> Result<ExecutionHandoffResult> {
@@ -2252,47 +2286,50 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn initial_sdk_discovers_its_accounts_bound_task_only() -> Result<()> {
-            let mut remote = Remote::new().await?;
+            let mut remote = Box::pin(Remote::new()).await?;
             let outcome: Result<()> = async {
                 let sdk = agent(&remote.project, &remote.node).await?;
-                remote.refresh_policies().await?;
-                let mut store = remote.node.store.lock().await;
-                let targets = store.execution_dispatch_targets(
-                    &sdk,
-                    "remote-task",
-                    "codex",
-                    Action::ExecutionSend,
-                    now_ms() as u64,
-                )?;
+                let discovered = remote.node.tool(
+                    sdk.clone(),
+                    "nodes",
+                    json!({"task_id":"remote-task","executor":"codex","execution_action":"send"}),
+                    "sdk-bound-targets",
+                ).await?;
+                let targets = discovered["execution_targets"].as_array()
+                    .context("nodes tool omitted its execution targets")?;
                 assert_eq!(targets.len(), 1);
                 assert_eq!(targets[0]["execution_grant"], json!(remote.grant));
                 assert_eq!(targets[0]["target_node"], remote.executor.node.node_id()?);
                 assert_eq!(targets[0]["task_ref"], remote.binding.binding.task_ref);
-                remote.project.task(&mut store, "conversation", "unbound")?;
+                assert_eq!(targets[0]["binding_status"], "bound");
+                assert_eq!(targets[0]["connection_status"], "verification_required");
+                assert!(targets[0].get("ready").is_none());
+                {
+                    let mut store = remote.node.store.lock().await;
+                    remote.project.task(&mut store, "conversation", "unbound")?;
+                    remote.project.conversation(&mut store, "elsewhere")?;
+                    remote.project.task(&mut store, "elsewhere", "other-conversation")?;
+                }
                 assert!(
-                    store
-                        .execution_dispatch_targets(
-                            &sdk,
-                            "unbound",
-                            "codex",
-                            Action::ExecutionSend,
-                            now_ms() as u64
+                    remote.node
+                        .tool(
+                            sdk.clone(),
+                            "nodes",
+                            json!({"task_id":"unbound","executor":"codex","execution_action":"send"}),
+                            "sdk-unbound-targets",
                         )
+                        .await
                         .is_err()
                 );
-                remote.project.conversation(&mut store, "elsewhere")?;
-                remote
-                    .project
-                    .task(&mut store, "elsewhere", "other-conversation")?;
                 assert!(
-                    store
-                        .execution_dispatch_targets(
-                            &sdk,
-                            "other-conversation",
-                            "codex",
-                            Action::ExecutionSend,
-                            now_ms() as u64
+                    remote.node
+                        .tool(
+                            sdk.clone(),
+                            "nodes",
+                            json!({"task_id":"other-conversation","executor":"codex","execution_action":"send"}),
+                            "sdk-other-conversation-targets",
                         )
+                        .await
                         .is_err()
                 );
                 Ok(())
@@ -2304,20 +2341,26 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn initial_sdk_rejects_a_foreign_accounts_bound_task() -> Result<()> {
-            let mut remote = Remote::from_fixture(true).await?;
+            let mut remote = Box::pin(Remote::from_fixture(true)).await?;
             let outcome: Result<()> = async {
                 let sdk = agent(&remote.project, &remote.node).await?;
-                remote.refresh_policies().await?;
-                let store = remote.node.store.lock().await;
-                let creation = store.task_creation(remote.project.space.as_str(), "conversation", "remote-task")?;
-                let event = store.verify_event(remote.project.space.as_str(), &creation)?;
-                let EventCause::Invocation { admission } = event.cause else {
-                    bail!("foreign Task has no actual Account admission");
-                };
-                assert_eq!(admission.invocation.payload.actor, Actor::Account(remote.task_creator.as_ref().context("foreign Task creator is missing")?.account.clone()));
-                assert_ne!(admission.invocation.payload.actor, sdk.initiator);
-                assert!(store.task_binding(remote.project.space.as_str(), &creation.hash)?.is_some());
-                let error = store.execution_dispatch_targets(&sdk, "remote-task", "codex", Action::ExecutionSend, now_ms() as u64).unwrap_err();
+                {
+                    let store = remote.node.store.lock().await;
+                    let creation = store.task_creation(remote.project.space.as_str(), "conversation", "remote-task")?;
+                    let event = store.verify_event(remote.project.space.as_str(), &creation)?;
+                    let EventCause::Invocation { admission } = event.cause else {
+                        bail!("foreign Task has no actual Account admission");
+                    };
+                    assert_eq!(admission.invocation.payload.actor, Actor::Account(remote.task_creator.as_ref().context("foreign Task creator is missing")?.account.clone()));
+                    assert_ne!(admission.invocation.payload.actor, sdk.initiator);
+                    assert!(store.task_binding(remote.project.space.as_str(), &creation.hash)?.is_some());
+                }
+                let error = remote.node.tool(
+                    sdk.clone(),
+                    "nodes",
+                    json!({"task_id":"remote-task","executor":"codex","execution_action":"send"}),
+                    "sdk-foreign-account-targets",
+                ).await.unwrap_err();
                 assert_eq!(error.to_string(), "initial SDK discovery requires its own task or its initiator's confirmed binding");
                 Ok(())
             }.await;
@@ -2328,7 +2371,7 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn account_task_sdk_continuation_keeps_the_original_message_and_observed_trigger()
         -> Result<()> {
-            let mut remote = Remote::new().await?;
+            let mut remote = Box::pin(Remote::new()).await?;
             let mut phase = "enable the account task follow-up";
             let outcome: Result<()> = async {
                 let mut body = remote.project.body("create_task", "conversation");
@@ -2342,13 +2385,14 @@ pub(crate) mod tests {
                 let initial = agent(&remote.project, &remote.node).await?;
                 let message = initial.sdk_session.session_id.clone();
                 phase = "authorize and build the initial SDK open";
+                remote.assert_cold_current(Action::ExecutionOpen).await?;
                 let open = remote.dispatch(&initial, "sdk-open", None).await?;
-                phase = "complete the open at independent C";
-                let opened = remote.execute(open).await?;
+                phase = "complete the open with the manual C Store fixture";
+                let opened = remote.execute_manual_c_fixture(open).await?;
                 phase = "authorize and build the initial SDK send";
                 let send = remote.dispatch(&initial, "sdk-first-send", Some(&opened)).await?;
-                phase = "complete the send at independent C";
-                let sent = remote.execute(send).await?;
+                phase = "complete the send with the manual C Store fixture";
+                let sent = remote.execute_manual_c_fixture(send).await?;
                 let trigger = {
                     let mut store = remote.node.store.lock().await;
                     let observed = store.context(remote.project.space.as_str(), "conversation", &[])?.events.into_iter()
@@ -2362,10 +2406,13 @@ pub(crate) mod tests {
                     crate::scheduler::finish(&mut store, remote.project.space.as_str(), "conversation", &invocation)?;
                     trigger
                 };
+                phase = "reopen persisted originals without Task Current before continuation";
+                *remote.node.store.lock().await = Store::open(remote.project.directory.join("node.sqlite3"))?;
                 phase = "grant and claim the real Observed SDK continuation";
                 let continuation = remote.node.store.lock().await.agent_grant(remote.project.space.as_str(), "conversation", &initial.service,
                     &SessionRef { target: initial.device.clone(), session_id: trigger.clone() }, &trigger, now_ms() as u64)?;
                 remote.node.claim_manager(&continuation, &trigger, "remote-sdk-continuation", &crypto::digest(b"runtime manager configuration")).await?;
+                remote.assert_cold_current(Action::ExecutionSend).await?;
                 phase = "authorize and build the continuation SDK send";
                 let wire = remote.dispatch(&continuation, "sdk-continuation-send", Some(&sent)).await?;
                 let origin = wire.handoff.sdk_origin.as_ref().context("continuation handoff has no SDK origin")?;
@@ -2379,8 +2426,13 @@ pub(crate) mod tests {
                 {
                     let mut store = remote.node.store.lock().await;
                     remote.project.task(&mut store, "conversation", "unrelated-task")?;
-                    assert!(store.execution_dispatch_targets(&continuation, "unrelated-task", "codex", Action::ExecutionSend, now_ms() as u64).is_err());
                 }
+                assert!(remote.node.tool(
+                    continuation.clone(),
+                    "nodes",
+                    json!({"task_id":"unrelated-task","executor":"codex","execution_action":"send"}),
+                    "sdk-continuation-unrelated-targets",
+                ).await.is_err());
                 assert_eq!(remote.c.lock().await.connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get::<_, u64>(0))?, 0);
                 assert!(remote.node._codex_process.lock().await.is_none());
                 Ok(())
