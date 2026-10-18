@@ -9,7 +9,7 @@ test('send waits for complete conversation context while the server selects the 
   assert.equal(canSend({ ...ready, busy: false }), true)
   assert.equal(canSend({ ...ready, missing: true, busy: false }), false)
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
-  assert.equal(composerHint({ ...ready, missing: true }), '等待上下文补齐后再发送。')
+  assert.equal(composerHint({ ...ready, missing: true }), '对话还在同步。')
   assert.equal(composerHint(ready), '')
 })
 test('an explicit retry preserves the complete original message request', () => {

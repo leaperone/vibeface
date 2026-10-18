@@ -212,7 +212,7 @@ test("workspace persists exact bot creation, routed messages and execution appro
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
-    await state.sendMessage("work")
+    await state.sendMessage("work", true)
     state = render()
     assert.ok(state.messagePending)
     const pending = JSON.parse(JSON.stringify(state.messagePending))
@@ -312,7 +312,7 @@ test("future processing can be revoked while the current execution is unknown an
   assert.ok(typeof ExecutionActivity === "function")
   const execution = { operation_id: "execution", target_node: "executor", session_id: "session", revision: 4, title: "work", state: "unknown", session_state: "unknown", capabilities: ["interrupt"], pending_requests: [], freshness: "unknown", detail: "", blobs: [], goal: { task_id: "work-goal", title: "goal", acceptance: "done", status: "working", followup_mode: "continue", followup_version: 3 } }
   ExecutionActivity({ execution, conversationId: "chat" })
-  const stop = elements.find(({ props }) => props.children === "停止后续处理")
+  const stop = elements.find(({ props }) => props.children === "取消后续任务")
   assert.ok(stop && typeof stop.props.action === "function")
   assert.equal(stop.props.disabled, false)
   assert.equal(elements.find(({ props }) => props.children === "停止当前执行")?.props.disabled, true)
@@ -320,5 +320,5 @@ test("future processing can be revoked while the current execution is unknown an
   assert.deepEqual(stopped, ["execution"])
   elements.length = 0
   ExecutionActivity({ execution: { ...execution, goal: { ...execution.goal, followup_mode: "off" } }, conversationId: "chat" })
-  assert.equal(elements.some(({ props }) => props.children === "停止后续处理"), false)
+  assert.equal(elements.some(({ props }) => props.children === "取消后续任务"), false)
 })

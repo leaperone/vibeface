@@ -137,14 +137,15 @@ body {
   }
   html {
     @apply font-sans;
+    overflow-x: clip;
   }
 }
 [hidden] { display: none !important; }
 .skip-link { position: absolute; top: .5rem; left: 1rem; transform: translateY(-200%); z-index: 50; padding: .75rem; background: var(--background); }
 .skip-link:focus { transform: translateY(0); }
-.workspace-shell { height: 100dvh; min-height: 0; overflow: hidden; align-items: stretch; }
-.workspace-shell [data-slot="sidebar-container"] { height: 100dvh; }
-[data-slot="sidebar"][data-mobile="true"] { max-width: calc(100vw - 1rem); height: 100dvh; }
+.workspace-shell { height: var(--app-height, 100dvh); min-height: 0; max-width: 100%; overflow: hidden; align-items: stretch; }
+.workspace-shell [data-slot="sidebar-container"] { height: var(--app-height, 100dvh); }
+[data-slot="sidebar"][data-mobile="true"] { max-width: min(18rem, calc(100vw - 1rem)); height: var(--app-height, 100dvh); }
 .conversation-view { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .workspace-notices { flex-shrink: 0; max-height: 40%; overflow-y: auto; padding: .75rem 1rem; }
 .workspace-screen { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 1rem; }

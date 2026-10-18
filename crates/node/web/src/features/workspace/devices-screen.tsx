@@ -12,7 +12,7 @@ export function DevicesScreen() {
       <Card>
         <CardHeader><CardTitle>浏览器提醒</CardTitle></CardHeader>
         <CardContent>
-          <p className="text-sm text-muted-foreground">需要你确认或工作完成时，接收此浏览器的通知。</p>
+          <p className="text-sm text-muted-foreground">有新消息时提醒。</p>
           <Button type="button" className="min-h-11 w-fit" variant="secondary" disabled={workspace.notificationButton.disabled} onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications()) }}>
             {workspace.notificationButton.label}
           </Button>

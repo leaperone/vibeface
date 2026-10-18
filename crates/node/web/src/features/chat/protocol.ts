@@ -18,8 +18,8 @@ export function canSend(input: SendGate): boolean {
 }
 export function composerHint(input: Omit<SendGate, 'busy'>): string {
   if (!input.hasConversation) return ''
-  if (!input.loaded) return '正在读取对话。'
-  if (input.missing) return '等待上下文补齐后再发送。'
+  if (!input.loaded) return '稍等'
+  if (input.missing) return '对话还在同步。'
   return ''
 }
 export function prepareSend(input: {

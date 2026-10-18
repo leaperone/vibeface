@@ -1,4 +1,5 @@
 import { HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'
+import { ViewportHeight } from '@/components/viewport-height'
 
 import appCss from '../styles.css?url'
 
@@ -10,7 +11,7 @@ export const Route = createRootRoute({
       },
       {
         name: 'viewport',
-        content: 'width=device-width, initial-scale=1',
+        content: 'width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content',
       },
       {
         title: 'Vibeface',
@@ -33,6 +34,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <HeadContent />
       </head>
       <body>
+        <ViewportHeight />
         <p data-testid="vibeface-shell" hidden>网页壳已加载。</p>
         {children}
         <Scripts />
