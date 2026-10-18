@@ -1,10 +1,12 @@
 use super::{
-    event_authorization::{event_authorization_in_view, verify_event_envelope},
+    event_authorization::{
+        event_authorization_in_view, validate_retained_event_scope_in, verify_event_envelope,
+    },
     journal::PolicyState,
 };
 use crate::{
-    model::{AgentSession, EventBody, EventCause, OperationRequest},
-    store::{Store, StoredEvent, closure_hashes, heads_from_events, load_events_from},
+    model::{AgentSession, Event, EventBody, EventCause, OperationRequest, SignedEvent},
+    store::{Store, StoredEvent, closure_hashes, heads_from_events},
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -301,9 +303,65 @@ fn check_heads(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
     Ok(())
 }
 
+fn retained_agent_events(
+    connection: &Connection,
+    space: &str,
+    trigger: &str,
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let encoded: String = connection.query_row(
+        "SELECT envelope FROM events WHERE space_id=? AND hash=?",
+        params![space, trigger],
+        |row| row.get(0),
+    )?;
+    let source: SignedEvent = serde_json::from_str(&encoded)?;
+    let event: Event = serde_json::from_str(&source.canonical_body)?;
+    ensure!(
+        event.network_id == space,
+        "agent trigger belongs to another space"
+    );
+    validate_retained_event_scope_in(connection, &source)?;
+    let events = {
+        let mut query = connection.prepare(
+            "SELECT envelope,status FROM events WHERE space_id=? AND resource_id=? AND scope_id=? ORDER BY hash",
+        )?;
+        query
+            .query_map(
+                params![space, event.resource_id.as_str(), event.scope_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .map(|row| {
+                let (encoded, status) = row?;
+                let envelope: SignedEvent = serde_json::from_str(&encoded)?;
+                let event = serde_json::from_str(&envelope.canonical_body)?;
+                Ok((
+                    envelope.hash.clone(),
+                    StoredEvent {
+                        envelope,
+                        event,
+                        status,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?
+    };
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(events)
+}
+
 impl Store {
     pub(crate) fn agent_origin(&self, session: &AgentSession, now_ms: u64) -> Result<AgentOrigin> {
-        let events = load_events_from(&self.connection, session.space_id.as_str())?;
+        let events = retained_agent_events(
+            &self.connection,
+            session.space_id.as_str(),
+            &session.sdk_session.session_id,
+        )?;
         let origin = resolve_current_agent_origin(
             &self.policy,
             &self.connection,
@@ -352,7 +410,7 @@ impl Store {
             "agent session does not identify its triggering event"
         );
         let space_id = SpaceId::parse(space)?;
-        let events = load_events_from(&self.connection, space)?;
+        let events = retained_agent_events(&self.connection, space, trigger)?;
         let source = events.get(trigger).context("agent trigger is missing")?;
         let event = &source.event;
         ensure!(
@@ -932,6 +990,79 @@ mod tests {
                 session_id: self.trigger.clone(),
             }
         }
+    }
+
+    #[test]
+    fn retained_agent_scope_keeps_one_budget_and_rejects_changed_ready_history() -> Result<()> {
+        let mut fixture = AgentFixture::new()?;
+        let session = fixture.session();
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let descriptor = verification.run(|| {
+            fixture.store.agent_grant(
+                &fixture.space,
+                "chat",
+                &fixture.audience.service,
+                &session,
+                &fixture.trigger,
+                NOW,
+            )
+        })?;
+        assert!(verification.counts().actual_verifications > 0);
+        assert!(verification.counts().actual_verifications <= 32);
+        let expected =
+            retained_agent_events(&fixture.store.connection, &fixture.space, &fixture.trigger)?;
+        assert!(expected.len() >= 2);
+        assert!(expected.values().all(|stored| stored.status == "ready"
+            && stored.event.network_id == fixture.space
+            && stored.event.scope_id == "chat"
+            && stored.event.resource_id == descriptor.resource_id));
+        fixture.store.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let nested =
+            retained_agent_events(&fixture.store.connection, &fixture.space, &fixture.trigger)?;
+        assert_eq!(
+            nested.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        assert!(!fixture.store.connection.is_autocommit());
+        fixture.store.connection.execute_batch("ROLLBACK")?;
+        for (column, changed, original) in [
+            ("status", "pending", "ready"),
+            (
+                "author",
+                "another-author",
+                expected[&fixture.trigger].event.author.as_str(),
+            ),
+        ] {
+            fixture.store.connection.execute(
+                &format!("UPDATE events SET {column}=? WHERE space_id=? AND hash=?"),
+                params![changed, fixture.space, fixture.trigger],
+            )?;
+            assert!(
+                retained_agent_events(&fixture.store.connection, &fixture.space, &fixture.trigger,)
+                    .is_err()
+            );
+            fixture.store.connection.execute(
+                &format!("UPDATE events SET {column}=? WHERE space_id=? AND hash=?"),
+                params![original, fixture.space, fixture.trigger],
+            )?;
+        }
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        verification.run(|| -> Result<()> {
+            let refreshed = fixture.store.refresh_agent_session(&descriptor, NOW)?;
+            let origin = fixture.store.agent_origin(&refreshed, NOW)?;
+            assert_eq!(
+                origin.parent.invocation_hash(),
+                &descriptor.parent_invocation
+            );
+            Ok(())
+        })?;
+        assert!(verification.counts().actual_verifications > 0);
+        assert!(verification.counts().actual_verifications <= 32);
+        eprintln!(
+            "SDK_SESSION_CHECKPOINT_SIGNATURE_USAGE {}",
+            serde_json::to_string(&verification.counts())?
+        );
+        Ok(())
     }
 
     #[test]
