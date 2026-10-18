@@ -1910,7 +1910,7 @@ impl VerifiedPolicySet {
         }
         .ok_or(AuthorizationError::InvalidProof("missing policy domain"))
     }
-    fn find_device(&self, device: &DeviceId) -> Result<&Signed<DeviceCertificate>> {
+    pub fn find_device(&self, device: &DeviceId) -> Result<&Signed<DeviceCertificate>> {
         for (hash, certificate) in self
             .devices
             .iter()

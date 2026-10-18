@@ -1390,7 +1390,7 @@ impl Runtime {
         stopped.map(|_| ())
     }
 
-    async fn mark_fenced_operations(
+    pub(super) async fn mark_fenced_operations(
         self: &Arc<Self>,
         context: &ExecutionContext,
         mut affected: Vec<String>,
