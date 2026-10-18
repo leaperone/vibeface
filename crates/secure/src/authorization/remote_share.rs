@@ -44,11 +44,25 @@ struct RemoteExecutionShareSelection {
     execution_grant: ObjectHash,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteExecutionShareReference {
+    version: u16,
+    kind: &'static str,
+    purpose: RemoteSharePurpose,
+    selection: RemoteExecutionShareSelection,
+    context: InvocationContext,
+    actions: Vec<Action>,
+    source_project: ResourceRef,
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedRemoteExecutionShare {
     prepared: PreparedSpaceGovernanceChange,
     grant: Signed<Grant>,
     selection: RemoteExecutionShareSelection,
+    purpose: RemoteSharePurpose,
+    source_project: ResourceRef,
     usage: ExecutionProofUsage,
 }
 
@@ -221,6 +235,7 @@ pub fn prepare_remote_execution_share(
                 "remote sharing did not prepare one exact Grant",
             ));
         };
+        usage.merge(prepared.proof_usage());
         usage.record_signed(grant)?;
         usage.record_metadata(&directional)?;
         finish_usage(&mut usage)?;
@@ -231,6 +246,8 @@ pub fn prepare_remote_execution_share(
                 execution_grant: grant.hash()?,
             },
             grant: grant.clone(),
+            purpose: original.purpose,
+            source_project: original.project.clone(),
             prepared,
             usage,
         })
@@ -315,6 +332,7 @@ fn verify_finished_leaf(
 pub struct VerifiedRemoteExecutionShare {
     change: VerifiedSpaceGovernanceChange,
     selection: Option<RemoteExecutionShareSelection>,
+    reference: Option<RemoteExecutionShareReference>,
     usage: ExecutionProofUsage,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = finishRemoteExecutionShare))]
@@ -333,6 +351,7 @@ pub fn finish_remote_execution_share(
             })?;
         let mut usage =
             verify_finished_leaf(prepared, &change, committed.commit.payload.accepted_at_ms)?;
+        usage.merge(change.proof_usage());
         let selection = match verify_finished_leaf(prepared, &change, now) {
             Ok(current) => {
                 usage.merge(&current);
@@ -345,10 +364,27 @@ pub fn finish_remote_execution_share(
         };
         usage.record_signed(&committed.commit)?;
         usage.record_metadata(&committed)?;
+        let reference = selection
+            .as_ref()
+            .map(|selection| RemoteExecutionShareReference {
+                version: AUTH_VERSION,
+                kind: "vibeface-remote-execution",
+                purpose: prepared.purpose,
+                selection: selection.clone(),
+                context: prepared.grant.payload.constraints.context.clone(),
+                actions: prepared.grant.payload.actions.clone(),
+                source_project: prepared.source_project.clone(),
+            });
+        require(
+            canonical(&reference)?.len() <= MAX_PROOF_BYTES,
+            "execution sharing reference exceeds carrier byte limit",
+        )?;
+        usage.record_metadata(&reference)?;
         finish_usage(&mut usage)?;
         Ok(VerifiedRemoteExecutionShare {
             change,
             selection,
+            reference,
             usage,
         })
     })()
@@ -367,6 +403,10 @@ impl VerifiedRemoteExecutionShare {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = selectionJson))]
     pub fn selection_json(&self) -> crate::Result<String> {
         encode(&self.selection)
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = referenceJson))]
+    pub fn reference_json(&self) -> crate::Result<String> {
+        encode(&self.reference)
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
     pub fn proof_usage_json(&self) -> crate::Result<String> {
@@ -668,7 +708,6 @@ mod tests {
     fn source_request(
         purpose: RemoteSharePurpose,
         resource: &ResourceRef,
-        reader: &Identity,
     ) -> (
         Vec<PolicyPin>,
         ClientAuthorizationBundle,
@@ -771,11 +810,27 @@ mod tests {
             intent.old_execution_receipt = Some(receipt);
         }
         let source = confirmed(&pins, &bundle, &project, &key(3), &key(4));
+        let raw = verify_client_authorization(
+            &encode(&bundle).unwrap(),
+            &encode(&pins).unwrap(),
+            intent.requester.as_str(),
+            project.space.as_str(),
+            &key(3).public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        assert!(
+            build_remote_share_intent(&encode(&intent).unwrap(), &raw, &key(3), NOW as f64)
+                .is_err()
+        );
+        assert!(
+            build_remote_share_intent(&encode(&intent).unwrap(), &source, &key(99), NOW as f64)
+                .is_err()
+        );
         let original =
             build_remote_share_intent(&encode(&intent).unwrap(), &source, &key(3), NOW as f64)
                 .unwrap();
         let original: SignedRemoteShareIntent = serde_json::from_str(&original).unwrap();
-        let _ = reader;
         (pins, bundle, original)
     }
     fn import_source(
@@ -796,6 +851,34 @@ mod tests {
         let request: Signed<RemoteSharePolicyReadRequest> =
             serde_json::from_str(&request_json).unwrap();
         let state = replay_policies(pins, &bundle.journal).unwrap();
+        let mut substituted = request.payload.clone();
+        substituted.intent.intent.requester = AccountId::from_root(&PublicKey::of(&key(99)));
+        let substituted = Signed::sign(substituted, reader).unwrap();
+        assert!(
+            verify_remote_share_policy_read(
+                &state,
+                &substituted,
+                &PublicKey::of(&key(4)),
+                &PublicKey::of(reader),
+                NOW
+            )
+            .is_err()
+        );
+        let mut substituted = request.payload.clone();
+        let mut task = substituted.intent.intent.task_creation.payload.clone();
+        task.task_id = "another-task".into();
+        substituted.intent.intent.task_creation = Signed::sign(task, &key(4)).unwrap();
+        let substituted = Signed::sign(substituted, reader).unwrap();
+        assert!(
+            verify_remote_share_policy_read(
+                &state,
+                &substituted,
+                &PublicKey::of(&key(4)),
+                &PublicKey::of(reader),
+                NOW
+            )
+            .is_err()
+        );
         let read = verify_remote_share_policy_read(
             &state,
             &request,
@@ -964,8 +1047,7 @@ mod tests {
             RemoteSharePurpose::Resolution,
             RemoteSharePurpose::Rebind,
         ] {
-            let (source_pins, source_bundle, original) =
-                source_request(purpose, &resource, &key(13));
+            let (source_pins, source_bundle, original) = source_request(purpose, &resource);
             let source = import_source(&source_pins, &source_bundle, &original, &key(13));
             let summary: serde_json::Value =
                 serde_json::from_str(&source.summary_json().unwrap()).unwrap();
@@ -1031,9 +1113,30 @@ mod tests {
                 serde_json::from_str(&finished.selection_json().unwrap()).unwrap();
             assert_eq!(selection.execution_grant, grant.hash().unwrap());
             assert_eq!(selection.execution_resource, resource);
+            let reference_json = finished.reference_json().unwrap();
+            assert!(reference_json.len() <= MAX_PROOF_BYTES);
+            let reference: serde_json::Value = serde_json::from_str(&reference_json).unwrap();
+            assert_eq!(reference["version"], AUTH_VERSION);
+            assert_eq!(reference["kind"], "vibeface-remote-execution");
+            assert_eq!(reference["purpose"], serde_json::to_value(purpose).unwrap());
+            assert_eq!(
+                reference["sourceProject"],
+                serde_json::to_value(&original.intent.project).unwrap()
+            );
+            assert_eq!(
+                reference["context"],
+                serde_json::to_value(&grant.payload.constraints.context).unwrap()
+            );
+            assert_eq!(
+                reference["actions"],
+                serde_json::to_value(&grant.payload.actions).unwrap()
+            );
+            assert!(reference.get("authorization").is_none());
+            assert!(reference.get("pins").is_none());
             let late =
                 finish_remote_execution_share(&prepared, &committed, (END + 1) as f64).unwrap();
             assert_eq!(late.selection_json().unwrap(), "null");
+            assert_eq!(late.reference_json().unwrap(), "null");
             assert_eq!(late.pins_json().unwrap(), finished.pins_json().unwrap());
             let mut future = source_pins.clone();
             let minimum = future[0].minimum_head.as_mut().unwrap();
