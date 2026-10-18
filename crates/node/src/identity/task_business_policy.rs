@@ -11,11 +11,15 @@ use vibeface_secure::authorization::{
 };
 
 mod ingress;
+mod operation;
 mod original;
 mod receipt;
 mod source;
 mod storage;
 pub(crate) use ingress::{TaskBusinessPolicyImportContext, check_task_business_policy_view_in};
+pub(crate) use operation::{
+    TaskBusinessOperationContext, check_task_business_operation_current_in,
+};
 pub(crate) use original::{
     TaskBusinessOriginalRecovery, bind_task_business_original_in,
     check_task_business_original_source_in,

@@ -13,6 +13,7 @@ use vibeface_secure::{
                 TaskBusinessOriginalPolicyImport, VerifiedTaskBusinessOriginalSource,
                 begin_task_business_original_import,
             },
+            original_operation::VerifiedTaskBusinessOperationCurrent,
         },
     },
     signature_verification::{ScopedSignatureVerification, SignatureVerification},
@@ -240,6 +241,34 @@ pub(crate) fn check_task_business_original_source_in(
         source.original_page_envelope_hashes(),
     )?;
     finish_usage(source.proof_usage().clone())
+}
+
+pub(super) fn check_operation_originals_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    operation: &VerifiedTaskBusinessOperationCurrent,
+) -> Result<()> {
+    let association = association_in(connection, operation.wire_hash())?;
+    ensure!(
+        operation.wire().hash()? == association.wire_hash
+            && operation.acceptance_envelope_hash()? == association.acceptance_envelope_hash
+            && operation.original_header_envelope_hash()? == association.header_envelope_hash
+            && operation.original_witness_envelope_hash()? == association.witness_envelope_hash
+            && ObjectHash::body(&(
+                "task-business-original-page-envelopes-v2",
+                operation.original_page_envelope_hashes(),
+            ))? == association.page_envelope_hashes_hash
+            && operation.accepted_at_ms() == association.accepted_at_ms,
+        "Task operation changed its durable original acceptance or source"
+    );
+    check_primary_in(connection, primary, &association)?;
+    let (header, witness) = originals_in(connection, &association)?;
+    check_import_originals_in(
+        connection,
+        &header,
+        &witness,
+        operation.original_page_envelope_hashes(),
+    )
 }
 
 impl Store {
