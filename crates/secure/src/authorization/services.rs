@@ -12,6 +12,59 @@ pub struct VerifiedServiceDelegation {
     expires_at_ms: u64,
 }
 
+struct ServiceGrantCore {
+    service: ServiceId,
+    device: DeviceId,
+    grant_leaf: ObjectHash,
+    initiator: Actor,
+    initiating_grant: Option<ObjectHash>,
+    account_grant: Option<ObjectHash>,
+    heads: Vec<PolicyStamp>,
+    expires_at_ms: u64,
+    budget: Budget,
+    chain_depth: usize,
+}
+impl ServiceGrantCore {
+    fn into_delegation(self) -> VerifiedServiceDelegation {
+        VerifiedServiceDelegation {
+            service: self.service,
+            device: self.device,
+            grant_leaf: self.grant_leaf,
+            initiator: self.initiator,
+            initiating_grant: self.initiating_grant,
+            account_grant: self.account_grant,
+            heads: self.heads,
+            expires_at_ms: self.expires_at_ms,
+        }
+    }
+}
+
+/// This authorizes only a local SDK source for a foreign policy read.
+pub(super) struct VerifiedSdkPolicyReadSource {
+    service: ServiceId,
+    device: DeviceId,
+    heads: Vec<PolicyStamp>,
+    expires_at_ms: u64,
+    usage: execution_handoff::ExecutionProofUsage,
+}
+impl VerifiedSdkPolicyReadSource {
+    pub(super) fn service(&self) -> &ServiceId {
+        &self.service
+    }
+    pub(super) fn device(&self) -> &DeviceId {
+        &self.device
+    }
+    pub(super) fn heads(&self) -> &[PolicyStamp] {
+        &self.heads
+    }
+    pub(super) fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+    pub(super) fn proof_usage(&self) -> &execution_handoff::ExecutionProofUsage {
+        &self.usage
+    }
+}
+
 impl VerifiedServiceDelegation {
     pub fn service(&self) -> &ServiceId {
         &self.service
@@ -44,6 +97,18 @@ impl VerifiedPolicySet {
         facts: &RequestFacts,
         now_ms: u64,
     ) -> Result<VerifiedServiceDelegation> {
+        self.verify_service_grant_inner(service, grant_leaf, facts, now_ms, true)
+            .map(ServiceGrantCore::into_delegation)
+    }
+
+    fn verify_service_grant_inner(
+        &self,
+        service: &ServiceId,
+        grant_leaf: &ObjectHash,
+        facts: &RequestFacts,
+        now_ms: u64,
+        verify_execution_target: bool,
+    ) -> Result<ServiceGrantCore> {
         validate_context(&facts.context)?;
         require(
             !facts.action.requires_account(),
@@ -98,20 +163,22 @@ impl VerifiedPolicySet {
             &mut dependencies,
             &mut BTreeSet::new(),
         )?;
-        if let Some(session) = &facts.context.execution_session {
-            let target = self.find_device(&session.target)?;
-            require(
-                matches!(target.payload.subject, Actor::Service(_))
-                    && target.payload.uses.contains(&DeviceUse::Noise),
-                "execution target is not a service",
-            )?;
-            self.validate_certificate(
-                target,
-                now_ms,
-                &mut budget,
-                &mut dependencies,
-                &mut BTreeSet::new(),
-            )?;
+        if verify_execution_target {
+            if let Some(session) = &facts.context.execution_session {
+                let target = self.find_device(&session.target)?;
+                require(
+                    matches!(target.payload.subject, Actor::Service(_))
+                        && target.payload.uses.contains(&DeviceUse::Noise),
+                    "execution target is not a service",
+                )?;
+                self.validate_certificate(
+                    target,
+                    now_ms,
+                    &mut budget,
+                    &mut dependencies,
+                    &mut BTreeSet::new(),
+                )?;
+            }
         }
         let path = self.grant_chain(Some(grant_leaf))?;
         let (initiating, _) =
@@ -153,7 +220,7 @@ impl VerifiedPolicySet {
             }
             None => (actor, None, None),
         };
-        Ok(VerifiedServiceDelegation {
+        Ok(ServiceGrantCore {
             service: service.clone(),
             device: certificate.payload.device.clone(),
             grant_leaf: grant_leaf.clone(),
@@ -162,6 +229,8 @@ impl VerifiedPolicySet {
             account_grant,
             heads: dependencies.into_values().collect(),
             expires_at_ms: budget.expires_at_ms,
+            chain_depth: path.len(),
+            budget,
         })
     }
 
@@ -173,6 +242,67 @@ impl VerifiedPolicySet {
         facts: &RequestFacts,
         now_ms: u64,
     ) -> Result<VerifiedServiceDelegation> {
+        self.verify_service_delegation_core(parent, service, grant_leaf, facts, now_ms, true)
+            .map(ServiceGrantCore::into_delegation)
+    }
+
+    pub(super) fn verify_sdk_policy_read_source(
+        &self,
+        parent: &VerifiedAuthorization,
+        service: &ServiceId,
+        grant_leaf: &ObjectHash,
+        facts: &RequestFacts,
+        now_ms: u64,
+    ) -> Result<VerifiedSdkPolicyReadSource> {
+        let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+        let core =
+            self.verify_service_delegation_core(parent, service, grant_leaf, facts, now_ms, false)?;
+        require(
+            facts.context.sdk_session.as_ref().is_some_and(|session| {
+                session.target == core.device && !session.session_id.is_empty()
+            }),
+            "SDK policy source has no matching local adapter session",
+        )?;
+        let mut heads: BTreeMap<_, _> = core
+            .heads
+            .into_iter()
+            .map(|head| (head.domain.clone(), head))
+            .collect();
+        for head in parent.dependencies() {
+            if let Some(previous) = heads.insert(head.domain.clone(), head.clone()) {
+                require(
+                    previous == *head,
+                    "SDK policy read source has conflicting current heads",
+                )?;
+            }
+        }
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        usage.record_authorization(parent)?;
+        usage.record_budget(&core.budget)?;
+        usage.record_chain_depth(core.chain_depth);
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
+        {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        Ok(VerifiedSdkPolicyReadSource {
+            service: core.service,
+            device: core.device,
+            heads: heads.into_values().collect(),
+            expires_at_ms: core.expires_at_ms,
+            usage,
+        })
+    }
+
+    fn verify_service_delegation_core(
+        &self,
+        parent: &VerifiedAuthorization,
+        service: &ServiceId,
+        grant_leaf: &ObjectHash,
+        facts: &RequestFacts,
+        now_ms: u64,
+        verify_execution_target: bool,
+    ) -> Result<ServiceGrantCore> {
         self.check_current(parent, now_ms)?;
         let source = &parent.invocation.payload;
         require(
@@ -188,7 +318,13 @@ impl VerifiedPolicySet {
                 && source.context.workspace_resource == facts.context.workspace_resource,
             "service session has no matching admitted account message",
         )?;
-        let mut verified = self.verify_service_grant(service, grant_leaf, facts, now_ms)?;
+        let mut verified = self.verify_service_grant_inner(
+            service,
+            grant_leaf,
+            facts,
+            now_ms,
+            verify_execution_target,
+        )?;
         require(
             verified.initiator == source.actor
                 && verified.account_grant.as_ref() == Some(&source.grant_leaf)

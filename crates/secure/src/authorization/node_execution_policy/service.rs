@@ -152,56 +152,6 @@ fn check_binding(
     )
 }
 
-fn service_usage(
-    primary: &VerifiedPolicySet,
-    parent: &VerifiedAuthorization,
-    service_grant: &ObjectHash,
-    facts: &RequestFacts,
-    local: &PublicKey,
-    now: u64,
-) -> Result<(ExecutionProofUsage, Vec<PolicyStamp>)> {
-    let mut budget = Budget::default();
-    let mut dependencies = BTreeMap::new();
-    let record = primary
-        .resource(&facts.resource.space, &facts.resource.resource)
-        .ok_or(AuthorizationError::PolicyConflict)?;
-    budget.verify(record)?;
-    let device = primary.find_device(&DeviceId::from_key(local))?;
-    primary.validate_certificate(
-        device,
-        now,
-        &mut budget,
-        &mut dependencies,
-        &mut BTreeSet::new(),
-    )?;
-    if let Some(session) = &facts.context.execution_session {
-        let target = primary.find_device(&session.target)?;
-        primary.validate_certificate(
-            target,
-            now,
-            &mut budget,
-            &mut dependencies,
-            &mut BTreeSet::new(),
-        )?;
-    }
-    let chain = primary.grant_chain(Some(service_grant))?;
-    primary.verify_grant_path(&chain, now, &mut budget, &mut dependencies, true)?;
-    primary.expand_authorities(now, &mut budget, &mut dependencies)?;
-    for head in parent.dependencies() {
-        if let Some(previous) = dependencies.insert(head.domain.clone(), head.clone()) {
-            require(
-                previous == *head,
-                "native source has conflicting parent and service heads",
-            )?;
-        }
-    }
-    let mut usage = ExecutionProofUsage::default();
-    usage.record_authorization(parent)?;
-    usage.record_budget(&budget)?;
-    usage.record_chain_depth(chain.len());
-    Ok((usage, dependencies.into_values().collect()))
-}
-
 /// The Store checks the persisted SDK lease/origin and ready Task/binding in this transaction.
 pub fn verify_node_service_policy_source(
     primary: &VerifiedPolicySet,
@@ -246,7 +196,7 @@ pub fn verify_node_service_policy_source(
         child_facts.action,
     )?;
     let delegated =
-        primary.verify_service_delegation(parent, service, service_grant, child_facts, now)?;
+        primary.verify_sdk_policy_read_source(parent, service, service_grant, child_facts, now)?;
     require(
         service == &ServiceId::from_key(&local)
             && delegated.service() == service
@@ -286,11 +236,10 @@ pub fn verify_node_service_policy_source(
         identity,
     )?);
     check_task_read_scope(trust, &TaskExecutionPolicyRequest::Node(request.clone()))?;
-    let (mut usage, heads) =
-        service_usage(primary, parent, service_grant, child_facts, &local, now)?;
+    let mut usage = delegated.proof_usage().clone();
     let authority = VerifiedNodeTaskPolicyAuthority {
         state: primary.clone(),
-        heads,
+        heads: delegated.heads().to_vec(),
     };
     let snapshot = policy_import::native_node_execution_source_snapshot(&authority, primary_pins)?;
     if let NodeExecutionPolicyReadRequest::Current(value) = &request {
