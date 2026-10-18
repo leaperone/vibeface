@@ -2554,7 +2554,7 @@ pub(crate) mod tests {
                 )
                 .map_err(anyhow::Error::msg)?,
         )?;
-        f.store.policy.verified().verify_prepare_intent(
+        let prepared = f.store.policy.verified().verify_prepare_intent(
             &signed_prepare,
             &intent["body"],
             Action::OperationResolve,
@@ -2562,6 +2562,56 @@ pub(crate) mod tests {
             &transport,
             now() + 3,
         )?;
+        let execution_domain = PolicyDomain::Space(f.execution.space.clone());
+        let execution_head = f.store.policy.verified().head(&execution_domain).unwrap();
+        assert!(signed_prepare.payload.request.expected_policies.contains(execution_head));
+        let mut missing_execution_head = signed_prepare.payload.clone();
+        missing_execution_head.request.expected_policies.retain(|head| head.domain != execution_domain);
+        assert!(matches!(
+            f.store.policy.verified().verify_prepare_intent(
+                &Signed::sign(missing_execution_head, &f.project.client)?,
+                &intent["body"],
+                Action::OperationResolve,
+                &f.audience,
+                &transport,
+                now() + 3,
+            ),
+            Err(AuthorizationError::NeedPolicySync(_))
+        ));
+        let signed_resolution: Signed<Invocation> = serde_json::from_str(
+            &resolver.sign(
+                &client,
+                &serde_json::to_string(&signed_prepare.payload.request)?,
+                &intent["body"].to_string(),
+                "operation_resolve",
+                "resolve-terminal",
+                &f.project.node.public_key_hex()?,
+                &f.project.client,
+                (now() + 3) as f64,
+            ).map_err(anyhow::Error::msg)?,
+        )?;
+        let resolution_facts = RequestFacts {
+            resource: signed_resolution.payload.resource.clone(),
+            action: Action::OperationResolve,
+            audience: f.audience.clone(),
+            operation_id: "resolve-terminal".into(),
+            body_hash: ObjectHash::body(&intent["body"])?,
+            context: signed_resolution.payload.context.clone(),
+        };
+        let destination = prepared.execution_destination().context("resolver destination missing")?;
+        let verified_resolution = f.store.policy.verified().verify_invocation_with_execution_destination(
+            &signed_resolution, &resolution_facts, &transport, destination, now() + 3,
+        )?;
+        assert!(verified_resolution.dependencies().contains(execution_head));
+        let mut missing_execution_head = signed_resolution.payload;
+        missing_execution_head.expected_policies.retain(|head| head.domain != execution_domain);
+        assert!(matches!(
+            f.store.policy.verified().verify_invocation_with_execution_destination(
+                &Signed::sign(missing_execution_head, &f.project.client)?,
+                &resolution_facts, &transport, destination, now() + 3,
+            ),
+            Err(AuthorizationError::NeedPolicySync(_))
+        ));
         let resolver_facts =
             f.store
                 .execution_dispatch_facts(&intent["body"], &f.audience, now() + 3)?;

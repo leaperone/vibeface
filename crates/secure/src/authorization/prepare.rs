@@ -110,6 +110,31 @@ impl VerifiedPolicySet {
         action: Action,
         now_ms: u64,
     ) -> Result<VerifiedExecutionDestination> {
+        self.verify_execution_destination_with_budget(
+            project,
+            project_audience,
+            resource,
+            public_key,
+            grant_leaf,
+            context,
+            action,
+            now_ms,
+            Budget::default(),
+        )
+    }
+
+    fn verify_execution_destination_with_budget(
+        &self,
+        project: &ResourceRef,
+        project_audience: &Audience,
+        resource: &ResourceRef,
+        public_key: &PublicKey,
+        grant_leaf: &ObjectHash,
+        context: &InvocationContext,
+        action: Action,
+        now_ms: u64,
+        mut budget: Budget,
+    ) -> Result<VerifiedExecutionDestination> {
         let execution_action = match action {
                 Action::ExecutionRebind => Action::ExecutionOpen,
                 Action::ExecutionOpen
@@ -175,7 +200,6 @@ impl VerifiedPolicySet {
                 && leaf.payload.constraints.context == execution_context,
             "remote execution grant must exactly bind this task and executor",
         )?;
-        let mut budget = Budget::default();
         let mut dependencies = BTreeMap::new();
         budget.verify(project_record)?;
         budget.verify(execution)?;
@@ -192,6 +216,7 @@ impl VerifiedPolicySet {
         let (initiating, _) =
             self.verify_grant_path(&path, now_ms, &mut budget, &mut dependencies, true)?;
         self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        budget.dependencies.extend(dependencies.clone());
         let (initiator, initiating_grant) = match initiating {
             Some((actor, hash)) => (actor, Some(hash)),
             None => (Actor::Service(project_audience.service.clone()), None),
@@ -213,6 +238,42 @@ impl VerifiedPolicySet {
             budget,
             grant_depth: path.len(),
         })
+    }
+
+    pub fn verify_invocation_with_execution_destination(
+        &self,
+        signed: &Signed<Invocation>,
+        facts: &RequestFacts,
+        transport: &TransportEvidence,
+        destination: &VerifiedExecutionDestination,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        let mut budget = Budget::default();
+        let hash = budget.verify(signed)?;
+        destination.check_facts(facts)?;
+        let current = self.verify_execution_destination_with_budget(
+            &destination.project,
+            &destination.project_audience,
+            &destination.resource,
+            &destination.public_key,
+            &destination.grant_leaf,
+            &destination.context,
+            destination.action,
+            now_ms,
+            budget,
+        )?;
+        if current.heads != destination.heads {
+            return Err(AuthorizationError::NeedPolicySync(current.heads));
+        }
+        self.verify_signed_invocation_body(
+            signed,
+            hash,
+            current.budget,
+            facts,
+            transport,
+            now_ms,
+            AuthorizationPhase::Admission,
+        )
     }
 }
 
@@ -2109,7 +2170,7 @@ impl VerifiedPolicySet {
         }
         let destination = remote_selection(raw_body)?
             .map(|(resource, key, grant)| {
-                self.verify_execution_destination(
+                self.verify_execution_destination_with_budget(
                     &i.resource,
                     local_audience,
                     &resource,
@@ -2118,9 +2179,13 @@ impl VerifiedPolicySet {
                     &i.context,
                     i.action,
                     now_ms,
+                    budget.clone(),
                 )
             })
             .transpose()?;
+        if let Some(destination) = &destination {
+            budget = destination.budget.clone();
+        }
         let facts = RequestFacts {
             resource: i.resource.clone(),
             action: expected_action,
