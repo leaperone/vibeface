@@ -877,7 +877,8 @@ impl Runtime {
         let (wire, completed) = {
             let mut store = self.store.lock().await;
             access.verification.run(|| {
-                let dispatch = store.execution_dispatch_facts(
+                let dispatch = store.execution_dispatch_facts_in_scope(
+                    &access.authorization,
                     &access.body,
                     access.authorization.audience(),
                     now_ms() as u64,
@@ -903,11 +904,7 @@ impl Runtime {
             completed
         } else {
             let response = self
-                .peer_request(
-                    &access.network_id,
-                    field(&access.body, "target_node")?,
-                    json!({"type":"execution_handoff_resolve","resolution":wire}),
-                )
+                .request_execution_dispatch_resolution(&wire)
                 .await
                 .context("remote resolution outcome is unconfirmed; reconcile its original authorization before retrying")?;
             let mut store = self.store.lock().await;

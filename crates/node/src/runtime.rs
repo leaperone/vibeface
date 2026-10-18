@@ -5308,7 +5308,8 @@ impl Runtime {
             access.verification.run(|| {
                 let now = now_ms() as u64;
                 if self.is_execution_dispatch(input)? {
-                    let dispatch = store.execution_dispatch_facts(
+                    let dispatch = store.execution_dispatch_facts_in_scope(
+                        &access.authorization,
                         input,
                         access.authorization.audience(),
                         now,
