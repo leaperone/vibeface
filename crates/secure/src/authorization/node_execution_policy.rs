@@ -825,6 +825,27 @@ impl VerifiedTaskCurrentPolicy {
             ),
             "observation policy cannot authorize a business request",
         )?;
+        self.check_exact_scope(facts, selection, context)
+    }
+    pub(super) fn check_business_observation_scope(
+        &self,
+        facts: &RequestFacts,
+        selection: &RemoteExecutionPolicySelection,
+        context: &prepare::PrepareContext,
+        now: u64,
+    ) -> Result<()> {
+        require(!self.source.retained
+            && self.request.purpose() == RemoteExecutionPolicyPurpose::ObservationRead,
+            "observation source requires a current dedicated readonly policy")?;
+        self.check_window(now)?;
+        self.check_exact_scope(facts, selection, context)
+    }
+    fn check_exact_scope(
+        &self,
+        facts: &RequestFacts,
+        selection: &RemoteExecutionPolicySelection,
+        context: &prepare::PrepareContext,
+    ) -> Result<()> {
         let source_matches = match &self.source.source_scope {
             TaskPolicySourceScope::Account(_) => {
                 facts.action == self.request.expected_action()

@@ -37,6 +37,12 @@ pub(super) fn native_node_execution_source_snapshot(
     native_source_snapshot(source.state().clone(), source.heads(), primary_pins)
 }
 
+pub(super) fn native_task_business_primary_snapshot(
+    source: &task_business_policy::TaskBusinessLocalAuthority,
+) -> Result<VerifiedPolicySnapshot> {
+    native_source_snapshot(source.state().clone(), source.heads(), source.pins())
+}
+
 fn native_source_snapshot(
     mut state: VerifiedPolicySet,
     source_heads: &[PolicyStamp],
