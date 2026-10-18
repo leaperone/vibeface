@@ -456,7 +456,8 @@ mod tests {
     use vibeface_secure::{
         Identity,
         authorization::{
-            Audience, AuthorizationSelection, ResourceRef, ServiceId,
+            Audience, ResourceRef, ServiceId,
+            client_policy_import::AuthorizationSelection,
             bootstrap::{self, VerifiedNodeClaim, recovery},
         },
         signature_verification::SignatureVerification,

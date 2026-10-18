@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use vibeface_secure::{
     Identity,
     authorization::{
+        client_policy_import::AuthorizationSelection,
         bootstrap::{
             self,
             recovery::{self, node_enrollment},
