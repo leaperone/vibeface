@@ -463,6 +463,10 @@ pub struct VerifiedTaskBusinessOperationCurrent {
 }
 
 impl VerifiedTaskBusinessOperationCurrent {
+    pub fn original_source(&self) -> &VerifiedTaskBusinessOriginalSource {
+        &self.original
+    }
+
     pub fn check_current(
         &self,
         primary: &VerifiedPolicySet,
