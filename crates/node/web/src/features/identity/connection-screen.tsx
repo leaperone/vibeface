@@ -5,13 +5,12 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
 import { messageOf, parseEntry } from '@/lib/node'
-import { passphrase } from '@/lib/secure'
 import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 import { VaultControls } from './vault-controls'
 import { IncomingEnrollmentControls } from './enrollment-status'
+import { ConnectionImport } from './connection-import'
 
 const input = 'min-h-10'
 const button = 'min-h-10'
@@ -95,26 +94,7 @@ export function ConnectionScreen() {
         <Collapsible open={invitationOpen} onOpenChange={setInvitationOpen}>
           <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">使用设备邀请或可信 Node 连接卡</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
           <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
-            <p className="text-sm text-muted-foreground">在新设备上扫描自己设备显示的二维码。首次创建账户时，在 Node 终端运行 <code>vibeface access</code>，使用其输出的可信连接卡。</p>
-            <form className="space-y-4" onSubmit={event => {
-              event.preventDefault(); const form = event.currentTarget
-              void run(async () => {
-                const password = value(form, 'password'); const confirmation = value(form, 'confirmation')
-                try { await device.useConnectionCard(value(form, 'invitation'), password || confirmation ? passphrase(password, confirmation) : undefined) }
-                finally { form.reset() }
-              })
-            }}><fieldset disabled={busy || !usable || !!device.review || !!device.incomingEnrollment} className="space-y-4">
-              <label className="grid gap-2 text-sm">设备邀请或连接卡<Textarea key={device.initialInvitation} className="min-h-28 font-mono text-xs" name="invitation" required defaultValue={device.initialInvitation} autoComplete="off" spellCheck={false} /></label>
-              <details className="group/passphrase">
-                <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 rounded-lg text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">首次创建账户时设置恢复包口令<ChevronDown className="size-4 transition-transform group-open/passphrase:rotate-180" /></summary>
-                <div className="space-y-4 pt-2">
-                  <p className="text-xs text-muted-foreground">至少 12 个字符。请独立保存口令，网站无法找回。</p>
-                  <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} /></label>
-                  <label className="grid gap-2 text-sm">再次填写口令<Input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} /></label>
-                </div>
-              </details>
-              <Button className={button} type="submit">读取邀请并核对授权</Button>
-            </fieldset></form>
+            <ConnectionImport disabled={!usable || !!device.review || !!device.incomingEnrollment} />
           </CollapsibleContent>
         </Collapsible>
       </Card>

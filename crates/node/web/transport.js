@@ -34,7 +34,7 @@ export function readInvitation(value) {
   if (/^https?:\/\//.test(input)) {
     const url = new URL(input);
     const fragment = new URLSearchParams(url.hash.slice(1));
-    content = fragment.get("enroll") || fragment.get("invite") || fragment.get("bootstrap") || "";
+    content = fragment.get("enroll") || fragment.get("connect") || fragment.get("invite") || fragment.get("bootstrap") || "";
   }
   if (!content) throw new Error("邀请链接缺少配对信息。请从管理设备重新复制完整链接。");
   let invitation;
@@ -418,9 +418,9 @@ export function prepareClientRecoveryContext(materialJson, expectedNodePublicKey
   return buildRecoveryContextRequest(materialJson, identity, expectedNodePublicKey, now, now + 120000);
 }
 
-export function createClientEnrollmentOffer(accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, authorization) {
+export function createClientEnrollmentOffer(accountId, endpoint, nodePublicKey, relay, requestedRightsJson, certificateExpiresAt, authorization) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return createDeviceEnrollmentOffer(identity, accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, authorization, Date.now());
+  return createDeviceEnrollmentOffer(identity, accountId, endpoint, nodePublicKey, relay, requestedRightsJson, certificateExpiresAt, authorization, Date.now());
 }
 
 export function createClientEnrollmentIntent(offer) {

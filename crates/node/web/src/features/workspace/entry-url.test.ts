@@ -11,6 +11,45 @@ import { inputText, parseConversation, parseNodes, parsePending, parsePendingBin
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 import type { OperationRequest } from "./types.ts"
 
+async function portableLibrary(name: string): Promise<string> {
+  const sourceUrl = new URL(`../../lib/${name}.ts`, import.meta.url)
+  let source = stripTypeScriptTypes(await readFile(sourceUrl, "utf8"))
+  for (const match of [...source.matchAll(/from ['"]([^'"]+)['"]/g)]) {
+    const relative = match[1]
+    const target = relative.endsWith('.js') ? new URL(relative, sourceUrl).href : await portableLibrary(relative.replace('./', ''))
+    source = source.replace(match[0], `from ${JSON.stringify(target)}`)
+  }
+  return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
+}
+
+test("connection files and pasted cards use the same pinned target and reject mixed claims", async () => {
+  const secure = await import(new URL('../../../generated/vibeface_secure.js', import.meta.url).href)
+  await secure.default({ module_or_path: await readFile(new URL('../../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
+  const library = await import(await portableLibrary('connection-file'))
+  const key = secure.Identity.fromSecretHex('09'.repeat(32))
+  const savedLocation = Object.getOwnPropertyDescriptor(globalThis, 'location')
+  Object.defineProperty(globalThis, 'location', { configurable: true, value: { protocol: 'https:', origin: 'https://client.example' } })
+  try {
+    const content = secure.createNodeConnectionCard('https://relay.example', key.publicKeyHex(), true, undefined)
+    const file = new File([content], 'node.vibeface.json', { type: 'application/json' })
+    const pasted = await library.inspectConnectionPackage(content)
+    assert.deepEqual(await library.inspectConnectionPackage(await library.readConnectionFile(file)), pasted)
+    assert.equal(pasted.kind, 'connection')
+    assert.deepEqual(pasted.entry, { address: 'https://relay.example', node_id: key.nodeId(), relay: true })
+    assert.equal(pasted.nodePublicKey, key.publicKeyHex())
+    const raw = JSON.parse(content)
+    for (const changed of [{ node_id: '00'.repeat(32) }, { capability: null }, { claim_nonce: null }, { unknown: true }]) {
+      await assert.rejects(library.inspectConnectionPackage(JSON.stringify({ ...raw, ...changed })))
+    }
+    await assert.rejects(library.readConnectionFile(new File(['x'.repeat(65537)], 'too-large.json')))
+    await assert.rejects(library.inspectConnectionPackage('中'.repeat(21846)))
+  } finally {
+    key.free()
+    if (savedLocation) Object.defineProperty(globalThis, 'location', savedLocation)
+    else Reflect.deleteProperty(globalThis, 'location')
+  }
+})
+
 const context = {
   conversation: { conversation_id: "chat", title: "test" }, messages: [], heads: ["head"],
   missing: { events: [], blobs: [], conflicts: [] }, tasks: [], sessions: [], operations: [],

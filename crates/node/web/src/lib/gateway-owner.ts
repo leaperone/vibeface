@@ -1,6 +1,7 @@
 import { gatewayRouteApprovalHash, nodeFingerprint } from '../../generated/vibeface_secure.js'
 import { parseAuthorizationTrust, typedId } from './authorization-trust'
-import { integer, parseGatewayConnectionCard, record, strings, text } from './node'
+import { integer, record, strings, text } from './node'
+import { parseGatewayConnectionCard } from './connection-file'
 import type { AuthorizationTrust } from './authorization-trust'
 import type { ConnectionEntry, GatewayConnectionCard } from './node'
 

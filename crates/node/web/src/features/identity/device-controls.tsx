@@ -7,7 +7,9 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { readInvitation } from '../../../transport.js'
-import { entryKey, messageOf, parseGatewayConnectionCard } from '@/lib/node'
+import { entryKey, messageOf } from '@/lib/node'
+import { createNodeConnectionCard } from '../../../generated/vibeface_secure.js'
+import { downloadConnectionFile, parseGatewayConnectionCard } from '@/lib/connection-file'
 import { useDevice } from './context'
 import { RecoveryControls } from './recovery-controls'
 import { EnrollmentQr } from './enrollment-qr'
@@ -36,13 +38,18 @@ export function DeviceControls() {
   const [relay, setRelay] = useState(false)
   const [enrollmentLink, setEnrollmentLink] = useState('')
   const [manageDevices, setManageDevices] = useState(false)
+  const [inviteEntryKey, setInviteEntryKey] = useState('')
   const [revokeId, setRevokeId] = useState('')
   let gatewayPreview: ReturnType<typeof parseGatewayConnectionCard> | null = null
   try { if (gatewayCard.trim()) gatewayPreview = parseGatewayConnectionCard(readInvitation(gatewayCard)) } catch {}
   const canManageDevices = ready?.authorization.enrollmentRights.some(right => right === 'enroll_device' || right === 'revoke_device') === true
+  const inviteEntries = ready ? entries.filter(entry => entry.node_id === ready.entry.node_id) : []
+  const suggestedEntry = inviteEntries.find(entry => entry.relay && entry.address.startsWith('https:'))
+    ?? inviteEntries.find(entry => !['localhost', '127.0.0.1', '[::1]'].includes(new URL(entry.address).hostname))
+  const inviteEntry = inviteEntries.find(entry => entryKey(entry) === inviteEntryKey) ?? suggestedEntry
 
   useEffect(() => {
-    setError(''); setStatus(''); setEnrollmentLink(''); setRevokeId('')
+    setError(''); setStatus(''); setEnrollmentLink(''); setRevokeId(''); setInviteEntryKey('')
     if (!ready || !canManageDevices) return
     let mounted = true
     void device.refreshDirectory().catch(error => { if (mounted && ready.isCurrent()) setError(messageOf(error)) })
@@ -110,10 +117,17 @@ export function DeviceControls() {
       <Collapsible>
         <CollapsibleTrigger asChild><Button type="button" variant="ghost" className={disclosure}><span className="flex items-center gap-2 font-semibold"><Plus className="size-4" />新增自己的设备</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
         <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
+          <label className="grid gap-2 text-sm">新设备连接入口
+            <select className="min-h-11 w-full rounded-lg border border-input bg-background px-3" value={inviteEntry ? entryKey(inviteEntry) : ''} disabled={busy} onChange={event => { setInviteEntryKey(event.target.value); setEnrollmentLink('') }}>
+              <option value="" disabled>选择新设备可访问的入口</option>
+              {inviteEntries.map(entry => <option key={entryKey(entry)} value={entryKey(entry)}>{entry.address} · {entry.relay ? '中继' : '直连'}{['localhost', '127.0.0.1', '[::1]'].includes(new URL(entry.address).hostname) ? ' · 仅本机' : ''}</option>)}
+            </select>
+          </label>
+          <p className="text-xs text-muted-foreground">手机需要可访问的 HTTPS 入口。可先在“连接入口”中保存此节点的 Relay 路径；生成邀请时会核对真实目标。</p>
           <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" disabled={busy} checked={manageDevices} onChange={event => setManageDevices(event.target.checked)} />允许新设备新增和撤销其他设备</label>
           <p className="text-xs text-muted-foreground">扫码后仍需在此设备上核对新设备指纹并批准。链接到期后需要重新生成。</p>
-          <Button type="button" className={button} disabled={busy} onClick={() => void run(async () => { const link = await device.createEnrollmentOffer(manageDevices); if (ready?.isCurrent()) setEnrollmentLink(link) })}>生成设备邀请二维码</Button>
-          {enrollmentLink && <EnrollmentQr link={enrollmentLink} />}
+          <Button type="button" className={button} disabled={busy || !inviteEntry} onClick={() => void run(async () => { const link = await device.createEnrollmentOffer(manageDevices, inviteEntry); if (ready?.isCurrent()) setEnrollmentLink(link) })}>生成设备邀请</Button>
+          {(enrollmentLink || device.activeEnrollmentLink) && <EnrollmentQr link={enrollmentLink || device.activeEnrollmentLink} />}
         </CollapsibleContent>
       </Collapsible>
     </Card>}
@@ -190,6 +204,16 @@ export function DeviceControls() {
             </>}
           </dl>
           <div className="flex flex-wrap gap-2">
+            {ready && <>
+              <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(async () => {
+                const content = createNodeConnectionCard(ready.entry.address, ready.info.public_key, ready.entry.relay, undefined)
+                await navigator.clipboard.writeText(content)
+              }, '连接卡已复制，仅含公开连接信息。')}>复制连接卡</Button>
+              <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(async () => {
+                const content = createNodeConnectionCard(ready.entry.address, ready.info.public_key, ready.entry.relay, undefined)
+                downloadConnectionFile(content, 'node-connection.vibeface.json')
+              }, '连接文件已下载，不包含设备私钥。')}>下载连接文件</Button>
+            </>}
             <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(device.backupVault, '设备密钥备份已下载。重新连接仍需可信账户信息，完整账户恢复请使用单独的恢复包。')}>下载设备密钥备份</Button>
             <Button type="button" variant="outline" className={button} disabled={busy} onClick={device.disconnect}>断开连接</Button>
           </div>

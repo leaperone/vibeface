@@ -72,24 +72,6 @@ export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '连接入口')
   return { address: validEndpoint(text(v.address)), node_id: validTarget(v.node_id), relay: boolean(v.relay) }
 }
-export function parseConnectionCard(value: unknown): ConnectionCard {
-  const card = record(value, '连接卡')
-  if (Object.keys(card).some(key => !['url', 'node_id', 'relay', 'node_public_key', 'capability', 'claim_nonce'].includes(key))) throw new Error('连接卡包含不支持的旧授权或额外字段。请重新运行 vibeface access。')
-  const entry = parseEntry({ address: card.url, node_id: card.node_id, relay: card.relay ?? false })
-  const nodePublicKey = validTarget(card.node_public_key)
-  if (card.capability === undefined && card.claim_nonce === undefined) return { kind: 'connection', entry, nodePublicKey }
-  const capability = validTarget(card.capability)
-  const claimNonce = validTarget(card.claim_nonce)
-  if (capability !== claimNonce) throw new Error('连接卡的认领凭证与挑战随机数不一致。')
-  return { kind: 'claim', entry, nodePublicKey, capability, claimNonce }
-}
-export function parseGatewayConnectionCard(value: unknown): GatewayConnectionCard {
-  const card = record(value, '网关连接卡')
-  if (card.kind !== 'vibeface-gateway' || card.version !== 2 || Object.keys(card).some(key => !['kind', 'version', 'gateway', 'approval'].includes(key))) throw new Error('请使用包含已批准路由的网关连接卡。')
-  const gateway = parseConnectionCard(card.gateway)
-  if (gateway.kind !== 'connection') throw new Error('网关连接卡不能包含设备认领凭证。')
-  return { kind: 'vibeface-gateway', version: 2, gateway, approval: record(card.approval, '网关路由批准') }
-}
 export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.node_id}:${entry.relay}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)

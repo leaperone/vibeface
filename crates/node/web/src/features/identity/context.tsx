@@ -1,9 +1,10 @@
+import { parseConnectionCard, parseGatewayConnectionCard } from '@/lib/connection-file'
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { prepareClientGatewayOwnerRoute, prepareClientGatewayReply, buildClientRemoteShareIntent, approveClientEnrollmentIntent, clientVaultStatus, connectDevice, createClientEnrollmentOffer, exportDeviceVault, initClient, lockClient, prepareClientDeviceEnrollment, prepareClientDeviceRevocation, prepareClientAccountNodeEnrollment, prepareClientFirstAuthenticatorIntent, prepareClientFirstAuthenticatorRegistration, prepareClientMembershipChange, prepareClientDirectionalGrant, prepareClientGrantRevocation, prepareClientTeamCreation, restoreClientTeamCreation, prepareClientPasskeyDeviceEnrollment, prepareClientRecoveryContext, prepareClientExecutionServiceRegistration, prepareClientRemoteExecutionShare, protectClientVaultWithPrf, readInvitation, signClientEnrollmentPossession, signClientPasskeyEnrollmentIntent, signClientPasskeyEnrollmentPossession } from '../../../transport.js'
 import type { ClientVaultOptions, DeviceChannel, VaultProfile } from '../../../transport.js'
 import {
-  array, entryKey, integer, messageOf, parseEntry, parseInfo, parseConnectionCard, parseGatewayConnectionCard, record, same, text,
+  array, entryKey, integer, messageOf, parseEntry, parseInfo, record, same, text,
 } from '@/lib/node'
 import type { AuthorizedRequest, ConnectionCard, ConnectionEntry, EntryInfo, AccountDeviceDirectory, PublicIdentity, ReadyConnection, RpcFacts, GatewayConnectionCard } from '@/lib/node'
 import { prepareRpc } from '@/lib/rpc-action'
@@ -26,7 +27,7 @@ import { createAccount, openAccountPackage, recoverAccount, restoreAccountRecove
 import { finishAccountDeviceChange, finishFirstAuthenticatorRegistration, finishSpaceGovernanceChange, gatewayRouteApprovalHash, finishExecutionServiceRegistration, selectExecutionServiceManagement, revalidateClientPolicyAuthorization, finishRemoteExecutionShare, verifyExecutionServiceSelection, finishTeamCreation, Identity, recoveryOpen, recoverySeal, deriveAuthorizationId, nodeFingerprint, verifySignedEvent, verifyAccountEnrollment, verifyAccountEnrollmentFromOffer, verifyDeviceEnrollmentIntentForManager, verifyDeviceEnrollmentOffer, verifyPasskeyEnrollmentRequestFromOffer } from '../../../generated/vibeface_secure.js'
 import { enrollmentHref, parseEnrollmentReference } from '@/lib/enrollment-reference'
 import type { EnrollmentReference } from '@/lib/enrollment-reference'
-import { parseEnrollmentRequest, requestDeviceEnrollment, verifyEnrollmentStatus } from '@/lib/enrollment'
+import { checkEnrollmentOffer, parseEnrollmentRequest, parseSavedEnrollmentRequest, requestDeviceEnrollment, verifyEnrollmentStatus } from '@/lib/enrollment'
 import type { EnrollmentRequest, EnrollmentStatus } from '@/lib/enrollment'
 import { assertNodePasskey } from '@/lib/node-passkey'
 import { registerNodePasskey } from '@/lib/node-passkey-registration'
@@ -43,7 +44,7 @@ type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: bo
 type RecoveryReadProject = { accountId: string; spaceId: string; projectId: string; entry: ConnectionEntry; nodePublicKey: string; expiresAt: number }
 type RecoveryInput = { file: File; password: string; connectionCard: string; targetConnectionCard?: string; sourceReadProjectIds?: string[]; sourceReadExpiresAt?: number }
 type IncomingEnrollment = { accountId: string; newDevicePublicKey: string; requestedRights: string[]; status: EnrollmentStatus }
-type ManagerEnrollment = { offer: string; reference: EnrollmentReference; material: ReturnType<ReturnType<typeof verifyScopedAuthentication>['enrollmentMaterial']> }
+type ManagerEnrollment = { offer: string; reference: EnrollmentReference; published: boolean }
 type BusinessRoute = { kind: 'direct' } | {
   kind: 'gateway'; channel: DeviceChannel | null; card: GatewayConnectionCard; approvalHash: string; sourceRef: string;
   generation: number; status: 'connecting' | 'ready' | 'unavailable'; error: string
@@ -77,8 +78,8 @@ type DeviceContextValue = {
   connectGatewayCard(content: string): Promise<void>; disconnectGateway(): void
   exportGatewayRequest(): Promise<string>; approveGatewayRoute(input: GatewayOwnerInput): Promise<void>; retryGatewayRoute(): Promise<void>; ownerGatewayRoute: GatewayOwnerRoute | null
   refreshDirectory(): Promise<void>
-  createEnrollmentOffer(manageDevices: boolean): Promise<string>
-  incomingEnrollment: IncomingEnrollment | null; enrollmentRequests: EnrollmentRequest[]; managerEnrollmentActive: boolean
+  createEnrollmentOffer(manageDevices: boolean, route?: ConnectionEntry): Promise<string>
+  incomingEnrollment: IncomingEnrollment | null; enrollmentRequests: EnrollmentRequest[]; managerEnrollmentActive: boolean; activeEnrollmentLink: string
   refreshIncomingEnrollment(): Promise<void>; refreshEnrollmentRequests(): Promise<EnrollmentRequest[]>; approveEnrollmentRequest(requestId: string): Promise<void>; completeEnrollmentRequest(requestId: string): Promise<void>; revokeDevice(deviceId: string): Promise<void>
   joinWithPasskey(protectLocal: boolean): Promise<void>
   localProtectionNotice: string
@@ -190,6 +191,19 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   const profileKey = (key: string) => `profile.${storageProfile()}.${key}`
   const savedSpaces = () => array(load(profileKey('policy-trusts'), true) ?? []).map(parseAuthorizationTrust)
+  const managerEnrollmentKey = (active: Session) => profileKey(`enrollment-offer.${active.entry.node_id}.${active.authorization?.scope.account_id}`)
+  function savedManagerEnrollment(active: Session): ManagerEnrollment | null {
+    if (!active.authorization?.enrollmentRights.includes('enroll_device')) return null
+    const value = load(managerEnrollmentKey(active), true)
+    if (!value) return null
+    const input = record(value), rawReference = record(input.reference)
+    if (integer(rawReference.expires_at_ms) <= Date.now()) return null
+    const reference = parseEnrollmentReference(rawReference), offer = text(input.offer)
+    checkEnrollmentOffer(offer, reference)
+    if (reference.node_public_key !== active.channel.publicKey || reference.account_id !== active.authorization.scope.account_id
+      || record(JSON.parse(offer)).issuer !== identityRef.current?.publicKey || typeof input.published !== 'boolean') throw new Error('已保存的邀请不属于当前管理设备、账户或节点。')
+    return { offer, reference, published: input.published }
+  }
 
   const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null); setIncomingEnrollment(null); setFirstPasskeyPending(false); setNodeEnrollmentReview(null); setGovernancePending(''); setTeamCreationReview(null); setCrossRecoveryPending(false) }, [])
   const closeConnection = useCallback((preserveSensitive: boolean) => {
@@ -576,6 +590,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     releaseSession(active); active.authorization = authorization; active.policyFrames = frames
     active.businessGeneration += 1
     if (active.businessRoute.kind === 'gateway') { active.businessRoute.channel?.close(); active.businessRoute.channel = null; active.businessRoute.status = 'unavailable'; active.businessRoute.error = '项目授权已刷新，正在重新连接网关。' }
+    managerEnrollment.current = savedManagerEnrollment(active)
+    setManagerEnrollmentActive(managerEnrollment.current?.published === true)
     saveEntry(active.entry)
     store(profileKey('last-entry'), active.entry)
     const projectKey = profileKey(`project.${authorization.scope.space_id}.${authorization.audience.service}`)
@@ -1569,28 +1585,55 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!sensitive.current?.nodeEnrollment) throw new Error('当前没有待批准的 Node 入网请求。')
     await sensitive.current.nodeEnrollment()
   }
-  async function createEnrollmentOffer(manageDevices: boolean) {
+  async function createEnrollmentOffer(manageDevices: boolean, route?: ConnectionEntry) {
     if (!ready?.isCurrent()) throw changed()
     const active = current(), authorization = active.authorization
     if (!authorization || !authorization.enrollmentRights.includes('enroll_device')) throw new Error('当前设备没有新增账户设备的权限。')
-    if (active.entry.relay || ready.audiencePublicKey !== active.channel.publicKey) throw new Error('请使用目标 Node 的直接入口，再生成新设备邀请。')
+    if (ready.audiencePublicKey !== active.channel.publicKey) throw new Error('请连接账户所属 Node，再生成新设备邀请。')
+    const selected = route ?? entries.find(entry => entry.node_id === active.entry.node_id && entry.relay && new URL(entry.address).protocol === 'https:') ?? active.entry
+    if (selected.node_id !== active.entry.node_id) throw new Error('邀请路径必须指向当前账户节点。')
+    if (selected.address !== active.entry.address || selected.relay !== active.entry.relay) {
+      const probe = await connectDevice(selected)
+      try {
+        const info = record(await probe.request('info'))
+        if (probe.publicKey !== active.channel.publicKey || info.node_id !== active.entry.node_id || info.public_key !== active.channel.publicKey) throw new Error('所选入口没有连接到当前节点。')
+      } finally { probe.close() }
+      if (session.current !== active) throw changed()
+    }
     const material = authorization.enrollmentMaterial()
     if (material.expiresAt === null) throw new Error('当前设备没有有效的账户管理期限。')
     const certificateExpiry = material.expiresAt
     const rights = manageDevices ? authorization.enrollmentRights.filter(right => right === 'enroll_device' || right === 'revoke_device').sort() : []
     const own = identityRef.current
     if (!own) throw changed()
-    const offer = await withSessionAuthorization(active, own, handle => createClientEnrollmentOffer(ready.scope.account_id, active.entry.address, active.channel.publicKey, JSON.stringify(rights), certificateExpiry, handle))
-    const checked = verifyDeviceEnrollmentOffer(offer, Date.now())
-    try {
-      const expected = { version: 2, kind: 'vibeface-device-enrollment', endpoint: active.entry.address, node_public_key: active.channel.publicKey,
-        account_id: checked.accountId(), offer_hash: checked.offerHash(), expires_at_ms: checked.expiresAtMs() }
-      const reply = record(await callSession(active, 'identity', { method: 'enrollment_offer_publish', params: { offer: JSON.parse(offer) } }))
-      const reference = parseEnrollmentReference(reply.reference)
-      if (!same(reference, expected)) throw new Error('节点返回的邀请引用与本地签名邀请不同。')
-      managerEnrollment.current = { offer, reference, material }; setEnrollmentRequests([]); setManagerEnrollmentActive(true)
-      return enrollmentHref(location.href, reference)
-    } finally { checked.free() }
+    return navigator.locks.request(profileKey('enrollment-offer-writer'), async () => {
+      if (session.current !== active || identityRef.current !== own) throw changed()
+      const previous = savedManagerEnrollment(active)
+      let flow: ManagerEnrollment
+      if (previous && !previous.published) {
+        const checked = checkEnrollmentOffer(previous.offer, previous.reference)
+        if (previous.reference.endpoint !== selected.address || previous.reference.relay !== selected.relay || !same(checked.rights, rights)) throw new Error('原邀请的发布结果尚未核对。请保持原入口和权限后重试。')
+        flow = previous
+      } else {
+        const offer = await withSessionAuthorization(active, own, handle => createClientEnrollmentOffer(ready.scope.account_id, selected.address, active.channel.publicKey, selected.relay, JSON.stringify(rights), certificateExpiry, handle))
+        const checked = verifyDeviceEnrollmentOffer(offer, Date.now())
+        try {
+          flow = { offer, published: false, reference: parseEnrollmentReference({ version: 2, kind: 'vibeface-device-enrollment', endpoint: selected.address, node_public_key: active.channel.publicKey, relay: selected.relay,
+            account_id: checked.accountId(), offer_hash: checked.offerHash(), expires_at_ms: checked.expiresAtMs() }) }
+        } finally { checked.free() }
+        store(managerEnrollmentKey(active), flow)
+      }
+      const existing = record(await callSession(active, 'identity', { method: 'enrollment_offer_get', params: { account_id: flow.reference.account_id, offer_hash: flow.reference.offer_hash } }))
+      if (existing.status === 'not_found') {
+        if (existing.account_id !== flow.reference.account_id || existing.offer_hash !== flow.reference.offer_hash) throw new Error('节点未确认原邀请不存在，不会重新发布。')
+        const reply = record(await callSession(active, 'identity', { method: 'enrollment_offer_publish', params: { offer: JSON.parse(flow.offer) } }))
+        if (reply.offer_hash !== flow.reference.offer_hash || !same(parseEnrollmentReference(reply.reference), flow.reference)) throw new Error('节点返回的邀请引用与本地签名邀请不同。')
+      } else if (!same(existing.offer, JSON.parse(flow.offer))) throw new Error('节点返回的邀请与原签名不同。')
+      const published = { ...flow, published: true }
+      store(managerEnrollmentKey(active), published)
+      managerEnrollment.current = published; setEnrollmentRequests([]); setManagerEnrollmentActive(true)
+      return enrollmentHref(location.href, published.reference)
+    })
   }
   async function refreshEnrollmentRequests() {
     const active = current(), flow = managerEnrollment.current
@@ -1642,6 +1685,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const auth = await readAuthentication(active, trust, { resourceId: connection.project.id, audience: connection.audience })
       await authenticate(auth, active, trust, connection.project.id, { resourceId: connection.project.id, audience: connection.audience })
       managerEnrollment.current = null; setManagerEnrollmentActive(false); setEnrollmentRequests([])
+      store(managerEnrollmentKey(active), null)
       await refreshDirectory()
     } finally { verified?.free(); prepared.free() }
   }
@@ -1755,7 +1799,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (savedSpaces().some(trust => trust.accountId !== reference.account_id)) throw new Error('请为另一个账户创建独立设备配置。')
     const own = identityRef.current
     if (!own) throw new Error('请先创建或解锁新设备配置。')
-    const active = await open({ address: reference.endpoint, node_id: nodeFingerprint(reference.node_public_key), relay: false }, reference.node_public_key)
+    cancelSensitive()
+    let active = await open({ address: reference.endpoint, node_id: nodeFingerprint(reference.node_public_key), relay: reference.relay }, reference.node_public_key)
+    const requestKey = profileKey('enrollment-request')
     const controller = new AbortController()
     let pending: Awaited<ReturnType<typeof requestDeviceEnrollment>> | null = null
     let passkey: {
@@ -1764,7 +1810,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       assertion: Awaited<ReturnType<typeof assertNodePasskey>> | null
     } | null = null
     const update = (status: EnrollmentStatus) => setIncomingEnrollment({ accountId: reference.account_id, newDevicePublicKey: own.publicKey, requestedRights: pending?.rights ?? [], status })
+    const resume = async () => {
+      if (identityRef.current !== own || controller.signal.aborted) throw changed()
+      active = session.current ?? await open(active.entry, reference.node_public_key)
+      if (active.channel.publicKey !== reference.node_public_key) throw changed()
+    }
     const flow: Sensitive = {
+      keepOnNetworkClose: () => pending !== null && !controller.signal.aborted,
+      retainForReconnect: entry => pending !== null && identityRef.current === own && entry.node_id === nodeFingerprint(reference.node_public_key),
       cancel() {
         controller.abort(); pending?.release(); pending = null
         passkey?.prepared?.free(); passkey?.qualified.free()
@@ -1772,10 +1825,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       },
       async passkeyEnrollment(protectLocal) {
         if (!pending || controller.signal.aborted) throw changed()
+        await resume()
         if (protectLocal && !own.profileId) throw new Error('本机 Passkey 保护需要独立口令设备配置。临时会话只验证账户身份。')
         const original = pending
         if (!passkey) {
           const offer = original.offer
+          if (!offer) throw new Error('原设备接入已经完成，请检查加入结果。')
           try {
             const intentJson = signClientPasskeyEnrollmentIntent(JSON.stringify(original.unsignedIntent), offer)
             const qualified = verifyPasskeyEnrollmentRequestFromOffer(intentJson, offer, Date.now())
@@ -1792,7 +1847,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           if (!attempt.completion) {
             attempt.assertion?.localPrf?.fill(0); attempt.assertion?.prfSalt?.fill(0); attempt.assertion = null
             attempt.assertion = await assertNodePasskey({ pendingResponse: preparedResponse, signedIntent: JSON.parse(attempt.intentJson), nodePublicKey: reference.node_public_key,
-              offer: original.offer,
+              offer: attempt.offer,
               signal: controller.signal, requestPrf: protectLocal,
               verify: (pendingId, response) => callSession(active, 'identity', { method: 'passkey_verify_device', params: { intent: JSON.parse(attempt.intentJson), pending_id: pendingId, response, origin: location.origin } }),
             })
@@ -1820,10 +1875,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         controller.signal.throwIfAborted()
         await authenticate(auth, active, trust, undefined, undefined, controller.signal)
         if (protectLocal) await saveLocalPasskeyProtection(attempt.assertion, controller.signal)
+        store(requestKey, null)
         if (sensitive.current === flow) cancelSensitive()
       },
       async refreshEnrollment() {
         if (!pending || controller.signal.aborted) throw changed()
+        await resume()
         const original = pending
         const response = await callSession(active, 'identity', { method: 'enrollment_status', params: { account_id: reference.account_id, offer_hash: reference.offer_hash, request_id: original.requestId } })
         controller.signal.throwIfAborted()
@@ -1834,11 +1891,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           const auth = await readAuthentication(active, original.trust, undefined, controller.signal)
           controller.signal.throwIfAborted()
           await authenticate(auth, active, original.trust, undefined, undefined, controller.signal)
+          store(requestKey, null)
           if (sensitive.current === flow) cancelSensitive()
           return
         }
         if (!status.intent) throw new Error('节点未提供原设备签署的批准意图。')
         const offer = original.offer
+        if (!offer) throw new Error('无法恢复未完成的设备邀请。请保留原申请并核对。')
         let qualified: ReturnType<typeof verifyAccountEnrollmentFromOffer> | null = null
         try {
           qualified = verifyAccountEnrollmentFromOffer(JSON.stringify(status.intent), offer, Date.now())
@@ -1854,11 +1913,20 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
     sensitive.current = flow
     try {
-      pending = await requestDeviceEnrollment(reference, own.publicKey, (method, params) => callSession(active, 'identity', { method, params }), controller.signal)
+      if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能安全保存设备申请。')
+      pending = await navigator.locks.request(profileKey('enrollment-request-writer'), () => requestDeviceEnrollment({
+        reference, ownPublicKey: own.publicKey, call: (method, params) => callSession(active, 'identity', { method, params }), signal: controller.signal,
+        saved: load(requestKey, true), save(request) {
+          controller.signal.throwIfAborted()
+          if (identityRef.current !== own || session.current !== active) throw changed()
+          store(requestKey, request)
+        },
+      }))
       controller.signal.throwIfAborted()
       await persistPolicyTrust(active, pending.trust, controller.signal)
       saveEntry(active.entry); store(profileKey('last-entry'), active.entry); store(profileKey('last-space'), pending.trust.spaceId)
-      controller.signal.throwIfAborted(); update('requested')
+      controller.signal.throwIfAborted(); update(pending.status.status)
+      if (pending.status.status === 'completed') await flow.refreshEnrollment?.()
     } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel(); throw error }
   }
   async function refreshIncomingEnrollment() {
@@ -2150,6 +2218,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (version !== generation.current) throw changed()
     identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
     setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces()); setRecoveryReadProjects(readRecoveryReadProjects(load(profileKey('recovery-read-projects'))))
+    const pendingEnrollment = load(profileKey('enrollment-request'), true)
+    if (pendingEnrollment) { await beginEnrollment(parseSavedEnrollmentRequest(pendingEnrollment).reference); return }
     if (!initialInvitation) {
       const lastEntry = load(profileKey('last-entry'), true)
       if (lastEntry) await connect(parseEntry(lastEntry))
@@ -2176,7 +2246,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let mounted = true
     const fragment = new URLSearchParams(location.hash.slice(1))
-    const invitation = fragment.get('enroll') || fragment.get('bootstrap') || fragment.get('invite') || ''
+    const invitation = fragment.get('enroll') || fragment.get('bootstrap') || fragment.get('connect') || fragment.get('invite') || ''
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
     if (invitation) setInitialInvitation(invitation)
     clientVaultStatus().then(status => {
@@ -2187,7 +2257,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const value: DeviceContextValue = {
     identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, review, initialInvitation, ownerGatewayRoute,
     exportGatewayRequest, approveGatewayRoute, retryGatewayRoute, connectGatewayCard, disconnectGateway, connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, createEnrollmentOffer, beginRecovery, restorePendingAccountRecovery, reencrypt,
-    incomingEnrollment, enrollmentRequests, managerEnrollmentActive, localProtectionNotice, governancePending, retryGovernance, createTeam, restoreTeamCreation, changeMembership, grantProject, revokeProjectGrant, teamCreationReview, confirmTeamCreation, nodeEnrollmentReview, beginNodeEnrollment, confirmNodeEnrollment, refreshIncomingEnrollment, refreshEnrollmentRequests, approveEnrollmentRequest, completeEnrollmentRequest, revokeDevice, joinWithPasskey,
+    incomingEnrollment, enrollmentRequests, managerEnrollmentActive, activeEnrollmentLink: managerEnrollment.current?.published ? enrollmentHref(location.href, managerEnrollment.current.reference) : '', localProtectionNotice, governancePending, retryGovernance, createTeam, restoreTeamCreation, changeMembership, grantProject, revokeProjectGrant, teamCreationReview, confirmTeamCreation, nodeEnrollmentReview, beginNodeEnrollment, confirmNodeEnrollment, refreshIncomingEnrollment, refreshEnrollmentRequests, approveEnrollmentRequest, completeEnrollmentRequest, revokeDevice, joinWithPasskey,
     firstPasskeyPending, registerAccountPasskey, resumePasskeyRegistration, crossRecoveryPending, recoveryReadProjects, resumeCrossRecoveryPreparation, restorePendingCrossRecovery,
     registerExecutionService, latestExecutionServiceResource: currentExecutionService()?.resourceId ?? '', downloadExecutionServiceBackup, executionServiceBackupAvailable: currentExecutionServiceBackup() !== null,
     executionServiceOptions: executionServiceResources.filter(matchesExecutionService).map(item => ({ spaceId: item.spaceId, resourceId: item.resourceId })), refreshExecutionServices, selectExecutionService,

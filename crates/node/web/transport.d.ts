@@ -35,7 +35,7 @@ export function prepareClientAccountRecovery(materialJson: string, context: Para
 export function buildClientAccountRecoveryPending(prepared: PreparedAccountRecovery, created: Parameters<typeof import('./generated/vibeface_secure.js').buildAccountRecoveryPending>[1], nextRoot: Identity, previousMaterialJson: string, endpoint: string): ReturnType<typeof import('./generated/vibeface_secure.js').buildAccountRecoveryPending>
 export function restoreClientAccountRecovery(pendingJson: string): ReturnType<typeof import('./generated/vibeface_secure.js').restoreAccountRecoveryPending>
 export function prepareClientRecoveryContext(materialJson: string, expectedNodePublicKey: string): string
-export function createClientEnrollmentOffer(accountId: string, endpoint: string, nodePublicKey: string, requestedRightsJson: string, certificateExpiresAt: number, authorization: VerifiedClientAuthorization): string
+export function createClientEnrollmentOffer(accountId: string, endpoint: string, nodePublicKey: string, relay: boolean, requestedRightsJson: string, certificateExpiresAt: number, authorization: VerifiedClientAuthorization): string
 export function createClientEnrollmentIntent(offer: VerifiedEnrollmentOffer): string
 export function approveClientEnrollmentIntent(intentJson: string, authorization: VerifiedClientAuthorization): string
 export function signClientEnrollmentPossession(qualified: VerifiedAccountEnrollment, pendingNonce: string): string
