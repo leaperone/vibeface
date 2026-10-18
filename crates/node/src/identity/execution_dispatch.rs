@@ -1146,7 +1146,7 @@ pub(super) fn retained_execution_history_reference_in(
                 &serde_json::to_string(&actual)?,
                 &serde_json::to_string(&account.source_body)?,
                 &serde_json::to_string(&account.invocation)?,
-                &serde_json::to_string(&binding)?,
+                &binding.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default(),
             )
             .map_err(anyhow::Error::msg)?,
         )?;
