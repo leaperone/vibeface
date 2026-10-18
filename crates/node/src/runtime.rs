@@ -5372,6 +5372,15 @@ impl Runtime {
             Ok(session)
             }).with_context(|| format!("SDK authorize source refresh; actual={:?}", verification.counts()))?
             };
+            for (field, expected) in [
+                ("sdk_session", serde_json::to_value(&session.sdk_session)?),
+                ("parent_invocation", json!(session.parent_invocation)),
+            ] {
+                if let Some(actual) = body.get(field) {
+                    ensure!(actual == &expected, "SDK request changed its {field}");
+                }
+                body[field] = expected;
+            }
             let task_policy = self
                 .ensure_sdk_execution_task_policy(&session, &body)
                 .await
