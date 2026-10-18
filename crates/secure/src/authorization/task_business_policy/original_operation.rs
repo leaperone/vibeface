@@ -443,3 +443,283 @@ impl VerifiedTaskBusinessOperationCurrent {
         &self.usage
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::{
+        client_policy_import::require_confirmed_client_policy,
+        execution_observation::tests::{
+            RetainedHistoryFixture, retained_history_fixture_with_execution_source,
+        },
+    };
+    use super::super::tests::{current_policy, current_policy_at, original_authorization};
+    use super::*;
+
+    fn receipts(
+        state: &VerifiedPolicySet,
+        heads: &[PolicyStamp],
+        challenge_hash: &ObjectHash,
+        fixture: &RetainedHistoryFixture,
+        now: u64,
+        expires: u64,
+    ) -> Vec<Signed<FreshnessReceipt>> {
+        heads
+            .iter()
+            .map(|head| {
+                let authority = match &head.domain {
+                    PolicyDomain::Account(id) => &state.account(id).unwrap().authority,
+                    PolicyDomain::Space(id) => &state.space(id).unwrap().authority,
+                };
+                let signer = [&fixture.project_node, &fixture.executor]
+                    .into_iter()
+                    .find(|identity| PublicKey::of(identity) == authority.public_key)
+                    .unwrap();
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: challenge_hash.clone(),
+                        issued_at_ms: now,
+                        expires_at_ms: expires,
+                    },
+                    signer,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn operation_fixture() -> (RetainedHistoryFixture, VerifiedTaskBusinessOriginalSource) {
+        let mut fixture = retained_history_fixture_with_execution_source();
+        let now = fixture.invocation.payload.not_before_ms;
+        let mut invocation = fixture.actual.handoff.invocation.payload.clone();
+        invocation.expires_at_ms = now + 1_000;
+        fixture.actual.handoff.invocation =
+            Signed::sign(invocation, &fixture.project_node).unwrap();
+        let current = current_policy(&fixture);
+        let wire = TaskBusinessWire::Submit(fixture.actual.handoff.clone());
+        let original = original_authorization(current.state(), &fixture.actual.handoff, now);
+        let transport = StoredTransport::VerifiedPeer {
+            origin: fixture.actual.handoff.invocation.payload.presenter.clone(),
+        };
+        let verified = current
+            .state()
+            .verify_execution_handoff(
+                &fixture.actual.handoff,
+                &original,
+                &transport.clone().into_evidence(),
+                None,
+                now,
+            )
+            .unwrap();
+        let challenge = ExecutionHandoffChallenge::new(
+            &verified,
+            CheckStage::Admit,
+            Nonce::random().unwrap(),
+            now,
+            now + 500,
+        )
+        .unwrap();
+        let freshness = ExecutionHandoffFreshness {
+            receipts: receipts(
+                current.state(),
+                verified.dependencies(),
+                &challenge.hash().unwrap(),
+                &fixture,
+                now,
+                now + 500,
+            ),
+            challenge,
+        };
+        let fresh = current
+            .state()
+            .verify_execution_handoff_freshness(&verified, &freshness, now)
+            .unwrap();
+        current
+            .state()
+            .admit_execution_handoff(&verified, &fresh, now)
+            .unwrap();
+        fixture.acceptance = RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt: Signed::sign(
+                ExecutionHandoffAdmissionReceipt::new(
+                    &fixture.actual.handoff,
+                    &freshness,
+                    &transport,
+                    now,
+                )
+                .unwrap(),
+                &fixture.executor,
+            )
+            .unwrap(),
+            freshness,
+            transport,
+        };
+        let mut export = build_task_business_policy_export(
+            &current,
+            TaskBusinessAuthorization::Submit(&verified),
+            &wire,
+            &fixture.project_node,
+            now,
+        )
+        .unwrap();
+        let source = require_confirmed_client_policy(&fixture.source).unwrap();
+        let mut pages = Vec::new();
+        for entry in source.journal() {
+            if export.allows_entry(entry).unwrap() {
+                pages.push(
+                    export
+                        .append_entry_page(&fixture.project_node, entry.clone(), now)
+                        .unwrap(),
+                );
+            }
+        }
+        let (last, witness) = export.finish_pages(&fixture.project_node, now).unwrap();
+        pages.push(last);
+        let mut import = begin_task_business_original_import(
+            &fixture.state,
+            &wire,
+            &fixture.acceptance,
+            export.header(),
+            &PublicKey::of(&fixture.executor),
+            now,
+        )
+        .unwrap();
+        for page in &pages {
+            import.append_page(page).unwrap();
+        }
+        let original = import.finish_original(&witness).unwrap();
+        (fixture, original)
+    }
+
+    #[test]
+    fn accepted_task_operation_renews_after_wire_and_header_expiry_without_new_admission() {
+        let (mut fixture, original) = operation_fixture();
+        let now = original
+            .header()
+            .payload
+            .expires_at_ms
+            .max(fixture.actual.handoff.invocation.payload.expires_at_ms)
+            + 1;
+        let c_key = PublicKey::of(&fixture.executor);
+        let current_b = current_policy_at(&fixture, now);
+        let check =
+            begin_task_business_operation_current(&fixture.state, &original, &c_key, &[], now)
+                .unwrap();
+        assert!(
+            check
+                .issue_challenge(CheckStage::Admit, Nonce::random().unwrap(), now, now + 500)
+                .is_err()
+        );
+        assert!(
+            check
+                .issue_challenge(
+                    CheckStage::RemoteRead,
+                    Nonce::random().unwrap(),
+                    now,
+                    now + 500
+                )
+                .is_err()
+        );
+        let state = check.combined.clone();
+        for stage in [CheckStage::Start, CheckStage::Renew] {
+            let challenge = check
+                .issue_challenge(stage, Nonce::random().unwrap(), now, now + 500)
+                .unwrap();
+            let source = verify_task_business_receipt_operation(
+                &current_b,
+                original.header(),
+                &fixture.actual.handoff,
+                &fixture.acceptance,
+                &challenge,
+                now,
+            )
+            .unwrap();
+            assert!(source.authorization().submission().phase == AuthorizationPhase::Operation);
+            assert_eq!(
+                source.acceptance_envelope_hash(),
+                &ObjectHash::body(&fixture.acceptance).unwrap()
+            );
+            let proof = ExecutionHandoffFreshness {
+                receipts: receipts(
+                    state.state(),
+                    check.dependencies(),
+                    &challenge.hash().unwrap(),
+                    &fixture,
+                    now,
+                    now + 500,
+                ),
+                challenge,
+            };
+            let mut missing = proof.clone();
+            missing.receipts.pop();
+            assert!(check.clone().finish(&missing, now).is_err());
+            let cap = check.clone().finish(&proof, now).unwrap();
+            assert_eq!(cap.wire(), &fixture.actual.handoff);
+            assert_eq!(cap.deadline_ms(), now + 500);
+            assert!(
+                cap.handoff_authorization().original().phase == AuthorizationPhase::Operation
+                    && cap.handoff_authorization().submission().phase
+                        == AuthorizationPhase::Operation
+            );
+            let fresh = state
+                .state()
+                .verify_execution_handoff_freshness(cap.handoff_authorization(), &proof, now)
+                .unwrap();
+            assert!(
+                state
+                    .state()
+                    .admit_execution_handoff(cap.handoff_authorization(), &fresh, now)
+                    .is_err()
+            );
+            let mut another_wire = fixture.actual.handoff.clone();
+            another_wire
+                .invocation
+                .payload
+                .operation_id
+                .push_str("-other");
+            assert!(
+                verify_task_business_receipt_operation(
+                    &current_b,
+                    original.header(),
+                    &another_wire,
+                    &fixture.acceptance,
+                    &proof.challenge,
+                    now,
+                )
+                .is_err()
+            );
+        }
+        let mut higher = original.pins().to_vec();
+        higher[0].minimum_head.as_mut().unwrap().sequence += 1;
+        assert!(
+            begin_task_business_operation_current(&fixture.state, &original, &c_key, &higher, now,)
+                .is_err()
+        );
+        let scope = original.scope();
+        let mut document = fixture
+            .state
+            .space(&scope.execution_resource.space)
+            .unwrap()
+            .clone();
+        document.previous = fixture
+            .state
+            .head(&PolicyDomain::Space(document.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document
+            .grants
+            .retain(|hash| hash != &scope.execution_grant);
+        fixture
+            .state
+            .install_space(Signed::sign(document, &fixture.root).unwrap())
+            .unwrap();
+        assert!(
+            begin_task_business_operation_current(&fixture.state, &original, &c_key, &[], now,)
+                .is_err()
+        );
+        assert_eq!(
+            original.accepted_at_ms(),
+            fixture.invocation.payload.not_before_ms
+        );
+    }
+}
