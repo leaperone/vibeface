@@ -227,8 +227,25 @@ impl Runtime {
         };
         let requests = match name {
             "command" | "delegate" => {
-                let target = self.agent_target(access, &intent, name).await?;
-                let cwd = field(&intent, "cwd")?;
+                let mut resolved = intent.clone();
+                if resolved.get("cwd").is_none() || resolved.get("target_node").is_none() {
+                    if let Some(project) = self.agent_project(access).await? {
+                        if resolved.get("cwd").is_none() {
+                            resolved["cwd"] = json!(project.cwd);
+                        }
+                        if resolved.get("target_node").is_none() {
+                            resolved["target_node"] = json!(project.target_node);
+                        }
+                    }
+                }
+                ensure!(
+                    resolved["cwd"]
+                        .as_str()
+                        .is_some_and(|cwd| !cwd.trim().is_empty()),
+                    "choose an allowed cwd from nodes, or configure a Bot project before executing"
+                );
+                let target = self.agent_target(access, &resolved, name).await?;
+                let cwd = field(&resolved, "cwd")?;
                 if name == "command" {
                     let timeout = intent["timeout_secs"]
                         .as_u64()
@@ -334,6 +351,28 @@ impl Runtime {
             intent,
             requests,
         })
+    }
+
+    async fn agent_project(&self, access: &Access) -> Result<Option<BotProject>> {
+        let scope = access
+            .conversation_id
+            .as_deref()
+            .context("missing tool scope")?;
+        let manager = access
+            .manager
+            .as_ref()
+            .context("project preferences require a live management invocation")?;
+        let store = self.store.lock().await;
+        let job = store
+            .scheduler_job(
+                &access.network_id,
+                scope,
+                &manager.trigger,
+                &manager.target_node,
+            )?
+            .context("management job is missing")?;
+        let context = store.context(&access.network_id, scope, &job.basis_heads)?;
+        Ok(crate::scheduler::context_bot(&context)?.and_then(|bot| bot.project))
     }
 
     async fn agent_target(
