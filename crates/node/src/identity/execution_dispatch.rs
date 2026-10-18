@@ -3147,6 +3147,7 @@ pub(crate) mod tests {
         pub(crate) fn bind_at(&mut self, cwd: String) -> Result<SignedBinding> {
             let mut body = self.selection("bind_execution", "bind-remote")?;
             for (field, value) in [
+                ("binding_generation", json!(1)),
                 ("conversation_id", json!("conversation")),
                 ("task_id", json!("remote-task")),
                 ("task_ref", json!(self.task.hash)),
