@@ -205,26 +205,6 @@ fn require_current_heads(
     Ok(())
 }
 
-fn require_sql_heads(connection: &Connection, expected_heads: &[PolicyStamp]) -> Result<()> {
-    for expected in expected_heads {
-        let (kind, id) = match &expected.domain {
-            PolicyDomain::Account(id) => ("account", id.as_str()),
-            PolicyDomain::Space(id) => ("space", id.as_str()),
-        };
-        let actual:(u64,u64,String)=connection.query_row("SELECT authority_epoch,sequence,head_hash FROM current_policy_heads WHERE domain_kind=? AND domain_id=?",params![kind,id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
-        ensure!(
-            actual
-                == (
-                    expected.authority_epoch,
-                    expected.sequence,
-                    expected.head.as_str().to_owned()
-                ),
-            "passkey policy changed in the database"
-        );
-    }
-    Ok(())
-}
-
 fn read_pending(
     connection: &Connection,
     account: &AccountId,
@@ -395,6 +375,11 @@ fn persist_pending(
     now_ms: u64,
 ) -> Result<PasskeyPreparation> {
     require_current_heads(policy.verified(), pending.envelope())?;
+    super::client_policy_read::check_heads_in(
+        connection,
+        policy,
+        &pending.envelope().expected_heads,
+    )?;
     let snapshot = policy.prepare_network_update(&[], now_ms)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     journal::commit_in(&tx, &snapshot)?;
@@ -416,6 +401,7 @@ fn persist_pending(
             "same passkey intent cannot change its ceremony or RP"
         );
         let result = preparation(&tx, old, now_ms)?;
+        super::passkey_rpc::ensure_preparation_carrier(&result)?;
         tx.commit()?;
         return Ok(result);
     }
@@ -432,6 +418,7 @@ fn persist_pending(
         params![pending.envelope().account.as_str(), id.as_str(), pending.envelope().enrollment_hash.as_str(), pending.envelope().nonce.as_str(), encoded, pending.envelope().expires_at_ms],
     )?;
     let result = preparation(&tx, pending, now_ms)?;
+    super::passkey_rpc::ensure_preparation_carrier(&result)?;
     tx.commit()?;
     Ok(result)
 }
@@ -1357,7 +1344,11 @@ impl Store {
             "passkey request was already consumed"
         );
         require_current_heads(self.policy.verified(), pending.envelope())?;
-        require_sql_heads(&self.connection, &pending.envelope().expected_heads)?;
+        super::client_policy_read::check_heads_in(
+            &self.connection,
+            &self.policy,
+            &pending.envelope().expected_heads,
+        )?;
         let policy = self.policy.verified();
         let account_document = policy
             .account(account)
@@ -1553,6 +1544,10 @@ impl Store {
         let mut receipts = prepared.receipts;
         for receipt in &mut receipts {
             receipt.accepted_at_ms = now_ms;
+            ensure!(
+                canonical(receipt)?.len() <= vibeface_secure::authorization::MAX_PROOF_BYTES,
+                "Passkey receipt exceeds its bounded carrier"
+            );
             tx.execute(
                 "INSERT INTO passkey_receipts(account_id,envelope_hash,completion_hash,receipt,accepted_at_ms) VALUES(?,?,?,?,?)",
                 params![receipt.account.as_str(), receipt.envelope_hash.as_str(), receipt.completion_hash.as_str(), canonical(&receipt)?, now_ms],

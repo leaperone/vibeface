@@ -6,7 +6,8 @@ use crate::{config::Config, crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use vibeface_secure::authorization::{
-    AUTH_VERSION, AuthenticatorManagementIntent, DeviceId, ObjectHash, PublicKey, Signed,
+    AUTH_VERSION, AuthenticatorManagementIntent, DeviceId, MAX_PROOF_BYTES, ObjectHash, PublicKey,
+    Signed,
     enrollment::{
         AuthenticatorEnrollmentIntent, DeviceEnrollmentIntent, verify_passkey_enrollment_request,
     },
@@ -51,6 +52,7 @@ fn preparation_response(
     signer: &vibeface_secure::Identity,
     now: u64,
 ) -> Result<Value> {
+    ensure_preparation_carrier(&prepared)?;
     let mut response = serde_json::to_value(&prepared)?;
     if let PasskeyPreparation::Pending { pending, .. } = prepared {
         let expires_at_ms = pending.envelope().expires_at_ms;
@@ -67,6 +69,24 @@ fn preparation_response(
     Ok(response)
 }
 
+pub(super) fn ensure_preparation_carrier(prepared: &PasskeyPreparation) -> Result<()> {
+    let mut carrier = serde_json::to_value(prepared)?;
+    if let PasskeyPreparation::Pending { pending, .. } = prepared {
+        let expires_at_ms = pending.envelope().expires_at_ms;
+        // Ed25519 key and signature fields have fixed wire lengths; this value is only measured.
+        carrier["signed_pending"] = json!({
+            "payload":NodePasskeyPending {version:AUTH_VERSION,pending:pending.clone(),
+                issued_at_ms:u64::MAX,expires_at_ms},
+            "issuer":"0".repeat(64),"signature":"0".repeat(128),
+        });
+    }
+    ensure!(
+        serde_json::to_vec(&carrier)?.len() <= MAX_PROOF_BYTES,
+        "Passkey preparation exceeds its bounded carrier"
+    );
+    Ok(())
+}
+
 impl Store {
     pub(crate) fn passkey_command(
         &mut self,
@@ -77,10 +97,16 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        ensure!(
+            serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
+            "Passkey request exceeds its bounded carrier"
+        );
         let context = passkey_context(config, identity, params)?;
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
-        match method {
+        let response = match method {
             "passkey_prepare_registration" => {
                 let intent: Signed<AuthenticatorEnrollmentIntent> =
                     serde_json::from_value(params["intent"].clone())?;
@@ -217,6 +243,11 @@ impl Store {
                 )?)
             }
             _ => bail!("unknown Passkey method"),
-        }
+        }?;
+        ensure!(
+            serde_json::to_vec(&response)?.len() <= MAX_PROOF_BYTES,
+            "Passkey response exceeds its bounded carrier"
+        );
+        Ok(response)
     }
 }

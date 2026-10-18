@@ -1,6 +1,9 @@
 //! Account policy changes require both a current manager and an existing Passkey.
 
+use super::client_policy_import::require_confirmed_client_policy;
+use super::execution_handoff::ExecutionProofUsage;
 use super::*;
+use crate::signature_verification::{ScopedSignatureVerification, SignatureVerification};
 use crate::webauthn::{
     PasskeyAssertionProof, PasskeyPurpose, RegisteredPasskey, verify_passkey_assertion,
 };
@@ -34,6 +37,7 @@ pub struct AuthenticatorPolicyApproval {
 pub struct VerifiedAuthenticatorManagement {
     intent: Signed<AuthenticatorManagementIntent>,
     hash: ObjectHash,
+    budget: Budget,
 }
 impl VerifiedAuthenticatorManagement {
     pub fn intent(&self) -> &AuthenticatorManagementIntent {
@@ -53,6 +57,15 @@ impl VerifiedAuthenticatorManagement {
     }
     pub fn expires_at_ms(&self) -> u64 {
         self.intent.payload.expires_at_ms
+    }
+    pub fn proof_usage(&self) -> Result<ExecutionProofUsage> {
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&self.budget)?;
+        if let Some(counts) = SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        Ok(usage)
     }
 }
 
@@ -83,6 +96,8 @@ impl VerifiedPolicySet {
         signed: &Signed<AuthenticatorManagementIntent>,
         now_ms: u64,
     ) -> Result<VerifiedAuthenticatorManagement> {
+        let _signature_scope = ScopedSignatureVerification::new();
+        let mut budget = Budget::default();
         let intent = &signed.payload;
         let account = self
             .account(&intent.account)
@@ -107,17 +122,18 @@ impl VerifiedPolicySet {
                 &intent.account,
                 &signed.issuer,
                 now_ms,
-                &mut Budget::default(),
+                &mut budget,
             )?;
             require(
                 intent.expires_at_ms <= deadline,
                 "authenticator management intent exceeds current manager expiry",
             )?;
         }
-        signed.verify_signature()?;
+        budget.verify(signed)?;
         Ok(VerifiedAuthenticatorManagement {
             intent: signed.clone(),
             hash: ObjectHash::body(intent)?,
+            budget,
         })
     }
     pub(super) fn validate_authenticator_manager(
@@ -260,29 +276,23 @@ impl VerifiedPolicySet {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = buildAuthenticatorManagementIntent))]
 pub fn build_authenticator_management_intent(
     auth: &VerifiedClientAuthorization,
-    bundle_json: &str,
-    pins_json: &str,
     proposal_json: &str,
     identity: &Identity,
     now_ms: f64,
     expires_at_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<Signed<AuthenticatorManagementIntent>> {
         require(
-            bundle_json.len() <= 1_048_576
-                && pins_json.len() <= MAX_PROOF_BYTES
-                && proposal_json.len() <= MAX_PROOF_BYTES,
+            proposal_json.len() <= MAX_PROOF_BYTES,
             "authenticator management input too large",
         )?;
         require(
             auth.scope.device_id == DeviceId::from_key(&PublicKey::of(identity)),
             "authenticator manager key mismatch",
         )?;
-        let bundle: ClientAuthorizationBundle = serde_json::from_str(bundle_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid management journal"))?;
-        let pins: Vec<PolicyPin> = serde_json::from_str(pins_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid management pins"))?;
-        let state = replay_policies(&pins, &bundle.journal)?;
+        let snapshot = require_confirmed_client_policy(auth)?;
+        let state = snapshot.state();
         for head in auth.heads() {
             require(
                 state.head(&head.domain) == Some(head),
@@ -295,14 +305,48 @@ pub fn build_authenticator_management_intent(
             proposal.account == auth.scope.account_id,
             "authenticator proposal account mismatch",
         )?;
+        let now = bootstrap::timestamp(now_ms)?;
+        let resource = &auth
+            .resources
+            .first()
+            .ok_or(AuthorizationError::InvalidProof(
+                "authenticator management requires a selected client resource",
+            ))?
+            .payload;
+        let selected = ResourceRef {
+            space: resource.space.clone(),
+            resource: resource.resource.clone(),
+        };
+        let current = verify_client_policy_state_selected(
+            state.clone(),
+            &ClientAuthorizationBundle {
+                journal: Vec::new(),
+                grant_leaf: auth.grant_leaf.clone(),
+            },
+            snapshot.pins(),
+            auth.scope.account_id.clone(),
+            auth.scope.space_id.clone(),
+            PublicKey::of(identity),
+            Some(&selected),
+            now,
+        )?;
         let signed = create_management_intent(
-            &state,
+            state,
             &proposal,
             identity,
-            bootstrap::timestamp(now_ms)?,
+            now,
             bootstrap::timestamp(expires_at_ms)?,
         )?;
-        state.verify_authenticator_management_intent(&signed, bootstrap::timestamp(now_ms)?)?;
+        let verified =
+            state.verify_authenticator_management_intent(&signed, bootstrap::timestamp(now_ms)?)?;
+        let mut usage = verified.proof_usage()?;
+        usage.record_budget(&current.budget)?;
+        usage.record_chain_depth(state.grant_chain(Some(&auth.grant_leaf))?.len());
+        usage.record_metadata(&proposal)?;
+        if let Some(counts) = SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
         Ok(signed)
     };
     serde_json::to_string(&build().map_err(|e| e.to_string())?)
