@@ -452,7 +452,7 @@ mod tests {
                     conversation: Some("chat".into()),
                     sdk_session: Some(SessionRef {
                         target: self.audience().device,
-                        session_id: "trigger".into(),
+                        session_id: "11".repeat(32),
                     }),
                     workspace_resource: Some(self.resource.resource.clone()),
                     ..Default::default()
@@ -461,6 +461,14 @@ mod tests {
         }
 
         fn parent(&self, grant: &ObjectHash, now_ms: u64) -> VerifiedAuthorization {
+            self.parent_with_admission(grant, now_ms).0
+        }
+
+        fn parent_with_admission(
+            &self,
+            grant: &ObjectHash,
+            now_ms: u64,
+        ) -> (VerifiedAuthorization, events::AdmissionProof) {
             let context = InvocationContext {
                 conversation: Some("chat".into()),
                 workspace_resource: Some(self.resource.resource.clone()),
@@ -544,9 +552,171 @@ mod tests {
                 .verify_freshness(&auth, &challenge, &receipts, NOW)
                 .unwrap();
             let admitted = self.state.admit_operation(&auth, &freshness, NOW).unwrap();
-            self.state
+            let current = self
+                .state
                 .verify_operation_authorization(&admitted, &facts, &transport, now_ms)
-                .unwrap()
+                .unwrap();
+            (
+                current,
+                events::AdmissionProof {
+                    invocation,
+                    source_body: serde_json::json!({"message":"run this"}),
+                    challenge,
+                    receipts,
+                    admitted_at_ms: NOW,
+                    transport: events::StoredTransport::from(&transport),
+                },
+            )
+        }
+
+        fn sdk_source_provenance(
+            &self,
+            parent: &VerifiedAuthorization,
+            child_facts: &RequestFacts,
+            lease_deadline: u64,
+        ) -> node_execution_policy::SdkPolicySourceProvenance {
+            use node_execution_policy::{
+                SdkPolicyLease, SdkPolicySession, SdkPolicySourceFacts, SdkPolicySourceProvenance,
+                sdk_policy_source_heads,
+            };
+            let (_, origin) =
+                self.parent_with_admission(&parent.signed_invocation().payload.grant_leaf, NOW);
+            assert_eq!(&origin.invocation, parent.signed_invocation());
+            let sdk = child_facts.context.sdk_session.as_ref().unwrap().clone();
+            let trigger = EventRef::parse(&sdk.session_id).unwrap();
+            let body = serde_json::json!({
+                "method":"agent_start","space_id":self.space,"resource_id":self.resource.resource,
+                "conversation_id":"chat","authorization_id":format!("manager:{}",trigger.as_str()),
+                "trigger":trigger,"sdk_session":sdk,"parent_invocation":parent.invocation_hash(),
+                "sdk_config":"actual-fixture-configuration",
+            });
+            let mut facts = self.agent_facts();
+            facts.context.sdk_session = Some(sdk.clone());
+            facts.operation_id = format!("manager:{}", trigger.as_str());
+            facts.body_hash = ObjectHash::body(&body).unwrap();
+            let delegation = self
+                .state
+                .verify_service_delegation(
+                    parent,
+                    &self.audience().service,
+                    &self.service_grant,
+                    &facts,
+                    NOW,
+                )
+                .unwrap();
+            let invocation = Signed::sign(
+                Invocation {
+                    version: AUTH_VERSION,
+                    actor: Actor::Service(self.audience().service),
+                    device: delegation.device().clone(),
+                    initiator: delegation.initiator().clone(),
+                    initiating_grant: delegation.initiating_grant().cloned(),
+                    resource: facts.resource.clone(),
+                    action: facts.action,
+                    audience: facts.audience.clone(),
+                    presenter: delegation.device().clone(),
+                    operation_id: facts.operation_id.clone(),
+                    body_hash: facts.body_hash.clone(),
+                    grant_leaf: delegation.grant_leaf().clone(),
+                    expected_policies: delegation.heads().to_vec(),
+                    context: facts.context.clone(),
+                    nonce: Nonce::from_bytes([14; 32]),
+                    not_before_ms: NOW,
+                    expires_at_ms: NOW + 10_000,
+                },
+                &self.node,
+            )
+            .unwrap();
+            let transport = TransportEvidence::LocalAgentAdapter {
+                service: self.audience().service,
+                session: sdk.clone(),
+            };
+            let manager = self
+                .state
+                .verify_invocation(&invocation, &facts, &transport, NOW)
+                .unwrap();
+            let challenge = FreshnessChallenge::new(
+                &manager,
+                CheckStage::Admit,
+                Nonce::from_bytes([15; 32]),
+                NOW,
+                lease_deadline,
+            )
+            .unwrap();
+            let receipts: Vec<_> = manager
+                .dependencies()
+                .iter()
+                .map(|current| {
+                    Signed::sign(
+                        FreshnessReceipt {
+                            version: AUTH_VERSION,
+                            current: current.clone(),
+                            challenge_hash: challenge.hash().unwrap(),
+                            issued_at_ms: NOW,
+                            expires_at_ms: lease_deadline,
+                        },
+                        &self.node,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let fresh = self
+                .state
+                .verify_freshness(&manager, &challenge, &receipts, NOW)
+                .unwrap();
+            self.state.admit_operation(&manager, &fresh, NOW).unwrap();
+            SdkPolicySourceProvenance {
+                version: AUTH_VERSION,
+                origin: execution_handoff::CompactSdkOrigin {
+                    message_event: trigger.clone(),
+                    sdk_trigger: trigger,
+                    invocation: origin.invocation,
+                    challenge: origin.challenge,
+                    receipts: origin.receipts,
+                    admitted_at_ms: origin.admitted_at_ms,
+                    transport: origin.transport,
+                },
+                session: SdkPolicySession {
+                    space_id: self.space.clone(),
+                    resource_id: self.resource.resource.clone(),
+                    service: self.audience().service,
+                    device: delegation.device().clone(),
+                    conversation_id: "chat".into(),
+                    sdk_session: sdk,
+                    grant_leaf: delegation.grant_leaf().clone(),
+                    initiator: delegation.initiator().clone(),
+                    initiating_grant: delegation.initiating_grant().cloned(),
+                    parent_invocation: parent.invocation_hash().clone(),
+                    expected_policies: delegation.heads().to_vec(),
+                    expires_at_ms: delegation.expires_at_ms(),
+                },
+                service_grant: self.service_grant.clone(),
+                manager_admission: events::AdmissionProof {
+                    invocation,
+                    source_body: body,
+                    challenge: challenge.clone(),
+                    receipts: receipts.clone(),
+                    admitted_at_ms: NOW,
+                    transport: events::StoredTransport::from(&transport),
+                },
+                lease: SdkPolicyLease {
+                    challenge,
+                    receipts,
+                    checked_at_ms: NOW,
+                    deadline: fresh.expires_at_ms(),
+                },
+                current_binding: None,
+                child_facts: SdkPolicySourceFacts::from(child_facts),
+                source_heads: sdk_policy_source_heads(
+                    &self.state,
+                    parent,
+                    &self.audience().service,
+                    &self.service_grant,
+                    child_facts,
+                    NOW,
+                )
+                .unwrap(),
+            }
         }
 
         fn update_space(&mut self, change: impl FnOnce(&mut SpaceDocument)) {
@@ -612,6 +782,16 @@ mod tests {
                 target: DeviceId::from_key(&target),
                 session_id: "foreign-execution".into(),
             });
+            facts.operation_id = "sdk-execution-open".into();
+            facts.body_hash = ObjectHash::body(&serde_json::json!({
+                "method":"bind_execution","space_id":self.space,"resource_id":self.resource.resource,
+                "conversation_id":"chat","task_id":"task","task_ref":facts.context.task,
+                "authorization_id":facts.operation_id,"target_node":remote.node.node_id(),
+                "session_id":"foreign-execution","executor":"codex","cwd":"/workspace",
+                "execution_resource":selection.execution_resource,"target_public_key":selection.target_public_key,
+                "execution_grant":selection.execution_grant,"sdk_session":facts.context.sdk_session,
+                "parent_invocation":self.parent(&self.owner_grant, NOW).invocation_hash(),
+            })).unwrap();
             let mut read = facts.context.clone();
             read.sdk_session = None;
             let context = prepare::PrepareContext {
@@ -682,6 +862,7 @@ mod tests {
                 .find_device(&DeviceId::from_key(&PublicKey::of(&remote.node)))
                 .is_err()
         );
+        let provenance = fixture.sdk_source_provenance(&parent, &facts, NOW + 400);
         let (_, request) = verify_node_service_policy_source(
             &fixture.state,
             &fixture.pins,
@@ -693,7 +874,7 @@ mod tests {
             &selection,
             &context,
             None,
-            NOW + 400,
+            &provenance,
             &fixture.node,
             remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
             NOW,
@@ -705,6 +886,10 @@ mod tests {
         };
         intent.verify_signature().unwrap();
         assert_eq!(intent.issuer, PublicKey::of(&fixture.node));
+        assert_eq!(
+            intent.payload.source_provenance.as_ref(),
+            Some(&ObjectHash::body(&provenance).unwrap())
+        );
         assert!(intent.payload.context.context.sdk_session.is_none());
         assert!(facts.context.sdk_session.is_some());
         assert_eq!(
@@ -901,6 +1086,7 @@ mod tests {
                 "action":{"type":"open"},"resources":[]}});
         facts.body_hash = ObjectHash::body(&body).unwrap();
         let parent = fixture.parent(&fixture.owner_grant, NOW);
+        let provenance = fixture.sdk_source_provenance(&parent, &facts, NOW + 250);
         let (source, request) = verify_node_service_policy_source(
             &fixture.state,
             &fixture.pins,
@@ -912,7 +1098,7 @@ mod tests {
             &selection,
             &context,
             None,
-            NOW + 250,
+            &provenance,
             &fixture.node,
             RemoteExecutionPolicyPurpose::Execution,
             NOW,
@@ -971,6 +1157,7 @@ mod tests {
             .cloned()
             .collect();
         let mut previous = header.hash().unwrap();
+        let mut pages = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
             let page_request = import.page_request();
             let next_cursor =
@@ -993,6 +1180,7 @@ mod tests {
             .unwrap();
             import.append_page(&page, NOW).unwrap();
             previous = page.hash().unwrap();
+            pages.push(page);
         }
         let witness = Signed::sign(
             RemoteExecutionPolicyWitness {
@@ -1040,8 +1228,12 @@ mod tests {
                 body_hash: facts.body_hash.clone(),
                 grant_leaf: delegated.grant_leaf().clone(),
                 expected_policies: {
-                    let mut heads: Vec<_> = policy.primary_heads().iter()
-                        .chain(policy.foreign_heads()).cloned().collect();
+                    let mut heads: Vec<_> = policy
+                        .primary_heads()
+                        .iter()
+                        .chain(policy.foreign_heads())
+                        .cloned()
+                        .collect();
                     heads.sort_by(|left, right| left.domain.cmp(&right.domain));
                     heads
                 },
@@ -1109,6 +1301,57 @@ mod tests {
                 .find_device(&DeviceId::from_key(&PublicKey::of(&remote.node)))
                 .is_err()
         );
+        let retained = node_task_policy_source_from_retained(
+            &fixture.state,
+            &fixture.pins,
+            &trust,
+            &provenance,
+            &request,
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(
+            begin_node_task_policy_import(&trust, &retained, &request, &header, &[], &peer, NOW),
+            Err(AuthorizationError::InvalidProof(
+                "retained Node policy requires its original transcript importer"
+            ))
+        ));
+        let mut replay =
+            begin_retained_node_task_policy_import(&trust, &retained, &request, &header, NOW)
+                .unwrap();
+        for page in &pages {
+            replay.append_page(page, NOW).unwrap();
+        }
+        assert!(matches!(
+            replay.clone().finish_current(&witness, NOW),
+            Err(AuthorizationError::InvalidProof(
+                "retained Node policy cannot become current"
+            ))
+        ));
+        assert!(matches!(
+            replay.clone().finish_history(&witness, NOW),
+            Err(AuthorizationError::InvalidProof(
+                "retained Node policy cannot become a current History reader"
+            ))
+        ));
+        let floors = replay.finish_retained_floors(&witness, NOW).unwrap();
+        assert_eq!(floors.len(), checked.target_heads().len());
+        for head in checked.target_heads() {
+            let pin = floors.iter().find(|pin| pin.domain == head.domain).unwrap();
+            let independent = remote
+                .pins
+                .iter()
+                .find(|pin| pin.domain == head.domain)
+                .unwrap();
+            assert_eq!(pin.genesis_root, independent.genesis_root);
+            assert_eq!(pin.minimum_head.as_ref(), Some(head));
+            assert!(
+                fixture
+                    .pins
+                    .iter()
+                    .all(|primary| primary.domain != pin.domain)
+            );
+        }
     }
 
     #[test]
@@ -1147,6 +1390,7 @@ mod tests {
                 "SDK policy source has no matching local adapter session"
             ))
         ));
+        let provenance = fixture.sdk_source_provenance(&parent, &facts, NOW + 100);
         assert!(matches!(
             verify_node_service_policy_source(
                 &fixture.state,
@@ -1159,14 +1403,14 @@ mod tests {
                 &selection,
                 &context,
                 None,
-                NOW,
+                &provenance,
                 &fixture.node,
                 remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
-                NOW,
+                NOW + 100,
                 NOW + 200,
             ),
             Err(AuthorizationError::InvalidProof(
-                "native policy source exceeds its current SDK lease"
+                "SDK manager lease is outside its original interval"
             ))
         ));
         let removed = fixture.service_grant.clone();
