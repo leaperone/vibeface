@@ -3497,6 +3497,7 @@ pub(crate) mod tests {
             policy: fixture.policy,
             target_recovery_import: None,
             account_node_enrollment_import: None,
+            foreign_execution_policy: Default::default(),
         };
         store.authorize_read(&auth, &proof, &fixture.transport, NOW)?;
         store.authorize_read(&auth, &proof, &fixture.transport, NOW + 1)?;

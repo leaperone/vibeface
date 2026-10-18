@@ -617,6 +617,7 @@ mod tests {
                 policy: fixture.policy,
                 target_recovery_import: None,
             account_node_enrollment_import: None,
+            foreign_execution_policy: Default::default(),
             };
             store.append_authorized_event(
                 &fixture.node,

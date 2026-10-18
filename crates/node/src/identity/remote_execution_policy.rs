@@ -1849,7 +1849,7 @@ mod tests {
         fixture.store.accept_execution_dispatch(
             &fixture.project.node,
             &dispatch,
-            &authorization,
+            &crate::identity::task_execution_context::TaskScopedAuthorization::from_primary(authorization.clone()),
             &freshness,
             &transport,
             &body,
