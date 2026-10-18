@@ -1585,7 +1585,7 @@ def dispatch(client, value, status=200):
         if value["action"]["type"] == "send":
             value["resources"] = [binding["binding"]["open_spec"]["cwd"]]
     original = client.signed_requests.get(value["operation_id"])
-    if original and original["body"]["request"] == value:
+    if status == 200 and original and original["body"]["request"] == value:
         return client.call("rpc", original["body"], invocation=original["invocation"], status=status)
     return client.rpc("operate", request=value, status=status)
 
