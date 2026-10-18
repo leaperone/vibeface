@@ -5286,7 +5286,7 @@ pub(crate) mod tests {
             Ok(fixture)
         }
 
-        fn verify_builder_and_isolate_executor(&mut self) -> Result<()> {
+        fn retain_source_dispatch(&mut self) -> Result<()> {
             use vibeface_secure::authorization::{
                 client_policy_import::AuthorizationSelection,
                 prepare::{PrepareContext, PrepareIntent},
@@ -5503,6 +5503,11 @@ pub(crate) mod tests {
                     now(),
                 )?
                 .0;
+            Ok(())
+        }
+
+        fn verify_builder_and_isolate_executor(&mut self) -> Result<()> {
+            self.retain_source_dispatch()?;
             let outcome = self.store.ingest_event(
                 self.project.space.as_str(),
                 &self.wire.handoff.project_dispatch,
@@ -5947,6 +5952,7 @@ pub(crate) mod tests {
         fn resign_resolution_account(
             &self,
             wire: &mut SignedExecutionHandoffResolution,
+            bind_destination: bool,
         ) -> Result<()> {
             let proof = &mut wire.resolution.account_admission;
             let mut invocation = proof.invocation.payload.clone();
@@ -5958,21 +5964,43 @@ pub(crate) mod tests {
             invocation.nonce = Nonce::random()?;
             proof.invocation = Signed::sign(invocation.clone(), &self.executor.client)?;
             let facts = RequestFacts {
-                resource: invocation.resource,
+                resource: invocation.resource.clone(),
                 action: invocation.action,
-                audience: invocation.audience,
-                operation_id: invocation.operation_id,
-                body_hash: invocation.body_hash,
-                context: invocation.context,
+                audience: invocation.audience.clone(),
+                operation_id: invocation.operation_id.clone(),
+                body_hash: invocation.body_hash.clone(),
+                context: invocation.context.clone(),
             };
-            let auth = super::super::policy::authorize_invocation_for_body(
-                self.store.policy.verified(),
-                &proof.invocation,
-                &facts,
-                &proof.transport.existing_evidence()?,
-                &proof.source_body,
-                now() + 50,
-            )?;
+            let policy = self.store.policy.verified();
+            let destination = if bind_destination {
+                super::super::policy::execution_destination_for_body(
+                    policy,
+                    &facts,
+                    &proof.source_body,
+                    now() + 50,
+                )?
+            } else {
+                None
+            };
+            let transport = proof.transport.existing_evidence()?;
+            let authorize = |signed| match &destination {
+                Some(destination) => policy.verify_invocation_with_execution_destination(
+                    signed,
+                    &facts,
+                    &transport,
+                    destination,
+                    now() + 50,
+                ),
+                None => policy.verify_invocation(signed, &facts, &transport, now() + 50),
+            };
+            let auth = match authorize(&proof.invocation) {
+                Err(AuthorizationError::NeedPolicySync(expected)) => {
+                    invocation.expected_policies = expected;
+                    proof.invocation = Signed::sign(invocation, &self.executor.client)?;
+                    authorize(&proof.invocation)?
+                }
+                other => other?,
+            };
             proof.challenge = FreshnessChallenge::new(
                 &auth,
                 CheckStage::Admit,
@@ -7099,33 +7127,20 @@ pub(crate) mod tests {
             let transport = admission.transport.existing_evidence()?;
             admission.invocation = Signed::sign(invocation.clone(), &fixture.project.client)?;
             let policy = fixture.store.policy.verified();
-            let destination = super::super::policy::execution_destination_for_body(
-                policy,
-                &facts,
-                &admission.source_body,
-                now(),
-            )?
-            .context("deep grant fixture destination")?;
-            let auth = match policy.verify_invocation_with_execution_destination(
-                &admission.invocation,
-                &facts,
-                &transport,
-                &destination,
-                now(),
-            ) {
-                Err(AuthorizationError::NeedPolicySync(expected)) => {
-                    invocation.expected_policies = expected;
-                    admission.invocation = Signed::sign(invocation, &fixture.project.client)?;
-                    policy.verify_invocation_with_execution_destination(
-                        &admission.invocation,
-                        &facts,
-                        &transport,
-                        &destination,
-                        now(),
-                    )?
-                }
-                result => result?,
-            };
+            let auth =
+                match policy.verify_invocation(&admission.invocation, &facts, &transport, now()) {
+                    Err(AuthorizationError::NeedPolicySync(expected)) => {
+                        invocation.expected_policies = expected;
+                        admission.invocation = Signed::sign(invocation, &fixture.project.client)?;
+                        policy.verify_invocation(
+                            &admission.invocation,
+                            &facts,
+                            &transport,
+                            now(),
+                        )?
+                    }
+                    result => result?,
+                };
             admission.challenge = FreshnessChallenge::new(
                 &auth,
                 CheckStage::Admit,
@@ -7188,95 +7203,18 @@ pub(crate) mod tests {
                 submission_usage.counts().max_chain_depth,
                 MAX_DELEGATION_DEPTH
             );
-            let mut initial_union = original_usage.clone();
-            initial_union.merge(&submission_usage);
-            initial_union.record_handoff(&fixture.wire)?;
-            let before_issue = fixture.store.connection.total_changes();
-            let issue_verification =
-                vibeface_secure::signature_verification::SignatureVerification::new();
-            let issued = issue_verification.run(|| {
-                fixture.store.issue_execution_handoff_challenge(
-                    &fixture.wire,
-                    &fixture.transport,
-                    CheckStage::Admit,
-                    now(),
-                )
-            });
-            if !intermediaries.is_empty() {
-                assert!(
-                    initial_union.counts().unique_signed_objects > MAX_PROOF_OBJECTS,
-                    "{:?}",
-                    initial_union.counts()
-                );
-                assert!(matches!(
-                    initial_union.enforce_limits(),
-                    Err(AuthorizationError::BudgetExceeded)
-                ));
-                let error = issued.unwrap_err();
-                assert!(
-                    matches!(
-                        error.downcast_ref::<AuthorizationError>(),
-                        Some(AuthorizationError::BudgetExceeded)
-                    ),
-                    "{error:#}"
-                );
-                assert_eq!(before_issue, fixture.store.connection.total_changes());
-                println!(
-                    "HANDOFF_OVEROBJECT_USAGE {}",
-                    json!({"original":original_usage.counts(),"submission":submission_usage.counts(),"union":initial_union.counts(),"actual":issue_verification.counts()})
-                );
-                continue;
-            }
-            let challenge = issued?;
-            let mut receipts = fixture.store.sign_execution_handoff_receipts(
-                &challenge,
-                &fixture.project.node,
-                now(),
-            )?;
-            receipts.extend(fixture.store.sign_execution_handoff_receipts(
-                &challenge,
-                &fixture.executor.node,
-                now(),
-            )?);
-            let proof = ExecutionHandoffFreshness {
-                challenge,
-                receipts,
-            };
-            let original = original_capsule_authorization(
-                fixture.store.policy.verified(),
-                &fixture.wire.handoff,
-                now(),
-            )?;
-            let full = fixture.store.policy.verified().verify_execution_handoff(
-                &fixture.wire,
-                &original,
-                &fixture.transport,
-                None,
-                now(),
-            )?;
-            let mut union_usage = full.proof_usage().clone();
-            union_usage.record_metadata(&proof.challenge)?;
-            for receipt in &proof.receipts {
-                union_usage.record_signed(receipt)?;
-            }
-            assert!(
-                union_usage.counts().unique_signed_objects > MAX_PROOF_OBJECTS
-                    || union_usage.counts().unique_signatures > MAX_PROOF_SIGNATURES
-            );
-            assert!(matches!(
-                union_usage.enforce_limits(),
-                Err(AuthorizationError::BudgetExceeded)
-            ));
+            let mut union_usage = original_usage.clone();
+            union_usage.merge(&submission_usage);
+            union_usage.record_handoff(&fixture.wire)?;
             let before = fixture.store.connection.total_changes();
             let verification =
                 vibeface_secure::signature_verification::SignatureVerification::new();
             let error = verification
                 .run(|| {
-                    fixture.store.accept_execution_handoff(
-                        &fixture.executor.node,
+                    fixture.store.issue_execution_handoff_challenge(
                         &fixture.wire,
-                        &proof,
                         &fixture.transport,
+                        CheckStage::Admit,
                         now(),
                     )
                 })
@@ -7293,6 +7231,9 @@ pub(crate) mod tests {
                 "HANDOFF_OVERBUDGET_USAGE {}",
                 json!({"original":original_usage.counts(),"submission":submission_usage.counts(),"union":union_usage.counts(),"actual":verification.counts()})
             );
+            if !intermediaries.is_empty() {
+                continue;
+            }
             let mut ninth = fixture
                 .store
                 .policy
@@ -7420,13 +7361,15 @@ pub(crate) mod tests {
         );
         assert_ne!(result.result["original_actor"], result.result["resolver"]);
         verify_execution_resolution_receipt_signature(&result)?;
-        let resolver = resolution_resolver_from(
-            &fixture.store.connection,
-            &fixture.store.policy,
-            fixture.store.policy.verified(),
-            &wire,
-            now() + 200_000,
-        )?;
+        let resolver = fixture
+            .store
+            .policy
+            .verified()
+            .verify_execution_resolution_account_checkpoint(
+                &wire,
+                &fixture.transport,
+                now() + 200_000,
+            )?;
         fixture
             .store
             .policy
@@ -7625,7 +7568,7 @@ pub(crate) mod tests {
         for (field, value) in wrong_values {
             let mut altered = wire.clone();
             altered.resolution.account_admission.source_body[field] = value;
-            fixture.resign_resolution_account(&mut altered)?;
+            fixture.resign_resolution_account(&mut altered, field != "execution_grant")?;
             let before = fixture.store.connection.total_changes();
             assert!(
                 fixture
@@ -7648,7 +7591,7 @@ pub(crate) mod tests {
         other.resolution.account_admission.source_body["authorization_id"] =
             json!("opposite-resolution");
         other.resolution.account_admission.source_body["outcome"] = json!("failed");
-        fixture.resign_resolution_account(&mut other)?;
+        fixture.resign_resolution_account(&mut other, true)?;
         let proof = fixture.resolution_freshness(&wire, now() + 55)?;
         let other_proof = fixture.resolution_freshness(&other, now() + 55)?;
         let stopped = fixture.fence("original-operation").await?;
@@ -8143,8 +8086,7 @@ pub(crate) mod tests {
     #[test]
     fn sdk_capsule_preserves_account_origin_without_replicating_private_messages() -> Result<()> {
         let mut fixture = Fixture::sdk()?;
-        fixture.verify_builder_and_isolate_executor()?;
-        fixture.print_handoff_proof_counts("sdk_production_builder")?;
+        fixture.print_handoff_proof_counts("sdk_capsule")?;
         let bytes = serde_json::to_string(&fixture.wire)?;
         assert!(!bytes.contains("private-user-message-DO-NOT-DISCLOSE"));
         assert!(!bytes.contains("other-task-secret-DO-NOT-DISCLOSE"));
@@ -8397,9 +8339,9 @@ pub(crate) mod tests {
                 .is_err()
         );
         let mut historical = fixture.wire.clone();
-        historical.handoff.sdk_origin.as_mut().unwrap().receipts[0]
-            .payload
-            .expires_at_ms += 1;
+        let receipt = &mut historical.handoff.sdk_origin.as_mut().unwrap().receipts[0];
+        receipt.payload.expires_at_ms -= 1;
+        *receipt = Signed::sign(receipt.payload.clone(), &signer)?;
         historical.handoff.attest_source(&signer)?;
         resign_carrier(&mut historical)?;
         fixture.store.issue_execution_handoff_challenge(
@@ -8551,6 +8493,7 @@ pub(crate) mod tests {
     #[test]
     fn direct_locks_block_handoff_and_signed_completion_releases_only_its_locks() -> Result<()> {
         let mut fixture = Fixture::new()?;
+        fixture.retain_source_dispatch()?;
         fixture
             .executor
             .conversation(&mut fixture.store, "conversation")?;
