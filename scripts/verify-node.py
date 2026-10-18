@@ -970,6 +970,13 @@ def fixture_manager(arguments):
             require(error.code == 400 and rejection in constraint,
                     "negative tool check rejects specifically for its expected authority constraint")
             value, accepted = None, False
+        except (OSError, http.client.HTTPException) as error:
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            fixture_record(run, "manager-tool-errors.jsonl", {
+                "conversation_id": context["conversation_id"], "trigger": trigger, "name": name,
+                "error_type": type(error).__name__, "elapsed_ms": elapsed_ms})
+            raise RuntimeError("fixture tool transport failed with " + type(error).__name__
+                               + " after " + str(elapsed_ms) + " ms") from None
         fixture_record(run, "manager-tools.jsonl", {"conversation_id": context["conversation_id"],
                        "trigger": trigger, "name": name, "accepted": accepted, "expected": expected,
                        "call_ref": call_ref, "response_discarded": discard,
