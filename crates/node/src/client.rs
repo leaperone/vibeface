@@ -21,8 +21,9 @@ use std::{
 };
 use vibeface_secure::authorization::{
     Actor, DeviceId, Invocation, MAX_PROOF_BYTES, PublicKey, Signed, TransportEvidence,
-    VerifiedClientAuthorization, execution_observation::ExecutionObservationRequest,
-    node_execution_policy::VerifiedTaskExecutionTrust,
+    VerifiedClientAuthorization,
+    execution_observation::ExecutionObservationRequest,
+    node_execution_policy::{ActualPolicyNoisePeer, VerifiedTaskExecutionTrust},
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -88,6 +89,7 @@ pub struct Client {
 
 pub(crate) struct NodePolicyReadClient {
     client: Client,
+    noise_peer: ActualPolicyNoisePeer,
 }
 
 #[derive(Deserialize)]
@@ -107,9 +109,17 @@ impl NodePolicyReadClient {
         let target = &trust.selection().target_public_key;
         let target_node_id = crate::crypto::fingerprint(target.as_str())?;
         let socket = network.dial(&target_node_id, Service::Client).await?;
-        Ok(Self {
-            client: Client::from_socket(socket, identity, target.as_str()).await?,
-        })
+        let (client, noise_peer) =
+            Client::from_socket_with_policy_peer(socket, identity, &target_node_id).await?;
+        ensure!(
+            noise_peer.public_key() == target,
+            "node policy Noise peer differs from the approved target key"
+        );
+        Ok(Self { client, noise_peer })
+    }
+
+    pub(crate) fn actual_noise_peer(&self) -> &ActualPolicyNoisePeer {
+        &self.noise_peer
     }
 
     pub(crate) async fn read(&mut self, request: &NodeReadRequest) -> Result<NodeReadResponse> {
@@ -178,11 +188,19 @@ impl Client {
         Self::from_socket(socket, identity, target).await
     }
     async fn from_socket(
-        mut socket: NetworkSocket,
+        socket: NetworkSocket,
         identity: &LocalIdentity,
         target: &str,
     ) -> Result<Self> {
-        let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let (client, _) = Self::from_socket_with_policy_peer(socket, identity, target).await?;
+        Ok(client)
+    }
+    async fn from_socket_with_policy_peer(
+        mut socket: NetworkSocket,
+        identity: &LocalIdentity,
+        target: &str,
+    ) -> Result<(Self, ActualPolicyNoisePeer)> {
+        let (channel, noise_peer) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let mut handshake = secure(Handshake::new(
                 true,
                 &identity.secret_key_hex,
@@ -196,11 +214,12 @@ impl Client {
                 "unexpected client handshake payload"
             );
             send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
-            secure(handshake.finish())
+            let noise_peer = ActualPolicyNoisePeer::from_finished_handshake(&handshake)?;
+            Ok::<_, anyhow::Error>((secure(handshake.finish())?, noise_peer))
         })
         .await
         .context("client handshake timed out")??;
-        Ok(Self { socket, channel })
+        Ok((Self { socket, channel }, noise_peer))
     }
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
