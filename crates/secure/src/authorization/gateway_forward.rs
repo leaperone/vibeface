@@ -359,6 +359,26 @@ impl GatewayClientPolicyImport {
 }
 
 impl VerifiedGatewayClientSource {
+    pub fn check_route(&self, route: &VerifiedGatewayRoute, now: u64) -> Result<()> {
+        route.check_window(now)?;
+        require(
+            self.route_hash == route.update.approval.hash()? && now < self.expires_at_ms,
+            "gateway source differs from its current route or window",
+        )?;
+        let snapshot = require_confirmed_client_policy(&self.authorization)?;
+        for minimum in route
+            .update
+            .minimum_pins
+            .iter()
+            .filter_map(|pin| pin.minimum_head.as_ref())
+        {
+            if !snapshot.state().roots.contains_key(minimum) {
+                return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
+            }
+        }
+        Ok(())
+    }
+
     pub fn reference(&self) -> &ClientPolicyContextReference {
         &self.reference
     }
@@ -528,30 +548,17 @@ pub fn verify_gateway_original(
     now: u64,
 ) -> Result<VerifiedGatewayForward> {
     let _scope = ScopedSignatureVerification::new();
-    route.check_window(now)?;
+    source.check_route(route, now)?;
     let approved = &route.update.approval.payload;
     let request = original.request();
     require(
-        source.route_hash == route.update.approval.hash()?
-            && actual_client == &approved.client_key
+        actual_client == &approved.client_key
             && original.issuer() == actual_client
             && request.resource == approved.resource
             && approved.allowed_actions.contains(&request.action)
-            && request.audience.device == DeviceId::from_key(&approved.target_key)
-            && now < source.expires_at_ms,
+            && request.audience.device == DeviceId::from_key(&approved.target_key),
         "gateway original differs from its current route or source",
     )?;
-    let snapshot = require_confirmed_client_policy(&source.authorization)?;
-    for minimum in route
-        .update
-        .minimum_pins
-        .iter()
-        .filter_map(|pin| pin.minimum_head.as_ref())
-    {
-        if !snapshot.state().roots.contains_key(minimum) {
-            return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
-        }
-    }
     let mut usage = source
         .authorization
         .client_policy_usage
@@ -1532,6 +1539,7 @@ mod tests {
             .finish(witness.clone(), confirm.clone(), confirmation.clone(), NOW)
             .unwrap();
         assert_eq!(source.reference(), independent_clone.reference());
+        source.check_route(&route, NOW).unwrap();
         assert_eq!(source.reference(), &reference);
         assert!(
             a.state
@@ -1629,6 +1637,11 @@ mod tests {
             NOW,
         )
         .unwrap();
+        assert!(matches!(
+            source.check_route(&high_route, NOW),
+            Err(AuthorizationError::NeedPolicySync(_))
+        ));
+        assert!(source.check_route(&route, NOW + 60_000).is_err());
         assert!(matches!(
             verify_gateway_original(
                 &high_route,
