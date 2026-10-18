@@ -293,7 +293,7 @@ impl ExecutionHandoffChallenge {
         Self::bound_to(handoff, stage, nonce, issued_at_ms, expires_at_ms)
     }
 
-    fn bound_to(
+    pub(super) fn bound_to(
         handoff: &VerifiedExecutionHandoff,
         stage: CheckStage,
         nonce: Nonce,
@@ -1738,7 +1738,7 @@ impl ExecutionHandoffResolutionChallenge {
         Self::bound_to(value, nonce, issued_at_ms, expires_at_ms)
     }
 
-    fn bound_to(
+    pub(super) fn bound_to(
         value: &VerifiedExecutionResolution,
         nonce: Nonce,
         issued_at_ms: u64,

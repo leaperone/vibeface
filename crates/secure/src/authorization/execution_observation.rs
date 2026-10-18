@@ -300,7 +300,7 @@ impl ExecutionObservationChallenge {
         Self::bound_to(value, nonce, issued_at_ms, expires_at_ms)
     }
 
-    fn bound_to(
+    pub(super) fn bound_to(
         value: &VerifiedExecutionObservationCurrent,
         nonce: Nonce,
         issued_at_ms: u64,
@@ -756,6 +756,15 @@ impl VerifiedPolicySet {
         usage.merge(&self.observation_source_usage(current.target(), original, now_ms)?);
         usage.enforce_limits()?;
         Ok(VerifiedExecutionObservation { current, usage })
+    }
+
+    pub(super) fn check_execution_observation_current(
+        &self,
+        value: &VerifiedExecutionObservationCurrent,
+        now: u64,
+    ) -> Result<()> {
+        self.check_current(&value.request.resolver, now)?;
+        self.check_current(&value.submission, now)
     }
 
     pub fn verify_execution_observation_current(
