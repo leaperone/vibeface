@@ -1076,9 +1076,16 @@ fn original_admission(
     )?;
     let mut usage = policy.usage.clone();
     usage.record_admission(proof)?;
+    let state = remote_resolution_history::at_heads(policy.state(), &proof.challenge.policies)?;
+    let original_authorization = state.verify_operation_authorization(
+        &admission,
+        &facts,
+        &proof.transport.clone().into_evidence(),
+        proof.admitted_at_ms,
+    )?;
+    usage.record_authorization(&original_authorization)?;
     usage.record_actual_signature_counts(signatures.counts());
     usage.enforce_limits()?;
-    let state = remote_resolution_history::at_heads(policy.state(), &proof.challenge.policies)?;
     let (primary_heads, foreign_heads) =
         proof.challenge.policies.iter().cloned().partition(|head| {
             policy
