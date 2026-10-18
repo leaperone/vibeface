@@ -1,7 +1,7 @@
 use super::{storage::*, *};
 use crate::{crypto::LocalIdentity, store::Store};
-use anyhow::{Result, ensure};
-use rusqlite::TransactionBehavior;
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, TransactionBehavior};
 use vibeface_secure::{
     authorization::{
         MAX_PROOF_BYTES, PublicKey,
@@ -86,6 +86,66 @@ fn check_current(
     Ok(usage)
 }
 
+pub(crate) fn check_task_business_policy_view_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    view: &TaskBusinessScopedView,
+    wire: &TaskBusinessWire,
+    now: u64,
+) -> Result<()> {
+    let _signatures = ScopedSignatureVerification::new();
+    view.verify_wire(wire, now)?;
+    let source = view.source();
+    let local_c = &view.scope().target_public_key;
+    let (heads, mut usage) =
+        task_business_primary_heads(primary.verified(), view.scope(), local_c, now)?;
+    ensure!(
+        view.primary_heads() == heads.as_slice(),
+        "NeedPolicySync: Task business view changed its current C policy heads"
+    );
+    super::super::client_policy_read::check_heads_in(connection, primary, &heads)?;
+    source.verify_current_grant(primary.verified(), local_c, now)?;
+    let reference = require_header(connection, source.header())?;
+    let complete: CompletedImport = read(connection, &key("import-complete", &reference))?
+        .context("NeedPolicySync: Task business source has no durable completion")?;
+    ensure!(
+        complete.header_hash == reference && complete.witness == *source.witness(),
+        "Task business source completion differs from its verified originals"
+    );
+    let progress: ImportProgress = read(connection, &key("import-progress", &reference))?
+        .context("NeedPolicySync: Task business source lost its durable final page")?;
+    let page_hashes = source.original_page_envelope_hashes();
+    ensure!(
+        progress.header_hash == reference
+            && progress.ready_for_finish
+            && progress.next_page_index == complete.witness.payload.page_count
+            && page_hashes.len() as u64 == complete.witness.payload.page_count,
+        "Task business source completion changed its original page cursor"
+    );
+    for (index, expected) in page_hashes.iter().enumerate() {
+        let page: Signed<TaskBusinessPolicyPage> = read(
+            connection,
+            &format!("{}:{index}", key("import-page", &reference)),
+        )?
+        .context("NeedPolicySync: Task business source original page is missing")?;
+        ensure!(
+            ObjectHash::body(&page)? == *expected,
+            "Task business source original signed page changed"
+        );
+    }
+    source.check_saved_floors(&floors(connection, source.pins())?)?;
+    usage.merge(view.proof_usage());
+    if let Some(counts) = SignatureVerification::current_counts() {
+        ensure!(
+            counts.actual_verifications <= 32,
+            "Task business source view exceeded its crypto budget"
+        );
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()?;
+    Ok(())
+}
+
 impl Store {
     pub(crate) fn task_business_policy_view(
         &self,
@@ -97,22 +157,10 @@ impl Store {
         let _signatures = ScopedSignatureVerification::new();
         let local_c = PublicKey::parse(&identity.public_key_hex()?)?;
         let tx = self.connection.unchecked_transaction()?;
-        let mut usage = check_current(&tx, &self.policy, session.source.header(), &local_c, now)?;
-        session
-            .source
-            .check_saved_floors(&floors(&tx, session.source.pins())?)?;
         let view = session
             .source
             .scoped_view(self.policy.verified(), &local_c, wire, now)?;
-        usage.merge(session.source.proof_usage());
-        if let Some(counts) = SignatureVerification::current_counts() {
-            ensure!(
-                counts.actual_verifications <= 32,
-                "Task business source view exceeded its crypto budget"
-            );
-            usage.record_actual_signature_counts(counts);
-        }
-        usage.enforce_limits()?;
+        check_task_business_policy_view_in(&tx, &self.policy, &view, wire, now)?;
         tx.commit()?;
         Ok(view)
     }

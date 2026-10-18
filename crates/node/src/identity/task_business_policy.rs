@@ -13,7 +13,7 @@ use vibeface_secure::authorization::{
 mod ingress;
 mod source;
 mod storage;
-pub(crate) use ingress::TaskBusinessPolicyImportContext;
+pub(crate) use ingress::{TaskBusinessPolicyImportContext, check_task_business_policy_view_in};
 pub(crate) use source::{TaskBusinessPolicySourceContext, TaskBusinessSourceChunk};
 
 #[derive(Serialize, Deserialize)]
