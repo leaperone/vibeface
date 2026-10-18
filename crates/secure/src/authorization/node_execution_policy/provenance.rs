@@ -1029,4 +1029,135 @@ mod tests {
         let wrong = NodeExecutionPolicyReadRequest::Current(Signed::sign(payload, &node).unwrap());
         assert!(restore_sdk_source_provenance(&state, &record, &wrong, NOW + 20).is_err());
     }
+
+    #[test]
+    fn renewed_manager_source_outlives_its_original_invocation_window() {
+        let (state, mut record, parent, request, node) = fixture();
+        let facts = invocation_facts(&record.manager_admission.invocation.payload);
+        let mut usage = ExecutionProofUsage::default();
+        let admitted =
+            manager_admission(&state, &record.manager_admission, &facts, &mut usage).unwrap();
+        let checked = NOW + 1_500;
+        assert!(record.manager_admission.invocation.payload.expires_at_ms < checked);
+        let manager = state
+            .verify_operation_authorization(
+                &admitted,
+                &facts,
+                &record.manager_admission.transport.clone().into_evidence(),
+                checked,
+            )
+            .unwrap();
+        let challenge = FreshnessChallenge::new(
+            &manager,
+            CheckStage::Renew,
+            Nonce::from_bytes([11; 32]),
+            checked,
+            checked + 1_000,
+        )
+        .unwrap();
+        let receipts = manager
+            .dependencies()
+            .iter()
+            .map(|current| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: current.clone(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: checked,
+                        expires_at_ms: checked + 1_000,
+                    },
+                    &node,
+                )
+                .unwrap()
+            })
+            .collect();
+        record.lease = SdkPolicyLease {
+            challenge,
+            receipts,
+            checked_at_ms: checked,
+            deadline: checked + 1_000,
+        };
+        let child = record.child_facts.request_facts();
+        let current = verify_sdk_source_provenance(
+            &state,
+            &parent,
+            &record,
+            &record.session.service,
+            &record.service_grant,
+            &child,
+            None,
+            checked + 10,
+        )
+        .unwrap();
+        assert_eq!(current.expires_at_ms(), checked + 1_000);
+        let NodeExecutionPolicyReadRequest::Current(value) = request else {
+            unreachable!()
+        };
+        let mut payload = value.payload;
+        payload.issued_at_ms = checked + 10;
+        payload.expires_at_ms = checked + 200;
+        payload.source_provenance = Some(ObjectHash::body(&record).unwrap());
+        let request =
+            NodeExecutionPolicyReadRequest::Current(Signed::sign(payload, &node).unwrap());
+        assert!(restore_sdk_source_provenance(&state, &record, &request, checked + 10).is_ok());
+        record.lease.receipts[0] = record.origin.receipts[0].clone();
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &record,
+                &record.session.service,
+                &record.service_grant,
+                &child,
+                None,
+                checked + 10
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn original_source_restores_exact_old_heads_after_current_grant_revocation() {
+        let (mut state, record, parent, request, _) = fixture();
+        let domain = PolicyDomain::Space(record.session.space_id.clone());
+        let mut document = state.space(&record.session.space_id).unwrap().clone();
+        document.previous = state.head(&domain).cloned();
+        document.sequence += 1;
+        document
+            .grants
+            .retain(|grant| grant != &record.service_grant);
+        state
+            .install_space(Signed::sign(document, &key(1)).unwrap())
+            .unwrap();
+        let facts = record.child_facts.request_facts();
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &record,
+                &record.session.service,
+                &record.service_grant,
+                &facts,
+                None,
+                NOW + 20
+            )
+            .is_err()
+        );
+        let original = restore_sdk_source_provenance(&state, &record, &request, NOW + 20).unwrap();
+        assert_eq!(original.heads(), record.source_heads);
+        assert_ne!(original.state().head(&domain), state.head(&domain));
+        let mut changed = record.clone();
+        changed.source_heads.pop();
+        let NodeExecutionPolicyReadRequest::Current(value) = request else {
+            unreachable!()
+        };
+        let mut payload = value.payload;
+        payload.source_provenance = Some(ObjectHash::body(&changed).unwrap());
+        let changed_request =
+            NodeExecutionPolicyReadRequest::Current(Signed::sign(payload, &key(4)).unwrap());
+        assert!(
+            restore_sdk_source_provenance(&state, &changed, &changed_request, NOW + 20).is_err()
+        );
+    }
 }
