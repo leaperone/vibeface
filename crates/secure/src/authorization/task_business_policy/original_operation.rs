@@ -10,12 +10,12 @@ use super::super::{
 };
 use super::*;
 
-fn submit_acceptance<'a>(
-    acceptance: &'a RemoteExecutionHistoryAcceptance,
+fn submit_acceptance(
+    acceptance: &RemoteExecutionHistoryAcceptance,
 ) -> Result<(
-    &'a Signed<ExecutionHandoffAdmissionReceipt>,
-    &'a ExecutionHandoffFreshness,
-    &'a StoredTransport,
+    &Signed<ExecutionHandoffAdmissionReceipt>,
+    &ExecutionHandoffFreshness,
+    &StoredTransport,
 )> {
     match acceptance {
         RemoteExecutionHistoryAcceptance::ExecutionResult {

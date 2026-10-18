@@ -5993,7 +5993,8 @@ pub(crate) mod tests {
                 ),
                 None => policy.verify_invocation(signed, &facts, &transport, now() + 50),
             };
-            let auth = match authorize(&proof.invocation) {
+            let signed = proof.invocation.clone();
+            let auth = match authorize(&signed) {
                 Err(AuthorizationError::NeedPolicySync(expected)) => {
                     invocation.expected_policies = expected;
                     proof.invocation = Signed::sign(invocation, &self.executor.client)?;

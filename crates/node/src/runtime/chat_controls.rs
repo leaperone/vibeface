@@ -1963,7 +1963,6 @@ mod tests {
         assert!(same_business_request(&admitted, &request));
         admitted.action = json!({"type":"interrupt","turn_id":"other"});
         assert!(!same_business_request(&admitted, &request));
-        std::fs::remove_dir_all(network.directory)?;
         Ok(())
     }
 
