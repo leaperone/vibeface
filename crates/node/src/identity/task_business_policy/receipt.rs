@@ -13,7 +13,7 @@ use vibeface_secure::{
             receipt::{
                 TaskBusinessChallenge, TaskBusinessReceiptRead,
                 VerifiedTaskBusinessReceiptAuthority, authorize_task_business_challenge,
-                verify_task_business_receipt_read,
+                verify_task_business_operation_receipt_read, verify_task_business_receipt_read,
             },
         },
     },
@@ -58,6 +58,50 @@ fn sign_current_receipts<T: Serialize>(
 }
 
 impl Store {
+    pub(crate) fn read_task_business_operation_receipts(
+        &self,
+        identity: &LocalIdentity,
+        current: &VerifiedTaskCurrentPolicy,
+        actual_c_noise: &ActualPolicyNoisePeer,
+        request: &Signed<TaskBusinessReceiptRead>,
+        now: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        let _signatures = ScopedSignatureVerification::new();
+        let signer = super::super::client_policy_read::signer(identity)?;
+        let local_b = PublicKey::of(&signer);
+        let tx = self.connection.unchecked_transaction()?;
+        let (header, wire) = source_originals_in(
+            &tx,
+            &request.payload.source_header_hash,
+            &request.payload.business_wire_hash,
+        )?;
+        let TaskBusinessWire::Submit(wire) = wire else {
+            anyhow::bail!("Task operation receipt read requires an original Submit wire")
+        };
+        let authority = verify_task_business_operation_receipt_read(
+            self.policy.verified(),
+            current,
+            &header,
+            &wire,
+            actual_c_noise,
+            request,
+            &local_b,
+            now,
+        )?;
+        let receipts = sign_current_receipts(
+            &tx,
+            &self.policy,
+            current,
+            &authority,
+            &signer,
+            request,
+            ExecutionProofUsage::default(),
+            now,
+        )?;
+        tx.commit()?;
+        Ok(receipts)
+    }
+
     pub(crate) fn task_business_challenge_receipts(
         &self,
         identity: &LocalIdentity,
