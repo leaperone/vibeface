@@ -8432,12 +8432,12 @@ pub(crate) mod tests {
         let mut altered = fixture.wire.clone();
         let mut event: Event =
             serde_json::from_str(&altered.handoff.project_dispatch.canonical_body)?;
-        let EventCause::Invocation { admission } = &mut event.cause else {
+        let EventBody::DispatchRecorded { action, .. } = &mut event.body else {
             unreachable!()
         };
-        admission.source_body["request"]["resources"] = json!([]);
+        action["resources"] = json!([]);
         altered.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
-        resign_dispatch(&fixture, &mut altered)?;
+        resign_carrier(&mut altered)?;
         altered.invocation.verify_signature()?;
         altered
             .handoff
