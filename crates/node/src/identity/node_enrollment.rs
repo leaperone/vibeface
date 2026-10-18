@@ -37,6 +37,18 @@ struct InstallationRequest {
     installation: AccountNodeInstallation,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusRequest {
+    request: Signed<node_enrollment::status::AccountNodeEnrollmentStatusRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitResponse {
+    journal_delta: Vec<vibeface_secure::authorization::JournalEntry>,
+}
+
 fn metadata(connection: &rusqlite::Connection, key: &str) -> Result<Option<String>> {
     Ok(connection
         .query_row(
@@ -116,9 +128,126 @@ impl Store {
                 self.account_node_import_resume(identity, principal, params, now)
             }
             "account_node_commit" => self.account_node_commit(identity, principal, params, now),
+            "account_node_status" => self.account_node_status(identity, principal, params, now),
             "account_node_install" => self.account_node_install(identity, principal, params, now),
             _ => bail!("unknown node enrollment method"),
         }
+    }
+
+    fn account_node_status(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+    ) -> Result<Value> {
+        use node_enrollment::status::{
+            AccountNodeEnrollmentStatusResponse, AccountNodeEnrollmentStatusResult,
+            verify_account_node_enrollment_status_request,
+        };
+        use vibeface_secure::authorization::{AUTH_VERSION, JournalEntry};
+        let input: StatusRequest = serde_json::from_value(params.clone())?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let noise = PublicKey::parse(principal)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let current = journal::PolicyState::reload_verified(&tx, &self.policy)?;
+        let mut usage = verify_account_node_enrollment_status_request(
+            current.verified(),
+            &input.request,
+            &local,
+            &noise,
+            now,
+        )?;
+        let query = &input.request.payload;
+        let receipt_key = format!("node-enrollment-commit:{}", query.enrollment_intent_hash);
+        let result = if let Some(receipt) = metadata(&tx, &receipt_key)? {
+            let receipt: Value = serde_json::from_str(&receipt)?;
+            ensure!(
+                receipt["request_hash"] == query.enrollment_intent_hash.as_str()
+                    && receipt["input_hash"] == query.commit_input_hash.as_str()
+                    && receipt["principal"] == principal,
+                "node enrollment status changed its original completion or requesting client"
+            );
+            let response: CommitResponse = serde_json::from_value(receipt["response"].clone())?;
+            let [
+                JournalEntry::Device(certificate),
+                JournalEntry::AccountCommit(committed),
+            ] = response.journal_delta.as_slice()
+            else {
+                bail!("node enrollment receipt has an invalid finite delta");
+            };
+            ensure!(
+                certificate.payload.public_key == query.target_node_public_key
+                    && committed.proposal.payload.account == query.account
+                    && current.verified().device(&certificate.hash()?) == Some(certificate)
+                    && current
+                        .verified()
+                        .account_history(&query.account)
+                        .is_some_and(|history| history
+                            .iter()
+                            .any(|document| document == &committed.proposal))
+                    && committed.commit.issuer == local
+                    && committed.commit.payload.proposal_hash == committed.proposal.hash()?
+                    && committed.commit.payload.accepted_at_ms <= now,
+                "node enrollment status receipt differs from accepted local policy"
+            );
+            certificate.verify_signature()?;
+            committed.proposal.verify_signature()?;
+            committed.commit.verify_signature()?;
+            ensure!(
+                !committed.receipts.is_empty(),
+                "node enrollment status receipt lacks authority freshness"
+            );
+            for receipt in &committed.receipts {
+                ensure!(
+                    receipt.issuer == local
+                        && receipt.payload.challenge_hash == committed.commit.challenge_hash()?,
+                    "node enrollment status receipt changed its authority or challenge"
+                );
+                receipt.verify_signature()?;
+            }
+            for entry in &response.journal_delta {
+                usage.merge(
+                    &vibeface_secure::authorization::policy_proof::policy_entry_payload_usage(
+                        entry,
+                    )?,
+                );
+            }
+            AccountNodeEnrollmentStatusResult::Committed {
+                journal_delta: response.journal_delta,
+            }
+        } else {
+            AccountNodeEnrollmentStatusResult::NotObserved
+        };
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let status = Signed::sign(
+            AccountNodeEnrollmentStatusResponse {
+                version: AUTH_VERSION,
+                purpose: query.purpose.clone(),
+                request_hash: input.request.hash()?,
+                account: query.account.clone(),
+                requesting_device: query.requesting_device.clone(),
+                source_node_public_key: local,
+                target_node_public_key: query.target_node_public_key.clone(),
+                enrollment_intent_hash: query.enrollment_intent_hash.clone(),
+                commit_input_hash: query.commit_input_hash.clone(),
+                result,
+                issued_at_ms: now,
+                expires_at_ms: query.expires_at_ms,
+            },
+            &signer,
+        )?;
+        usage.record_signed(&status)?;
+        let response = bounded_response(params, json!({"status":status}))?;
+        usage.record_metadata(params)?;
+        usage.record_metadata(&response)?;
+        usage.enforce_limits()?;
+        tx.commit()?;
+        self.policy = current;
+        Ok(response)
     }
 
     fn account_node_commit(
@@ -604,6 +733,225 @@ mod tests {
         )
         .map_err(anyhow::Error::msg)
     }
+    #[test]
+    fn status_reads_the_exact_receipt_without_policy_nonce_or_receipt_writes() -> Result<()> {
+        use node_enrollment::status::{
+            prepare_account_node_enrollment_status, verify_account_node_enrollment_status,
+        };
+        let mut f = Fixture::new()?;
+        let (prepared, commit) = f.commit_request()?;
+        let principal = f.network.client.public_key_hex();
+        let query = prepare_account_node_enrollment_status(
+            &prepared,
+            &f.network.client,
+            now() as f64,
+            (now() + 30_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let params: Value =
+            serde_json::from_str(&query.request_json().map_err(anyhow::Error::msg)?)?;
+        let before = f.authority.connection.total_changes();
+        let missing = f.authority.node_enrollment_command(
+            &f.network.node,
+            &principal,
+            "account_node_status",
+            &params,
+            now(),
+        )?;
+        assert_eq!(f.authority.connection.total_changes(), before);
+        let missing = verify_account_node_enrollment_status(
+            &query,
+            &serde_json::to_string(&missing["status"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(missing.state(), "not_observed");
+        assert!(missing.enrollment().is_none());
+        let committed = f.authority.node_enrollment_command(
+            &f.network.node,
+            &principal,
+            "account_node_commit",
+            &commit,
+            now(),
+        )?;
+        let before = f.authority.connection.total_changes();
+        let status = f.authority.node_enrollment_command(
+            &f.network.node,
+            &principal,
+            "account_node_status",
+            &params,
+            now(),
+        )?;
+        assert_eq!(f.authority.connection.total_changes(), before);
+        assert_eq!(
+            status["status"]["payload"]["result"]["journal_delta"],
+            committed["journal_delta"]
+        );
+        let verified = verify_account_node_enrollment_status(
+            &query,
+            &serde_json::to_string(&status["status"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(verified.state(), "committed");
+        let enrollment = verified
+            .enrollment()
+            .context("committed status has no native enrollment")?;
+        let installation = f.installation(&enrollment)?;
+        assert_eq!(
+            f.fresh.node_enrollment_command(
+                &f.node,
+                &principal,
+                "account_node_install",
+                &installation,
+                now()
+            )?["installed"],
+            true
+        );
+        assert_eq!(f.authority.connection.total_changes(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn status_rejects_changed_inputs_noise_source_expiry_and_revocation_without_writes()
+    -> Result<()> {
+        use node_enrollment::status::{
+            AccountNodeEnrollmentStatusRequest, AccountNodeEnrollmentStatusResponse,
+            prepare_account_node_enrollment_status, verify_account_node_enrollment_status,
+        };
+        let mut f = Fixture::new()?;
+        let (prepared, commit) = f.commit_request()?;
+        let principal = f.network.client.public_key_hex();
+        f.authority.node_enrollment_command(
+            &f.network.node,
+            &principal,
+            "account_node_commit",
+            &commit,
+            now(),
+        )?;
+        let query = prepare_account_node_enrollment_status(
+            &prepared,
+            &f.network.client,
+            now() as f64,
+            (now() + 30_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let params: Value =
+            serde_json::from_str(&query.request_json().map_err(anyhow::Error::msg)?)?;
+        let original: Signed<AccountNodeEnrollmentStatusRequest> =
+            serde_json::from_value(params["request"].clone())?;
+        let before = f.authority.connection.total_changes();
+        for mutation in 0..4 {
+            let mut payload = original.payload.clone();
+            match mutation {
+                0 => payload.commit_input_hash = ObjectHash::body(&"different original commit")?,
+                1 => {
+                    payload.source_node_public_key =
+                        PublicKey::of(&Identity::generate().map_err(anyhow::Error::msg)?)
+                }
+                2 => {
+                    payload.target_node_public_key =
+                        PublicKey::of(&Identity::generate().map_err(anyhow::Error::msg)?)
+                }
+                _ => payload.expires_at_ms = now(),
+            }
+            let changed = Signed::sign(payload, &f.network.client)?;
+            assert!(
+                f.authority
+                    .node_enrollment_command(
+                        &f.network.node,
+                        &principal,
+                        "account_node_status",
+                        &json!({"request":changed}),
+                        now()
+                    )
+                    .is_err()
+            );
+            assert_eq!(f.authority.connection.total_changes(), before);
+        }
+        let other = Identity::generate().map_err(anyhow::Error::msg)?;
+        assert!(
+            f.authority
+                .node_enrollment_command(
+                    &f.network.node,
+                    &other.public_key_hex(),
+                    "account_node_status",
+                    &params,
+                    now()
+                )
+                .is_err()
+        );
+        assert_eq!(f.authority.connection.total_changes(), before);
+        let response = f.authority.node_enrollment_command(
+            &f.network.node,
+            &principal,
+            "account_node_status",
+            &params,
+            now(),
+        )?;
+        let original: Signed<AccountNodeEnrollmentStatusResponse> =
+            serde_json::from_value(response["status"].clone())?;
+        let signer = Identity::from_secret_hex(&f.network.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        for mutation in 0..5 {
+            let mut payload = original.payload.clone();
+            match mutation {
+                0 => payload.target_node_public_key = PublicKey::of(&other),
+                1 => payload.commit_input_hash = ObjectHash::body(&"other completion")?,
+                2 => payload.request_hash = ObjectHash::body(&"other readonly query")?,
+                3 => payload.expires_at_ms = now(),
+                _ => {
+                    let node_enrollment::status::AccountNodeEnrollmentStatusResult::Committed {
+                        journal_delta,
+                    } = &mut payload.result
+                    else {
+                        bail!("expected committed receipt")
+                    };
+                    let Some(vibeface_secure::authorization::JournalEntry::Device(certificate)) =
+                        journal_delta.first_mut()
+                    else {
+                        bail!("expected original certificate")
+                    };
+                    certificate.payload.nonce = vibeface_secure::authorization::Nonce::random()?;
+                }
+            }
+            let changed = Signed::sign(payload, &signer)?;
+            assert!(
+                verify_account_node_enrollment_status(
+                    &query,
+                    &serde_json::to_string(&changed)?,
+                    now() as f64
+                )
+                .is_err()
+            );
+        }
+        let changed = Signed::sign(original.payload, &other)?;
+        assert!(
+            verify_account_node_enrollment_status(
+                &query,
+                &serde_json::to_string(&changed)?,
+                now() as f64
+            )
+            .is_err()
+        );
+        let mut independent = Store::open(f.network.directory.join("authority.sqlite3"))?;
+        f.network.revoke_client(&mut independent)?;
+        let before = f.authority.connection.total_changes();
+        assert!(
+            f.authority
+                .node_enrollment_command(
+                    &f.network.node,
+                    &principal,
+                    "account_node_status",
+                    &params,
+                    now() + 2
+                )
+                .is_err()
+        );
+        assert_eq!(f.authority.connection.total_changes(), before);
+        Ok(())
+    }
+
     #[test]
     fn bounded_node_enrollment_installs_and_retries_after_reopen() -> Result<()> {
         let mut f = Fixture::new()?;
