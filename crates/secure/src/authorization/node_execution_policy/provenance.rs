@@ -70,6 +70,7 @@ impl SdkPolicySourceFacts {
 pub struct SdkPolicySourceProvenance {
     pub version: u16,
     pub origin: execution_handoff::CompactSdkOrigin,
+    pub origin_source_body: serde_json::Value,
     pub session: SdkPolicySession,
     pub service_grant: ObjectHash,
     pub manager_admission: events::AdmissionProof,
@@ -170,7 +171,7 @@ fn origin_parent(
     let facts = invocation_facts(value);
     let proof = events::AdmissionProof {
         invocation: origin.invocation.clone(),
-        source_body: origin.source_body.clone(),
+        source_body: record.origin_source_body.clone(),
         challenge: origin.challenge.clone(),
         receipts: origin.receipts.clone(),
         admitted_at_ms: origin.admitted_at_ms,
@@ -856,11 +857,11 @@ mod tests {
         .unwrap();
         let record = SdkPolicySourceProvenance {
             version: AUTH_VERSION,
+            origin_source_body: origin.source_body,
             origin: execution_handoff::CompactSdkOrigin {
                 message_event: trigger.clone(),
                 sdk_trigger: trigger,
                 invocation: origin.invocation,
-                source_body: origin.source_body,
                 challenge: origin.challenge,
                 receipts: origin.receipts,
                 admitted_at_ms: origin.admitted_at_ms,
@@ -969,7 +970,7 @@ mod tests {
             .is_err()
         );
         let mut changed = record.clone();
-        changed.origin.source_body["text"] = json!("changed account message");
+        changed.origin_source_body["text"] = json!("changed account message");
         assert!(
             verify_sdk_source_provenance(
                 &state,
@@ -1021,12 +1022,12 @@ mod tests {
         let text = "x".repeat(MAX_PROOF_BYTES + 1);
         let (state, record, parent, _, _) = fixture_with_message(&text);
         assert_eq!(
-            record.origin.source_body["text"].as_str(),
+            record.origin_source_body["text"].as_str(),
             Some(text.as_str())
         );
         assert!(text.len() > MAX_PROOF_BYTES);
         assert_eq!(
-            ObjectHash::body(&record.origin.source_body).unwrap(),
+            ObjectHash::body(&record.origin_source_body).unwrap(),
             record.origin.invocation.payload.body_hash,
         );
         let facts = record.child_facts.request_facts();
@@ -1045,7 +1046,7 @@ mod tests {
         assert!(counts.authorization_bytes <= MAX_PROOF_BYTES);
         assert!(counts.authorization_bytes < text.len());
         let mut changed = record.clone();
-        changed.origin.source_body["text"] = json!("changed large original message");
+        changed.origin_source_body["text"] = json!("changed large original message");
         assert!(
             verify_sdk_source_provenance(
                 &state,

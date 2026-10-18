@@ -694,11 +694,11 @@ mod tests {
             self.state.admit_operation(&manager, &fresh, NOW).unwrap();
             SdkPolicySourceProvenance {
                 version: AUTH_VERSION,
+                origin_source_body: origin.source_body,
                 origin: execution_handoff::CompactSdkOrigin {
                     message_event: trigger.clone(),
                     sdk_trigger: trigger,
                     invocation: origin.invocation,
-                    source_body: origin.source_body,
                     challenge: origin.challenge,
                     receipts: origin.receipts,
                     admitted_at_ms: origin.admitted_at_ms,
