@@ -1,21 +1,31 @@
 use super::{
-    admission::check_policy_heads_in,
+    admission::{
+        admission_for_operation_from, check_manager_tool_in, check_policy_heads_in,
+        reconstruct_admission,
+    },
     foreign_execution_policy::{
         bind_task_execution_policy_in, check_task_policy_heads_in,
         current_task_execution_policy_in, original_task_execution_policy_in,
+        task_policy_for_binding_in,
     },
     journal::PolicyState,
     policy::authorize_invocation_for_body,
 };
-use crate::{binding::SignedBinding, crypto::LocalIdentity, model::AdmissionProof, store::Store};
+use crate::{
+    binding::SignedBinding,
+    crypto::LocalIdentity,
+    model::{AdmissionProof, OperationRequest},
+    store::Store,
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use serde_json::Value;
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 use vibeface_secure::authorization::{
-    CheckStage, FreshnessChallenge, Invocation, Nonce, RequestFacts, Signed, TransportEvidence,
-    VerifiedAuthorization, VerifiedPolicySet,
+    CheckStage, DeviceId, FreshnessChallenge, Invocation, Nonce, PublicKey, RequestFacts,
+    ServiceId, Signed, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
     node_execution_policy::{VerifiedTaskCurrentPolicy, VerifiedTaskOriginalAdmissionPolicy},
+    remote_execution_policy::RemoteExecutionPolicySelection,
 };
 
 #[derive(Clone)]
@@ -24,7 +34,111 @@ pub(crate) struct TaskScopedAuthorization {
     task_policy: Option<VerifiedTaskCurrentPolicy>,
 }
 
+impl Deref for TaskScopedAuthorization {
+    type Target = VerifiedAuthorization;
+
+    fn deref(&self) -> &Self::Target {
+        &self.authorization
+    }
+}
+
 impl TaskScopedAuthorization {
+    pub(crate) fn for_admitted_operation_in(
+        connection: &Connection,
+        policy: &PolicyState,
+        identity: &LocalIdentity,
+        proof: &AdmissionProof,
+        facts: &RequestFacts,
+        now_ms: u64,
+    ) -> Result<Self> {
+        ensure!(
+            proof.source_body["method"] == "operate",
+            "operation scope requires an original operate admission"
+        );
+        let invocation = &proof.invocation.payload;
+        ensure!(
+            admission_for_operation_from(
+                connection,
+                invocation.resource.space.as_str(),
+                &invocation.operation_id,
+            )? == *proof,
+            "operation scope differs from its persisted admission"
+        );
+        let request: OperationRequest =
+            serde_json::from_value(proof.source_body["request"].clone())?;
+        let encoded: String = connection.query_row(
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+            params![invocation.resource.space.as_str(), invocation.operation_id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            request.operation_id == invocation.operation_id
+                && request.network_id == invocation.resource.space.as_str()
+                && serde_json::from_str::<OperationRequest>(&encoded)? == request,
+            "operation scope differs from its persisted request"
+        );
+        let captured_transport = proof.transport.clone().into_evidence();
+        let original = OriginalAdmissionView::load(connection, policy, proof)?;
+        let admitted =
+            reconstruct_admission(connection, policy, proof, facts, &captured_transport)?;
+        let source = PublicKey::parse(&identity.public_key_hex()?)?;
+        ensure!(
+            invocation.audience.device == DeviceId::from_key(&source)
+                && invocation.audience.service == ServiceId::from_key(&source),
+            "operation scope targets another Node"
+        );
+        let task_policy = if original.task_policy().is_some() {
+            let binding = request
+                .binding
+                .as_ref()
+                .context("NeedPolicySync: admitted remote operation has no original binding")?;
+            let selection = RemoteExecutionPolicySelection {
+                execution_resource: serde_json::from_value(
+                    proof.source_body["execution_resource"].clone(),
+                )
+                .context("NeedPolicySync: admitted remote operation has no execution resource")?,
+                target_public_key: serde_json::from_value(
+                    proof.source_body["target_public_key"].clone(),
+                )
+                .context("NeedPolicySync: admitted remote operation has no execution key")?,
+                execution_grant: serde_json::from_value(
+                    proof.source_body["execution_grant"].clone(),
+                )
+                .context("NeedPolicySync: admitted remote operation has no execution grant")?,
+            };
+            Some(task_policy_for_binding_in(
+                connection,
+                policy,
+                &source,
+                binding,
+                &facts.resource,
+                &selection,
+                facts.action,
+                now_ms,
+            )?)
+        } else {
+            None
+        };
+        let state = task_policy
+            .as_ref()
+            .map_or(policy.verified(), |task| task.state());
+        let authorization =
+            state.verify_operation_authorization(&admitted, facts, &captured_transport, now_ms)?;
+        check_manager_tool_in(
+            connection,
+            policy,
+            &authorization,
+            &captured_transport,
+            now_ms,
+        )?;
+        let scoped = Self {
+            authorization,
+            task_policy,
+        };
+        scoped.check_current_in(connection, policy.verified(), facts, now_ms)?;
+        Ok(scoped)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_primary(authorization: VerifiedAuthorization) -> Self {
         Self {
