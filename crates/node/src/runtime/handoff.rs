@@ -348,15 +348,15 @@ impl Runtime {
         Ok(Arc::new(Mutex::new(policy)))
     }
 
-    async fn check_handoff_execution_policy(
-        &self,
-        value: &AdmittedExecutionHandoff,
-        policy: &HandoffExecutionPolicy,
+    fn check_handoff_execution_policy<'a>(
+        &'a self,
+        value: &'a AdmittedExecutionHandoff,
+        policy: &'a HandoffExecutionPolicy,
         stage: CheckStage,
-        verification: &SignatureVerification,
-    ) -> Result<HandoffExecutionCheck> {
+        verification: &'a SignatureVerification,
+    ) -> futures_util::future::BoxFuture<'a, Result<HandoffExecutionCheck>> {
         match policy {
-            HandoffExecutionPolicy::Primary => {
+            HandoffExecutionPolicy::Primary => Box::pin(async move {
                 let authorization = {
                     let store = self.store.lock().await;
                     verification.run(|| {
@@ -378,10 +378,10 @@ impl Runtime {
                     authorization,
                     freshness,
                 })
-            }
+            }),
             HandoffExecutionPolicy::TaskBusiness {
                 source, acceptance, ..
-            } => {
+            } => Box::pin(async move {
                 let mut context = {
                     let mut store = self.store.lock().await;
                     verification.run(|| {
@@ -438,7 +438,7 @@ impl Runtime {
                     )
                 })?;
                 Ok(HandoffExecutionCheck::TaskBusiness(current))
-            }
+            }),
         }
     }
 
@@ -1240,49 +1240,51 @@ impl Runtime {
         self.execute_handoff_with_policy(accepted, policy).await
     }
 
-    pub(super) async fn execute_handoff_with_business(
+    pub(super) fn execute_handoff_with_business(
         self: Arc<Self>,
         accepted: AdmittedExecutionHandoff,
         session: TaskBusinessPolicySession,
         source: VerifiedTaskBusinessOriginalSource,
         acceptance: RemoteExecutionHistoryAcceptance,
-    ) -> Result<()> {
-        ensure!(
-            session.source().header().hash()? == source.header().hash()?
-                && session.source().wire_hash() == source.wire_hash()
-                && source.acceptance() == &acceptance,
-            "Task execution changed its completed source or original acceptance"
-        );
-        let TaskBusinessWire::Submit(wire) = source.wire() else {
-            bail!("Task execution requires its original accepted Submit");
-        };
-        let (project, operation) = original(wire)?;
-        ensure!(
-            project.space == accepted.execution_context.space_id
-                && project.resource == accepted.execution_context.resource_id
-                && operation == accepted.original_request.operation_id
-                && wire.handoff.execution_resource.space
-                    == accepted.execution_context.execution_space_id
-                && wire.handoff.execution_resource.resource
-                    == accepted.execution_context.execution_service_resource,
-            "Task execution source differs from its accepted execution namespace"
-        );
-        let policy = Arc::new(Mutex::new(HandoffExecutionPolicy::TaskBusiness {
-            source,
-            acceptance,
-            current: None,
-        }));
-        self.execute_handoff_with_policy(accepted, policy).await
+    ) -> futures_util::future::BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            ensure!(
+                session.source().header().hash()? == source.header().hash()?
+                    && session.source().wire_hash() == source.wire_hash()
+                    && source.acceptance() == &acceptance,
+                "Task execution changed its completed source or original acceptance"
+            );
+            let TaskBusinessWire::Submit(wire) = source.wire() else {
+                bail!("Task execution requires its original accepted Submit");
+            };
+            let (project, operation) = original(wire)?;
+            ensure!(
+                project.space == accepted.execution_context.space_id
+                    && project.resource == accepted.execution_context.resource_id
+                    && operation == accepted.original_request.operation_id
+                    && wire.handoff.execution_resource.space
+                        == accepted.execution_context.execution_space_id
+                    && wire.handoff.execution_resource.resource
+                        == accepted.execution_context.execution_service_resource,
+                "Task execution source differs from its accepted execution namespace"
+            );
+            let policy = Arc::new(Mutex::new(HandoffExecutionPolicy::TaskBusiness {
+                source,
+                acceptance,
+                current: None,
+            }));
+            self.execute_handoff_with_policy(accepted, policy).await
+        })
     }
 
-    async fn execute_handoff_with_policy(
-        self: Arc<Self>,
-        accepted: AdmittedExecutionHandoff,
-        policy: SharedHandoffExecutionPolicy,
-    ) -> Result<()> {
-        let _work = self.maintenance.enter()?;
-        let verification = SignatureVerification::new();
-        let preparation = async {
+    fn prepare_handoff_execution<'a>(
+        &'a self,
+        accepted: &'a AdmittedExecutionHandoff,
+        policy: &'a SharedHandoffExecutionPolicy,
+        verification: &'a SignatureVerification,
+    ) -> futures_util::future::BoxFuture<'a, Result<(AdmittedExecutionHandoff, bool, HandoffProgram)>>
+    {
+        Box::pin(async move {
             ensure!(
                 self.config.roles.contains(&NodeRole::Executor),
                 "executor capability is disabled"
@@ -1290,10 +1292,10 @@ impl Runtime {
             let snapshot = policy.lock().await.clone();
             let checked = self
                 .check_handoff_execution_policy(
-                    &accepted,
+                    accepted,
                     &snapshot,
                     CheckStage::Start,
-                    &verification,
+                    verification,
                 )
                 .await?;
             let program = if accepted.original_request.action["type"] == "command" {
@@ -1356,201 +1358,214 @@ impl Runtime {
                 }
             };
             Ok::<_, anyhow::Error>((value, fresh, program))
-        }
-        .await;
-        let (value, fresh, program) = match preparation {
-            Ok(value) => value,
-            Err(error) => {
-                let current = {
-                    let store = self.store.lock().await;
-                    verification.run(|| {
-                        store.execution_handoff_status(
-                            &self.identity,
-                            accepted.execution_context.execution_space_id.as_str(),
-                            accepted.execution_context.space_id.as_str(),
-                            &accepted.original_request.operation_id,
-                            now_ms() as u64,
-                        )
-                    })?
-                };
-                if current.state == OperationState::Accepted {
-                    if matches!(*policy.lock().await, HandoffExecutionPolicy::Primary) {
-                        self.finish_handoff_with_policy(
-                            &current,
-                            OperationState::Rejected,
-                            json!({"error":format!("{error:#}")}),
-                            &verification,
-                            &policy,
-                        )
-                        .await?;
-                    } else {
-                        self.stop_handoff_with_policy(
-                            &current,
-                            &format!("accepted Task execution could not start: {error:#}"),
-                            &verification,
-                            &policy,
-                        )
-                        .await?;
-                    }
-                }
-                return Err(error);
-            }
-        };
-        if !fresh {
-            return Ok(());
-        }
-        let (kind, action) = match program {
-            HandoffProgram::Session { kind, action } => (kind, action),
-            HandoffProgram::Command(spec) => {
-                self.supervise_handoff(value.clone(), policy.clone()).await;
-                let result = self
-                    .engine
-                    .execute_command_authorized(&context(&value), &spec)
-                    .await;
-                let (state, result) = match result {
-                    Ok(output) => (
-                        if output.exit_code == Some(0) {
-                            OperationState::Succeeded
-                        } else {
-                            OperationState::Failed
-                        },
-                        serde_json::to_value(output)?,
-                    ),
-                    Err(error) => (
-                        if error.uncertain {
-                            OperationState::Unknown
-                        } else {
-                            OperationState::Failed
-                        },
-                        json!({"error":error.message}),
-                    ),
-                };
-                return self
-                    .finish_handoff_with_policy(
-                        &value,
-                        state,
-                        result,
-                        &SignatureVerification::new(),
-                        &policy,
-                    )
-                    .await;
-            }
-        };
-        let context = context(&value);
-        let session = value
-            .execution_session
-            .as_ref()
-            .context("claimed handoff lost its local session")?;
-        let native = ExecutorSession {
-            executor: kind,
-            cwd: PathBuf::from(&session.cwd),
-            native_session_id: session.native_session_id.clone(),
-        };
-        self.supervise_handoff(value.clone(), policy.clone()).await;
-        let store = self.store.clone();
-        let execution = value.execution_context.execution_space_id.clone();
-        let project = ResourceRef {
-            space: context.space_id.clone(),
-            resource: context.resource_id.clone(),
-        };
-        let operation = context.operation_id.clone();
-        let native_verification = verification.clone();
-        let native_policy = policy.clone();
-        let result = self
-            .engine
-            .execute_authorized(&context, &native, action.clone(), move |id| async move {
-                let policy = native_policy.lock().await;
-                let mut store = store.lock().await;
-                native_verification.run(|| match &*policy {
-                    HandoffExecutionPolicy::Primary => store.persist_execution_handoff_native(
-                        execution.as_str(),
-                        &project,
-                        &operation,
-                        &id,
-                        now_ms() as u64,
-                    ),
-                    HandoffExecutionPolicy::TaskBusiness { current, .. } => store
-                        .persist_execution_handoff_native_operation_current(
-                            current
-                                .as_ref()
-                                .context("Task execution has no current consumed lease")?,
-                            &id,
-                            now_ms() as u64,
-                        ),
-                })?;
-                Ok(())
-            })
-            .await;
-        let completion_verification = SignatureVerification::new();
-        match result {
-            Ok(result)
-                if native.executor == ExecutorKind::Codex
-                    && matches!(action, EngineAction::Send { .. }) =>
-            {
-                self.store.lock().await.local_set(
-                    value.execution_context.execution_space_id.as_str(),
-                    &turn_key(&context),
-                    &result.result,
-                )?;
-                if let (Some(native), Some(turn)) = (
-                    result.native_session_id.as_deref(),
-                    result.result["turn"]["id"].as_str(),
-                ) {
-                    if let Ok(Some(observed)) = self
-                        .engine
-                        .read_turn_authorized(&context, native, turn)
-                        .await
-                    {
-                        if matches!(
-                            observed["status"].as_str(),
-                            Some("completed" | "failed" | "interrupted")
-                        ) {
-                            let state = if observed["status"] == "completed" {
-                                OperationState::Succeeded
-                            } else {
-                                OperationState::Failed
-                            };
+        })
+    }
+
+    fn execute_handoff_with_policy(
+        self: Arc<Self>,
+        accepted: AdmittedExecutionHandoff,
+        policy: SharedHandoffExecutionPolicy,
+    ) -> futures_util::future::BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            let _work = self.maintenance.enter()?;
+            let verification = SignatureVerification::new();
+            let preparation = self
+                .prepare_handoff_execution(&accepted, &policy, &verification)
+                .await;
+            let (value, fresh, program) = match preparation {
+                Ok(value) => value,
+                Err(error) => {
+                    let current = {
+                        let store = self.store.lock().await;
+                        verification.run(|| {
+                            store.execution_handoff_status(
+                                &self.identity,
+                                accepted.execution_context.execution_space_id.as_str(),
+                                accepted.execution_context.space_id.as_str(),
+                                &accepted.original_request.operation_id,
+                                now_ms() as u64,
+                            )
+                        })?
+                    };
+                    if current.state == OperationState::Accepted {
+                        if matches!(*policy.lock().await, HandoffExecutionPolicy::Primary) {
                             self.finish_handoff_with_policy(
-                                &value,
-                                state,
-                                provider_result(observed, Some(native)),
-                                &completion_verification,
+                                &current,
+                                OperationState::Rejected,
+                                json!({"error":format!("{error:#}")}),
+                                &verification,
+                                &policy,
+                            )
+                            .await?;
+                        } else {
+                            self.stop_handoff_with_policy(
+                                &current,
+                                &format!("accepted Task execution could not start: {error:#}"),
+                                &verification,
                                 &policy,
                             )
                             .await?;
                         }
                     }
+                    return Err(error);
+                }
+            };
+            if !fresh {
+                return Ok(());
+            }
+            let (kind, action) = match program {
+                HandoffProgram::Session { kind, action } => (kind, action),
+                HandoffProgram::Command(spec) => {
+                    self.supervise_handoff(value.clone(), policy.clone()).await;
+                    let result = self
+                        .engine
+                        .execute_command_authorized(&context(&value), &spec)
+                        .await;
+                    let (state, result) = match result {
+                        Ok(output) => (
+                            if output.exit_code == Some(0) {
+                                OperationState::Succeeded
+                            } else {
+                                OperationState::Failed
+                            },
+                            serde_json::to_value(output)?,
+                        ),
+                        Err(error) => (
+                            if error.uncertain {
+                                OperationState::Unknown
+                            } else {
+                                OperationState::Failed
+                            },
+                            json!({"error":error.message}),
+                        ),
+                    };
+                    return self
+                        .finish_handoff_with_policy(
+                            &value,
+                            state,
+                            result,
+                            &SignatureVerification::new(),
+                            &policy,
+                        )
+                        .await;
+                }
+            };
+            let context = context(&value);
+            let session = value
+                .execution_session
+                .as_ref()
+                .context("claimed handoff lost its local session")?;
+            let native = ExecutorSession {
+                executor: kind,
+                cwd: PathBuf::from(&session.cwd),
+                native_session_id: session.native_session_id.clone(),
+            };
+            self.supervise_handoff(value.clone(), policy.clone()).await;
+            let store = self.store.clone();
+            let execution = value.execution_context.execution_space_id.clone();
+            let project = ResourceRef {
+                space: context.space_id.clone(),
+                resource: context.resource_id.clone(),
+            };
+            let operation = context.operation_id.clone();
+            let native_verification = verification.clone();
+            let native_policy = policy.clone();
+            let result = self
+                .engine
+                .execute_authorized(&context, &native, action.clone(), move |id| async move {
+                    let policy = native_policy.lock().await;
+                    let mut store = store.lock().await;
+                    native_verification.run(|| match &*policy {
+                        HandoffExecutionPolicy::Primary => store.persist_execution_handoff_native(
+                            execution.as_str(),
+                            &project,
+                            &operation,
+                            &id,
+                            now_ms() as u64,
+                        ),
+                        HandoffExecutionPolicy::TaskBusiness { current, .. } => store
+                            .persist_execution_handoff_native_operation_current(
+                                current
+                                    .as_ref()
+                                    .context("Task execution has no current consumed lease")?,
+                                &id,
+                                now_ms() as u64,
+                            ),
+                    })?;
+                    Ok(())
+                })
+                .await;
+            let completion_verification = SignatureVerification::new();
+            match result {
+                Ok(result)
+                    if native.executor == ExecutorKind::Codex
+                        && matches!(action, EngineAction::Send { .. }) =>
+                {
+                    self.store.lock().await.local_set(
+                        value.execution_context.execution_space_id.as_str(),
+                        &turn_key(&context),
+                        &result.result,
+                    )?;
+                    if let (Some(native), Some(turn)) = (
+                        result.native_session_id.as_deref(),
+                        result.result["turn"]["id"].as_str(),
+                    ) {
+                        if let Ok(Some(observed)) = self
+                            .engine
+                            .read_turn_authorized(&context, native, turn)
+                            .await
+                        {
+                            if matches!(
+                                observed["status"].as_str(),
+                                Some("completed" | "failed" | "interrupted")
+                            ) {
+                                let state = if observed["status"] == "completed" {
+                                    OperationState::Succeeded
+                                } else {
+                                    OperationState::Failed
+                                };
+                                self.finish_handoff_with_policy(
+                                    &value,
+                                    state,
+                                    provider_result(observed, Some(native)),
+                                    &completion_verification,
+                                    &policy,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+                Ok(result) => {
+                    self.finish_handoff_with_policy(
+                        &value,
+                        OperationState::Succeeded,
+                        provider_result(result.result, result.native_session_id.as_deref()),
+                        &completion_verification,
+                        &policy,
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    self.finish_handoff_with_policy(
+                        &value,
+                        if error.uncertain {
+                            OperationState::Unknown
+                        } else {
+                            OperationState::Failed
+                        },
+                        provider_result(
+                            json!({"error":error.message}),
+                            error.native_session_id.as_deref(),
+                        ),
+                        &completion_verification,
+                        &policy,
+                    )
+                    .await?
                 }
             }
-            Ok(result) => {
-                self.finish_handoff_with_policy(
-                    &value,
-                    OperationState::Succeeded,
-                    provider_result(result.result, result.native_session_id.as_deref()),
-                    &completion_verification,
-                    &policy,
-                )
-                .await?
-            }
-            Err(error) => {
-                self.finish_handoff_with_policy(
-                    &value,
-                    if error.uncertain {
-                        OperationState::Unknown
-                    } else {
-                        OperationState::Failed
-                    },
-                    provider_result(
-                        json!({"error":error.message}),
-                        error.native_session_id.as_deref(),
-                    ),
-                    &completion_verification,
-                    &policy,
-                )
-                .await?
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn supervise_handoff(
