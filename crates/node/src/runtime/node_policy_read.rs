@@ -38,6 +38,114 @@ fn policy_sync_needed(error: &anyhow::Error) -> bool {
 }
 
 impl Runtime {
+    pub(super) fn bound_sdk_execution_tool_targets(
+        &self,
+        store: &Store,
+        session: &AgentSession,
+        task_id: &str,
+        executor: &str,
+        now: u64,
+    ) -> Result<Vec<Value>> {
+        let audience = self.audience()?;
+        let saved = store
+            .local_value(
+                session.space_id.as_str(),
+                &format!("agent-session:{}", session.sdk_session.session_id),
+            )?
+            .context("target discovery has no persisted SDK session")?;
+        ensure!(
+            saved == serde_json::to_value(session)?
+                && now < session.expires_at_ms
+                && session.sdk_session.target == session.device
+                && audience.service == session.service
+                && audience.device == session.device,
+            "target discovery changed its current SDK delegation"
+        );
+        let primary = store.authorization_state();
+        let host = primary.verify_service_device(&session.space_id, &session.device, now)?;
+        let project = primary
+            .resource(&session.space_id, &session.resource_id)
+            .context("target discovery has no current Project")?;
+        ensure!(
+            project.payload.kind == ResourceKind::Project
+                && project.payload.host == session.service
+                && host.payload.subject == Actor::Service(session.service.clone()),
+            "target discovery changed the current Project host"
+        );
+        let origin = store.agent_origin(session, now)?;
+        let creation =
+            store.task_creation(session.space_id.as_str(), &session.conversation_id, task_id)?;
+        let event = store.verify_event(session.space_id.as_str(), &creation)?;
+        ensure!(
+            event.resource_id == session.resource_id && event.scope_id == session.conversation_id,
+            "target discovery belongs to another Project or conversation"
+        );
+        let task = EventRef::parse(&creation.hash)?;
+        let binding = store.task_binding(session.space_id.as_str(), &creation.hash)?;
+        if let Some((own_task, own_ref)) = &origin.task {
+            ensure!(
+                own_task == task_id && own_ref == &task,
+                "continuation target discovery escaped its own Task"
+            );
+        } else {
+            let EventCause::Invocation { admission } = &event.cause else {
+                bail!("SDK Task has no admitted creation");
+            };
+            let own_sdk = admission.invocation.payload.actor
+                == Actor::Service(session.service.clone())
+                && admission.invocation.payload.context.sdk_session.as_ref()
+                    == Some(&session.sdk_session)
+                && admission.source_body["parent_invocation"].as_str()
+                    == Some(session.parent_invocation.as_str());
+            let account_bound = matches!(admission.invocation.payload.actor, Actor::Account(_))
+                && admission.invocation.payload.actor == session.initiator
+                && binding.is_some();
+            ensure!(
+                own_sdk || account_bound,
+                "initial SDK discovery requires its own task or its initiator's confirmed binding"
+            );
+        }
+        let Some(binding) = binding else {
+            return Ok(vec![]);
+        };
+        store.verify_historical_binding(&binding)?;
+        ensure!(
+            binding.binding.open_spec["executor"].as_str() == Some(executor),
+            "target discovery changed its confirmed executor"
+        );
+        if let Some(original) = &origin.execution {
+            ensure!(
+                original.binding.as_ref() == Some(&binding)
+                    && original.target_node == binding.binding.target_node
+                    && original.session_id == binding.binding.session_id,
+                "SDK continuation changed its original execution binding"
+            );
+        }
+        let (project, selection, context) =
+            store.bound_node_task_policy_selection(&self.identity, &binding)?;
+        ensure!(
+            project.space == session.space_id
+                && project.resource == session.resource_id
+                && context.context.task.as_ref() == Some(&task)
+                && context.context.conversation.as_deref()
+                    == Some(session.conversation_id.as_str()),
+            "bound target selection changed its current SDK Project or Task"
+        );
+        Ok(vec![json!({
+            "execution_resource":selection.execution_resource,
+            "target_public_key":selection.target_public_key,
+            "execution_grant":selection.execution_grant,
+            "target_node":binding.binding.target_node,
+            "session_id":binding.binding.session_id,
+            "executor":executor,
+            "task_id":task_id,
+            "task_ref":task,
+            "cwd":context.canonical_cwd,
+            "binding_status":"bound",
+            "connection_status":"verification_required",
+        })])
+    }
+
     fn sdk_task_policy_input(
         &self,
         store: &Store,

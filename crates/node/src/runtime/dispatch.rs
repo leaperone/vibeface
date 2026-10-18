@@ -221,14 +221,13 @@ impl Runtime {
         ) else {
             return Ok(vec![]);
         };
-        let action = match action {
-            "open" => vibeface_secure::authorization::Action::ExecutionOpen,
-            "send" => vibeface_secure::authorization::Action::ExecutionSend,
-            _ => bail!("target discovery requires an explicit open or send action"),
-        };
+        ensure!(
+            matches!(action, "open" | "send"),
+            "target discovery requires an explicit open or send action"
+        );
         let store = self.store.lock().await;
         verification.run(|| {
-            store.execution_dispatch_targets(session, task, executor, action, now_ms() as u64)
+            self.bound_sdk_execution_tool_targets(&store, session, task, executor, now_ms() as u64)
         })
     }
 
