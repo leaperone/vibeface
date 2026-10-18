@@ -569,6 +569,12 @@ impl VerifiedRemoteExecutionPolicySourceIntent {
     pub fn source_heads(&self) -> &[PolicyStamp] {
         &self.source_heads
     }
+    pub fn source_node_public_key(&self) -> &PublicKey {
+        &self.source_node_public_key
+    }
+    pub(super) fn verified_at_ms(&self) -> u64 {
+        self.verified_at_ms
+    }
 }
 
 pub fn verify_remote_execution_policy_delegation_source(
