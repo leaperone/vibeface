@@ -1867,7 +1867,7 @@ mod tests {
                 &serde_json::to_vec(&network.node)?,
             )?;
             drop(network.at(&dir.join("node.sqlite3"))?);
-            let value = Arc::new(Runtime::open(dir).await?);
+            let value = Arc::new(Box::pin(Runtime::open(dir)).await?);
             *value.store.lock().await = store;
             Ok(value)
         }
@@ -1961,8 +1961,8 @@ mod tests {
         let c_listener = TcpListener::bind("127.0.0.1:0").await?;
         let b_url = format!("ws://{}/api/network/ws", b_listener.local_addr()?);
         let c_url = format!("ws://{}/api/network/ws", c_listener.local_addr()?);
-        let b = runtime(&fixture.project, fixture.store, &c_url, &b_url).await?;
-        let c = runtime(&fixture.executor, fixture.target, &b_url, &c_url).await?;
+        let b = Box::pin(runtime(&fixture.project, fixture.store, &c_url, &b_url)).await?;
+        let c = Box::pin(runtime(&fixture.executor, fixture.target, &b_url, &c_url)).await?;
         fn start_server(
             tasks: &mut JoinSet<()>,
             node: Arc<Runtime>,
@@ -2003,8 +2003,12 @@ mod tests {
             c_url.clone(),
             b_url.clone(),
         );
-        let mut client =
-            TaskBusinessClient::connect(&b.network, &b.identity, source.export()).await?;
+        let mut client = Box::pin(TaskBusinessClient::connect(
+            &b.network,
+            &b.identity,
+            source.export(),
+        ))
+        .await?;
         client
             .exchange(&TaskBusinessRequest::SourceBegin {
                 header: source.header().clone(),
@@ -2066,8 +2070,15 @@ mod tests {
             )?,
             0
         );
-        let admitted =
-            task_business_rpc(&mut client, &b, &source, &authorization, &business, true).await?;
+        let admitted = Box::pin(task_business_rpc(
+            &mut client,
+            &b,
+            &source,
+            &authorization,
+            &business,
+            true,
+        ))
+        .await?;
         assert_eq!(admitted.handoff, wire);
         assert_eq!(
             admitted.receipt.payload.state,
@@ -2108,7 +2119,13 @@ mod tests {
             tokio::task::yield_now().await;
         };
         assert_eq!(original.acceptance(), &acceptance);
-        let start = task_business_operation_current(&b, &c, &original, CheckStage::Start).await?;
+        let start = Box::pin(task_business_operation_current(
+            &b,
+            &c,
+            &original,
+            CheckStage::Start,
+        ))
+        .await?;
         start.proof_usage().enforce_limits()?;
         let (running, fresh, first_deadline) = {
             let mut store = c.store.lock().await;
@@ -2122,7 +2139,13 @@ mod tests {
         };
         assert!(fresh);
         assert_eq!(running.state, OperationState::Running);
-        let renewed = task_business_operation_current(&b, &c, &original, CheckStage::Renew).await?;
+        let renewed = Box::pin(task_business_operation_current(
+            &b,
+            &c,
+            &original,
+            CheckStage::Renew,
+        ))
+        .await?;
         let deadline = {
             let mut store = c.store.lock().await;
             task_business_checked("Renew consume", || {
@@ -2137,9 +2160,14 @@ mod tests {
         if revoke {
             fixture.project.revoke_client(&mut *b.store.lock().await)?;
             assert!(
-                task_business_operation_current(&b, &c, &original, CheckStage::Renew)
-                    .await
-                    .is_err()
+                Box::pin(task_business_operation_current(
+                    &b,
+                    &c,
+                    &original,
+                    CheckStage::Renew
+                ))
+                .await
+                .is_err()
             );
             let mut store = c.store.lock().await;
             let domain = PolicyDomain::Space(fixture.executor.space.clone());
@@ -2256,9 +2284,15 @@ mod tests {
         drop(c_store);
         drop(start_guard);
         if !revoke {
-            let status =
-                task_business_rpc(&mut client, &b, &source, &authorization, &business, false)
-                    .await?;
+            let status = Box::pin(task_business_rpc(
+                &mut client,
+                &b,
+                &source,
+                &authorization,
+                &business,
+                false,
+            ))
+            .await?;
             assert_eq!(status.handoff, wire);
             assert_eq!(
                 status.receipt.payload.state,
