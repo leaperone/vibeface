@@ -1159,6 +1159,392 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn account_observation_requires_current_readonly_policy_and_exact_original_wire() -> Result<()>
+    {
+        use vibeface_secure::authorization::{
+            execution_observation::ExecutionObservationRequest,
+            remote_execution_policy::RemoteExecutionPolicySelection,
+        };
+        let project = TestNetwork::new()?;
+        let executor = TestNetwork::new()?;
+        let local = PublicKey::parse(&project.node.public_key_hex()?)?;
+        let target = PublicKey::parse(&executor.node.public_key_hex()?)?;
+        let audience = Audience {
+            service: ServiceId::from_key(&local),
+            device: DeviceId::from_key(&local),
+        };
+        let mut store = project.at(&project.directory.join("foreign-approval.sqlite3"))?;
+        project.conversation(&mut store, "readonly-conversation")?;
+        let task = project.task(&mut store, "readonly-conversation", "remote-task")?;
+        let project_ref = ResourceRef {
+            space: project.space.clone(),
+            resource: project.resource.clone(),
+        };
+        let head = store
+            .policy
+            .verified()
+            .head(&PolicyDomain::Space(project.space.clone()))
+            .context("readonly source space is missing")?
+            .clone();
+        let source_grant = Signed::sign(
+            Grant {
+                version: AUTH_VERSION,
+                owner_space: project.space.clone(),
+                scope: ResourceScope::Exact(project_ref.clone()),
+                grantee: Grantee::Actor(Actor::Account(project.account.clone())),
+                actions: vec![Action::OperationResolve],
+                audience: audience.clone(),
+                constraints: GrantConstraints::default(),
+                execution_source: None,
+                parent: None,
+                remaining_delegations: 0,
+                issued_under: head.clone(),
+                not_before_ms: now(),
+                expires_at_ms: now() + 1_000_000,
+                nonce: Nonce::random()?,
+            },
+            &project.root,
+        )?;
+        let mut space = store
+            .policy
+            .verified()
+            .space(&project.space)
+            .context("readonly source space missing")?
+            .clone();
+        space.previous = Some(head);
+        space.sequence += 1;
+        space.grants.push(source_grant.hash()?);
+        space.grants.sort();
+        store.install_policy_journal(
+            &[
+                JournalEntry::Grant(source_grant.clone()),
+                JournalEntry::Space(Signed::sign(space, &project.root)?),
+            ],
+            now(),
+        )?;
+        let context = PrepareContext {
+            context: InvocationContext {
+                conversation: Some("readonly-conversation".into()),
+                task: Some(EventRef::parse(&task.hash)?),
+                execution_session: Some(SessionRef {
+                    target: DeviceId::from_key(&target),
+                    session_id: "remote-session".into(),
+                }),
+                executor_kind: Some("codex".into()),
+                workspace_resource: Some(project.resource.clone()),
+                sdk_session: None,
+            },
+            binding_generation: Some(1),
+            canonical_cwd: Some(executor.project.to_string_lossy().into_owned()),
+            execution_target_public_key: Some(target),
+        };
+        let mut fixture = unseeded_fixture_with_context(project, executor, store, context, false)?;
+        let writer_selection = fixture.intent.payload.selection.clone();
+        let head = fixture
+            .target
+            .policy
+            .verified()
+            .head(&PolicyDomain::Space(fixture.executor.space.clone()))
+            .context("readonly execution space missing")?
+            .clone();
+        let mut grant_context = fixture.intent.payload.context.context.clone();
+        grant_context.workspace_resource =
+            Some(writer_selection.execution_resource.resource.clone());
+        let readonly_grant = Signed::sign(
+            Grant {
+                version: AUTH_VERSION,
+                owner_space: fixture.executor.space.clone(),
+                scope: ResourceScope::Exact(writer_selection.execution_resource.clone()),
+                grantee: Grantee::Actor(Actor::Service(audience.service.clone())),
+                actions: vec![Action::ExecutionResolve, Action::OperationResolve],
+                audience: Audience {
+                    service: ServiceId::from_key(&writer_selection.target_public_key),
+                    device: DeviceId::from_key(&writer_selection.target_public_key),
+                },
+                constraints: GrantConstraints {
+                    context: grant_context,
+                    ..Default::default()
+                },
+                execution_source: None,
+                parent: None,
+                remaining_delegations: 0,
+                issued_under: head.clone(),
+                not_before_ms: now(),
+                expires_at_ms: now() + 1_000_000,
+                nonce: Nonce::random()?,
+            },
+            &fixture.executor.root,
+        )?;
+        let mut space = fixture
+            .target
+            .policy
+            .verified()
+            .space(&fixture.executor.space)
+            .context("readonly execution space missing")?
+            .clone();
+        space.previous = Some(head);
+        space.sequence += 1;
+        space.grants.push(readonly_grant.hash()?);
+        space.grants.sort();
+        fixture.target.install_policy_journal(
+            &[
+                JournalEntry::Grant(readonly_grant.clone()),
+                JournalEntry::Space(Signed::sign(space, &fixture.executor.root)?),
+            ],
+            now(),
+        )?;
+        let writer = import_current_policy(&mut fixture)?;
+        let original = admit_unseeded_dispatch(&mut fixture, &writer)?;
+        assert!(carrier(|| fixture
+            .store
+            .execution_dispatch_uses_task_policy(
+                &fixture.project.node,
+                &original
+            ))?);
+        let proof = crate::identity::admission::admission_for_operation_from(
+            &fixture.store.connection,
+            fixture.project.space.as_str(),
+            &original.invocation.payload.operation_id,
+        )?;
+        let operation: crate::model::OperationRequest =
+            serde_json::from_value(proof.source_body["request"].clone())?;
+        let binding = operation
+            .binding
+            .as_ref()
+            .context("readonly original binding missing")?;
+        let association = carrier(|| {
+            binding_association_in(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                binding,
+                &mut ExecutionProofUsage::default(),
+            )
+        })?;
+        let trust = carrier(|| {
+            load_task_execution_trust_in(
+                &fixture.store.connection,
+                &local,
+                &association.approval_ref,
+            )
+        })?;
+        let selection = RemoteExecutionPolicySelection {
+            execution_grant: readonly_grant.hash()?,
+            ..writer_selection.clone()
+        };
+        assert_ne!(selection.execution_grant, writer_selection.execution_grant);
+        assert_ne!(
+            source_grant.hash()?,
+            fixture.project.bundle.grant_leaf.clone()
+        );
+        let source = carrier(|| {
+            verified_client_policy_for_test(
+                &mut fixture.store,
+                &fixture.project.node,
+                &fixture.project.client,
+                &fixture.project.account,
+                AuthorizationSelection {
+                    resource: project_ref,
+                    audience,
+                    grant_leaf: source_grant.hash()?,
+                },
+                &fixture.project.pins,
+                now(),
+            )
+        })?;
+        let mut context = fixture.intent.payload.context.clone();
+        context.canonical_cwd = None;
+        let intent: Signed<RemoteExecutionPolicyReadIntent> = serde_json::from_str(&build_remote_execution_policy_read_intent(
+            &source, &json!({"selection":selection,"context":context,"expected_action":Action::OperationResolve,
+                "purpose":RemoteExecutionPolicyPurpose::ObservationRead,"execution_pins":fixture.executor.pins}).to_string(),
+            &fixture.project.client, now() as f64, (now() + 60_000) as f64).map_err(anyhow::Error::msg)?)?;
+        let readonly = import_current_policy_in(
+            &fixture.project,
+            &fixture.executor,
+            &mut fixture.store,
+            &mut fixture.target,
+            &source,
+            &intent,
+            Some(&trust),
+        )?;
+        let request: Signed<ExecutionObservationRequest> = carrier(|| {
+            Ok(serde_json::from_str(
+                &readonly
+                    .sign_observation_request(
+                        &serde_json::to_string(&original)?,
+                        "readonly-observation",
+                        local.as_str(),
+                        &fixture.project.client,
+                        now() as f64,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+            )?)
+        })?;
+        let transport = TransportEvidence::DirectNoise {
+            device: DeviceId::from_key(&PublicKey::of(&fixture.project.client)),
+        };
+        let (wire, current, strong) = carrier(|| {
+            fixture.store.prepare_task_execution_dispatch_observation(
+                &fixture.project.node,
+                &request,
+                &transport,
+                now(),
+            )
+        })?;
+        assert_eq!(
+            current.request().purpose(),
+            RemoteExecutionPolicyPurpose::ObservationRead
+        );
+        assert_eq!(current.selection(), &selection);
+        assert_eq!(strong.hash(), &wire.hash()?);
+        let (retry, _, retry_strong) = carrier(|| {
+            fixture.store.prepare_task_execution_dispatch_observation(
+                &fixture.project.node,
+                &request,
+                &transport,
+                now() + 1,
+            )
+        })?;
+        assert_eq!(retry, wire);
+        assert_eq!(retry_strong.hash(), strong.hash());
+        let (_, restored) = carrier(|| {
+            fixture
+                .store
+                .current_task_business_observe(&fixture.project.node, &wire, now())
+        })?;
+        assert_eq!(restored.hash(), &wire.hash()?);
+        assert!(
+            carrier(|| fixture.store.prepare_execution_dispatch_observation(
+                &fixture.project.node,
+                &request,
+                &transport,
+                now()
+            ))
+            .is_err()
+        );
+        let wrong_purpose = carrier(|| {
+            current_task_readonly_policy_in(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                &local,
+                binding,
+                &selection,
+                RemoteExecutionPolicyPurpose::Resolver,
+                &request.payload.request,
+                &request.issuer,
+                &context,
+                now(),
+            )
+        });
+        assert!(wrong_purpose.is_err());
+        let mut changed = request.payload.clone();
+        changed.intent.execution_grant = writer_selection.execution_grant.clone();
+        changed.request.body_hash = ObjectHash::body(&changed.intent)?;
+        let wrong_grant = Signed::sign(changed, &fixture.project.client)?;
+        let mut changed = request.payload.clone();
+        changed.request.grant_leaf = fixture.project.bundle.grant_leaf.clone();
+        let wrong_source = Signed::sign(changed, &fixture.project.client)?;
+        let mut changed = request.payload.clone();
+        changed.request.body_hash = ObjectHash::body(&"another readonly intent")?;
+        let wrong_body = Signed::sign(changed, &fixture.project.client)?;
+        let mut changed = request.payload.clone();
+        changed.request.operation_id = "another-readonly-operation".into();
+        let wrong_operation = Signed::sign(changed, &fixture.project.client)?;
+        let wrong_reader = Signed::sign(request.payload.clone(), &fixture.executor.client)?;
+        for invalid in [
+            &wrong_grant,
+            &wrong_source,
+            &wrong_body,
+            &wrong_operation,
+            &wrong_reader,
+        ] {
+            assert!(
+                carrier(
+                    || fixture.store.prepare_task_execution_dispatch_observation(
+                        &fixture.project.node,
+                        invalid,
+                        &transport,
+                        now()
+                    )
+                )
+                .is_err()
+            );
+        }
+        let mut changed_wire = wire.clone();
+        changed_wire.request = wrong_body;
+        assert!(
+            carrier(|| fixture.store.current_task_business_observe(
+                &fixture.project.node,
+                &changed_wire,
+                now()
+            ))
+            .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .policy
+                .verified()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .policy
+                .verified()
+                .space(&fixture.executor.space)
+                .is_none()
+        );
+        let path = fixture.project.directory.join("foreign-approval.sqlite3");
+        let reopened = Store::open(&path)?;
+        let retained = carrier(|| {
+            original_task_execution_policy_in(
+                &reopened.connection,
+                &reopened.policy,
+                &local,
+                &proof,
+            )
+        })?
+        .context("reopen lost the original admitted writer policy")?;
+        assert_eq!(retained.signed_invocation_hash(), &proof.invocation.hash()?);
+        let cold = carrier(|| {
+            reopened.current_task_business_observe(&fixture.project.node, &wire, now() + 1)
+        });
+        let error = cold
+            .err()
+            .context("cold Original restored current readonly observation authority")?;
+        assert!(error.to_string().contains("NeedPolicySync"), "{error:#}");
+        assert!(
+            reopened
+                .policy
+                .verified()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        carrier(|| fixture.project.revoke_client(&mut fixture.store))?;
+        assert!(
+            carrier(
+                || fixture.store.prepare_task_execution_dispatch_observation(
+                    &fixture.project.node,
+                    &request,
+                    &transport,
+                    now() + 1
+                )
+            )
+            .is_err()
+        );
+        assert!(
+            carrier(|| fixture.store.current_task_business_observe(
+                &fixture.project.node,
+                &wire,
+                now() + 1
+            ))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cold_original_policy_cannot_authorize_a_new_current_request() -> Result<()> {
         let mut fixture = unseeded_fixture()?;
         let remote = import_current_policy(&mut fixture)?;
