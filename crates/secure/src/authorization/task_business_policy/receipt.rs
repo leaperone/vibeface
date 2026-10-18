@@ -1,5 +1,8 @@
 //! Read-only receipts for the original typed Task business challenges.
 
+#[cfg(test)]
+mod resolution_tests;
+
 use super::super::{
     execution_handoff::{ExecutionHandoffChallenge, ExecutionHandoffResolutionChallenge},
     execution_observation::ExecutionObservationChallenge,
