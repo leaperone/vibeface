@@ -818,17 +818,20 @@ impl Store {
         };
         let rows = self
             .connection
-            .prepare("SELECT envelope FROM events WHERE space_id=? AND scope_id=? ORDER BY hash")?
-            .query_map(params![network, scope], |row| row.get::<_, String>(0))?
+            .prepare("SELECT envelope,resource_id FROM events WHERE space_id=? AND scope_id=? ORDER BY hash")?
+            .query_map(params![network, scope], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut creation = None;
         let mut resource = None;
-        for encoded in rows {
+        for (encoded, indexed_resource) in rows {
             let envelope: SignedEvent = serde_json::from_str(&encoded)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             ensure!(
                 event.network_id == network
                     && event.scope_id == scope
+                    && event.resource_id.as_str() == indexed_resource
                     && resource.as_ref().is_none_or(|id| id == &event.resource_id),
                 "task history belongs to another space, scope or resource"
             );
@@ -2281,8 +2284,9 @@ mod tests {
         network.conversation(&mut store, "parallel")?;
         let creation = network.task(&mut store, "conversation", "same-task")?;
         let parallel = network.task(&mut store, "parallel", "same-task")?;
+        let mut latest = creation.clone();
         for _ in 0..40 {
-            network.message(&mut store, "conversation", "retained history")?;
+            latest = network.message(&mut store, "conversation", "retained history")?;
         }
         let verification = vibeface_secure::signature_verification::SignatureVerification::new();
         let actual =
@@ -2305,6 +2309,31 @@ mod tests {
         );
         assert!(!store.connection.is_autocommit());
         store.connection.execute_batch("ROLLBACK")?;
+        let other_resource = "another-local-resource";
+        store.connection.execute(
+            "INSERT INTO resource_records(space_id,resource_id,record_hash,kind,host_service_id,signed_record) SELECT space_id,?,record_hash,kind,host_service_id,signed_record FROM resource_records WHERE space_id=? AND resource_id=?",
+            params![other_resource, space, network.resource.as_str()],
+        )?;
+        assert_eq!(
+            store.connection.execute(
+                "UPDATE events SET resource_id=? WHERE space_id=? AND hash=?",
+                params![other_resource, space, latest.hash],
+            )?,
+            1
+        );
+        assert!(
+            store
+                .task_creation(space, "conversation", "same-task")
+                .is_err()
+        );
+        store.connection.execute(
+            "UPDATE events SET resource_id=? WHERE space_id=? AND hash=?",
+            params![network.resource.as_str(), space, latest.hash],
+        )?;
+        assert_eq!(
+            store.task_creation(space, "conversation", "same-task")?,
+            creation
+        );
         store.connection.execute(
             "UPDATE events SET sequence=999 WHERE space_id=? AND hash=?",
             params![space, parallel.hash],
