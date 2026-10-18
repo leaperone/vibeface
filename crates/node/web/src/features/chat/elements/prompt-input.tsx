@@ -71,7 +71,7 @@ export function PromptInput({
             disabled={!onStop && (disabled || busy || !value.trim())}
             aria-busy={busy || undefined}
             aria-label={onStop ? '停止回复' : '发送消息'}
-            className="ms-auto size-10 rounded-full"
+            className="ms-auto size-11 rounded-full"
             onClick={onStop}
           >
             {onStop ? <SquareIcon aria-hidden="true" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}

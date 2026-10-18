@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react"
 import { PlusIcon, RefreshCwIcon, Settings2Icon, UnplugIcon } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
+import { StatusOrb } from "@/components/status-orb"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Alert, AlertDescription } from "@/components/ui/alert"
@@ -23,13 +24,13 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { Spinner } from "@/components/ui/spinner"
 import { useWorkspace } from "./context"
 import { DevicesScreen } from "./devices-screen"
 import { BotForm } from "./bot-form"
 
 export function WorkspaceShell() {
-  return <SidebarProvider className="workspace-shell"><WorkspaceLayout /></SidebarProvider>
+  const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
+  return <SidebarProvider className="workspace-shell" open={sidebarOpen} onOpenChange={setSidebarOpen}><WorkspaceLayout /></SidebarProvider>
 }
 
 function WorkspaceLayout() {
@@ -106,7 +107,7 @@ function WorkspaceLayout() {
         </SidebarContent>
         <SidebarFooter className="shrink-0 gap-3 px-4 py-3">
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground" data-connection={workspace.connectionOnline ? "online" : "offline"} title={workspace.connectionText}>
-            <span className={`size-1.5 shrink-0 rounded-full ${workspace.connectionOnline ? "bg-emerald-500" : "bg-destructive"}`} aria-hidden="true" />
+            <StatusOrb place={workspace.connectionOnline ? "idle-link" : "connection"} size={20} />
             <span>{workspace.connectionOnline ? "已连接" : "正在恢复连接"}</span>
           </div>
           <SidebarMenu>
@@ -124,12 +125,12 @@ function WorkspaceLayout() {
         </SidebarFooter>
       </Sidebar>
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
-        <header className="flex h-14 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(0.75rem,env(safe-area-inset-left))] pe-[max(0.75rem,env(safe-area-inset-right))] sm:gap-3 sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
           <SidebarTrigger aria-label="切换侧栏" title="切换侧栏" />
           <h1 className="min-w-0 flex-1 truncate text-sm font-semibold" title={title}>{title}</h1>
-          {workspace.view === "chat" && !workspace.selectedBot ? <Button type="button" variant="secondary" disabled={!workspace.writable && !workspace.pendingBot} onClick={() => openCreator()}>{createLabel}</Button> : null}
-          <Button type="button" size="icon" variant="ghost" disabled={!workspace.connectionOnline} aria-label="刷新状态" title="刷新状态" aria-busy={workspace.refreshing} onClick={() => { void workspace.run(async () => { await workspace.refresh(); workspace.announce("已刷新。") }) }}>
-            {workspace.refreshing ? <Spinner /> : <RefreshCwIcon aria-hidden="true" />}
+          {workspace.view === "chat" && !workspace.selectedBot ? <Button type="button" variant="secondary" className="min-h-11 shrink-0" disabled={!workspace.writable && !workspace.pendingBot} onClick={() => openCreator()}><PlusIcon aria-hidden="true" /><span className="sr-only sm:not-sr-only">{createLabel}</span></Button> : null}
+          <Button type="button" size="icon" variant="ghost" className="size-11 shrink-0" disabled={!workspace.connectionOnline} aria-label="刷新状态" title="刷新状态" aria-busy={workspace.refreshing} onClick={() => { void workspace.run(async () => { await workspace.refresh(); workspace.announce("已刷新。") }) }}>
+            {workspace.refreshing ? <StatusOrb place="refresh" size={20} /> : <RefreshCwIcon aria-hidden="true" />}
           </Button>
         </header>
         {!workspace.connectionOnline || workspace.writeNotice || workspace.noticeText || workspace.error || workspace.data && workspace.incomplete ? (

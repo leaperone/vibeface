@@ -6,7 +6,7 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { Spinner } from "@/components/ui/spinner"
+import { StatusOrb } from "@/components/status-orb"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@/features/identity/context"
 import { messageOf } from "@/lib/node"
@@ -108,7 +108,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
           {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
           <div className="flex flex-wrap gap-3">
             <Button type="submit" className="min-h-11" disabled={busy || !workspace.writable} aria-busy={busy}>
-              {busy ? <Spinner /> : null}{busy ? pending ? "正在核对…" : "正在创建…" : pending ? rejected ? "核对创建结果" : "重试创建" : "创建机器人"}
+              {busy ? <StatusOrb place="reconcile" size={20} /> : null}{busy ? pending ? "正在核对…" : "正在创建…" : pending ? rejected ? "核对创建结果" : "重试创建" : "创建机器人"}
             </Button>
             <Button type="button" className="min-h-11" variant="outline" onClick={() => onOpenChange(false)}>关闭</Button>
           </div>

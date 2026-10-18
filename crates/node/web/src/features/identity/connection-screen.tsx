@@ -10,12 +10,13 @@ import { readInvitation } from '../../../transport.js'
 import { messageOf, parseEntry, parseInvitation } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { primaryLane } from './connection-lane'
+import { StatusOrb } from '@/components/status-orb'
 import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 
-const input = 'min-h-10'
-const button = 'min-h-10'
-const panel = 'gap-4 p-5'
+const input = 'min-h-11'
+const button = 'min-h-11'
+const panel = 'min-w-0 gap-4 p-4 sm:p-5'
 const check = 'size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50'
 const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
 type Lane = 'invite' | 'saved' | 'manual' | 'recovery' | 'passphrase'
@@ -83,14 +84,16 @@ export function ConnectionScreen() {
     : purpose === 'node' ? '到那台机器运行 vibeface pair，这张网页不能接受。'
     : ''
   const focused = Boolean(device.review || device.waiting)
-  return <main className="h-dvh overflow-y-auto overscroll-contain">
-    <div className="mx-auto w-full max-w-2xl space-y-5 px-4 py-8 pb-[max(2rem,env(safe-area-inset-bottom))] sm:px-6 sm:py-12">
+  const showConnectOrb = linking || ['initializing', 'connecting', 'reconnecting'].includes(device.phase)
+  return <main className="h-[var(--app-height,100dvh)] overflow-x-hidden overflow-y-auto overscroll-contain">
+    <div className="mx-auto w-full min-w-0 max-w-2xl space-y-5 py-8 pb-[max(2rem,env(safe-area-inset-bottom))] ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:py-12 sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
       <header className="space-y-2 pb-2">
         <p className="text-sm font-medium text-muted-foreground">Vibeface</p>
-        <h1 className="text-2xl font-semibold tracking-tight">连接设备</h1>
+        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">连接设备</h1>
         <p className="text-sm text-muted-foreground">{subtitle}</p>
       </header>
-      {['initializing', 'connecting', 'reconnecting', 'unpaired'].includes(device.phase) && <p role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '稍等' : device.phase === 'connecting' ? '正在连接…' : device.phase === 'reconnecting' ? '正在重连…' : '还没授权。'}</p>}
+      {showConnectOrb ? <div className="flex items-center gap-3"><StatusOrb place="connection" size={64} /><p role="status" className="text-sm text-muted-foreground">{device.phase === 'reconnecting' ? '正在重连…' : '正在连接…'}</p></div> : null}
+      {device.phase === 'unpaired' && !showConnectOrb ? <p role="status" className="text-sm text-muted-foreground">还没授权。</p> : null}
       {(error || device.error && device.phase !== 'reconnecting') && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
       {device.phase === 'blocked' && <Card className={panel} aria-labelledby="secure-page-title"><h2 id="secure-page-title" className="font-semibold">需要安全页面</h2><p className="text-sm text-muted-foreground">请用本机或 HTTPS 打开。</p></Card>}
       {device.phase === 'key_lost' && <Card className={panel} aria-labelledby="lost-key-title"><h2 id="lost-key-title" className="font-semibold">密钥已丢失</h2><p className="text-sm text-muted-foreground">新密钥需要重新配对。</p><Button variant="outline" className={`${button} self-start`} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新密钥</Button></Card>}
@@ -153,7 +156,7 @@ export function ConnectionScreen() {
         </div>
       </div>}
       {device.identity && <Collapsible className="px-1">
-        <CollapsibleTrigger asChild><Button variant="ghost" className="min-h-10 w-full justify-between text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">此浏览器的设备指纹<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
+        <CollapsibleTrigger asChild><Button variant="ghost" className="min-h-11 w-full justify-between text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">此浏览器的设备指纹<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
         <CollapsibleContent forceMount className="px-3 pb-3 data-[state=closed]:hidden"><p className="break-all font-mono text-xs text-muted-foreground">{device.identity.nodeId}</p></CollapsibleContent>
       </Collapsible>}
     </div>
