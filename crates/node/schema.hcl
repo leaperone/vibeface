@@ -312,6 +312,7 @@ table "operations" {
   }
   column "session_id" {
     type = text
+    null = true
   }
   column "request" {
     type = text

@@ -23,7 +23,7 @@ CREATE TABLE `tasks` (`space_id` text NOT NULL, `conversation_id` text NOT NULL,
 -- Create "execution_sessions" table
 CREATE TABLE `execution_sessions` (`space_id` text NOT NULL, `target_node` text NOT NULL, `session_id` text NOT NULL, `revision` integer NOT NULL, `record` text NOT NULL, PRIMARY KEY (`space_id`, `target_node`, `session_id`), CONSTRAINT `sessions_node` FOREIGN KEY (`space_id`, `target_node`) REFERENCES `node_certificates` (`space_id`, `node_id`), CONSTRAINT `session_revision` CHECK (revision >= 0));
 -- Create "operations" table
-CREATE TABLE `operations` (`space_id` text NOT NULL, `operation_id` text NOT NULL, `target_node` text NOT NULL, `session_id` text NOT NULL, `request` text NOT NULL, `state` text NOT NULL, `control` integer NOT NULL DEFAULT 0, `result` text NOT NULL, PRIMARY KEY (`space_id`, `operation_id`), CONSTRAINT `operations_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `operation_control` CHECK (control IN (0,1)));
+CREATE TABLE `operations` (`space_id` text NOT NULL, `operation_id` text NOT NULL, `target_node` text NOT NULL, `session_id` text NULL, `request` text NOT NULL, `state` text NOT NULL, `control` integer NOT NULL DEFAULT 0, `result` text NOT NULL, PRIMARY KEY (`space_id`, `operation_id`), CONSTRAINT `operations_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `operation_control` CHECK (control IN (0,1)));
 -- Create index "operations_session" to table: "operations"
 CREATE INDEX `operations_session` ON `operations` (`space_id`, `target_node`, `session_id`, `state`);
 -- Create index "operations_request_reference" to table: "operations"
