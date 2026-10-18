@@ -415,9 +415,21 @@ impl Store {
         &self,
         network_id: &str,
         node_id: &str,
-        role: Option<NodeRole>,
+        _role: Option<NodeRole>,
     ) -> Result<NodeCertificate> {
-        authorize_node_from(&self.connection, network_id, node_id, role)
+        let snapshot = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let policy =
+            crate::identity::journal::PolicyState::reload_verified(&self.connection, &self.policy)?;
+        let certificate =
+            authorize_verified_node_from(&self.connection, policy.verified(), network_id, node_id)?;
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
+        }
+        Ok(certificate)
     }
     pub fn save_local_device(&mut self, network_id: &str, identity: &LocalIdentity) -> Result<()> {
         let node_id = identity.node_id()?;
@@ -1617,6 +1629,16 @@ fn authorize_node_from(
     node_id: &str,
     _role: Option<NodeRole>,
 ) -> Result<NodeCertificate> {
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
+    authorize_verified_node_from(connection, policy.verified(), network_id, node_id)
+}
+
+fn authorize_verified_node_from(
+    connection: &Connection,
+    policy: &vibeface_secure::authorization::VerifiedPolicySet,
+    network_id: &str,
+    node_id: &str,
+) -> Result<NodeCertificate> {
     use vibeface_secure::authorization::{DeviceId, PublicKey, SpaceId};
     let key: String = connection.query_row(
         "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
@@ -1627,9 +1649,8 @@ fn authorize_node_from(
         crate::crypto::fingerprint(&key)? == node_id,
         "Node certificate projection mismatch"
     );
-    let policy = crate::identity::journal::PolicyState::load(connection)?;
     let public_key = PublicKey::parse(&key)?;
-    let certificate = policy.verified().verify_service_device(
+    let certificate = policy.verify_service_device(
         &SpaceId::parse(network_id)?,
         &DeviceId::from_key(&public_key),
         crate::runtime::now_ms() as u64,
@@ -2274,6 +2295,52 @@ mod tests {
         let (auth, transport) = network.authorization(store, &body, now())?;
         let proof = network.freshness(store, &auth, CheckStage::Admit, now())?;
         store.rebind_task_authorized(&network.node, &auth, &proof, &transport, &body, now())
+    }
+
+    #[test]
+    fn node_authorization_reuses_verified_prefix_and_rechecks_certificate() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        let node_id = network.node.node_id()?;
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let certificate = verification.run(|| store.authorize_node(space, &node_id, None))?;
+        assert_eq!(certificate.node_id, node_id);
+        assert_eq!(certificate.public_key, network.node.public_key_hex()?);
+        assert!(verification.counts().actual_verifications > 0);
+        assert!(verification.counts().actual_verifications <= 32);
+        store.connection.execute_batch("BEGIN IMMEDIATE")?;
+        assert_eq!(
+            store.authorize_node(space, &node_id, None)?.node_id,
+            node_id
+        );
+        assert!(!store.connection.is_autocommit());
+        store.connection.execute_batch("ROLLBACK")?;
+        let changed_key = Identity::generate()
+            .map_err(anyhow::Error::msg)?
+            .public_key_hex();
+        store.connection.execute(
+            "UPDATE node_certificates SET public_key=? WHERE space_id=? AND node_id=?",
+            params![changed_key, space, node_id],
+        )?;
+        assert!(store.authorize_node(space, &node_id, None).is_err());
+        store.connection.execute(
+            "UPDATE node_certificates SET public_key=? WHERE space_id=? AND node_id=?",
+            params![certificate.public_key, space, node_id],
+        )?;
+        store.connection.execute_batch(
+            "UPDATE policy_journal SET accepted_at_ms=accepted_at_ms+1 WHERE ordinal=(SELECT MIN(ordinal) FROM policy_journal)",
+        )?;
+        assert!(store.authorize_node(space, &node_id, None).is_err());
+        store.connection.execute_batch(
+            "UPDATE policy_journal SET accepted_at_ms=accepted_at_ms-1 WHERE ordinal=(SELECT MIN(ordinal) FROM policy_journal)",
+        )?;
+        assert_eq!(
+            store.authorize_node(space, &node_id, None)?.node_id,
+            node_id
+        );
+        network.revoke_node(&mut store)?;
+        assert!(store.authorize_node(space, &node_id, None).is_err());
+        Ok(())
     }
 
     #[test]
