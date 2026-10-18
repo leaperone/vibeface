@@ -2276,6 +2276,7 @@ impl ExecutionProofUsage {
         require(auth.signed_invocation() == &proof.invocation,
             "cached admission differs from its verified invocation")?;
         self.objects.extend(auth.budget.object_bytes.iter().map(|(hash, size)| (hash.clone(), *size)));
+        self.metadata.extend(auth.budget.metadata.iter().map(|(hash, size)| (hash.clone(), *size)));
         self.record_chain_depth(auth.grant_path().len());
         let mut retained = Self::default();
         retained.record_admission_kind(proof, false)?;
@@ -2287,6 +2288,7 @@ impl ExecutionProofUsage {
         for (hash, size) in &budget.object_bytes {
             self.objects.insert(hash.clone(), *size);
         }
+        self.metadata.extend(budget.metadata.iter().map(|(hash, size)| (hash.clone(), *size)));
         for signature in &budget.signatures {
             self.signatures.insert(ObjectHash::body(signature)?);
         }

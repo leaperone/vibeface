@@ -1719,4 +1719,367 @@ mod tests {
             Err(AuthorizationError::NeedPolicySync(_))
         ));
     }
+
+    fn current_business_request(
+        b: &AccountFixture,
+        gateway: &Identity,
+    ) -> (GatewayOriginal, RequestFacts) {
+        let account = AccountId::from_root(&PublicKey::of(&b.root));
+        let auth = verify_client_policy_state_selected(
+            b.state.clone(),
+            &b.bundle,
+            &b.pins,
+            account.clone(),
+            b.resource.space.clone(),
+            PublicKey::of(&b.client),
+            Some(&b.resource),
+            NOW,
+        )
+        .unwrap();
+        let body = json!({"method":"message", "space_id":b.resource.space, "resource_id":b.resource.resource,
+            "authorization_id":"business_write", "conversation_id":"chat", "text":"hello"});
+        let context = InvocationContext {
+            conversation: Some("chat".into()),
+            workspace_resource: Some(b.resource.resource.clone()),
+            ..Default::default()
+        };
+        let signed = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Account(account.clone()),
+                device: DeviceId::from_key(&PublicKey::of(&b.client)),
+                initiator: Actor::Account(account),
+                initiating_grant: None,
+                resource: b.resource.clone(),
+                action: Action::MessageAppend,
+                audience: auth.audience.clone(),
+                presenter: DeviceId::from_key(&PublicKey::of(gateway)),
+                operation_id: "business_write".into(),
+                body_hash: ObjectHash::body(&body).unwrap(),
+                grant_leaf: b.bundle.grant_leaf.clone(),
+                expected_policies: auth.heads.clone(),
+                context: context.clone(),
+                nonce: Nonce::from_bytes([160; 32]),
+                not_before_ms: NOW,
+                expires_at_ms: NOW + 60_000,
+            },
+            &b.client,
+        )
+        .unwrap();
+        let facts = RequestFacts {
+            resource: b.resource.clone(),
+            action: Action::MessageAppend,
+            audience: auth.audience,
+            operation_id: "business_write".into(),
+            body_hash: signed.payload.body_hash.clone(),
+            context,
+        };
+        (
+            GatewayOriginal::Invoke {
+                body,
+                invocation: signed,
+            },
+            facts,
+        )
+    }
+
+    #[test]
+    fn directed_business_uses_current_b_policy_without_enrolling_a() {
+        let b = account_fixture(170);
+        let gateway = key(180);
+        let (original, facts) = current_business_request(&b, &gateway);
+        let GatewayOriginal::Invoke { body, invocation } = &original else {
+            unreachable!()
+        };
+        let header = header(&original, &gateway, &b.node);
+        let proof = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &header,
+            &original,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            b.state
+                .find_device(&DeviceId::from_key(&PublicKey::of(&gateway)))
+                .is_err()
+        );
+        let authorized = b
+            .state
+            .verify_gateway_invocation(invocation, body, &facts, &proof, NOW)
+            .unwrap();
+        assert_eq!(authorized.actor(), &invocation.payload.actor);
+        assert_eq!(
+            authorized.dependencies(),
+            invocation.payload.expected_policies
+        );
+        assert!(authorized.expires_at_ms() <= header.payload.expires_at_ms);
+        let legacy = TransportEvidence::GatewayNoise {
+            device: invocation.payload.device.clone(),
+            gateway: invocation.payload.presenter.clone(),
+        };
+        assert!(
+            b.state
+                .verify_invocation(invocation, &facts, &legacy, NOW)
+                .is_err()
+        );
+        assert!(
+            b.state
+                .verify_invocation(
+                    invocation,
+                    &facts,
+                    &TransportEvidence::VerifiedPeer {
+                        origin: invocation.payload.presenter.clone()
+                    },
+                    NOW
+                )
+                .is_err()
+        );
+        let intent = Signed::sign(
+            PrepareIntent {
+                request: invocation.payload.clone(),
+                binding_generation: None,
+                canonical_cwd: None,
+                execution_target_public_key: None,
+            },
+            &b.client,
+        )
+        .unwrap();
+        let prepare = GatewayOriginal::Prepare {
+            body: body.clone(),
+            intent: intent.clone(),
+        };
+        let prepare_header = self::header(&prepare, &gateway, &b.node);
+        let prepare_proof = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &prepare_header,
+            &prepare,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        let prepared = b
+            .state
+            .verify_gateway_prepare_intent(
+                &intent,
+                body,
+                Action::MessageAppend,
+                &facts.audience,
+                &prepare_proof,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(prepared.raw_body(), body);
+        assert!(
+            b.state
+                .verify_prepare_intent(
+                    &intent,
+                    body,
+                    Action::MessageAppend,
+                    &facts.audience,
+                    &legacy,
+                    NOW
+                )
+                .is_err()
+        );
+        assert!(
+            b.state
+                .verify_gateway_invocation(invocation, body, &facts, &prepare_proof, NOW)
+                .is_err()
+        );
+        let mut changed = invocation.payload.clone();
+        changed.nonce = Nonce::from_bytes([181; 32]);
+        let changed = Signed::sign(changed, &b.client).unwrap();
+        assert!(
+            b.state
+                .verify_gateway_invocation(&changed, body, &facts, &proof, NOW)
+                .is_err()
+        );
+        let mut revoked = b.state.clone();
+        let mut document = revoked.space(&b.resource.space).unwrap().clone();
+        document.previous = revoked
+            .head(&PolicyDomain::Space(b.resource.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.grants.retain(|hash| hash != &b.bundle.grant_leaf);
+        revoked
+            .install_space(Signed::sign(document, &b.root).unwrap())
+            .unwrap();
+        assert!(
+            b.state
+                .verify_gateway_invocation(invocation, body, &facts, &proof, NOW)
+                .is_ok()
+        );
+        assert!(
+            revoked
+                .verify_gateway_invocation(invocation, body, &facts, &proof, NOW)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn directed_business_preserves_context_and_uv_constraints() {
+        let mut b = account_fixture(190);
+        let gateway = key(200);
+        let mut grant = b.state.grant(&b.bundle.grant_leaf).unwrap().payload.clone();
+        grant.issued_under = b
+            .state
+            .head(&PolicyDomain::Space(b.resource.space.clone()))
+            .unwrap()
+            .clone();
+        grant.parent = Some(b.bundle.grant_leaf.clone());
+        grant.remaining_delegations -= 1;
+        grant.nonce = Nonce::from_bytes([201; 32]);
+        grant.constraints.context.conversation = Some("locked".into());
+        let constrained = b
+            .state
+            .install_grant(Signed::sign(grant.clone(), &b.client).unwrap(), NOW)
+            .unwrap();
+        grant.constraints.context.conversation = None;
+        grant.constraints.require_webauthn_uv = true;
+        grant.nonce = Nonce::from_bytes([202; 32]);
+        let uv = b
+            .state
+            .install_grant(Signed::sign(grant, &b.client).unwrap(), NOW)
+            .unwrap();
+        let mut document = b.state.space(&b.resource.space).unwrap().clone();
+        document.previous = b
+            .state
+            .head(&PolicyDomain::Space(b.resource.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.grants.extend([constrained.clone(), uv.clone()]);
+        document.grants.sort();
+        b.state
+            .install_space(Signed::sign(document, &b.root).unwrap())
+            .unwrap();
+        b.bundle.grant_leaf = constrained;
+        let (original, facts) = current_business_request(&b, &gateway);
+        let GatewayOriginal::Invoke { body, invocation } = &original else {
+            unreachable!()
+        };
+        let signed_header = header(&original, &gateway, &b.node);
+        let proof = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &signed_header,
+            &original,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            b.state
+                .verify_gateway_invocation(invocation, body, &facts, &proof, NOW)
+                .is_err()
+        );
+        b.bundle.grant_leaf = uv;
+        let (original, facts) = current_business_request(&b, &gateway);
+        let GatewayOriginal::Invoke { body, invocation } = &original else {
+            unreachable!()
+        };
+        let signed_header = header(&original, &gateway, &b.node);
+        let proof = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &signed_header,
+            &original,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            b.state
+                .verify_gateway_invocation(invocation, body, &facts, &proof, NOW)
+                .unwrap_err(),
+            AuthorizationError::UserPresenceRequired
+        );
+    }
+
+    #[test]
+    fn directed_freshness_keeps_original_body_in_the_budget() {
+        let b = account_fixture(210);
+        let gateway = key(220);
+        let (original, facts) = current_business_request(&b, &gateway);
+        let GatewayOriginal::Invoke { body, invocation } = &original else {
+            unreachable!()
+        };
+        let signed_header = header(&original, &gateway, &b.node);
+        let proof = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &signed_header,
+            &original,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        let baseline = b
+            .state
+            .verify_gateway_invocation(invocation, body, &facts, &proof, NOW)
+            .unwrap();
+        let receipts_for = |auth: &VerifiedAuthorization| {
+            let challenge = FreshnessChallenge::new(
+                auth,
+                CheckStage::Admit,
+                Nonce::from_bytes([221; 32]),
+                NOW,
+                NOW + 1_000,
+            )
+            .unwrap();
+            let receipts: Vec<_> = auth
+                .dependencies()
+                .iter()
+                .map(|head| {
+                    Signed::sign(
+                        FreshnessReceipt {
+                            version: AUTH_VERSION,
+                            current: head.clone(),
+                            challenge_hash: challenge.hash().unwrap(),
+                            issued_at_ms: NOW,
+                            expires_at_ms: NOW + 1_000,
+                        },
+                        &b.node,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            (challenge, receipts)
+        };
+        let (challenge, receipts) = receipts_for(&baseline);
+        b.state
+            .verify_freshness(&baseline, &challenge, &receipts, NOW)
+            .unwrap();
+        let mut body = body.clone();
+        body["text"] = Value::String("x".repeat(MAX_PROOF_BYTES - baseline.budget.bytes - 128));
+        let mut request = invocation.payload.clone();
+        request.body_hash = ObjectHash::body(&body).unwrap();
+        let invocation = Signed::sign(request, &b.client).unwrap();
+        let original = GatewayOriginal::Invoke {
+            body: body.clone(),
+            invocation: invocation.clone(),
+        };
+        let signed_header = header(&original, &gateway, &b.node);
+        let proof = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &signed_header,
+            &original,
+            &PublicKey::of(&b.node),
+            NOW,
+        )
+        .unwrap();
+        let mut facts = facts;
+        facts.body_hash = invocation.payload.body_hash.clone();
+        let near_limit = b
+            .state
+            .verify_gateway_invocation(&invocation, &body, &facts, &proof, NOW)
+            .unwrap();
+        assert!(near_limit.budget.bytes < MAX_PROOF_BYTES);
+        assert!(MAX_PROOF_BYTES - near_limit.budget.bytes < 256);
+        let (challenge, receipts) = receipts_for(&near_limit);
+        assert_eq!(
+            b.state
+                .verify_freshness(&near_limit, &challenge, &receipts, NOW)
+                .unwrap_err(),
+            AuthorizationError::BudgetExceeded
+        );
+    }
 }

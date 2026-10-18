@@ -870,6 +870,16 @@ pub enum TransportEvidence {
         session: SessionRef,
     },
 }
+#[derive(Clone, Copy)]
+enum InvocationTransport<'a> {
+    Existing(&'a TransportEvidence),
+    DirectedGateway {
+        proof: &'a gateway_forward::VerifiedDirectedGateway,
+        original: &'a gateway_forward::GatewayOriginal,
+    },
+    PortableIntent,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuthorizationPhase {
     Admission,
@@ -1008,6 +1018,7 @@ pub struct VerifiedPolicySet {
 struct Budget {
     objects: BTreeSet<ObjectHash>,
     object_bytes: BTreeMap<ObjectHash, usize>,
+    metadata: BTreeMap<ObjectHash, usize>,
     signatures: BTreeSet<(PublicKey, String, ObjectHash, Signature)>,
     external_signatures: BTreeSet<ObjectHash>,
     bytes: usize,
@@ -1021,6 +1032,7 @@ impl Default for Budget {
         Self {
             objects: BTreeSet::new(),
             object_bytes: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             signatures: BTreeSet::new(),
             external_signatures: BTreeSet::new(),
             bytes: 0,
@@ -1032,6 +1044,21 @@ impl Default for Budget {
     }
 }
 impl Budget {
+    fn record_metadata<T: Serialize>(&mut self, value: &T) -> Result<()> {
+        let hash = ObjectHash::body(value)?;
+        if !self.metadata.contains_key(&hash) {
+            let bytes = canonical(value)?.len();
+            self.bytes = self
+                .bytes
+                .checked_add(bytes)
+                .ok_or(AuthorizationError::BudgetExceeded)?;
+            self.metadata.insert(hash, bytes);
+        }
+        if self.bytes > MAX_PROOF_BYTES {
+            return Err(AuthorizationError::BudgetExceeded);
+        }
+        Ok(())
+    }
     fn authenticator_assertion(&mut self, assertion: &crate::webauthn::VerifiedPasskeyAssertion) {
         self.authenticator_updates.insert(
             assertion.record_hash().clone(),
@@ -1101,6 +1128,23 @@ impl Budget {
         Ok(hash)
     }
 }
+fn gateway_invocation_original(
+    signed: &Signed<Invocation>,
+    raw_body: &serde_json::Value,
+) -> gateway_forward::GatewayOriginal {
+    if signed.payload.action == Action::OperationStatusRead {
+        gateway_forward::GatewayOriginal::Status {
+            body: raw_body.clone(),
+            invocation: signed.clone(),
+        }
+    } else {
+        gateway_forward::GatewayOriginal::Invoke {
+            body: raw_body.clone(),
+            invocation: signed.clone(),
+        }
+    }
+}
+
 fn sorted_unique<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
@@ -2322,6 +2366,63 @@ impl VerifiedPolicySet {
             AuthorizationPhase::Admission,
         )
     }
+    pub fn verify_gateway_invocation(
+        &self,
+        signed: &Signed<Invocation>,
+        raw_body: &serde_json::Value,
+        facts: &RequestFacts,
+        gateway: &gateway_forward::VerifiedDirectedGateway,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+        let original = gateway_invocation_original(signed, raw_body);
+        let mut budget = Budget::default();
+        let hash = budget.verify(signed)?;
+        self.verify_authorized_invocation_body(
+            signed,
+            hash,
+            budget,
+            facts,
+            InvocationTransport::DirectedGateway {
+                proof: gateway,
+                original: &original,
+            },
+            now_ms,
+            AuthorizationPhase::Admission,
+        )
+    }
+
+    fn check_directed_gateway_request(
+        &self,
+        signed: &Signed<Invocation>,
+        invocation_hash: &ObjectHash,
+        gateway: &gateway_forward::VerifiedDirectedGateway,
+        original: &gateway_forward::GatewayOriginal,
+        now_ms: u64,
+    ) -> Result<()> {
+        let target = &self
+            .find_device(&signed.payload.audience.device)?
+            .payload
+            .public_key;
+        gateway.check_original(original, target, now_ms)?;
+        let (hash, signature) = match original {
+            gateway_forward::GatewayOriginal::Prepare { intent, .. } => {
+                (intent.hash()?, &intent.signature)
+            }
+            gateway_forward::GatewayOriginal::Invoke { invocation, .. }
+            | gateway_forward::GatewayOriginal::Status { invocation, .. } => {
+                (invocation.hash()?, &invocation.signature)
+            }
+        };
+        require(
+            original.request() == &signed.payload
+                && original.issuer() == &signed.issuer
+                && signature == &signed.signature
+                && &hash == invocation_hash
+                && matches!(signed.payload.actor, Actor::Account(_)),
+            "directed gateway does not match this original Account request",
+        )
+    }
     /// The caller persists this proof with nonce consumption and policy-head CAS.
     pub fn admit_operation(
         &self,
@@ -2398,7 +2499,7 @@ impl VerifiedPolicySet {
             invocation_hash,
             budget,
             facts,
-            Some(transport),
+            InvocationTransport::Existing(transport),
             now_ms,
             phase,
         )
@@ -2423,7 +2524,7 @@ impl VerifiedPolicySet {
             intent_hash,
             budget,
             facts,
-            None,
+            InvocationTransport::PortableIntent,
             now_ms,
             AuthorizationPhase::Admission,
         )
@@ -2435,7 +2536,7 @@ impl VerifiedPolicySet {
         invocation_hash: ObjectHash,
         mut budget: Budget,
         facts: &RequestFacts,
-        transport: Option<&TransportEvidence>,
+        transport: InvocationTransport<'_>,
         now_ms: u64,
         phase: AuthorizationPhase,
     ) -> Result<VerifiedAuthorization> {
@@ -2514,8 +2615,8 @@ impl VerifiedPolicySet {
         )?;
         let mut transport_dependencies = BTreeMap::new();
         let prior_budget_dependencies = budget.dependencies.clone();
-        if let Some(transport) = transport {
-            match transport {
+        match transport {
+            InvocationTransport::Existing(transport) => match transport {
                 TransportEvidence::DirectNoise { device } => require(
                     device == &i.device && i.presenter == *device,
                     "direct transport device mismatch",
@@ -2547,14 +2648,24 @@ impl VerifiedPolicySet {
                         && i.context.sdk_session.as_ref() == Some(session),
                     "agent session mismatch",
                 )?,
+            },
+            InvocationTransport::DirectedGateway { proof, original } => {
+                self.check_directed_gateway_request(
+                    signed,
+                    &invocation_hash,
+                    proof,
+                    original,
+                    now_ms,
+                )?;
+                budget.verify(proof.header())?;
+                budget.record_metadata(original.body())?;
+                budget.expires(proof.header().payload.expires_at_ms);
             }
-        } else if i.presenter != i.device {
-            self.validate_presenter(
-                &i.presenter,
-                now_ms,
-                &mut budget,
-                &mut dependencies,
-            )?;
+            InvocationTransport::PortableIntent => {
+                if i.presenter != i.device {
+                    self.validate_presenter(&i.presenter, now_ms, &mut budget, &mut dependencies)?;
+                }
+            }
         }
         transport_dependencies.extend(budget.dependencies.clone());
         budget.dependencies = prior_budget_dependencies;
@@ -2651,6 +2762,16 @@ impl VerifiedPolicySet {
             self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
         }
         let dependencies = dependencies.into_values().collect();
+        if let InvocationTransport::DirectedGateway { proof, .. } = transport {
+            let mut usage = proof.proof_usage().clone();
+            usage.record_budget(&budget)?;
+            if let Some(counts) =
+                crate::signature_verification::SignatureVerification::current_counts()
+            {
+                usage.record_actual_signature_counts(counts);
+            }
+            usage.enforce_limits()?;
+        }
         Ok(VerifiedAuthorization {
             invocation: signed.clone(),
             invocation_hash,
@@ -6503,12 +6624,12 @@ fn sign_client_invocation_inner(
         .map_err(|_| AuthorizationError::InvalidProof("unknown expected action"))?;
     let request: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| AuthorizationError::InvalidProof("invalid request JSON"))?;
-    validate_client_invocation_fields(
-        auth, &invocation, &request, action, operation, &PublicKey::of(key), presenter, now as u64,
-    )?;
     require(
         invocation.expected_policies == auth.heads,
-        "invocation template changed exact client policy heads",
+        "invocation template does not match client request",
+    )?;
+    validate_client_invocation_fields(
+        auth, &invocation, &request, action, operation, &PublicKey::of(key), presenter, now as u64,
     )?;
     invocation.nonce = Nonce::random()?;
     serde_json::to_string(&Signed::sign(invocation, key)?)

@@ -1,7 +1,7 @@
 //! Read-only qualification of raw client intent before business-data normalization.
 
-use super::*;
 use super::execution_handoff::ExecutionProofUsage;
+use super::*;
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,15 +137,19 @@ impl VerifiedPolicySet {
         mut budget: Budget,
     ) -> Result<VerifiedExecutionDestination> {
         let execution_action = match action {
-                Action::ExecutionRebind => Action::ExecutionOpen,
-                Action::ExecutionOpen
-                    | Action::ExecutionSend
-                    | Action::ExecutionSteer
-                    | Action::ExecutionInterrupt
-                    | Action::ExecutionRespondApproval
-                    | Action::OperationStatusRead
-                    | Action::OperationResolve => action,
-                _ => return Err(AuthorizationError::InvalidProof("unsupported remote execution action")),
+            Action::ExecutionRebind => Action::ExecutionOpen,
+            Action::ExecutionOpen
+            | Action::ExecutionSend
+            | Action::ExecutionSteer
+            | Action::ExecutionInterrupt
+            | Action::ExecutionRespondApproval
+            | Action::OperationStatusRead
+            | Action::OperationResolve => action,
+            _ => {
+                return Err(AuthorizationError::InvalidProof(
+                    "unsupported remote execution action",
+                ));
+            }
         };
         let project_record = self
             .resource(&project.space, &project.resource)
@@ -249,6 +253,46 @@ impl VerifiedPolicySet {
         destination: &VerifiedExecutionDestination,
         now_ms: u64,
     ) -> Result<VerifiedAuthorization> {
+        self.verify_invocation_with_execution_transport(
+            signed,
+            facts,
+            InvocationTransport::Existing(transport),
+            destination,
+            now_ms,
+        )
+    }
+
+    pub fn verify_gateway_invocation_with_execution_destination(
+        &self,
+        signed: &Signed<Invocation>,
+        raw_body: &Value,
+        facts: &RequestFacts,
+        gateway: &gateway_forward::VerifiedDirectedGateway,
+        destination: &VerifiedExecutionDestination,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+        let original = gateway_invocation_original(signed, raw_body);
+        self.verify_invocation_with_execution_transport(
+            signed,
+            facts,
+            InvocationTransport::DirectedGateway {
+                proof: gateway,
+                original: &original,
+            },
+            destination,
+            now_ms,
+        )
+    }
+
+    fn verify_invocation_with_execution_transport(
+        &self,
+        signed: &Signed<Invocation>,
+        facts: &RequestFacts,
+        transport: InvocationTransport<'_>,
+        destination: &VerifiedExecutionDestination,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
         let mut budget = Budget::default();
         let hash = budget.verify(signed)?;
         destination.check_facts(facts)?;
@@ -272,7 +316,7 @@ impl VerifiedPolicySet {
             now_ms,
             &mut current.budget,
         )?;
-        self.verify_signed_invocation_body(
+        self.verify_authorized_invocation_body(
             signed,
             hash,
             current.budget,
@@ -286,24 +330,46 @@ impl VerifiedPolicySet {
     fn retain_execution_transport_dependencies(
         &self,
         invocation: &Invocation,
-        transport: &TransportEvidence,
+        transport: InvocationTransport<'_>,
         now_ms: u64,
         budget: &mut Budget,
     ) -> Result<()> {
         let presenter = match transport {
-            TransportEvidence::GatewayNoise { device, gateway } => {
+            InvocationTransport::Existing(transport) => match transport {
+                TransportEvidence::GatewayNoise { device, gateway } => {
+                    require(
+                        device == &invocation.device && gateway == &invocation.presenter,
+                        "gateway transport device mismatch",
+                    )?;
+                    gateway
+                }
+                TransportEvidence::VerifiedPeer { origin } => {
+                    require(origin == &invocation.presenter, "peer presenter mismatch")?;
+                    origin
+                }
+                TransportEvidence::DirectNoise { .. }
+                | TransportEvidence::LocalAgentAdapter { .. } => {
+                    return Ok(());
+                }
+            },
+            InvocationTransport::DirectedGateway { proof, original } => {
                 require(
-                    device == &invocation.device && gateway == &invocation.presenter,
-                    "gateway transport device mismatch",
+                    original.request() == invocation,
+                    "gateway destination transport changed request",
                 )?;
-                gateway
-            }
-            TransportEvidence::VerifiedPeer { origin } => {
-                require(origin == &invocation.presenter, "peer presenter mismatch")?;
-                origin
-            }
-            TransportEvidence::DirectNoise { .. } | TransportEvidence::LocalAgentAdapter { .. } => {
+                let target = &self
+                    .find_device(&invocation.audience.device)?
+                    .payload
+                    .public_key;
+                proof.check_original(original, target, now_ms)?;
+                budget.verify(proof.header())?;
+                budget.expires(proof.header().payload.expires_at_ms);
                 return Ok(());
+            }
+            InvocationTransport::PortableIntent => {
+                return Err(AuthorizationError::InvalidProof(
+                    "portable intent has no live execution transport",
+                ));
             }
         };
         let mut dependencies = BTreeMap::new();
@@ -475,8 +541,11 @@ pub fn verify_remote_execution(
     (|| -> Result<VerifiedRemoteExecution> {
         let signatures = crate::signature_verification::ScopedSignatureVerification::new();
         let now = client_time(now_ms)?;
-        require(execution.intent().purpose != remote_execution_policy::RemoteExecutionPolicyPurpose::History,
-            "history policy cannot authorize remote execution")?;
+        require(
+            execution.intent().purpose
+                != remote_execution_policy::RemoteExecutionPolicyPurpose::History,
+            "history policy cannot authorize remote execution",
+        )?;
         let baseline = execution.revalidate(auth, now)?;
         let source = client_policy_import::require_confirmed_client_policy(auth)?;
         let merged = policy_import::merge_same_head_snapshots(source, execution.snapshot())?;
@@ -566,9 +635,7 @@ impl VerifiedRemoteExecution {
         )?;
         let event: events::Event =
             serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)
-                .map_err(|_| {
-                    AuthorizationError::InvalidProof("invalid observation dispatch")
-                })?;
+                .map_err(|_| AuthorizationError::InvalidProof("invalid observation dispatch"))?;
         let events::EventCause::Invocation { admission } = &event.cause else {
             return Err(AuthorizationError::InvalidProof(
                 "observation has no original admission",
@@ -581,8 +648,7 @@ impl VerifiedRemoteExecution {
                 && actual.handoff.handoff.target_public_key == self.selection.target_public_key
                 && actual.handoff.invocation.issuer == self.source.audience_public_key
                 && actual.handoff.invocation.payload.action == Action::ExecutionSubmit
-                && actual.handoff.invocation.payload.resource
-                    == self.selection.execution_resource
+                && actual.handoff.invocation.payload.resource == self.selection.execution_resource
                 && admission.invocation.payload.resource.space == self.source.scope.space_id
                 && Some(&admission.invocation.payload.resource.resource)
                     == self.context.context.workspace_resource.as_ref()
@@ -629,9 +695,7 @@ impl VerifiedRemoteExecution {
         let body: Value = serde_json::from_str(expected_body_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid original browser body"))?;
         let invocation: Signed<Invocation> = serde_json::from_str(expected_invocation_json)
-            .map_err(|_| {
-                AuthorizationError::InvalidProof("invalid original browser invocation")
-            })?;
+            .map_err(|_| AuthorizationError::InvalidProof("invalid original browser invocation"))?;
         let event: events::Event =
             serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid result dispatch"))?;
@@ -650,8 +714,7 @@ impl VerifiedRemoteExecution {
                         .find_device(&self.source.scope.device_id)?
                         .payload
                         .public_key
-                && invocation.payload.actor
-                    == Actor::Account(self.source.scope.account_id.clone()),
+                && invocation.payload.actor == Actor::Account(self.source.scope.account_id.clone()),
             "remote result differs from the original browser authorization",
         )?;
         Ok(actual)
@@ -675,9 +738,10 @@ impl VerifiedRemoteExecution {
                 && auth
                     .client_policy_context_json()
                     .map_err(|_| AuthorizationError::InvalidProof("source is not confirmed"))?
-                    == self.source.client_policy_context_json().map_err(|_| {
-                        AuthorizationError::InvalidProof("source is not confirmed")
-                    })?,
+                    == self
+                        .source
+                        .client_policy_context_json()
+                        .map_err(|_| AuthorizationError::InvalidProof("source is not confirmed"))?,
             "remote handle belongs to a different or refreshed Project authorization",
         )?;
         let selected = remote_selection(body)?.ok_or(AuthorizationError::InvalidProof(
@@ -729,9 +793,8 @@ impl VerifiedRemoteExecution {
                 "observation handoff is too large",
             )?;
             let original: execution_handoff::SignedExecutionHandoff =
-                serde_json::from_str(original_json).map_err(|_| {
-                    AuthorizationError::InvalidProof("invalid original handoff")
-                })?;
+                serde_json::from_str(original_json)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid original handoff"))?;
             let target =
                 execution_observation::ExecutionObservationTarget::from_original(&original)?;
             require(
@@ -739,8 +802,7 @@ impl VerifiedRemoteExecution {
                     == remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead
                     && self.action == Action::OperationResolve
                     && now >= self.verified_at_ms
-                    && DeviceId::from_key(&PublicKey::of(signer))
-                        == self.source.scope.device_id
+                    && DeviceId::from_key(&PublicKey::of(signer)) == self.source.scope.device_id
                     && target.source.project.space == self.source.scope.space_id
                     && self.source.resources.iter().any(|record| {
                         record.payload.space == target.source.project.space
@@ -749,8 +811,7 @@ impl VerifiedRemoteExecution {
                     && target.execution_resource == self.selection.execution_resource
                     && target.target_public_key == self.selection.target_public_key
                     && self.context.context == target.context(&target.source.project.resource)
-                    && self.context.binding_generation
-                        == Some(target.source.binding_generation)
+                    && self.context.binding_generation == Some(target.source.binding_generation)
                     && self.context.execution_target_public_key.as_ref()
                         == Some(&target.target_public_key)
                     && original
@@ -769,9 +830,11 @@ impl VerifiedRemoteExecution {
                 "execution_grant": self.selection.execution_grant,
             });
             self.signing_authorization(&self.source, &body, now)?;
-            let expires = now.checked_add(INVOCATION_MAX_AGE_MS).ok_or(
-                AuthorizationError::InvalidProof("observation expiry overflow"),
-            )?;
+            let expires =
+                now.checked_add(INVOCATION_MAX_AGE_MS)
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "observation expiry overflow",
+                    ))?;
             let signed = self.state.build_forwarded_execution_observation_request(
                 &original,
                 signer,
@@ -836,9 +899,7 @@ impl VerifiedRemoteExecution {
             } else {
                 let result: ExecutionHandoffTerminalReconciliationResult =
                     serde_json::from_value(raw).map_err(|_| {
-                        AuthorizationError::InvalidProof(
-                            "invalid terminal reconciliation result",
-                        )
+                        AuthorizationError::InvalidProof("invalid terminal reconciliation result")
                     })?;
                 let clock = result
                     .freshness
@@ -954,9 +1015,7 @@ impl VerifiedRemoteExecution {
             serde_json::to_string(
                 &serde_json::json!({"state":state,"purpose":purpose,"actual":encoded}),
             )
-            .map_err(|_| {
-                AuthorizationError::InvalidProof("verified resolution encoding failed")
-            })
+            .map_err(|_| AuthorizationError::InvalidProof("verified resolution encoding failed"))
         })()
         .map_err(|error| error.to_string())
     }
@@ -1023,9 +1082,8 @@ impl VerifiedRemoteExecution {
                 "resolver handle differs from the original task binding",
             )?;
             self.signing_authorization(&self.source, &body, now)?;
-            serde_json::to_string(&serde_json::json!({"body":body,"context":context})).map_err(
-                |_| AuthorizationError::InvalidProof("resolution intent encoding failed"),
-            )
+            serde_json::to_string(&serde_json::json!({"body":body,"context":context}))
+                .map_err(|_| AuthorizationError::InvalidProof("resolution intent encoding failed"))
         })()
         .map_err(|error| error.to_string())
     }
@@ -1090,8 +1148,8 @@ impl VerifiedRemoteExecution {
                 serde_json::from_str(receipt_json).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid executor session receipt")
                 })?;
-            let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
-                .map_err(|_| {
+            let binding: task_binding::SignedBinding =
+                serde_json::from_str(binding_json).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid executor session binding")
                 })?;
             let project = ResourceRef {
@@ -1138,10 +1196,8 @@ impl VerifiedRemoteExecution {
                 AuthorizationError::InvalidProof("session snapshot encoding failed")
             })?;
             value["target_node"] = Value::String(binding.binding.target_node.clone());
-            value["execution_session_receipt"] =
-                serde_json::to_value(&receipt).map_err(|_| {
-                    AuthorizationError::InvalidProof("session receipt encoding failed")
-                })?;
+            value["execution_session_receipt"] = serde_json::to_value(&receipt)
+                .map_err(|_| AuthorizationError::InvalidProof("session receipt encoding failed"))?;
             serde_json::to_string(&value)
                 .map_err(|_| AuthorizationError::InvalidProof("session proof encoding failed"))
         })()
@@ -1167,16 +1223,14 @@ impl VerifiedRemoteExecution {
             let now = client_time(now_ms)?;
             let body: Value = serde_json::from_str(body_json)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid remote replay body"))?;
-            let invocation: Signed<Invocation> = serde_json::from_str(invocation_json)
-                .map_err(|_| {
+            let invocation: Signed<Invocation> =
+                serde_json::from_str(invocation_json).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid remote replay invocation")
                 })?;
             let qualified = self.signing_authorization(auth, &body, now)?;
             let i = &invocation.payload;
             let action: Action = serde_json::from_value(Value::String(expected_action.into()))
-                .map_err(|_| {
-                    AuthorizationError::InvalidProof("unknown remote replay action")
-                })?;
+                .map_err(|_| AuthorizationError::InvalidProof("unknown remote replay action"))?;
             require(
                 i.actor == Actor::Account(qualified.scope.account_id.clone())
                     && i.device == qualified.scope.device_id
@@ -1215,12 +1269,21 @@ impl VerifiedRemoteExecution {
                 context: self.context.context.clone(),
             };
             let destination = self.state.verify_execution_destination(
-                &facts.resource, &facts.audience, &self.selection.execution_resource,
-                &self.selection.target_public_key, &self.selection.execution_grant,
-                &facts.context, facts.action, now,
+                &facts.resource,
+                &facts.audience,
+                &self.selection.execution_resource,
+                &self.selection.target_public_key,
+                &self.selection.execution_grant,
+                &facts.context,
+                facts.action,
+                now,
             )?;
             self.state.verify_invocation_with_execution_destination(
-                &invocation, &facts, &transport, &destination, now,
+                &invocation,
+                &facts,
+                &transport,
+                &destination,
+                now,
             )?;
             Ok(())
         })()
@@ -1239,16 +1302,15 @@ impl VerifiedRemoteExecution {
         now_ms: f64,
     ) -> crate::Result<String> {
         require(
-            self.purpose
-                != remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead,
+            self.purpose != remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead,
             "observation policy cannot prepare an execution or resolution write",
         )
         .map_err(|error| error.to_string())?;
         let now = client_time(now_ms).map_err(|error| error.to_string())?;
         let body: Value =
             serde_json::from_str(body_json).map_err(|_| "invalid remote request".to_owned())?;
-        let context: PrepareContext = serde_json::from_str(context_json)
-            .map_err(|_| "invalid remote context".to_owned())?;
+        let context: PrepareContext =
+            serde_json::from_str(context_json).map_err(|_| "invalid remote context".to_owned())?;
         require(
             context == self.context
                 && serde_json::to_value(self.action)
@@ -1332,7 +1394,9 @@ impl VerifiedRemoteExecution {
     }
 }
 
-pub(super) fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, ObjectHash)>> {
+pub(super) fn remote_selection(
+    body: &Value,
+) -> Result<Option<(ResourceRef, PublicKey, ObjectHash)>> {
     let fields = [
         body.get("execution_resource"),
         body.get("target_public_key"),
@@ -1846,51 +1910,92 @@ fn raw_binding(value: Option<&Value>) -> Result<Option<task_binding::SignedBindi
         .transpose()
 }
 
-fn check_raw_rebind(intent:&PrepareIntent,body:&Value,audience_key:&PublicKey)->Result<bool> {
-    if body["method"]!="rebind_execution" {return Ok(false);}
-    if remote_selection(body)?.is_none() {return Ok(false);}
-    let i=&intent.request;
-    let binding=raw_binding(body.get("binding"))?.ok_or(AuthorizationError::InvalidProof("rebind has no old binding"))?;
-    let seal:task_binding::SignedSeal=serde_json::from_value(body["previous_seal"].clone())
-        .map_err(|_|AuthorizationError::InvalidProof("invalid previous executor seal"))?;
-    let old_key:PublicKey=serde_json::from_value(body["previous_target_public_key"].clone())
-        .map_err(|_|AuthorizationError::InvalidProof("previous executor pin is missing"))?;
-    task_binding::verify_binding(&binding,audience_key.as_str())
-        .map_err(|_|AuthorizationError::InvalidProof("old binding has another Project authority"))?;
-    task_binding::verify_seal(&seal,old_key.as_str())
-        .map_err(|_|AuthorizationError::InvalidProof("old binding has no matching executor seal"))?;
-    let (_,new_key,_)=remote_selection(body)?.ok_or(AuthorizationError::InvalidProof("rebind needs its independent new execution destination"))?;
-    let generation=binding.binding.generation.checked_add(1)
-        .ok_or(AuthorizationError::InvalidProof("binding generation overflow"))?;
-    require(i.action==Action::ExecutionRebind && matches!(i.actor,Actor::Account(_))
-        && i.context.sdk_session.is_none()
-        && binding.binding.network_id==i.resource.space.as_str()
-        && node_fingerprint(old_key.as_str()).map_err(|_|AuthorizationError::InvalidProof("invalid previous executor pin"))?==binding.binding.target_node
-        && seal.seal.network_id==binding.binding.network_id
-        && seal.seal.binding_hash==task_binding::binding_hash(&binding.binding).map_err(|_|AuthorizationError::InvalidProof("invalid old binding"))?
-        && seal.seal.target_node==binding.binding.target_node
-        && body["task_ref"].as_str()==Some(binding.binding.task_ref.as_str())
-        && body["task_id"].as_str()==Some(binding.binding.task_id.as_str())
-        && body["conversation_id"].as_str()==Some(binding.binding.conversation_id.as_str())
-        && i.context.task.as_ref().map(EventRef::as_str)==Some(binding.binding.task_ref.as_str())
-        && i.context.conversation.as_deref()==Some(binding.binding.conversation_id.as_str())
-        && i.context.execution_session.as_ref().is_some_and(|session|
-            session.target==DeviceId::from_key(&new_key) && body["session_id"].as_str()==Some(session.session_id.as_str()))
-        && body["target_node"].as_str()==Some(node_fingerprint(new_key.as_str()).map_err(|_|AuthorizationError::InvalidProof("invalid new executor pin"))?.as_str())
-        && i.context.executor_kind.as_deref()==body["executor"].as_str()
-        && intent.binding_generation==Some(generation)
-        && intent.execution_target_public_key.as_ref()==Some(&new_key)
-        && intent.canonical_cwd.is_some()
-        && intent.canonical_cwd.as_deref()==body["cwd"].as_str(),
-        "rebind changed its sealed source or independently selected new target")?;
+fn check_raw_rebind(
+    intent: &PrepareIntent,
+    body: &Value,
+    audience_key: &PublicKey,
+) -> Result<bool> {
+    if body["method"] != "rebind_execution" {
+        return Ok(false);
+    }
+    if remote_selection(body)?.is_none() {
+        return Ok(false);
+    }
+    let i = &intent.request;
+    let binding = raw_binding(body.get("binding"))?.ok_or(AuthorizationError::InvalidProof(
+        "rebind has no old binding",
+    ))?;
+    let seal: task_binding::SignedSeal = serde_json::from_value(body["previous_seal"].clone())
+        .map_err(|_| AuthorizationError::InvalidProof("invalid previous executor seal"))?;
+    let old_key: PublicKey = serde_json::from_value(body["previous_target_public_key"].clone())
+        .map_err(|_| AuthorizationError::InvalidProof("previous executor pin is missing"))?;
+    task_binding::verify_binding(&binding, audience_key.as_str()).map_err(|_| {
+        AuthorizationError::InvalidProof("old binding has another Project authority")
+    })?;
+    task_binding::verify_seal(&seal, old_key.as_str()).map_err(|_| {
+        AuthorizationError::InvalidProof("old binding has no matching executor seal")
+    })?;
+    let (_, new_key, _) = remote_selection(body)?.ok_or(AuthorizationError::InvalidProof(
+        "rebind needs its independent new execution destination",
+    ))?;
+    let generation =
+        binding
+            .binding
+            .generation
+            .checked_add(1)
+            .ok_or(AuthorizationError::InvalidProof(
+                "binding generation overflow",
+            ))?;
+    require(
+        i.action == Action::ExecutionRebind
+            && matches!(i.actor, Actor::Account(_))
+            && i.context.sdk_session.is_none()
+            && binding.binding.network_id == i.resource.space.as_str()
+            && node_fingerprint(old_key.as_str())
+                .map_err(|_| AuthorizationError::InvalidProof("invalid previous executor pin"))?
+                == binding.binding.target_node
+            && seal.seal.network_id == binding.binding.network_id
+            && seal.seal.binding_hash
+                == task_binding::binding_hash(&binding.binding)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid old binding"))?
+            && seal.seal.target_node == binding.binding.target_node
+            && body["task_ref"].as_str() == Some(binding.binding.task_ref.as_str())
+            && body["task_id"].as_str() == Some(binding.binding.task_id.as_str())
+            && body["conversation_id"].as_str() == Some(binding.binding.conversation_id.as_str())
+            && i.context.task.as_ref().map(EventRef::as_str)
+                == Some(binding.binding.task_ref.as_str())
+            && i.context.conversation.as_deref() == Some(binding.binding.conversation_id.as_str())
+            && i.context.execution_session.as_ref().is_some_and(|session| {
+                session.target == DeviceId::from_key(&new_key)
+                    && body["session_id"].as_str() == Some(session.session_id.as_str())
+            })
+            && body["target_node"].as_str()
+                == Some(
+                    node_fingerprint(new_key.as_str())
+                        .map_err(|_| AuthorizationError::InvalidProof("invalid new executor pin"))?
+                        .as_str(),
+                )
+            && i.context.executor_kind.as_deref() == body["executor"].as_str()
+            && intent.binding_generation == Some(generation)
+            && intent.execution_target_public_key.as_ref() == Some(&new_key)
+            && intent.canonical_cwd.is_some()
+            && intent.canonical_cwd.as_deref() == body["cwd"].as_str(),
+        "rebind changed its sealed source or independently selected new target",
+    )?;
     Ok(true)
 }
 
-pub(super) fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &PublicKey) -> Result<()> {
+pub(super) fn check_raw_context(
+    intent: &PrepareIntent,
+    body: &Value,
+    audience_key: &PublicKey,
+) -> Result<()> {
     if execution_binding_seal::check_client_seal_intent(intent, body, audience_key)? {
         return Ok(());
     }
-    if check_raw_rebind(intent,body,audience_key)? {return Ok(());}
+    if check_raw_rebind(intent, body, audience_key)? {
+        return Ok(());
+    }
     if check_raw_resolution(intent, body, audience_key)? {
         return Ok(());
     }
@@ -2190,6 +2295,52 @@ impl VerifiedPolicySet {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<VerifiedPrepareAuthorization> {
+        self.verify_prepare_intent_with_transport(
+            signed,
+            raw_body,
+            expected_action,
+            local_audience,
+            InvocationTransport::Existing(transport),
+            now_ms,
+        )
+    }
+
+    pub fn verify_gateway_prepare_intent(
+        &self,
+        signed: &Signed<PrepareIntent>,
+        raw_body: &Value,
+        expected_action: Action,
+        local_audience: &Audience,
+        gateway: &gateway_forward::VerifiedDirectedGateway,
+        now_ms: u64,
+    ) -> Result<VerifiedPrepareAuthorization> {
+        let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+        let original = gateway_forward::GatewayOriginal::Prepare {
+            body: raw_body.clone(),
+            intent: signed.clone(),
+        };
+        self.verify_prepare_intent_with_transport(
+            signed,
+            raw_body,
+            expected_action,
+            local_audience,
+            InvocationTransport::DirectedGateway {
+                proof: gateway,
+                original: &original,
+            },
+            now_ms,
+        )
+    }
+
+    fn verify_prepare_intent_with_transport(
+        &self,
+        signed: &Signed<PrepareIntent>,
+        raw_body: &Value,
+        expected_action: Action,
+        local_audience: &Audience,
+        transport: InvocationTransport<'_>,
+        now_ms: u64,
+    ) -> Result<VerifiedPrepareAuthorization> {
         require(
             canonical(raw_body)?.len() <= MAX_PROOF_BYTES,
             "raw prepare body too large",
@@ -2248,7 +2399,7 @@ impl VerifiedPolicySet {
             issuer: signed.issuer.clone(),
             signature: signed.signature.clone(),
         };
-        let verified = self.verify_signed_invocation_body(
+        let verified = self.verify_authorized_invocation_body(
             &request,
             hash,
             budget,
@@ -2630,6 +2781,120 @@ mod tests {
             )
             .unwrap();
         let final_invocation: Signed<Invocation> = serde_json::from_str(&final_wire).unwrap();
+        let gateway = Identity::from_secret_hex(&hex::encode([89; 32])).unwrap();
+        let gateway_key = PublicKey::of(&gateway);
+        assert!(
+            f.state
+                .find_device(&DeviceId::from_key(&gateway_key))
+                .is_err()
+        );
+        let proof_for = |original: &gateway_forward::GatewayOriginal| {
+            let header = Signed::sign(
+                gateway_forward::GatewayForwardHeader {
+                    version: AUTH_VERSION,
+                    purpose: original.purpose(),
+                    route_approval_hash: ObjectHash::body(&"gateway-route").unwrap(),
+                    gateway_key: gateway_key.clone(),
+                    client_key: PublicKey::of(&user),
+                    target_key: PublicKey::of(&f.node),
+                    source: client_policy_import::ClientPolicyContextReference {
+                        snapshot_id: Nonce::from_bytes([90; 32]),
+                        request_hash: ObjectHash::body(&"read").unwrap(),
+                        snapshot_hash: ObjectHash::body(&"snapshot").unwrap(),
+                        witness_hash: ObjectHash::body(&"witness").unwrap(),
+                    },
+                    original_hash: original.hash().unwrap(),
+                    authorization_id: original.request().operation_id.clone(),
+                    lookup_operation_id: None,
+                    nonce: Nonce::random().unwrap(),
+                    issued_at_ms: NOW,
+                    expires_at_ms: original.request().expires_at_ms,
+                },
+                &gateway,
+            )
+            .unwrap();
+            gateway_forward::verify_directed_gateway(
+                &gateway_key,
+                &header,
+                original,
+                &PublicKey::of(&f.node),
+                NOW,
+            )
+            .unwrap()
+        };
+        let mut gateway_intent = signed.payload.clone();
+        gateway_intent.request.presenter = DeviceId::from_key(&gateway_key);
+        let gateway_intent = Signed::sign(gateway_intent, &user).unwrap();
+        let gateway_original = gateway_forward::GatewayOriginal::Prepare {
+            body: body.clone(),
+            intent: gateway_intent.clone(),
+        };
+        let gateway_proof = proof_for(&gateway_original);
+        let gateway_prepared = f
+            .state
+            .verify_gateway_prepare_intent(
+                &gateway_intent,
+                &body,
+                Action::ExecutionSend,
+                &audience,
+                &gateway_proof,
+                NOW,
+            )
+            .unwrap();
+        let destination = gateway_prepared.execution_destination().unwrap();
+        let gateway_invocation =
+            Signed::sign(gateway_intent.payload.request.clone(), &user).unwrap();
+        let gateway_original = gateway_forward::GatewayOriginal::Invoke {
+            body: body.clone(),
+            invocation: gateway_invocation.clone(),
+        };
+        let invocation_proof = proof_for(&gateway_original);
+        let gateway_facts = RequestFacts {
+            resource: gateway_invocation.payload.resource.clone(),
+            action: Action::ExecutionSend,
+            audience: audience.clone(),
+            operation_id: gateway_invocation.payload.operation_id.clone(),
+            body_hash: gateway_invocation.payload.body_hash.clone(),
+            context: gateway_invocation.payload.context.clone(),
+        };
+        f.state
+            .verify_gateway_invocation_with_execution_destination(
+                &gateway_invocation,
+                &body,
+                &gateway_facts,
+                &invocation_proof,
+                destination,
+                NOW,
+            )
+            .unwrap();
+        let mut missing_executor = f.state.clone();
+        missing_executor
+            .devices
+            .retain(|_, certificate| certificate.payload.public_key != execution_key);
+        assert!(
+            missing_executor
+                .verify_gateway_prepare_intent(
+                    &gateway_intent,
+                    &body,
+                    Action::ExecutionSend,
+                    &audience,
+                    &gateway_proof,
+                    NOW,
+                )
+                .is_err()
+        );
+        assert!(
+            missing_executor
+                .verify_gateway_invocation_with_execution_destination(
+                    &gateway_invocation,
+                    &body,
+                    &gateway_facts,
+                    &invocation_proof,
+                    destination,
+                    NOW,
+                )
+                .is_err()
+        );
         let metadata: Value = serde_json::from_str(&handle.metadata_json().unwrap()).unwrap();
         assert_eq!(metadata["context"], serde_json::to_value(&raw).unwrap());
         assert_eq!(
