@@ -159,7 +159,13 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<Value> {
-        use vibeface_secure::authorization::{Actor, ClientAuthorizationBundle, PolicyPin};
+        use vibeface_secure::authorization::{
+            AUTH_VERSION, Actor, DeviceId, EventRef, INVOCATION_MAX_AGE_MS, MAX_PROOF_BYTES, Nonce,
+            ServiceId, Signed,
+            remote_share::{RemoteShareIntent, RemoteSharePurpose, RemoteShareTaskAttestation},
+        };
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             auth.action() == Action::ConversationRead
                 && matches!(auth.actor(), Actor::Account(_))
@@ -173,62 +179,140 @@ impl Store {
                 && auth.body_hash() == &ObjectHash::body(body)?,
             "execution sharing requires a current Account task read"
         );
-        self.policy.verified().check_current(auth, now_ms)?;
-        let creation = self.task_creation(
-            auth.resource().space.as_str(),
-            text(body, "conversation_id")?,
-            text(body, "task_id")?,
-        )?;
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        current.verified().check_current(auth, now_ms)?;
+        check_policy_heads_in(&tx, current.verified(), auth, now_ms)?;
+        let encoded: String = tx
+            .query_row(
+                "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
+                params![auth.resource().space.as_str(), text(body, "task_ref")?],
+                |row| row.get(0),
+            )
+            .context("source sharing requires the exact ready Task")?;
+        let creation = serde_json::from_str(&encoded)?;
         let event = self.verify_event(auth.resource().space.as_str(), &creation)?;
         ensure!(
             creation.hash == text(body, "task_ref")?
                 && event.resource_id == auth.resource().resource
                 && event.scope_id == text(body, "conversation_id")?
-                && self
-                    .missing_dependencies(
-                        auth.resource().space.as_str(),
-                        std::slice::from_ref(&creation.hash)
-                    )?
-                    .is_complete(),
+                && matches!(&event.body, crate::model::EventBody::TaskCreated { task_id, .. }
+                    if task_id == text(body, "task_id")?)
+                && auth
+                    .signed_invocation()
+                    .payload
+                    .context
+                    .conversation
+                    .as_deref()
+                    == Some(event.scope_id.as_str()),
             "execution sharing task history differs from the selected Project"
         );
-        let principal = auth.signed_invocation().issuer.as_str();
         let Actor::Account(account) = auth.actor() else {
             unreachable!()
         };
-        let projection = super::policy::authenticate_account_from(
-            &self.connection,
-            &self.policy,
-            principal,
-            &json!({"account_id":account,"space_id":auth.resource().space,"resource_id":auth.resource().resource,
-                "device_public_key":principal,"audience":auth.audience()}),
-            now_ms,
-        )?;
-        let pins: Vec<PolicyPin> = serde_json::from_value(projection["pins"].clone())?;
-        let bundle: ClientAuthorizationBundle =
-            serde_json::from_value(projection["authorization"].clone())?;
         let options = &body["share_request"];
+        let purpose: RemoteSharePurpose = serde_json::from_value(options["purpose"].clone())?;
         let session = text(options, "session_id")?;
         let executor = text(options, "executor_kind")?;
         serde_json::from_value::<crate::engine::ExecutorKind>(Value::String(executor.into()))?;
         let expires = options["expires_at_ms"]
             .as_u64()
             .context("share request expiry is required")?;
+        ensure!(
+            expires > now_ms && expires - now_ms <= INVOCATION_MAX_AGE_MS,
+            "source sharing requires a bounded future deadline"
+        );
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
-        let envelope = vibeface_secure::authorization::remote_share::build_execution_share_request(
-            self.policy.verified(),
-            &pins,
-            &bundle,
-            auth.resource(),
-            &creation,
-            session,
-            executor,
-            &signer,
+        let source = PublicKey::of(&signer);
+        let record = current
+            .verified()
+            .resource(&auth.resource().space, &auth.resource().resource)
+            .context("source Project is missing")?;
+        current.verified().verify_service_device(
+            &auth.resource().space,
+            &DeviceId::from_key(&source),
             now_ms,
-            expires,
         )?;
-        Ok(serde_json::to_value(envelope)?)
+        ensure!(
+            record.payload.kind == vibeface_secure::authorization::ResourceKind::Project
+                && record.payload.host == ServiceId::from_key(&source)
+                && auth.audience().service == ServiceId::from_key(&source)
+                && auth.audience().device == DeviceId::from_key(&source),
+            "source sharing targets another Project host"
+        );
+        let optional = |name: &str| -> Result<Option<Value>> {
+            Ok(options.get(name).filter(|value| !value.is_null()).cloned())
+        };
+        let old_binding: Option<SignedBinding> = optional("old_binding")?
+            .map(serde_json::from_value)
+            .transpose()?;
+        if purpose == RemoteSharePurpose::Execution {
+            ensure!(
+                old_binding.is_none() && options["old_execution_receipt"].is_null(),
+                "ordinary execution sharing cannot carry an old binding"
+            );
+        } else {
+            let old = old_binding
+                .as_ref()
+                .context("existing binding is required")?;
+            ensure!(
+                self.task_binding(auth.resource().space.as_str(), &creation.hash)?
+                    .as_ref()
+                    == Some(old)
+                    && old.binding.conversation_id == event.scope_id
+                    && old.binding.task_id == text(body, "task_id")?
+                    && old.binding.session_id == session,
+                "source sharing changed the current binding or exact Task"
+            );
+        }
+        let attestation = Signed::sign(
+            RemoteShareTaskAttestation {
+                version: AUTH_VERSION,
+                project: auth.resource().clone(),
+                task: EventRef::parse(&creation.hash)?,
+                task_id: text(body, "task_id")?.into(),
+                conversation_id: event.scope_id,
+                author: event.author,
+                sequence: event.sequence,
+                source_node_public_key: source.clone(),
+                issued_at_ms: now_ms,
+                expires_at_ms: expires,
+            },
+            &signer,
+        )?;
+        let intent = RemoteShareIntent {
+            version: AUTH_VERSION,
+            purpose,
+            project: auth.resource().clone(),
+            task_creation: attestation,
+            source_node_public_key: source,
+            requester: account.clone(),
+            requester_device: auth.signed_invocation().payload.device.clone(),
+            saved_pins: Vec::new(),
+            policy_heads: auth.dependencies().to_vec(),
+            session_id: session.into(),
+            executor_kind: executor.into(),
+            execution_resource: optional("execution_resource")?
+                .map(serde_json::from_value)
+                .transpose()?,
+            target_public_key: optional("target_public_key")?
+                .map(serde_json::from_value)
+                .transpose()?,
+            old_binding,
+            old_execution_receipt: optional("old_execution_receipt")?
+                .map(serde_json::from_value)
+                .transpose()?,
+            nonce: Nonce::random()?,
+            issued_at_ms: now_ms,
+            expires_at_ms: expires,
+        };
+        ensure!(
+            serde_json::to_vec(&intent)?.len() <= MAX_PROOF_BYTES,
+            "source sharing input exceeds byte limit"
+        );
+        tx.commit()?;
+        Ok(serde_json::to_value(intent)?)
     }
 
     pub fn execution_dispatch_targets(
