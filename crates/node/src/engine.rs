@@ -186,7 +186,9 @@ pub struct Engine {
     isolation: Option<DockerIsolation>,
     manager_isolation: Option<DockerIsolation>,
     command_isolation: Option<DockerIsolation>,
+    #[allow(clippy::type_complexity)]
     codex_contexts: Arc<Mutex<BTreeMap<(Option<String>, String), ExecutionContext>>>,
+    #[allow(clippy::type_complexity)]
     personal_turns: Arc<Mutex<BTreeMap<(String, String, String), (String, String)>>>,
     fenced_operations: Arc<Mutex<BTreeSet<ExecutionGeneration>>>,
 }
@@ -294,6 +296,7 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_turn(&self, native_id: &str, turn_id: &str) -> Result<Option<Value>> {
         let codex = self.codex.get().context("Codex socket is not configured")?;
         Self::read_turn_from(codex, native_id, turn_id).await
@@ -688,10 +691,10 @@ impl Engine {
                 .await
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             loop {
-                if let Some(turn) = Self::read_turn_from(codex, native_id, turn_id).await? {
-                    if terminal(&turn) {
-                        return Ok(());
-                    }
+                if let Some(turn) = Self::read_turn_from(codex, native_id, turn_id).await?
+                    && terminal(&turn)
+                {
+                    return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1093,37 +1096,35 @@ impl Engine {
                             .into(),
                 }),
             };
-        if !context.shared && running_turn {
-            if let Ok(reply) = &result {
-                if let (Some(native), Some(turn)) = (
-                    &reply.native_session_id,
-                    reply.result["turn"]["id"].as_str(),
-                ) {
-                    vibeface_protocol::validate_id(turn).map_err(|error| EngineError {
-                        uncertain: true,
-                        native_session_id: Some(native.clone()),
-                        message: error,
-                    })?;
-                    self.personal_turns.lock().await.insert(
-                        personal_turn_key(context),
-                        (native.clone(), turn.to_owned()),
-                    );
-                }
-            }
+        if !context.shared
+            && running_turn
+            && let Ok(reply) = &result
+            && let (Some(native), Some(turn)) = (
+                &reply.native_session_id,
+                reply.result["turn"]["id"].as_str(),
+            )
+        {
+            vibeface_protocol::validate_id(turn).map_err(|error| EngineError {
+                uncertain: true,
+                native_session_id: Some(native.clone()),
+                message: error,
+            })?;
+            self.personal_turns.lock().await.insert(
+                personal_turn_key(context),
+                (native.clone(), turn.to_owned()),
+            );
         }
         if context.shared {
             if result.as_ref().is_err_and(|error| error.uncertain) {
                 let _ = self.cancel_operation(context).await;
-            } else if !running_turn || result.is_err() {
-                if let Err(error) = self.complete_operation(context).await {
-                    return Err(EngineError {
-                        uncertain: true,
-                        native_session_id: native,
-                        message: format!(
-                            "isolated execution cleanup could not be confirmed: {error}"
-                        ),
-                    });
-                }
+            } else if (!running_turn || result.is_err())
+                && let Err(error) = self.complete_operation(context).await
+            {
+                return Err(EngineError {
+                    uncertain: true,
+                    native_session_id: native,
+                    message: format!("isolated execution cleanup could not be confirmed: {error}"),
+                });
             }
         }
         result
@@ -1150,6 +1151,7 @@ fn scoped_event(event: &Value, context: &ExecutionContext, container_id: Option<
     json!({"execution_context":{"space_id":context.space_id,"resource_id":context.resource_id,"operation_id":context.operation_id,"container_id":container_id},"event":event})
 }
 
+#[allow(clippy::type_complexity)]
 fn codex_events(
     output: mpsc::UnboundedSender<Value>,
     contexts: Arc<Mutex<BTreeMap<(Option<String>, String), ExecutionContext>>>,

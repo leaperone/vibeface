@@ -2,7 +2,7 @@
 
 mod gateway_forward;
 
-pub(crate) use gateway_forward::{GatewayForwardClient, GatewayForwardReply, GatewaySourceClient};
+pub(crate) use gateway_forward::{GatewayForwardClient, GatewayForwardReply};
 
 use crate::{
     crypto::LocalIdentity,
@@ -390,7 +390,7 @@ enum TaskBusinessClientPhase {
     AwaitingBegin,
     Importing,
     Ready,
-    Pending(TaskBusinessPending),
+    Pending(Box<TaskBusinessPending>),
 }
 
 #[derive(Deserialize)]
@@ -641,7 +641,7 @@ impl TaskBusinessClient {
                 );
             }
             self.phase = match pending {
-                Some(original) => TaskBusinessClientPhase::Pending(original),
+                Some(original) => TaskBusinessClientPhase::Pending(Box::new(original)),
                 None => TaskBusinessClientPhase::Ready,
             };
             return Ok(response);
@@ -2355,7 +2355,7 @@ mod tests {
             tokio::task::yield_now().await;
         };
         assert_eq!(original.acceptance(), &acceptance);
-        let start = task_business_operation_current(&b, &c, &original, CheckStage::Start).await?;
+        let start = task_business_operation_current(b, c, &original, CheckStage::Start).await?;
         start.proof_usage().enforce_limits()?;
         let (running, fresh, first_deadline) = {
             let mut store = c.store.lock().await;
@@ -2369,7 +2369,7 @@ mod tests {
         };
         assert!(fresh);
         assert_eq!(running.state, OperationState::Running);
-        let renewed = task_business_operation_current(&b, &c, &original, CheckStage::Renew).await?;
+        let renewed = task_business_operation_current(b, c, &original, CheckStage::Renew).await?;
         let deadline = {
             let mut store = c.store.lock().await;
             task_business_checked("Renew consume", || {
@@ -2384,7 +2384,7 @@ mod tests {
         if revoke {
             fixture.project.revoke_client(&mut *b.store.lock().await)?;
             assert!(
-                task_business_operation_current(&b, &c, &original, CheckStage::Renew)
+                task_business_operation_current(b, c, &original, CheckStage::Renew)
                     .await
                     .is_err()
             );

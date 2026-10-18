@@ -582,10 +582,10 @@ impl DockerIsolation {
 
     pub async fn affected(&self, context: &ExecutionContext) -> Vec<String> {
         let mut affected = BTreeSet::from([context.operation_id.clone()]);
-        if let Some(scope) = self.scopes.lock().await.get(&self.key(context)) {
-            if scope.operations.contains_key(&context.operation_id) {
-                affected.extend(scope.operations.keys().cloned());
-            }
+        if let Some(scope) = self.scopes.lock().await.get(&self.key(context))
+            && scope.operations.contains_key(&context.operation_id)
+        {
+            affected.extend(scope.operations.keys().cloned());
         }
         affected.into_iter().collect()
     }
@@ -674,27 +674,27 @@ impl DockerIsolation {
                 None
             }
         };
-        if let Some(id) = &id {
-            if let Some(container) = self.inspect(id).await? {
-                ensure!(
-                    container["Config"]["Labels"]["vibeface.node"] == node
-                        && container["Config"]["Labels"]["vibeface.scope"] == key,
-                    "refuse to stop an unrelated container"
-                );
-                if container["State"]["Running"] == true {
-                    let mut command = self.docker();
-                    command.args(["stop", "--time", "2", id]);
-                    checked_output(command, "stop isolated resource container").await?;
-                }
-                let stopped = self
-                    .inspect(id)
-                    .await?
-                    .context("container disappeared before stop could be confirmed")?;
-                ensure!(
-                    stopped["State"]["Running"] == false && stopped["State"]["Pid"] == 0,
-                    "isolated execution stop could not be confirmed"
-                );
+        if let Some(id) = &id
+            && let Some(container) = self.inspect(id).await?
+        {
+            ensure!(
+                container["Config"]["Labels"]["vibeface.node"] == node
+                    && container["Config"]["Labels"]["vibeface.scope"] == key,
+                "refuse to stop an unrelated container"
+            );
+            if container["State"]["Running"] == true {
+                let mut command = self.docker();
+                command.args(["stop", "--time", "2", id]);
+                checked_output(command, "stop isolated resource container").await?;
             }
+            let stopped = self
+                .inspect(id)
+                .await?
+                .context("container disappeared before stop could be confirmed")?;
+            ensure!(
+                stopped["State"]["Running"] == false && stopped["State"]["Pid"] == 0,
+                "isolated execution stop could not be confirmed"
+            );
         }
         Ok((
             StoppedScope {
@@ -722,23 +722,23 @@ impl DockerIsolation {
                 "stopped execution container name belongs to a different generation"
             );
         }
-        if let Some(id) = &stopped.id {
-            if let Some(container) = self.inspect(id).await? {
-                ensure!(
-                    container["Config"]["Labels"]["vibeface.node"] == stopped.node
-                        && container["Config"]["Labels"]["vibeface.scope"] == stopped.key
-                        && container["State"]["Running"] == false
-                        && container["State"]["Pid"] == 0,
-                    "fenced execution is no longer confirmed stopped"
-                );
-                let mut command = self.docker();
-                command.args(["rm", id]);
-                checked_output(command, "remove fenced isolated container").await?;
-                ensure!(
-                    self.inspect(id).await?.is_none(),
-                    "fenced container still exists after cleanup"
-                );
-            }
+        if let Some(id) = &stopped.id
+            && let Some(container) = self.inspect(id).await?
+        {
+            ensure!(
+                container["Config"]["Labels"]["vibeface.node"] == stopped.node
+                    && container["Config"]["Labels"]["vibeface.scope"] == stopped.key
+                    && container["State"]["Running"] == false
+                    && container["State"]["Pid"] == 0,
+                "fenced execution is no longer confirmed stopped"
+            );
+            let mut command = self.docker();
+            command.args(["rm", id]);
+            checked_output(command, "remove fenced isolated container").await?;
+            ensure!(
+                self.inspect(id).await?.is_none(),
+                "fenced container still exists after cleanup"
+            );
         }
         if let Some(egress) = &self.config.egress {
             if let Some(network) = self.inspect_network(&stopped.name).await? {
@@ -747,40 +747,40 @@ impl DockerIsolation {
                     "stopped execution cannot clean a different model network generation"
                 );
             }
-            if let Some(id) = &stopped.network_id {
-                if let Some(network) = self.inspect_network(id).await? {
-                    ensure!(
-                        network["Labels"]["vibeface.node"] == stopped.node
-                            && network["Labels"]["vibeface.scope"] == stopped.key,
-                        "refuse to clean an unrelated model network"
-                    );
-                    let gateway = self.inspect(&egress.gateway_container).await?;
-                    let gateway_id = gateway
-                        .as_ref()
-                        .map(|gateway| gateway["Id"].as_str().context("model gateway ID missing"))
-                        .transpose()?;
-                    let peers = network["Containers"]
-                        .as_object()
-                        .context("model network peers unavailable")?;
-                    ensure!(
-                        peers.keys().all(|peer| Some(peer.as_str()) == gateway_id),
-                        "fenced model network has another execution endpoint"
-                    );
-                    if let Some(gateway_id) = gateway_id {
-                        if peers.contains_key(gateway_id) {
-                            let mut command = self.docker();
-                            command.args(["network", "disconnect", id, &egress.gateway_container]);
-                            checked_output(command, "disconnect fenced model network").await?;
-                        }
-                    }
+            if let Some(id) = &stopped.network_id
+                && let Some(network) = self.inspect_network(id).await?
+            {
+                ensure!(
+                    network["Labels"]["vibeface.node"] == stopped.node
+                        && network["Labels"]["vibeface.scope"] == stopped.key,
+                    "refuse to clean an unrelated model network"
+                );
+                let gateway = self.inspect(&egress.gateway_container).await?;
+                let gateway_id = gateway
+                    .as_ref()
+                    .map(|gateway| gateway["Id"].as_str().context("model gateway ID missing"))
+                    .transpose()?;
+                let peers = network["Containers"]
+                    .as_object()
+                    .context("model network peers unavailable")?;
+                ensure!(
+                    peers.keys().all(|peer| Some(peer.as_str()) == gateway_id),
+                    "fenced model network has another execution endpoint"
+                );
+                if let Some(gateway_id) = gateway_id
+                    && peers.contains_key(gateway_id)
+                {
                     let mut command = self.docker();
-                    command.args(["network", "rm", id]);
-                    checked_output(command, "remove fenced model network").await?;
-                    ensure!(
-                        self.inspect_network(id).await?.is_none(),
-                        "fenced model network still exists after cleanup"
-                    );
+                    command.args(["network", "disconnect", id, &egress.gateway_container]);
+                    checked_output(command, "disconnect fenced model network").await?;
                 }
+                let mut command = self.docker();
+                command.args(["network", "rm", id]);
+                checked_output(command, "remove fenced model network").await?;
+                ensure!(
+                    self.inspect_network(id).await?.is_none(),
+                    "fenced model network still exists after cleanup"
+                );
             }
         }
         scopes.remove(&stopped.key);
@@ -849,8 +849,12 @@ impl DockerIsolation {
         ensure!(
             container["Config"]["Labels"]["vibeface.node"] == node
                 && container["Config"]["Labels"]["vibeface.scope"] == key
-                && container["Config"]["Labels"]["vibeface.project-read-only"]
-                    == self.project_read_only.to_string()
+                && container["Config"]["Labels"]["vibeface.project-read-only"].as_str()
+                    == Some(if self.project_read_only {
+                        "true"
+                    } else {
+                        "false"
+                    })
                 && container["Config"]["Labels"]["vibeface.project"]
                     == hash(project.to_str().context("project path must be UTF-8")?),
             "isolated container belongs to a different Node, space or project"

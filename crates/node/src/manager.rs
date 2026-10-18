@@ -207,6 +207,7 @@ impl std::fmt::Display for ManagerError {
 }
 impl std::error::Error for ManagerError {}
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_manager_authorized<F, P, PF>(
     engine: &Engine,
     context: &ExecutionContext,
@@ -279,6 +280,7 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_codex<F, P, PF>(
     config: &ManagerConfig,
     mut command: Command,

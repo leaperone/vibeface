@@ -1,7 +1,6 @@
 use super::{
-    CALL_TIMEOUT, Client, GATEWAY_FORWARD_METHOD, GATEWAY_SOURCE_METHOD, GatewaySourceRequest,
-    LocalIdentity, NetworkHub, Request, Service, UniqueJsonKeys, receive_value,
-    require_node_policy_carrier, secure, send_frame,
+    CALL_TIMEOUT, Client, GATEWAY_FORWARD_METHOD, LocalIdentity, NetworkHub, Request, Service,
+    UniqueJsonKeys, receive_value, require_node_policy_carrier, secure, send_frame,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -33,11 +32,6 @@ pub(crate) struct GatewayForwardClient {
     client: Client,
     gateway: PublicKey,
     target: PublicKey,
-    failed: bool,
-}
-
-pub(crate) struct GatewaySourceClient {
-    client: Client,
     failed: bool,
 }
 
@@ -108,30 +102,6 @@ impl GatewayForwardClient {
             &result.outcome,
             crate::runtime::now_ms() as u64,
         )?;
-        self.failed = false;
-        Ok(result)
-    }
-}
-
-impl GatewaySourceClient {
-    pub(crate) async fn connect(
-        network: &NetworkHub,
-        identity: &LocalIdentity,
-        gateway: &PublicKey,
-    ) -> Result<Self> {
-        Ok(Self {
-            client: connect(network, identity, gateway).await?,
-            failed: false,
-        })
-    }
-
-    pub(crate) async fn exchange(&mut self, request: &GatewaySourceRequest) -> Result<Value> {
-        ensure!(
-            !self.failed,
-            "gateway connection must be reopened after an unknown outcome"
-        );
-        self.failed = true;
-        let result = exchange(&mut self.client, GATEWAY_SOURCE_METHOD, request).await?;
         self.failed = false;
         Ok(result)
     }
