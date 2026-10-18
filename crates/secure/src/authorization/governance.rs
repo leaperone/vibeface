@@ -521,6 +521,11 @@ pub fn prepare_space_resource_registration(
     build().map_err(|error| error.to_string())
 }
 
+impl PreparedSpaceGovernanceChange {
+    pub(crate) fn proof_usage(&self) -> &execution_handoff::ExecutionProofUsage {
+        &self.usage
+    }
+}
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl PreparedSpaceGovernanceChange {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = requestJson))]
@@ -773,6 +778,9 @@ pub fn finish_space_governance_change(
     finish().map_err(|error| error.to_string())
 }
 impl VerifiedSpaceGovernanceChange {
+    pub(crate) fn proof_usage(&self) -> &execution_handoff::ExecutionProofUsage {
+        &self.usage
+    }
     pub(crate) fn snapshot(&self) -> &VerifiedPolicySnapshot {
         &self.snapshot
     }
@@ -2009,7 +2017,7 @@ pub(crate) mod tests {
             account.as_str(),
             resource.space.as_str(),
             own,
-            node.public_key_hex(),
+            &node.public_key_hex(),
             &json(&pins).unwrap(),
             &json(&Some(&selection)).unwrap(),
             now as f64,
@@ -2045,7 +2053,7 @@ pub(crate) mod tests {
             &request_json,
             &json(&snapshot).unwrap(),
             own,
-            node.public_key_hex(),
+            &node.public_key_hex(),
             now as f64,
         )
         .unwrap();
@@ -2138,7 +2146,7 @@ pub(crate) mod tests {
             &authorization,
             &confirmation_request_json,
             &json(&confirmation).unwrap(),
-            node.public_key_hex(),
+            &node.public_key_hex(),
             now as f64,
         )
         .unwrap()
