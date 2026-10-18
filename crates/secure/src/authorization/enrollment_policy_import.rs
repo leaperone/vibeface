@@ -486,7 +486,7 @@ mod tests {
             } else {
                 PublicKey::of(&key(72))
             };
-            let source = fixture.node.clone();
+            let source = Identity::from_secret_hex(&fixture.node.secret_hex()).unwrap();
             let domain = PolicyDomain::Account(fixture.account.clone());
             let history = fixture.state.account_history(&fixture.account).unwrap();
             let mut entries = vec![JournalEntry::AccountGenesis(history[0].clone())];

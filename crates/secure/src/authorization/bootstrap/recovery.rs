@@ -960,79 +960,229 @@ mod tests {
         enroll_nodes(account(), count)
     }
 
+    fn import_node_enrollment(
+        created: &CreatedAccount,
+        request_json: &str,
+        node: u8,
+        claim_nonce: u8,
+        stages: &mut Vec<serde_json::Value>,
+    ) -> (
+        node_enrollment::VerifiedAccountNodeEnrollmentContext,
+        serde_json::Value,
+    ) {
+        use crate::authorization::enrollment_policy_import::{
+            EnrollmentPolicyPage, EnrollmentPolicyPageRequest, EnrollmentPolicyReadRequest,
+            EnrollmentPolicySnapshot, EnrollmentPolicyWitness,
+            verify_enrollment_policy_read_request,
+        };
+        use node_enrollment::*;
+        let envelope: serde_json::Value = serde_json::from_str(request_json).unwrap();
+        let credential: AccountNodeEnrollmentCredential =
+            serde_json::from_value(envelope["credential"]["credential"].clone()).unwrap();
+        let request: Signed<EnrollmentPolicyReadRequest> =
+            serde_json::from_value(envelope["request"].clone()).unwrap();
+        let descriptor = &credential.descriptor;
+        let credential_hash = ObjectHash::body(&credential).unwrap();
+        let request_hash = request.hash().unwrap();
+        stream::measured(stages, "node_source_read", || {
+            let mut usage = verify_account_node_enrollment_read(
+                &created.authorization.policy_snapshot,
+                &credential.intent,
+                descriptor,
+                &PublicKey::of(&key(4)),
+                &PublicKey::of(&key(3)),
+                NOW as u64,
+            )?;
+            usage.merge(&verify_enrollment_policy_read_request(
+                &request,
+                descriptor,
+                &credential_hash,
+                &PublicKey::of(&key(4)),
+                &PublicKey::of(&key(3)),
+                NOW as u64,
+            )?);
+            usage.enforce_limits()
+        });
+        let snapshot = Signed::sign(
+            EnrollmentPolicySnapshot {
+                version: AUTH_VERSION,
+                purpose: descriptor.purpose,
+                credential_hash: credential_hash.clone(),
+                request_hash: request_hash.clone(),
+                snapshot_id: Nonce::from_bytes([77; 32]),
+                descriptor_hash: ObjectHash::body(descriptor).unwrap(),
+                reader_public_key: PublicKey::of(&key(3)),
+                target_public_key: PublicKey::of(&key(node)),
+                source_node_public_key: PublicKey::of(&key(4)),
+                saved_pins_hash: ObjectHash::body(&descriptor.pins).unwrap(),
+                required_heads_hash: ObjectHash::body(&descriptor.required_heads).unwrap(),
+                target_heads: descriptor.target_heads.clone(),
+                issued_at_ms: NOW as u64,
+                expires_at_ms: descriptor.expires_at_ms,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let credential_json = encode(&credential).unwrap();
+        let read_json = encode(&request).unwrap();
+        let snapshot_json = encode(&snapshot).unwrap();
+        let mut import = stream::measured(stages, "node_import_begin", || {
+            begin_account_node_enrollment_import(
+                &credential_json,
+                &read_json,
+                &snapshot_json,
+                &key(node),
+                &nonce(claim_nonce),
+                &key(3).public_key_hex(),
+                NOW,
+            )
+        });
+        let snapshot_hash = snapshot.hash().unwrap();
+        let mut previous = snapshot_hash.clone();
+        let mut pages = Vec::new();
+        for (index, entry) in created.bundle.journal.iter().enumerate() {
+            let page_request: EnrollmentPolicyPageRequest =
+                serde_json::from_str(&import.page_request_json().unwrap()).unwrap();
+            assert_eq!(page_request.snapshot_id, snapshot.payload.snapshot_id);
+            assert_eq!(page_request.request_hash, request_hash);
+            let complete = index + 1 == created.bundle.journal.len();
+            let page = Signed::sign(
+                EnrollmentPolicyPage {
+                    version: AUTH_VERSION,
+                    purpose: descriptor.purpose,
+                    credential_hash: credential_hash.clone(),
+                    request_hash: request_hash.clone(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    snapshot_hash: snapshot_hash.clone(),
+                    request_cursor: page_request.cursor,
+                    page_index: index as u64,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    next_cursor: (!complete).then(|| {
+                        ObjectHash::body(&("node-enrollment-cursor", &snapshot_hash, index))
+                            .unwrap()
+                    }),
+                    complete,
+                    issued_at_ms: NOW as u64,
+                    expires_at_ms: descriptor.expires_at_ms,
+                },
+                &key(4),
+            )
+            .unwrap();
+            previous = page.hash().unwrap();
+            stream::measured(stages, "node_import_page", || {
+                import.append_page(&encode(&page).unwrap(), NOW)
+            });
+            pages.push(page);
+        }
+        let witness = Signed::sign(
+            EnrollmentPolicyWitness {
+                version: AUTH_VERSION,
+                purpose: descriptor.purpose,
+                credential_hash,
+                request_hash,
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                snapshot_hash,
+                target_heads_hash: ObjectHash::body(&descriptor.target_heads).unwrap(),
+                final_page_hash: previous,
+                page_count: created.bundle.journal.len() as u64,
+                entry_count: created.bundle.journal.len() as u64,
+                issued_at_ms: NOW as u64,
+                expires_at_ms: descriptor.expires_at_ms,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let context = stream::measured(stages, "node_import_finish", || {
+            import.finish(
+                &encode(&witness).unwrap(),
+                &key(node),
+                &nonce(claim_nonce),
+                &key(3).public_key_hex(),
+                NOW,
+            )
+        });
+        (
+            context,
+            serde_json::json!({"credential":credential,"request":request,"snapshot":snapshot,
+                "pages":pages,"witness":witness}),
+        )
+    }
+
     fn enroll_nodes(mut created: CreatedAccount, count: u8) -> CreatedAccount {
         use node_enrollment::*;
         let backup = material(&created);
+        let mut stages = Vec::new();
         for index in 0..count {
-            let pins = created.pins_json().unwrap();
-            let bundle = created.bundle_json().unwrap();
+            let current = stream::confirmed_client(
+                &created,
+                &key(3),
+                &key(4),
+                NOW as u64,
+                NOW as u64 + 30_000,
+                &mut stages,
+            );
             let node = 20 + index;
             let claim_nonce = 100 + index;
-            let prepared = prepare_account_node_enrollment(
-                &backup,
-                &pins,
-                &bundle,
-                &key(3),
-                &claim(node, claim_nonce, NOW),
-                END,
-                NOW,
-            )
-            .unwrap();
-            let possession = sign_account_node_enrollment_possession(
+            let prepared = stream::measured(&mut stages, "node_prepare", || {
+                prepare_account_node_enrollment(
+                    &backup,
+                    &current,
+                    &key(3),
+                    &claim(node, claim_nonce, NOW),
+                    END,
+                    NOW,
+                )
+            });
+            let (context, _) = import_node_enrollment(
+                &created,
                 &prepared.request_json().unwrap(),
-                &key(node),
-                &nonce(claim_nonce),
-                NOW,
-            )
-            .unwrap();
-            let prepared =
+                node,
+                claim_nonce,
+                &mut stages,
+            );
+            let possession = stream::measured(&mut stages, "node_possession", || {
+                sign_account_node_enrollment_possession(
+                    &context,
+                    &key(node),
+                    &nonce(claim_nonce),
+                    NOW,
+                )
+            });
+            let prepared = stream::measured(&mut stages, "node_commit_prepare", || {
                 prepare_account_node_enrollment_commit(&prepared, &backup, &possession, NOW)
-                    .unwrap();
-            let delta = commit_account_node_enrollment(
-                &prepared.request_json().unwrap(),
-                &key(4),
-                &pins,
-                &bundle,
-                NOW,
-            )
-            .unwrap();
-            let installed = finish_account_node_enrollment(&prepared, &delta, NOW).unwrap();
+            });
+            let request: AccountNodeEnrollmentCommitRequest =
+                serde_json::from_str(&prepared.request_json().unwrap()).unwrap();
+            let delta = stream::measured(&mut stages, "node_authority_commit", || {
+                commit_account_node_enrollment_in_state(
+                    &request,
+                    &created.authorization.policy_snapshot,
+                    &key(4),
+                    NOW as u64,
+                )
+            });
+            let installed = stream::measured(&mut stages, "node_client_finish", || {
+                finish_account_node_enrollment(&prepared, &encode(&delta).unwrap(), NOW)
+            });
+            let installation = stream::measured(&mut stages, "node_install", || {
+                verify_account_node_installation(
+                    &context,
+                    &installed.installation_json().unwrap(),
+                    &key(node),
+                    &nonce(claim_nonce),
+                    NOW,
+                )
+            });
+            assert_eq!(installation.pins(), installed.pins());
+            let (_, _, journal) = installation.into_store_parts();
+            assert_eq!(journal, installed.journal());
             created.pins = installed.pins().to_vec();
-            created.bundle = installed.bundle().clone();
+            created.bundle.journal.extend(delta);
+            created.authorization = installed.authorization().unwrap();
         }
-        let required = created
-            .pins
-            .iter()
-            .filter_map(|pin| pin.minimum_head.clone())
-            .collect();
-        let mut import = crate::authorization::policy_import::BoundedPolicyImport::new(
-            created.pins.clone(),
-            required,
-        )
-        .unwrap();
-        for entry in &created.bundle.journal {
-            let _scope = crate::signature_verification::ScopedSignatureVerification::new();
-            import.apply_entry(entry.clone()).unwrap();
-        }
-        let heads = created
-            .pins
-            .iter()
-            .filter_map(|pin| pin.minimum_head.clone())
-            .collect::<Vec<_>>();
-        let snapshot = import.finish(&heads).unwrap();
-        created.authorization = verify_client_policy_state(
-            snapshot.state().clone(),
-            &created.bundle,
-            &created.pins,
-            created.authorization.scope.account_id.clone(),
-            created.authorization.scope.space_id.clone(),
-            PublicKey::of(&key(3)),
-            NOW as u64,
-        )
-        .unwrap();
         created
     }
-
     fn prepared(account: &CreatedAccount, node: u8) -> PreparedAccountRecovery {
         prepare_account_recovery_from_bundle(
             &material(account),
@@ -2157,17 +2307,25 @@ mod tests {
         use node_enrollment::*;
         let original = account();
         let backup = material(&original);
-        let pins = original.pins_json().unwrap();
-        let bundle = original.bundle_json().unwrap();
+        let mut stages = Vec::new();
+        let (current, client_policy) = stream::confirmed_client_with_evidence(
+            &original,
+            &key(3),
+            &key(4),
+            NOW as u64,
+            NOW as u64 + 30_000,
+            &mut stages,
+        );
         let new_claim = claim(7, 44, NOW);
-        let prepared =
-            prepare_account_node_enrollment(&backup, &pins, &bundle, &key(3), &new_claim, END, NOW)
-                .unwrap();
+        let prepared = stream::measured(&mut stages, "node_prepare", || {
+            prepare_account_node_enrollment(&backup, &current, &key(3), &new_claim, END, NOW)
+        });
         let request = prepared.request_json().unwrap();
         assert!(!request.contains("secret_hex"));
-        let possession_request: AccountNodePossessionRequest =
-            serde_json::from_str(&request).unwrap();
-        let signed = possession_request.intent.clone();
+        let envelope: serde_json::Value = serde_json::from_str(&request).unwrap();
+        let credential: AccountNodeEnrollmentCredential =
+            serde_json::from_value(envelope["credential"]["credential"].clone()).unwrap();
+        let signed = credential.intent.clone();
         assert_eq!(
             signed.payload.certificate.owner,
             PolicyDomain::Account(original.authorization.scope.account_id.clone())
@@ -2176,33 +2334,97 @@ mod tests {
             signed.payload.certificate.uses,
             [DeviceUse::Noise, DeviceUse::ServiceInvocation]
         );
+        let (context, policy_import) =
+            import_node_enrollment(&original, &request, 7, 44, &mut stages);
         assert!(
-            sign_account_node_enrollment_possession(&request, &key(8), &nonce(44), NOW).is_err()
+            sign_account_node_enrollment_possession(&context, &key(8), &nonce(44), NOW).is_err()
         );
         assert!(
-            sign_account_node_enrollment_possession(&request, &key(7), &nonce(43), NOW).is_err()
+            sign_account_node_enrollment_possession(&context, &key(7), &nonce(43), NOW).is_err()
         );
         assert!(
-            sign_account_node_enrollment_possession(&request, &key(7), &nonce(44), NOW + 100_000.0)
+            sign_account_node_enrollment_possession(&context, &key(7), &nonce(44), NOW + 100_000.0)
                 .is_err()
         );
-        let possession =
-            sign_account_node_enrollment_possession(&request, &key(7), &nonce(44), NOW).unwrap();
+        let possession = stream::measured(&mut stages, "node_possession", || {
+            sign_account_node_enrollment_possession(&context, &key(7), &nonce(44), NOW)
+        });
         assert!(
             prepare_account_node_enrollment_commit(&prepared, &backup, &"00".repeat(64), NOW)
                 .is_err()
         );
-        let commit =
-            prepare_account_node_enrollment_commit(&prepared, &backup, &possession, NOW).unwrap();
+        let commit = stream::measured(&mut stages, "node_commit_prepare", || {
+            prepare_account_node_enrollment_commit(&prepared, &backup, &possession, NOW)
+        });
         let public = commit.request_json().unwrap();
-        assert!(commit_account_node_enrollment(&public, &key(1), &pins, &bundle, NOW).is_err());
-        let delta = commit_account_node_enrollment(&public, &key(4), &pins, &bundle, NOW).unwrap();
-        let result = finish_account_node_enrollment(&commit, &delta, NOW).unwrap();
-        let delayed = finish_account_node_enrollment(&commit, &delta, NOW + 200_000.0).unwrap();
+        let commit_request: AccountNodeEnrollmentCommitRequest =
+            serde_json::from_str(&public).unwrap();
+        assert!(
+            commit_account_node_enrollment_in_state(
+                &commit_request,
+                &original.authorization.policy_snapshot,
+                &key(1),
+                NOW as u64,
+            )
+            .is_err()
+        );
+        let delta = stream::measured(&mut stages, "node_authority_commit", || {
+            commit_account_node_enrollment_in_state(
+                &commit_request,
+                &original.authorization.policy_snapshot,
+                &key(4),
+                NOW as u64,
+            )
+        });
+        assert!(matches!(
+            delta.as_slice(),
+            [JournalEntry::Device(_), JournalEntry::AccountCommit(_)]
+        ));
+        let delta_json = encode(&delta).unwrap();
+        let result = stream::measured(&mut stages, "node_client_finish", || {
+            finish_account_node_enrollment(&commit, &delta_json, NOW)
+        });
+        let delayed =
+            finish_account_node_enrollment(&commit, &delta_json, NOW + 200_000.0).unwrap();
         assert_eq!(delayed.pins_json().unwrap(), result.pins_json().unwrap());
         assert_eq!(result.account(), &original.authorization.scope.account_id);
-        let before = replay_policies(&original.pins, &original.bundle.journal).unwrap();
-        let after = replay_policies(result.pins(), result.journal()).unwrap();
+        assert_eq!(
+            result.authorization().unwrap().grant_leaf,
+            original.bundle.grant_leaf
+        );
+        let expired_proof =
+            finish_account_node_enrollment(&commit, &delta_json, END + 1.0).unwrap();
+        assert_eq!(
+            expired_proof.pins_json().unwrap(),
+            result.pins_json().unwrap()
+        );
+        assert!(
+            verify_account_node_installation(
+                &context,
+                &expired_proof.installation_json().unwrap(),
+                &key(7),
+                &nonce(44),
+                END + 1.0
+            )
+            .is_err()
+        );
+        let installation = result.installation_json().unwrap();
+        assert!(!installation.contains("secret_hex"));
+        let installed = stream::measured(&mut stages, "node_install", || {
+            verify_account_node_installation(
+                &context,
+                &installation,
+                &key(7),
+                &nonce(44),
+                NOW + 200_000.0,
+            )
+        });
+        assert_eq!(installed.account(), result.account());
+        assert_eq!(installed.node_public_key(), &PublicKey::of(&key(7)));
+        let (after, installed_pins, installed_journal) = installed.into_store_parts();
+        assert_eq!(installed_pins, result.pins());
+        assert_eq!(installed_journal, result.journal());
+        let before = &original.authorization.policy_snapshot;
         let cert = after
             .verify_transport_device(&DeviceId::from_key(&PublicKey::of(&key(7))), NOW as u64)
             .unwrap();
@@ -2215,32 +2437,14 @@ mod tests {
             before.account(result.account()).unwrap().enrollment,
             after.account(result.account()).unwrap().enrollment
         );
-        assert_eq!(result.bundle().grant_leaf, original.bundle.grant_leaf);
-        let expired_proof = finish_account_node_enrollment(&commit, &delta, END + 1.0).unwrap();
-        assert_eq!(
-            expired_proof.pins_json().unwrap(),
-            result.pins_json().unwrap()
+        assert!(
+            verify_account_node_installation(&context, &installation, &key(8), &nonce(44), NOW)
+                .is_err()
         );
         assert!(
-            verify_account_node_installation(
-                &expired_proof.installation_json().unwrap(),
-                &key(7),
-                &nonce(44),
-                END + 1.0
-            )
-            .is_err()
+            verify_account_node_installation(&context, &installation, &key(7), &nonce(43), NOW)
+                .is_err()
         );
-        let installation = result.installation_json().unwrap();
-        assert!(!installation.contains("secret_hex"));
-        let installed =
-            verify_account_node_installation(&installation, &key(7), &nonce(44), NOW + 200_000.0)
-                .unwrap();
-        assert_eq!(
-            installed.bundle_json().unwrap(),
-            result.bundle_json().unwrap()
-        );
-        assert!(verify_account_node_installation(&installation, &key(8), &nonce(44), NOW).is_err());
-        assert!(verify_account_node_installation(&installation, &key(7), &nonce(43), NOW).is_err());
         assert!(
             finish_account_node_enrollment(
                 &commit,
@@ -2251,44 +2455,49 @@ mod tests {
         );
         let mut wrong = signed.payload;
         wrong.certificate.uses.push(DeviceUse::AccountInvocation);
-        let wrong = AccountNodePossessionRequest {
+        let wrong = AccountNodeEnrollmentCredential {
             intent: Signed::sign(wrong, &key(1)).unwrap(),
-            ..possession_request
+            ..credential.clone()
         };
         assert!(
-            sign_account_node_enrollment_possession(
-                &encode(&wrong).unwrap(),
+            verify_account_node_enrollment_read(
+                before,
+                &wrong.intent,
+                &wrong.descriptor,
+                &PublicKey::of(&key(4)),
+                &PublicKey::of(&key(3)),
+                NOW as u64,
+            )
+            .is_err()
+        );
+        let mut changed_context = credential;
+        changed_context.descriptor.pins.clear();
+        assert!(
+            begin_account_node_enrollment_import(
+                &encode(&changed_context).unwrap(),
+                &encode(&policy_import["request"]).unwrap(),
+                &encode(&policy_import["snapshot"]).unwrap(),
                 &key(7),
                 &nonce(44),
+                &key(3).public_key_hex(),
                 NOW
             )
             .is_err()
         );
-        let mut changed_context: AccountNodePossessionRequest =
-            serde_json::from_str(&request).unwrap();
-        changed_context.bundle.grant_leaf = ObjectHash::body(&"another public context").unwrap();
-        assert!(
-            sign_account_node_enrollment_possession(
-                &encode(&changed_context).unwrap(),
-                &key(7),
-                &nonce(44),
-                NOW
-            )
-            .unwrap_err()
-            .contains("trust context")
-        );
         let mut changed_installation: serde_json::Value =
             serde_json::from_str(&installation).unwrap();
-        changed_installation["pins"] = serde_json::json!([]);
+        changed_installation["request"]["descriptor"]["pins"] = serde_json::json!([]);
         assert!(
             verify_account_node_installation(
+                &context,
                 &encode(&changed_installation).unwrap(),
                 &key(7),
                 &nonce(44),
                 NOW
             )
-            .unwrap_err()
-            .contains("trust context")
+            .err()
+            .unwrap()
+            .contains("context")
         );
         assert!(
             after
@@ -2312,8 +2521,7 @@ mod tests {
             assert!(
                 prepare_account_node_enrollment(
                     &backup,
-                    &pins,
-                    &bundle,
+                    &current,
                     &key(3),
                     &claim(reused, 44, NOW),
                     END,
@@ -2323,7 +2531,28 @@ mod tests {
             );
         }
         if let Ok(path) = std::env::var("VIBEFACE_NODE_ENROLLMENT_VECTOR") {
-            std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":original.pins,"bundle":original.bundle,"claim":new_claim.claim,"request":serde_json::from_str::<serde_json::Value>(&request).unwrap(),"possession":possession,"commit_request":serde_json::from_str::<serde_json::Value>(&public).unwrap(),"delta":serde_json::from_str::<serde_json::Value>(&delta).unwrap(),"installation":serde_json::from_str::<serde_json::Value>(&installation).unwrap(),"updated_pins":result.pins(),"updated_bundle":result.bundle()})).unwrap()).unwrap();
+            let value = serde_json::json!({"now":NOW,"end":END,"material":backup,
+                "pins":original.pins,"claim":new_claim.claim,"client_policy":client_policy,
+                "request":envelope,"policy_import":policy_import,"possession":possession,
+                "commit_request":commit_request,"delta":delta,
+                "installation":serde_json::from_str::<serde_json::Value>(&installation).unwrap(),
+                "updated_pins":result.pins(),"stages":stages});
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&value).unwrap()).unwrap();
         }
     }
+
 }
