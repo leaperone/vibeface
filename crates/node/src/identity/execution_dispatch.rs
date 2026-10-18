@@ -1227,7 +1227,111 @@ fn retained_dispatch_authorization(
     Ok((scoped, facts))
 }
 
+fn current_task_business_submit_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    retained: &RetainedDispatch,
+    now_ms: u64,
+) -> Result<(
+    TaskScopedAuthorization,
+    vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
+)> {
+    let invocation = &retained.admission.invocation.payload;
+    let (source, scoped) = dispatch_authorization_from(
+        connection,
+        policy,
+        identity,
+        invocation.resource.space.as_str(),
+        &invocation.operation_id,
+        now_ms,
+    )?;
+    ensure!(
+        source == retained.source,
+        "Task business submission changed its ready admitted dispatch"
+    );
+    let verified = scoped.state(policy.verified()).verify_execution_handoff(
+        wire,
+        scoped.authorization(),
+        &TransportEvidence::VerifiedPeer {
+            origin: vibeface_secure::authorization::DeviceId::from_key(&PublicKey::parse(
+                &identity.public_key_hex()?,
+            )?),
+        },
+        None,
+        now_ms,
+    )?;
+    validate_operation_binding_from(connection, &retained.request)?;
+    Ok((scoped, verified))
+}
+
 impl Store {
+    pub(crate) fn current_task_business_submit(
+        &self,
+        identity: &LocalIdentity,
+        wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<(
+        TaskScopedAuthorization,
+        vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
+    )> {
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let retained = retained_dispatch_from(&tx, identity, wire)?;
+        let result =
+            current_task_business_submit_in(&tx, &current, identity, wire, &retained, now_ms)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn prepare_execution_dispatch_task_business_source(
+        &mut self,
+        identity: &LocalIdentity,
+        wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<
+        Option<(
+            super::task_business_policy::TaskBusinessPolicySourceContext,
+            vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
+        )>,
+    > {
+        use super::task_execution_context::OriginalAdmissionView;
+        use vibeface_secure::authorization::task_business_policy::{
+            TaskBusinessAuthorization, TaskBusinessWire,
+        };
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let retained = retained_dispatch_from(&tx, identity, wire)?;
+        if OriginalAdmissionView::load(&tx, &current, &retained.admission)?
+            .task_policy()
+            .is_none()
+        {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let (scoped, authorization) =
+            current_task_business_submit_in(&tx, &current, identity, wire, &retained, now_ms)?;
+        let task_policy = scoped
+            .task_policy()
+            .context("Task business submission has no current execution policy")?
+            .clone();
+        tx.commit()?;
+        self.policy = current;
+        let source = self.begin_task_business_source(
+            identity,
+            &task_policy,
+            TaskBusinessAuthorization::Submit(&authorization),
+            &TaskBusinessWire::Submit(wire.clone()),
+            now_ms,
+        )?;
+        Ok(Some((source, authorization)))
+    }
+
     pub fn execution_dispatch_handoff(
         &self,
         space: &str,

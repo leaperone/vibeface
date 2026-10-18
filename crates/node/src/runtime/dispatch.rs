@@ -1,8 +1,15 @@
 use super::*;
+use crate::identity::task_business_policy::{
+    TaskBusinessPolicySourceContext, TaskBusinessRequest, TaskBusinessResponse,
+};
 use vibeface_secure::authorization::{
     RequestFacts,
     execution_handoff::{
         ExecutionHandoffResult, SignedExecutionHandoff, SignedExecutionHandoffResolution,
+        VerifiedExecutionHandoff,
+    },
+    task_business_policy::{
+        TaskBusinessAuthorization, TaskBusinessWire, receipt::TaskBusinessChallenge,
     },
 };
 
@@ -576,14 +583,33 @@ impl Runtime {
         submit: bool,
         verification: &SignatureVerification,
     ) -> Result<ExecutionHandoffResult> {
-        let kind = if submit {
-            "execution_handoff_submit"
-        } else {
-            "execution_handoff_status"
+        let source = {
+            let mut store = self.store.lock().await;
+            SignatureVerification::new().run(|| {
+                store.prepare_execution_dispatch_task_business_source(
+                    &self.identity,
+                    wire,
+                    now_ms() as u64,
+                )
+            })?
         };
-        let response = self
-            .peer_request(space, target, json!({"type":kind,"handoff":wire}))
-            .await?;
+        let response = if let Some((source, authorization)) = source {
+            ensure!(
+                source.header().payload.scope.source_project.space.as_str() == space
+                    && crypto::fingerprint(source.target_public_key().as_str())? == target,
+                "Task business source differs from its requested Project or target"
+            );
+            self.request_execution_dispatch_task_business(source, authorization, wire, submit)
+                .await?
+        } else {
+            let kind = if submit {
+                "execution_handoff_submit"
+            } else {
+                "execution_handoff_status"
+            };
+            self.peer_request(space, target, json!({"type":kind,"handoff":wire}))
+                .await?
+        };
         let result: ExecutionHandoffResult = serde_json::from_value(response)?;
         ensure!(
             result.handoff == *wire,
@@ -594,6 +620,105 @@ impl Runtime {
             store.verify_execution_dispatch_receipt(&self.identity, &result, now_ms() as u64)
         })?;
         Ok(result)
+    }
+
+    async fn request_execution_dispatch_task_business(
+        &self,
+        mut source: TaskBusinessPolicySourceContext,
+        authorization: VerifiedExecutionHandoff,
+        wire: &SignedExecutionHandoff,
+        submit: bool,
+    ) -> Result<Value> {
+        let mut client = crate::client::TaskBusinessClient::connect(
+            &self.network,
+            &self.identity,
+            source.export(),
+        )
+        .await?;
+        let header_hash = source.header().hash()?;
+        let business = TaskBusinessWire::Submit(wire.clone());
+        let wire_hash = business.hash()?;
+        client
+            .exchange(&TaskBusinessRequest::SourceBegin {
+                header: source.header().clone(),
+            })
+            .await?;
+        loop {
+            let chunk = {
+                let mut store = self.store.lock().await;
+                SignatureVerification::new().run(|| {
+                    store.next_task_business_source(&self.identity, &mut source, now_ms() as u64)
+                })?
+            };
+            if let Some(page) = chunk.page {
+                client
+                    .exchange(&TaskBusinessRequest::SourcePage { page })
+                    .await?;
+            }
+            if let Some(witness) = chunk.witness {
+                client
+                    .exchange(&TaskBusinessRequest::SourceFinish { witness })
+                    .await?;
+                break;
+            }
+        }
+        let request = if submit {
+            TaskBusinessRequest::Business(business.clone())
+        } else {
+            TaskBusinessRequest::Status {
+                wire: business.clone(),
+            }
+        };
+        let mut response = client.exchange(&request).await?;
+        if let TaskBusinessResponse::Challenge {
+            source_context,
+            business_wire_hash,
+            challenge,
+        } = &response
+        {
+            let TaskBusinessChallenge::Submit(typed) = challenge else {
+                bail!("Task business submission returned another challenge purpose");
+            };
+            ensure!(
+                *source_context == header_hash
+                    && *business_wire_hash == wire_hash
+                    && typed.handoff_hash == wire.hash()?
+                    && if submit {
+                        matches!(typed.stage, CheckStage::Admit | CheckStage::RemoteRead)
+                    } else {
+                        typed.stage == CheckStage::RemoteRead
+                    },
+                "Task business challenge changed its source, wire or stage"
+            );
+            let challenge_hash = challenge.hash()?;
+            let receipts = {
+                let store = self.store.lock().await;
+                SignatureVerification::new().run(|| {
+                    store.task_business_challenge_receipts(
+                        &self.identity,
+                        source.current_policy(),
+                        TaskBusinessAuthorization::Submit(&authorization),
+                        &business,
+                        &header_hash,
+                        challenge,
+                        now_ms() as u64,
+                    )
+                })?
+            };
+            response = client
+                .exchange(&TaskBusinessRequest::Receipts {
+                    source_context: header_hash,
+                    business_wire_hash: wire_hash,
+                    challenge_hash,
+                    receipts,
+                })
+                .await?;
+        }
+        match response {
+            TaskBusinessResponse::Business(value) if submit => Ok(value),
+            TaskBusinessResponse::Status(value) => Ok(value),
+            _ => bail!("Task business submission has no final result for its original request"),
+        }
     }
 
     async fn advance_execution_dispatch(
