@@ -1119,6 +1119,105 @@ fn verify_selections_page(
 }
 
 #[cfg(test)]
+pub(crate) fn verified_client_policy_for_test(
+    store: &mut Store,
+    node: &LocalIdentity,
+    client: &Identity,
+    account: &vibeface_secure::authorization::AccountId,
+    selection: AuthorizationSelection,
+    independent_pins: &[vibeface_secure::authorization::PolicyPin],
+    now: u64,
+) -> Result<VerifiedClientAuthorization> {
+    fn carrier<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let result = verification.run(action)?;
+        ensure!(
+            verification.counts().actual_verifications <= 32,
+            "test client carrier exceeded its crypto budget"
+        );
+        Ok(result)
+    }
+
+    let principal = client.public_key_hex();
+    let source = node.public_key_hex()?;
+    let expires = now
+        .checked_add(90_000)
+        .context("test client read expiry overflow")?;
+    let request = Signed::sign(
+        ClientPolicyReadRequest {
+            version: AUTH_VERSION,
+            account: account.clone(),
+            space: selection.resource.space.clone(),
+            device_public_key: PublicKey::of(client),
+            node_public_key: PublicKey::parse(&source)?,
+            saved_pins: independent_pins.to_vec(),
+            selection: Some(selection.clone()),
+            nonce: Nonce::random()?,
+            issued_at_ms: now,
+            expires_at_ms: expires,
+        },
+        client,
+    )?;
+    let response =
+        carrier(|| store.begin_client_policy_read(node, &principal, request.clone(), now))?;
+    let snapshot: Signed<ClientPolicySnapshot> =
+        serde_json::from_value(response["snapshot"].clone())?;
+    let pins_json = serde_json::to_string(&independent_pins)?;
+    let request_json = serde_json::to_string(&request)?;
+    let snapshot_json = serde_json::to_string(&snapshot)?;
+    let mut importer = carrier(|| {
+        begin_client_policy_import(
+            &pins_json,
+            &request_json,
+            &snapshot_json,
+            client,
+            &source,
+            now as f64,
+        )
+        .map_err(anyhow::Error::msg)
+    })?;
+    loop {
+        let params: Value =
+            serde_json::from_str(&importer.page_request_json().map_err(anyhow::Error::msg)?)?;
+        let response = carrier(|| store.client_policy_page(node, &principal, &params, now))?;
+        let page: Signed<ClientPolicyPage> = serde_json::from_value(response["page"].clone())?;
+        let encoded = serde_json::to_string(&page)?;
+        carrier(|| {
+            importer
+                .append_page(&encoded, now as f64)
+                .map_err(anyhow::Error::msg)
+        })?;
+        if page.payload.complete {
+            break;
+        }
+    }
+    let params = serde_json::to_value(ClientPolicyPageRequest {
+        snapshot_id: snapshot.payload.snapshot_id,
+        request_hash: snapshot.payload.request_hash,
+        cursor: None,
+    })?;
+    let response = carrier(|| store.client_policy_witness(node, &principal, &params, now))?;
+    let witness_json = serde_json::to_string(&response["witness"])?;
+    let selection_json = serde_json::to_string(&selection)?;
+    let auth = carrier(|| {
+        importer
+            .finish(&witness_json, &selection_json, now as f64)
+            .map_err(anyhow::Error::msg)
+    })?;
+    let confirm = carrier(|| {
+        build_client_policy_auth_confirm_request(&auth, client, now as f64, expires as f64)
+            .map_err(anyhow::Error::msg)
+    })?;
+    let params: Value = serde_json::from_str(&confirm)?;
+    let response = carrier(|| store.confirm_client_policy_auth(node, &principal, &params, now))?;
+    let confirmation = serde_json::to_string(&response["confirmation"])?;
+    carrier(|| {
+        confirm_client_policy_authorization(&auth, &confirm, &confirmation, &source, now as f64)
+            .map_err(anyhow::Error::msg)
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::test_support::{TestNetwork, now};
@@ -1546,8 +1645,16 @@ mod tests {
                 now()
             ))?
         );
-        let selected = read_request(&network, true)?;
-        begin(&mut store, &network, selected)?;
+        let auth = verified_client_policy_for_test(
+            &mut store,
+            &network.node,
+            &network.client,
+            &network.account,
+            selection(&network)?,
+            &network.pins,
+            now(),
+        )?;
+        assert_eq!(auth.grant_leaf(), &network.bundle.grant_leaf);
         Ok(())
     }
 
