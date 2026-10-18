@@ -35,6 +35,7 @@ impl SignedObject for EnrollmentOffer {
 pub struct VerifiedEnrollmentOffer {
     signed: Signed<EnrollmentOffer>,
     account_head: PolicyStamp,
+    state: VerifiedPolicySet,
 }
 
 pub fn enrollment_offer_hash(offer: &Signed<EnrollmentOffer>) -> Result<ObjectHash> {
@@ -85,6 +86,14 @@ pub fn verify_enrollment_offer(
     signed: &Signed<EnrollmentOffer>,
     now_ms: u64,
 ) -> Result<VerifiedEnrollmentOffer> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
+    verify_enrollment_offer_in(signed, None, now_ms)
+}
+fn verify_enrollment_offer_in(
+    signed: &Signed<EnrollmentOffer>,
+    known: Option<&VerifiedPolicySet>,
+    now_ms: u64,
+) -> Result<VerifiedEnrollmentOffer> {
     require(
         canonical(signed)?.len() <= MAX_ENROLLMENT_OFFER_BYTES,
         "enrollment offer too large",
@@ -121,7 +130,10 @@ pub fn verify_enrollment_offer(
         .filter(|pin| pin.domain == PolicyDomain::Account(offer.account.clone()))
         .cloned()
         .collect();
-    let state = replay_policies(&account_pins, &offer.manager_journal)?;
+    let state = match known {
+        Some(state) => state.clone(),
+        None => replay_policies(&account_pins, &offer.manager_journal)?,
+    };
     let role = actor(
         &state,
         &offer.account,
@@ -188,6 +200,7 @@ pub fn verify_enrollment_offer(
     Ok(VerifiedEnrollmentOffer {
         signed: signed.clone(),
         account_head,
+        state,
     })
 }
 
@@ -199,14 +212,17 @@ pub fn create_device_enrollment_offer(
     target_node_public_key: &str,
     requested_rights_json: &str,
     certificate_expires_at_ms: f64,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let create = || -> Result<Signed<EnrollmentOffer>> {
         let now = time(now_ms)?;
-        let (state, mut pins, bundle) = state_from(pins_json, bundle_json)?;
+        let snapshot = confirmed_policy(authorization, now)?;
+        let state = snapshot.state();
+        let mut pins = snapshot.pins().to_vec();
         let account = AccountId::parse(account_id)?;
+        authorized_account(authorization, &account)?;
         pins.retain(|pin| {
             pin.domain == PolicyDomain::Account(account.clone())
                 || pin.domain == PolicyDomain::Space(SpaceId::personal(&account))
@@ -220,9 +236,10 @@ pub fn create_device_enrollment_offer(
                 version: AUTH_VERSION,
                 account: account.clone(),
                 pins,
-                manager_journal: bundle
-                    .journal
-                    .into_iter()
+                manager_journal: snapshot
+                    .journal()
+                    .iter()
+                    .cloned()
                     .filter(|entry| account_entry(entry, &account))
                     .collect(),
                 entry: EnrollmentEntry {
@@ -237,7 +254,7 @@ pub fn create_device_enrollment_offer(
             },
             manager,
         )?;
-        verify_enrollment_offer(&signed, now)?;
+        verify_enrollment_offer_in(&signed, Some(state), now)?;
         Ok(signed)
     };
     encode(&create().map_err(|error| error.to_string())?)
@@ -294,17 +311,12 @@ pub fn create_device_enrollment_intent_from_offer(
     new_device: &Identity,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let create = || -> Result<DeviceEnrollmentIntent> {
         let now = time(now_ms)?;
-        let checked = verify_enrollment_offer(&offer.signed, now)?;
+        let checked = verify_enrollment_offer_in(&offer.signed, Some(&offer.state), now)?;
         let value = &checked.signed.payload;
-        let account_pins: Vec<_> = value
-            .pins
-            .iter()
-            .filter(|pin| pin.domain == PolicyDomain::Account(value.account.clone()))
-            .cloned()
-            .collect();
-        let state = replay_policies(&account_pins, &value.manager_journal)?;
+        let state = &checked.state;
         independent_device_key(&state, &value.account, &PublicKey::of(new_device))?;
         Ok(DeviceEnrollmentIntent {
             account: value.account.clone(),
@@ -325,7 +337,7 @@ fn intent_state_from_offer(
     expected_new_device: &PublicKey,
     now: u64,
 ) -> Result<VerifiedPolicySet> {
-    let checked = verify_enrollment_offer(&offer.signed, now)?;
+    let checked = verify_enrollment_offer_in(&offer.signed, Some(&offer.state), now)?;
     let value = &checked.signed.payload;
     validate_window(
         intent.certificate_not_before_ms,
@@ -342,13 +354,7 @@ fn intent_state_from_offer(
             && intent.expected_heads == [checked.account_head],
         "device enrollment intent differs from verified offer",
     )?;
-    let account_pins: Vec<_> = value
-        .pins
-        .iter()
-        .filter(|pin| pin.domain == PolicyDomain::Account(value.account.clone()))
-        .cloned()
-        .collect();
-    let state = replay_policies(&account_pins, &value.manager_journal)?;
+    let state = checked.state;
     independent_device_key(&state, &intent.account, expected_new_device)?;
     Ok(state)
 }
@@ -360,6 +366,7 @@ pub fn verify_device_enrollment_intent_for_offer(
     expected_new_device_public_key: &str,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<String> {
         let intent: DeviceEnrollmentIntent = parse(intent_json)?;
         intent_state_from_offer(
@@ -380,6 +387,7 @@ pub fn verify_account_enrollment_from_offer(
     offer: &VerifiedEnrollmentOffer,
     now_ms: f64,
 ) -> crate::Result<VerifiedAccountEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<VerifiedAccountEnrollment> {
         let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_intent_json.as_bytes())?;
         require(
@@ -405,6 +413,7 @@ pub fn sign_passkey_enrollment_intent_from_offer(
     offer: &VerifiedEnrollmentOffer,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let sign = || -> Result<Signed<DeviceEnrollmentIntent>> {
         let now = time(now_ms)?;
         let intent: DeviceEnrollmentIntent = parse(intent_json)?;
@@ -422,6 +431,7 @@ pub fn verify_passkey_enrollment_request_from_offer(
     offer: &VerifiedEnrollmentOffer,
     now_ms: f64,
 ) -> crate::Result<VerifiedPasskeyEnrollmentRequest> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<VerifiedPasskeyEnrollmentRequest> {
         let now = time(now_ms)?;
         let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
@@ -445,6 +455,7 @@ pub fn prepare_passkey_device_enrollment_from_offer(
     offer: &VerifiedEnrollmentOffer,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountDeviceChange> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountDeviceChange> {
         let now = time(now_ms)?;
         let proof = PasskeyEnrollmentProof {
@@ -462,8 +473,9 @@ pub fn prepare_passkey_device_enrollment_from_offer(
         Ok(PreparedAccountDeviceChange {
             request,
             pins: offer.signed.payload.pins.clone(),
-            bundle: None,
-            account_journal: offer.signed.payload.manager_journal.clone(),
+            state: offer.state.clone(),
+            imported_snapshot: None,
+            authorization: None,
         })
     };
     prepare().map_err(|error| error.to_string())

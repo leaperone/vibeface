@@ -1,6 +1,8 @@
 //! Current account enrollment eligibility and signed device policy changes.
 
-use super::*;
+use super::{
+    client_policy_import::require_confirmed_client_policy, policy_import::VerifiedPolicySnapshot, *,
+};
 
 pub mod offer;
 
@@ -134,18 +136,56 @@ fn time(value: f64) -> Result<u64> {
     )?;
     Ok(value as u64)
 }
-fn state_from(
-    pins: &str,
-    bundle: &str,
-) -> Result<(VerifiedPolicySet, Vec<PolicyPin>, ClientAuthorizationBundle)> {
-    let pins: Vec<PolicyPin> = parse(pins)?;
-    let bundle: ClientAuthorizationBundle = parse(bundle)?;
+fn confirmed_policy(
+    authorization: &VerifiedClientAuthorization,
+    now: u64,
+) -> Result<&VerifiedPolicySnapshot> {
+    let snapshot = require_confirmed_client_policy(authorization)?;
+    let resource = authorization
+        .resources
+        .first()
+        .ok_or(AuthorizationError::PolicyConflict)?;
     require(
-        bundle.journal.len() <= 125,
-        "enrollment journal requires checkpoint",
+        authorization.resources.len() == 1,
+        "device change requires one selected client resource",
     )?;
-    let state = replay_policies(&pins, &bundle.journal)?;
-    Ok((state, pins, bundle))
+    let selected = ResourceRef {
+        space: resource.payload.space.clone(),
+        resource: resource.payload.resource.clone(),
+    };
+    let key = snapshot
+        .state()
+        .find_device(&authorization.scope.device_id)?
+        .payload
+        .public_key
+        .clone();
+    let current = verify_client_policy_state_selected(
+        snapshot.state().clone(),
+        &ClientAuthorizationBundle {
+            journal: Vec::new(),
+            grant_leaf: authorization.grant_leaf.clone(),
+        },
+        snapshot.pins(),
+        authorization.scope.account_id.clone(),
+        authorization.scope.space_id.clone(),
+        key,
+        Some(&selected),
+        now,
+    )?;
+    require(
+        current.heads == authorization.heads && current.audience == authorization.audience,
+        "device change requires a fresh confirmed client selection",
+    )?;
+    Ok(snapshot)
+}
+fn authorized_account(
+    authorization: &VerifiedClientAuthorization,
+    account: &AccountId,
+) -> Result<()> {
+    require(
+        authorization.scope.account_id == *account,
+        "device change belongs to another authenticated account",
+    )
 }
 fn current_heads(
     state: &VerifiedPolicySet,
@@ -344,34 +384,32 @@ pub fn verify_authenticator_enrollment(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyAccountEnrollment))]
 pub fn verify_account_enrollment_json(
     signed_json: &str,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<VerifiedAccountEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<VerifiedAccountEnrollment> {
-        let (state, _, _) = state_from(pins_json, bundle_json)?;
-        verify_account_enrollment(
-            &state,
-            &decode_signed(signed_json.as_bytes())?,
-            time(now_ms)?,
-        )
+        let snapshot = confirmed_policy(authorization, time(now_ms)?)?;
+        let state = snapshot.state();
+        let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
+        authorized_account(authorization, &signed.payload.account)?;
+        verify_account_enrollment(&state, &signed, time(now_ms)?)
     };
     verify().map_err(|e| e.to_string())
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyAuthenticatorEnrollment))]
 pub fn verify_authenticator_enrollment_json(
     signed_json: &str,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<VerifiedAuthenticatorEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<VerifiedAuthenticatorEnrollment> {
-        let (state, _, _) = state_from(pins_json, bundle_json)?;
-        verify_authenticator_enrollment(
-            &state,
-            &decode_signed(signed_json.as_bytes())?,
-            time(now_ms)?,
-        )
+        let snapshot = confirmed_policy(authorization, time(now_ms)?)?;
+        let state = snapshot.state();
+        let signed: Signed<AuthenticatorEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
+        authorized_account(authorization, &signed.payload.account)?;
+        verify_authenticator_enrollment(&state, &signed, time(now_ms)?)
     };
     verify().map_err(|e| e.to_string())
 }
@@ -412,13 +450,16 @@ pub fn create_device_enrollment_intent(
 pub fn sign_device_enrollment_intent(
     intent_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let sign = || -> Result<Signed<DeviceEnrollmentIntent>> {
-        let (state, _, _) = state_from(pins_json, bundle_json)?;
-        let signed = Signed::sign(parse(intent_json)?, signer)?;
+        let snapshot = confirmed_policy(authorization, time(now_ms)?)?;
+        let state = snapshot.state();
+        let intent: DeviceEnrollmentIntent = parse(intent_json)?;
+        authorized_account(authorization, &intent.account)?;
+        let signed = Signed::sign(intent, signer)?;
         verify_account_enrollment(&state, &signed, time(now_ms)?)?;
         Ok(signed)
     };
@@ -428,13 +469,16 @@ pub fn sign_device_enrollment_intent(
 pub fn sign_authenticator_enrollment_intent(
     intent_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let sign = || -> Result<Signed<AuthenticatorEnrollmentIntent>> {
-        let (state, _, _) = state_from(pins_json, bundle_json)?;
-        let signed = Signed::sign(parse(intent_json)?, signer)?;
+        let snapshot = confirmed_policy(authorization, time(now_ms)?)?;
+        let state = snapshot.state();
+        let intent: AuthenticatorEnrollmentIntent = parse(intent_json)?;
+        authorized_account(authorization, &intent.account)?;
+        let signed = Signed::sign(intent, signer)?;
         verify_authenticator_enrollment(&state, &signed, time(now_ms)?)?;
         Ok(signed)
     };
@@ -468,15 +512,16 @@ pub struct AccountDevicePolicyRequest {
 pub struct PreparedAccountDeviceChange {
     request: AccountDevicePolicyRequest,
     pins: Vec<PolicyPin>,
-    bundle: Option<ClientAuthorizationBundle>,
-    account_journal: Vec<JournalEntry>,
+    state: VerifiedPolicySet,
+    imported_snapshot: Option<VerifiedPolicySnapshot>,
+    authorization: Option<VerifiedClientAuthorization>,
 }
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedAccountDeviceChange {
     pins: Vec<PolicyPin>,
-    bundle: Option<ClientAuthorizationBundle>,
-    account_journal: Vec<JournalEntry>,
+    journal_delta: Vec<JournalEntry>,
+    authorization: Option<VerifiedClientAuthorization>,
     scope: Option<ClientScope>,
 }
 
@@ -610,17 +655,19 @@ pub fn prepare_account_device_enrollment(
     qualified: &VerifiedAccountEnrollment,
     device_possession_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountDeviceChange> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountDeviceChange> {
         let now = time(now_ms)?;
         require(
             now < qualified.expires && PublicKey::of(signer) == *qualified.issuer(),
             "enrollment qualification expired or signer mismatch",
         )?;
-        let (mut state, pins, bundle) = state_from(pins_json, bundle_json)?;
+        let snapshot = confirmed_policy(authorization, now)?;
+        let mut state = snapshot.state().clone();
+        authorized_account(authorization, qualified.account())?;
         let certificate =
             Signed::sign(parse::<DeviceCertificate>(device_possession_json)?, signer)?;
         let d = enrollment_document(&mut state, &qualified.signed, &certificate, now)?;
@@ -632,13 +679,14 @@ pub fn prepare_account_device_enrollment(
                 certificate,
             },
         };
-        let (mut state, _, _) = state_from(pins_json, bundle_json)?;
+        let mut state = snapshot.state().clone();
         validate_device_request(&mut state, &request, now)?;
         Ok(PreparedAccountDeviceChange {
             request,
-            pins,
-            bundle: Some(bundle),
-            account_journal: Vec::new(),
+            pins: snapshot.pins().to_vec(),
+            state: snapshot.state().clone(),
+            imported_snapshot: Some(snapshot.clone()),
+            authorization: Some(authorization.clone()),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -649,24 +697,27 @@ pub fn prepare_passkey_device_enrollment(
     signed_certificate_json: &str,
     assertion_proof_json: &str,
     new_device: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountDeviceChange> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountDeviceChange> {
         let now = time(now_ms)?;
-        let (mut state, pins, bundle) = state_from(pins_json, bundle_json)?;
+        let snapshot = confirmed_policy(authorization, now)?;
+        let mut state = snapshot.state().clone();
         let proof = PasskeyEnrollmentProof {
             intent: decode_signed(signed_intent_json.as_bytes())?,
             certificate: decode_signed(signed_certificate_json.as_bytes())?,
             assertion: parse(assertion_proof_json)?,
         };
+        authorized_account(authorization, &proof.intent.payload.account)?;
         let request = prepare_passkey_request(&mut state, proof, new_device, now)?;
         Ok(PreparedAccountDeviceChange {
             request,
-            pins,
-            bundle: Some(bundle),
-            account_journal: Vec::new(),
+            pins: snapshot.pins().to_vec(),
+            state: snapshot.state().clone(),
+            imported_snapshot: Some(snapshot.clone()),
+            authorization: Some(authorization.clone()),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -700,14 +751,16 @@ pub fn prepare_account_device_revocation(
     account_id: &str,
     revoked_device_id: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountDeviceChange> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountDeviceChange> {
         let now = time(now_ms)?;
-        let (mut state, pins, bundle) = state_from(pins_json, bundle_json)?;
+        let snapshot = confirmed_policy(authorization, now)?;
+        let mut state = snapshot.state().clone();
         let account = AccountId::parse(account_id)?;
+        authorized_account(authorization, &account)?;
         let device = DeviceId::parse(revoked_device_id)?;
         let d = revocation_document(&state, &account, &device, &PublicKey::of(signer), now)?;
         let request = AccountDevicePolicyRequest {
@@ -718,9 +771,10 @@ pub fn prepare_account_device_revocation(
         validate_device_request(&mut state, &request, now)?;
         Ok(PreparedAccountDeviceChange {
             request,
-            pins,
-            bundle: Some(bundle),
-            account_journal: Vec::new(),
+            pins: snapshot.pins().to_vec(),
+            state: snapshot.state().clone(),
+            imported_snapshot: Some(snapshot.clone()),
+            authorization: Some(authorization.clone()),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -734,18 +788,17 @@ impl PreparedAccountDeviceChange {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = issueAccountDevicePolicyChallenge))]
 pub fn issue_account_device_policy_challenge(
     request_json: &str,
     authority: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    state: &VerifiedPolicySet,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let issue = || -> Result<Signed<PolicyCommit>> {
         let now = time(now_ms)?;
         let request: AccountDevicePolicyRequest = parse(request_json)?;
-        let (mut state, _, _) = state_from(pins_json, bundle_json)?;
+        let mut state = state.clone();
         let dependencies = validate_device_request(&mut state, &request, now)?;
         let account = state
             .account(&request.proposal.payload.account)
@@ -775,20 +828,19 @@ pub fn issue_account_device_policy_challenge(
     };
     encode(&issue().map_err(|e| e.to_string())?)
 }
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = acceptAccountDevicePolicyChange))]
 pub fn accept_account_device_policy_change(
     request_json: &str,
     challenge_json: &str,
     receipts_json: &str,
     authority: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    state: &VerifiedPolicySet,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let accept = || -> Result<Committed<AccountDocument>> {
         let now = time(now_ms)?;
         let request: AccountDevicePolicyRequest = parse(request_json)?;
-        let (mut state, _, _) = state_from(pins_json, bundle_json)?;
+        let mut state = state.clone();
         let dependencies = validate_device_request(&mut state, &request, now)?;
         let challenge: Signed<PolicyCommit> = decode_signed(challenge_json.as_bytes())?;
         challenge.verify_signature()?;
@@ -833,7 +885,8 @@ pub fn finish_account_device_change(
     committed_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedAccountDeviceChange> {
-    let finish = || -> Result<(Option<ClientAuthorizationBundle>, Vec<JournalEntry>, Vec<PolicyPin>, Option<PublicKey>)> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let finish = || -> Result<VerifiedAccountDeviceChange> {
         let now = time(now_ms)?;
         let committed: Committed<AccountDocument> = parse(committed_json)?;
         let accepted = committed.commit.payload.accepted_at_ms;
@@ -841,16 +894,13 @@ pub fn finish_account_device_change(
             committed.proposal == prepared.request.proposal && accepted <= now,
             "policy commit belongs to another device request",
         )?;
-        let journal = prepared.bundle.as_ref().map(|bundle| bundle.journal.as_slice()).unwrap_or(&prepared.account_journal);
-        let replay_pins: Vec<_> = prepared.pins.iter().filter(|pin| prepared.bundle.is_some()
-            || pin.domain == PolicyDomain::Account(prepared.request.proposal.payload.account.clone())).cloned().collect();
-        let mut state = replay_policies(&replay_pins, journal)?;
+        let mut state = prepared.state.clone();
         validate_device_request(&mut state, &prepared.request, accepted)?;
         let head = state.replay_account_committed(committed.clone())?;
-        let mut journal = journal.to_vec();
+        let mut delta = Vec::new();
         let key = match &prepared.request.change {
             AccountDeviceChange::Enrollment { certificate, .. } => {
-                journal.push(JournalEntry::Device(certificate.clone()));
+                delta.push(JournalEntry::Device(certificate.clone()));
                 Some(certificate.payload.public_key.clone())
             }
             AccountDeviceChange::Passkey(proof) => {
@@ -858,63 +908,94 @@ pub fn finish_account_device_change(
             }
             AccountDeviceChange::Revocation(_) => None,
         };
-        journal.push(JournalEntry::AccountCommit(committed));
-        let bundle = prepared.bundle.as_ref().map(|bundle| ClientAuthorizationBundle {
-            journal: journal.clone(), grant_leaf: bundle.grant_leaf.clone(),
-        });
+        delta.push(JournalEntry::AccountCommit(committed));
+        let snapshot = prepared
+            .imported_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.apply_delta(&delta))
+            .transpose()?;
         let mut pins = prepared.pins.clone();
         for pin in &mut pins {
             if pin.domain == head.domain {
                 pin.minimum_head = Some(head.clone());
             }
         }
-        let account_journal = if bundle.is_none() { journal } else { Vec::new() };
-        Ok((bundle, account_journal, pins, key))
+        // A historical receipt can finish after expiry; current writer eligibility is separate.
+        let revalidate = |key: PublicKey| -> Result<VerifiedClientAuthorization> {
+            let original = prepared
+                .authorization
+                .as_ref()
+                .ok_or(AuthorizationError::Revoked)?;
+            let resource = original
+                .resources
+                .first()
+                .ok_or(AuthorizationError::PolicyConflict)?;
+            let selected = ResourceRef {
+                space: resource.payload.space.clone(),
+                resource: resource.payload.resource.clone(),
+            };
+            let mut current = verify_client_policy_state_selected(
+                state.clone(),
+                &ClientAuthorizationBundle {
+                    journal: Vec::new(),
+                    grant_leaf: original.grant_leaf.clone(),
+                },
+                &pins,
+                original.scope.account_id.clone(),
+                original.scope.space_id.clone(),
+                key,
+                Some(&selected),
+                now,
+            )?;
+            current.imported_snapshot = snapshot.clone();
+            current.client_policy_context = original.client_policy_context.clone();
+            Ok(current)
+        };
+        let current_or_none = |result: Result<VerifiedClientAuthorization>| -> Result<Option<VerifiedClientAuthorization>> {
+            match result {
+                Ok(authorization) => Ok(Some(authorization)),
+                Err(AuthorizationError::Expired | AuthorizationError::Revoked) => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        let scope = if prepared.authorization.is_some() {
+            key.map(|key| current_or_none(revalidate(key)))
+                .transpose()?
+                .flatten()
+                .map(|auth| auth.scope)
+        } else {
+            None
+        };
+        let authorization = if let Some(original) = &prepared.authorization {
+            let key = prepared
+                .state
+                .find_device(&original.scope.device_id)?
+                .payload
+                .public_key
+                .clone();
+            current_or_none(revalidate(key))?
+        } else {
+            None
+        };
+        Ok(VerifiedAccountDeviceChange {
+            pins,
+            journal_delta: delta,
+            authorization,
+            scope,
+        })
     };
-    let (bundle, account_journal, pins, key) = finish().map_err(|e| e.to_string())?;
-    let scope = if let (Some(key), Some(bundle)) = (key, bundle.as_ref()) {
-        let state = replay_policies(&pins, &bundle.journal).map_err(|e| e.to_string())?;
-        let space = &state
-            .grant(&bundle.grant_leaf)
-            .ok_or("missing enrolled client grant")?
-            .payload
-            .owner_space;
-        verify_client_authorization(
-            &encode(&bundle)?,
-            &encode(&pins)?,
-            prepared.request.proposal.payload.account.as_str(),
-            space.as_str(),
-            key.as_str(),
-            now_ms,
-        )
-        .ok()
-        .map(|verified| verified.scope().clone())
-    } else {
-        None
-    };
-    Ok(VerifiedAccountDeviceChange {
-        pins,
-        bundle,
-        account_journal,
-        scope,
-    })
+    finish().map_err(|error| error.to_string())
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedAccountDeviceChange {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = bundleJson))]
-    pub fn bundle_json(&self) -> crate::Result<String> {
-        encode(
-            self.bundle
-                .as_ref()
-                .ok_or("account-only change has no business authorization bundle")?,
-        )
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = journalDeltaJson))]
+    pub fn journal_delta_json(&self) -> crate::Result<String> {
+        encode(&self.journal_delta)
     }
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = accountJournalJson))]
-    pub fn account_journal_json(&self) -> crate::Result<String> {
-        if self.bundle.is_some() {
-            return Err("client change uses bundleJson".to_owned());
-        }
-        encode(&self.account_journal)
+    pub fn authorization(&self) -> crate::Result<VerifiedClientAuthorization> {
+        self.authorization
+            .clone()
+            .ok_or_else(|| "device change has no current confirmed client authorization".to_owned())
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
@@ -1165,13 +1246,16 @@ pub(super) fn authorize_passkey_delta(
 pub fn sign_passkey_enrollment_intent(
     intent_json: &str,
     new_device: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let sign = || -> Result<Signed<DeviceEnrollmentIntent>> {
-        let (state, _, _) = state_from(pins_json, bundle_json)?;
-        let signed = Signed::sign(parse(intent_json)?, new_device)?;
+        let snapshot = confirmed_policy(authorization, time(now_ms)?)?;
+        let state = snapshot.state();
+        let intent: DeviceEnrollmentIntent = parse(intent_json)?;
+        authorized_account(authorization, &intent.account)?;
+        let signed = Signed::sign(intent, new_device)?;
         verify_passkey_enrollment_request(&state, &signed, time(now_ms)?)?;
         Ok(signed)
     };
@@ -1180,17 +1264,16 @@ pub fn sign_passkey_enrollment_intent(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyPasskeyEnrollmentRequest))]
 pub fn verify_passkey_enrollment_request_json(
     signed_json: &str,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<VerifiedPasskeyEnrollmentRequest> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<VerifiedPasskeyEnrollmentRequest> {
-        let (state, _, _) = state_from(pins_json, bundle_json)?;
-        verify_passkey_enrollment_request(
-            &state,
-            &decode_signed(signed_json.as_bytes())?,
-            time(now_ms)?,
-        )
+        let snapshot = confirmed_policy(authorization, time(now_ms)?)?;
+        let state = snapshot.state();
+        let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
+        authorized_account(authorization, &signed.payload.account)?;
+        verify_passkey_enrollment_request(&state, &signed, time(now_ms)?)
     };
     verify().map_err(|e| e.to_string())
 }
@@ -1230,6 +1313,173 @@ mod tests {
     const END: u64 = 500_000;
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
+    }
+    fn confirmed_authorization(
+        state: &VerifiedPolicySet,
+        pins: &[PolicyPin],
+        bundle: &ClientAuthorizationBundle,
+        resource: &ResourceRef,
+    ) -> VerifiedClientAuthorization {
+        use client_policy_import::*;
+        let own = key(3);
+        let node = key(4);
+        let audience = state
+            .grant(&bundle.grant_leaf)
+            .unwrap()
+            .payload
+            .audience
+            .clone();
+        let account = match &state
+            .find_device(&DeviceId::from_key(&PublicKey::of(&own)))
+            .unwrap()
+            .payload
+            .subject
+        {
+            Actor::Account(account) => account.clone(),
+            _ => unreachable!(),
+        };
+        let selection = AuthorizationSelection {
+            resource: resource.clone(),
+            audience,
+            grant_leaf: bundle.grant_leaf.clone(),
+        };
+        let request_json = build_client_policy_read_request(
+            account.as_str(),
+            resource.space.as_str(),
+            &own,
+            &node.public_key_hex(),
+            &encode(&pins).unwrap(),
+            &encode(&Some(&selection)).unwrap(),
+            (NOW as f64),
+            (NOW as f64) + 60_000.0,
+        )
+        .unwrap();
+        let request: Signed<ClientPolicyReadRequest> = parse(&request_json).unwrap();
+        let current = verify_client_policy_read(
+            state,
+            &request,
+            &PublicKey::of(&node),
+            &PublicKey::of(&own),
+            (NOW as f64) as u64,
+        )
+        .unwrap();
+        let snapshot = Signed::sign(
+            ClientPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: client_policy_saved_pins_hash(pins).unwrap(),
+                target_heads: current.heads().to_vec(),
+                selection: selection.clone(),
+                source_node_public_key: PublicKey::of(&node),
+                issued_at_ms: (NOW as f64) as u64,
+                expires_at_ms: (NOW as f64) as u64 + 60_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let mut import = begin_client_policy_import(
+            &encode(&pins).unwrap(),
+            &request_json,
+            &encode(&snapshot).unwrap(),
+            &own,
+            &node.public_key_hex(),
+            (NOW as f64),
+        )
+        .unwrap();
+        let mut previous = snapshot.hash().unwrap();
+        for (index, entry) in bundle.journal.iter().enumerate() {
+            let complete = index + 1 == bundle.journal.len();
+            let page = Signed::sign(
+                ClientPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: request.hash().unwrap(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    target_heads_hash: client_policy_target_heads_hash(current.heads()).unwrap(),
+                    page_index: index as u64,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    next_cursor: if complete {
+                        None
+                    } else {
+                        Some(ObjectHash::body(&("native-test-cursor", index)).unwrap())
+                    },
+                    complete,
+                },
+                &node,
+            )
+            .unwrap();
+            previous = page.hash().unwrap();
+            import
+                .append_page(&encode(&page).unwrap(), (NOW as f64))
+                .unwrap();
+        }
+        let witness = Signed::sign(
+            ClientPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                target_heads: current.heads().to_vec(),
+                final_page_hash: previous,
+                page_count: bundle.journal.len() as u64,
+                entry_count: bundle.journal.len() as u64,
+                snapshot_hash: snapshot.hash().unwrap(),
+                source_node_public_key: PublicKey::of(&node),
+                issued_at_ms: (NOW as f64) as u64,
+                expires_at_ms: (NOW as f64) as u64 + 60_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let authorization = import
+            .finish(
+                &encode(&witness).unwrap(),
+                &encode(&selection).unwrap(),
+                (NOW as f64),
+            )
+            .unwrap();
+        let confirmation_request_json = build_client_policy_auth_confirm_request(
+            &authorization,
+            &own,
+            (NOW as f64),
+            (NOW as f64) + 30_000.0,
+        )
+        .unwrap();
+        let confirmation_request: Signed<ClientPolicyAuthConfirmRequest> =
+            parse(&confirmation_request_json).unwrap();
+        verify_client_policy_auth_confirm(
+            state,
+            &request,
+            &snapshot,
+            &witness,
+            &confirmation_request,
+            &PublicKey::of(&node),
+            &PublicKey::of(&own),
+            (NOW as f64) as u64,
+        )
+        .unwrap();
+        let confirmation = Signed::sign(
+            ClientPolicyAuthConfirmation {
+                version: AUTH_VERSION,
+                context: confirmation_request.payload.context.clone(),
+                confirmation_request_hash: confirmation_request.hash().unwrap(),
+                selection,
+                target_heads: current.heads().to_vec(),
+                device_public_key: PublicKey::of(&own),
+                source_node_public_key: PublicKey::of(&node),
+                accepted_at_ms: (NOW as f64) as u64,
+            },
+            &node,
+        )
+        .unwrap();
+        confirm_client_policy_authorization(
+            &authorization,
+            &confirmation_request_json,
+            &encode(&confirmation).unwrap(),
+            &node.public_key_hex(),
+            (NOW as f64),
+        )
+        .unwrap()
     }
     struct Fixture {
         pins: Vec<PolicyPin>,
@@ -1323,6 +1573,26 @@ mod tests {
         fn bundle_json(&self) -> String {
             encode(&self.bundle).unwrap()
         }
+        fn authorization(&self) -> VerifiedClientAuthorization {
+            let state = self.state();
+            let resource = state
+                .resources
+                .values()
+                .find(|record| {
+                    record.payload.kind == ResourceKind::Project
+                        && record.payload.space == SpaceId::personal(&self.account())
+                })
+                .unwrap();
+            confirmed_authorization(
+                &state,
+                &self.pins,
+                &self.bundle,
+                &ResourceRef {
+                    space: resource.payload.space.clone(),
+                    resource: resource.payload.resource.clone(),
+                },
+            )
+        }
         fn intent(&self, child: u8, rights: Vec<AccountRight>) -> DeviceEnrollmentIntent {
             DeviceEnrollmentIntent {
                 account: self.account(),
@@ -1353,22 +1623,16 @@ mod tests {
                 &qualified,
                 &proof,
                 &key(3),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.authorization(),
                 NOW as f64,
             )
             .unwrap()
         }
         fn accept(&self, prepared: &PreparedAccountDeviceChange) -> VerifiedAccountDeviceChange {
             let request = prepared.request_json().unwrap();
-            let challenge = issue_account_device_policy_challenge(
-                &request,
-                &key(4),
-                &self.pins_json(),
-                &self.bundle_json(),
-                NOW as f64,
-            )
-            .unwrap();
+            let challenge =
+                issue_account_device_policy_challenge(&request, &key(4), &self.state(), NOW as f64)
+                    .unwrap();
             let signed: Signed<PolicyCommit> = parse(&challenge).unwrap();
             assert_eq!(signed.payload.accepted_at_ms, 0);
             let receipts: Vec<_> = signed
@@ -1394,8 +1658,7 @@ mod tests {
                 &challenge,
                 &encode(&receipts).unwrap(),
                 &key(4),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.state(),
                 NOW as f64,
             )
             .unwrap();
@@ -1462,12 +1725,63 @@ mod tests {
                 },
             }
         }
-        fn from_result(result: &VerifiedAccountDeviceChange) -> Self {
+        fn after(&self, result: &VerifiedAccountDeviceChange) -> Self {
+            let mut bundle = self.bundle.clone();
+            bundle.journal.extend(result.journal_delta.clone());
             Self {
                 pins: result.pins.clone(),
-                bundle: result.bundle.clone().unwrap(),
+                bundle,
             }
         }
+    }
+
+    #[test]
+    fn native_device_builders_reject_unconfirmed_and_cross_account_handles() {
+        let f = Fixture::new();
+        let intent = encode(&f.intent(5, vec![])).unwrap();
+        let unconfirmed = verify_client_authorization(
+            &f.bundle_json(),
+            &f.pins_json(),
+            f.account().as_str(),
+            SpaceId::personal(&f.account()).as_str(),
+            &key(3).public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        assert!(sign_device_enrollment_intent(&intent, &key(3), &unconfirmed, NOW as f64).is_err());
+        let authorization = f.authorization();
+        assert!(
+            sign_device_enrollment_intent(&intent, &key(3), &authorization, NOW as f64).is_ok()
+        );
+        let mut other = f.intent(5, vec![]);
+        other.account = AccountId::from_root(&PublicKey::of(&key(99)));
+        assert!(
+            sign_device_enrollment_intent(
+                &encode(&other).unwrap(),
+                &key(3),
+                &authorization,
+                NOW as f64
+            )
+            .is_err()
+        );
+        let prepared = f.manager(5, vec![]);
+        let result = f.accept(&prepared);
+        let next = result.authorization().unwrap();
+        assert_eq!(
+            next.scope.device_id,
+            DeviceId::from_key(&PublicKey::of(&key(3)))
+        );
+        assert_ne!(
+            next.scope.device_id,
+            result.scope.as_ref().unwrap().device_id
+        );
+        assert!(require_confirmed_client_policy(&next).is_ok());
+        assert_eq!(
+            parse::<Vec<JournalEntry>>(&result.journal_delta_json().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1475,7 +1789,7 @@ mod tests {
         let f = Fixture::new();
         let p = f.manager(5, vec![]);
         let result = f.accept(&p);
-        let current = Fixture::from_result(&result);
+        let current = f.after(&result);
         let state = current.state();
         let account = state.account(&f.account()).unwrap();
         assert!(
@@ -1515,8 +1829,7 @@ mod tests {
             &key(4).public_key_hex(),
             "[]",
             END as f64,
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1545,14 +1858,8 @@ mod tests {
         let intent: DeviceEnrollmentIntent = parse(&intent_json).unwrap();
         assert_eq!(intent, f.intent(5, vec![]));
         assert!(
-            sign_device_enrollment_intent(
-                &intent_json,
-                &key(3),
-                &f.pins_json(),
-                &f.bundle_json(),
-                NOW as f64
-            )
-            .is_ok()
+            sign_device_enrollment_intent(&intent_json, &key(3), &f.authorization(), NOW as f64)
+                .is_ok()
         );
         assert!(
             create_device_enrollment_intent_from_offer(
@@ -1573,8 +1880,7 @@ mod tests {
                 &key(4).public_key_hex(),
                 "[]",
                 END as f64,
-                &f.pins_json(),
-                &f.bundle_json(),
+                &f.authorization(),
                 NOW as f64
             )
             .is_err()
@@ -1591,8 +1897,7 @@ mod tests {
             &key(4).public_key_hex(),
             "[]",
             END as f64,
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1643,8 +1948,7 @@ mod tests {
             &key(4).public_key_hex(),
             "[]",
             END as f64,
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1685,8 +1989,7 @@ mod tests {
             &key(4).public_key_hex(),
             "[]",
             END as f64,
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1827,18 +2130,17 @@ mod tests {
             5,
             vec![AccountRight::EnrollDevice, AccountRight::RevokeDevice],
         ));
-        let f = Fixture::from_result(&manager);
+        let f = f.after(&manager);
         let p = prepare_account_device_revocation(
             f.account().as_str(),
             DeviceId::from_key(&PublicKey::of(&key(3))).as_str(),
             &key(1),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
         let result = f.accept(&p);
-        let f = Fixture::from_result(&result);
+        let f = f.after(&result);
         let state = f.state();
         let intent = f.intent(6, vec![AccountRight::EnrollDevice]);
         assert!(
@@ -1967,8 +2269,7 @@ mod tests {
             &encode(&proof.certificate).unwrap(),
             &encode(&proof.assertion).unwrap(),
             &key(5),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1985,10 +2286,10 @@ mod tests {
         assert_eq!(budget.signatures.len(), 4);
         let result = f.accept(&p);
         assert_eq!(
-            result.bundle.as_ref().unwrap().journal.len(),
+            f.after(&result).bundle.journal.len(),
             f.bundle.journal.len() + 1
         );
-        let state = Fixture::from_result(&result).state();
+        let state = f.after(&result).state();
         let account = state.account(&f.account()).unwrap();
         assert!(
             account
@@ -2018,16 +2319,13 @@ mod tests {
             &encode(&proof.certificate).unwrap(),
             &encode(&proof.assertion).unwrap(),
             &key(6),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
         for prepared in [f.manager(5, vec![]), passkey] {
             let result = f.accept(&prepared);
-            let Some(JournalEntry::AccountCommit(committed)) =
-                result.bundle.as_ref().unwrap().journal.last()
-            else {
+            let Some(JournalEntry::AccountCommit(committed)) = result.journal_delta.last() else {
                 panic!("missing committed result")
             };
             let receipt = encode(committed).unwrap();
@@ -2052,8 +2350,7 @@ mod tests {
             &key(4).public_key_hex(),
             "[]",
             END as f64,
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -2089,20 +2386,12 @@ mod tests {
         )
         .unwrap();
         let result = f.accept(&prepared);
-        assert!(result.bundle_json().is_err());
+        assert!(result.authorization().is_err());
         assert_eq!(result.scope_json().unwrap(), "null");
-        let journal_json = result.account_journal_json().unwrap();
+        let journal_json = result.journal_delta_json().unwrap();
         assert!(!journal_json.contains("grant_leaf"));
         let journal: Vec<JournalEntry> = parse(&journal_json).unwrap();
-        assert_eq!(
-            journal.len(),
-            parse::<Signed<EnrollmentOffer>>(&offer_json)
-                .unwrap()
-                .payload
-                .manager_journal
-                .len()
-                + 1
-        );
+        assert_eq!(journal.len(), 1);
         assert!(journal.iter().all(|entry| matches!(
             entry,
             JournalEntry::AccountGenesis(_)
@@ -2118,25 +2407,31 @@ mod tests {
             .cloned()
             .collect();
         assert!(
-            replay_policies(&account_pins, &journal)
-                .unwrap()
-                .find_device(&proof.certificate.payload.device)
-                .is_ok()
+            replay_policies(&account_pins, &{
+                let mut history = parse::<Signed<EnrollmentOffer>>(&offer_json)
+                    .unwrap()
+                    .payload
+                    .manager_journal;
+                history.extend(journal);
+                history
+            })
+            .unwrap()
+            .find_device(&proof.certificate.payload.device)
+            .is_ok()
         );
         let full_prepared = prepare_passkey_device_enrollment(
             &signed,
             &certificate,
             &encode(&proof.assertion).unwrap(),
             &key(5),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
         let full_result = f.accept(&full_prepared);
         assert!(
             verify_client_authorization(
-                &full_result.bundle_json().unwrap(),
+                &f.after(&full_result).bundle_json(),
                 &result.pins_json().unwrap(),
                 f.account().as_str(),
                 SpaceId::personal(&f.account()).as_str(),
@@ -2165,13 +2460,12 @@ mod tests {
         let f = Fixture::new();
         let manager = f.manager(5, vec![]);
         let joined = f.accept(&manager);
-        let joined_fixture = Fixture::from_result(&joined);
+        let joined_fixture = f.after(&joined);
         let revoke = prepare_account_device_revocation(
             f.account().as_str(),
             DeviceId::from_key(&PublicKey::of(&key(5))).as_str(),
             &key(1),
-            &joined_fixture.pins_json(),
-            &joined_fixture.bundle_json(),
+            &joined_fixture.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -2182,16 +2476,13 @@ mod tests {
             &encode(&passkey_proof.certificate).unwrap(),
             &encode(&passkey_proof.assertion).unwrap(),
             &key(7),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
         let passkey_result = f.accept(&passkey);
         let committed = |result: &VerifiedAccountDeviceChange| {
-            let Some(JournalEntry::AccountCommit(value)) =
-                result.bundle.as_ref().unwrap().journal.last()
-            else {
+            let Some(JournalEntry::AccountCommit(value)) = result.journal_delta.last() else {
                 panic!("missing committed device change")
             };
             value.clone()
@@ -2203,8 +2494,7 @@ mod tests {
             &key(4).public_key_hex(),
             "[]",
             END as f64,
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -2222,9 +2512,9 @@ mod tests {
         let vector = serde_json::json!({
             "now": NOW, "end": END, "account": f.account(), "pins": f.pins, "bundle": f.bundle,
             "offer": parse::<Signed<EnrollmentOffer>>(&offer).unwrap(), "offer_hash": verified_offer.offer_hash().unwrap(),
-            "manager": {"intent_hash": manager_intent_hash, "request": manager.request, "committed": committed(&joined), "bundle": joined.bundle, "pins": joined.pins, "scope": joined.scope},
-            "revoke": {"request": revoke.request, "committed": committed(&revoked), "bundle": revoked.bundle, "pins": revoked.pins, "scope": revoked.scope},
-            "passkey": {"proof": passkey_proof, "request": passkey.request, "committed": committed(&passkey_result), "bundle": passkey_result.bundle, "pins": passkey_result.pins, "scope": passkey_result.scope}
+            "manager": {"intent_hash": manager_intent_hash, "request": manager.request, "committed": committed(&joined), "bundle": f.after(&joined).bundle, "pins": joined.pins, "scope": joined.scope},
+            "revoke": {"request": revoke.request, "committed": committed(&revoked), "bundle": joined_fixture.after(&revoked).bundle, "pins": revoked.pins, "scope": revoked.scope},
+            "passkey": {"proof": passkey_proof, "request": passkey.request, "committed": committed(&passkey_result), "bundle": f.after(&passkey_result).bundle, "pins": passkey_result.pins, "scope": passkey_result.scope}
         });
         if let Ok(path) = std::env::var("VIBEFACE_ENROLLMENT_VECTORS") {
             std::fs::write(path, serde_json::to_vec(&vector).unwrap()).unwrap();
@@ -2240,12 +2530,11 @@ mod tests {
             &encode(&proof.certificate).unwrap(),
             &encode(&proof.assertion).unwrap(),
             &key(5),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
-        let f = Fixture::from_result(&f.accept(&prepared));
+        let f = f.after(&f.accept(&prepared));
         let state = f.state();
         let mut proof = f.passkey_proof(6);
         assert_eq!(
@@ -2272,13 +2561,12 @@ mod tests {
             &encode(&proof.certificate).unwrap(),
             &encode(&proof.assertion).unwrap(),
             &key(6),
-            &f.pins_json(),
-            &f.bundle_json(),
+            &f.authorization(),
             NOW as f64,
         )
         .unwrap();
         let result = f.accept(&prepared);
-        let replayed = Fixture::from_result(&result).state();
+        let replayed = f.after(&result).state();
         assert_eq!(
             replayed
                 .verify_authenticator(&proof.assertion.record, NOW)

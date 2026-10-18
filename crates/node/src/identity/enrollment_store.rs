@@ -435,6 +435,8 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         if method == "account_device_commit" {
             return self.commit_account_device(identity, principal, params, now);
         }
@@ -681,25 +683,30 @@ impl Store {
             );
             pending = Some((encoded, record));
         }
-        let snapshot = self.authenticate_account(
-            principal,
-            &json!({"account_id":account,"space_id":space,"device_public_key":principal}),
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.policy.verified().verify_account_client_device(
+            account,
+            &DeviceId::from_key(&PublicKey::parse(principal)?),
             now,
         )?;
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
         let request_json = serde_json::to_string(&request)?;
-        let pins = serde_json::to_string(&snapshot["pins"])?;
-        let bundle = serde_json::to_string(&snapshot["authorization"])?;
         let challenge: Signed<PolicyCommit> = serde_json::from_str(
             &enrollment::issue_account_device_policy_challenge(
                 &request_json,
                 &signer,
-                &pins,
-                &bundle,
+                self.policy.verified(),
                 now as f64,
             )
             .map_err(anyhow::Error::msg)?,
+        )?;
+        super::client_policy_read::check_heads_in(
+            &tx,
+            &self.policy,
+            &challenge.payload.dependencies,
         )?;
         let mut receipts = Vec::new();
         for head in &challenge.payload.dependencies {
@@ -742,8 +749,7 @@ impl Store {
                 &serde_json::to_string(&challenge)?,
                 &serde_json::to_string(&receipts)?,
                 &signer,
-                &pins,
-                &bundle,
+                self.policy.verified(),
                 now as f64,
             )
             .map_err(anyhow::Error::msg)?,
@@ -755,9 +761,6 @@ impl Store {
         delta.push(JournalEntry::AccountCommit(committed.clone()));
         let response = json!({"committed":committed,"journal_delta":delta});
         let update = self.policy.prepare_network_update(&delta, now)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
         if let Some((previous, mut record)) = pending {
@@ -807,6 +810,37 @@ mod tests {
     use std::collections::BTreeMap;
     use vibeface_secure::Identity;
 
+    fn authorization(
+        network: &TestNetwork,
+        store: &mut Store,
+        at: u64,
+    ) -> Result<vibeface_secure::authorization::VerifiedClientAuthorization> {
+        use vibeface_secure::authorization::{AuthorizationSelection, ResourceRef};
+        let audience = store
+            .policy
+            .verified()
+            .grant(&network.bundle.grant_leaf)
+            .context("fixture grant missing")?
+            .payload
+            .audience
+            .clone();
+        super::super::client_policy_read::verified_client_policy_for_test(
+            store,
+            &network.node,
+            &network.client,
+            &network.account,
+            AuthorizationSelection {
+                resource: ResourceRef {
+                    space: network.space.clone(),
+                    resource: network.resource.clone(),
+                },
+                audience,
+                grant_leaf: network.bundle.grant_leaf.clone(),
+            },
+            &network.pins,
+            at,
+        )
+    }
     struct Flow {
         network: TestNetwork,
         store: Store,
@@ -820,7 +854,7 @@ mod tests {
     impl Flow {
         fn new(persistent: bool) -> Result<Self> {
             let network = TestNetwork::new()?;
-            let store = if persistent {
+            let mut store = if persistent {
                 network.at(&network.directory.join("enrollment.sqlite3"))?
             } else {
                 network.memory()?
@@ -832,8 +866,7 @@ mod tests {
                 &network.node.public_key_hex()?,
                 "[]",
                 (now() + 60_000) as f64,
-                &serde_json::to_string(&network.pins)?,
-                &serde_json::to_string(&network.bundle)?,
+                &authorization(&network, &mut store, now())?,
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)?;
@@ -894,12 +927,16 @@ mod tests {
             Ok(self.record.clone())
         }
 
+        fn authorization(
+            &self,
+        ) -> Result<vibeface_secure::authorization::VerifiedClientAuthorization> {
+            authorization(&self.network, &mut self.network.memory()?, now())
+        }
         fn approval(&self) -> Result<String> {
             enrollment::sign_device_enrollment_intent(
                 &self.intent,
                 &self.network.client,
-                &serde_json::to_string(&self.network.pins)?,
-                &serde_json::to_string(&self.network.bundle)?,
+                &self.authorization()?,
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)
@@ -953,8 +990,7 @@ mod tests {
                 &self.qualification()?,
                 &self.certificate()?,
                 &self.network.client,
-                &serde_json::to_string(&self.network.pins)?,
-                &serde_json::to_string(&self.network.bundle)?,
+                &self.authorization()?,
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)
@@ -1297,8 +1333,7 @@ mod tests {
             &flow.network.node.public_key_hex()?,
             "[]",
             (later + 60_000) as f64,
-            &serde_json::to_string(&flow.network.pins)?,
-            &serde_json::to_string(&flow.network.bundle)?,
+            &flow.authorization()?,
             later as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -1346,8 +1381,7 @@ mod tests {
             &flow.network.node.public_key_hex()?,
             "[]",
             (now() + 60_000) as f64,
-            &serde_json::to_string(&flow.network.pins)?,
-            &serde_json::to_string(&flow.network.bundle)?,
+            &flow.authorization()?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -1407,18 +1441,12 @@ mod tests {
             )?["status"],
             "completed"
         );
-        let snapshot = flow.store.authenticate_account(
-            &manager,
-            &json!({"account_id":flow.network.account,
-            "space_id":flow.network.space,"device_public_key":manager}),
-            now(),
-        )?;
+        let current = authorization(&flow.network, &mut flow.store, now())?;
         let revoke = enrollment::prepare_account_device_revocation(
             flow.network.account.as_str(),
             DeviceId::from_key(&PublicKey::of(&flow.device)).as_str(),
             &flow.network.client,
-            &serde_json::to_string(&snapshot["pins"])?,
-            &serde_json::to_string(&snapshot["authorization"])?,
+            &current,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
