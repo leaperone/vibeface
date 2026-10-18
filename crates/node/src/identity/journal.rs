@@ -18,6 +18,7 @@ pub(crate) struct PolicyState {
     order: Vec<ObjectHash>,
     pub(crate) local_admissions: super::admission::AdmissionCheckpoints,
     pub(crate) task_execution_policy: super::foreign_execution_policy::TaskExecutionPolicyProvenance,
+    pub(crate) gateway_policy: super::gateway_forward::GatewayPolicyCache,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1042,6 +1043,7 @@ impl PolicyState {
             order: Vec::new(),
             local_admissions: Default::default(),
             task_execution_policy: Default::default(),
+            gateway_policy: Default::default(),
         };
         let mut additions = Vec::with_capacity(journal.len());
         for entry in journal {

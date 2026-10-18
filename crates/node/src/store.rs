@@ -78,6 +78,9 @@ fn validate_persisted_state(connection: &Connection) -> Result<crate::identity::
         crate::identity::foreign_execution_policy::rehydrate_task_execution_policy_in(
             connection, &mut policy, &source,
         )?;
+        crate::identity::gateway_forward::rehydrate_gateway_sources_in(
+            connection, &mut policy, &source, crate::runtime::now_ms() as u64,
+        )?;
     }
     crate::identity::foreign_execution_policy::validate_task_execution_policy_links_in(connection, &policy)?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
