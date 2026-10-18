@@ -189,7 +189,10 @@ impl AdmissionCheckpoints {
         } else {
             None
         };
-        let _original = OriginalAdmissionView::load(connection, policy, proof)?;
+        let key = super::event_authorization::audience_key(policy.verified(), proof)?;
+        let _original = super::foreign_execution_policy::original_task_execution_policy_in(
+            connection, policy, &key, proof,
+        )?;
         validate_persisted_admission(connection, proof)?;
         ensure!(
             checkpoint.proof == *proof
