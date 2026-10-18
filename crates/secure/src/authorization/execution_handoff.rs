@@ -2644,6 +2644,12 @@ impl ExecutionProofUsage {
                 )?;
             }
             usage.metadata.remove(&hash);
+            usage.signatures.remove(&ObjectHash::body(&(
+                &value.issuer,
+                T::DOMAIN,
+                &hash,
+                &value.signature,
+            ))?);
             usage.historical_wrappers.insert(hash.clone(), bytes);
             usage.record_metadata(&serde_json::json!({
                 "completed_task_policy_carrier": {

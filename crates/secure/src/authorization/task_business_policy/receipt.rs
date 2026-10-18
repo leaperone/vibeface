@@ -738,8 +738,20 @@ mod tests {
         let normalized = completed_current.counts();
         assert!(normalized.authorization_bytes < raw_current_counts.authorization_bytes);
         assert_eq!(
-            normalized.unique_signatures,
+            normalized.unique_signatures + 5,
+            raw_current_counts.unique_signatures,
+            "closed original intent, readonly intent/delegation, snapshot and witness"
+        );
+        assert_eq!(
+            readonly.proof_usage().counts().unique_signatures,
             raw_current_counts.unique_signatures
+        );
+        completed_current
+            .record_signed(readonly.trust().approval())
+            .unwrap();
+        assert_eq!(
+            completed_current.counts().unique_signatures,
+            normalized.unique_signatures
         );
         completed_current
             .normalize_completed_task_policy_transport(&readonly)
@@ -893,6 +905,7 @@ mod tests {
         )
         .unwrap();
         let completed_bytes = completed_current.counts().authorization_bytes;
+        let completed_signatures = completed_current.counts().unique_signatures;
         completed_current.record_signed(&read).unwrap();
         completed_current
             .normalize_completed_task_policy_transport(&readonly)
@@ -900,6 +913,10 @@ mod tests {
         assert_eq!(
             completed_current.counts().authorization_bytes,
             completed_bytes + canonical(&read).unwrap().len()
+        );
+        assert_eq!(
+            completed_current.counts().unique_signatures,
+            completed_signatures + 1
         );
         verify_task_business_receipt_read(
             source.state(),
