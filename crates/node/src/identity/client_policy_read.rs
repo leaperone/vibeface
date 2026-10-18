@@ -40,13 +40,6 @@ struct ReadPosition {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CachedPage {
-    request_cursor: Option<ObjectHash>,
-    page: Signed<ClientPolicyPage>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SelectionsRecord {
     request: Signed<ClientPolicyReadRequest>,
     snapshot_id: Nonce,
@@ -275,7 +268,7 @@ fn verify_record(
     now: u64,
 ) -> Result<(
     VerifiedClientPolicyRead,
-    Option<CachedPage>,
+    Option<Signed<ClientPolicyPage>>,
     ExecutionProofUsage,
 )> {
     let verified = verify_read(connection, policy, &record.request, local, principal, now)?;
@@ -304,25 +297,26 @@ fn verify_record(
     let mut usage = signed_usage(&record.request)?;
     usage.merge(verified.proof_usage());
     usage.record_signed(&record.snapshot)?;
-    let cached: Option<CachedPage> = metadata(connection, &page_key(&snapshot.snapshot_id))?
-        .map(|value| serde_json::from_str(&value))
-        .transpose()?;
+    let cached: Option<Signed<ClientPolicyPage>> =
+        metadata(connection, &page_key(&snapshot.snapshot_id))?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
     if let Some(cached) = &cached {
-        let page = &cached.page.payload;
+        let page = &cached.payload;
         ensure!(
-            cached.page.issuer == *local
+            cached.issuer == *local
                 && page.version == AUTH_VERSION
                 && page.request_hash == snapshot.request_hash
                 && page.snapshot_id == snapshot.snapshot_id
                 && page.target_heads_hash == ObjectHash::body(&snapshot.target_heads)?
                 && page.page_index.checked_add(1) == Some(record.position.page_count)
-                && cached.page.hash()? == record.position.previous_page_hash
+                && cached.hash()? == record.position.previous_page_hash
                 && page.next_cursor == record.position.cursor
                 && page.complete == record.witness.is_some(),
             "client policy cursor changed its signed page"
         );
-        cached.page.verify_signature()?;
-        usage.record_signed(&cached.page)?;
+        cached.verify_signature()?;
+        usage.record_signed(cached)?;
         if let Some(entry) = &page.entry {
             usage.merge(&policy_entry_payload_usage(entry)?);
         }
@@ -568,8 +562,8 @@ impl Store {
         let (verified, cached, mut usage) =
             verify_record(&tx, &self.policy, &record, &local, principal, now)?;
         if let Some(cached) = cached {
-            if cached.request_cursor == request.cursor {
-                return finish_response(json!({"page":cached.page}), usage);
+            if cached.payload.request_cursor == request.cursor {
+                return finish_response(json!({"page":cached}), usage);
             }
         }
         ensure!(
@@ -614,6 +608,7 @@ impl Store {
                 snapshot_id: request.snapshot_id,
                 target_heads_hash: ObjectHash::body(&record.snapshot.payload.target_heads)?,
                 page_index,
+                request_cursor: request.cursor.clone(),
                 previous_page_hash,
                 entry,
                 next_cursor: next_cursor.clone(),
@@ -646,7 +641,7 @@ impl Store {
         }
         let response = finish_response(json!({"page":page}), usage)?;
         tx.execute("INSERT INTO identity_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![page_key(&record.snapshot.payload.snapshot_id),encode(&CachedPage {request_cursor:request.cursor,page})?])?;
+            params![page_key(&record.snapshot.payload.snapshot_id),encode(&page)?])?;
         ensure!(
             tx.execute(
                 "UPDATE identity_meta SET value=? WHERE key=? AND value=?",
@@ -1806,7 +1801,8 @@ mod tests {
     {
         let network = TestNetwork::new()?;
         let mut store = network.memory()?;
-        let snapshot = begin(&mut store, &network, read_request(&network, true)?)?;
+        let request = read_request(&network, true)?;
+        let snapshot = begin(&mut store, &network, request.clone())?;
         let key = context_key(&snapshot.payload.snapshot_id);
         let original = metadata(&store.connection, &key)?.context("snapshot missing")?;
         let mut changed: ClientReadRecord = serde_json::from_str(&original)?;
@@ -1858,7 +1854,7 @@ mod tests {
             "UPDATE policy_pins SET genesis_root=? WHERE domain_kind='account' AND domain_id=?",
             params![root.as_str(), network.account.as_str()],
         )?;
-        measured("page_after_rejected_tamper", || {
+        let response = measured("page_after_rejected_tamper", || {
             store.client_policy_page(
                 &network.node,
                 &network.client.public_key_hex(),
@@ -1866,6 +1862,85 @@ mod tests {
                 now(),
             )
         })?;
+        let page: Signed<ClientPolicyPage> = serde_json::from_value(response["page"].clone())?;
+        assert!(page.payload.request_cursor.is_none());
+        let cache_key = page_key(&snapshot.payload.snapshot_id);
+        let cached =
+            metadata(&store.connection, &cache_key)?.context("signed page cache missing")?;
+        assert_eq!(
+            serde_json::from_str::<Signed<ClientPolicyPage>>(&cached)?,
+            page
+        );
+        let forged_cursor = ObjectHash::body(&"wrong cached request cursor")?;
+        let mut changed_page = page.clone();
+        changed_page.payload.request_cursor = Some(forged_cursor.clone());
+        store.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![encode(&changed_page)?, cache_key],
+        )?;
+        let original_position = metadata(&store.connection, &key)?;
+        let wrong_request = page_request(&snapshot, Some(forged_cursor))?;
+        assert!(
+            store
+                .client_policy_page(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &wrong_request,
+                    now()
+                )
+                .is_err()
+        );
+        assert_eq!(metadata(&store.connection, &key)?, original_position);
+        store.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![cached, cache_key],
+        )?;
+        assert!(
+            store
+                .client_policy_page(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &wrong_request,
+                    now()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.client_policy_page(
+                &network.node,
+                &network.client.public_key_hex(),
+                &params,
+                now()
+            )?,
+            response
+        );
+        let mut native = begin_client_policy_import(
+            &serde_json::to_string(&request.payload.saved_pins)?,
+            &serde_json::to_string(&request)?,
+            &serde_json::to_string(&snapshot)?,
+            &network.client,
+            &network.node.public_key_hex()?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let changed_page = Signed::sign(changed_page.payload, &signer(&network.node)?)?;
+        assert!(
+            native
+                .append_page(&serde_json::to_string(&changed_page)?, now() as f64)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &native.page_request_json().map_err(anyhow::Error::msg)?
+            )?,
+            params
+        );
+        native
+            .append_page(&serde_json::to_string(&page)?, now() as f64)
+            .map_err(anyhow::Error::msg)?;
+        native
+            .append_page(&serde_json::to_string(&page)?, now() as f64)
+            .map_err(anyhow::Error::msg)?;
         Ok(())
     }
 

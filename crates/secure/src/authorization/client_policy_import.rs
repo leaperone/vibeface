@@ -71,6 +71,7 @@ pub struct ClientPolicyPage {
     pub snapshot_id: Nonce,
     pub target_heads_hash: ObjectHash,
     pub page_index: u64,
+    pub request_cursor: Option<ObjectHash>,
     pub previous_page_hash: ObjectHash,
     pub entry: Option<JournalEntry>,
     pub next_cursor: Option<ObjectHash>,
@@ -763,6 +764,7 @@ impl ClientPolicyImport {
             require(
                 !self.complete
                     && page.payload.page_index == self.page_count
+                    && page.payload.request_cursor == self.next_cursor
                     && page.payload.previous_page_hash == self.previous_page_hash
                     && page.payload.complete == page.payload.next_cursor.is_none(),
                 "client policy page is missing, duplicated or out of order",
