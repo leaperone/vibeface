@@ -814,6 +814,7 @@ pub fn verify_device_enrollment_intent_for_manager(
             now,
         )?;
         usage.record_budget(&authorization.budget)?;
+        client_policy_import::record_confirmed_client_policy_metadata(authorization, &mut usage)?;
         usage.record_metadata(&(&intent, &expected_hash, &expected_new_device, now))?;
         if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
         {
