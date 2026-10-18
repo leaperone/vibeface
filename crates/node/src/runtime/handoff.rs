@@ -1,12 +1,41 @@
 use super::*;
 use crate::identity::execution_handoff::AdmittedExecutionHandoff;
+use crate::identity::task_business_policy::TaskBusinessPolicySession;
 use vibeface_secure::authorization::execution_handoff::{
     ExecutionHandoffChallenge, ExecutionHandoffFreshness, ExecutionHandoffResolutionChallenge,
     ExecutionHandoffResolutionFreshness, ExecutionHandoffResolutionResult, ExecutionHandoffResult,
     ExecutionHandoffTerminalReconciliationResult, ExecutionResolutionPurpose,
     SignedExecutionHandoff, SignedExecutionHandoffResolution,
 };
+use vibeface_secure::authorization::{
+    remote_execution_history::RemoteExecutionHistoryAcceptance,
+    task_business_policy::{
+        TaskBusinessWire, VerifiedTaskBusinessOriginalSource,
+        original_operation::VerifiedTaskBusinessOperationCurrent,
+        receipt::{TaskBusinessChallenge, TaskBusinessReceiptRead},
+    },
+};
 use vibeface_secure::signature_verification::SignatureVerification;
+
+#[derive(Clone)]
+enum HandoffExecutionPolicy {
+    Primary,
+    TaskBusiness {
+        source: VerifiedTaskBusinessOriginalSource,
+        acceptance: RemoteExecutionHistoryAcceptance,
+        current: Option<VerifiedTaskBusinessOperationCurrent>,
+    },
+}
+
+enum HandoffExecutionCheck {
+    Primary {
+        authorization: vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
+        freshness: ExecutionHandoffFreshness,
+    },
+    TaskBusiness(VerifiedTaskBusinessOperationCurrent),
+}
+
+type SharedHandoffExecutionPolicy = Arc<Mutex<HandoffExecutionPolicy>>;
 
 fn original(wire: &SignedExecutionHandoff) -> Result<(ResourceRef, String)> {
     let event: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
@@ -89,6 +118,182 @@ fn provider_result(mut value: Value, native: Option<&str>) -> Value {
 }
 
 impl Runtime {
+    async fn handoff_execution_policy(
+        &self,
+        value: &AdmittedExecutionHandoff,
+    ) -> Result<SharedHandoffExecutionPolicy> {
+        let policy = match self
+            .load_task_business_execution_original(
+                value.execution_context.execution_space_id.as_str(),
+                value.execution_context.space_id.as_str(),
+                &value.original_request.operation_id,
+            )
+            .await?
+        {
+            Some((source, acceptance)) => HandoffExecutionPolicy::TaskBusiness {
+                source,
+                acceptance,
+                current: None,
+            },
+            None => HandoffExecutionPolicy::Primary,
+        };
+        Ok(Arc::new(Mutex::new(policy)))
+    }
+
+    async fn check_handoff_execution_policy(
+        &self,
+        value: &AdmittedExecutionHandoff,
+        policy: &HandoffExecutionPolicy,
+        stage: CheckStage,
+        verification: &SignatureVerification,
+    ) -> Result<HandoffExecutionCheck> {
+        match policy {
+            HandoffExecutionPolicy::Primary => {
+                let authorization = {
+                    let store = self.store.lock().await;
+                    verification.run(|| {
+                        store.execution_handoff_authorization(
+                            value.execution_context.execution_space_id.as_str(),
+                            value.execution_context.space_id.as_str(),
+                            &value.original_request.operation_id,
+                            now_ms() as u64,
+                        )
+                    })?
+                };
+                let transport = TransportEvidence::VerifiedPeer {
+                    origin: authorization.wire().invocation.payload.device.clone(),
+                };
+                let freshness = self
+                    .handoff_freshness(authorization.wire(), &transport, stage, verification)
+                    .await?;
+                Ok(HandoffExecutionCheck::Primary {
+                    authorization,
+                    freshness,
+                })
+            }
+            HandoffExecutionPolicy::TaskBusiness {
+                source, acceptance, ..
+            } => {
+                let mut context = {
+                    let mut store = self.store.lock().await;
+                    verification.run(|| {
+                        store.begin_task_business_operation_check(
+                            &self.identity,
+                            source,
+                            source.wire(),
+                            acceptance,
+                            stage,
+                            now_ms() as u64,
+                        )
+                    })?
+                };
+                let challenge = context.challenge().clone();
+                let issued_at_ms = now_ms() as u64;
+                let signer =
+                    vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
+                        .map_err(anyhow::Error::msg)?;
+                let request = Signed::sign(
+                    TaskBusinessReceiptRead {
+                        version: AUTH_VERSION,
+                        source_header_hash: source.header().hash()?,
+                        business_wire_hash: source.wire_hash().clone(),
+                        challenge: TaskBusinessChallenge::Submit(challenge.clone()),
+                        acceptance: Some(acceptance.clone()),
+                        nonce: Nonce::random()?,
+                        issued_at_ms,
+                        expires_at_ms: issued_at_ms
+                            .checked_add(INVOCATION_MAX_AGE_MS)
+                            .context("Task operation receipt read deadline overflow")?
+                            .min(challenge.expires_at_ms),
+                    },
+                    &signer,
+                )?;
+                let mut client = crate::client::TaskBusinessReceiptClient::connect_original(
+                    &self.network,
+                    &self.identity,
+                    source,
+                )
+                .await?;
+                let mut receipts = context.local_receipts().to_vec();
+                receipts.extend(client.read(&request).await?);
+                let proof = ExecutionHandoffFreshness {
+                    challenge,
+                    receipts,
+                };
+                let store = self.store.lock().await;
+                let current = verification.run(|| {
+                    store.finish_task_business_operation_check(
+                        &self.identity,
+                        &mut context,
+                        &proof,
+                        now_ms() as u64,
+                    )
+                })?;
+                Ok(HandoffExecutionCheck::TaskBusiness(current))
+            }
+        }
+    }
+
+    async fn renew_handoff_execution_policy(
+        &self,
+        value: &AdmittedExecutionHandoff,
+        policy: &SharedHandoffExecutionPolicy,
+        verification: &SignatureVerification,
+    ) -> Result<u64> {
+        let snapshot = policy.lock().await.clone();
+        let checked = self
+            .check_handoff_execution_policy(value, &snapshot, CheckStage::Renew, verification)
+            .await?;
+        let _renewal = self.handoff_resolution_lock.lock().await;
+        self.apply_handoff_execution_renewal(value, policy, checked, verification)
+            .await
+    }
+
+    async fn apply_handoff_execution_renewal(
+        &self,
+        value: &AdmittedExecutionHandoff,
+        policy: &SharedHandoffExecutionPolicy,
+        checked: HandoffExecutionCheck,
+        verification: &SignatureVerification,
+    ) -> Result<u64> {
+        let deadline = {
+            let mut policy = policy.lock().await;
+            let mut store = self.store.lock().await;
+            match checked {
+                HandoffExecutionCheck::Primary {
+                    authorization,
+                    freshness,
+                } => verification.run(|| {
+                    store.renew_execution_handoff(
+                        &self.identity,
+                        &authorization,
+                        &freshness,
+                        now_ms() as u64,
+                    )
+                })?,
+                HandoffExecutionCheck::TaskBusiness(current) => {
+                    let deadline = verification.run(|| {
+                        store.renew_execution_handoff_operation_current(
+                            &self.identity,
+                            &current,
+                            now_ms() as u64,
+                        )
+                    })?;
+                    let HandoffExecutionPolicy::TaskBusiness { current: saved, .. } = &mut *policy
+                    else {
+                        bail!("Task operation renewal changed its execution policy");
+                    };
+                    *saved = Some(current);
+                    deadline
+                }
+            }
+        };
+        self.engine
+            .renew_operation(&context(value), deadline)
+            .await?;
+        Ok(deadline)
+    }
+
     pub(super) async fn seal_remote_execution(
         self: &Arc<Self>,
         access: &Access,
@@ -565,11 +770,76 @@ impl Runtime {
     async fn finish_handoff(
         self: &Arc<Self>,
         value: &AdmittedExecutionHandoff,
+        state: OperationState,
+        result: Value,
+        verification: &SignatureVerification,
+    ) -> Result<()> {
+        let policy = match self.handoff_execution_policy(value).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                let _completion = self.handoff_resolution_lock.lock().await;
+                self.engine.fence_operation(&context(value)).await?;
+                return Err(error);
+            }
+        };
+        if value.state == OperationState::Running
+            && matches!(
+                *policy.lock().await,
+                HandoffExecutionPolicy::TaskBusiness { .. }
+            )
+        {
+            let snapshot = policy.lock().await.clone();
+            let checked = self
+                .check_handoff_execution_policy(value, &snapshot, CheckStage::Renew, verification)
+                .await;
+            let completion = self.handoff_resolution_lock.lock().await;
+            let renewal = match checked {
+                Ok(checked) => {
+                    self.apply_handoff_execution_renewal(value, &policy, checked, verification)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = renewal {
+                drop(completion);
+                self.stop_handoff_with_policy(
+                    value,
+                    &format!("execution completion has no current authorization lease: {error:#}"),
+                    verification,
+                    &policy,
+                )
+                .await?;
+                return Err(error);
+            }
+            return self
+                .finish_handoff_in_locked(value, state, result, verification, &policy)
+                .await;
+        }
+        self.finish_handoff_with_policy(value, state, result, verification, &policy)
+            .await
+    }
+
+    async fn finish_handoff_with_policy(
+        self: &Arc<Self>,
+        value: &AdmittedExecutionHandoff,
+        state: OperationState,
+        result: Value,
+        verification: &SignatureVerification,
+        policy: &SharedHandoffExecutionPolicy,
+    ) -> Result<()> {
+        let _completion = self.handoff_resolution_lock.lock().await;
+        self.finish_handoff_in_locked(value, state, result, verification, policy)
+            .await
+    }
+
+    async fn finish_handoff_in_locked(
+        self: &Arc<Self>,
+        value: &AdmittedExecutionHandoff,
         mut state: OperationState,
         mut result: Value,
         verification: &SignatureVerification,
+        policy: &SharedHandoffExecutionPolicy,
     ) -> Result<()> {
-        let _completion = self.handoff_resolution_lock.lock().await;
         let current = {
             let store = self.store.lock().await;
             verification.run(|| {
@@ -598,14 +868,49 @@ impl Runtime {
                 cleanup_affected = affected;
             }
         }
-        self.persist_handoff_result(&current, state.clone(), result, verification)
-            .await?;
+        let business = matches!(
+            *policy.lock().await,
+            HandoffExecutionPolicy::TaskBusiness { .. }
+        );
+        let mut completion_error = None;
+        if !business || state != OperationState::Unknown {
+            let persisted = {
+                let policy = policy.lock().await;
+                self.persist_handoff_result(&current, state, result, verification, &policy)
+                    .await
+            };
+            match persisted {
+                Ok(actual) => state = actual,
+                Err(error) if business => {
+                    state = OperationState::Unknown;
+                    completion_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if state == OperationState::Unknown {
             let mut affected = cleanup_affected;
             affected.extend(self.engine.affected_operations(&context).await);
             let stopped = self.engine.fence_operation(&context).await;
             if let Ok((_, operations)) = &stopped {
                 affected.extend(operations.iter().cloned());
+            }
+            if business {
+                let reason = completion_error
+                    .as_ref()
+                    .map(|error| {
+                        format!("execution completion has no current authorization: {error:#}")
+                    })
+                    .unwrap_or_else(|| "execution outcome requires reconciliation".to_owned());
+                let policy = policy.lock().await;
+                self.persist_handoff_result(
+                    &current,
+                    OperationState::Unknown,
+                    json!({"error":reason,"cancellation_confirmed":stopped.is_ok()}),
+                    verification,
+                    &policy,
+                )
+                .await?;
             }
             self.mark_fenced_operations(
                 &context,
@@ -617,6 +922,9 @@ impl Runtime {
             .await?;
             stopped?;
         }
+        if let Some(error) = completion_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -626,7 +934,8 @@ impl Runtime {
         state: OperationState,
         result: Value,
         verification: &SignatureVerification,
-    ) -> Result<()> {
+        policy: &HandoffExecutionPolicy,
+    ) -> Result<OperationState> {
         let project = ResourceRef {
             space: value.execution_context.space_id.clone(),
             resource: value.execution_context.resource_id.clone(),
@@ -639,21 +948,94 @@ impl Runtime {
                 &value.original_request.target_node,
                 &value.original_request.session_id,
             )?;
-            store.finish_execution_handoff(
-                &self.identity,
-                value.execution_context.execution_space_id.as_str(),
-                project.space.as_str(),
-                &value.original_request.operation_id,
-                state,
-                result,
-                session.as_ref(),
-                now_ms() as u64,
-            )?;
-            Ok(())
+            let value = match policy {
+                HandoffExecutionPolicy::Primary => store.finish_execution_handoff(
+                    &self.identity,
+                    value.execution_context.execution_space_id.as_str(),
+                    project.space.as_str(),
+                    &value.original_request.operation_id,
+                    state,
+                    result,
+                    session.as_ref(),
+                    now_ms() as u64,
+                )?,
+                HandoffExecutionPolicy::TaskBusiness {
+                    source, current, ..
+                } => {
+                    if state == OperationState::Unknown {
+                        let reason = result["error"]
+                            .as_str()
+                            .or_else(|| result["reason"].as_str())
+                            .unwrap_or("execution outcome requires reconciliation");
+                        store.mark_task_business_handoff_unknown(
+                            &self.identity,
+                            source,
+                            reason,
+                            now_ms() as u64,
+                        )?
+                    } else {
+                        store.finish_execution_handoff_operation_current(
+                            &self.identity,
+                            current
+                                .as_ref()
+                                .context("Task execution has no current consumed lease")?,
+                            state,
+                            result,
+                            session.as_ref(),
+                            now_ms() as u64,
+                        )?
+                    }
+                }
+            };
+            Ok(value.state)
         })
     }
 
     async fn execute_handoff(self: Arc<Self>, accepted: AdmittedExecutionHandoff) -> Result<()> {
+        let policy = self.handoff_execution_policy(&accepted).await?;
+        self.execute_handoff_with_policy(accepted, policy).await
+    }
+
+    pub(super) async fn execute_handoff_with_business(
+        self: Arc<Self>,
+        accepted: AdmittedExecutionHandoff,
+        session: TaskBusinessPolicySession,
+        source: VerifiedTaskBusinessOriginalSource,
+        acceptance: RemoteExecutionHistoryAcceptance,
+    ) -> Result<()> {
+        ensure!(
+            session.source().header().hash()? == source.header().hash()?
+                && session.source().wire_hash() == source.wire_hash()
+                && source.acceptance() == &acceptance,
+            "Task execution changed its completed source or original acceptance"
+        );
+        let TaskBusinessWire::Submit(wire) = source.wire() else {
+            bail!("Task execution requires its original accepted Submit");
+        };
+        let (project, operation) = original(wire)?;
+        ensure!(
+            project.space == accepted.execution_context.space_id
+                && project.resource == accepted.execution_context.resource_id
+                && operation == accepted.original_request.operation_id
+                && wire.handoff.execution_resource.space
+                    == accepted.execution_context.execution_space_id
+                && wire.handoff.execution_resource.resource
+                    == accepted.execution_context.execution_service_resource,
+            "Task execution source differs from its accepted execution namespace"
+        );
+        let policy = Arc::new(Mutex::new(HandoffExecutionPolicy::TaskBusiness {
+            source,
+            acceptance,
+            current: None,
+        }));
+        self.execute_handoff_with_policy(accepted, policy).await
+    }
+
+    async fn execute_handoff_with_policy(
+        self: Arc<Self>,
+        accepted: AdmittedExecutionHandoff,
+        policy: SharedHandoffExecutionPolicy,
+    ) -> Result<()> {
         let _work = self.maintenance.enter()?;
         let verification = SignatureVerification::new();
         let preparation = async {
@@ -661,22 +1043,14 @@ impl Runtime {
                 self.config.roles.contains(&NodeRole::Executor),
                 "executor capability is disabled"
             );
-            let auth = {
-                let store = self.store.lock().await;
-                verification.run(|| {
-                    store.execution_handoff_authorization(
-                        accepted.execution_context.execution_space_id.as_str(),
-                        accepted.execution_context.space_id.as_str(),
-                        &accepted.original_request.operation_id,
-                        now_ms() as u64,
-                    )
-                })?
-            };
-            let transport = TransportEvidence::VerifiedPeer {
-                origin: auth.wire().invocation.payload.device.clone(),
-            };
-            let proof = self
-                .handoff_freshness(auth.wire(), &transport, CheckStage::Start, &verification)
+            let snapshot = policy.lock().await.clone();
+            let checked = self
+                .check_handoff_execution_policy(
+                    &accepted,
+                    &snapshot,
+                    CheckStage::Start,
+                    &verification,
+                )
                 .await?;
             let session = accepted
                 .execution_session
@@ -690,10 +1064,39 @@ impl Runtime {
             }
             let (value, fresh, _) = {
                 let _start = self.handoff_resolution_lock.lock().await;
+                let mut policy = policy.lock().await;
                 let mut store = self.store.lock().await;
-                verification.run(|| {
-                    store.claim_execution_handoff(&self.identity, &auth, &proof, now_ms() as u64)
-                })?
+                match checked {
+                    HandoffExecutionCheck::Primary {
+                        authorization,
+                        freshness,
+                    } => verification.run(|| {
+                        store.claim_execution_handoff(
+                            &self.identity,
+                            &authorization,
+                            &freshness,
+                            now_ms() as u64,
+                        )
+                    })?,
+                    HandoffExecutionCheck::TaskBusiness(current) => {
+                        let claimed = verification.run(|| {
+                            store.claim_execution_handoff_operation_current(
+                                &self.identity,
+                                &current,
+                                now_ms() as u64,
+                            )
+                        })?;
+                        if claimed.1 {
+                            let HandoffExecutionPolicy::TaskBusiness { current: saved, .. } =
+                                &mut *policy
+                            else {
+                                bail!("Task operation claim changed its execution policy");
+                            };
+                            *saved = Some(current);
+                        }
+                        claimed
+                    }
+                }
             };
             Ok::<_, anyhow::Error>((value, fresh, kind, action))
         }
@@ -714,13 +1117,24 @@ impl Runtime {
                     })?
                 };
                 if current.state == OperationState::Accepted {
-                    self.finish_handoff(
-                        &current,
-                        OperationState::Rejected,
-                        json!({"error":format!("{error:#}")}),
-                        &verification,
-                    )
-                    .await?;
+                    if matches!(*policy.lock().await, HandoffExecutionPolicy::Primary) {
+                        self.finish_handoff_with_policy(
+                            &current,
+                            OperationState::Rejected,
+                            json!({"error":format!("{error:#}")}),
+                            &verification,
+                            &policy,
+                        )
+                        .await?;
+                    } else {
+                        self.stop_handoff_with_policy(
+                            &current,
+                            &format!("accepted Task execution could not start: {error:#}"),
+                            &verification,
+                            &policy,
+                        )
+                        .await?;
+                    }
                 }
                 return Err(error);
             }
@@ -738,7 +1152,7 @@ impl Runtime {
             cwd: PathBuf::from(&session.cwd),
             native_session_id: session.native_session_id.clone(),
         };
-        self.supervise_handoff(value.clone()).await;
+        self.supervise_handoff(value.clone(), policy.clone()).await;
         let store = self.store.clone();
         let execution = value.execution_context.execution_space_id.clone();
         let project = ResourceRef {
@@ -747,18 +1161,28 @@ impl Runtime {
         };
         let operation = context.operation_id.clone();
         let native_verification = verification.clone();
+        let native_policy = policy.clone();
         let result = self
             .engine
             .execute_authorized(&context, &native, action.clone(), move |id| async move {
+                let policy = native_policy.lock().await;
                 let mut store = store.lock().await;
-                native_verification.run(|| {
-                    store.persist_execution_handoff_native(
+                native_verification.run(|| match &*policy {
+                    HandoffExecutionPolicy::Primary => store.persist_execution_handoff_native(
                         execution.as_str(),
                         &project,
                         &operation,
                         &id,
                         now_ms() as u64,
-                    )
+                    ),
+                    HandoffExecutionPolicy::TaskBusiness { current, .. } => store
+                        .persist_execution_handoff_native_operation_current(
+                            current
+                                .as_ref()
+                                .context("Task execution has no current consumed lease")?,
+                            &id,
+                            now_ms() as u64,
+                        ),
                 })?;
                 Ok(())
             })
@@ -792,11 +1216,12 @@ impl Runtime {
                             } else {
                                 OperationState::Failed
                             };
-                            self.finish_handoff(
+                            self.finish_handoff_with_policy(
                                 &value,
                                 state,
                                 provider_result(observed, Some(native)),
                                 &completion_verification,
+                                &policy,
                             )
                             .await?;
                         }
@@ -804,16 +1229,17 @@ impl Runtime {
                 }
             }
             Ok(result) => {
-                self.finish_handoff(
+                self.finish_handoff_with_policy(
                     &value,
                     OperationState::Succeeded,
                     provider_result(result.result, result.native_session_id.as_deref()),
                     &completion_verification,
+                    &policy,
                 )
                 .await?
             }
             Err(error) => {
-                self.finish_handoff(
+                self.finish_handoff_with_policy(
                     &value,
                     if error.uncertain {
                         OperationState::Unknown
@@ -825,6 +1251,7 @@ impl Runtime {
                         error.native_session_id.as_deref(),
                     ),
                     &completion_verification,
+                    &policy,
                 )
                 .await?
             }
@@ -832,7 +1259,11 @@ impl Runtime {
         Ok(())
     }
 
-    async fn supervise_handoff(self: &Arc<Self>, value: AdmittedExecutionHandoff) {
+    async fn supervise_handoff(
+        self: &Arc<Self>,
+        value: AdmittedExecutionHandoff,
+        policy: SharedHandoffExecutionPolicy,
+    ) {
         let mut context = context(&value);
         let key = (context.space_id.to_string(), context.operation_id.clone());
         if !self.execution_leases.lock().await.insert(key.clone()) {
@@ -860,62 +1291,28 @@ impl Runtime {
                     Ok(current) if current.state == OperationState::Running => {}
                     _ => {
                         let _ = node
-                            .stop_handoff(
+                            .stop_handoff_with_policy(
                                 &value,
                                 "execution outcome requires reconciliation",
                                 &verification,
+                                &policy,
                             )
                             .await;
                         break;
                     }
                 }
-                let renewal = async {
-                    let auth = {
-                        let store = node.store.lock().await;
-                        verification.run(|| {
-                            store.execution_handoff_authorization(
-                                value.execution_context.execution_space_id.as_str(),
-                                context.space_id.as_str(),
-                                &context.operation_id,
-                                now_ms() as u64,
-                            )
-                        })?
-                    };
-                    let transport = TransportEvidence::VerifiedPeer {
-                        origin: auth.wire().invocation.payload.device.clone(),
-                    };
-                    let proof = node
-                        .handoff_freshness(
-                            auth.wire(),
-                            &transport,
-                            CheckStage::Renew,
-                            &verification,
-                        )
-                        .await?;
-                    let _renewal = node.handoff_resolution_lock.lock().await;
-                    let deadline = {
-                        let mut store = node.store.lock().await;
-                        verification.run(|| {
-                            store.renew_execution_handoff(
-                                &node.identity,
-                                &auth,
-                                &proof,
-                                now_ms() as u64,
-                            )
-                        })?
-                    };
-                    node.engine.renew_operation(&context, deadline).await?;
-                    Ok::<_, anyhow::Error>(deadline)
-                }
-                .await;
+                let renewal = node
+                    .renew_handoff_execution_policy(&value, &policy, &verification)
+                    .await;
                 match renewal {
                     Ok(deadline) => context.lease_expires_at_ms = deadline,
                     Err(error) => {
                         let _ = node
-                            .stop_handoff(
+                            .stop_handoff_with_policy(
                                 &value,
                                 &format!("authorization lease could not renew: {error:#}"),
                                 &verification,
+                                &policy,
                             )
                             .await;
                         break;
@@ -932,6 +1329,25 @@ impl Runtime {
         reason: &str,
         verification: &SignatureVerification,
     ) -> Result<()> {
+        let policy = match self.handoff_execution_policy(value).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                let _completion = self.handoff_resolution_lock.lock().await;
+                self.engine.fence_operation(&context(value)).await?;
+                return Err(error);
+            }
+        };
+        self.stop_handoff_with_policy(value, reason, verification, &policy)
+            .await
+    }
+
+    async fn stop_handoff_with_policy(
+        self: &Arc<Self>,
+        value: &AdmittedExecutionHandoff,
+        reason: &str,
+        verification: &SignatureVerification,
+        policy: &SharedHandoffExecutionPolicy,
+    ) -> Result<()> {
         let _completion = self.handoff_resolution_lock.lock().await;
         let context = context(value);
         let mut affected = self.engine.affected_operations(&context).await;
@@ -939,7 +1355,36 @@ impl Runtime {
         if let Ok((_, operations)) = &stopped {
             affected.extend(operations.iter().cloned());
         }
-        affected.push(context.operation_id.clone());
+        let current = {
+            let store = self.store.lock().await;
+            verification.run(|| {
+                store.execution_handoff_status(
+                    &self.identity,
+                    value.execution_context.execution_space_id.as_str(),
+                    value.execution_context.space_id.as_str(),
+                    &value.original_request.operation_id,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        if current.state == OperationState::Running
+            || (current.state == OperationState::Accepted
+                && matches!(
+                    *policy.lock().await,
+                    HandoffExecutionPolicy::TaskBusiness { .. }
+                ))
+        {
+            let policy = policy.lock().await;
+            self.persist_handoff_result(
+                &current,
+                OperationState::Unknown,
+                json!({"error":reason,"cancellation_confirmed":stopped.is_ok()}),
+                verification,
+                &policy,
+            )
+            .await?;
+        }
+        affected.retain(|operation| operation != &context.operation_id);
         self.mark_fenced_operations(&context, affected, reason, stopped.is_ok(), verification)
             .await?;
         stopped.map(|_| ())
@@ -979,11 +1424,14 @@ impl Runtime {
             };
             if let Some(current) = handoff {
                 if current.state == OperationState::Running {
+                    let policy = self.handoff_execution_policy(&current).await?;
+                    let policy = policy.lock().await;
                     self.persist_handoff_result(
                         &current,
                         OperationState::Unknown,
                         json!({"error":reason,"cancellation_confirmed":confirmed}),
                         verification,
+                        &policy,
                     )
                     .await?;
                 }
