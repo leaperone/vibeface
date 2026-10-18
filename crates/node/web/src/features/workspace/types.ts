@@ -1,5 +1,6 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type { AuthorizedRequest } from "../../lib/node"
+import type { TrustedRemoteExecution } from "../../lib/remote-execution"
 
 export type NodeInfo = {
   node_id: string
@@ -38,6 +39,7 @@ export type OperationRecord = {
   state: string
   request: OperationRequest
   raw: unknown
+  execution_source?: Record<string, unknown>
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type MissingContext = { events: string[]; blobs: unknown[]; conflicts: string[] }
@@ -71,13 +73,22 @@ export type OperationRequest = {
   resources: string[]
   action: OperateAction
 }
-export type PendingOperation = Pick<OperationRequest, "space_id" | "operation_id" | "target_node" | "session_id" | "conversation_id"> & { request: OperationRequest }
-export type PendingConversation = { conversation_id: string; title: string }
+export type PendingOperation = Pick<OperationRequest, "space_id" | "operation_id" | "target_node" | "session_id" | "conversation_id"> & { request: OperationRequest; attempt: AuthorizedRequest | null; remote?: TrustedRemoteExecution; execution_session_receipt?: Record<string, unknown> }
+export type PendingConversation = ConversationSummary & { attempt: AuthorizedRequest | null }
 export type TaskCreationRequest = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string; auto_followup: boolean }
 export type PendingTask = TaskCreationRequest & { attempts: AuthorizedRequest[] }
 export type PendingBinding = {
   request: Omit<OperationRequest, "binding"> & { action: Extract<OperateAction, { type: "open" }> }
   task: TaskRecord
+  attempt: AuthorizedRequest | null
+  remote?: TrustedRemoteExecution
+}
+export type PendingRemoteResolution = {
+  request: OperationRequest
+  remote: TrustedRemoteExecution
+  observation: Record<string, unknown>
+  body: Record<string, unknown>
+  context: Record<string, unknown>
   attempt: AuthorizedRequest | null
 }
 export type WorkspaceView = "chat" | "tasks" | "sessions" | "devices" | "notifications"

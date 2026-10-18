@@ -1,97 +1,36 @@
-import { signAuthorizedClientInvocation, signAuthorizedClientPrepare } from '../../transport.js'
-import { verifyAccountDeviceDirectory, verifyClientAuthorization } from '../../generated/vibeface_secure.js'
-import { array, record, strings, text } from './node'
-import { parseIdentityScope, sameScope } from './scope'
-import type { AccountDeviceDirectory, ProjectResource, PublicIdentity } from './node'
+import { signAuthorizedClientInvocation, signAuthorizedClientPrepare, prepareRemoteClientExecution, signRemoteClientExecution, signRemoteExecutionObservation } from '../../transport.js'
+import { deriveAuthorizationId, revalidateClientPolicyAuthorization, verifyAccountDeviceDirectory, verifyProjectExecutionMetadata, verifyRemoteExecution, verifyRemoteExecutionResultHistory, verifyRemoteResolutionHistory } from '../../generated/vibeface_secure.js'
+import type * as secure from '../../generated/vibeface_secure.js'
+import { parseRemoteExecutionObservation, parseRemoteExecutionResolutionResult, parseRemoteExecutionSession, parseRemoteExecutionShare, parseTrustedRemoteExecution } from './remote-execution'
+import type { RemoteExecutionObservation, RemoteExecutionResolutionResult, TrustedRemoteExecution } from './remote-execution'
+import { array, record, same, strings } from './node'
+import { parseIdentityScope } from './scope'
+import type { AccountDeviceDirectory, AuthorizedRequest, ProjectResource, PublicIdentity } from './node'
 
-type PolicyDomain = { kind: 'account' | 'space'; id: string }
-type PolicyStamp = { domain: PolicyDomain; authority_epoch: number; sequence: number; head: string }
-type PolicyPin = { domain: PolicyDomain; genesis_root: string; minimum_head: PolicyStamp | null }
-export type AuthorizationTrust = { kind: 'policy'; accountId: string; spaceId: string; pins: PolicyPin[] }
-export type AuthorizationSelection = { resourceId: string; audience: { device: string; service: string } }
+import { mergeAuthorizationTrust, parseAuthorizationTrust, typedId, counter, stamp } from './authorization-trust'
+import type { AuthorizationTrust } from './authorization-trust'
+export { parseAuthorizationTrust, mergeAuthorizationTrust } from './authorization-trust'
+export type { AuthorizationTrust } from './authorization-trust'
 
-function typedId(value: unknown, prefix: string) {
-  const id = text(value)
-  if (!new RegExp(`^${prefix}[a-f0-9]{64}$`).test(id)) throw new Error('账户授权标识格式无效。')
-  return id
-}
-function domain(value: unknown): PolicyDomain {
-  const input = record(value)
-  if (input.kind !== 'account' && input.kind !== 'space') throw new Error('政策范围格式无效。')
-  return { kind: input.kind, id: typedId(input.id, input.kind === 'account' ? 'acc2_' : 'spc2_') }
-}
-function counter(value: unknown) {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('政策版本格式无效。')
-  return value
-}
+export type AuthorizationSelection = { resourceId: string; audience: { device: string; service: string }; grantLeaf?: string }
+
 export function parseAuthorizationSelection(value: unknown): AuthorizationSelection {
   const selection = record(value), target = record(selection.audience)
-  return { resourceId: typedId(selection.resourceId, 'res2_'), audience: { device: typedId(target.device, 'dev2_'), service: typedId(target.service, 'svc2_') } }
-}
-function stamp(value: unknown): PolicyStamp {
-  const input = record(value)
-  return { domain: domain(input.domain), authority_epoch: counter(input.authority_epoch), sequence: counter(input.sequence), head: typedId(input.head, 'h2_') }
-}
-export function parseAuthorizationTrust(value: unknown): AuthorizationTrust {
-  const input = record(value, '已保存的账户信任')
-  if (input.kind !== 'policy') throw new Error('需要新格式账户连接卡或当前格式的设备备份。')
-  const pins = array(input.pins).map(value => {
-    const pin = record(value)
-    return { domain: domain(pin.domain), genesis_root: typedId(pin.genesis_root, ''), minimum_head: pin.minimum_head === null ? null : stamp(pin.minimum_head) }
-  })
-  if (!pins.length || pins.length > 10) throw new Error('账户根信任数量无效。')
-  return { kind: 'policy', accountId: typedId(input.accountId, 'acc2_'), spaceId: typedId(input.spaceId, 'spc2_'), pins }
+  return { resourceId: typedId(selection.resourceId, 'res2_'), audience: { device: typedId(target.device, 'dev2_'), service: typedId(target.service, 'svc2_') }, ...(selection.grantLeaf === undefined ? {} : { grantLeaf: typedId(selection.grantLeaf, 'h2_') }) }
 }
 
-function newerHead(left: PolicyStamp | null, right: PolicyStamp | null): PolicyStamp | null {
-  if (!left) return right
-  if (!right) return left
-  if (left.authority_epoch === right.authority_epoch && left.sequence === right.sequence) {
-    if (left.head !== right.head) throw new Error('政策在相同版本出现不同签名历史，已暂停连接。')
-    return left
-  }
-  return left.authority_epoch > right.authority_epoch || left.authority_epoch === right.authority_epoch && left.sequence > right.sequence ? left : right
-}
-
-export function mergeAuthorizationTrust(candidate: AuthorizationTrust, known: AuthorizationTrust[]): AuthorizationTrust {
-  if (known.some(trust => trust.accountId !== candidate.accountId)) throw new Error('此设备配置已属于另一个账户。请为新账户创建独立设备配置。')
-  const pins = candidate.pins.map(pin => {
-    let minimum = pin.minimum_head
-    for (const trust of known) {
-      const saved = trust.pins.find(other => other.domain.kind === pin.domain.kind && other.domain.id === pin.domain.id)
-      if (!saved) continue
-      if (saved.genesis_root !== pin.genesis_root) throw new Error('账户或空间根信任与已保存配置不一致。')
-      minimum = newerHead(minimum, saved.minimum_head)
-    }
-    return { ...pin, minimum_head: minimum }
-  })
-  return { ...candidate, pins }
-}
-
-function parseAccountDirectory(value: unknown): AccountDeviceDirectory {
-  const input = record(value)
-  return {
-    account_id: typedId(input.account, 'acc2_'),
-    devices: array(input.devices).map(value => {
-      const entry = record(value), device = record(record(entry.certificate).payload), subject = record(device.subject)
-      if (subject.kind !== 'account' && subject.kind !== 'service') throw new Error('已验证的账户设备主体格式无效。')
-      if (entry.status !== 'active' && entry.status !== 'expired' && entry.status !== 'pending') throw new Error('已验证的账户设备状态无效。')
-      return { device_id: typedId(device.device, 'dev2_'), public_key: typedId(device.public_key, ''),
-        subject: { kind: subject.kind, id: typedId(subject.id, subject.kind === 'account' ? 'acc2_' : 'svc2_') },
-        uses: strings(device.uses), not_before_ms: counter(device.not_before_ms), expires_at_ms: counter(device.expires_at_ms), status: entry.status,
-      }
-    }),
-  }
-}
-
-export function verifyScopedAuthentication(value: unknown, own: PublicIdentity, trust: AuthorizationTrust, gatewayPublicKey: string, selection?: AuthorizationSelection) {
-  const auth = record(value)
-  const verified = verifyClientAuthorization(JSON.stringify(record(auth.authorization)), JSON.stringify(trust.pins), trust.accountId, trust.spaceId, own.publicKey, Date.now())
+export function verifyScopedAuthentication(handle: secure.VerifiedClientAuthorization, own: PublicIdentity, trust: AuthorizationTrust, gatewayPublicKey: string, selection?: AuthorizationSelection) {
+  let verified = handle
   let released = false
   try {
+    verified.clientPolicyContextJson()
+    const current = revalidateClientPolicyAuthorization(verified, JSON.stringify(trust.pins), Date.now())
+    verified.free(); verified = current
     const scope = parseIdentityScope(JSON.parse(verified.scopeJson()))
-    if (!sameScope(scope, parseIdentityScope(auth.scope))) throw new Error('入口返回了其他账户、空间或设备范围。')
+    if (scope.account_id !== trust.accountId || scope.space_id !== trust.spaceId || scope.device_id !== deriveAuthorizationId('device', own.publicKey)) throw new Error('入口返回了其他账户、空间或设备范围。')
     const policy = record(JSON.parse(verified.policyJson()))
+    const grantLeaf = typedId(policy.grant_leaf, 'h2_')
+    if (selection?.grantLeaf !== undefined && grantLeaf !== selection.grantLeaf) throw new Error('入口返回的授权叶与已保存的可信项目选择不同。')
     if (!selection && policy.audience_public_key !== gatewayPublicKey) throw new Error('授权资源与当前加密连接的目标设备不一致。')
     const target = record(policy.audience)
     const audience = { device: typedId(target.device, 'dev2_'), service: typedId(target.service, 'svc2_') }
@@ -109,11 +48,84 @@ export function verifyScopedAuthentication(value: unknown, own: PublicIdentity, 
     const actions = strings(policy.actions)
     const enrollmentRights = strings(policy.account_enrollment_rights)
     const pins = trust.pins.map(pin => ({ ...pin, minimum_head: heads.find(head => head.domain.kind === pin.domain.kind && head.domain.id === pin.domain.id) ?? pin.minimum_head }))
+    let currentTrust: AuthorizationTrust = { ...trust, pins }
+    const requireActive = () => { if (released) throw new Error('账户授权已释放，请重新连接。') }
+    const adoptRemote = (handle: secure.VerifiedRemoteExecution, value: TrustedRemoteExecution) => {
+      let disposed = false
+      try {
+        requireActive()
+        const remote = parseTrustedRemoteExecution(value)
+        const selection = parseRemoteExecutionShare({ ...remote.share, selection: JSON.parse(handle.selectionJson()) }).selection
+        if (!same(selection, remote.share.selection)) throw new Error('远端政策与选定的执行授权不同。')
+        const metadata = record(JSON.parse(handle.metadataJson()))
+        const nextTrust = parseAuthorizationTrust({ ...remote.trust, pins: metadata.pins })
+        const requireRemoteActive = () => { if (released || disposed) throw new Error('远端执行授权已释放，请重新核对。') }
+        return {
+          selection, trust: nextTrust, context: record(metadata.context),
+          prepare(bodyJson: string, preparedContextJson: string, expectedAction: string, operationId: string) {
+            requireRemoteActive()
+            return prepareRemoteClientExecution(handle, verified, bodyJson, preparedContextJson, expectedAction, operationId, gatewayPublicKey)
+          },
+          sign(templateJson: string, bodyJson: string, expectedAction: string, operationId: string) {
+            requireRemoteActive()
+            return signRemoteClientExecution(handle, verified, templateJson, bodyJson, expectedAction, operationId, gatewayPublicKey)
+          },
+          validateReplay(bodyJson: string, invocationJson: string, expectedAction: string, operationId: string) {
+            requireRemoteActive()
+            handle.validateReplay(verified, bodyJson, invocationJson, expectedAction, operationId, gatewayPublicKey, Date.now())
+          },
+          session(receipt: Record<string, unknown>, binding: Record<string, unknown>) {
+            requireRemoteActive()
+            return parseRemoteExecutionSession(JSON.parse(handle.sessionJson(JSON.stringify(receipt), JSON.stringify(binding), Date.now())))
+          },
+          result(actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown>) {
+            requireRemoteActive()
+            return parseRemoteExecutionObservation(JSON.parse(handle.resultJson(JSON.stringify(actual), JSON.stringify(original.body), JSON.stringify(original.invocation), JSON.stringify(binding), Date.now())))
+          },
+          observation(actual: Record<string, unknown>, binding: Record<string, unknown>) {
+            requireRemoteActive()
+            return parseRemoteExecutionObservation(JSON.parse(handle.observationJson(JSON.stringify(actual), JSON.stringify(binding), Date.now())))
+          },
+          observationRequest(original: Record<string, unknown>, authorizationId: string) {
+            requireRemoteActive()
+            return record(JSON.parse(signRemoteExecutionObservation(handle, JSON.stringify(original), authorizationId, gatewayPublicKey)))
+          },
+          resolution(actual: Record<string, unknown>, authorizationId: string, outcome: string, evidence: string) {
+            requireRemoteActive()
+            const intent = record(JSON.parse(handle.resolutionBodyJson(JSON.stringify(actual), authorizationId, outcome, evidence, Date.now())))
+            return { body: record(intent.body), context: record(intent.context) }
+          },
+          finishResolution(actual: Record<string, unknown>, original: AuthorizedRequest) {
+            requireRemoteActive()
+            return parseRemoteExecutionResolutionResult(JSON.parse(handle.resolutionResultJson(JSON.stringify(actual), JSON.stringify(original.body), JSON.stringify(original.invocation), Date.now())))
+          },
+          release() { if (!disposed) { disposed = true; handle.free() } },
+        }
+      } catch (error) { handle.free(); throw error }
+    }
     return {
-      scope, audience, projects, actions, policy, enrollmentRights, authorityEpoch, trust: { ...trust, pins },
+      scope, audience, projects, actions, policy, enrollmentRights, authorityEpoch, grantLeaf,
+      get trust() { return currentTrust },
+      spaceGenesis: verified.spaceGenesisHash(), isTeam: verified.spaceKind() === 'team',
+      clientPolicyContext() { requireActive(); return record(JSON.parse(verified.clientPolicyContextJson())) },
+      revalidate(latestTrust: AuthorizationTrust) {
+        requireActive()
+        if (latestTrust.accountId !== scope.account_id || latestTrust.spaceId !== scope.space_id) throw new Error('最新政策水位属于其他账户或空间。')
+        const nextTrust = mergeAuthorizationTrust(latestTrust, [currentTrust])
+        const next = revalidateClientPolicyAuthorization(verified, JSON.stringify(nextTrust.pins), Date.now())
+        const previous = verified
+        verified = next; currentTrust = nextTrust; previous.free()
+        return currentTrust
+      },
+      withNative<T>(work: (authorization: secure.VerifiedClientAuthorization) => T): T { requireActive(); return work(verified) },
+      accountRecoveryPolicy() {
+        if (released) throw new Error('账户授权已释放，请重新连接。')
+        const recovery = record(JSON.parse(verified.accountRecoveryPolicyJson()))
+        return { threshold: counter(recovery.threshold), keys: strings(recovery.keys) }
+      },
       enrollmentMaterial() {
         if (released) throw new Error('账户授权已释放，请重新连接。')
-        return { pins, bundle: record(auth.authorization), expiresAt: policy.account_enrollment_expires_at_ms === null ? null : counter(policy.account_enrollment_expires_at_ms) }
+        return { pins: currentTrust.pins, grantLeaf, expiresAt: policy.account_enrollment_expires_at_ms === null ? null : counter(policy.account_enrollment_expires_at_ms) }
       },
       prepare(bodyJson: string, contextJson: string, action: string, operationId: string) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
@@ -123,10 +135,62 @@ export function verifyScopedAuthentication(value: unknown, own: PublicIdentity, 
         if (released) throw new Error('账户授权已释放，请重新连接。')
         return signAuthorizedClientInvocation(verified, templateJson, bodyJson, action, operationId, policy.audience_public_key === gatewayPublicKey ? undefined : gatewayPublicKey)
       },
-      directory(value: unknown) {
+      adoptRemote,
+      remote(value: TrustedRemoteExecution, policy: secure.VerifiedRemoteExecutionPolicy): ReturnType<typeof adoptRemote> {
+        requireActive()
+        const remote = parseTrustedRemoteExecution(value)
+        const currentPolicy = policy.revalidatePins(JSON.stringify(remote.trust.pins), Date.now())
+        try { return adoptRemote(verifyRemoteExecution(verified, currentPolicy, Date.now()), remote) }
+        finally { currentPolicy.free() }
+      },
+      projectExecutionMetadata(source: Record<string, unknown>, binding: Record<string, unknown>) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
-        const response = record(value)
-        return parseAccountDirectory(JSON.parse(verifyAccountDeviceDirectory(verified, JSON.stringify(record(response.authorization)), JSON.stringify(pins), JSON.stringify(array(response.devices)), Date.now())))
+        return record(JSON.parse(verifyProjectExecutionMetadata(verified, JSON.stringify(source), JSON.stringify(binding))))
+      },
+      remoteExecutionResultHistory(value: TrustedRemoteExecution, policy: secure.VerifiedRemoteExecutionHistoryPolicy, actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown>): RemoteExecutionObservation {
+        requireActive()
+        const remote = parseTrustedRemoteExecution(value)
+        const currentPolicy = policy.revalidatePins(JSON.stringify(remote.trust.pins), Date.now())
+        try {
+          const result = record(JSON.parse(verifyRemoteExecutionResultHistory(verified, currentPolicy, JSON.stringify(actual), JSON.stringify(original.body), JSON.stringify(original.invocation), JSON.stringify(binding), Date.now())))
+          return parseRemoteExecutionObservation(result.actual)
+        } finally { currentPolicy.free() }
+      },
+      remoteResolutionHistory(value: TrustedRemoteExecution, policy: secure.VerifiedRemoteExecutionHistoryPolicy, actual: Record<string, unknown>, original: AuthorizedRequest): RemoteExecutionResolutionResult {
+        requireActive()
+        const remote = parseTrustedRemoteExecution(value)
+        const currentPolicy = policy.revalidatePins(JSON.stringify(remote.trust.pins), Date.now())
+        try {
+          return parseRemoteExecutionResolutionResult(JSON.parse(verifyRemoteResolutionHistory(verified, currentPolicy, JSON.stringify(actual), JSON.stringify(original.body), JSON.stringify(original.invocation), Date.now())))
+        } finally { currentPolicy.free() }
+      },
+      directory(): AccountDeviceDirectory {
+        requireActive()
+        const accountHead = heads.find(head => head.domain.kind === 'account' && head.domain.id === scope.account_id)
+        if (!accountHead) throw new Error('已确认快照缺少账户政策头。')
+        const devices: AccountDeviceDirectory['devices'] = []
+        const cursors = new Set<string>()
+        let cursor: string | null = null
+        for (;;) {
+          const page = record(JSON.parse(verifyAccountDeviceDirectory(verified, JSON.stringify(cursor), Date.now())))
+          if (page.account !== scope.account_id || !same(stamp(page.head), accountHead)) throw new Error('设备目录切换了账户或已确认政策头。')
+          const entries = array(page.devices)
+          if (entries.length > 1) throw new Error('设备目录页面超过单条记录限制。')
+          for (const value of entries) {
+            const entry = record(value), certificate = record(record(entry.certificate).payload), owner = record(certificate.owner), subject = record(certificate.subject)
+            const publicKey = typedId(certificate.public_key, '')
+            if (certificate.version !== 2 || owner.kind !== 'account' || owner.id !== scope.account_id
+              || certificate.device !== deriveAuthorizationId('device', publicKey) || subject.kind !== 'account' && subject.kind !== 'service'
+              || entry.status !== 'active' && entry.status !== 'expired' && entry.status !== 'pending') throw new Error('设备目录记录的所属账户、设备或状态无效。')
+            devices.push({ device_id: certificate.device, public_key: publicKey,
+              subject: { kind: subject.kind, id: typedId(subject.id, subject.kind === 'account' ? 'acc2_' : 'svc2_') }, uses: strings(certificate.uses),
+              not_before_ms: counter(certificate.not_before_ms), expires_at_ms: counter(certificate.expires_at_ms), status: entry.status })
+          }
+          if (page.next_cursor === null) return { account_id: scope.account_id, devices }
+          const next = typedId(page.next_cursor, 'h2_')
+          if (!entries.length || cursors.has(next)) throw new Error('设备目录分页没有继续推进。')
+          cursors.add(next); cursor = next
+        }
       },
       release() { if (!released) { released = true; verified.free() } },
     }

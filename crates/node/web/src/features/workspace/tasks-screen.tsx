@@ -79,7 +79,7 @@ export function TasksScreen() {
                     </div>
                     {!workspace.canAutoFollowup ? <p className="text-sm text-muted-foreground">当前入口未启用接入角色，无法自动检查。</p> : null}
                   </Field>
-                  <SubmitButton busy={busy}>{pending ? "重试确认创建" : "创建工单"}</SubmitButton>
+                  <SubmitButton busy={busy} disabled={!workspace.writable}>{pending ? "重试确认创建" : "创建工单"}</SubmitButton>
                 </FieldGroup>
               </form>
             </CardContent>
@@ -145,7 +145,7 @@ function TaskCard({ task, conversationId }: { task: TaskRecord; conversationId: 
                   <FieldLabel htmlFor={`task-detail-${task.task_id}`}>说明</FieldLabel>
                   <Textarea id={`task-detail-${task.task_id}`} name="detail" rows={3} required defaultValue={task.detail || ""} />
                 </Field>
-                <SubmitButton busy={busy} variant="secondary">保存状态</SubmitButton>
+                <SubmitButton busy={busy} disabled={!workspace.writable} variant="secondary">保存状态</SubmitButton>
               </FieldGroup>
             </form>
           </CollapsibleContent>

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { approveClientEnrollmentIntent, clientVaultStatus, connectDevice, createClientEnrollmentOffer, exportDeviceVault, initClient, lockClient, prepareClientDeviceEnrollment, prepareClientDeviceRevocation, prepareClientFirstAuthenticatorIntent, prepareClientFirstAuthenticatorRegistration, prepareClientPasskeyDeviceEnrollment, prepareClientRecoveryContext, protectClientVaultWithPrf, readInvitation, signClientEnrollmentPossession, signClientPasskeyEnrollmentIntent, signClientPasskeyEnrollmentPossession } from '../../../transport.js'
+import { buildClientRemoteShareIntent, approveClientEnrollmentIntent, clientVaultStatus, connectDevice, createClientEnrollmentOffer, exportDeviceVault, initClient, lockClient, prepareClientDeviceEnrollment, prepareClientDeviceRevocation, prepareClientAccountNodeEnrollment, prepareClientFirstAuthenticatorIntent, prepareClientFirstAuthenticatorRegistration, prepareClientMembershipChange, prepareClientDirectionalGrant, prepareClientGrantRevocation, prepareClientTeamCreation, restoreClientTeamCreation, prepareClientPasskeyDeviceEnrollment, prepareClientRecoveryContext, prepareClientExecutionServiceRegistration, prepareClientRemoteExecutionShare, protectClientVaultWithPrf, readInvitation, signClientEnrollmentPossession, signClientPasskeyEnrollmentIntent, signClientPasskeyEnrollmentPossession } from '../../../transport.js'
 import type { ClientVaultOptions, DeviceChannel, VaultProfile } from '../../../transport.js'
 import {
   array, entryKey, integer, messageOf, parseEntry, parseInfo, parseConnectionCard, record, same, text,
@@ -8,24 +8,52 @@ import {
 import type { AuthorizedRequest, ConnectionCard, ConnectionEntry, EntryInfo, AccountDeviceDirectory, PublicIdentity, ReadyConnection, RpcFacts } from '@/lib/node'
 import { prepareRpc } from '@/lib/rpc-action'
 import { prepareContext, verifyPreparedBody } from '@/lib/rpc-prepare'
+import { validateRpcReplay } from '@/lib/rpc-replay'
 import type { AuthorizationSelection, AuthorizationTrust } from '@/lib/authorization'
 import { mergeAuthorizationTrust, parseAuthorizationSelection, parseAuthorizationTrust, subscriptionRenewalDelay, verifyScopedAuthentication } from '@/lib/authorization'
+import { readClientPolicyAuthorization } from '@/lib/client-policy'
+import { readRemoteSharePolicy } from '@/lib/source-share-policy'
+import { readRemoteExecutionPolicy } from '@/lib/remote-execution-policy'
+import { readRemoteExecutionHistoryPolicy } from '@/lib/remote-execution-history-policy'
+import { callExecutionResource as callPinnedExecutionResource } from '@/lib/execution-resource-call'
+import type { VerifiedClientAuthorization, VerifiedEnrollmentOffer } from '../../../generated/vibeface_secure.js'
 import { downloadPackage } from '@/lib/secure'
-import { createAccount, openAccountPackage, recoverAccount, sealAccountPackage } from '@/lib/account'
-import { finishAccountDeviceChange, finishFirstAuthenticatorRegistration, nodeFingerprint, verifyAccountEnrollment, verifyAccountEnrollmentFromOffer, verifyDeviceEnrollmentIntentForOffer, verifyDeviceEnrollmentOffer, verifyPasskeyEnrollmentRequestFromOffer } from '../../../generated/vibeface_secure.js'
+import { createAccount, openAccountPackage, recoverAccount, restoreAccountRecovery, sealAccountPackage } from '@/lib/account'
+import { finishAccountDeviceChange, finishFirstAuthenticatorRegistration, finishSpaceGovernanceChange, finishExecutionServiceRegistration, selectExecutionServiceManagement, revalidateClientPolicyAuthorization, finishRemoteExecutionShare, verifyExecutionServiceSelection, finishTeamCreation, Identity, recoveryOpen, recoverySeal, deriveAuthorizationId, nodeFingerprint, verifySignedEvent, verifyAccountEnrollment, verifyAccountEnrollmentFromOffer, verifyDeviceEnrollmentIntentForManager, verifyDeviceEnrollmentOffer, verifyPasskeyEnrollmentRequestFromOffer } from '../../../generated/vibeface_secure.js'
 import { enrollmentHref, parseEnrollmentReference } from '@/lib/enrollment-reference'
 import type { EnrollmentReference } from '@/lib/enrollment-reference'
 import { parseEnrollmentRequest, requestDeviceEnrollment, verifyEnrollmentStatus } from '@/lib/enrollment'
 import type { EnrollmentRequest, EnrollmentStatus } from '@/lib/enrollment'
 import { assertNodePasskey } from '@/lib/node-passkey'
 import { registerNodePasskey } from '@/lib/node-passkey-registration'
+import { prepareNodeEnrollment } from '@/lib/node-enrollment'
+import { prepareCrossNodeRecovery, restoreCrossNodeRecovery } from '@/lib/account-cross-node'
+import type { CrossNodeRecoveryResult, CrossNodeRecoveryReview } from '@/lib/account-cross-node'
+import type { TeamControlsProps } from './team-controls'
+import { parseRemoteExecutionShare, parseRemoteExecutionShareInput, parseRemoteExecutionSourceTrust, remoteExecutionProposal } from '@/lib/remote-execution'
+import type { RemoteExecutionRequestSummary } from '@/lib/remote-execution'
 
 type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'no_project' | 'ready'
-type Review = { kind: 'bootstrap' | 'recovery'; accountId: string; spaceId: string; serviceGrant: { projectId: string; actions: string[] }; targetChanged: boolean }
-type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (saved: boolean) => Promise<void>; refreshEnrollment?: () => Promise<void>; passkeyEnrollment?: (protectLocal: boolean) => Promise<void>; retryPasskeyRegistration?: () => Promise<void> }
+type Review = { kind: 'bootstrap' | 'recovery'; accountId: string; spaceId: string; serviceGrant: { projectId: string; actions: string[] }; targetChanged: boolean; sourceRead?: CrossNodeRecoveryReview['sourceRead']; recoveryStage?: 'prepared' | 'submitted' | 'committed' | 'installed' }
+type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (saved: boolean) => Promise<void>; refreshEnrollment?: () => Promise<void>; passkeyEnrollment?: (protectLocal: boolean) => Promise<void>; retryPasskeyRegistration?: () => Promise<void>; nodeEnrollment?: () => Promise<void>; governance?: () => Promise<void>; teamCreation?: (saved: boolean) => Promise<void>; keepOnNetworkClose?: () => boolean; retainForReconnect?: (entry: ConnectionEntry) => boolean; crossPrepare?: () => Promise<void> }
+type RecoveryReadProject = { accountId: string; spaceId: string; projectId: string; entry: ConnectionEntry; nodePublicKey: string; expiresAt: number }
+type RecoveryInput = { file: File; password: string; connectionCard: string; targetConnectionCard?: string; sourceReadProjectIds?: string[]; sourceReadExpiresAt?: number }
 type IncomingEnrollment = { accountId: string; newDevicePublicKey: string; requestedRights: string[]; status: EnrollmentStatus }
 type ManagerEnrollment = { offer: string; reference: EnrollmentReference; material: ReturnType<ReturnType<typeof verifyScopedAuthentication>['enrollmentMaterial']> }
 type Session = { renewal?: number; authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
+type GovernanceConfirmation = { trust: AuthorizationTrust; authorized: boolean; grantLeaf?: string }
+type GovernanceProtocol = {
+  method: string
+  params: Record<string, unknown>
+  verify(committed: Record<string, unknown>): GovernanceConfirmation
+  afterSaved(confirmed: GovernanceConfirmation, active: Session, signal: AbortSignal): void | Promise<void>
+  dispose(): void
+}
+type ExecutionServiceContext = {
+  spaceId: string; sourceSpaceId: string; sourceProjectId: string; nodePublicKey: string; resourceId: string
+  trust: AuthorizationTrust; authorization: VerifiedClientAuthorization; grantLeaf: string; own: PublicIdentity
+}
+type ExecutionServiceBackup = { bytes: Uint8Array; accountId: string; own: PublicIdentity }
 function releaseSession(active: Session | null) {
   if (active?.renewal !== undefined) window.clearTimeout(active.renewal)
   active?.authorization?.release()
@@ -41,8 +69,20 @@ type DeviceContextValue = {
   refreshIncomingEnrollment(): Promise<void>; refreshEnrollmentRequests(): Promise<EnrollmentRequest[]>; approveEnrollmentRequest(requestId: string): Promise<void>; completeEnrollmentRequest(requestId: string): Promise<void>; revokeDevice(deviceId: string): Promise<void>
   joinWithPasskey(protectLocal: boolean): Promise<void>
   localProtectionNotice: string
+  restoreTeamCreation(input: { file: File; password: string }): Promise<void>
+  createTeam: TeamControlsProps['createTeam']; changeMembership: TeamControlsProps['changeMembership']; grantProject: TeamControlsProps['grant']; revokeProjectGrant: TeamControlsProps['revokeGrant']
+  governancePending: string; retryGovernance(): Promise<void>
+  registerExecutionService: TeamControlsProps['registerExecutionService']; latestExecutionServiceResource: string
+  createRemoteExecutionShare: TeamControlsProps['createRemoteExecutionShare']; latestRemoteExecutionShare: string
+  inspectRemoteExecutionRequest: TeamControlsProps['inspectRemoteExecutionRequest']
+  downloadExecutionServiceBackup(): void; executionServiceBackupAvailable: boolean
+  executionServiceOptions: TeamControlsProps['executionServiceOptions']; refreshExecutionServices(): Promise<void>; selectExecutionService(resourceId: string): Promise<void>
+  teamCreationReview: { accountId: string; teamId: string; sourceProjectId: string; nodePublicKey: string; submitted: boolean; committed: boolean } | null; confirmTeamCreation(saved: boolean): Promise<void>
+  nodeEnrollmentReview: { accountId: string; nodePublicKey: string; address: string; submitted: boolean } | null
+  beginNodeEnrollment(input: { file: File; password: string; connectionCard: string; certificateExpiresAt: number }): Promise<void>; confirmNodeEnrollment(): Promise<void>
   firstPasskeyPending: boolean; registerAccountPasskey(input: { file: File; password: string; protectLocal: boolean }): Promise<void>; resumePasskeyRegistration(): Promise<void>
-  beginRecovery(input: { file: File; password: string; connectionCard: string }): Promise<void>
+  crossRecoveryPending: boolean; recoveryReadProjects: RecoveryReadProject[]; resumeCrossRecoveryPreparation(): Promise<void>; restorePendingCrossRecovery(input: { file: File; password: string }): Promise<void>
+  beginRecovery(input: RecoveryInput): Promise<void>; restorePendingAccountRecovery(input: { file: File; password: string }): Promise<void>
   reencrypt(input: { file: File; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): void; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(saved: boolean): Promise<void>; cancelSensitive(): void
 }
@@ -55,7 +95,33 @@ function savedEntries(profile: string, read: (key: string) => unknown): Connecti
   if (!Array.isArray(value)) return []
   return value.flatMap(item => { try { return [parseEntry(item)] } catch { return [] } })
 }
+function readRecoveryReadProjects(value: unknown): RecoveryReadProject[] {
+  return array(value ?? []).map(value => {
+    const input = record(value), accountId = text(input.accountId), spaceId = text(input.spaceId), projectId = text(input.projectId)
+    const entry = parseEntry(input.entry), nodePublicKey = text(input.nodePublicKey), expiresAt = integer(input.expiresAt)
+    if (!/^acc2_[a-f0-9]{64}$/.test(accountId) || !/^spc2_[a-f0-9]{64}$/.test(spaceId) || !/^res2_[a-f0-9]{64}$/.test(projectId)
+      || nodeFingerprint(nodePublicKey) !== entry.node_id) throw new Error('已保存的原项目只读入口无效，请保留数据并核对。')
+    return { accountId, spaceId, projectId, entry, nodePublicKey, expiresAt }
+  })
+}
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
+
+function executionManagement(authorization: VerifiedClientAuthorization, sourceProject: { space: string; resource: string }, targetPublicKey: string) {
+  let cursor: string | null = null
+  for (;;) {
+    const page = selectExecutionServiceManagement(authorization, JSON.stringify(sourceProject), targetPublicKey, JSON.stringify(cursor), Date.now())
+    try {
+      const metadata = record(JSON.parse(page.metadataJson()))
+      if (!same(metadata.source_project, sourceProject) || metadata.target_node_public_key !== targetPublicKey) throw new Error('执行资源管理选择改变了源项目或目标 Node。')
+      const selection = page.selection()
+      if (selection) return { selection, grant: text(metadata.management_grant) }
+      if (metadata.next_cursor === null) throw new Error('当前项目没有可用于登记执行资源的管理授权。')
+      const next = text(metadata.next_cursor)
+      if (!/^h2_[a-f0-9]{64}$/.test(next) || cursor !== null && next <= cursor) throw new Error('执行资源管理选择分页无效。')
+      cursor = next
+    } finally { page.free() }
+  }
+}
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
@@ -75,10 +141,21 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [managerEnrollmentActive, setManagerEnrollmentActive] = useState(false)
   const [localProtectionNotice, setLocalProtectionNotice] = useState('')
   const [firstPasskeyPending, setFirstPasskeyPending] = useState(false)
+  const [governancePending, setGovernancePending] = useState('')
+  const executionAuthorizations = useRef(new Set<VerifiedClientAuthorization>())
+  const [executionServiceResource, setExecutionServiceResource] = useState<ExecutionServiceContext | null>(null)
+  const [executionServiceResources, setExecutionServiceResources] = useState<ExecutionServiceContext[]>([])
+  const [executionServiceBackups, setExecutionServiceBackups] = useState(new Map<string, ExecutionServiceBackup>())
+  const [remoteExecutionShare, setRemoteExecutionShare] = useState<{ value: string; execution: ExecutionServiceContext } | null>(null)
+  const [crossRecoveryPending, setCrossRecoveryPending] = useState(false)
+  const [recoveryReadProjects, setRecoveryReadProjects] = useState<RecoveryReadProject[]>([])
+  const [teamCreationReview, setTeamCreationReview] = useState<DeviceContextValue['teamCreationReview']>(null)
+  const [nodeEnrollmentReview, setNodeEnrollmentReview] = useState<DeviceContextValue['nodeEnrollmentReview']>(null)
   const managerEnrollment = useRef<ManagerEnrollment | null>(null)
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
   const connecting = useRef<AbortController | null>(null)
+  const independentReads = useRef(new Set<AbortController>())
   const sensitive = useRef<Sensitive | null>(null)
   const listeners = useRef(new Set<() => void>())
   const identityRef = useRef<PublicIdentity | null>(null)
@@ -98,18 +175,23 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const profileKey = (key: string) => `profile.${storageProfile()}.${key}`
   const savedSpaces = () => array(load(profileKey('policy-trusts'), true) ?? []).map(parseAuthorizationTrust)
 
-  const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null); setIncomingEnrollment(null); setFirstPasskeyPending(false) }, [])
-  const disconnect = useCallback(() => {
+  const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null); setIncomingEnrollment(null); setFirstPasskeyPending(false); setNodeEnrollmentReview(null); setGovernancePending(''); setTeamCreationReview(null); setCrossRecoveryPending(false) }, [])
+  const closeConnection = useCallback((preserveSensitive: boolean) => {
     generation.current += 1
-    cancelSensitive()
+    if (!preserveSensitive) cancelSensitive()
     connecting.current?.abort(); connecting.current = null
+    for (const controller of independentReads.current) controller.abort()
+    independentReads.current.clear()
     const previous = session.current; session.current = null
     releaseSession(previous); previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setInfo(null); setEntry(null)
     managerEnrollment.current = null; setEnrollmentRequests([]); setManagerEnrollmentActive(false)
+    for (const authorization of executionAuthorizations.current) authorization.free()
+    executionAuthorizations.current.clear(); setExecutionServiceResource(null); setExecutionServiceResources([]); setRemoteExecutionShare(null)
     setLocalProtectionNotice('')
     setPhase('disconnected'); setError('')
   }, [cancelSensitive])
+  const disconnect = useCallback(() => closeConnection(false), [closeConnection])
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
     const parsed = parseEntry(candidate)
     const next = [...savedEntries(storageProfile(), load).filter(item => entryKey(item) !== entryKey(parsed)), parsed]
@@ -127,22 +209,55 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return result
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
-  async function persistPolicyTrust(active: Session, trust: AuthorizationTrust, signal?: AbortSignal) {
-    const own = identityRef.current
+  function resumableAuthority(active: Session, own: PublicIdentity, available: () => boolean, extraSpaces: string[] = []) {
+    const sourceNode = active.entry.node_id, sourceKey = active.channel.publicKey, scope = active.authorization?.scope
+    const originalProfile = () => identityRef.current?.publicKey === own.publicKey && identityRef.current.profileId === own.profileId
+    return {
+      keepOnNetworkClose: available,
+      retainForReconnect: (entry: ConnectionEntry) => available() && originalProfile() && entry.node_id === sourceNode,
+      resume() {
+        const resumed = current(), candidate = resumed.authorization?.scope
+        if (!originalProfile() || resumed.entry.node_id !== sourceNode || resumed.channel.publicKey !== sourceKey
+          || !scope || candidate?.account_id !== scope.account_id || candidate.space_id !== scope.space_id && !extraSpaces.includes(candidate.space_id)) {
+          throw new Error('请用原设备配置重新连接原授权 Node 和空间，再核对原请求。')
+        }
+        return resumed
+      },
+    }
+  }
+  async function persistPolicyTrust(active: Session | null, trust: AuthorizationTrust, signal?: AbortSignal, own = identityRef.current) {
     if (!own) throw changed()
     const profile = storageProfile(own), key = `profile.${profile}.policy-trusts`, temporary = own.profileId === null
     if (!('locks' in navigator)) throw new Error('需要 Web Locks 才能保存已提交的账户政策。请保留当前页面并核对设备权限。')
-    await navigator.locks.request(`profile.${profile}.policy-trust-writer`, () => {
+    const updated = await navigator.locks.request(`profile.${profile}.policy-trust-writer`, () => {
       signal?.throwIfAborted()
-      if (temporary && session.current !== active) throw changed()
+      if (temporary && (active ? session.current !== active : identityRef.current !== own)) throw changed()
       const known = array((temporary ? temporaryRecords.current.get(key) : readPersistent(key, true)) ?? []).map(parseAuthorizationTrust)
-      const updated = mergeAuthorizationTrust(trust, known)
+      const updated = mergedRemotePolicyTrust(mergeAuthorizationTrust(trust, known), own)
       const next = [...known.filter(item => item.spaceId !== updated.spaceId).map(item => mergeAuthorizationTrust(item, [updated])), updated]
       if (temporary) temporaryRecords.current.set(key, JSON.parse(JSON.stringify(next)))
       else writePersistent(key, next)
-      if (session.current === active) setSpaces(next)
+      if (identityRef.current === own && (active === null || session.current === active)) setSpaces(next)
+      return updated
     })
-    if (session.current !== active || signal?.aborted) throw changed()
+    if (identityRef.current !== own || active !== null && session.current !== active || signal?.aborted) throw changed()
+    return updated
+  }
+  async function withPolicyTrust<T,>(own: PublicIdentity, work: () => T): Promise<T> {
+    if (!('locks' in navigator)) throw new Error('此浏览器需要 Web Locks 才能使用已保存的账户政策。')
+    return navigator.locks.request(`profile.${storageProfile(own)}.policy-trust-writer`, () => {
+      if (identityRef.current !== own) throw changed()
+      return work()
+    })
+  }
+  function withSessionAuthorization<T>(active: Session, own: PublicIdentity, work: (authorization: VerifiedClientAuthorization) => T, signal?: AbortSignal): Promise<T> {
+    return withPolicyTrust(own, () => {
+      signal?.throwIfAborted()
+      const authorization = active.authorization
+      if (session.current !== active || identityRef.current !== own || !authorization) throw changed()
+      authorization.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(authorization.trust, savedSpaces()), own))
+      return authorization.withNative(work)
+    })
   }
   async function saveLocalPasskeyProtection(result: { credentialId: string; localPrf: Uint8Array | null; prfSalt: Uint8Array | null } | null, signal: AbortSignal) {
     signal.throwIfAborted()
@@ -158,36 +273,63 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
   }
   const targetKey = (spaceId: string, entry: ConnectionEntry) => profileKey(`target.${JSON.stringify([spaceId, entryKey(entry)])}`)
-  async function authenticate(authValue: unknown, active = current(), expected: AuthorizationTrust | null = null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal) {
-    signal?.throwIfAborted()
+  function ownerProjectSelection(bundle: unknown, projectId: string, nodePublicKey: string) {
+    const grantLeaf = text(record(bundle).grant_leaf)
+    return { ...parseAuthorizationSelection({ resourceId: projectId, audience: { device: deriveAuthorizationId('device', nodePublicKey), service: deriveAuthorizationId('service', nodePublicKey) }, grantLeaf }), ownerGrantLeaf: grantLeaf }
+  }
+  async function readAuthentication(active: Session, trust: AuthorizationTrust, selection?: AuthorizationSelection, signal?: AbortSignal, projectId = selection?.resourceId) {
+    const own = identityRef.current
+    if (!own) throw changed()
+    const currentTrust = mergedRemotePolicyTrust(mergeAuthorizationTrust(trust, savedSpaces()), own)
+    return readClientPolicyAuthorization({ call: (method, params) => callSession(active, 'identity', { method, params }), trust: currentTrust,
+      gatewayPublicKey: active.channel.publicKey, selection, resourceId: projectId, signal,
+      check() { if (session.current !== active || identityRef.current !== own) throw changed() } })
+  }
+  async function authenticate(authValue: VerifiedClientAuthorization, active: Session, expected: AuthorizationTrust | null = null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal) {
     const cancel = () => { if (session.current === active) active.channel.close() }
     signal?.addEventListener('abort', cancel, { once: true })
     try { await authenticateSession(authValue, active, expected, projectId, selection, signal) }
     finally { signal?.removeEventListener('abort', cancel) }
   }
-  async function authenticateSession(authValue: unknown, active: Session, expected: AuthorizationTrust | null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal) {
-    signal?.throwIfAborted()
+  async function authenticateSession(authValue: VerifiedClientAuthorization, active: Session, expected: AuthorizationTrust | null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal) {
     const request = scoped(active)
     const own = identityRef.current
-    if (!own) throw new Error('浏览器密钥尚未初始化。')
-    if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能安全保存账户政策。请更换安全浏览器入口。')
-    const authorization = await navigator.locks.request(profileKey('policy-trust-writer'), () => {
-      signal?.throwIfAborted()
-      if (session.current !== active) throw changed()
-      const known = savedSpaces()
-      const selectedSpace = load(profileKey('last-space'))
-      const candidate = expected ?? known.find(trust => trust.spaceId === selectedSpace) ?? known[0]
-      const trust = mergeAuthorizationTrust(parseAuthorizationTrust(candidate), known)
-      const verified = verifyScopedAuthentication(authValue, own, trust, active.channel.publicKey, selection)
+    if (!own) { authValue.free(); throw new Error('浏览器密钥尚未初始化。') }
+    const signingProfile: PublicIdentity = own
+    const ownPublicKey = own.publicKey
+    const authorization = await (async () => {
+      let incoming: VerifiedClientAuthorization | null = authValue
+      let verified: ReturnType<typeof verifyScopedAuthentication> | null = null
       try {
-        const others = known.filter(trust => trust.spaceId !== verified.trust.spaceId)
-        const next = [...others.map(trust => mergeAuthorizationTrust(trust, [verified.trust])), verified.trust]
-        store(profileKey('policy-trusts'), next)
-        store(profileKey('last-space'), verified.scope.space_id)
-        setSpaces(next)
-      } catch (error) { verified.release(); throw error }
-      return verified
-    })
+        signal?.throwIfAborted()
+        if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能安全保存账户政策。请更换安全浏览器入口。')
+        const check = () => { signal?.throwIfAborted(); if (session.current !== active || identityRef.current !== own) throw changed() }
+        const latestTrust = () => {
+          const known = savedSpaces(), selectedSpace = load(profileKey('last-space'))
+          const candidate = expected ?? known.find(trust => trust.spaceId === selectedSpace) ?? known[0]
+          return mergedRemotePolicyTrust(mergeAuthorizationTrust(parseAuthorizationTrust(candidate), known), own)
+        }
+        verified = await withPolicyTrust(own, () => {
+          check()
+          const trust = latestTrust(), adopted = incoming
+          if (!adopted) throw changed()
+          incoming = null
+          return verifyScopedAuthentication(adopted, own, trust, active.channel.publicKey, selection)
+        })
+        const response = record(await request('authenticate', verified.clientPolicyContext()))
+        check()
+        if (!same(response.scope, verified.scope) || !same(response.policy, verified.policy) || !same(response.resources, verified.policy.resources)) throw new Error('Node 的会话范围与本地已确认的有限授权不同。')
+        const confirmed = verified
+        await withPolicyTrust(own, () => {
+          check(); confirmed.revalidate(latestTrust())
+          const known = savedSpaces(), others = known.filter(trust => trust.spaceId !== confirmed.trust.spaceId)
+          const next = [...others.map(trust => mergeAuthorizationTrust(trust, [confirmed.trust])), confirmed.trust]
+          store(profileKey('policy-trusts'), next); store(profileKey('last-space'), confirmed.scope.space_id); setSpaces(next)
+        })
+        verified = null
+        return confirmed
+      } finally { incoming?.free(); verified?.release() }
+    })()
     if (session.current !== active || signal?.aborted) { authorization.release(); throw changed() }
     releaseSession(active); active.authorization = authorization
     saveEntry(active.entry)
@@ -201,59 +343,275 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       return
     }
     store(projectKey, project.id)
-    store(targetKey(authorization.scope.space_id, active.entry), { resourceId: project.id, audience: authorization.audience })
+    const target = targetKey(authorization.scope.space_id, active.entry), previousTarget = load(target)
+    const ownerGrantLeaf = previousTarget ? record(previousTarget).ownerGrantLeaf : undefined
+    store(target, { resourceId: project.id, audience: authorization.audience, grantLeaf: authorization.grantLeaf, ...(ownerGrantLeaf === undefined ? {} : { ownerGrantLeaf }) })
     const selectedProjectId = project.id
-    async function signedCall(method: string, params: Record<string, unknown> = {}, channelMethod = 'rpc', beforeSend?: (proof: AuthorizedRequest) => void, facts?: RpcFacts) {
-      if (session.current !== active) throw changed()
+    function currentProjectTrust() {
+      return authorization.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(authorization.trust, savedSpaces()), signingProfile))
+    }
+    async function verifyRemotePolicy(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], context: Record<string, unknown>, action: string, purpose?: 'execution' | 'observation_read' | 'resolver') {
+      const controller = new AbortController(); independentReads.current.add(controller)
+      const check = () => { controller.signal.throwIfAborted(); if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
+      let bChannel: DeviceChannel | null = null, cChannel: DeviceChannel | null = null
+      let policy: Awaited<ReturnType<typeof readRemoteExecutionPolicy>> | null = null
+      try {
+        check()
+        const proposed = remoteExecutionProposal(value)
+        if (proposed.purpose === 'rebind') throw new Error('原 C 封存使用独立 Account Rebind 授权。')
+        const remote = { ...value, trust: mergedRemotePolicyTrust(value.trust, signingProfile) }, sourceNodePublicKey = text(authorization.policy.audience_public_key)
+        bChannel = active.channel.publicKey === sourceNodePublicKey ? active.channel : await connectDevice({ address: active.entry.address, node_id: nodeFingerprint(sourceNodePublicKey), relay: true }, { signal: controller.signal })
+        check()
+        const target = remote.share.selection.target_public_key, stored = savedEntries(storageProfile(signingProfile), load).find(entry => entry.node_id === nodeFingerprint(target))
+        cChannel = await connectDevice(stored ?? { address: active.entry.address, node_id: nodeFingerprint(target), relay: true }, { signal: controller.signal })
+        check()
+        const invocation = record(context.context), executionSession = invocation.execution_session === null ? null : record(invocation.execution_session)
+        if (invocation.sdk_session !== null) throw new Error('远端任务申请不能带 SDK 私有会话。')
+        const preparedContext = { context: { conversation: invocation.conversation === null ? null : text(invocation.conversation), task: invocation.task === null ? null : text(invocation.task), sdk_session: null,
+          execution_session: executionSession === null ? null : { target: text(executionSession.target), session_id: text(executionSession.session_id) }, executor_kind: invocation.executor_kind === null ? null : text(invocation.executor_kind), workspace_resource: text(invocation.workspace_resource) }, binding_generation: context.binding_generation === null ? null : integer(context.binding_generation),
+          canonical_cwd: context.canonical_cwd === null ? null : text(context.canonical_cwd), execution_target_public_key: target }
+        policy = await readRemoteExecutionPolicy({ bChannel, cChannel, sourceNodePublicKey, executionNodePublicKey: target,
+          withSource: work => withSessionAuthorization(active, signingProfile, work, controller.signal), selection: remote.share.selection, context: preparedContext,
+          action, purpose: purpose ?? (proposed.purpose === 'resolution' ? 'resolver' : 'execution'), executionTrust: remote.trust,
+          latestExecutionTrust: () => mergedRemotePolicyTrust(remote.trust, signingProfile), check, signal: controller.signal })
+        const completed = policy
+        return await withSessionAuthorization(active, signingProfile, () => {
+          check()
+          return authorization.remote({ ...remote, trust: mergedRemotePolicyTrust(remote.trust, signingProfile) }, completed)
+        }, controller.signal)
+      } finally { policy?.free(); if (bChannel !== active.channel) bChannel?.close(); cChannel?.close(); independentReads.current.delete(controller) }
+    }
+    async function verifyRemoteHistory<T>(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown> | undefined,
+      verify: (remote: typeof value, policy: Awaited<ReturnType<typeof readRemoteExecutionHistoryPolicy>>) => T): Promise<T> {
+      const controller = new AbortController(); independentReads.current.add(controller)
+      const check = () => { controller.signal.throwIfAborted(); if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
+      const latestPins = () => {
+        check()
+        const source = mergedRemotePolicyTrust(mergeAuthorizationTrust(authorization.trust, savedSpaces()), signingProfile)
+        const execution = mergedRemotePolicyTrust(value.trust, signingProfile, true)
+        const pins = new Map<string, AuthorizationTrust['pins'][number]>()
+        for (const pin of [...source.pins, ...execution.pins]) {
+          const key = `${pin.domain.kind}:${pin.domain.id}`, previous = pins.get(key)
+          if (previous && (previous.genesis_root !== pin.genesis_root || previous.minimum_head && pin.minimum_head && !same(previous.minimum_head, pin.minimum_head))) throw new Error('来源与执行端的已保存政策水位不同，请先同步并核对完整签名历史。')
+          pins.set(key, { ...pin, minimum_head: pin.minimum_head ?? previous?.minimum_head ?? null })
+        }
+        return [...pins.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([, pin]) => pin)
+      }
+      let bChannel: DeviceChannel | null = null, cChannel: DeviceChannel | null = null
+      let policy: Awaited<ReturnType<typeof readRemoteExecutionHistoryPolicy>> | null = null
+      try {
+        check(); remoteExecutionProposal(value)
+        const pins = latestPins(), sourceNodePublicKey = text(authorization.policy.audience_public_key), target = value.share.selection.target_public_key
+        bChannel = active.channel.publicKey === sourceNodePublicKey ? active.channel : await connectDevice({ address: active.entry.address, node_id: nodeFingerprint(sourceNodePublicKey), relay: true }, { signal: controller.signal })
+        check()
+        const stored = savedEntries(storageProfile(signingProfile), load).find(entry => entry.node_id === nodeFingerprint(target))
+        cChannel = await connectDevice(stored ?? { address: active.entry.address, node_id: nodeFingerprint(target), relay: true }, { signal: controller.signal })
+        check()
+        policy = await readRemoteExecutionHistoryPolicy({ bChannel, cChannel, sourceNodePublicKey, executionNodePublicKey: target, actual, original, binding,
+          withSource: work => withSessionAuthorization(active, signingProfile, work, controller.signal), independentPins: pins, latestIndependentPins: latestPins, check, signal: controller.signal })
+        const completed = policy
+        return await withSessionAuthorization(active, signingProfile, () => {
+          check()
+          return verify({ ...value, trust: { ...mergedRemotePolicyTrust(value.trust, signingProfile, true), pins: latestPins() } }, completed)
+        }, controller.signal)
+      } finally { policy?.free(); if (bChannel !== active.channel) bChannel?.close(); cChannel?.close(); independentReads.current.delete(controller) }
+    }
+    async function signedCall(method: string, params: Record<string, unknown> = {}, channelMethod = 'rpc', beforeSend?: (proof: AuthorizedRequest) => void, facts?: RpcFacts, replay?: AuthorizedRequest) {
+      const check = () => { if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
+      check()
       if (params.resource_id !== undefined && params.resource_id !== selectedProjectId) throw new Error('请求属于其他项目，已拒绝签名。')
       params = { ...params, resource_id: selectedProjectId }
       if (['notifications', 'ack'].includes(method)) {
         if (params.client_id !== undefined && params.client_id !== authorization.scope.device_id) throw new Error('通知请求属于其他设备，已拒绝签名。')
         params = { ...params, client_id: authorization.scope.device_id }
       }
-      const prepared = prepareRpc({ method, params, spaceId: authorization.scope.space_id, authorizationId: crypto.randomUUID() })
+      const prepared = prepareRpc({ method, params, spaceId: authorization.scope.space_id, authorizationId: facts?.authorizationId ?? crypto.randomUUID() })
+      if (!authorization.actions.includes(prepared.action)) throw new Error('当前入口未授权此操作，请核对项目权限。')
       const body = record(JSON.parse(JSON.stringify(prepared.body)))
-      const rawContext = prepareContext(body, authorization.audience.device, selectedProjectId, facts)
-      const intent = record(JSON.parse(authorization.prepare(JSON.stringify(body), JSON.stringify(rawContext), prepared.action, prepared.authorizationId)))
-      const template = record(await request('prepare_invocation', { body, intent }))
-      const normalized = record(template.body)
-      verifyPreparedBody(body, normalized, facts)
-      const invocationTemplate = record(template.invocation)
-      if (!same(invocationTemplate.context, rawContext.context)) throw new Error('节点准备的执行范围与本地已验证的工单或会话不同。')
-      const invocation = record(JSON.parse(authorization.sign(JSON.stringify(invocationTemplate), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
-      beforeSend?.({ body: normalized, invocation })
-      const result = await callSession(active, channelMethod, normalized, invocation)
-      if (channelMethod === 'subscribe') {
-        const expiresAt = integer(record(invocation.payload).expires_at_ms)
-        const delay = subscriptionRenewalDelay(expiresAt, Date.now())
-        if (active.renewal !== undefined) window.clearTimeout(active.renewal)
-        active.renewal = window.setTimeout(() => {
-          if (session.current !== active) return
-          void signedCall('conversations', {}, 'subscribe').catch(error => {
-            if (session.current !== active) return
-            active.channel.close(); setError(messageOf(error))
+      const projectMetadata = facts?.projectExecutionMetadata ? authorization.projectExecutionMetadata(facts.projectExecutionMetadata.source, facts.projectExecutionMetadata.binding) : undefined
+      const rawContext = prepareContext(body, authorization.audience.device, selectedProjectId, facts, projectMetadata, text(authorization.policy.audience_public_key))
+      const openRemote = () => facts?.remote ? verifyRemotePolicy({ ...facts.remote.authorization, trust: mergedRemotePolicyTrust(facts.remote.authorization.trust, signingProfile, true) }, rawContext, prepared.action) : Promise.resolve(null)
+      let remote: ReturnType<typeof authorization.remote> | null = null
+      const releaseRemote = () => { remote?.release(); remote = null }
+      try {
+        if (replay) {
+          if (channelMethod !== 'rpc') throw new Error('原签名仅能用于显式核对原业务请求。')
+          remote = await openRemote()
+          const proof = await withPolicyTrust(signingProfile, () => {
+            check(); currentProjectTrust()
+            return validateRpcReplay({ proof: replay, body, facts, scope: authorization.scope, projectId: selectedProjectId, audience: authorization.audience,
+              ownPublicKey, gatewayPublicKey: active.channel.publicKey, audiencePublicKey: text(authorization.policy.audience_public_key), action: prepared.action, operationId: prepared.authorizationId, remoteReplay: remote?.validateReplay, projectMetadata })
           })
-        }, delay)
-      }
-      return { result, body: normalized, invocation }
+          check()
+          beforeSend?.(proof)
+          const result = await callSession(active, 'rpc', proof.body, proof.invocation)
+          check()
+          return { ...proof, result }
+        }
+        remote = await openRemote()
+        const intent = await withPolicyTrust(signingProfile, () => {
+          check(); currentProjectTrust()
+          return record(JSON.parse((remote ?? authorization).prepare(JSON.stringify(body), JSON.stringify(rawContext), prepared.action, prepared.authorizationId)))
+        })
+        check()
+        const template = record(await request('prepare_invocation', { body, intent }))
+        check()
+        const normalized = record(template.body)
+        verifyPreparedBody(body, normalized, facts)
+        const invocationTemplate = record(template.invocation)
+        if (!same(invocationTemplate.context, rawContext.context)) throw new Error('节点准备的执行范围与本地已验证的工单或会话不同。')
+        releaseRemote(); remote = await openRemote()
+        const invocation = await withPolicyTrust(signingProfile, () => {
+          check(); currentProjectTrust()
+          return record(JSON.parse((remote ?? authorization).sign(JSON.stringify(invocationTemplate), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
+        })
+        check()
+        beforeSend?.({ body: normalized, invocation })
+        const result = await callSession(active, channelMethod, normalized, invocation)
+        check()
+        if (channelMethod === 'subscribe') {
+          const expiresAt = integer(record(invocation.payload).expires_at_ms)
+          const delay = subscriptionRenewalDelay(expiresAt, Date.now())
+          if (active.renewal !== undefined) window.clearTimeout(active.renewal)
+          active.renewal = window.setTimeout(() => {
+            if (session.current !== active || active.authorization !== authorization) return
+            void signedCall('conversations', {}, 'subscribe').catch(error => {
+              if (session.current !== active || active.authorization !== authorization) return
+              active.channel.close(); setError(messageOf(error))
+            })
+          }, delay)
+        }
+        return { result, body: normalized, invocation }
+      } finally { releaseRemote() }
     }
-    try { await signedCall('conversations', {}, 'subscribe') }
+    try {
+      await signedCall('conversations', {}, 'subscribe')
+      if (session.current !== active || active.authorization !== authorization) throw changed()
+    }
     catch (error) { authorization.release(); if (active.authorization === authorization) active.authorization = undefined; throw error }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, scope: authorization.scope, audience: authorization.audience, info: active.info,
       project, projects: authorization.projects, audiencePublicKey: text(authorization.policy.audience_public_key),
-      authorization: { enrollmentRights: authorization.enrollmentRights, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch },
-      request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
+      authorization: { enrollmentRights: authorization.enrollmentRights, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch, spaceGenesis: authorization.spaceGenesis, isTeam: authorization.isTeam },
+      request: (method, params) => { if (session.current !== active || active.authorization !== authorization) return Promise.reject(changed()); return request(method, params) },
       rpc: (method, params, facts) => signedCall(method, params, 'rpc', undefined, facts).then(reply => reply.result),
-      rpcWithProof: (method, params, beforeSend, facts) => signedCall(method, params, 'rpc', beforeSend, facts),
-      subscribe(listener) { if (session.current !== active) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
-      isCurrent: () => session.current === active && generation.current === active.generation,
+      rpcWithProof: (method, params, beforeSend, facts, replay) => signedCall(method, params, 'rpc', beforeSend, facts, replay),
+      remote: (value, rawContext, action) => verifyRemotePolicy(value, rawContext, action),
+      currentRemoteExecutionTrust(trust) {
+        if (session.current !== active || active.authorization !== authorization || identityRef.current !== own) throw changed()
+        return mergedRemotePolicyTrust(trust, own, true)
+      },
+      async persistRemoteExecutionTrust(trust) {
+        if (session.current !== active || active.authorization !== authorization || identityRef.current !== own) throw changed()
+        const updated = await persistRemotePolicyTrust(trust, own)
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        return updated
+      },
+      projectExecutionMetadata: (source, binding) => { if (session.current !== active || active.authorization !== authorization) throw changed(); return authorization.projectExecutionMetadata(source, binding) },
+      async remoteExecutionResultHistory(value, actual, original, binding) {
+        return verifyRemoteHistory(value, actual, original, binding, (remote, policy) => authorization.remoteExecutionResultHistory(remote, policy, actual, original, binding))
+      },
+      async remoteResolutionHistory(value, actual, original) {
+        return verifyRemoteHistory(value, actual, original, undefined, (remote, policy) => authorization.remoteResolutionHistory(remote, policy, actual, original))
+      },
+      async observeRemoteExecution(original, remote, rawContext) {
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        const handle = await verifyRemotePolicy(remote, rawContext, 'operation_resolve', 'observation_read')
+        let signed: Record<string, unknown>
+        try { signed = await withPolicyTrust(own, () => {
+          if (session.current !== active || active.authorization !== authorization) throw changed()
+          currentProjectTrust()
+          return handle.observationRequest(original, crypto.randomUUID())
+        }) } finally { handle.release() }
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        const result = await callSession(active, 'rpc', { method: 'execution_observation', observation_request: signed })
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        return result
+      },
+      async callExecutionResource(remote, body, beforeSend, replay) {
+        const controller = new AbortController()
+        independentReads.current.add(controller)
+        const check = () => { controller.signal.throwIfAborted(); if (session.current !== active || active.authorization !== authorization || identityRef.current !== own) throw changed() }
+        let channel: DeviceChannel | null = null
+        try {
+          check()
+          if (remoteExecutionProposal(remote).purpose !== 'rebind') throw new Error('封存需要单独批准的原 C Rebind 授权。')
+          const target = remote.share.selection.target_public_key, targetNode = nodeFingerprint(target)
+          const stored = savedEntries(storageProfile(own), load).find(entry => entry.node_id === targetNode)
+          channel = await connectDevice(stored ?? { address: active.entry.address, node_id: targetNode, relay: true }, { signal: controller.signal })
+          check()
+          if (channel.publicKey !== target) throw new Error('原执行端连接与独立保存的 C 公钥不同。')
+          const compositeTrust = () => {
+            check()
+            const sourceTrust = currentProjectTrust(), executionTrust = mergedRemotePolicyTrust(remote.trust, own, true)
+            const accountPin = sourceTrust.pins.find(pin => pin.domain.kind === 'account' && pin.domain.id === authorization.scope.account_id)
+            if (!accountPin) throw new Error('原 B 账户缺少独立保存的根信任。')
+            const pins = [...executionTrust.pins]
+            const shared = pins.find(pin => same(pin.domain, accountPin.domain))
+            if (shared) {
+              if (shared.genesis_root !== accountPin.genesis_root || shared.minimum_head !== null && accountPin.minimum_head !== null && !same(shared.minimum_head, accountPin.minimum_head)) throw new Error('B 和 C 保存的账户水位尚未一致，请先完成有限政策同步再封存。')
+              if (shared.minimum_head === null) pins[pins.indexOf(shared)] = accountPin
+            } else pins.push(accountPin)
+            pins.sort((left, right) => { const a = `${left.domain.kind}:${left.domain.id}`, b = `${right.domain.kind}:${right.domain.id}`; return a < b ? -1 : a > b ? 1 : 0 })
+            return parseAuthorizationTrust({ kind: 'policy', accountId: authorization.scope.account_id, spaceId: remote.share.selection.execution_resource.space, pins })
+          }
+          const trust = await withPolicyTrust(own, compositeTrust)
+          return await callPinnedExecutionResource({ channel, nodePublicKey: target, own, trust,
+            selection: { resourceId: remote.share.selection.execution_resource.resource, grantLeaf: remote.share.selection.execution_grant,
+              audience: { device: deriveAuthorizationId('device', target), service: deriveAuthorizationId('service', target) } }, body, check,
+            withTrust: work => withPolicyTrust(own, work), latestTrust: compositeTrust,
+            async persistTrust(updated) {
+              check()
+              const executionTrust = mergedRemotePolicyTrust(remote.trust, own, true)
+              const execution = parseAuthorizationTrust({ ...executionTrust, pins: executionTrust.pins.map(pin => updated.pins.find(next => same(next.domain, pin.domain)) ?? pin) })
+              await persistRemotePolicyTrust(execution, own)
+              check()
+              const sourceTrust = currentProjectTrust()
+              const source = parseAuthorizationTrust({ ...sourceTrust, pins: sourceTrust.pins.map(pin => updated.pins.find(next => same(next.domain, pin.domain)) ?? pin) })
+              await persistPolicyTrust(active, source, controller.signal, own)
+            }, beforeSend, replay,
+          })
+        } finally { channel?.close(); independentReads.current.delete(controller) }
+      },
+      async createRemoteExecutionRequest(input) {
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now()) throw new Error('请明确选择晚于当前时刻的执行申请有效期。')
+        const creation = verifySignedEvent(JSON.stringify(input.taskCreation), authorization.scope.space_id, selectedProjectId, text(authorization.policy.audience_public_key))
+        let taskRef: string
+        try {
+          const event = record(JSON.parse(creation.bodyJson())), task = record(event.body)
+          if (event.scope_id !== input.conversationId || task.type !== 'task_created' || task.task_id !== input.taskId || creation.hash !== input.taskRef) throw new Error('执行申请与已验证的项目、任务或会话不同。')
+          taskRef = creation.hash
+        } finally { creation.free() }
+        const reply = await signedCall('execution_share_request', { conversation_id: input.conversationId, task_id: input.taskId, task_ref: taskRef,
+          share_request: { session_id: input.sessionId, executor_kind: input.executorKind, expires_at_ms: input.expiresAt, purpose: input.purpose,
+            ...(input.executionResource ? { execution_resource: input.executionResource, target_public_key: input.targetPublicKey } : {}),
+            ...(input.oldBinding ? { old_binding: input.oldBinding, old_execution_receipt: input.oldExecutionReceipt } : {}) } }, 'rpc', undefined, { taskRef })
+        const produced = record(reply.result), attestation = record(record(produced.task_creation).payload)
+        if (!same(produced.project, { space: authorization.scope.space_id, resource: selectedProjectId })
+          || produced.source_node_public_key !== authorization.policy.audience_public_key || produced.purpose !== input.purpose
+          || produced.session_id !== input.sessionId || produced.executor_kind !== input.executorKind || produced.expires_at_ms !== input.expiresAt
+          || attestation.task !== taskRef || attestation.task_id !== input.taskId || attestation.conversation_id !== input.conversationId
+          || !same(produced.execution_resource, input.executionResource ?? null) || produced.target_public_key !== (input.targetPublicKey ?? null)
+          || !same(produced.old_binding, input.oldBinding ?? null) || !same(produced.old_execution_receipt, input.oldExecutionReceipt ?? null)) throw new Error('Node 的精简执行申请与本地明确选择的任务或用途不同。')
+        return withSessionAuthorization(active, own, handle => buildClientRemoteShareIntent(JSON.stringify(produced), handle))
+
+      },
+      exportExecutionSourceTrust() {
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        const nodePublicKey = text(authorization.policy.audience_public_key)
+        return JSON.stringify({ version: 2, kind: 'vibeface-source-trust', trust: currentProjectTrust(), nodePublicKey,
+          entry: { address: active.entry.address, node_id: nodeFingerprint(nodePublicKey), relay: active.entry.relay || active.channel.publicKey !== nodePublicKey } })
+      },
+      subscribe(listener) { if (session.current !== active || active.authorization !== authorization) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
+      isCurrent: () => session.current === active && active.authorization === authorization && generation.current === active.generation,
     }
     setDirectory(null); setReady(connection); setPhase('ready'); setError('')
   }
   async function open(entryValue: ConnectionEntry, expectedPublicKey?: string) {
     const parsed = parseEntry(entryValue)
-    disconnect(); setPhase('connecting'); setEntry(parsed)
+    const preserveSensitive = sensitive.current?.retainForReconnect?.(parsed) === true
+    closeConnection(preserveSensitive); setPhase('connecting'); setEntry(parsed)
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     try {
@@ -262,7 +620,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; releaseSession(session.current); session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPhase('disconnected'); setError(messageOf(reason))
+          generation.current += 1; for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); releaseSession(session.current); session.current = null; if (!sensitive.current?.keepOnNetworkClose?.()) cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPhase('disconnected'); setError(messageOf(reason))
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -273,7 +631,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const active = { channel, entry: parsed, info: details, generation: version }
       session.current = active; setInfo(details); setPhase('unpaired'); return active
     } catch (cause) {
-      if (version === generation.current) { disconnect(); setError(messageOf(cause)) }
+      if (version === generation.current) { closeConnection(preserveSensitive); setError(messageOf(cause)) }
       throw cause
     }
   }
@@ -285,12 +643,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!trust) throw new Error('请先使用新格式连接卡为此设备配置取得账户授权。')
     const savedTarget = load(targetKey(trust.spaceId, candidate), true)
     const selection = savedTarget ? parseAuthorizationSelection(savedTarget) : undefined
-    if (selection && projectId) selection.resourceId = projectId
+    if (selection && projectId && selection.resourceId !== projectId) { selection.resourceId = projectId; delete selection.grantLeaf }
     const active = await open(candidate)
-    const request = scoped(active)
-    let auth: unknown
+    let auth: VerifiedClientAuthorization
     try {
-      auth = await request('authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: identityRef.current?.publicKey, ...(selection ? { resource_id: selection.resourceId, audience: selection.audience } : projectId ? { resource_id: projectId } : {}) })
+      auth = await readAuthentication(active, trust, selection, undefined, projectId ?? selection?.resourceId)
     }
     catch (cause) { if (isResponseError(cause)) { setError('此设备尚未取得所选空间授权。请在已授权设备上批准。'); return }; throw cause }
     await authenticate(auth, active, trust, projectId ?? selection?.resourceId, selection)
@@ -308,13 +665,614 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   async function refreshDirectory() {
     if (!ready?.isCurrent()) return
-    const active = current()
-    const authorization = active.authorization
-    if (!authorization || !authorization.enrollmentRights.some(right => right === 'enroll_device' || right === 'revoke_device')) throw new Error('此设备没有账户设备管理权限。')
-    const response = await callSession(active, 'identity', { method: 'device_directory', params: { account_id: authorization.scope.account_id, space_id: authorization.scope.space_id, device_public_key: identityRef.current?.publicKey, resource_id: ready.project.id, audience: authorization.audience } })
-    const directory = authorization.directory(response)
-    if (!ready.isCurrent()) throw changed()
+    const connection = ready, active = current(), own = identityRef.current, authorization = active.authorization
+    if (!own || !authorization || !authorization.enrollmentRights.some(right => right === 'enroll_device' || right === 'revoke_device')) throw new Error('此设备没有账户设备管理权限。')
+    const selection = { resourceId: connection.project.id, audience: connection.audience, grantLeaf: authorization.grantLeaf }
+    const handle = await readAuthentication(active, authorization.trust, selection)
+    await authenticate(handle, active, authorization.trust, selection.resourceId, selection)
+    const refreshed = active.authorization
+    if (!refreshed) throw changed()
+    const directory = await withSessionAuthorization(active, own, () => {
+      if (active.authorization !== refreshed) throw changed()
+      return refreshed.directory()
+    })
+    if (session.current !== active || active.authorization !== refreshed) throw changed()
     setDirectory(directory)
+  }
+  const createTeam: DeviceContextValue['createTeam'] = async input => {
+    governanceMaterial()
+    if (!ready?.isCurrent()) throw changed()
+    const active = current(), authorization = active.authorization
+    const own = identityRef.current
+    if (!own) throw changed()
+    if (!authorization) throw changed()
+    const recovery = authorization.accountRecoveryPolicy()
+    if (recovery.threshold !== 1 || recovery.keys.length !== 1) throw new Error('当前创建入口需要单密钥账户恢复政策。请先核对账户恢复配置。')
+    const ownerAccount = ready.scope.account_id
+    const root = Identity.generate()
+    let prepared: ReturnType<typeof prepareClientTeamCreation>
+    try { prepared = await withSessionAuthorization(active, own, handle => prepareClientTeamCreation(root, ownerAccount, active.channel.publicKey, recovery.keys[0], ready.project.id, handle, input.certificateExpiresAt)) }
+    catch (error) { input.password = ''; throw error }
+    finally { root.free() }
+    try { reviewPreparedTeam(prepared, input.password, active, own, ready.project.id) }
+    finally { input.password = '' }
+  }
+  async function restoreTeamCreation(input: { file: File; password: string }) {
+    governanceMaterial()
+    if (!ready?.isCurrent()) throw changed()
+    const active = current(), own = identityRef.current
+    if (!own) throw changed()
+    if (!input.file.size || input.file.size > 2 * 1024 * 1024 + 4096) throw new Error('请选择不超过 2 MiB 的待提交团队恢复包。')
+    let cleartext: Uint8Array | null = null
+    let prepared: ReturnType<typeof prepareClientTeamCreation> | null = null
+    try {
+      const encrypted = new Uint8Array(await input.file.arrayBuffer())
+      if (session.current !== active || identityRef.current !== own) throw changed()
+      governanceMaterial()
+      try { cleartext = recoveryOpen(encrypted, input.password) }
+      catch { throw new Error('无法解锁团队恢复包。请核对口令并使用未修改的原文件。') }
+      const originalMaterial = new TextDecoder('utf-8', { fatal: true }).decode(cleartext)
+      prepared = await withSessionAuthorization(active, own, handle => restoreClientTeamCreation(originalMaterial, handle))
+      const original = record(record(JSON.parse(prepared.requestJson())).payload)
+      if (original.owner_account !== ready.scope.account_id || original.target_node_public_key !== active.channel.publicKey
+        || !same(original.source_project, { space: ready.scope.space_id, resource: ready.project.id })) {
+        throw new Error('请使用原设备配置，连接原 Node 并选择原个人项目后，再恢复该团队请求。')
+      }
+      const restored = prepared
+      prepared = null
+      reviewPreparedTeam(restored, input.password, active, own, ready.project.id)
+    } finally { cleartext?.fill(0); prepared?.free(); input.password = '' }
+  }
+  function reviewPreparedTeam(prepared: ReturnType<typeof prepareClientTeamCreation>, passwordInput: string, active: Session, own: PublicIdentity, sourceProjectId: string) {
+    const authorization = active.authorization
+    if (!authorization) { prepared.free(); throw changed() }
+    const ownerAccount = authorization.scope.account_id, audience = authorization.audience, nodePublicKey = active.channel.publicKey
+    let password = passwordInput
+    const encoder = new TextEncoder()
+    const seal = (value: string) => { const bytes = encoder.encode(value); try { return recoverySeal(bytes, password) } finally { bytes.fill(0) } }
+    let backup: Uint8Array
+    try { backup = seal(prepared.recoveryMaterialJson()) }
+    catch (error) { prepared.free(); password = ''; throw error }
+    const teamId = prepared.teamId(), request = JSON.parse(prepared.requestJson())
+    const controller = new AbortController()
+    let downloaded = false, running = false, released = false
+    let receipt: Record<string, unknown> | null = null
+    let committed: { trust: AuthorizationTrust; projectId: string; authorized: boolean } | null = null
+    const release = () => { if (!released) { released = true; prepared.free(); backup.fill(0); password = '' } }
+    const retained = resumableAuthority(active, own, () => !released && !controller.signal.aborted, [teamId])
+    const flow: Sensitive = {
+      keepOnNetworkClose: retained.keepOnNetworkClose, retainForReconnect: retained.retainForReconnect,
+      cancel() { controller.abort(); if (!running) release() },
+      download() { controller.signal.throwIfAborted(); downloadPackage(backup, teamId); downloaded = true },
+      async teamCreation(saved) {
+        if (running || released) throw new Error('原团队请求仍在等待结果或已关闭。')
+        if (!saved || !downloaded) throw new Error('请先下载当前团队恢复包，并确认已妥善保存。')
+        controller.signal.throwIfAborted(); const resumed = retained.resume(); running = true
+        try {
+          if (!committed) {
+            setTeamCreationReview({ accountId: ownerAccount, teamId, sourceProjectId, nodePublicKey, submitted: true, committed: false })
+            if (!receipt) {
+              const reply = record(await callSession(resumed, 'identity', { method: 'team_create', params: { request } }))
+              receipt = record(reply.acceptance)
+            }
+            const verified = finishTeamCreation(prepared, JSON.stringify(receipt), Date.now())
+            try {
+              const next = seal(verified.recoveryMaterialJson())
+              backup.fill(0); backup = next
+              committed = { trust: parseAuthorizationTrust({ kind: 'policy', accountId: ownerAccount, spaceId: teamId, pins: JSON.parse(verified.pinsJson()) }), projectId: verified.projectResourceId(), authorized: JSON.parse(verified.scopeJson()) !== null }
+              downloaded = false; password = ''
+            } finally { verified.free() }
+            if (sensitive.current === flow && !controller.signal.aborted) setTeamCreationReview({ accountId: ownerAccount, teamId, sourceProjectId, nodePublicKey, submitted: true, committed: true })
+            await persistPolicyTrust(resumed, committed.trust, undefined, own)
+            controller.signal.throwIfAborted()
+            return
+          }
+          await persistPolicyTrust(resumed, committed.trust, undefined, own)
+          controller.signal.throwIfAborted()
+          if (!committed.authorized) throw new Error('团队创建回执已核验并保存。当前团队授权已过期，请保存更新恢复包后重新取得授权。')
+          const auth = await readAuthentication(resumed, committed.trust, { resourceId: committed.projectId, audience }, controller.signal)
+          await authenticate(auth, resumed, committed.trust, committed.projectId, { resourceId: committed.projectId, audience }, controller.signal)
+          if (sensitive.current === flow) cancelSensitive()
+        } finally { running = false; if (controller.signal.aborted) release() }
+      },
+    }
+    sensitive.current = flow
+    setTeamCreationReview({ accountId: ownerAccount, teamId, sourceProjectId, nodePublicKey, submitted: false, committed: false })
+  }
+  async function confirmTeamCreation(saved: boolean) {
+    if (!sensitive.current?.teamCreation) throw new Error('当前没有待核对的团队创建请求。')
+    await sensitive.current.teamCreation(saved)
+  }
+  async function submitGovernance(prepared: ReturnType<typeof prepareClientMembershipChange>, label: string, protocol?: GovernanceProtocol) {
+    if (!ready?.isCurrent()) { prepared.free(); throw changed() }
+    const active = current(), authorization = active.authorization
+    const own = identityRef.current
+    if (!own) { prepared.free(); throw changed() }
+    if (!authorization) { prepared.free(); throw changed() }
+    const selection = { resourceId: ready.project.id, audience: ready.audience }
+    const request = JSON.parse(prepared.requestJson())
+    const commit = protocol ?? {
+      method: 'space_policy_commit', params: { request },
+      verify(committed: Record<string, unknown>) {
+        const verified = finishSpaceGovernanceChange(prepared, JSON.stringify(committed), Date.now())
+        try { return { trust: parseAuthorizationTrust({ ...authorization.trust, pins: JSON.parse(verified.pinsJson()) }), authorized: JSON.parse(verified.scopeJson()) !== null } }
+        finally { verified.free() }
+      },
+      afterSaved() {},
+      dispose() {},
+    }
+    cancelSensitive()
+    const controller = new AbortController()
+    let running = false, released = false, published = false
+    let confirmed: GovernanceConfirmation | null = null
+    const release = () => { if (!released) { released = true; prepared.free(); commit.dispose() } }
+    const retained = resumableAuthority(active, own, () => !released && !controller.signal.aborted)
+    const flow: Sensitive = {
+      keepOnNetworkClose: retained.keepOnNetworkClose, retainForReconnect: retained.retainForReconnect,
+      cancel() { controller.abort(); if (!running) release() },
+      async governance() {
+        if (running || released) throw new Error('原政策请求仍在等待结果或已关闭。')
+        controller.signal.throwIfAborted(); const resumed = retained.resume(); running = true
+        try {
+          if (!confirmed) {
+            const reply = record(await callSession(resumed, 'identity', { method: commit.method, params: commit.params }))
+            confirmed = commit.verify(record(reply.committed))
+          }
+          confirmed.trust = await persistPolicyTrust(resumed, confirmed.trust, undefined, own)
+          controller.signal.throwIfAborted()
+          if (!confirmed.authorized) { lockVault(); return }
+          if (!published) {
+            const confirmation = confirmed
+            await withPolicyTrust(own, () => {
+              controller.signal.throwIfAborted()
+              confirmation.trust = mergedRemotePolicyTrust(confirmation.trust, own)
+            })
+            await commit.afterSaved(confirmation, resumed, controller.signal)
+            controller.signal.throwIfAborted(); published = true
+          }
+          const refreshTrust = mergeAuthorizationTrust(authorization.trust, [confirmed.trust])
+          const auth = await readAuthentication(resumed, refreshTrust, selection, controller.signal)
+          await authenticate(auth, resumed, refreshTrust, selection.resourceId, selection, controller.signal)
+          if (sensitive.current === flow) cancelSensitive()
+        } finally { running = false; if (controller.signal.aborted) release() }
+      },
+    }
+    sensitive.current = flow; setGovernancePending(label)
+    await flow.governance?.()
+  }
+  function governanceMaterial() {
+    if (sensitive.current) throw new Error('请先核对或关闭当前待处理的敏感请求。')
+    if (!ready?.isCurrent()) throw changed()
+    const authorization = current().authorization
+    if (!authorization) throw changed()
+    const own = identityRef.current
+    if (!own) throw changed()
+    return { ...authorization.enrollmentMaterial(), pins: mergedRemotePolicyTrust(authorization.trust, own).pins, spaceId: ready.scope.space_id }
+  }
+  function prepareGovernance<T>(work: (authorization: VerifiedClientAuthorization) => T) {
+    governanceMaterial()
+    const active = current(), own = identityRef.current
+    if (!own) throw changed()
+    return withSessionAuthorization(active, own, work)
+  }
+  const changeMembership: DeviceContextValue['changeMembership'] = async input => {
+    const material = governanceMaterial()
+    const intent = { space: material.spaceId, subject_account: input.subjectAccount, roles: input.roles, expires_at_ms: input.expiresAt }
+    await submitGovernance(await prepareGovernance(handle => prepareClientMembershipChange(JSON.stringify(intent), handle)), '成员政策变更')
+  }
+  const grantProject: DeviceContextValue['grantProject'] = async input => {
+    const material = governanceMaterial()
+    if (!ready || input.scope.value.space !== ready.scope.space_id || input.scope.value.resource !== ready.project.id) throw new Error('授权范围与当前项目不同。')
+    const intent = { space: material.spaceId, grantee: input.grantee, scope: input.scope, actions: input.actions, audience_node_public_key: input.audienceNodePublicKey,
+      constraints: input.constraints, remaining_delegations: input.remainingDelegations, expires_at_ms: input.expiresAt }
+    await submitGovernance(await prepareGovernance(handle => prepareClientDirectionalGrant(JSON.stringify(intent), handle)), '项目授权')
+  }
+  const revokeProjectGrant: DeviceContextValue['revokeProjectGrant'] = async hash => {
+    const material = governanceMaterial()
+    await submitGovernance(await prepareGovernance(handle => prepareClientGrantRevocation(material.spaceId, hash, handle)), '授权撤销')
+  }
+  const registerExecutionService: DeviceContextValue['registerExecutionService'] = async input => {
+    const material = governanceMaterial()
+    if (!ready?.isCurrent()) throw changed()
+    if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now()) throw new Error('请明确选择晚于当前时刻的登记有效期。')
+    const connection = ready, active = current(), nodePublicKey = connection.audiencePublicKey, own = identityRef.current
+    if (!own) throw changed()
+    if (nodePublicKey !== active.channel.publicKey) throw new Error('请直接连接项目所在的已核验 Node，再登记它的执行资源。当前入口暂不转送账户根批准。')
+    const controller = new AbortController()
+    let password = input.password, opened: Awaited<ReturnType<typeof openAccountPackage>> | null = null
+    const reservation: Sensitive = { cancel() { controller.abort(); opened?.release(); opened = null; password = ''; input.password = '' } }
+    const check = () => { controller.signal.throwIfAborted(); if (sensitive.current !== reservation || session.current !== active || identityRef.current !== own || !connection.isCurrent()) throw changed() }
+    sensitive.current = reservation
+    let transferred = false, resourceId = '', backup: Uint8Array | null = null, backupTransferred = false
+    try {
+      opened = await openAccountPackage(input.file, password)
+      check()
+      if (opened.scope.account_id !== connection.scope.account_id) throw new Error('恢复包必须属于此 Node 所属的个人账户。')
+      const personalSpaceId = opened.scope.space_id
+      const known = [...savedSpaces(), ...savedRemotePolicyTrusts(own)].filter(item => item.accountId === connection.scope.account_id && item.spaceId === personalSpaceId)
+      if (!known[0]) throw new Error('请先连接并核验本人个人空间，再登记执行资源。恢复包不用于建立公共历史信任。')
+      const savedOwner = load(targetKey(personalSpaceId, active.entry), true)
+      if (!savedOwner) throw new Error('请先连接本人个人项目，保存已核验的公共账户授权，再返回当前项目登记执行资源。')
+      const ownerTarget = record(savedOwner), ownerGrantLeaf = ownerTarget.ownerGrantLeaf ?? ownerTarget.grantLeaf
+      if (!ownerGrantLeaf) throw new Error('请先重新连接本人个人项目，核验原账户管理授权。')
+      const ownerSelection = parseAuthorizationSelection({ ...ownerTarget, grantLeaf: ownerGrantLeaf })
+      const ownerHandle = await readAuthentication(active, mergeAuthorizationTrust(known[0], known), ownerSelection, controller.signal)
+      let owner: ReturnType<typeof verifyScopedAuthentication> | null = null
+      let incomingOwner: VerifiedClientAuthorization | null = ownerHandle
+      let prepared: ReturnType<typeof prepareClientExecutionServiceRegistration>
+      try {
+        owner = await withPolicyTrust(own, () => {
+          check()
+          const handle = incomingOwner
+          if (!handle) throw changed()
+          incomingOwner = null
+          return verifyScopedAuthentication(handle, own, mergedRemotePolicyTrust(mergeAuthorizationTrust(known[0], known), own), nodePublicKey, ownerSelection)
+        })
+        await persistPolicyTrust(active, owner.trust, controller.signal, own)
+        const privateMaterial = opened, ownerAuthorization = owner
+        prepared = await withPolicyTrust(own, () => {
+          check()
+          ownerAuthorization.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(ownerAuthorization.trust, savedSpaces()), own))
+          const source = active.authorization
+          if (!source) throw changed()
+          source.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(source.trust, savedSpaces()), own))
+          return source.withNative(sourceHandle => {
+            const management = executionManagement(sourceHandle, { space: material.spaceId, resource: connection.project.id }, nodePublicKey)
+            try { return ownerAuthorization.withNative(ownerHandle => prepareClientExecutionServiceRegistration(sourceHandle, management.selection, ownerHandle, privateMaterial.material, nodePublicKey, input.expiresAt)) }
+            finally { management.selection.free() }
+          })
+        })
+      } finally { incomingOwner?.free(); owner?.release() }
+      try { check() } catch (error) { prepared.free(); throw error }
+      opened.release(); opened = null; sensitive.current = null
+      transferred = true
+      await submitGovernance(prepared, '执行资源登记', {
+        method: 'execution_service_register', params: record(JSON.parse(prepared.requestJson())),
+        verify(committed) {
+          const verified = finishExecutionServiceRegistration(prepared, JSON.stringify(committed), Date.now())
+          try {
+            if (verified.spaceId() !== prepared.spaceId() || verified.resourceId() !== prepared.resourceId()) throw new Error('执行资源登记回执与原请求不同。')
+            resourceId = verified.resourceId()
+            const cleartext = new TextEncoder().encode(verified.recoveryMaterialJson())
+            try { const next = recoverySeal(cleartext, password); if (!backupTransferred) backup?.fill(0); backup = next } finally { cleartext.fill(0) }
+            const bytes = backup
+            setExecutionServiceBackups(previous => {
+              const next = new Map(previous), profile = storageProfile(own)
+              next.get(profile)?.bytes.fill(0); next.set(profile, { bytes, accountId: connection.scope.account_id, own })
+              return next
+            }); backupTransferred = true
+            const selection = verified.authorization()
+            try { return { trust: parseAuthorizationTrust({ kind: 'policy', accountId: connection.scope.account_id, spaceId: verified.spaceId(), pins: JSON.parse(verified.pinsJson()) }), authorized: JSON.parse(verified.scopeJson()) !== null, grantLeaf: text(record(JSON.parse(selection.policyJson())).grant_leaf) } }
+            finally { selection.free() }
+          } finally { verified.free() }
+        },
+        async afterSaved(confirmed, resumed, governanceSignal) {
+          if (!backup || !confirmed.grantLeaf) throw new Error('更新的账户恢复包或执行管理授权尚未准备完成，请保留原请求继续核对。')
+          const grantLeaf = confirmed.grantLeaf
+          const selection = parseAuthorizationSelection({ resourceId, audience: { device: deriveAuthorizationId('device', nodePublicKey), service: deriveAuthorizationId('service', nodePublicKey) }, grantLeaf: confirmed.grantLeaf })
+          let incoming: VerifiedClientAuthorization | null = await readAuthentication(resumed, confirmed.trust, selection, governanceSignal)
+          const candidate: { authorization: VerifiedClientAuthorization | null } = { authorization: null }
+          try {
+            await withPolicyTrust(own, () => {
+              governanceSignal.throwIfAborted()
+              if (session.current !== resumed || identityRef.current !== own || resumed.channel.publicKey !== nodePublicKey
+                || resumed.authorization?.scope.space_id !== material.spaceId || !resumed.authorization.projects.some(project => project.id === connection.project.id) || !incoming) throw changed()
+              candidate.authorization = revalidateClientPolicyAuthorization(incoming, JSON.stringify(mergedRemotePolicyTrust(mergeAuthorizationTrust(confirmed.trust, savedSpaces()), own).pins), Date.now())
+              const next: ExecutionServiceContext = { spaceId: confirmed.trust.spaceId, sourceSpaceId: material.spaceId, sourceProjectId: connection.project.id, nodePublicKey, resourceId, trust: confirmed.trust, authorization: candidate.authorization, grantLeaf, own }
+              saveExecutionServiceChoice(next)
+              replaceExecutionAuthorizations([next]); candidate.authorization = null
+              setExecutionServiceResource(next); setExecutionServiceResources([next])
+            })
+          } finally { incoming?.free(); incoming = null; candidate.authorization?.free() }
+        },
+        dispose() { password = ''; if (!backupTransferred) backup?.fill(0) },
+      })
+      if (!resourceId) throw new Error('执行资源登记尚未取得当前有效回执，请核对原请求。')
+      return resourceId
+    } finally {
+      opened?.release(); input.password = ''
+      if (!transferred) { password = ''; if (sensitive.current === reservation) sensitive.current = null }
+    }
+  }
+  function replaceExecutionAuthorizations(available: ExecutionServiceContext[]) {
+    const retained = new Set(available.map(item => item.authorization))
+    for (const authorization of executionAuthorizations.current) if (!retained.has(authorization)) authorization.free()
+    executionAuthorizations.current = retained
+  }
+  function matchesExecutionService(value: ExecutionServiceContext) {
+    return !!ready?.isCurrent() && identityRef.current === value.own && value.sourceSpaceId === ready.scope.space_id
+      && value.sourceProjectId === ready.project.id && value.nodePublicKey === ready.audiencePublicKey
+  }
+  function currentExecutionService() { return executionServiceResource && matchesExecutionService(executionServiceResource) ? executionServiceResource : null }
+  function executionServiceChoiceKey(value: Pick<ExecutionServiceContext, 'own' | 'sourceSpaceId' | 'sourceProjectId' | 'nodePublicKey'>) {
+    return `profile.${storageProfile(value.own)}.execution-service-choice.${JSON.stringify([value.sourceSpaceId, value.sourceProjectId, value.nodePublicKey])}`
+  }
+  function saveExecutionServiceChoice(value: ExecutionServiceContext) {
+    const key = executionServiceChoiceKey(value)
+    if (value.own.profileId === null) temporaryRecords.current.set(key, value.resourceId)
+    else writePersistent(key, value.resourceId)
+  }
+  async function readExecutionServices(resourceId?: string) {
+    governanceMaterial()
+    const connection = ready, active = current(), own = identityRef.current, source = active.authorization
+    if (!connection || !own || !source) throw changed()
+    if (active.channel.publicKey !== connection.audiencePublicKey) throw new Error('请直接连接物理执行 Node，再读取已登记的执行资源。')
+    const sourceProject = { space: connection.scope.space_id, resource: connection.project.id }
+    const chosen = resourceId ? executionServiceResources.find(item => item.resourceId === resourceId && matchesExecutionService(item)) : null
+    if (resourceId && !chosen) throw new Error('请先读取当前项目已登记的执行资源，再选择列表中的原资源。')
+    const controller = new AbortController(), reservation: Sensitive = { cancel() { controller.abort() } }
+    const check = () => { controller.signal.throwIfAborted(); if (!connection.isCurrent() || identityRef.current !== own || sensitive.current !== reservation) throw changed() }
+    sensitive.current = reservation
+    const available: ExecutionServiceContext[] = []
+    let published = false
+    try {
+      const sourceGrant = await withPolicyTrust(own, () => {
+        check(); source.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(source.trust, savedSpaces()), own))
+        return source.withNative(handle => { const management = executionManagement(handle, sourceProject, connection.audiencePublicKey); try { return management.grant } finally { management.selection.free() } })
+      })
+      let cursor: string | null = null
+      do {
+        const reply = record(await callSession(active, 'identity', { method: 'execution_service_select', params: {
+          account_id: connection.scope.account_id, device_public_key: own.publicKey, source_project: sourceProject, source_grant: sourceGrant,
+          target_node_public_key: connection.audiencePublicKey, ...(chosen ? { execution_resource: { space: chosen.spaceId, resource: chosen.resourceId } } : { cursor }),
+        } }))
+        check()
+        const selections = array(reply.selections)
+        if (selections.length > 1) throw new Error('执行资源列表超过单页允许的候选数量。')
+        for (const value of selections) {
+          const selection = record(value), resource = record(selection.execution_resource)
+          const executionResource = { space: text(resource.space), resource: text(resource.resource) }
+          if (resourceId && (executionResource.resource !== resourceId || executionResource.space !== chosen?.spaceId)) throw new Error('Node 返回了其他执行资源，已拒绝切换。')
+          const known = [...savedSpaces(), ...savedRemotePolicyTrusts(own)].filter(item => item.accountId === connection.scope.account_id && item.spaceId === executionResource.space)
+          if (!known[0]) throw new Error('请先连接并核验本人个人空间，再读取已登记的执行资源。')
+          const trust = mergedRemotePolicyTrust(mergeAuthorizationTrust(known[0], known), own)
+          const requested = parseAuthorizationSelection({ resourceId: executionResource.resource,
+            audience: { device: deriveAuthorizationId('device', connection.audiencePublicKey), service: deriveAuthorizationId('service', connection.audiencePublicKey) }, grantLeaf: selection.management_parent })
+          let imported: VerifiedClientAuthorization | null = await readAuthentication(active, trust, requested, controller.signal)
+          let verified: VerifiedClientAuthorization | null = null
+          try {
+            verified = await withPolicyTrust(own, () => {
+              check()
+              if (!imported) throw changed()
+              const current = revalidateClientPolicyAuthorization(imported, JSON.stringify(mergedRemotePolicyTrust(mergeAuthorizationTrust(trust, savedSpaces()), own).pins), Date.now())
+              try { return verifyExecutionServiceSelection(current, JSON.stringify(selection), JSON.stringify(sourceProject), JSON.stringify(executionResource), connection.audiencePublicKey, Date.now()) }
+              finally { current.free() }
+            })
+            const policy = record(JSON.parse(verified.policyJson())), heads = array(policy.heads).map(value => record(value))
+            const updated = parseAuthorizationTrust({ ...trust, pins: trust.pins.map(pin => ({ ...pin, minimum_head: heads.find(head => same(head.domain, pin.domain)) ?? pin.minimum_head })) })
+            const saved = await persistPolicyTrust(active, updated, controller.signal, own)
+            check()
+            available.push({ spaceId: executionResource.space, sourceSpaceId: sourceProject.space, sourceProjectId: sourceProject.resource,
+              nodePublicKey: connection.audiencePublicKey, resourceId: executionResource.resource, trust: saved, authorization: verified, grantLeaf: text(policy.grant_leaf), own })
+            verified = null
+          } finally { imported?.free(); imported = null; verified?.free() }
+        }
+        if (chosen || reply.next_cursor === null) break
+        const next = text(reply.next_cursor)
+        if (!/^res2_[a-f0-9]{64}$/.test(next) || cursor !== null && next <= cursor) throw new Error('执行资源分页游标无效。')
+        cursor = next
+      } while (cursor !== null)
+      await withPolicyTrust(own, () => {
+        check()
+        if (new Set(available.map(item => item.resourceId)).size !== available.length) throw new Error('Node 返回了重复的执行资源。')
+        const key = executionServiceChoiceKey({ own, sourceSpaceId: sourceProject.space, sourceProjectId: sourceProject.resource, nodePublicKey: connection.audiencePublicKey })
+        const remembered = own.profileId === null ? temporaryRecords.current.get(key) : readPersistent(key)
+        const selected = resourceId ? available.find(item => item.resourceId === resourceId) : available.find(item => item.resourceId === remembered) ?? (available.length === 1 ? available[0] : null)
+        if (resourceId && !selected) throw new Error('原执行资源当前不可用，请核对它的授权和登记状态。')
+        for (const value of available) {
+          const current = revalidateClientPolicyAuthorization(value.authorization, JSON.stringify(mergedRemotePolicyTrust(mergeAuthorizationTrust(value.trust, savedSpaces()), own).pins), Date.now())
+          value.authorization.free(); value.authorization = current
+        }
+        const next = resourceId ? [...executionServiceResources.filter(item => item.resourceId !== resourceId && matchesExecutionService(item)), ...available] : available
+        if (selected) saveExecutionServiceChoice(selected)
+        replaceExecutionAuthorizations(next)
+        setExecutionServiceResources(next); setExecutionServiceResource(selected ?? null); setRemoteExecutionShare(null); published = true
+      })
+    } finally {
+      if (!published) for (const value of available) value.authorization.free()
+      if (sensitive.current === reservation) sensitive.current = null
+    }
+  }
+  async function refreshExecutionServices() { await readExecutionServices() }
+  async function selectExecutionService(resourceId: string) { await readExecutionServices(resourceId) }
+  function downloadExecutionServiceBackup() {
+    const backup = currentExecutionServiceBackup()
+    if (!backup) throw new Error('请解锁原设备配置，再下载已核验的更新账户恢复包。')
+    downloadPackage(backup.bytes, backup.accountId)
+  }
+  function currentExecutionServiceBackup() {
+    const own = identityRef.current
+    if (!own) return null
+    const backup = executionServiceBackups.get(storageProfile(own))
+    return backup?.own.publicKey === own.publicKey ? backup : null
+  }
+  function savedRemotePolicyTrusts(own: PublicIdentity) {
+    const key = `profile.${storageProfile(own)}.remote-policy-trusts`
+    return array((own.profileId === null ? temporaryRecords.current.get(key) : readPersistent(key, true)) ?? []).map(parseAuthorizationTrust)
+  }
+  function mergedRemotePolicyTrust(trust: AuthorizationTrust, own: PublicIdentity, requireSaved = false) {
+    const profile = storageProfile(own), key = `profile.${profile}.policy-trusts`
+    const ownTrusts = array((own.profileId === null ? temporaryRecords.current.get(key) : readPersistent(key, true)) ?? []).map(parseAuthorizationTrust)
+    const known = [...savedRemotePolicyTrusts(own), ...ownTrusts].filter(item => item.accountId === trust.accountId)
+    if (requireSaved && !known.some(item => item.spaceId === trust.spaceId)) throw new Error('请先独立核对并保存此执行 Node 的完整根信任。')
+    return mergeAuthorizationTrust(parseAuthorizationTrust(trust), known)
+  }
+  async function persistRemotePolicyTrust(trust: AuthorizationTrust, own: PublicIdentity) {
+    const profile = storageProfile(own), key = `profile.${profile}.remote-policy-trusts`, temporary = own.profileId === null
+    if (!('locks' in navigator)) throw new Error('此浏览器需要 Web Locks 才能保存独立源信任。')
+    const updated = await navigator.locks.request(`profile.${profile}.policy-trust-writer`, () => {
+      if (temporary && identityRef.current !== own) throw changed()
+      const all = savedRemotePolicyTrusts(own), sameAccount = all.filter(item => item.accountId === trust.accountId)
+      const updated = mergedRemotePolicyTrust(trust, own)
+      const next = [...all.filter(item => item.accountId !== trust.accountId), ...sameAccount.filter(item => item.spaceId !== trust.spaceId).map(item => mergeAuthorizationTrust(item, [updated])), updated]
+      if (temporary) temporaryRecords.current.set(key, JSON.parse(JSON.stringify(next)))
+      else writePersistent(key, next)
+      return updated
+    })
+    if (identityRef.current !== own) throw changed()
+    return mergedRemotePolicyTrust(updated, own, true)
+  }
+  function savedSourceTrustCards(own: PublicIdentity) {
+    const key = `profile.${storageProfile(own)}.remote-source-cards`
+    return array((own.profileId === null ? temporaryRecords.current.get(key) : readPersistent(key, true)) ?? []).map(parseRemoteExecutionSourceTrust)
+  }
+  async function verifiedRemoteExecutionRequest(input: Parameters<TeamControlsProps['inspectRemoteExecutionRequest']>[0]) {
+    if (!ready?.isCurrent()) throw changed()
+    const connection = ready, own = identityRef.current
+    if (!own) throw changed()
+    const signed = record(JSON.parse(input.requestJson)), intent = record(signed.intent), project = record(intent.project)
+    let candidates = savedSourceTrustCards(own)
+    if (input.sourceTrustJson) {
+      if (!input.confirmedSourceRoots) throw new Error('请先通过独立可信渠道核对完整 B 根信任和 Node 公钥。')
+      candidates = [parseRemoteExecutionSourceTrust(JSON.parse(input.sourceTrustJson))]
+    }
+    const card = candidates.find(candidate => candidate.nodePublicKey === intent.source_node_public_key && candidate.trust.accountId === intent.requester && candidate.trust.spaceId === project.space)
+    if (!card) throw new Error('请导入通过独立可信渠道核对的完整 B 来源卡，包含原 Node 公钥及入口。')
+    const controller = new AbortController(); independentReads.current.add(controller)
+    const check = () => { controller.signal.throwIfAborted(); if (!connection.isCurrent() || identityRef.current !== own) throw changed() }
+    let channel: DeviceChannel | null = null
+    let verified: Awaited<ReturnType<typeof readRemoteSharePolicy>>['verified'] | null = null
+    try {
+      const trust = mergedRemotePolicyTrust(card.trust, own)
+      channel = await connectDevice(card.entry, { signal: controller.signal })
+      check()
+      if (channel.publicKey !== card.nodePublicKey) throw new Error('B 来源连接与独立保存的 Node 公钥不同。')
+      const sourceChannel = channel
+      const imported = await readRemoteSharePolicy({ intentJson: input.requestJson, trust, nodePublicKey: card.nodePublicKey,
+        call: (method, params) => sourceChannel.request('identity', { method, params }), check, signal: controller.signal })
+      verified = imported.verified
+      const metadata = record(JSON.parse(verified.summaryJson())), verifiedProject = record(metadata.project)
+      if (metadata.requesterAccountId !== trust.accountId || verifiedProject.space !== trust.spaceId) throw new Error('已验证的来源申请属于其他账户或空间。')
+      const savedTrust = await persistRemotePolicyTrust(imported.trust, own)
+      check()
+      const qualified = verified
+      await withPolicyTrust(own, () => {
+        check()
+        const next = qualified.revalidate(JSON.stringify(mergedRemotePolicyTrust(savedTrust, own, true).pins), Date.now())
+        qualified.free(); verified = next
+        const key = `profile.${storageProfile(own)}.remote-source-cards`, saved = savedSourceTrustCards(own)
+        const nextCards = [...saved.filter(value => value.nodePublicKey !== card.nodePublicKey || value.trust.accountId !== trust.accountId || value.trust.spaceId !== trust.spaceId), { ...card, trust: savedTrust }]
+        const values = nextCards.map(value => ({ version: 2, kind: 'vibeface-source-trust', ...value }))
+        if (own.profileId === null) temporaryRecords.current.set(key, values)
+        else writePersistent(key, values)
+      })
+      const purpose = metadata.purpose
+      if (purpose !== 'execution' && purpose !== 'resolution' && purpose !== 'rebind') throw new Error('来源申请没有明确的单一用途。')
+      const summary: RemoteExecutionRequestSummary = { requestHash: text(metadata.intentHash), projectResourceId: text(verifiedProject.resource), projectLabel: '', taskId: text(metadata.taskId), purpose,
+        executorKind: text(metadata.executorKind), servicePublicKey: card.nodePublicKey, expiresAt: integer(metadata.expiresAtMs) }
+      const result = verified
+      if (!result) throw changed()
+      verified = null
+      return { summary, trust: savedTrust, verified: result }
+    } finally { verified?.free(); channel?.close(); independentReads.current.delete(controller) }
+  }
+  const inspectRemoteExecutionRequest: DeviceContextValue['inspectRemoteExecutionRequest'] = async input => {
+    const source = await verifiedRemoteExecutionRequest(input)
+    try { return source.summary } finally { source.verified.free() }
+  }
+  const createRemoteExecutionShare: DeviceContextValue['createRemoteExecutionShare'] = async rawInput => {
+    governanceMaterial()
+    const input = parseRemoteExecutionShareInput(rawInput, Date.now()), execution = currentExecutionService(), own = identityRef.current
+    if (!execution || !own || input.executionResourceId !== execution.resourceId) throw new Error('先为当前项目登记并核验执行资源，再生成受限分享。')
+    const source = await verifiedRemoteExecutionRequest({ requestJson: input.requestJson, confirmedSourceRoots: false })
+    let prepared: ReturnType<typeof prepareClientRemoteExecutionShare>
+    try {
+      prepared = await withPolicyTrust(own, () => {
+        governanceMaterial()
+        if (currentExecutionService() !== execution || identityRef.current !== own) throw changed()
+        const executionTrust = mergedRemotePolicyTrust(mergeAuthorizationTrust(execution.trust, savedSpaces()), own)
+        const owner = revalidateClientPolicyAuthorization(execution.authorization, JSON.stringify(executionTrust.pins), Date.now())
+        try {
+          const request = source.verified.revalidate(JSON.stringify(mergedRemotePolicyTrust(source.trust, own, true).pins), Date.now())
+          try { return prepareClientRemoteExecutionShare(JSON.stringify({ executionResourceId: input.executionResourceId, actions: input.actions, expiresAt: input.expiresAt }), owner, request) }
+          finally { request.free() }
+        } finally { owner.free() }
+      })
+    } finally { source.verified.free() }
+    let verified: ReturnType<typeof finishRemoteExecutionShare> | null = null, result = ''
+    await submitGovernance(prepared, '远端执行分享授权', {
+      method: 'space_policy_commit', params: { request: JSON.parse(prepared.requestJson()) },
+      verify(committed) {
+        verified = finishRemoteExecutionShare(prepared, JSON.stringify(committed), Date.now())
+        return { trust: parseAuthorizationTrust({ ...execution.trust, pins: JSON.parse(verified.pinsJson()) }), authorized: JSON.parse(verified.scopeJson()) !== null }
+      },
+      async afterSaved(confirmed, resumed, signal) {
+        if (!verified) throw new Error('原分享授权回执尚未核验，请继续核对原请求。')
+        result = verified.referenceJson()
+        const share = parseRemoteExecutionShare(JSON.parse(result))
+        if (share.selection.execution_resource.space !== execution.spaceId || share.selection.execution_resource.resource !== execution.resourceId || share.selection.target_public_key !== execution.nodePublicKey || share.selection.execution_grant !== prepared.grantHash() || share.purpose !== source.summary.purpose) throw new Error('原生分享引用与本次执行资源、用途或 Grant 不同。')
+        const selection = { resourceId: execution.resourceId, audience: { device: deriveAuthorizationId('device', execution.nodePublicKey), service: deriveAuthorizationId('service', execution.nodePublicKey) }, grantLeaf: execution.grantLeaf }
+        let imported: VerifiedClientAuthorization | null = await readAuthentication(resumed, confirmed.trust, selection, signal)
+        const pending: { authorization: VerifiedClientAuthorization | null } = { authorization: null }
+        try {
+          await withPolicyTrust(own, () => {
+            signal.throwIfAborted()
+            if (session.current !== resumed || identityRef.current !== own || !imported) throw changed()
+            pending.authorization = revalidateClientPolicyAuthorization(imported, JSON.stringify(mergedRemotePolicyTrust(mergeAuthorizationTrust(confirmed.trust, savedSpaces()), own).pins), Date.now())
+            const next: ExecutionServiceContext = { ...execution, trust: confirmed.trust, authorization: pending.authorization }
+            saveExecutionServiceChoice(next)
+            const available = [...executionServiceResources.filter(value => value.resourceId !== next.resourceId && executionAuthorizations.current.has(value.authorization)), next]
+            replaceExecutionAuthorizations(available); pending.authorization = null
+            setExecutionServiceResource(next); setExecutionServiceResources(available); setRemoteExecutionShare({ value: result, execution: next })
+          })
+        } finally { imported?.free(); imported = null; pending.authorization?.free() }
+      },
+      dispose() { verified?.free(); verified = null },
+    })
+    if (!result) throw new Error('原分享授权尚未取得当前有效回执，请核对原请求。')
+    return result
+  }
+  async function retryGovernance() {
+    if (!sensitive.current?.governance) throw new Error('当前没有待核对的政策提交。')
+    await sensitive.current.governance()
+  }
+  async function beginNodeEnrollment(input: { file: File; password: string; connectionCard: string; certificateExpiresAt: number }) {
+    if (!Number.isSafeInteger(input.certificateExpiresAt) || input.certificateExpiresAt <= Date.now()) throw new Error('请选择晚于当前时刻的服务证书有效期。')
+    if (!ready?.isCurrent()) throw changed()
+    const active = current(), authorization = active.authorization
+    const own = identityRef.current
+    if (!own) throw changed()
+    if (!authorization) throw changed()
+    const selection = { resourceId: ready.project.id, audience: ready.audience }
+    const card = parseConnectionCard(readInvitation(input.connectionCard))
+    if (card.kind !== 'claim') throw new Error('请在新 Node 本机运行 vibeface access，使用包含本机认领凭证的可信连接卡。')
+    if (card.nodePublicKey === active.channel.publicKey) throw new Error('请选择尚未加入账户的另一台 Node。')
+    cancelSensitive()
+    const controller = new AbortController()
+    let prepared: Awaited<ReturnType<typeof prepareNodeEnrollment>> | null = null
+    let trust = authorization.trust
+    const retained = resumableAuthority(active, own, () => prepared !== null && !controller.signal.aborted)
+    const flow: Sensitive = {
+      keepOnNetworkClose: retained.keepOnNetworkClose, retainForReconnect: retained.retainForReconnect,
+      cancel() { controller.abort(); prepared?.release(); prepared = null },
+      async nodeEnrollment() {
+        if (!prepared || controller.signal.aborted) throw changed()
+        const original = prepared, resumed = retained.resume()
+        await original.prepare()
+        controller.signal.throwIfAborted()
+        setNodeEnrollmentReview(value => value ? { ...value, submitted: true } : null)
+        await original.commit(async pins => { trust = parseAuthorizationTrust({ ...trust, pins }); await persistPolicyTrust(resumed, trust, undefined, own) })
+        controller.signal.throwIfAborted()
+        saveEntry(original.entry)
+        const auth = await readAuthentication(resumed, trust, selection, controller.signal)
+        await authenticate(auth, resumed, trust, selection.resourceId, selection, controller.signal)
+        if (sensitive.current === flow) cancelSensitive()
+      },
+    }
+    sensitive.current = flow
+    try {
+      prepared = await prepareNodeEnrollment({ ...input, accountId: ready.scope.account_id, card, signal: controller.signal,
+        prepare: (material, claim, expiry) => withSessionAuthorization(active, own, handle => prepareClientAccountNodeEnrollment(material, handle, claim, expiry), controller.signal) })
+      controller.signal.throwIfAborted()
+      if (session.current !== active) throw changed()
+      setNodeEnrollmentReview({ accountId: prepared.accountId, nodePublicKey: prepared.nodePublicKey, address: prepared.entry.address, submitted: false })
+      await prepared.prepare()
+    } catch (error) { if (!prepared || controller.signal.aborted) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }; throw error }
+    finally { input.password = '' }
+  }
+  async function confirmNodeEnrollment() {
+    if (!sensitive.current?.nodeEnrollment) throw new Error('当前没有待批准的 Node 入网请求。')
+    await sensitive.current.nodeEnrollment()
   }
   async function createEnrollmentOffer(manageDevices: boolean) {
     if (!ready?.isCurrent()) throw changed()
@@ -323,8 +1281,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (active.entry.relay || ready.audiencePublicKey !== active.channel.publicKey) throw new Error('请使用目标 Node 的直接入口，再生成新设备邀请。')
     const material = authorization.enrollmentMaterial()
     if (material.expiresAt === null) throw new Error('当前设备没有有效的账户管理期限。')
+    const certificateExpiry = material.expiresAt
     const rights = manageDevices ? authorization.enrollmentRights.filter(right => right === 'enroll_device' || right === 'revoke_device').sort() : []
-    const offer = createClientEnrollmentOffer(ready.scope.account_id, active.entry.address, active.channel.publicKey, JSON.stringify(rights), material.expiresAt, JSON.stringify(material.pins), JSON.stringify(material.bundle))
+    const own = identityRef.current
+    if (!own) throw changed()
+    const offer = await withSessionAuthorization(active, own, handle => createClientEnrollmentOffer(ready.scope.account_id, active.entry.address, active.channel.publicKey, JSON.stringify(rights), certificateExpiry, handle))
     const checked = verifyDeviceEnrollmentOffer(offer, Date.now())
     try {
       const expected = { version: 2, kind: 'vibeface-device-enrollment', endpoint: active.entry.address, node_public_key: active.channel.publicKey,
@@ -355,9 +1316,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (managerEnrollment.current !== flow) throw changed()
     const request = requests.find(item => item.requestId === requestId)
     if (!request || !same(request, shown)) throw new Error('此设备申请已变化。请重新核对最新显示的完整公钥和状态，再明确批准。')
+    const active = current(), own = identityRef.current
+    if (!own) throw changed()
     const offer = verifyDeviceEnrollmentOffer(flow.offer, Date.now())
     try {
-      const intent = JSON.parse(verifyDeviceEnrollmentIntentForOffer(offer, JSON.stringify(request.unsignedIntent), request.newDevicePublicKey, Date.now()))
+      const intent = JSON.parse(await withSessionAuthorization(active, own, handle => verifyDeviceEnrollmentIntentForManager(handle, offer, flow.reference.offer_hash, JSON.stringify(request.unsignedIntent), request.newDevicePublicKey, Date.now())))
       if (!same(intent, request.unsignedIntent)) throw new Error('设备申请与原邀请不同。')
     } finally { offer.free() }
     return { flow, request }
@@ -365,40 +1328,48 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function approveEnrollmentRequest(requestId: string) {
     const active = current(), { flow, request } = await managerRequest(requestId)
     if (request.status !== 'requested') throw new Error('申请已不处于等待批准状态，请重新核对。')
-    const signed = JSON.parse(approveClientEnrollmentIntent(JSON.stringify(request.unsignedIntent), JSON.stringify(flow.material.pins), JSON.stringify(flow.material.bundle)))
+    const own = identityRef.current
+    if (!own) throw changed()
+    const signed = JSON.parse(await withSessionAuthorization(active, own, handle => approveClientEnrollmentIntent(JSON.stringify(request.unsignedIntent), handle)))
     await callSession(active, 'identity', { method: 'enrollment_approve', params: { account_id: flow.reference.account_id, offer_hash: flow.reference.offer_hash, request_id: requestId, intent: signed } })
     await refreshEnrollmentRequests()
   }
   async function applyDeviceChange(prepared: ReturnType<typeof prepareClientDeviceRevocation>, active: Session, requestId?: string, revokedDeviceId?: string) {
     let verified: ReturnType<typeof finishAccountDeviceChange> | null = null
     try {
+      const connection = ready, own = identityRef.current
+      if (!connection?.isCurrent() || !own) throw changed()
       const reply = record(await callSession(active, 'identity', { method: 'account_device_commit', params: { request: JSON.parse(prepared.requestJson()), ...(requestId ? { request_id: requestId } : {}) } }))
       verified = finishAccountDeviceChange(prepared, JSON.stringify(record(reply.committed)), Date.now())
-      if (!ready?.isCurrent() || !identityRef.current) throw changed()
-      const trust = parseAuthorizationTrust({ kind: 'policy', accountId: ready.scope.account_id, spaceId: ready.scope.space_id, pins: JSON.parse(verified.pinsJson()) })
-      await persistPolicyTrust(active, trust)
-      if (revokedDeviceId === ready.scope.device_id) { lockVault(); return }
-      const auth = await callSession(active, 'authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: identityRef.current.publicKey, resource_id: ready.project.id, audience: ready.audience })
-      await authenticate(auth, active, trust, ready.project.id, { resourceId: ready.project.id, audience: ready.audience })
+      const trust = parseAuthorizationTrust({ kind: 'policy', accountId: connection.scope.account_id, spaceId: connection.scope.space_id, pins: JSON.parse(verified.pinsJson()) })
+      await persistPolicyTrust(active, trust, undefined, own)
+      if (revokedDeviceId === connection.scope.device_id) { lockVault(); return }
+      const auth = await readAuthentication(active, trust, { resourceId: connection.project.id, audience: connection.audience })
+      await authenticate(auth, active, trust, connection.project.id, { resourceId: connection.project.id, audience: connection.audience })
       managerEnrollment.current = null; setManagerEnrollmentActive(false); setEnrollmentRequests([])
       await refreshDirectory()
     } finally { verified?.free(); prepared.free() }
   }
   async function completeEnrollmentRequest(requestId: string) {
-    const active = current(), { flow, request } = await managerRequest(requestId)
+    const active = current(), { request } = await managerRequest(requestId)
     if (request.status !== 'possessed' || !request.intent || !request.certificate || !same(request.intent.payload, request.unsignedIntent)) throw new Error('新设备尚未提供与原申请一致的密钥持有证明。')
-    const qualified = verifyAccountEnrollment(JSON.stringify(request.intent), JSON.stringify(flow.material.pins), JSON.stringify(flow.material.bundle), Date.now())
-    try {
-      const prepared = prepareClientDeviceEnrollment(qualified, JSON.stringify(request.certificate), JSON.stringify(flow.material.pins), JSON.stringify(flow.material.bundle))
-      await applyDeviceChange(prepared, active, requestId)
-    } finally { qualified.free() }
+    const own = identityRef.current
+    if (!own) throw changed()
+    const prepared = await withSessionAuthorization(active, own, handle => {
+      const qualified = verifyAccountEnrollment(JSON.stringify(request.intent), handle, Date.now())
+      try { return prepareClientDeviceEnrollment(qualified, JSON.stringify(request.certificate), handle) }
+      finally { qualified.free() }
+    })
+    await applyDeviceChange(prepared, active, requestId)
   }
+
   async function revokeDevice(deviceId: string) {
     if (!ready?.isCurrent()) throw changed()
     const active = current(), authorization = active.authorization
     if (!authorization?.enrollmentRights.includes('revoke_device')) throw new Error('当前设备没有撤销账户设备的权限。')
-    const material = authorization.enrollmentMaterial()
-    const prepared = prepareClientDeviceRevocation(ready.scope.account_id, deviceId, JSON.stringify(material.pins), JSON.stringify(material.bundle))
+    const own = identityRef.current
+    if (!own) throw changed()
+    const prepared = await withSessionAuthorization(active, own, handle => prepareClientDeviceRevocation(ready.scope.account_id, deviceId, handle))
     await applyDeviceChange(prepared, active, undefined, deviceId)
   }
   async function registerAccountPasskey(input: { file: File; password: string; protectLocal: boolean }) {
@@ -416,33 +1387,43 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     let prepared: ReturnType<typeof prepareClientFirstAuthenticatorRegistration> | null = null
     let intentJson = ''
     let completion: Record<string, unknown> | null = null
-    const finish = async (receipt: Record<string, unknown>) => {
+    let running = true, released = false
+    const release = () => {
+      if (released) return
+      released = true; opened?.release(); opened = null; registration?.release(); registration = null; prepared?.free(); prepared = null; intentJson = ''; completion = null; input.password = ''
+    }
+    const finish = async (receipt: Record<string, unknown>, resumed = active) => {
       if (!prepared) throw new Error('原 Passkey 注册材料已释放，请重新连接核对。')
-      controller.signal.throwIfAborted()
       const verified = finishFirstAuthenticatorRegistration(prepared, JSON.stringify(array(receipt.journal)), Date.now())
       let trust: AuthorizationTrust
       try { trust = parseAuthorizationTrust({ kind: 'policy', accountId: connection.scope.account_id, spaceId: connection.scope.space_id, pins: JSON.parse(verified.pinsJson()) }) }
       finally { verified.free() }
-      await persistPolicyTrust(active, trust)
+      await persistPolicyTrust(resumed, trust, undefined, own)
       controller.signal.throwIfAborted()
-      const auth = await callSession(active, 'authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: own.publicKey, resource_id: connection.project.id, audience: connection.audience })
-      await authenticate(auth, active, trust, connection.project.id, { resourceId: connection.project.id, audience: connection.audience }, controller.signal)
+      const auth = await readAuthentication(resumed, trust, { resourceId: connection.project.id, audience: connection.audience }, controller.signal)
+      await authenticate(auth, resumed, trust, connection.project.id, { resourceId: connection.project.id, audience: connection.audience }, controller.signal)
       if (input.protectLocal) await saveLocalPasskeyProtection(registration, controller.signal)
       if (sensitive.current === flow) cancelSensitive()
     }
+    const retained = resumableAuthority(active, own, () => prepared !== null && completion !== null && !released && !controller.signal.aborted)
     const flow: Sensitive = {
-      cancel() { controller.abort(); opened?.release(); opened = null; registration?.release(); registration = null; prepared?.free(); prepared = null; intentJson = ''; completion = null; input.password = '' },
+      keepOnNetworkClose: retained.keepOnNetworkClose, retainForReconnect: retained.retainForReconnect,
+      cancel() { controller.abort(); opened?.release(); opened = null; registration?.release(); registration = null; if (!running) release() },
       async retryPasskeyRegistration() {
+        if (running || released) throw new Error('原 Passkey 注册请求仍在等待结果或已关闭。')
         if (!prepared || !completion || !intentJson) throw new Error('当前没有需要核对的原注册提交。')
         controller.signal.throwIfAborted()
-        const pending = record(await callSession(active, 'identity', { method: 'passkey_prepare_registration', params: { intent: JSON.parse(intentJson), origin: location.origin } }))
-        controller.signal.throwIfAborted()
-        if (pending.status === 'completed') await finish(record(pending.receipt))
-        else {
-          if (pending.status !== 'pending') throw new Error('节点未确认原注册的待处理状态。')
-          const receipt = record(await callSession(active, 'identity', { method: 'passkey_complete_registration', params: { completion, origin: location.origin } }))
-          controller.signal.throwIfAborted(); await finish(receipt)
-        }
+        const resumed = retained.resume(); running = true
+        try {
+          const pending = record(await callSession(resumed, 'identity', { method: 'passkey_prepare_registration', params: { intent: JSON.parse(intentJson), origin: location.origin } }))
+          if (pending.status === 'completed') await finish(record(pending.receipt), resumed)
+          else {
+            controller.signal.throwIfAborted()
+            if (pending.status !== 'pending') throw new Error('节点未确认原注册的待处理状态。')
+            const receipt = record(await callSession(resumed, 'identity', { method: 'passkey_complete_registration', params: { completion, origin: location.origin } }))
+            await finish(receipt, resumed)
+          }
+        } finally { running = false; if (controller.signal.aborted) release() }
       },
     }
     sensitive.current = flow
@@ -450,7 +1431,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       opened = await openAccountPackage(input.file, input.password)
       input.password = ''; controller.signal.throwIfAborted()
       if (opened.scope.account_id !== connection.scope.account_id || opened.entry.nodePublicKey !== active.channel.publicKey) throw new Error('恢复包与当前账户或可信 Node 不同。')
-      intentJson = prepareClientFirstAuthenticatorIntent(opened.material, JSON.stringify(material.pins), JSON.stringify(material.bundle), material.expiresAt)
+      const privateMaterial = opened.material, credentialExpiry = material.expiresAt
+      intentJson = await withSessionAuthorization(active, own, handle => prepareClientFirstAuthenticatorIntent(privateMaterial, handle, credentialExpiry), controller.signal)
       const pending = record(await callSession(active, 'identity', { method: 'passkey_prepare_registration', params: { intent: JSON.parse(intentJson), origin: location.origin } }))
       controller.signal.throwIfAborted()
       if (pending.status === 'completed') throw new Error('节点记录此注册已完成。请重新连接核对账户 Passkey，不会重复登记。')
@@ -458,16 +1440,17 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       registration = await registerNodePasskey({ pendingResponse: pending, signedIntent: JSON.parse(intentJson), nodePublicKey: active.channel.publicKey, signal: controller.signal, requestPrf: input.protectLocal })
       controller.signal.throwIfAborted()
       if (!opened) throw changed()
-      prepared = prepareClientFirstAuthenticatorRegistration(opened.material, JSON.stringify(material.pins), JSON.stringify(material.bundle), intentJson, registration.registration)
+      const privateMaterialForRegistration = opened.material, verifiedRegistration = registration.registration
+      prepared = await withSessionAuthorization(active, own, handle => prepareClientFirstAuthenticatorRegistration(privateMaterialForRegistration, handle, intentJson, verifiedRegistration), controller.signal)
       opened.release(); opened = null
       completion = { intent: JSON.parse(intentJson), pending_id: registration.pendingId, response: registration.response, journal: JSON.parse(prepared.completionJournalJson()) }
       setFirstPasskeyPending(true)
       const receipt = record(await callSession(active, 'identity', { method: 'passkey_complete_registration', params: { completion, origin: location.origin } }))
-      controller.signal.throwIfAborted(); await finish(receipt)
+      await finish(receipt)
     } catch (error) {
       if (!prepared || controller.signal.aborted) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
       throw error
-    } finally { input.password = ''; opened?.release(); opened = null }
+    } finally { running = false; input.password = ''; opened?.release(); opened = null; if (controller.signal.aborted) release() }
   }
   async function resumePasskeyRegistration() {
     if (!sensitive.current?.retryPasskeyRegistration) throw new Error('当前没有待核对的账户 Passkey 注册。')
@@ -481,15 +1464,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const controller = new AbortController()
     let pending: Awaited<ReturnType<typeof requestDeviceEnrollment>> | null = null
     let passkey: {
-      intentJson: string; offer: ReturnType<typeof verifyDeviceEnrollmentOffer>; qualified: ReturnType<typeof verifyPasskeyEnrollmentRequestFromOffer>
+      intentJson: string; offer: VerifiedEnrollmentOffer; qualified: ReturnType<typeof verifyPasskeyEnrollmentRequestFromOffer>
       prepared: ReturnType<typeof prepareClientPasskeyDeviceEnrollment> | null; completion: Record<string, unknown> | null
       assertion: Awaited<ReturnType<typeof assertNodePasskey>> | null
     } | null = null
     const update = (status: EnrollmentStatus) => setIncomingEnrollment({ accountId: reference.account_id, newDevicePublicKey: own.publicKey, requestedRights: pending?.rights ?? [], status })
     const flow: Sensitive = {
       cancel() {
-        controller.abort(); pending = null
-        passkey?.prepared?.free(); passkey?.qualified.free(); passkey?.offer.free()
+        controller.abort(); pending?.release(); pending = null
+        passkey?.prepared?.free(); passkey?.qualified.free()
         passkey?.assertion?.localPrf?.fill(0); passkey?.assertion?.prfSalt?.fill(0); passkey = null
       },
       async passkeyEnrollment(protectLocal) {
@@ -497,12 +1480,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (protectLocal && !own.profileId) throw new Error('本机 Passkey 保护需要独立口令设备配置。临时会话只验证账户身份。')
         const original = pending
         if (!passkey) {
-          const offer = verifyDeviceEnrollmentOffer(original.offerJson, Date.now())
+          const offer = original.offer
           try {
             const intentJson = signClientPasskeyEnrollmentIntent(JSON.stringify(original.unsignedIntent), offer)
             const qualified = verifyPasskeyEnrollmentRequestFromOffer(intentJson, offer, Date.now())
             passkey = { intentJson, offer, qualified, prepared: null, completion: null, assertion: null }
-          } catch (error) { offer.free(); throw error }
+          } catch (error) { throw error }
         }
         const attempt = passkey
         const preparedResponse = record(await callSession(active, 'identity', { method: 'passkey_prepare_device', params: { intent: JSON.parse(attempt.intentJson), origin: location.origin } }))
@@ -513,9 +1496,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           if (preparedResponse.status !== 'pending') throw new Error('节点未确认原 Passkey 接入请求。')
           if (!attempt.completion) {
             attempt.assertion?.localPrf?.fill(0); attempt.assertion?.prfSalt?.fill(0); attempt.assertion = null
-            const accountProof = record(JSON.parse(original.offerJson).payload)
             attempt.assertion = await assertNodePasskey({ pendingResponse: preparedResponse, signedIntent: JSON.parse(attempt.intentJson), nodePublicKey: reference.node_public_key,
-              pins: array(original.trust.pins).filter(value => record(record(value).domain).kind === 'account'), journal: array(accountProof.manager_journal),
+              offer: original.offer,
               signal: controller.signal, requestPrf: protectLocal,
               verify: (pendingId, response) => callSession(active, 'identity', { method: 'passkey_verify_device', params: { intent: JSON.parse(attempt.intentJson), pending_id: pendingId, response, origin: location.origin } }),
             })
@@ -539,7 +1521,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           await persistPolicyTrust(active, trust)
         }
         controller.signal.throwIfAborted()
-        const auth = await callSession(active, 'authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: own.publicKey })
+        const auth = await readAuthentication(active, trust)
         controller.signal.throwIfAborted()
         await authenticate(auth, active, trust, undefined, undefined, controller.signal)
         if (protectLocal) await saveLocalPasskeyProtection(attempt.assertion, controller.signal)
@@ -552,8 +1534,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         controller.signal.throwIfAborted()
         const status = verifyEnrollmentStatus(response, original)
         if (status.status === 'requested') { update(status.status); return }
+        if (status.status === 'completed') {
+          if (!status.completion) throw new Error('节点未确认账户设备变更已提交。')
+          const auth = await readAuthentication(active, original.trust, undefined, controller.signal)
+          controller.signal.throwIfAborted()
+          await authenticate(auth, active, original.trust, undefined, undefined, controller.signal)
+          if (sensitive.current === flow) cancelSensitive()
+          return
+        }
         if (!status.intent) throw new Error('节点未提供原设备签署的批准意图。')
-        const offer = verifyDeviceEnrollmentOffer(original.offerJson, Date.now())
+        const offer = original.offer
         let qualified: ReturnType<typeof verifyAccountEnrollmentFromOffer> | null = null
         try {
           qualified = verifyAccountEnrollmentFromOffer(JSON.stringify(status.intent), offer, Date.now())
@@ -563,13 +1553,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             controller.signal.throwIfAborted(); update('possessed'); return
           }
           if (!status.certificate || !same(status.certificate, certificate)) throw new Error('接入记录中的持有证明与此设备原证明不同。')
-          if (status.status === 'possessed') { update(status.status); return }
-          if (!status.completion) throw new Error('节点未确认账户设备变更已提交。')
-          const auth = await callSession(active, 'authenticate', { account_id: original.trust.accountId, space_id: original.trust.spaceId, device_public_key: own.publicKey })
-          controller.signal.throwIfAborted()
-          await authenticate(auth, active, original.trust, undefined, undefined, controller.signal)
-          if (sensitive.current === flow) cancelSensitive()
-        } finally { qualified?.free(); offer.free() }
+          update(status.status)
+        } finally { qualified?.free() }
       },
     }
     sensitive.current = flow
@@ -600,7 +1585,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const own = identityRef.current
       const trust = savedSpaces().find(trust => trust.spaceId === load(profileKey('last-space'))) ?? savedSpaces()[0]
       if (!trust || !own) throw new Error('此设备配置没有账户信任。请导入完整账户恢复包，或取得新设备授权。')
-      const auth = await callSession(active, 'authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: own.publicKey })
+      const auth = await readAuthentication(active, trust)
       await authenticate(auth, active, trust)
       return
     }
@@ -622,20 +1607,22 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (!saved || !downloaded || !prepared) throw new Error('请先下载完整账户恢复包，并确认妥善保存。')
         if (controller.signal.aborted || session.current !== active || submitted) throw changed()
         const created = prepared
+        const selection = ownerProjectSelection(created.authorization, created.serviceGrant.projectId, active.channel.publicKey)
         if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能保存账户信任。')
         await navigator.locks.request(profileKey('policy-trust-writer'), () => {
           if (controller.signal.aborted || session.current !== active) throw changed()
           const trust = mergeAuthorizationTrust(created.trust, savedSpaces())
           store(profileKey('policy-trusts'), [trust]); store(profileKey('last-space'), trust.spaceId); setSpaces([trust])
           saveEntry(active.entry); store(profileKey('last-entry'), active.entry)
+          store(targetKey(created.trust.spaceId, active.entry), selection)
         })
         if (controller.signal.aborted || session.current !== active) throw changed()
         submitted = true
         try {
           await callSession(active, 'identity', { method: 'bootstrap', params: { pins: created.trust.pins, authorization: created.authorization } })
           if (controller.signal.aborted) throw new Error('初始化已提交，但本地确认已取消。请重新连接核对账户状态。')
-          const auth = await callSession(active, 'authenticate', { account_id: created.trust.accountId, space_id: created.trust.spaceId, device_public_key: identityRef.current?.publicKey })
-          await authenticate(auth, active, created.trust, undefined, undefined, controller.signal)
+          const auth = await readAuthentication(active, created.trust, selection, controller.signal)
+          await authenticate(auth, active, created.trust, selection.resourceId, selection, controller.signal)
         } finally { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
       },
     }
@@ -647,68 +1634,208 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel(); throw error }
     finally { password = '' }
   }
-  async function beginRecovery(input: { file: File; password: string; connectionCard: string }) {
+  function persistRecoveryLinks(own: PublicIdentity, sourceEntry: ConnectionEntry, targetEntry: ConnectionEntry, result: CrossNodeRecoveryResult, expiresAt: number) {
+    const profile = storageProfile(own), temporary = own.profileId === null
+    if (temporary && identityRef.current !== own) throw changed()
+    const readOriginal = (key: string) => temporary ? temporaryRecords.current.get(key) : readPersistent(key, true)
+    const writeOriginal = (key: string, value: unknown) => { if (temporary) temporaryRecords.current.set(key, JSON.parse(JSON.stringify(value))); else writePersistent(key, value) }
+    const links = result.sourceReadSelections.map(item => ({ accountId: result.trust.accountId, spaceId: item.project.space, projectId: item.project.resource, entry: sourceEntry, nodePublicKey: item.targetPublicKey, expiresAt }))
+    const entries = savedEntries(profile, readOriginal)
+    const nextEntries = [...entries.filter(item => entryKey(item) !== entryKey(sourceEntry) && entryKey(item) !== entryKey(targetEntry)), sourceEntry, targetEntry]
+    writeOriginal(`profile.${profile}.connections`, nextEntries)
+    writeOriginal(`profile.${profile}.recovery-read-projects`, links)
+    for (const item of result.sourceReadSelections) {
+      const selection = { resourceId: item.project.resource, audience: { device: deriveAuthorizationId('device', item.targetPublicKey), service: deriveAuthorizationId('service', item.targetPublicKey) }, grantLeaf: item.grantLeaf }
+      writeOriginal(`profile.${profile}.target.${JSON.stringify([item.project.space, entryKey(sourceEntry)])}`, selection)
+    }
+    if (identityRef.current === own) { setEntries(nextEntries); setRecoveryReadProjects(links) }
+  }
+  async function beginCrossRecovery(input: RecoveryInput) {
     if (savedSpaces().length) throw new Error('账户恢复需要新的独立设备配置。请先锁定并创建新配置。')
+    const own = identityRef.current
+    if (!own) throw new Error('请先解锁新的独立设备配置。')
+    const target = parseConnectionCard(readInvitation(input.targetConnectionCard ?? ''))
+    if (target.kind !== 'claim') throw new Error('跨 Node 恢复需要目标 Node 本机生成的认领卡。')
+    const source = input.connectionCard.trim() ? parseConnectionCard(readInvitation(input.connectionCard)) : null
+    if (source?.entry.relay) throw new Error('原 Node 需要直接入口，公钥将与加密恢复包核对。')
+    const projects = input.sourceReadProjectIds ?? [], expiresAt = input.sourceReadExpiresAt
+    if (!projects.length || !Number.isSafeInteger(expiresAt) || !expiresAt || expiresAt <= Date.now()) throw new Error('请明确选择原 Project，并设置晚于当前时刻的只读期限。')
+    disconnect()
+    const controller = new AbortController()
+    let prepared: Awaited<ReturnType<typeof prepareCrossNodeRecovery>> | null = null
+    installCrossRecoveryFlow(controller, own, () => prepared)
+    const flow = sensitive.current
+    try {
+      prepared = await prepareCrossNodeRecovery({ file: input.file, password: input.password, newPassword: input.password, card: target,
+        sourceAddress: source?.entry.address, sourceReadProjectIds: projects, sourceReadExpiresAt: expiresAt,
+        certificateExpiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000, signal: controller.signal })
+      if (source && source.nodePublicKey !== prepared.sourceNodePublicKey) { prepared.release(); prepared = null; throw new Error('原 Node 连接卡的公钥与恢复包不一致。') }
+      controller.signal.throwIfAborted()
+      if (identityRef.current !== own || sensitive.current !== flow) throw changed()
+      setCrossRecoveryPending(true)
+      await flow?.crossPrepare?.()
+    } catch (error) {
+      if (!prepared || controller.signal.aborted) { if (sensitive.current === flow) cancelSensitive(); else flow?.cancel() }
+      throw error
+    } finally { input.password = ''; target.capability = ''; target.claimNonce = '' }
+  }
+  async function restorePendingCrossRecovery(input: { file: File; password: string }) {
+    const own = identityRef.current
+    if (!own) throw new Error('请先解锁原恢复设备配置。')
+    disconnect()
+    const controller = new AbortController()
+    let prepared: Awaited<ReturnType<typeof restoreCrossNodeRecovery>> | null = null
+    installCrossRecoveryFlow(controller, own, () => prepared)
+    const flow = sensitive.current
+    try {
+      prepared = await restoreCrossNodeRecovery({ ...input, signal: controller.signal })
+      controller.signal.throwIfAborted()
+      if (identityRef.current !== own || sensitive.current !== flow) throw changed()
+      const accountId = prepared.accountId
+      if (savedSpaces().some(trust => trust.accountId !== accountId)) throw new Error('待恢复请求属于另一账户，请使用原恢复设备配置。')
+      setCrossRecoveryPending(true)
+      await flow?.crossPrepare?.()
+    } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow?.cancel(); throw error }
+    finally { input.password = '' }
+  }
+  function installCrossRecoveryFlow(controller: AbortController, own: PublicIdentity, pending: () => Awaited<ReturnType<typeof prepareCrossNodeRecovery>> | null) {
+    let downloaded: Uint8Array | null = null
+    let result: CrossNodeRecoveryResult | null = null
+    const check = () => { controller.signal.throwIfAborted(); if (identityRef.current !== own) throw changed() }
+    const update = () => {
+      const prepared = pending(), review = prepared?.publicReview
+      if (!prepared || !review || sensitive.current !== flow || controller.signal.aborted || identityRef.current !== own) return
+      setReview({ kind: 'recovery', accountId: review.accountId, spaceId: review.spaceId, serviceGrant: review.serviceGrant, targetChanged: true,
+        sourceRead: review.sourceRead, recoveryStage: prepared.phase === 'installed' ? 'installed' : prepared.committed ? 'committed' : prepared.submitted ? 'submitted' : 'prepared' })
+    }
+    const flow: Sensitive = {
+      keepOnNetworkClose: () => !!pending() && !controller.signal.aborted,
+      retainForReconnect: entry => !!pending() && identityRef.current === own && entry.node_id === pending()!.targetEntry.node_id,
+      cancel() { controller.abort(); pending()?.release(); downloaded = null },
+      download() { check(); const prepared = pending(); if (!prepared) throw changed(); const bytes = prepared.bytes; downloadPackage(bytes, prepared.accountId); downloaded = bytes },
+      async crossPrepare() { check(); const prepared = pending(); if (!prepared) throw changed(); await prepared.prepare(); check(); update() },
+      async recover(saved) {
+        check(); const prepared = pending(), review = prepared?.publicReview
+        if (!prepared || !review) throw new Error('请先完成原跨 Node 恢复准备。')
+        if (!saved || downloaded !== prepared.bytes) throw new Error('请先下载当前恢复包，并确认已妥善保存。')
+        if (prepared.phase !== 'installed') {
+          try {
+            result = await prepared.commit(true, async next => {
+              result = next
+              await persistPolicyTrust(null, next.trust, undefined, own)
+              persistRecoveryLinks(own, prepared.sourceEntry, prepared.targetEntry, next, review.sourceRead.expiresAt)
+            })
+          } finally { update() }
+          return
+        }
+        if (!result) throw new Error('请先核对原恢复回执和当前政策。')
+        const active = await open(prepared.targetEntry, prepared.targetNodePublicKey)
+        const authorization = await readAuthentication(active, result.trust, result.selection, controller.signal)
+        await authenticate(authorization, active, result.trust, result.selection.resourceId, result.selection, controller.signal)
+        if (sensitive.current === flow) cancelSensitive()
+      },
+    }
+    sensitive.current = flow
+  }
+  async function resumeCrossRecoveryPreparation() {
+    if (!sensitive.current?.crossPrepare) throw new Error('当前没有待核对的跨 Node 恢复准备。')
+    await sensitive.current.crossPrepare()
+  }
+  function installAccountRecoveryFlow(controller: AbortController, own: PublicIdentity, pending: () => Awaited<ReturnType<typeof recoverAccount>> | null) {
+    let downloaded: Uint8Array | null = null, running = false, installed = false
+    const check = () => { controller.signal.throwIfAborted(); if (identityRef.current !== own || sensitive.current !== flow) throw changed() }
+    const update = () => {
+      const prepared = pending()
+      if (!prepared || identityRef.current !== own || sensitive.current !== flow || controller.signal.aborted) return
+      setReview({ kind: 'recovery', accountId: prepared.scope.account_id, spaceId: prepared.scope.space_id, serviceGrant: prepared.serviceGrant, targetChanged: false,
+        recoveryStage: installed ? 'installed' : prepared.committed ? 'committed' : prepared.submitted ? 'submitted' : 'prepared' })
+    }
+    const flow: Sensitive = {
+      keepOnNetworkClose: () => !!pending() && !controller.signal.aborted,
+      retainForReconnect: entry => !!pending() && identityRef.current === own && entry.node_id === nodeFingerprint(pending()!.entry.nodePublicKey),
+      cancel() { controller.abort(); pending()?.release(); downloaded = null },
+      download() { check(); const prepared = pending(); if (!prepared) throw changed(); const bytes = prepared.bytes; downloadPackage(bytes, prepared.scope.account_id); downloaded = bytes },
+      async recover(saved) {
+        check()
+        if (running) throw new Error('原账户恢复仍在核对结果，请等待当前请求。')
+        const prepared = pending()
+        if (!prepared || !saved || downloaded !== prepared.bytes) throw new Error('请先下载当前恢复包，并确认已妥善保存。')
+        if (installed) { cancelSensitive(); return }
+        running = true
+        try {
+          let active = session.current
+          if (!active) active = await open({ address: prepared.entry.endpoint, node_id: nodeFingerprint(prepared.entry.nodePublicKey), relay: false }, prepared.entry.nodePublicKey)
+          check()
+          if (active.channel.publicKey !== prepared.entry.nodePublicKey) throw new Error('当前连接与原恢复 Node 的独立公钥不同。')
+          try { await prepared.commit(true) } finally { update() }
+          check()
+          let candidate: VerifiedClientAuthorization | null = await readAuthentication(active, prepared.trust, prepared.selection, controller.signal)
+          let confirmed: VerifiedClientAuthorization | null = null
+          try {
+            check(); confirmed = prepared.phase === 'confirmed' ? candidate : prepared.confirm(candidate)
+            if (confirmed === candidate) candidate = null
+            candidate?.free(); candidate = null
+            const adopted = confirmed; confirmed = null
+            await authenticate(adopted, active, prepared.trust, prepared.selection.resourceId, prepared.selection, controller.signal)
+          } finally { candidate?.free(); confirmed?.free() }
+          check(); installed = true
+        } finally { running = false; update() }
+      },
+    }
+    sensitive.current = flow
+    return { update, call: async (method: string, params: Record<string, unknown>) => {
+      check(); const prepared = pending(), active = current()
+      if (prepared && active.channel.publicKey !== prepared.entry.nodePublicKey) throw new Error('请连接原恢复 Node 后核对同一请求。')
+      return callSession(active, 'identity', { method, params })
+    } }
+  }
+  async function restorePendingAccountRecovery(input: { file: File; password: string }) {
+    const own = identityRef.current
+    if (!own) throw new Error('请先解锁原恢复设备配置。')
+    disconnect()
+    const controller = new AbortController()
+    let prepared: Awaited<ReturnType<typeof recoverAccount>> | null = null
+    const installed = installAccountRecoveryFlow(controller, own, () => prepared), flow = sensitive.current
+    try {
+      prepared = await restoreAccountRecovery({ ...input, signal: controller.signal, call: installed.call })
+      controller.signal.throwIfAborted()
+      if (savedSpaces().some(trust => trust.accountId !== prepared!.trust.accountId)) throw new Error('待恢复请求属于另一账户，请使用原恢复设备配置。')
+      await open({ address: prepared.entry.endpoint, node_id: nodeFingerprint(prepared.entry.nodePublicKey), relay: false }, prepared.entry.nodePublicKey)
+      installed.update()
+    } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow?.cancel(); throw error }
+    finally { input.password = '' }
+  }
+  async function beginRecovery(input: RecoveryInput) {
+    if (input.targetConnectionCard?.trim()) return beginCrossRecovery(input)
+    if (savedSpaces().length) throw new Error('账户恢复需要新的独立设备配置。请先锁定并创建新配置。')
+    const own = identityRef.current
+    if (!own) throw new Error('请先解锁新的独立设备配置。')
     const version = generation.current
     let password = input.password; input.password = ''
     const opened = await openAccountPackage(input.file, password).catch(error => { password = ''; throw error })
     if (version !== generation.current) { opened.release(); password = ''; throw changed() }
-    let card: ConnectionCard | null = null
-    let publicKey: string
-    let active: Session
+    let card: ConnectionCard | null = null, active: Session
     try {
       card = input.connectionCard.trim() ? parseConnectionCard(readInvitation(input.connectionCard)) : null
-      publicKey = card?.nodePublicKey ?? opened.entry.nodePublicKey
-      if (publicKey !== opened.entry.nodePublicKey) throw new Error('换 Node 恢复需要可信源政策见证，当前还不能在此页面提交。请先连接原 Node 恢复。')
+      const publicKey = card?.nodePublicKey ?? opened.entry.nodePublicKey
+      if (publicKey !== opened.entry.nodePublicKey) throw new Error('请选择跨 Node 恢复，并明确选择原项目只读范围。')
       const target = card?.entry ?? { address: opened.entry.endpoint, node_id: nodeFingerprint(publicKey), relay: false }
       active = await open(target, publicKey)
     } catch (error) { opened.release(); password = ''; throw error }
     const controller = new AbortController()
     let prepared: Awaited<ReturnType<typeof recoverAccount>> | null = null
-    let downloaded = false
-    let submitted = false
-    const flow: Sensitive = {
-      cancel() { controller.abort(); opened.release(); password = ''; prepared?.bytes.fill(0); if (card?.kind === 'claim') { card.capability = ''; card.claimNonce = '' } },
-      download() {
-        if (controller.signal.aborted || session.current !== active || !prepared) throw changed()
-        downloadPackage(prepared.bytes, prepared.scope.account_id); downloaded = true
-      },
-      async recover(saved) {
-        if (!saved || !downloaded || !prepared) throw new Error('请先下载更新后的完整账户恢复包，并确认妥善保存。')
-        if (controller.signal.aborted || session.current !== active || submitted) throw changed()
-        const recovered = prepared
-        if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能保存账户信任。')
-        await navigator.locks.request(profileKey('policy-trust-writer'), () => {
-          if (controller.signal.aborted || session.current !== active) throw changed()
-          const trust = mergeAuthorizationTrust(recovered.trust, savedSpaces())
-          store(profileKey('policy-trusts'), [trust]); store(profileKey('last-space'), trust.spaceId); setSpaces([trust])
-          saveEntry(active.entry); store(profileKey('last-entry'), active.entry)
-        })
-        if (controller.signal.aborted || session.current !== active) throw changed()
-        submitted = true
-        try {
-          await callSession(active, 'identity', { method: 'recover', params: recovered.commit })
-          if (controller.signal.aborted) throw new Error('恢复已提交，但本地确认已取消。请重新连接核对授权状态。')
-          const auth = await callSession(active, 'authenticate', { account_id: recovered.trust.accountId, space_id: recovered.trust.spaceId, device_public_key: identityRef.current?.publicKey })
-          await authenticate(auth, active, recovered.trust, undefined, undefined, controller.signal)
-        } finally { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
-      },
-    }
-    sensitive.current = flow
+    const installed = installAccountRecoveryFlow(controller, own, () => prepared), flow = sensitive.current
     try {
-      if (!active.info.initialized && card?.kind !== 'claim') throw new Error('恢复到新 Node 需要它本机生成的认领连接卡。')
-      const request = record(JSON.parse(prepareClientRecoveryContext(opened.material, publicKey)))
-      const nonce = text(record(request.payload).nonce)
-      const response = record(await callSession(active, 'identity', { method: 'recovery_context', params: { request, ...(card?.kind === 'claim' ? { capability: card.capability } : {}) } }))
-      if (controller.signal.aborted || session.current !== active) throw changed()
-      prepared = await recoverAccount({ material: opened.material, latestBundle: response.authorization, claim: response.claim,
-        nodePublicKey: publicKey, claimNonce: nonce, endpoint: active.entry.address, password, signal: controller.signal,
-        possession: params => callSession(active, 'identity', { method: 'recovery_node_possession', params }),
-      })
-      if (controller.signal.aborted || session.current !== active) { prepared.bytes.fill(0); throw changed() }
-      setReview({ kind: 'recovery', accountId: prepared.scope.account_id, spaceId: prepared.scope.space_id, serviceGrant: prepared.serviceGrant, targetChanged: publicKey !== opened.entry.nodePublicKey })
-    } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel(); throw error }
-    finally { opened.release(); password = '' }
+      if (!active.info.initialized) throw new Error('原 Node 尚未初始化。请使用跨 Node 恢复和目标 Node 的可信认领卡。')
+      const requestJson = prepareClientRecoveryContext(opened.material, opened.entry.nodePublicKey)
+      const request = record(JSON.parse(requestJson))
+      const response = record(await callSession(active, 'identity', { method: 'recovery_context', params: { request } }))
+      controller.signal.throwIfAborted()
+      prepared = await recoverAccount({ material: opened.material, requestJson, snapshot: response.snapshot,
+        nodePublicKey: opened.entry.nodePublicKey, endpoint: active.entry.address, password, signal: controller.signal, call: installed.call })
+      controller.signal.throwIfAborted(); installed.update()
+    } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow?.cancel(); throw error }
+    finally { opened.release(); password = ''; if (card?.kind === 'claim') { card.capability = ''; card.claimNonce = '' } }
   }
   async function reencrypt(input: { file: File; oldPassword: string; password: string }) {
     const version = generation.current
@@ -727,14 +1854,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const own = await initClient(options)
     if (version !== generation.current) throw changed()
     identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
-    setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces())
+    setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces()); setRecoveryReadProjects(readRecoveryReadProjects(load(profileKey('recovery-read-projects'))))
     if (!initialInvitation) {
       const lastEntry = load(profileKey('last-entry'), true)
       if (lastEntry) await connect(parseEntry(lastEntry))
     }
   }
   function lockVault() {
-    disconnect(); lockClient(); temporaryRecords.current.clear(); identityRef.current = null; setIdentity(null); setEntries([]); setSpaces([])
+    disconnect(); lockClient(); temporaryRecords.current.clear(); identityRef.current = null; setIdentity(null); setEntries([]); setSpaces([]); setRecoveryReadProjects([])
     setPhase('initializing')
     const version = generation.current
     void clientVaultStatus().then(status => {
@@ -760,13 +1887,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     clientVaultStatus().then(status => {
       if (mounted) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
     }).catch(cause => { if (mounted) { setPhase('blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; releaseSession(previous); previous?.channel.close(); listeners.current.clear() }
+    return () => { mounted = false; generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); const previous = session.current; session.current = null; releaseSession(previous); previous?.channel.close(); listeners.current.clear(); for (const authorization of executionAuthorizations.current) authorization.free(); executionAuthorizations.current.clear() }
   }, [])
   const value: DeviceContextValue = {
     identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, review, initialInvitation,
-    connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, createEnrollmentOffer, beginRecovery, reencrypt,
-    incomingEnrollment, enrollmentRequests, managerEnrollmentActive, localProtectionNotice, refreshIncomingEnrollment, refreshEnrollmentRequests, approveEnrollmentRequest, completeEnrollmentRequest, revokeDevice, joinWithPasskey,
-    firstPasskeyPending, registerAccountPasskey, resumePasskeyRegistration,
+    connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, createEnrollmentOffer, beginRecovery, restorePendingAccountRecovery, reencrypt,
+    incomingEnrollment, enrollmentRequests, managerEnrollmentActive, localProtectionNotice, governancePending, retryGovernance, createTeam, restoreTeamCreation, changeMembership, grantProject, revokeProjectGrant, teamCreationReview, confirmTeamCreation, nodeEnrollmentReview, beginNodeEnrollment, confirmNodeEnrollment, refreshIncomingEnrollment, refreshEnrollmentRequests, approveEnrollmentRequest, completeEnrollmentRequest, revokeDevice, joinWithPasskey,
+    firstPasskeyPending, registerAccountPasskey, resumePasskeyRegistration, crossRecoveryPending, recoveryReadProjects, resumeCrossRecoveryPreparation, restorePendingCrossRecovery,
+    registerExecutionService, latestExecutionServiceResource: currentExecutionService()?.resourceId ?? '', downloadExecutionServiceBackup, executionServiceBackupAvailable: currentExecutionServiceBackup() !== null,
+    executionServiceOptions: executionServiceResources.filter(matchesExecutionService).map(item => ({ spaceId: item.spaceId, resourceId: item.resourceId })), refreshExecutionServices, selectExecutionService,
+    createRemoteExecutionShare, inspectRemoteExecutionRequest, latestRemoteExecutionShare: remoteExecutionShare && currentExecutionService()?.resourceId === remoteExecutionShare.execution.resourceId ? remoteExecutionShare.value : '',
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有待下载的恢复包。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(saved) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(saved) },

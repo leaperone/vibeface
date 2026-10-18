@@ -90,9 +90,9 @@ export function ActionButton({
   )
 }
 
-export function SubmitButton({ children, busy, variant = "default" }: { children: ReactNode; busy: boolean; variant?: "default" | "secondary" }) {
+export function SubmitButton({ children, busy, disabled, variant = "default" }: { children: ReactNode; busy: boolean; disabled?: boolean; variant?: "default" | "secondary" }) {
   return (
-    <Button type="submit" variant={variant} disabled={busy} aria-busy={busy}>
+    <Button type="submit" variant={variant} disabled={busy || disabled} aria-busy={busy}>
       {busy ? <Spinner /> : null}
       {children}
     </Button>

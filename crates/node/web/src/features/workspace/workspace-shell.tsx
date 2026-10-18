@@ -130,7 +130,7 @@ function WorkspaceLayout() {
                     <Input defaultValue={workspace.pendingConversation?.title ?? ""} readOnly={Boolean(workspace.pendingConversation)} ref={titleRef} id="conversation-title" name="title" required maxLength={200} placeholder="输入名称" />
                   </Field>
                   <div className="flex gap-2">
-                    <SubmitButton busy={creatingConversation}>创建</SubmitButton>
+                    <SubmitButton busy={creatingConversation} disabled={!workspace.writable}>创建</SubmitButton>
                     <Button type="button" size="sm" variant="ghost" onClick={() => { setCreating(false); newConversationRef.current?.focus() }}>取消</Button>
                   </div>
                 </form>
@@ -164,6 +164,10 @@ function WorkspaceLayout() {
         <SidebarFooter className="max-h-[45%] shrink-0 gap-2 overflow-y-auto border-t px-4 py-3">
           {device.spaces.length > 1 && <label className="grid gap-1 text-xs text-muted-foreground">当前空间<NativeSelect aria-label="切换空间" value={device.ready?.scope.space_id ?? ''} onChange={event => void workspace.run(() => device.selectSpace(event.target.value))}>{device.spaces.map(space => <NativeSelectOption key={space.spaceId} value={space.spaceId}>{space.spaceId.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
           {device.ready && <label className="grid min-w-0 gap-1 text-xs text-muted-foreground">当前项目<NativeSelect aria-label="切换项目" value={device.ready.project.id} onChange={event => void workspace.run(() => device.selectProject(event.target.value))}>{device.ready.projects.map(project => <NativeSelectOption key={project.id} value={project.id}>{project.id.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
+          {device.recoveryReadProjects.length > 0 && <label className="grid min-w-0 gap-1 text-xs text-muted-foreground">恢复后保留只读的原项目<NativeSelect aria-label="读取原 Node 的项目" value="" onChange={event => {
+            const link = device.recoveryReadProjects.find(item => `${item.spaceId}/${item.projectId}` === event.target.value)
+            if (link) void workspace.run(() => device.connect(link.entry, link.spaceId, link.projectId))
+          }}><NativeSelectOption value="">选择原项目，需原 Node 在线</NativeSelectOption>{device.recoveryReadProjects.map(link => <NativeSelectOption key={`${link.spaceId}/${link.projectId}`} value={`${link.spaceId}/${link.projectId}`} disabled={link.expiresAt <= Date.now()}>{link.projectId.slice(0, 17)} · {link.expiresAt <= Date.now() ? '已过期' : '只读'}</NativeSelectOption>)}</NativeSelect></label>}
           <Button type="button" size="sm" variant="ghost" className="h-8 justify-start px-0 text-muted-foreground" onClick={device.lockVault}>锁定设备仓库</Button>
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground" data-connection={workspace.connectionOnline ? "online" : "offline"} title={workspace.connectionText}>
             <span className={`size-1.5 shrink-0 rounded-full ${workspace.connectionOnline ? "bg-emerald-500" : "bg-destructive"}`} aria-hidden="true" />

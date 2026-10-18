@@ -42,7 +42,7 @@ export function prepareSend(input: {
   }
   const pending = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,
-    scheduler_node: input.schedulerNodeId, entry_node: input.entryNode, basis_heads: [...input.heads],
+    scheduler_node: input.schedulerNodeId, entry_node: input.entryNode, basis_heads: [...input.heads], attempt: null,
   }
   return { ok: true, pending, body: {
     conversation_id: pending.conversation_id, message_id: pending.message_id, text: pending.text,

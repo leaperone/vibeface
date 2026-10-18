@@ -367,22 +367,23 @@ test("locking during initialization releases candidates and preserves temporary 
 
 test("saved policy heads cannot move backwards or replace an account root", async () => {
   const source = await readFile(new URL("../../lib/authorization.ts", import.meta.url), "utf8")
-  const boundary = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source.replace(/^import .*\n/gm, ""))).toString("base64")}`)
+  const trustBoundary = await import("../../lib/authorization-trust.ts")
+  const boundary = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source.replace(/^(?:import .*|export \{ .* from .*)\n/gm, ""))).toString("base64")}`)
   assert.equal(boundary.subscriptionRenewalDelay(120000, 0), 60000)
   assert.equal(boundary.subscriptionRenewalDelay(1000, 800), 100)
   assert.throws(() => boundary.subscriptionRenewalDelay(1000, 1000))
-  const domain = { kind: "account", id: `acc2_${"a".repeat(64)}` }
+  const domain: Parameters<typeof trustBoundary.mergeAuthorizationTrust>[0]["pins"][number]["domain"] = { kind: "account", id: `acc2_${"a".repeat(64)}` }
   const firstHead = { domain, authority_epoch: 1, sequence: 1, head: `h2_${"1".repeat(64)}` }
   const latestHead = { ...firstHead, sequence: 2, head: `h2_${"2".repeat(64)}` }
-  const trust = { kind: "policy", accountId: domain.id, spaceId: `spc2_${"b".repeat(64)}`, pins: [{ domain, genesis_root: "a".repeat(64), minimum_head: firstHead }] }
+  const trust: Parameters<typeof trustBoundary.mergeAuthorizationTrust>[0] = { kind: "policy", accountId: domain.id, spaceId: `spc2_${"b".repeat(64)}`, pins: [{ domain, genesis_root: "a".repeat(64), minimum_head: firstHead }] }
   const latest = { ...trust, pins: [{ ...trust.pins[0], minimum_head: latestHead }] }
-  assert.deepEqual(boundary.mergeAuthorizationTrust(trust, [latest]).pins[0].minimum_head, latestHead)
-  assert.deepEqual(boundary.mergeAuthorizationTrust(latest, [trust]).pins[0].minimum_head, latestHead)
-  assert.throws(() => boundary.mergeAuthorizationTrust({ ...trust, accountId: `acc2_${"f".repeat(64)}` }, [latest]))
-  assert.throws(() => boundary.mergeAuthorizationTrust({ ...trust, pins: [{ ...trust.pins[0], genesis_root: "f".repeat(64) }] }, [latest]))
-  assert.throws(() => boundary.mergeAuthorizationTrust({ ...trust, pins: [{ ...trust.pins[0], minimum_head: { ...latestHead, head: `h2_${"3".repeat(64)}` } }] }, [latest]))
+  assert.deepEqual(trustBoundary.mergeAuthorizationTrust(trust, [latest]).pins[0].minimum_head, latestHead)
+  assert.deepEqual(trustBoundary.mergeAuthorizationTrust(latest, [trust]).pins[0].minimum_head, latestHead)
+  assert.throws(() => trustBoundary.mergeAuthorizationTrust({ ...trust, accountId: `acc2_${"f".repeat(64)}` }, [latest]))
+  assert.throws(() => trustBoundary.mergeAuthorizationTrust({ ...trust, pins: [{ ...trust.pins[0], genesis_root: "f".repeat(64) }] }, [latest]))
+  assert.throws(() => trustBoundary.mergeAuthorizationTrust({ ...trust, pins: [{ ...trust.pins[0], minimum_head: { ...latestHead, head: `h2_${"3".repeat(64)}` } }] }, [latest]))
   const switchedAuthority = { ...firstHead, authority_epoch: 2, sequence: 0, head: `h2_${"4".repeat(64)}` }
-  assert.deepEqual(boundary.mergeAuthorizationTrust(trust, [{ ...latest, pins: [{ ...latest.pins[0], minimum_head: switchedAuthority }] }]).pins[0].minimum_head, switchedAuthority)
+  assert.deepEqual(trustBoundary.mergeAuthorizationTrust(trust, [{ ...latest, pins: [{ ...latest.pins[0], minimum_head: switchedAuthority }] }]).pins[0].minimum_head, switchedAuthority)
 })
 
 

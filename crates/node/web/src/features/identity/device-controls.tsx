@@ -11,6 +11,8 @@ import { RecoveryControls } from './recovery-controls'
 import { EnrollmentQr } from './enrollment-qr'
 import { EnrollmentRequestsControls } from './enrollment-status'
 import { AccountPasskeyControls } from './account-passkey-controls'
+import { NodeControls } from './node-controls'
+import { TeamWorkspaceControls } from './team-workspace-controls'
 
 const button = 'min-h-10'
 const input = 'min-h-10'
@@ -162,6 +164,8 @@ export function DeviceControls() {
         </CollapsibleContent>
       </Collapsible>
     </Card>
+    <NodeControls />
+    <TeamWorkspaceControls />
     <AccountPasskeyControls />
     <RecoveryControls />
   </div>

@@ -1,9 +1,10 @@
 import { parseOperation, record } from "./model.ts"
 import type { OperationRecord } from "./types.ts"
 
-export type ReconcileRecord =
+export type ReconcileRecord = (
   | { operation: OperationRecord; actual?: unknown }
   | { operation: null; state: "not_found"; space_id: string; target_node: string; checked_at_ms: number }
+) & { verification?: "project_metadata" | "execution_receipt" | "execution_result" }
 
 export function parseReconcile(value: unknown): ReconcileRecord {
   const data = record(value)
@@ -12,6 +13,7 @@ export function parseReconcile(value: unknown): ReconcileRecord {
   return { operation: null, state: "not_found", space_id: data.space_id, target_node: data.target_node, checked_at_ms: data.checked_at_ms }
 }
 export function reconcileDecision(record: ReconcileRecord, pending: { space_id: string; operation_id: string; target_node: string; conversation_id: string; session_id: string }): "settled" | "missing" | "pending" {
+  if (record.verification === "project_metadata" || record.verification === "execution_receipt") return "pending"
   if (record.operation === null) return record.space_id === pending.space_id && record.target_node === pending.target_node ? "missing" : "pending"
   if (record.operation.request.space_id !== pending.space_id || record.operation.request.operation_id !== pending.operation_id || record.operation.request.target_node !== pending.target_node || record.operation.request.conversation_id !== pending.conversation_id || record.operation.request.session_id !== pending.session_id) throw new Error("执行设备返回了其他操作，已保留原待核对记录。")
   return ["succeeded", "failed", "rejected"].includes(record.operation.state) ? "settled" : "pending"

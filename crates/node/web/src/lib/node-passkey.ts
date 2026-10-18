@@ -1,23 +1,22 @@
-import { verifyNodePasskeyPending, verifyNodePasskeyState, verifyPasskeyAssertion } from '../../generated/vibeface_secure.js'
-import { array, record, text } from './node'
+import { verifyNodePasskeyPending, verifyNodePasskeyState, verifyPasskeyAssertionFromEnrollmentOffer } from '../../generated/vibeface_secure.js'
+import type { VerifiedEnrollmentOffer } from '../../generated/vibeface_secure.js'
+import { record, text } from './node'
 import { assertPasskey } from './passkey'
 
 export async function assertNodePasskey(input: {
   pendingResponse: unknown
   signedIntent: unknown
   nodePublicKey: string
-  pins: unknown
-  journal: unknown
+  offer: VerifiedEnrollmentOffer
   signal: AbortSignal
   requestPrf?: boolean
   verify(pendingId: string, response: Awaited<ReturnType<typeof assertPasskey>>['response']): Promise<unknown>
 }) {
   const rpId = location.hostname, origin = location.origin
   const signedIntentJson = JSON.stringify(record(input.signedIntent, 'Passkey 登记请求'))
-  const pinsJson = JSON.stringify(array(input.pins)), journalJson = JSON.stringify(array(input.journal))
   let pending: ReturnType<typeof verifyNodePasskeyPending> | null = null
   let state: ReturnType<typeof verifyNodePasskeyState> | null = null
-  let assertion: ReturnType<typeof verifyPasskeyAssertion> | null = null
+  let assertion: ReturnType<typeof verifyPasskeyAssertionFromEnrollmentOffer> | null = null
   let prf: Uint8Array | null = null
   let salt: Uint8Array | null = null
   const release = () => {
@@ -43,7 +42,8 @@ export async function assertNodePasskey(input: {
     if (!pending) throw new Error('Passkey 验证已取消。')
     const proofJson = JSON.stringify(record(verified.proof, 'Passkey 证明'))
     state = verifyNodePasskeyState(JSON.stringify(record(verified.signed_state)), pending, proofJson, JSON.stringify(browser.response), Date.now())
-    assertion = verifyPasskeyAssertion(proofJson, state.trustedStateJson(), pinsJson, journalJson, pendingId, rpId, origin, Date.now())
+    assertion = verifyPasskeyAssertionFromEnrollmentOffer(proofJson, state, input.offer, pendingId, rpId, origin, Date.now())
+    input.signal.throwIfAborted()
     const proof = record(JSON.parse(proofJson), '已验证的 Passkey 证明')
     if (prf && salt) {
       const localPrf = prf, prfSalt = salt

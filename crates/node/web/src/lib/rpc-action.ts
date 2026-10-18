@@ -1,6 +1,7 @@
 export function rpcAction(method: string, body: Record<string, unknown>) {
   switch (method) {
     case 'conversations':
+    case 'execution_share_request':
     case 'conversation': return 'conversation_read'
     case 'notifications': return 'notification_read'
     case 'create_conversation': return 'conversation_create'
@@ -9,12 +10,14 @@ export function rpcAction(method: string, body: Record<string, unknown>) {
     case 'update_task': return body.status === 'accepted' ? 'task_accept' : body.status === 'cancelled' ? 'task_cancel' : 'task_progress'
     case 'nodes':
     case 'operation':
+    case 'remote_execution_seal_status':
     case 'session': return 'operation_status_read'
     case 'reconcile': return 'operation_reconcile'
     case 'resolve_unknown': return 'operation_resolve'
     case 'ack': return 'notification_ack'
     case 'bind_execution': return 'execution_open'
-    case 'rebind_execution': return 'execution_rebind'
+    case 'rebind_execution':
+    case 'seal_remote_execution': return 'execution_rebind'
     case 'export': return 'export'
     case 'operate': {
       const request = body.request

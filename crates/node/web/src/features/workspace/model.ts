@@ -2,9 +2,11 @@ import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
   ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, OperationRecord,
   OperationRequest, OperateAction, PendingOperation, SessionRecord, TaskRecord,
-  PendingBinding, PendingConversation, PendingTask,
+  PendingBinding, PendingConversation, PendingRemoteResolution, PendingTask,
 } from "./types"
 import type { AuthorizedRequest } from "../../lib/node"
+import { deriveAuthorizationBodyHash } from "../../../generated/vibeface_secure.js"
+import { parseTrustedRemoteExecution, remoteExecutionProposal } from "../../lib/remote-execution.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
   const normalized = value.trim()
@@ -73,7 +75,7 @@ export function parseOperation(value: unknown): OperationRecord {
   const data = record(value), request = record(data.request)
   const state = text(data.state)
   if (!["accepted", "running", "unknown", "succeeded", "failed", "rejected"].includes(state)) throw new Error("未知的操作状态。")
-  return { state, request: operationRequest(request, text(request.space_id)), raw: value }
+  return { state, request: parseOperationRequest(request, text(request.space_id)), raw: value, ...(data.execution_source == null ? {} : { execution_source: record(data.execution_source) }) }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
   const data = record(value), missing = record(data.missing)
@@ -107,7 +109,7 @@ function operationIntent(value: unknown, spaceId: string): Omit<OperationRequest
     basis_heads: texts(data.basis_heads), resources: texts(data.resources), action: parseAction(data.action),
   }
 }
-function operationRequest(value: unknown, spaceId: string): OperationRequest {
+export function parseOperationRequest(value: unknown, spaceId: string): OperationRequest {
   const data = record(value), request = operationIntent(data, spaceId), proof = record(data.binding), binding = record(proof.binding)
   if (!text(proof.signature)) throw new Error("待核对操作缺少绑定签名。")
   for (const key of ["space_id", "conversation_id", "task_id", "target_node", "session_id"] as const) {
@@ -117,22 +119,23 @@ function operationRequest(value: unknown, spaceId: string): OperationRequest {
 }
 export function parsePending(value: unknown, spaceId: string): PendingOperation[] {
   return list(value).map((item) => {
-    const data = record(item), request = operationRequest(data.request, spaceId)
+    const data = record(item), request = parseOperationRequest(data.request, spaceId)
     for (const key of ["space_id", "operation_id", "target_node", "conversation_id", "session_id"] as const) {
       if (data[key] !== request[key]) throw new Error("待核对操作内容不一致。")
     }
-    return { space_id: request.space_id, operation_id: request.operation_id, target_node: request.target_node, conversation_id: request.conversation_id, session_id: request.session_id, request }
+    return { space_id: request.space_id, operation_id: request.operation_id, target_node: request.target_node, conversation_id: request.conversation_id, session_id: request.session_id, request, attempt: parseAttempt(data.attempt), ...(data.remote === undefined ? {} : { remote: parseTrustedRemoteExecution(data.remote) }), ...(data.execution_session_receipt === undefined ? {} : { execution_session_receipt: record(data.execution_session_receipt) }) }
   })
 }
 export function parsePendingMessages(value: unknown): PendingMessage[] {
   return list(value).map((item) => {
     const data = record(item)
-    return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), scheduler_node: text(data.scheduler_node), entry_node: text(data.entry_node), basis_heads: texts(data.basis_heads) }
+    return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), scheduler_node: text(data.scheduler_node), entry_node: text(data.entry_node), basis_heads: texts(data.basis_heads), attempt: parseAttempt(data.attempt) }
   })
 }
 export function parsePendingConversation(value: unknown): PendingConversation | null {
   if (value === null) return null
-  return conversation(value)
+  const data = record(value)
+  return { ...conversation(data), attempt: parseAttempt(data.attempt) }
 }
 export function parsePendingTasks(value: unknown): PendingTask[] {
   return list(value).map((item) => {
@@ -146,12 +149,26 @@ function parseAuthorizedRequest(value: unknown): AuthorizedRequest {
   const data = record(value)
   return { body: record(data.body), invocation: record(data.invocation) }
 }
+function parseAttempt(value: unknown): AuthorizedRequest | null {
+  return value == null ? null : parseAuthorizedRequest(value)
+}
 export function parsePendingBindings(value: unknown, spaceId: string): PendingBinding[] {
   return list(value).map((item) => {
     const data = record(item), request = operationIntent(data.request, spaceId), task = parseTask(data.task)
     if (request.action.type !== "open" || request.task_id !== task.task_id) throw new Error("待核对绑定与工单不一致。")
-    return { request: { ...request, action: request.action }, task, attempt: data.attempt === null ? null : parseAuthorizedRequest(data.attempt) }
+    return { request: { ...request, action: request.action }, task, attempt: data.attempt === null ? null : parseAuthorizedRequest(data.attempt), ...(data.remote === undefined ? {} : { remote: parseTrustedRemoteExecution(data.remote) }) }
   })
+}
+export function parsePendingRemoteResolutions(value: unknown, spaceId: string): PendingRemoteResolution[] {
+  const parsed = list(value).map(item => {
+    const data = record(item), request = parseOperationRequest(data.request, spaceId), body = record(data.body)
+    if (body.method !== 'resolve_unknown' || body.space_id !== spaceId || body.operation_id !== request.operation_id || typeof body.authorization_id !== 'string' || !body.authorization_id || body.authorization_id === request.operation_id) throw new Error('待核对远端裁定缺少独立授权编号或原操作。')
+    const remote = parseTrustedRemoteExecution(data.remote), attempt = parseAttempt(data.attempt)
+    if (remoteExecutionProposal(remote).purpose !== 'resolution' || attempt && deriveAuthorizationBodyHash(JSON.stringify(attempt.body)) !== deriveAuthorizationBodyHash(JSON.stringify(body))) throw new Error('待核对裁定的授权用途或完整签名正文不同。')
+    return { request, remote, observation: record(data.observation), body, context: record(data.context), attempt }
+  })
+  if (new Set(parsed.map(item => item.request.operation_id)).size !== parsed.length) throw new Error('同一原操作存在多份待核对裁定，请保留记录并核查。')
+  return parsed
 }
 export function frontierMap(value: unknown) {
   const next: Record<string, string[]> = {}

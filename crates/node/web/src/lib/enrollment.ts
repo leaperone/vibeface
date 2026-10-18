@@ -1,5 +1,6 @@
-import { createClientEnrollmentIntent, validTarget } from '../../transport.js'
+import { beginClientEnrollmentOfferImport, buildClientEnrollmentPolicyReadRequest, createClientEnrollmentIntent, validTarget } from '../../transport.js'
 import { verifyDeviceEnrollmentOffer } from '../../generated/vibeface_secure.js'
+import type { EnrollmentOfferDescriptor, VerifiedEnrollmentOffer } from '../../generated/vibeface_secure.js'
 import { parseAuthorizationTrust } from './authorization'
 import { array, record, same, strings, text } from './node'
 import type { EnrollmentReference } from './enrollment-reference'
@@ -29,29 +30,80 @@ export function parseEnrollmentRequest(value: unknown): EnrollmentRequest {
   }
 }
 
+function inspectEnrollmentOffer(descriptor: EnrollmentOfferDescriptor, reference: EnrollmentReference) {
+  if (descriptor.offerHash() !== reference.offer_hash || descriptor.accountId() !== reference.account_id || descriptor.expiresAtMs() !== reference.expires_at_ms
+    || !same(JSON.parse(descriptor.entryJson()), { endpoint: reference.endpoint, node_public_key: reference.node_public_key })) throw new Error('取得的设备邀请与扫码时固定的账户、节点或摘要不同。')
+  const pins = array(JSON.parse(descriptor.pinsJson()))
+  const space = pins.map(value => record(record(value).domain)).find(domain => domain.kind === 'space')
+  const trust = parseAuthorizationTrust({ kind: 'policy', accountId: reference.account_id, spaceId: text(space?.id), pins })
+  return { trust, rights: strings(JSON.parse(descriptor.requestedRightsJson())) }
+}
+
 export function checkEnrollmentOffer(offerJson: string, reference: EnrollmentReference) {
-  const verified = verifyDeviceEnrollmentOffer(offerJson, Date.now())
+  const descriptor = verifyDeviceEnrollmentOffer(offerJson, Date.now())
+  try { return inspectEnrollmentOffer(descriptor, reference) }
+  finally { descriptor.free() }
+}
+
+export async function readVerifiedEnrollmentOffer(offerJson: string, reference: EnrollmentReference, ownPublicKey: string, call: EnrollmentCall, signal: AbortSignal): Promise<VerifiedEnrollmentOffer> {
+  const read = async (method: string, params: Record<string, unknown>) => {
+    signal.throwIfAborted()
+    const response = await call(method, params)
+    signal.throwIfAborted()
+    return record(response)
+  }
+  signal.throwIfAborted()
+  const descriptor = verifyDeviceEnrollmentOffer(offerJson, Date.now())
+  let importer: ReturnType<typeof beginClientEnrollmentOfferImport> | null = null
+  let offer: VerifiedEnrollmentOffer | null = null
   try {
-    if (verified.offerHash() !== reference.offer_hash || verified.accountId() !== reference.account_id || verified.expiresAtMs() !== reference.expires_at_ms
-      || !same(JSON.parse(verified.entryJson()), { endpoint: reference.endpoint, node_public_key: reference.node_public_key })) throw new Error('取得的设备邀请与扫码时固定的账户、节点或摘要不同。')
-    const pins = array(JSON.parse(verified.pinsJson()))
-    const space = pins.map(value => record(record(value).domain)).find(domain => domain.kind === 'space')
-    const trust = parseAuthorizationTrust({ kind: 'policy', accountId: reference.account_id, spaceId: text(space?.id), pins })
-    return { trust, rights: strings(JSON.parse(verified.requestedRightsJson())), unsignedIntent: record(JSON.parse(createClientEnrollmentIntent(verified))) }
-  } finally { verified.free() }
+    inspectEnrollmentOffer(descriptor, reference)
+    const requestJson = buildClientEnrollmentPolicyReadRequest(descriptor, Math.min(reference.expires_at_ms, Date.now() + 120_000))
+    const request = record(JSON.parse(requestJson)), reader = record(request.payload)
+    if (request.issuer !== ownPublicKey || reader.reader_public_key !== ownPublicKey || reader.target_public_key !== ownPublicKey) throw new Error('设备邀请策略读取请求未绑定当前浏览器的独立公钥。')
+    const begun = await read('enrollment_policy_read_begin', {
+      credential: { purpose: 'browser_device', credential: JSON.parse(offerJson) }, request,
+    })
+    importer = beginClientEnrollmentOfferImport(descriptor, requestJson, JSON.stringify(begun.snapshot), reference.node_public_key)
+    for (;;) {
+      const response = await read('enrollment_policy_read_page', record(JSON.parse(importer.pageRequestJson())))
+      const page = record(response.page)
+      importer.appendPage(JSON.stringify(page), Date.now())
+      if (record(page.payload).complete === true) break
+    }
+    const witnessParams = record(JSON.parse(importer.pageRequestJson()))
+    const witnessed = await read('enrollment_policy_read_witness', { ...witnessParams, cursor: null })
+    offer = importer.finish(JSON.stringify(record(witnessed.witness)), Date.now())
+    signal.throwIfAborted()
+    const verifiedOffer = offer
+    offer = null
+    return verifiedOffer
+  } finally { offer?.free(); importer?.free(); descriptor.free() }
 }
 
 export async function requestDeviceEnrollment(reference: EnrollmentReference, ownPublicKey: string, call: EnrollmentCall, signal: AbortSignal) {
   signal.throwIfAborted()
   const response = record(await call('enrollment_offer_get', { account_id: reference.account_id, offer_hash: reference.offer_hash }))
   signal.throwIfAborted()
-  const offerJson = JSON.stringify(record(response.offer)), checked = checkEnrollmentOffer(offerJson, reference)
-  if (checked.unsignedIntent.new_device_public_key !== ownPublicKey) throw new Error('设备接入意图未绑定当前浏览器的独立公钥。')
-  const pending = record(await call('enrollment_request', { account_id: reference.account_id, offer_hash: reference.offer_hash, new_device_public_key: ownPublicKey, intent: checked.unsignedIntent }))
-  signal.throwIfAborted()
-  const requestId = text(pending.request_id), nonce = validTarget(pending.nonce)
-  if (!/^h2_[a-f0-9]{64}$/.test(requestId) || pending.status !== 'requested') throw new Error('节点未确认原始设备接入申请。')
-  return { ...checked, reference, offerJson, requestId, nonce }
+  const offerJson = JSON.stringify(record(response.offer))
+  let offer: VerifiedEnrollmentOffer | null = await readVerifiedEnrollmentOffer(offerJson, reference, ownPublicKey, call, signal)
+  try {
+    const checked = inspectEnrollmentOffer(offer, reference)
+    const unsignedIntent = record(JSON.parse(createClientEnrollmentIntent(offer)))
+    if (unsignedIntent.new_device_public_key !== ownPublicKey) throw new Error('设备接入意图未绑定当前浏览器的独立公钥。')
+    signal.throwIfAborted()
+    const pending = record(await call('enrollment_request', { account_id: reference.account_id, offer_hash: reference.offer_hash, new_device_public_key: ownPublicKey, intent: unsignedIntent }))
+    signal.throwIfAborted()
+    const requestId = text(pending.request_id), nonce = validTarget(pending.nonce)
+    if (!/^h2_[a-f0-9]{64}$/.test(requestId) || pending.status !== 'requested') throw new Error('节点未确认原始设备接入申请。')
+    const verifiedOffer = offer
+    offer = null
+    let released = false
+    return {
+      ...checked, reference, offerJson, requestId, nonce, unsignedIntent, offer: verifiedOffer,
+      release() { if (!released) { released = true; verifiedOffer.free() } },
+    }
+  } finally { offer?.free() }
 }
 
 export function verifyEnrollmentStatus(value: unknown, original: Awaited<ReturnType<typeof requestDeviceEnrollment>>) {

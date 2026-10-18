@@ -1,4 +1,4 @@
-import init, { Identity, Handshake, signClientInvocation, signForwardedClientInvocation, signClientPrepareIntent, prepareAccountCreation, prepareAccountRecovery, buildRecoveryContextRequest, createDeviceEnrollmentOffer, createDeviceEnrollmentIntentFromOffer, signDeviceEnrollmentIntent, signDeviceEnrollmentPossession, prepareAccountDeviceEnrollment, prepareAccountDeviceRevocation, signPasskeyEnrollmentIntentFromOffer, signPasskeyEnrollmentPossession, preparePasskeyDeviceEnrollmentFromOffer, buildFirstAuthenticatorEnrollmentIntent, prepareFirstAuthenticatorRegistration } from "/generated/vibeface_secure.js";
+import init, { Identity, Handshake, signClientInvocation, signForwardedClientInvocation, signClientPrepareIntent, prepareAccountCreation, prepareAccountRecovery, buildRecoveryContextRequest, createDeviceEnrollmentOffer, createDeviceEnrollmentIntentFromOffer, signDeviceEnrollmentIntent, signDeviceEnrollmentPossession, prepareAccountDeviceEnrollment, prepareAccountDeviceRevocation, signPasskeyEnrollmentIntentFromOffer, signPasskeyEnrollmentPossession, preparePasskeyDeviceEnrollmentFromOffer, buildFirstAuthenticatorEnrollmentIntent, prepareFirstAuthenticatorRegistration, prepareAccountNodeEnrollment, prepareTeamCreation, restorePreparedTeamCreation, prepareSpaceMembershipChange, prepareDirectionalGrant, prepareSpaceGrantRevocation, buildCrossNodeRecoveryRequest, prepareCrossNodeAccountRecovery, restorePreparedCrossNodeRecoveryCommit, prepareExecutionServiceRegistration, prepareRemoteExecutionShare, buildClientPolicyReadRequest as nativeBuildClientPolicyReadRequest, beginClientPolicyImport as nativeBeginClientPolicyImport, verifyClientPolicySelections as nativeVerifyClientPolicySelections, buildClientPolicyAuthConfirmRequest as nativeBuildClientPolicyAuthConfirmRequest, buildAccountRecoveryPending, restoreAccountRecoveryPending, buildRemoteShareIntent, buildRemoteSharePolicyReadRequest, prepareAccountNodeEnrollmentStatus, buildEnrollmentOfferPolicyReadRequest, beginEnrollmentOfferImport, buildRemoteExecutionPolicyReadIntent, buildRemoteExecutionHistoryPolicyReadIntent } from "./generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -343,14 +343,63 @@ export function signAuthorizedClientPrepare(authorization, bodyJson, contextJson
   return signClientPrepareIntent(authorization, bodyJson, contextJson, expectedAction, operationId, gatewayPublicKey, identity, Date.now());
 }
 
+export function prepareRemoteClientExecution(remote, authorization, bodyJson, contextJson, expectedAction, operationId, gatewayPublicKey) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return remote.prepare(authorization, bodyJson, contextJson, expectedAction, operationId, gatewayPublicKey, identity, Date.now());
+}
+
+export function signRemoteClientExecution(remote, authorization, templateJson, bodyJson, expectedAction, operationId, gatewayPublicKey) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return remote.sign(authorization, templateJson, bodyJson, expectedAction, operationId, gatewayPublicKey, identity, Date.now());
+}
+
+export function buildClientCrossNodeRecoveryRequest(materialJson, nextRoot, claim, resourceJson, readExpiresAt, requestExpiresAt) {
+  if (!identity) throw new Error("请先解锁新的独立设备配置。");
+  return buildCrossNodeRecoveryRequest(materialJson, nextRoot, identity, claim, resourceJson, readExpiresAt, Date.now(), requestExpiresAt);
+}
+
+export function prepareClientCrossNodeAccountRecovery(materialJson, context, nextRoot, certificateExpiresAt) {
+  if (!identity) throw new Error("请先解锁新的独立设备配置。");
+  return prepareCrossNodeAccountRecovery(materialJson, context, nextRoot, identity, certificateExpiresAt, Date.now());
+}
+
+export function restoreClientCrossNodeRecovery(materialJson) {
+  if (!identity) throw new Error("请先解锁原恢复设备配置后继续。");
+  const prepared = restorePreparedCrossNodeRecoveryCommit(materialJson, Date.now());
+  try {
+    const client = prepared.clientIdentity();
+    try {
+      if (client.publicKeyHex() !== identity.publicKeyHex()) throw new Error("请解锁原恢复设备配置后继续。");
+      return prepared;
+    } finally { client.free(); }
+  } catch (error) { prepared.free(); throw error; }
+}
+
 export function prepareClientAccountCreation(root, recovery, claim, certificateExpiresAt) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
   return prepareAccountCreation(root, recovery, identity, claim, certificateExpiresAt, Date.now());
 }
 
-export function prepareClientAccountRecovery(materialJson, latestBundleJson, nextRoot, claim, certificateExpiresAt) {
+export function prepareClientAccountRecovery(materialJson, context, nextRoot, certificateExpiresAt) {
   if (!identity) throw new Error("请先解锁新的独立设备配置。");
-  return prepareAccountRecovery(materialJson, latestBundleJson, nextRoot, identity, claim, certificateExpiresAt, Date.now());
+  return prepareAccountRecovery(materialJson, context, nextRoot, identity, certificateExpiresAt, Date.now());
+}
+
+export function buildClientAccountRecoveryPending(prepared, created, nextRoot, previousMaterialJson, endpoint) {
+  if (!identity) throw new Error("请先解锁原恢复设备配置。");
+  return buildAccountRecoveryPending(prepared, created, nextRoot, identity, previousMaterialJson, endpoint, Date.now());
+}
+
+export function restoreClientAccountRecovery(pendingJson) {
+  if (!identity) throw new Error("请先解锁原恢复设备配置。");
+  const pending = restoreAccountRecoveryPending(pendingJson, Date.now());
+  try {
+    const client = pending.clientIdentity();
+    try {
+      if (client.publicKeyHex() !== identity.publicKeyHex()) throw new Error("请解锁原恢复设备配置后继续。");
+      return pending;
+    } finally { client.free(); }
+  } catch (error) { pending.free(); throw error; }
 }
 
 export function prepareClientRecoveryContext(materialJson, expectedNodePublicKey) {
@@ -359,9 +408,9 @@ export function prepareClientRecoveryContext(materialJson, expectedNodePublicKey
   return buildRecoveryContextRequest(materialJson, identity, expectedNodePublicKey, now, now + 120000);
 }
 
-export function createClientEnrollmentOffer(accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, pinsJson, bundleJson) {
+export function createClientEnrollmentOffer(accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, authorization) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return createDeviceEnrollmentOffer(identity, accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, pinsJson, bundleJson, Date.now());
+  return createDeviceEnrollmentOffer(identity, accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, authorization, Date.now());
 }
 
 export function createClientEnrollmentIntent(offer) {
@@ -369,9 +418,9 @@ export function createClientEnrollmentIntent(offer) {
   return createDeviceEnrollmentIntentFromOffer(offer, identity, Date.now());
 }
 
-export function approveClientEnrollmentIntent(intentJson, pinsJson, bundleJson) {
+export function approveClientEnrollmentIntent(intentJson, authorization) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return signDeviceEnrollmentIntent(intentJson, identity, pinsJson, bundleJson, Date.now());
+  return signDeviceEnrollmentIntent(intentJson, identity, authorization, Date.now());
 }
 
 export function signClientEnrollmentPossession(qualified, pendingNonce) {
@@ -379,14 +428,14 @@ export function signClientEnrollmentPossession(qualified, pendingNonce) {
   return signDeviceEnrollmentPossession(qualified, identity, pendingNonce, Date.now());
 }
 
-export function prepareClientDeviceEnrollment(qualified, possessionJson, pinsJson, bundleJson) {
+export function prepareClientDeviceEnrollment(qualified, possessionJson, authorization) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return prepareAccountDeviceEnrollment(qualified, possessionJson, identity, pinsJson, bundleJson, Date.now());
+  return prepareAccountDeviceEnrollment(qualified, possessionJson, identity, authorization, Date.now());
 }
 
-export function prepareClientDeviceRevocation(accountId, deviceId, pinsJson, bundleJson) {
+export function prepareClientDeviceRevocation(accountId, deviceId, authorization) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return prepareAccountDeviceRevocation(accountId, deviceId, identity, pinsJson, bundleJson, Date.now());
+  return prepareAccountDeviceRevocation(accountId, deviceId, identity, authorization, Date.now());
 }
 
 export function signClientPasskeyEnrollmentIntent(intentJson, offer) {
@@ -404,14 +453,89 @@ export function prepareClientPasskeyDeviceEnrollment(intentJson, certificateJson
   return preparePasskeyDeviceEnrollmentFromOffer(intentJson, certificateJson, proofJson, identity, offer, Date.now());
 }
 
-export function prepareClientFirstAuthenticatorIntent(materialJson, pinsJson, bundleJson, credentialExpiresAt) {
+export function prepareClientFirstAuthenticatorIntent(materialJson, authorization, credentialExpiresAt) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return buildFirstAuthenticatorEnrollmentIntent(materialJson, pinsJson, bundleJson, identity, Date.now(), credentialExpiresAt);
+  return buildFirstAuthenticatorEnrollmentIntent(materialJson, authorization, identity, Date.now(), credentialExpiresAt);
 }
 
-export function prepareClientFirstAuthenticatorRegistration(materialJson, pinsJson, bundleJson, intentJson, registration) {
+export function prepareClientFirstAuthenticatorRegistration(materialJson, authorization, intentJson, registration) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return prepareFirstAuthenticatorRegistration(materialJson, pinsJson, bundleJson, intentJson, registration, Date.now());
+  return prepareFirstAuthenticatorRegistration(materialJson, authorization, intentJson, registration, Date.now());
+}
+
+export function prepareClientAccountNodeEnrollment(materialJson, authorization, claim, certificateExpiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareAccountNodeEnrollment(materialJson, authorization, identity, claim, certificateExpiresAt, Date.now());
+}
+
+export function prepareClientTeamCreation(root, ownerAccountId, targetNodePublicKey, recoveryPublicKey, sourceProjectResourceId, authorization, certificateExpiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareTeamCreation(root, identity, ownerAccountId, targetNodePublicKey, recoveryPublicKey, sourceProjectResourceId, authorization, certificateExpiresAt, Date.now());
+}
+
+export function restoreClientTeamCreation(materialJson, authorization) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return restorePreparedTeamCreation(materialJson, identity, authorization, Date.now());
+}
+
+export function prepareClientMembershipChange(intentJson, authorization) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareSpaceMembershipChange(intentJson, identity, authorization, Date.now());
+}
+
+export function prepareClientDirectionalGrant(intentJson, authorization) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareDirectionalGrant(intentJson, identity, authorization, Date.now());
+}
+
+export function prepareClientGrantRevocation(spaceId, grantHash, authorization) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareSpaceGrantRevocation(spaceId, grantHash, identity, authorization, Date.now());
+}
+
+export function buildClientPolicyReadRequest(account, space, nodePublicKey, pinsJson, selectionJson, expiresAt) {
+  if (!identity) throw new Error("请先解锁设备配置。");
+  return nativeBuildClientPolicyReadRequest(account, space, identity, nodePublicKey, pinsJson, selectionJson, Date.now(), expiresAt);
+}
+
+export function beginClientPolicyImport(pinsJson, requestJson, snapshotJson, nodePublicKey) {
+  if (!identity) throw new Error("请先解锁设备配置。");
+  return nativeBeginClientPolicyImport(pinsJson, requestJson, snapshotJson, identity, nodePublicKey, Date.now());
+}
+
+export function verifyClientPolicySelections(pinsJson, requestJson, pageJson, nodePublicKey) {
+  if (!identity) throw new Error("请先解锁设备配置。");
+  return nativeVerifyClientPolicySelections(pinsJson, requestJson, pageJson, identity, nodePublicKey, Date.now());
+}
+
+export function buildClientPolicyAuthConfirmRequest(authorization, expiresAt) {
+  if (!identity) throw new Error("请先解锁设备配置。");
+  return nativeBuildClientPolicyAuthConfirmRequest(authorization, identity, Date.now(), expiresAt);
+}
+
+export function prepareClientExecutionServiceRegistration(source, management, owner, ownerMaterialJson, targetNodePublicKey, expiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareExecutionServiceRegistration(source, management, owner, ownerMaterialJson, identity, targetNodePublicKey, Date.now(), expiresAt);
+}
+
+export function buildClientRemoteShareIntent(intentJson, source) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return buildRemoteShareIntent(intentJson, source, identity, Date.now());
+}
+
+export function buildClientRemoteSharePolicyReadRequest(intentJson, pinsJson, nodePublicKey, expiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return buildRemoteSharePolicyReadRequest(intentJson, identity, pinsJson, nodePublicKey, Date.now(), expiresAt);
+}
+
+export function prepareClientRemoteExecutionShare(intentJson, authorization, source) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareRemoteExecutionShare(intentJson, identity, authorization, source, Date.now());
+}
+
+export function signRemoteExecutionObservation(remote, originalJson, authorizationId, pinnedGatewayPublicKey) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return remote.signObservationRequest(originalJson, authorizationId, pinnedGatewayPublicKey, identity, Date.now());
 }
 
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
@@ -522,4 +646,29 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     },
     close() { fail(new Error("已断开设备连接。")); },
   };
+}
+
+export function prepareClientAccountNodeEnrollmentStatus(prepared, expiresAt) {
+  if (!identity) throw new Error("请先解锁原账户设备配置。");
+  return prepareAccountNodeEnrollmentStatus(prepared, identity, Date.now(), expiresAt);
+}
+
+export function buildClientEnrollmentPolicyReadRequest(offer, expiresAt) {
+  if (!identity) throw new Error("请先解锁新的独立设备配置。");
+  return buildEnrollmentOfferPolicyReadRequest(offer, identity, Date.now(), expiresAt);
+}
+
+export function beginClientEnrollmentOfferImport(offer, requestJson, snapshotJson, nodePublicKey) {
+  if (!identity) throw new Error("请先解锁新的独立设备配置。");
+  return beginEnrollmentOfferImport(offer, requestJson, snapshotJson, identity, nodePublicKey, Date.now());
+}
+
+export function buildClientRemoteExecutionPolicyReadIntent(source, inputJson, expiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return buildRemoteExecutionPolicyReadIntent(source, inputJson, identity, Date.now(), expiresAt);
+}
+
+export function buildClientRemoteExecutionHistoryPolicyReadIntent(source, inputJson, independentPinsJson, expiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return buildRemoteExecutionHistoryPolicyReadIntent(source, inputJson, independentPinsJson, identity, Date.now(), expiresAt);
 }
