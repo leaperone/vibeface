@@ -1306,6 +1306,11 @@ pub fn revalidate_client_policy_authorization(
             Some(&selection.resource),
             bootstrap::timestamp(now_ms)?,
         )?;
+        bind_client_policy_source_node(
+            &mut auth,
+            &provenance.request.payload.node_public_key,
+            bootstrap::timestamp(now_ms)?,
+        )?;
         require(
             auth.heads == authorization.heads && auth.audience == authorization.audience,
             "client policy revalidation requires explicit finite synchronization",
