@@ -312,6 +312,7 @@ pub fn verify_account_enrollment(
     signed: &Signed<DeviceEnrollmentIntent>,
     now_ms: u64,
 ) -> Result<VerifiedAccountEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     signed.verify_signature()?;
     let i = &signed.payload;
     current_heads(state, &i.account, &i.expected_heads)?;
@@ -359,6 +360,7 @@ pub fn verify_authenticator_enrollment(
     signed: &Signed<AuthenticatorEnrollmentIntent>,
     now_ms: u64,
 ) -> Result<VerifiedAuthenticatorEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     signed.verify_signature()?;
     let i = &signed.payload;
     current_heads(state, &i.account, &i.expected_heads)?;
@@ -1079,6 +1081,7 @@ pub fn verify_passkey_enrollment_request(
     signed: &Signed<DeviceEnrollmentIntent>,
     now_ms: u64,
 ) -> Result<VerifiedPasskeyEnrollmentRequest> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     signed.verify_signature()?;
     let i = &signed.payload;
     current_heads(state, &i.account, &i.expected_heads)?;
@@ -1122,6 +1125,7 @@ pub fn verify_passkey_device_enrollment(
     proof: &PasskeyEnrollmentProof,
     now_ms: u64,
 ) -> Result<VerifiedEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     require(
         canonical(proof)?.len() <= MAX_PROOF_BYTES,
         "passkey enrollment proof too large",

@@ -312,6 +312,7 @@ pub fn verify_enrollment_offer_history(
     signed: &Signed<EnrollmentOffer>,
     now: u64,
 ) -> Result<()> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     verify_enrollment_offer_current(&retained_offer_state(state, signed)?, signed, now).map(|_| ())
 }
 
@@ -352,6 +353,7 @@ pub fn verify_enrollment_intent_in_state(
     expected_new_device: &PublicKey,
     now: u64,
 ) -> Result<()> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     verify_enrollment_offer_current(state, signed, now)?;
     verify_intent_descriptor(signed, intent, expected_new_device, now)?;
     independent_device_key(state, &intent.account, expected_new_device)
@@ -364,6 +366,7 @@ pub fn verify_enrollment_record_history(
     approval: Option<&Signed<DeviceEnrollmentIntent>>,
     now: u64,
 ) -> Result<()> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let retained = retained_offer_state(state, offer)?;
     verify_enrollment_intent_in_state(
         &retained,
@@ -390,6 +393,7 @@ pub fn verify_enrollment_offer_policy_read(
     noise: &PublicKey,
     now: u64,
 ) -> Result<ExecutionProofUsage> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let mut usage = verify_enrollment_offer_current(state, offer, now)?;
     require(
         request.payload.purpose == EnrollmentPolicyPurpose::BrowserDevice
