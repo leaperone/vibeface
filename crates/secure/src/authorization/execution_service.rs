@@ -864,7 +864,8 @@ pub fn select_execution_service_management(
             grant_cursor_json,
         ))?;
         let selection = if let Some(candidate) = candidate {
-            match authorization(
+            let mut candidate_budget = Budget::default();
+            let checked = authorization(
                 snapshot.state(),
                 &source.scope.account_id,
                 &signer,
@@ -872,8 +873,10 @@ pub fn select_execution_service_management(
                 candidate,
                 &target,
                 now,
-                &mut Budget::default(),
-            ) {
+                &mut candidate_budget,
+            );
+            usage.record_budget(&candidate_budget)?;
+            match checked {
                 Ok(verified) => {
                     usage.record_budget(&verified.budget)?;
                     usage.record_chain_depth(verified.max_depth);
@@ -1258,7 +1261,11 @@ pub fn finish_execution_service_registration(
             entry: prepared.material.entry.clone(),
             policy_checkpoint: None,
         };
-        bootstrap::recovery::compact_recovery_material_in_state(&mut material, &owner_state, now)?;
+        bootstrap::recovery::compact_recovery_material_in_state(
+            &mut material,
+            &owner_state,
+            accepted,
+        )?;
         usage.merge(&bootstrap::recovery::recovery_material_usage(&material)?);
         let material_json =
             zeroize::Zeroizing::new(json(&material).map_err(|_| {

@@ -451,6 +451,16 @@ pub fn verify_client_policy_auth_confirm(
     witness.verify_signature()?;
     confirm.verify_signature()?;
     window(
+        snapshot.payload.issued_at_ms,
+        snapshot.payload.expires_at_ms,
+        now,
+    )?;
+    window(
+        witness.payload.issued_at_ms,
+        witness.payload.expires_at_ms,
+        now,
+    )?;
+    window(
         confirm.payload.issued_at_ms,
         confirm.payload.expires_at_ms,
         now,
@@ -468,6 +478,8 @@ pub fn verify_client_policy_auth_confirm(
             && snapshot.payload.saved_pins_hash
                 == client_policy_saved_pins_hash(&read.payload.saved_pins)?
             && confirm.payload.expires_at_ms <= read.payload.expires_at_ms
+            && confirm.payload.expires_at_ms <= snapshot.payload.expires_at_ms
+            && confirm.payload.expires_at_ms <= witness.payload.expires_at_ms
             && confirm.issuer == *noise
             && confirm.payload.version == AUTH_VERSION
             && confirm.payload.device_public_key == *noise
