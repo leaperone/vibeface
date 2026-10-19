@@ -87,6 +87,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         validate_role_dependencies(&self.roles)?;
+        self.network.validate()?;
         let url = browser_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
             h == "localhost"
