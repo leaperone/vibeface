@@ -49,7 +49,7 @@ pub(super) fn pending_requests(
         }).collect()
 }
 
-fn request_command(params: &Value) -> Option<String> {
+pub(super) fn request_command(params: &Value) -> Option<String> {
     params["command"].as_str().map(str::to_owned).or_else(|| {
         params["command"].as_array().map(|command| {
             command

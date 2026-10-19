@@ -1,6 +1,6 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
-  AgentTaskRecord, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
+  AgentTaskRecord, AnsweredRequest, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
   HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
 } from "./types"
 
@@ -106,6 +106,14 @@ function nativeSession(value: unknown): NativeSessionRecord {
     target_node: text(data.target_node), thread_id: text(data.thread_id), turn_id: data.turn_id === null ? null : text(data.turn_id),
     state: nativeSessionState(data.state), freshness, can_control: flag(data.can_control),
     detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
+    origin_trigger: optionalText(data.origin_trigger), answered_requests: list(data.answered_requests ?? []).map(answeredRequest),
+  }
+}
+function answeredRequest(value: unknown): AnsweredRequest {
+  const data = record(value), decision = data.decision
+  return {
+    request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind),
+    decision: decision === "accept" || decision === "decline" || decision === "cancel" ? decision : "answer", command: optionalText(data.command), at_ms: number(data.at_ms),
   }
 }
 function pendingCheck(value: unknown): PendingCheck {

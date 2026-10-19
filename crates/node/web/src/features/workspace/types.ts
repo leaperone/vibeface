@@ -23,9 +23,13 @@ export type AgentTaskRecord = {
   text: string
   detail: string
 }
+/** One line per request a person answered; kept by the executing device after it leaves `pending_requests`. */
+export type AnsweredRequest = { request_id: string | number; kind: string; decision: "accept" | "decline" | "cancel" | "answer"; command?: string; at_ms: number }
 export type NativeSessionRecord = {
   work_id: string
   task_ref: string | null
+  origin_trigger?: string
+  answered_requests?: AnsweredRequest[]
   target_node: string
   thread_id: string
   turn_id: string | null
