@@ -70,9 +70,6 @@ impl Runtime {
                 }) {
                     missing.push("Codex SDK dependencies");
                 }
-                if scheduler_available && self.native_socket().is_none() {
-                    missing.push("Codex App Server");
-                }
             }
         }
         let readiness = if settings.manager.is_none() {
@@ -186,12 +183,6 @@ impl Runtime {
             .settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
-        if self.settings_snapshot().manager.is_some_and(|manager| {
-            manager.provider == "codex_sdk" || self.config.codex_socket.is_some()
-        }) && let Err(error) = self.ensure_native_client().await
-        {
-            tracing::warn!(%error, "native Codex is unavailable after settings change");
-        }
         self.schedule_wakeup.notify_one();
         self.node_settings().await
     }

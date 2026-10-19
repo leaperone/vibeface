@@ -467,7 +467,7 @@ mod tests {
             .join(format!("maintenance-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         config.codex_socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;
@@ -508,13 +508,6 @@ mod tests {
             let lease = acquire(&dir).await?;
             assert_eq!(lease.health.peer_id, health.peer_id);
             assert!(node.maintenance.enter().is_err());
-            assert!(
-                node.sync_all("test")
-                    .await
-                    .unwrap_err()
-                    .downcast_ref::<Busy>()
-                    .is_some()
-            );
             assert!(
                 crate::scheduler::status(&node, "test", "chat", "trigger")
                     .await

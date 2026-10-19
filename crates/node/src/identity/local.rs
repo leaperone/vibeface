@@ -290,7 +290,6 @@ impl Store {
 
     pub fn install_state(&mut self, incoming: NetworkState) -> Result<AuthorizationView> {
         incoming.project()?;
-        self.retire_identity_readers(&incoming.genesis.network_id);
         self.transaction(|tx| {
             let next = if has_network_in(tx)? {
                 let current = load_state(tx)?;
@@ -487,7 +486,6 @@ impl Store {
     }
 
     pub fn store_signed_grant(&mut self, event: super::GovernanceEvent) -> Result<NetworkState> {
-        self.retire_identity_readers(&event.network_id);
         let super::GovernanceAction::Grant { member } = &event.action else {
             bail!("pairing requires a grant")
         };

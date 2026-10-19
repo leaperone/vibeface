@@ -1267,16 +1267,14 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.roles = vec![NodeRole::Relay, NodeRole::Replica, NodeRole::Scheduler];
-        let native_socket = dir.join("unavailable-codex.sock");
-        config.codex_socket = Some(native_socket.clone());
+        config.codex_socket = Some(dir.join("unavailable-codex.sock"));
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
         let node = Arc::new(Runtime::open(&dir).await?);
-        assert!(node.native_socket().is_none());
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
         let client = LocalIdentity::generate();
@@ -1452,7 +1450,6 @@ mod tests {
             serde_json::to_value(&codex_settings)?,
         )
         .await?;
-        assert_eq!(node.native_socket(), Some(native_socket.as_path()));
         dispatch(
             &node,
             &mut manager_session,
@@ -1460,7 +1457,6 @@ mod tests {
             serde_json::to_value(&settings)?,
         )
         .await?;
-        assert_eq!(node.native_socket(), Some(native_socket.as_path()));
         drop(node);
         let reopened = Runtime::open(&dir).await?;
         assert_eq!(
@@ -1513,7 +1509,7 @@ mod tests {
                 &dir.join("identity.json"),
                 &serde_json::to_vec(&LocalIdentity::generate())?,
             )?;
-            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
             let node = Arc::new(Runtime::open(dir).await?);
             let root = LocalIdentity::generate();
             node.install_membership(NetworkState::new(Genesis::create(

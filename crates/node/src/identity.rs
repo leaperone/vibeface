@@ -29,9 +29,9 @@ mod tests {
             network_id: state.genesis.network_id.clone(),
             scope_id: "archive".into(),
             author: old_node.peer_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![],
+            seq: 1,
+            prev: None,
+            deps: vec![],
             created_at_ms: 1,
             body: crate::model::EventBody::ConversationCreated {
                 title: "old context".into(),

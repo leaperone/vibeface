@@ -670,7 +670,6 @@ async fn local_join_status(
 struct ToolRequest {
     name: String,
     arguments: Value,
-    call_id: String,
 }
 
 async fn tool(
@@ -679,10 +678,10 @@ async fn tool(
     Json(input): Json<ToolRequest>,
 ) -> ApiResult<Json<Value>> {
     let access = bearer_access(&app, &headers).await?;
-    validate_tool_call(&input.name, &input.call_id)?;
+    validate_tool_call(&input.name)?;
     Ok(Json(
         app.node
-            .tool(access, &input.name, input.arguments, &input.call_id)
+            .tool(access, &input.name, input.arguments)
             .await
             .map_err(ApiError::bad)?,
     ))
@@ -693,7 +692,6 @@ async fn tool(
 struct ToolCallback {
     tool_name: String,
     args: Value,
-    tool_call_id: Option<String>,
     agent_id: String,
 }
 
@@ -708,33 +706,18 @@ async fn tool_callback(
             "args must be an object and agentId must be nonempty and bounded",
         ));
     }
-    let write = !matches!(
-        input.tool_name.as_str(),
-        "nodes" | "context" | "task_status" | "call_lookup"
-    );
-    let call_id = match input.tool_call_id {
-        Some(id) => id,
-        None if !write => uuid::Uuid::new_v4().to_string(),
-        None => {
-            return Err(ApiError::bad(
-                "write tool callbacks require a stable toolCallId",
-            ));
-        }
-    };
-    validate_tool_call(&input.tool_name, &call_id)?;
+    validate_tool_call(&input.tool_name)?;
     let result = app
         .node
-        .tool(access, &input.tool_name, input.args, &call_id)
+        .tool(access, &input.tool_name, input.args)
         .await
         .map_err(ApiError::bad)?;
     Ok(Json(json!({"result": result})))
 }
 
-fn validate_tool_call(name: &str, call_id: &str) -> ApiResult<()> {
-    if name.is_empty() || name.len() > 128 || call_id.is_empty() || call_id.len() > 256 {
-        return Err(ApiError::bad(
-            "tool name and call ID must be nonempty and bounded",
-        ));
+fn validate_tool_call(name: &str) -> ApiResult<()> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(ApiError::bad("tool name must be nonempty and bounded"));
     }
     Ok(())
 }
@@ -987,7 +970,7 @@ mod tests {
         let mut config = Config::local(address, vec![], false);
         config.roles = vec![NodeRole::Relay];
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -1092,7 +1075,7 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
-        assert!(validate_tool_call("send_task", "stable-call-id").is_ok());
-        assert!(validate_tool_call("send_task", "").is_err());
+        assert!(validate_tool_call("dispatch_work").is_ok());
+        assert!(validate_tool_call("").is_err());
     }
 }

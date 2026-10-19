@@ -696,7 +696,7 @@ mod tests {
     async fn open_node(dir: &Path, listen: SocketAddr) -> Result<Arc<Runtime>> {
         config::private_dir(dir)?;
         Config::local(listen, vec![], false).save(dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,

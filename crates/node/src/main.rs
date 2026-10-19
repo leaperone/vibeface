@@ -229,10 +229,17 @@ async fn main() -> Result<()> {
                     runtime.config.listen.port()
                 );
             }
-            tokio::select! {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let result = tokio::select! {
                 result = api::serve(runtime.clone()) => result,
-                result = maintenance::serve(runtime, options.data.data_dir) => result,
-            }
+                result = maintenance::serve(runtime.clone(), options.data.data_dir) => result,
+                _ = terminate.recv() => Ok(()),
+                _ = tokio::signal::ctrl_c() => Ok(()),
+            };
+            // The App Server group must not outlive the Node that manages it.
+            runtime.shutdown().await;
+            result
         }
         Action::Access(options) => access(options).await,
         Action::Status(options) => status(options).await,
@@ -410,7 +417,7 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
     println!("Initialized device with Peer ID {}", identity.peer_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
@@ -462,7 +469,7 @@ async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":5}),
+        epoch == json!({"data_epoch":6}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
@@ -626,16 +633,13 @@ async fn pair(options: Pair) -> Result<()> {
 
 async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 128, "invalid tool name");
-    let arguments: Value =
+    let mut arguments: Value =
         serde_json::from_str(&arguments).context("invalid tool arguments JSON")?;
     ensure!(
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let write = !matches!(
-        name.as_str(),
-        "nodes" | "context" | "task_status" | "call_lookup"
-    );
+    let write = name == "dispatch_work";
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
@@ -647,13 +651,12 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
     ensure!(
         !write || call_ref.is_some(),
-        "write tools require --call-ref; keep it and query call_lookup after any uncertain result"
+        "dispatch_work requires --call-ref; keep it and query call_lookup after any uncertain result"
     );
-    let call_id = call_ref.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    ensure!(
-        !call_id.is_empty() && call_id.len() <= 256 && !call_id.chars().any(char::is_control),
-        "invalid call reference"
-    );
+    if let Some(call_ref) = &call_ref {
+        arguments["call_ref"] = json!(call_ref);
+    }
+    let call_id = call_ref.unwrap_or_default();
     let url =
         origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
     ensure!(
@@ -668,7 +671,7 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         .build()?
         .post(url.join("api/tools")?)
         .bearer_auth(token)
-        .json(&json!({"name": name, "arguments": arguments, "call_id": call_id}))
+        .json(&json!({"name": name, "arguments": arguments}))
         .send()
         .await
         .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
@@ -1034,7 +1037,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface", "tool", "send_task", "--json", "{}"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch_work", "--json", "{}"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "vibeface",
