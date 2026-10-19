@@ -58,6 +58,12 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
             !matches!(action, Action::InstallUpdater),
             "npm installations are updated with npm install -g vibeface@nightly"
         );
+        if matches!(action, Action::Install) {
+            drop(
+                config::lock_data_dir(data)
+                    .context("stop the node before installing its npm service")?,
+            );
+        }
         executable
             .parent()
             .context("npm native package is missing")?
@@ -97,6 +103,7 @@ pub async fn run(options: Service) -> Result<()> {
         Some(root) => root.clone(),
         None => update::managed_install_root(&data)?,
     };
+    let mut operation = command(&root, &data, &executable, options.action)?;
     if npm_root.is_some() && matches!(options.action, Action::Install) {
         let status = command(&root, &data, &executable, Action::UninstallUpdater)?
             .status()
@@ -107,7 +114,7 @@ pub async fn run(options: Service) -> Result<()> {
             "could not disable the previous updater: {status}"
         );
     }
-    let status = command(&root, &data, &executable, options.action)?
+    let status = operation
         .status()
         .await
         .context("run user service manager")?;
@@ -222,6 +229,10 @@ mod tests {
         assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
         assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
         assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());
+        let running = config::lock_data_dir(&data).unwrap();
+        assert!(command(&root, &data, &binary, Action::Install).is_err());
+        assert!(command(&root, &data, &binary, Action::Stop).is_ok());
+        drop(running);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -14,7 +14,7 @@ vibeface
 
 一个 npm 包包含三个平台的完整程序及随包资源，按本机平台启动 Rust 程序。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。发布前从 PR 的 `npm-package-<SHA>` CI artifact 下载 `.tgz`，可用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/vibeface-<version>.tgz` 隔离安装。
 
-初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。安装 npm 服务会移除同一数据目录绑定的旧受管更新定时器。
+初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝仍被运行中节点锁定的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。
 
 npm 安装由 npm 更新，内建 `update apply`、`update check`、`update configure` 会提示使用 npm，`update status` 报告 npm 来源及关闭的自动更新。先等待操作结束并对账所有结果未知的写入，再停止后台服务、更新和重启：
 
