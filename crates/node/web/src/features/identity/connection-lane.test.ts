@@ -489,12 +489,13 @@ test('a node invitation uses the local Node endpoint and requires explicit accep
   } finally { app.close() }
 })
 
-test('refreshing a local Node restores its review without resending a request or accepting it', async () => {
+test('refreshing a local Node restores its review without resending a request or accepting it', async t => {
   const app = deviceHarness({ local: 'fresh' }), { receipt } = nodeJoinFixture()
   app.joinResponses.set('status', receipt)
   try {
-    app.render(); await settle(); await settle()
-    assert.equal(app.render().localJoin?.kind, 'review')
+    app.render()
+    await t.waitFor(() => assert.equal(app.render().localJoin?.kind, 'review'))
+    assert.deepEqual(JSON.parse(JSON.stringify(app.render().localJoin)), receipt)
     assert.deepEqual(app.joinRequests.map(request => request.action), ['status'])
     assert.equal(app.render().ready, null)
   } finally { app.close() }
@@ -517,7 +518,7 @@ test('Node joining verifies the displayed hash and refuses a mismatched local id
   }
 })
 
-test('a lost Node acceptance response is reconciled through its original receipt without automatic resubmission', async () => {
+test('a lost Node acceptance response is reconciled through its original receipt without automatic resubmission', async t => {
   const app = deviceHarness({ local: 'fresh' }), restored = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
   const selected: ClusterTarget = { kind: 'cluster', clusterId: cluster, directories: ['wss://directory.example/custom/socket'] }
   const recent = JSON.stringify({ kind: 'cluster', clusterId: cluster, target: selected, path: { address: selected.directories[0], peer_id: target, mode: 'relay' } })
@@ -546,10 +547,11 @@ test('a lost Node acceptance response is reconciled through its original receipt
     for (const [key, value] of app.stored) restored.stored.set(key, value)
     restored.joinResponses.set('status', { ...receipt, kind: 'pending' })
     restored.render()
-    for (let tries = 0; tries < 100 && restored.render().localJoin === null; tries++) await settle()
+    await t.waitFor(() => assert.equal(restored.render().localJoin?.kind, 'pending'))
     const resumed = restored.render().localJoin
     assert.equal(resumed?.kind, 'pending')
     assert.equal((resumed?.kind === 'pending' || resumed?.kind === 'review') && resumed.request_id, receipt.request_id)
+    assert.equal((resumed?.kind === 'pending' || resumed?.kind === 'review') && resumed.review_hash, receipt.review_hash)
     assert.deepEqual(restored.joinRequests.map(request => request.action), ['status'])
     assert.equal(restored.sockets.length, 0)
     assert.equal(restored.stored.get('vibeface.last-authenticated'), recent)
@@ -572,7 +574,7 @@ test('switching away while a Node join request is pending prevents a stale revie
   } finally { app.close() }
 })
 
-test('recovering onto a fresh localhost Node reuses local setup authority without a pasted invitation', async () => {
+test('recovering onto a fresh localhost Node reuses local setup authority without a pasted invitation', async t => {
   const app = deviceHarness({ local: 'fresh' })
   try {
     app.render(); await settle()
@@ -582,7 +584,7 @@ test('recovering onto a fresh localhost Node reuses local setup authority withou
     challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
     const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: localEntry, bootstrap: '' })
     const rejected = assert.rejects(recovering, /stop after authority check/)
-    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    await t.waitFor(() => assert.equal(app.calls.includes('recovery_context'), true))
     assert.equal(app.requests.find(request => request.method === 'recovery_context')?.params.capability, localCapability)
     contextHold.reject(new Error('stop after authority check')); await rejected
     assert.equal(app.render().ready, null)
@@ -590,7 +592,7 @@ test('recovering onto a fresh localhost Node reuses local setup authority withou
   } finally { app.close() }
 })
 
-test('localhost recovery can use a remote fresh Node invitation without sending local setup authority', async () => {
+test('localhost recovery can use a remote fresh Node invitation without sending local setup authority', async t => {
   const app = deviceHarness({ local: 'fresh' }), remote = { ...entry, peer_id: '6'.repeat(64) }, capability = '4'.repeat(64)
   try {
     app.render(); await settle()
@@ -601,7 +603,7 @@ test('localhost recovery can use a remote fresh Node invitation without sending 
     challengeHold.resolve({ challenge_id: challenge.challenge_id, challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
     const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: remote, bootstrap: JSON.stringify({ url: remote.address, peer_id: remote.peer_id, capability }) })
     const rejected = assert.rejects(recovering, /stop after remote authority check/)
-    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    await t.waitFor(() => assert.equal(app.calls.includes('recovery_context'), true))
     const sent = app.requests.find(request => request.method === 'recovery_context')?.params.capability
     assert.equal(sent, capability)
     assert.notEqual(sent, localCapability)
@@ -765,7 +767,7 @@ for (const flow of ['pair', 'sensitive']) test(`cancelling ${flow} after subscri
   } finally { app.close() }
 })
 
-for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} response resolves prevents stale state and material publication`, async () => {
+for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} response resolves prevents stale state and material publication`, async t => {
   const app = deviceHarness({ saved: flow === 'directory' })
   try {
     app.render(); await settle(); app.render()
@@ -779,7 +781,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
       work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })
     }
     const rejected = assert.rejects(work, /切换|取消/)
-    for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    await t.waitFor(() => assert.equal(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'), true))
     assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'))
     hold.resolve({ state: { genesis }, view: membership })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
@@ -889,7 +891,7 @@ test('Cluster candidates continue after a false Noise key and an unsynchronized 
 
 const gatewayMember = (subject_id: string): Member => ({ subject_id, public_key: publicKey, kind: 'node', name: subject_id, node_roles: ['gateway', 'replica'], manage: false })
 
-for (const flow of ['pair', 'recovery']) for (const succeeds of [true, false]) test(`${succeeds ? 'successful' : 'failed'} ${flow} selection replaces the explicit Cluster target and preserves the authenticated refresh source`, async () => {
+for (const flow of ['pair', 'recovery']) for (const succeeds of [true, false]) test(`${succeeds ? 'successful' : 'failed'} ${flow} selection replaces the explicit Cluster target and preserves the authenticated refresh source`, async t => {
   const app = deviceHarness(), restored = deviceHarness()
   const previousEntry = { address: 'https://previous.example', peer_id: 'f'.repeat(64) }
   const previousTarget = { kind: 'cluster', clusterId: 'e'.repeat(64), directories: ['wss://previous.example/socket'] } satisfies ClusterTarget
@@ -937,7 +939,7 @@ for (const flow of ['pair', 'recovery']) for (const succeeds of [true, false]) t
       assert.deepEqual(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? '{}'), { kind: 'peer', entry, clusterId: cluster })
     } else {
       const rejected = assert.rejects(work, /fixture unavailable/)
-      for (let tries = 0; tries < 100 && !app.calls.includes(heldMethod); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+      await t.waitFor(() => assert.equal(app.calls.includes(heldMethod), true))
       assert.ok(app.calls.includes(heldMethod))
       pending.reject(new Error('fixture unavailable'))
       await rejected
