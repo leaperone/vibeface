@@ -35,8 +35,10 @@ function purposeOf(invitation: string): Purpose {
 
 export function ConnectionScreen() {
   const device = useDevice()
-  const [busy, setBusy] = useState(false)
-  const pending = useRef(false)
+  const generation = device.connectionGeneration()
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === generation
+  const pending = useRef<number | null>(null)
   const [error, setError] = useState('')
   const [confirmed, setConfirmed] = useState(false)
   const [invitation, setInvitation] = useState(device.initialInvitation)
@@ -49,11 +51,17 @@ export function ConnectionScreen() {
   useEffect(() => {
     if (device.initialInvitation) setInvitation(current => current.trim() ? current : device.initialInvitation)
   }, [device.initialInvitation])
+  useEffect(() => { setError('') }, [generation])
   async function run(action: () => Promise<void>) {
-    if (pending.current) return
-    pending.current = true; setBusy(true); setError('')
-    try { await action() } catch (cause) { setError(messageOf(cause)) }
-    finally { pending.current = false; setBusy(false) }
+    if (pending.current === device.connectionGeneration()) return
+    let owner = device.connectionGeneration()
+    setError('')
+    try {
+      const work = action()
+      owner = device.connectionGeneration(); pending.current = owner; setBusyGeneration(owner)
+      await work
+    } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
+    finally { if (pending.current === owner) pending.current = null; setBusyGeneration(active => active === owner ? null : active) }
   }
   function connect(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()

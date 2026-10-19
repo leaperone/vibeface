@@ -33,6 +33,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const [error, setError] = useState("")
   const submitting = useRef(false)
   const wasOpen = useRef(false)
+  useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
   const projects = workspace.nodes.flatMap((node, index) => {
     if (node.revoked || !node.online || !node.roles.includes("executor")) return []
     const deviceName = directory?.members.find((member) => member.subject_id === node.node_id)?.name || (node.local ? "本机" : `执行设备 ${index + 1}`)
@@ -71,9 +72,9 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
       } : {
         name, instructions, project: selected?.project,
       })
-      onOpenChange(false)
-    } catch (cause) { setError(messageOf(cause)) }
-    finally { submitting.current = false; setBusy(false) }
+      if (workspace.isCurrent()) onOpenChange(false)
+    } catch (cause) { if (workspace.isCurrent()) setError(messageOf(cause)) }
+    finally { if (workspace.isCurrent()) { submitting.current = false; setBusy(false) } }
   }
 
   return (

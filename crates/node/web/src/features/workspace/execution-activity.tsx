@@ -21,7 +21,8 @@ export function ExecutionActivity({ execution, conversationId, compact = false }
   const { directory } = useDevice()
   const id = useId()
   const deviceName = directory?.members.find((member) => member.subject_id === execution.target_node)?.name || (workspace.nodes.some((node) => node.node_id === execution.target_node && node.local) ? "本机" : "执行设备")
-  const [steerBusy, setSteerBusy] = useState(false)
+  const [steerGeneration, setSteerGeneration] = useState<number | null>(null)
+  const steerBusy = steerGeneration === workspace.generation
   const targetOnline = workspace.nodes.some((node) => node.node_id === execution.target_node && node.online && !node.revoked)
   const pending = workspace.pending.filter((item) => item.conversation_id === conversationId && (item.execution_control?.expected_operation_id === execution.operation_id || item.target_node === execution.target_node && execution.session_id !== null && item.session_id === execution.session_id))
   const canControl = workspace.writable && Boolean(workspace.selectedBot) && targetOnline && execution.state !== "unknown" && execution.session_state !== "unknown" && execution.freshness !== "unknown" && pending.length === 0
@@ -61,11 +62,12 @@ export function ExecutionActivity({ execution, conversationId, compact = false }
             const form = event.currentTarget
             if (!form.reportValidity()) return
             const text = String(new FormData(form).get("text") ?? "").trim()
-            setSteerBusy(true)
+            const generation = workspace.generation
+            setSteerGeneration(generation)
             void workspace.run(async () => {
               await workspace.executionControl(execution.operation_id, { type: "steer", text })
-              form.reset()
-            }).finally(() => setSteerBusy(false))
+              if (workspace.isCurrent()) form.reset()
+            }).finally(() => setSteerGeneration(owner => owner === generation ? null : owner))
           }}>
             <fieldset disabled={!canControl} className="min-w-0"><FieldGroup>
               <Field><FieldLabel htmlFor={`${id}-steer`}>补充说明</FieldLabel><Textarea id={`${id}-steer`} name="text" rows={3} required maxLength={50000} /></Field>
@@ -85,8 +87,8 @@ export function ExecutionActivity({ execution, conversationId, compact = false }
 
 export function PendingExecutionControl({ operation }: { operation: PendingOperation }) {
   const workspace = useWorkspace()
-  const [resultText, setResultText] = useState("")
-  const [missing, setMissing] = useState(false)
+  const [result, setResult] = useState<{ generation: number; text: string; missing: boolean } | null>(null)
+  const currentResult = result?.generation === workspace.generation ? result : null
   const online = workspace.nodes.some((node) => node.node_id === operation.target_node && node.online && !node.revoked)
   return <section className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" aria-label="操作待核对">
     <h3 className="text-sm font-semibold">操作结果待核对</h3>
@@ -94,14 +96,14 @@ export function PendingExecutionControl({ operation }: { operation: PendingOpera
     <div className="flex flex-wrap gap-2">
       <ActionButton disabled={!workspace.connectionOnline || !online} action={() => workspace.run(async () => {
         const result = await workspace.reconcile(operation)
+        if (!workspace.isCurrent()) return
         const decision = reconcileDecision(result, operation)
-        setMissing(decision === "missing")
-        setResultText(result.operation ? `执行设备已记录，${stateLabel(result.operation.state)}。` : "执行设备尚未找到原请求。")
+        setResult({ generation: workspace.generation, missing: decision === "missing", text: result.operation ? `执行设备已记录，${stateLabel(result.operation.state)}。` : "执行设备尚未找到原请求。" })
       })}>核对原操作</ActionButton>
       {operation.execution_control ? <ActionButton disabled={!workspace.writable || !online || !workspace.selectedBot} action={() => workspace.run(() => workspace.retryExecutionControl(operation))}>重试原请求</ActionButton> : null}
     </div>
-    {resultText ? <p role="status" className="text-sm">{resultText}</p> : null}
-    {missing ? <><p className="text-sm">确认原请求已结束后，可解除本地待核对记录。</p><ActionButton disabled={!workspace.writable} action={() => workspace.run(() => workspace.confirmMissing(operation.operation_id))}>确认原请求结束并解除待核对</ActionButton></> : null}
+    {currentResult ? <p role="status" className="text-sm">{currentResult.text}</p> : null}
+    {currentResult?.missing ? <><p className="text-sm">确认原请求已结束后，可解除本地待核对记录。</p><ActionButton disabled={!workspace.writable} action={() => workspace.run(() => workspace.confirmMissing(operation.operation_id))}>确认原请求结束并解除待核对</ActionButton></> : null}
   </section>
 }
 
@@ -114,7 +116,8 @@ export function UnknownOperationActivity({ operation }: { operation: OperationRe
 function ResolveForm({ targetNode, operationId }: { targetNode: string; operationId: string }) {
   const workspace = useWorkspace()
   const id = useId()
-  const [busy, setBusy] = useState(false)
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === workspace.generation
   return <Collapsible>
     <CollapsibleTrigger asChild><Button type="button" variant="secondary">记录本人核查结果</Button></CollapsibleTrigger>
     <CollapsibleContent className="pt-3"><form onSubmit={(event) => {
@@ -122,8 +125,9 @@ function ResolveForm({ targetNode, operationId }: { targetNode: string; operatio
       const form = event.currentTarget
       if (!form.reportValidity()) return
       const data = new FormData(form)
-      setBusy(true)
-      void workspace.run(() => workspace.resolveUnknown(targetNode, operationId, String(data.get("outcome") ?? ""), String(data.get("evidence") ?? ""))).finally(() => setBusy(false))
+      const generation = workspace.generation
+      setBusyGeneration(generation)
+      void workspace.run(() => workspace.resolveUnknown(targetNode, operationId, String(data.get("outcome") ?? ""), String(data.get("evidence") ?? ""))).finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
     }}><fieldset disabled={!workspace.writable || !workspace.selectedBot} className="min-w-0"><FieldGroup>
       <p className="text-sm">只有确认原进程已结束和外部结果后，才能解除占用。</p>
       <Field><FieldLabel htmlFor={`${id}-evidence`}>核查证据</FieldLabel><Textarea id={`${id}-evidence`} name="evidence" rows={3} required minLength={12} /></Field>
@@ -135,7 +139,8 @@ function ResolveForm({ targetNode, operationId }: { targetNode: string; operatio
 
 function ExecutionApproval({ execution, request, canRespond, disabled }: { execution: ExecutionActivityRecord; request: HumanRequest; canRespond: boolean; disabled: boolean }) {
   const workspace = useWorkspace()
-  const [busy, setBusy] = useState(false)
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === workspace.generation
   const id = useId()
   const questions = request.questions ?? []
   return (
@@ -145,11 +150,12 @@ function ExecutionApproval({ execution, request, canRespond, disabled }: { execu
       {canRespond && request.choices?.length ? (
         <div className="flex flex-wrap gap-2">
           {request.choices.map((choice, index) => <ActionButton key={index} disabled={busy || disabled} action={async () => {
-            setBusy(true)
+            const generation = workspace.generation
+            setBusyGeneration(generation)
             try {
               await workspace.run(async () => { await workspace.executionControl(execution.operation_id, { type: "respond_request", request_id: request.request_id, response: choice.response }) })
             } finally {
-              setBusy(false)
+              setBusyGeneration(owner => owner === generation ? null : owner)
             }
           }}>{choice.label}</ActionButton>)}
         </div>
@@ -159,7 +165,8 @@ function ExecutionApproval({ execution, request, canRespond, disabled }: { execu
           const form = event.currentTarget
           if (!form.reportValidity()) return
           const values = new FormData(form)
-          setBusy(true)
+          const generation = workspace.generation
+          setBusyGeneration(generation)
           void workspace.run(async () => {
             const answers = Object.fromEntries(questions.map((question, index) => {
               const answer = String(values.get(`answer-${index}`) ?? '').trim()
@@ -167,7 +174,7 @@ function ExecutionApproval({ execution, request, canRespond, disabled }: { execu
               return [question.id, { answers: [answer] }]
             }))
             await workspace.executionControl(execution.operation_id, { type: "respond_request", request_id: request.request_id, response: { answers } })
-          }).finally(() => setBusy(false))
+          }).finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
         }}>
           <fieldset disabled={disabled || busy || !workspace.writable} className="min-w-0">
             <FieldGroup>

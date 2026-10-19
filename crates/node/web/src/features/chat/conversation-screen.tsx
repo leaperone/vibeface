@@ -96,8 +96,7 @@ export function ConversationScreen() {
               {messagePending ? <div className="pending-message-actions">
                 <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对</ActionButton>
                 <ActionButton disabled={!workspace.writable || !originalEntry || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
-                  await workspace.sendMessage(messagePending.text, messagePending.report_results ?? false)
-                  clearSentDraft(messagePending.conversation_id, messagePending.text)
+                  if (await workspace.sendMessage(messagePending.text, messagePending.report_results ?? false) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
                 })}>重试</ActionButton>
                 <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>解除</ActionButton>
               </div> : null}
@@ -134,11 +133,7 @@ export function ConversationScreen() {
         onSubmit={() => {
           if (sendDisabled || !text.trim()) return
           void workspace.run(async () => {
-            try {
-              await workspace.sendMessage(text, reportResults)
-            } finally {
-              clearSentDraft(conversationId, text)
-            }
+            if (await workspace.sendMessage(text, reportResults) && workspace.isCurrent()) clearSentDraft(conversationId, text)
           })
         }}
       />
