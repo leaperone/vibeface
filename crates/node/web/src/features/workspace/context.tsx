@@ -22,8 +22,6 @@ function useWorkspaceState(connection: ReadyConnection) {
   const networkId = connection.principal.network_id
   const clientId = connection.principal.subject_id
   const [booted, setBooted] = useState(false)
-  const [writeState, setWriteState] = useState<"checking" | "writable" | "readonly" | "unsupported">("checking")
-  const writer = useRef(false)
   const [error, setError] = useState("")
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("chat")
@@ -68,20 +66,21 @@ function useWorkspaceState(connection: ReadyConnection) {
     return requireContext(id)
   }
   const showError = (caught: unknown) => { if (current()) setError(errorText(caught)) }
-  const requireWriter = () => {
+  const requireWritable = () => {
     requireCurrent()
-    if (!writer.current) throw new Error("此页面只读。关闭正在操作此设备的其他页面，再重新连接。浏览器需支持 Web Locks。")
+    if (!booted) throw new Error("本地待核对记录尚未读取，已暂停写入。")
+    if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
   const readFrontiers = () => frontierMap(readStorage<unknown>(networkKey("frontiers", networkId), {}, true))
   const replacePending = (next: PendingOperation[]) => {
-    requireWriter()
+    requireWritable()
     writeStorage(scoped("pending"), next, true)
     pendingRef.current = next
     if (current()) setPending(next)
   }
   const replaceMessages = (next: PendingMessage[]) => {
-    requireWriter()
+    requireWritable()
     writeStorage(scoped("pending-messages"), next, true)
     messagesRef.current = next
     if (current()) setPendingMessages(next)
@@ -110,7 +109,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     }
     dataRef.current = next
     setData(next)
-    if (writer.current && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
+    if (current() && readConnection.current === connection && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
       replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
     }
     setLiveProgress((previous) => previous.filter((progress) => {
@@ -127,7 +126,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       if (results.some((result) => result.status === "fulfilled")) scheduleRefresh()
     }
-    if (writer.current && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
+    if (current() && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
@@ -237,24 +236,6 @@ function useWorkspaceState(connection: ReadyConnection) {
   }, [connection])
 
   useEffect(() => {
-    let disposed = false
-    let release = () => {}
-    writer.current = false
-    setWriteState("checking")
-    if (!("locks" in navigator)) { setWriteState("unsupported"); return }
-    void navigator.locks.request(scoped("workspace-writer"), { mode: "exclusive", ifAvailable: true }, async (lock) => {
-      if (disposed) return
-      if (!lock) { setWriteState("readonly"); return }
-      loadPending()
-      writer.current = true
-      setWriteState("writable")
-      await new Promise<void>((resolve) => { release = resolve })
-      if (!disposed) writer.current = false
-    }).catch((caught: unknown) => { if (!disposed) { setWriteState("unsupported"); showError(caught) } })
-    return () => { disposed = true; writer.current = false; release() }
-  }, [connection])
-
-  useEffect(() => {
     if (!booted) return
     void refreshRef.current().catch(showError)
     const unsubscribe = connection.subscribe((event) => {
@@ -279,9 +260,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   }, [booted, connection])
 
   const withMutation = async <T,>(key: string, work: () => Promise<T>) => {
-    requireWriter()
-    if (!booted) throw new Error("本地待核对记录尚未读取，已暂停写入。")
-    if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
+    requireWritable()
     const mutations = inFlight.current
     if (mutations.has(key)) throw new Error("原请求尚未结束，请等待并核对结果。")
     mutations.add(key)
@@ -368,10 +347,8 @@ function useWorkspaceState(connection: ReadyConnection) {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView, nodes, conversationId, data, notifications, pending, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress,
-    writable: writeState === "writable" && current() && readConnection.current === connection,
-    writeNotice: writeState === "readonly" ? "另一个页面正在操作此浏览器设备。此页只读，关闭其他页面后重新连接。"
-      : writeState === "unsupported" ? "浏览器未能提供跨页面写锁，此页只读。请使用支持 Web Locks 的安全浏览器入口。"
-      : writeState === "checking" ? "正在核对浏览器设备的写入权限。" : readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
+    writable: booted && current() && readConnection.current === connection,
+    writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
     syncText: !data ? "发一条消息开始对话。" : incomplete
       ? "对话还在同步。"
       : `此入口已取得已知上下文，共 ${data.heads.length} 个历史位置。其他离线设备可能仍有未同步记录。`,
@@ -502,7 +479,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       const result = parseReconcile(await connection.rpc("reconcile", { target_node: operation.target_node, operation_id: operation.operation_id }))
       requireCurrent()
-      if (reconcileDecision(result, operation) === "settled" && writer.current) {
+      if (reconcileDecision(result, operation) === "settled" && current()) {
         removePending(operation.operation_id)
         if (activeId.current === operation.conversation_id) await refreshRef.current()
       }
