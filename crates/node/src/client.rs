@@ -632,9 +632,11 @@ async fn dispatch(
                 .lock()
                 .await
                 .register_invite(&record, &session.device_id)?;
+            // Only this Node's own relay knows the invite, so only it admits the joiner's token.
+            let own_relay = node.config.network.own_relay().ok().flatten();
             let entry = node.net().ok().map(|net| {
                 let addr = net.addr();
-                json!({"relay_url":addr.relay_urls().next(),
+                json!({"relay_url":own_relay.or_else(|| addr.relay_urls().next().cloned()),
                     "direct_addrs":addr.ip_addrs().take(8).collect::<Vec<_>>()})
             });
             Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry}))
