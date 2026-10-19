@@ -1,4 +1,3 @@
-//! SDK host tools do local work; these tools coordinate personal Nodes.
 use super::*;
 
 const AGENT_BLOB_BYTES: usize = 2 * MAX_BLOB_BYTES;
@@ -63,7 +62,7 @@ impl Runtime {
         .await
         .context("agent tool admission timed out")??;
         match name {
-            "observe_session" => self.observe_session(&access, &args).await,
+            "observe_session" => self.observe_session(&access, &args, call_id).await,
             "nodes" => self.rpc_inner(access, json!({"method":"nodes"})).await,
             "context" => self.agent_context(&access, &args).await,
             "task_status" => self.store.lock().await.agent_task_status(

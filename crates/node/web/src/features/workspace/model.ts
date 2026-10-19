@@ -99,10 +99,13 @@ function agentTask(value: unknown): AgentTaskRecord {
 }
 function nativeSession(value: unknown): NativeSessionRecord {
   const data = record(value)
+  const freshness = data.freshness
+  if (freshness !== "observed" && freshness !== "cached") throw new Error("未知的原生进度读取来源。")
   return {
     work_id: text(data.work_id), task_ref: data.task_ref === null ? null : text(data.task_ref),
     target_node: text(data.target_node), thread_id: text(data.thread_id), turn_id: data.turn_id === null ? null : text(data.turn_id),
-    state: nativeSessionState(data.state), detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
+    state: nativeSessionState(data.state), freshness, can_control: flag(data.can_control),
+    detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
   }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {

@@ -30,6 +30,8 @@ export type NativeSessionRecord = {
   thread_id: string
   turn_id: string | null
   state: NativeSessionState
+  freshness: "observed" | "cached"
+  can_control: boolean
   detail: string
   pending_requests: HumanRequest[]
 }

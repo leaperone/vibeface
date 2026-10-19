@@ -12,7 +12,10 @@ use tokio::sync::watch;
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 pub const SESSION_SECONDS: u64 = 86400;
-pub const COOKIE: &str = "vibeface_local";
+
+pub fn cookie_name(peer_id: &str) -> String {
+    format!("vibeface_local_{peer_id}")
+}
 
 pub struct LocalAccess {
     dir: PathBuf,

@@ -1226,33 +1226,41 @@ mod tests {
             Client::from_socket(NetworkSocket::Client(Box::new(socket)), identity, target).await
         }
 
+        async fn browser_node(
+            dir: &std::path::Path,
+            manager: &LocalIdentity,
+        ) -> Result<Arc<Runtime>> {
+            crate::config::private_dir(dir)?;
+            let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let listen = reservation.local_addr()?;
+            drop(reservation);
+            crate::config::Config::local(listen, vec![], false).save(dir)?;
+            crate::config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&LocalIdentity::generate())?,
+            )?;
+            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+            let node = Arc::new(Runtime::open(dir).await?);
+            node.install_membership(NetworkState::new(Genesis::create(
+                &LocalIdentity::generate(),
+                vec![
+                    Member::node(&node.identity, "local device", node.config.roles.clone())?,
+                    Member::client(manager, "management browser", true)?,
+                ],
+            )?)?)
+            .await?;
+            Ok(node)
+        }
+
         let dir =
             std::env::temp_dir().join(format!("vibeface-local-browser-{}", uuid::Uuid::new_v4()));
-        crate::config::private_dir(&dir)?;
-        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let listen = reservation.local_addr()?;
-        drop(reservation);
-        let configuration = crate::config::Config::local(listen, vec![], false);
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let root = LocalIdentity::generate();
         let manager = LocalIdentity::generate();
         let browser = LocalIdentity::generate();
-        node.install_membership(NetworkState::new(Genesis::create(
-            &root,
-            vec![
-                Member::node(&node.identity, "local device", node.config.roles.clone())?,
-                Member::client(&manager, "management browser", true)?,
-            ],
-        )?)?)
-        .await?;
+        let node = browser_node(&dir, &manager).await?;
+        let listen = node.config.listen;
         let serving = node.clone();
         let server = tokio::spawn(async move { crate::api::serve(serving).await });
+        let mut second_server = None;
         let result: Result<()> = async {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
@@ -1273,11 +1281,49 @@ mod tests {
                 let input = json!({"token":launch["token"],"peer_id":launcher.peer_id,"subject_id":identity.peer_id()?,"public_key":identity.public_key_hex()?});
                 let exchanged = http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.error_for_status()?;
                 let cookie = exchanged.headers().get("set-cookie").context("session cookie missing")?.to_str()?;
-                assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+                assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict") && cookie.contains("Path=/api/local"));
                 cookies.push(cookie.split(';').next().context("session cookie missing")?.to_owned());
                 assert_eq!(http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.status(), 401);
             }
-            let mut local = connect_local(&launcher.origin, &launcher.peer_id, &cookies[0], &browser).await?;
+            let second_dir = dir.join("second");
+            let second = browser_node(&second_dir, &manager).await?;
+            second_server = Some(tokio::spawn(async move { crate::api::serve(second).await }));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !second_dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await?;
+            let second_launcher: crate::local_access::Launcher = serde_json::from_slice(&std::fs::read(second_dir.join("local-access.json"))?)?;
+            let first_origin = reqwest::Url::parse(&launcher.origin)?;
+            let second_origin = reqwest::Url::parse(&second_launcher.origin)?;
+            assert_eq!(first_origin.host_str(), Some("127.0.0.1"));
+            assert_eq!(second_origin.host_str(), first_origin.host_str());
+            assert_ne!(second_origin.port(), first_origin.port());
+            let launch: Value = http.post(format!("{}/api/local/launch", second_launcher.origin)).bearer_auth(&second_launcher.capability).json(&json!({})).send().await?.error_for_status()?.json().await?;
+            let input = json!({"token":launch["token"],"peer_id":second_launcher.peer_id,"subject_id":browser.peer_id()?,"public_key":browser.public_key_hex()?});
+            let exchanged = http.post(format!("{}/api/local/exchange", second_launcher.origin)).header("Origin", &second_launcher.origin).json(&input).send().await?.error_for_status()?;
+            let second_cookie = exchanged.headers().get("set-cookie").context("second session cookie missing")?.to_str()?;
+            assert!(second_cookie.contains("HttpOnly") && second_cookie.contains("SameSite=Strict") && second_cookie.contains("Path=/api/local"));
+            let second_cookie = second_cookie.split(';').next().context("second session cookie missing")?;
+            let mut jar = std::collections::BTreeMap::new();
+            for cookie in [cookies[0].as_str(), second_cookie] {
+                let (name, value) = cookie.split_once('=').context("invalid session cookie")?;
+                jar.insert(name, value);
+            }
+            assert_eq!(jar.len(), 2, "same-host Nodes must retain separate cookies");
+            let shared_cookies = jar.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; ");
+            for origin in [&launcher.origin, &second_launcher.origin] {
+                let info: Value = http.get(format!("{origin}/api/local/info")).header("Cookie", &shared_cookies).send().await?.error_for_status()?.json().await?;
+                assert_eq!(info["has_session"], true);
+                assert_eq!(info["subject_id"], browser.peer_id()?);
+            }
+            let (first_name, _) = cookies[0].split_once('=').context("invalid session cookie")?;
+            let (_, second_value) = second_cookie.split_once('=').context("invalid second session cookie")?;
+            let wrong_node_cookie = format!("{first_name}={second_value}");
+            let info: Value = http.get(format!("{}/api/local/info", launcher.origin)).header("Cookie", &wrong_node_cookie).send().await?.error_for_status()?.json().await?;
+            assert_eq!(info["has_session"], false);
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &wrong_node_cookie).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            let mut second_local = connect_local(&second_launcher.origin, &second_launcher.peer_id, &shared_cookies, &browser).await?;
+            assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
+            let mut local = connect_local(&launcher.origin, &launcher.peer_id, &shared_cookies, &browser).await?;
             let auth = local.call("authenticate", json!({})).await?;
             assert_eq!(auth["principal"]["source"], "local_session");
             assert_eq!(auth["principal"]["can_manage"], false);
@@ -1296,6 +1342,7 @@ mod tests {
             local.call("local_access", json!({"enabled":false})).await?;
             assert!(!crate::config::Config::load(&dir)?.local_auto_access);
             assert!(local.call("rpc", json!({"method":"conversations"})).await.is_err());
+            assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
             assert_eq!(signed.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             signed.call("local_access", json!({"enabled":true})).await?;
             assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
@@ -1303,6 +1350,10 @@ mod tests {
         }.await;
         server.abort();
         let _ = server.await;
+        if let Some(server) = second_server {
+            server.abort();
+            let _ = server.await;
+        }
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result

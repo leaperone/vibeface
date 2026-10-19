@@ -1106,6 +1106,8 @@ mod tests {
                 AgentMessageKind::Progress,
             ),
         ] {
+            let missing_reply = reply.is_none();
+            let before = store.heads(&network, "chat")?;
             let forged = store.append_event(
                 author,
                 &network,
@@ -1122,7 +1124,16 @@ mod tests {
                 },
                 vec![],
                 6,
-            )?;
+            );
+            if missing_reply {
+                assert_eq!(
+                    forged.unwrap_err().to_string(),
+                    "agent reply has no task reference"
+                );
+                assert_eq!(store.heads(&network, "chat")?, before);
+                continue;
+            }
+            let forged = forged?;
             assert!(
                 store
                     .validate_followup_result(&network, "chat", &forged.hash, &node)

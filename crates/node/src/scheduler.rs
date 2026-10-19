@@ -18,7 +18,7 @@ use std::{
 use vibeface_bridge::agent::CustomToolConfig;
 
 const PROMPT_LIMIT: usize = 60_000;
-const INLINE_OUTPUT: usize = 131_072;
+const INLINE_OUTPUT: usize = 16_384;
 const CONSTRAINTS: &[&str] = &[
     "Operate only inside this personal network and conversation.",
     "Use the SDK host Shell and file tools for work on this device. Use send_task to ask another Node's Agent to work on its own host.",

@@ -160,7 +160,6 @@ impl Store {
             path: path.to_owned(),
             process_lock: None,
         };
-        // Reject incompatible membership before recovery changes jobs or projections.
         for network in store.networks()? {
             store
                 .trust_bundle(&network)?
@@ -1683,6 +1682,53 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    pub fn raise_notification_once(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        notification: Notification,
+        at: i64,
+    ) -> Result<Option<SignedEvent>> {
+        ensure!(
+            !notification.notification_id.is_empty(),
+            "notification ID required"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT record FROM notification_outbox WHERE network_id=? AND notification_id=?",
+                params![network, notification.notification_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(old) = old {
+            let old: Notification = serde_json::from_str(&old)?;
+            ensure!(
+                old.conversation_id == notification.conversation_id
+                    && old.kind == notification.kind
+                    && old.text == notification.text,
+                "notification ID reused with different body"
+            );
+            return Ok(None);
+        }
+        let event = append_event_from(
+            &tx,
+            identity,
+            network,
+            &notification.conversation_id,
+            EventBody::NotificationRaised {
+                notification_id: notification.notification_id,
+                kind: notification.kind,
+                text: notification.text,
+            },
+            vec![],
+            at,
+        )?;
+        tx.commit()?;
+        Ok(Some(event))
+    }
     pub fn pending_notifications(
         &self,
         network_id: &str,
@@ -1894,16 +1940,7 @@ fn publish_scheduler_terminal_from(
             .hash,
         );
     }
-    if let Some(hash) = agent_messages::publish_agent_result_from(
-        connection,
-        identity,
-        network,
-        &job,
-        &marker.outcome,
-        marker.created_at_ms,
-    )? {
-        event_hashes.push(hash);
-    }
+    let task_outcome = marker.outcome.clone();
     job.state = match marker.outcome {
         JobOutcome::Completed => JobState::Completed { attempt },
         JobOutcome::Failed(detail) => JobState::Failed { attempt, detail },
@@ -1930,6 +1967,16 @@ fn publish_scheduler_terminal_from(
     }
     scheduler_save(connection, network, &key, &job)?;
     save_scheduler_session(connection, network, &session)?;
+    if let Some(hash) = agent_messages::publish_agent_result_from(
+        connection,
+        identity,
+        network,
+        &job,
+        &task_outcome,
+        marker.created_at_ms,
+    )? {
+        event_hashes.push(hash);
+    }
     connection.execute(
         "DELETE FROM local_values WHERE network_id=? AND key=?",
         params![
@@ -4382,6 +4429,18 @@ mod tests {
         let mb = admitted_message(&mut store, &b, "same-id", &target)?;
         assert_eq!(
             store
+                .admit_trigger(&na, "conversation", &ma.hash, &target, &target)?
+                .state,
+            "queued"
+        );
+        assert_eq!(
+            store
+                .admit_trigger(&nb, "conversation", &mb.hash, &target, &target)?
+                .state,
+            "queued"
+        );
+        assert_eq!(
+            store
                 .claim_next(&na, "conversation", &target, "boot", "sdk")?
                 .unwrap()
                 .job
@@ -4500,21 +4559,73 @@ mod tests {
         let network = a.fixture_network_id()?;
         let mut source = memory(&a, None)?;
         let mut target = memory(&a, None)?;
-        conversation(&mut source, &a)?;
-        source.append_event(
-            &a,
-            &network,
-            "conversation",
-            EventBody::NotificationRaised {
-                notification_id: "sync-notice".into(),
-                kind: "approval".into(),
-                text: "human response needed".into(),
+        let origin = conversation(&mut source, &a)?;
+        let notification = Notification {
+            notification_id: "sync-notice".into(),
+            conversation_id: "conversation".into(),
+            kind: "approval".into(),
+            text: "human response needed".into(),
+            event_hash: origin.hash,
+        };
+        let raised = source
+            .raise_notification_once(&a, &network, notification.clone(), 2)?
+            .context("notification event missing")?;
+        let heads = source.heads(&network, "conversation")?;
+        assert!(
+            source
+                .raise_notification_once(&a, &network, notification.clone(), 3)?
+                .is_none()
+        );
+        for changed in [
+            Notification {
+                text: "changed text".into(),
+                ..notification.clone()
             },
-            vec![],
-            2,
-        )?;
-        target.import_snapshot(&network, &source.export_snapshot(&network, "conversation")?)?;
-        assert_eq!(target.pending_notifications(&network, "phone")?.len(), 1);
+            Notification {
+                kind: "changed-kind".into(),
+                ..notification.clone()
+            },
+            Notification {
+                conversation_id: "another-conversation".into(),
+                ..notification.clone()
+            },
+        ] {
+            assert_eq!(
+                source
+                    .raise_notification_once(&a, &network, changed, 3)
+                    .unwrap_err()
+                    .to_string(),
+                "notification ID reused with different body"
+            );
+        }
+        assert_eq!(source.heads(&network, "conversation")?, heads);
+        assert_eq!(
+            source.context(&network, "conversation", &[])?.events.len(),
+            2
+        );
+        let expected = Notification {
+            event_hash: raised.hash,
+            ..notification
+        };
+        assert_eq!(
+            source.pending_notifications(&network, "phone")?,
+            vec![expected.clone()]
+        );
+        let snapshot = source.export_snapshot(&network, "conversation")?;
+        assert!(target.import_snapshot(&network, &snapshot)?.is_complete());
+        assert_eq!(
+            target.pending_notifications(&network, "phone")?,
+            vec![expected.clone()]
+        );
+        assert!(target.import_snapshot(&network, &snapshot)?.is_complete());
+        assert_eq!(
+            target.pending_notifications(&network, "phone")?,
+            vec![expected.clone()]
+        );
+        assert_eq!(
+            target.context(&network, "conversation", &[])?.events.len(),
+            2
+        );
         source.append_event(
             &a,
             &network,
@@ -4528,9 +4639,16 @@ mod tests {
         )?;
         target.import_snapshot(&network, &source.export_snapshot(&network, "conversation")?)?;
         assert!(target.pending_notifications(&network, "phone")?.is_empty());
-        assert_eq!(target.pending_notifications(&network, "laptop")?.len(), 1);
+        assert_eq!(
+            target.pending_notifications(&network, "laptop")?,
+            vec![expected.clone()]
+        );
         target.rebuild_projections(&network)?;
         assert!(target.pending_notifications(&network, "phone")?.is_empty());
+        assert_eq!(
+            target.pending_notifications(&network, "laptop")?,
+            vec![expected]
+        );
         assert!(
             target
                 .scheduler_jobs(&network, "conversation", &a.peer_id()?)?

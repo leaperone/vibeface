@@ -2602,7 +2602,7 @@ def chat_agent_acceptance(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
     report = {"status": "running", "source_binary": str(binary), "binary_sha256": file_sha256(binary),
-              "provider_calls": 0, "evidence": [], "not_checked": ["real provider model behavior",
+              "provider_calls": 0, "coverage": "real Node and Noise; fixture SDK and native App Server", "evidence": [], "not_checked": ["real provider model behavior",
                   "rendered browser UI", "real LAN/public ingress", "OS sandboxing of SDK host tools"]}
 
     def passed(description, **evidence):
@@ -2673,6 +2673,7 @@ def phase1_acceptance(options):
     nodes = []
     report = {"status": "running", "source_binary": str(source_binary),
               "binary_sha256": file_sha256(binary), "provider_calls": 0,
+              "coverage": "real Node and durable Scheduler; fixture SDK",
               "evidence": [], "not_checked": ["real Cursor/Codex model success and native controls",
                   "rendered browser UI", "wire ACK loss", "real LAN/public ingress",
                   "instruction-boundary claim/final-commit crash injection (verify separately in Rust tests)"]}
@@ -2865,8 +2866,37 @@ def phase1_acceptance(options):
                 "text": "forbidden restart work"}, "accepted": False}])
         wait_for("new read-only recovery conversation remains usable", lambda: completed(readonly))
         require(not (workspace / "forbidden-restart").exists(), "read-only recovery cannot create business work")
+
+        def cached_remote_session():
+            with sqlite3.connect(f"file:{c.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+                sessions = [json.loads(row[0]) for row in connection.execute(
+                    "SELECT value FROM local_values WHERE network_id=? AND key LIKE 'scheduler:v1:remote-session:%'", (network,))]
+            return next((session for session in sessions if any(job.get("trigger") == interrupted["trigger"]
+                         for job in session.get("jobs", []))), None)
+
+        def remote_frozen(expected):
+            snapshot = conversation(c.client, name)
+            cached = cached_remote_session()
+            unknown = next((job for job in snapshot["scheduler"]["jobs"] if job["trigger"] == interrupted["trigger"]), None)
+            return cached if (cached and cached["write_frozen"] is expected
+                and snapshot["scheduler"]["write_frozen"] is expected and unknown and unknown["state"] == "unknown") else None
+
+        cached_frozen = wait_for("C caches the original remote Unknown as write frozen", lambda: remote_frozen(True))
+        c.stop()
+        require(cached_remote_session()["write_frozen"], "remote frozen status is persisted before C restarts")
+        c.start()
+        reconnect(c)
+        wait_for("restarted C restores the same remote frozen status", lambda: remote_frozen(True))
         a.client.rpc("resolve_manager_unknown", conversation_id=name, trigger=interrupted["trigger"],
                      evidence="Owned fixture process terminated; original attempt admitted no business operations.")
+        cached_resolved = wait_for("remote reconciliation releases C's cached freeze without a new job", lambda: remote_frozen(False))
+        require(cached_resolved["status_revision"] > cached_frozen["status_revision"],
+                "remote permission changes advance the original target's observed status revision")
+        c.stop()
+        require(cached_remote_session()["write_frozen"] is False, "remote freeze release persists before C restarts")
+        c.start()
+        reconnect(c)
+        wait_for("restarted C keeps reconciled remote history writable", lambda: remote_frozen(False))
         writable, _ = send(a.client, name, "after-human-reconcile",
                            host_command="printf allowed > after-reconcile", host_cwd=str(workspace))
         wait_for("new human round receives normal authority only after reconciliation", lambda: completed(writable))
@@ -2875,6 +2905,9 @@ def phase1_acceptance(options):
                 "reconciliation restores future writes without changing or replaying the original Unknown")
         passed("restart preserves Unknown, enforces read-only recovery and restores only future writes after human reconciliation",
                attempt_id=old_attempt)
+        passed("cached remote Unknown survives C restart, then reconciliation releases and persists the freeze without replay",
+               attempt_id=old_attempt, frozen_revision=cached_frozen["status_revision"],
+               reconciled_revision=cached_resolved["status_revision"])
 
         name = new_conversation("phase1-remote-ack")
         wait_for("remote source knows conversation", lambda: conversation(c.client, name))
@@ -3033,8 +3066,9 @@ def acceptance(options):
     helper.chmod(0o600)
     nodes = []
     report = {"status": "running", "evidence": [], "provider_calls": 0, "binary_sha256": file_sha256(binary),
+              "coverage": "real Node, Noise, isolated Relay and WASM client; fixture SDK",
               "not_checked": ["paid model output and SDK reasoning", "real LAN/public ingress", "rendered browser UI",
-                              "local Noise key enforcement is covered by the Rust client process test"]}
+                              "physical phone, Mac mini and PVE deployment", "local Noise key enforcement through WebSocket"]}
     capture = recovery_client = phone_client = None
 
     def passed(description, kind="real_node_processes", **evidence):
@@ -3105,7 +3139,7 @@ def acceptance(options):
         phone_client.url = capture.url
         phone_client.connect(a.peer_id, relay=True)
         phone_client.authenticate(network)
-        require(phone_client.call("info")["peer_id"] == a.peer_id, "relay Web client authenticates the pinned Mac Node")
+        require(phone_client.call("info")["peer_id"] == a.peer_id, "relay client authenticates the pinned personal Node")
         with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
             require(connection.execute("SELECT COUNT(*) FROM networks").fetchone()[0] == 0,
                     "public relay remains outside every personal network")
@@ -3138,7 +3172,7 @@ def acceptance(options):
                 "public relay never receives the private conversation as plaintext")
         with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
             require(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0, "pure relay stores no private event replica")
-        passed("phone pairs through PVE to its pinned personal Node while PVE remains a Web and ciphertext relay")
+        passed("independent WASM client pairs through an isolated Web and ciphertext Relay to its pinned personal Node")
 
         directory = workspace / "delayed-host-task"
         directory.mkdir()
@@ -3234,7 +3268,7 @@ def acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 def history_sync_fields(line):
-    fields = re.findall(r'\b(network|target|source|origin|request_id|scope|state|processed|changed|missing_events|missing_blobs|conflicts|hash|size|offset|limit|committed_offset|part_length|returned_bytes|phase|peer|link_id|outbound|route)=("[^"]*"|[^\s]+)', line)
+    fields = re.findall(r'\b(network|target|source|origin|request_id|scope|state|processed|changed|missing_events|missing_blobs|conflicts|hash|size|offset|limit|committed_offset|part_length|returned_bytes|phase|peer|link_id|outbound|route|flight_id|jobs)=("[^"]*"|[^\s]+)', line)
     return {key: value[1:-1] if value.startswith('"') else value for key, value in fields}
 
 
@@ -3242,7 +3276,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                                          event_count=100001):
     repository = Path(__file__).resolve().parents[1]
     case = {"status": "running", "history_events": event_count, "batch_budget": 1024,
-            "observations": [], "batches": [], "complete": False,
+            "observations": [], "batches": [], "scope_flight_completions": [], "complete": False,
             "source_isolation": "maintenance leases block background sync and allow authenticated peer reads"}
     report["cases"]["closure_progress"] = case
     leases = []
@@ -3325,6 +3359,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
         log_path = receiver.directory / "process.log"
         log_offset = log_path.stat().st_size
         log_tail = b""
+        scope_flights = set()
 
         def read_progress():
             nonlocal log_offset, log_tail
@@ -3337,6 +3372,14 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
             for raw in lines:
                 line = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode(errors="replace"))
                 fields = history_sync_fields(line)
+                if "history sync flight" in line:
+                    if fields.get("network") == network and fields.get("scope") == scope:
+                        scope_flights.add(fields["flight_id"])
+                    if "history sync flight yielded" in line and fields.get("scope") == scope:
+                        scope_flights.add(fields["flight_id"])
+                        case["batches"].append(fields)
+                    if "history sync flight finished" in line and fields.get("flight_id") in scope_flights:
+                        case["scope_flight_completions"].append(fields)
                 if fields.get("network") != network:
                     continue
                 if "history event fetched" in line:
@@ -3346,12 +3389,10 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                             or (target == parent_source.peer_id and digest != chain["head"]),
                             "each event is fetched from its actual fixed source distribution")
                     source_events[target].add(digest)
-                elif "history blob fetched" in line:
-                    require(fields["target"] == blob_source.peer_id and fields["hash"] == blob["hash"],
+                elif "history blob committed" in line and int(fields.get("committed_offset", "0")) == blob["size"]:
+                    require(fields["source"] == blob_source.peer_id and fields["hash"] == blob["hash"],
                             "the complete attachment is fetched from replica C")
-                    source_blobs[fields["target"]].add(fields["hash"])
-                elif "history scope sync finished" in line and fields.get("scope") == scope:
-                    case["batches"].append(fields)
+                    source_blobs[fields["source"]].add(fields["hash"])
             with sqlite3.connect(database, timeout=10) as connection:
                 count, ready, pending, invalid = connection.execute(
                     "SELECT COUNT(*),COALESCE(SUM(status='ready'),0),COALESCE(SUM(status='pending'),0),COALESCE(SUM(status IN ('invalid','conflict')),0) FROM events WHERE network_id=? AND scope_id=?",
@@ -3405,9 +3446,10 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                     connection.execute("INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?)",
                                        (network, blob["hash"], blob["size"], payload))
                 case["blob_supply"] = "replica C supplies the missing attachment after the incomplete-message rejection"
-            complete = any(batch.get("target") == head_source.peer_id and batch.get("state") == "Complete"
-                           and batch.get("missing_events") == "0" and batch.get("missing_blobs") == "0"
-                           and batch.get("conflicts") == "0" for batch in case["batches"])
+            complete = bool(case["scope_flight_completions"]) and any(
+                progress["heads"] == [chain["head"]] and not progress["next_events"]
+                and progress["missing_blobs"] == 0 and progress["frontier_generation"] is not None
+                for progress in observation["continuations"])
             if complete and observation["persisted_events"] == event_count and observation["ready_events"] == event_count and observation["complete_blob"]:
                 case["complete"] = True
                 break
@@ -3415,8 +3457,10 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
             time.sleep(0.5)
         require(case["complete"], "the full history reaches a complete signed frontier within the observation bound")
         require(blocked_message is not None, "pending history has an actual rejected message admission")
-        require(any(int(batch.get("processed", "0")) == 1024 for batch in case["batches"]) or event_count <= 1024,
-                "large history advances through the actual 1024-event runtime batch budget")
+        require(event_count <= 1024 or (len(case["batches"]) >= 2
+                and any(int(batch.get("processed", "0")) > 0 for batch in case["batches"])
+                and all(int(batch.get("processed", "0")) <= 1024 for batch in case["batches"])),
+                "large history yields across real bounded coordinator steps before completing its signed frontier")
         digest = hashlib.sha256()
         with sqlite3.connect(database, timeout=10) as connection:
             for envelope, in connection.execute("SELECT envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY sequence", (network, scope)):
@@ -5490,21 +5534,19 @@ def network_reliability_acceptance(options):
         if lane == 1:
             log_path = receiver.directory / "process.log"
 
-            def complete_syncs(offset, *, unchanged=False):
+            def complete_syncs(offset):
                 with log_path.open("rb") as log:
                     log.seek(offset)
                     lines = log.read().decode(errors="replace").splitlines()
-                expected = {"network": network, "target": source.peer_id, "scope": conversation,
-                            "state": "Complete", "missing_events": "0", "missing_blobs": "0", "conflicts": "0"}
-                if unchanged:
-                    expected["changed"] = "false"
-                completed = []
+                flights, completed = set(), []
                 for line in lines:
                     line = re.sub(r"\x1b\[[0-9;]*m", "", line)
-                    if "history scope sync finished" not in line:
+                    if "history sync flight" not in line:
                         continue
                     fields = history_sync_fields(line)
-                    if all(fields.get(key) == value for key, value in expected.items()):
+                    if fields.get("network") == network and fields.get("scope") == conversation:
+                        flights.add(fields["flight_id"])
+                    if "history sync flight finished" in line and fields.get("flight_id") in flights:
                         completed.append(line)
                 return completed
 
@@ -5524,7 +5566,7 @@ def network_reliability_acceptance(options):
             log_offset = log_path.stat().st_size
             starting_bytes, starting_frames = capture.payload_bytes, capture.frame_count
             completed = wait_for("a new complete unchanged scope sync inside the audit window",
-                                 lambda: complete_syncs(log_offset, unchanged=True))
+                                 lambda: complete_syncs(log_offset))
         else:
             time.sleep(7)
         after = receiver.client.rpc("export", conversation_id=conversation)

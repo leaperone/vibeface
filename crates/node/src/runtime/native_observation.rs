@@ -140,6 +140,113 @@ fn loaded_thread(thread: &Value) -> bool {
     )
 }
 
+async fn read_original_turn(
+    client: &vibeface_bridge::codex::CodexClient,
+    work: &NativeWork,
+) -> Result<Value> {
+    let turn_id = work
+        .turn_id
+        .as_deref()
+        .context("original native turn is unknown")?;
+    if let Ok(reply) = client
+        .request(
+            "thread/read",
+            json!({"threadId":work.thread_id,"includeTurns":true}),
+        )
+        .await
+    {
+        ensure!(
+            reply["thread"]["id"] == work.thread_id && loaded_thread(&reply["thread"]),
+            "the original native thread is not loaded on this Socket"
+        );
+        if let Some(turn) = reply["thread"]["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|turn| turn["id"] == turn_id)
+        {
+            return Ok(turn.clone());
+        }
+    }
+    let mut cursor: Option<String> = None;
+    let mut cursors = BTreeSet::new();
+    loop {
+        let reply = client
+            .request(
+                "thread/turns/list",
+                json!({"threadId":work.thread_id,"cursor":cursor,
+            "limit":100,"itemsView":"full","sortDirection":"desc"}),
+            )
+            .await?;
+        let turns = reply["data"]
+            .as_array()
+            .context("native turn history is unavailable")?;
+        ensure!(
+            turns.len() <= 100,
+            "native turn history exceeded its requested page"
+        );
+        if let Some(turn) = turns.iter().find(|turn| turn["id"] == turn_id) {
+            return Ok(turn.clone());
+        }
+        let next = reply["nextCursor"]
+            .as_str()
+            .context("the original turn was not found in native history")?;
+        ensure!(
+            !next.is_empty() && cursors.insert(next.to_owned()),
+            "native turn history cursor did not advance"
+        );
+        cursor = Some(next.to_owned());
+    }
+}
+
+fn reconcile_work(work: &mut NativeWork, turn: Result<Value>, assistant: Option<&str>) -> bool {
+    if work.state.terminal() {
+        return false;
+    }
+    let turn = match turn {
+        Ok(turn) if work.turn_id.is_some() && turn["id"].as_str() == work.turn_id.as_deref() => {
+            turn
+        }
+        _ => {
+            let detail = "The original native turn cannot be verified on this Socket. Its outcome is unknown; reconcile it on the owning device before retrying.";
+            let changed = work.state != NativeState::Unknown || work.detail != detail;
+            work.state = NativeState::Unknown;
+            work.detail = detail.into();
+            return changed;
+        }
+    };
+    let state = match turn["status"].as_str() {
+        Some("inProgress") => match work.state {
+            NativeState::Waiting | NativeState::Interrupting => work.state,
+            _ => NativeState::Running,
+        },
+        Some(status) => match terminal_state(status) {
+            Some(state) => state,
+            None => return false,
+        },
+        None => return false,
+    };
+    let detail = turn["error"]["message"]
+        .as_str()
+        .or_else(|| {
+            turn["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .find(|item| item["type"] == "agentMessage")
+                .and_then(|item| item["text"].as_str())
+        })
+        .or(assistant)
+        .or_else(|| (work.state == NativeState::Unknown).then_some(""));
+    let changed = work.state != state || detail.is_some_and(|detail| work.detail != detail);
+    work.state = state;
+    if let Some(detail) = detail {
+        work.detail = detail.chars().take(65536).collect();
+    }
+    changed
+}
+
 pub(crate) fn outcome(works: &[NativeWork]) -> Option<JobOutcome> {
     if works.is_empty() {
         return Some(JobOutcome::Completed);
@@ -168,7 +275,13 @@ impl Runtime {
             .context("this Node has no native Codex Socket configured")
     }
 
-    pub(super) async fn observe_session(&self, access: &Access, args: &Value) -> Result<Value> {
+    pub(super) async fn observe_session(
+        &self,
+        access: &Access,
+        args: &Value,
+        call_id: &str,
+    ) -> Result<Value> {
+        vibeface_protocol::validate_id(call_id).map_err(anyhow::Error::msg)?;
         let manager = access
             .manager
             .as_ref()
@@ -179,34 +292,6 @@ impl Runtime {
             .context("missing conversation")?;
         let thread_id = id(args, "thread_id")?;
         let turn_id = id(args, "turn_id")?;
-        let client = self.native_client()?;
-        let read = client
-            .request(
-                "thread/read",
-                json!({"threadId":thread_id,"includeTurns":false}),
-            )
-            .await?;
-        ensure!(
-            read["thread"]["id"] == thread_id,
-            "native Socket returned a different thread"
-        );
-        ensure!(
-            loaded_thread(&read["thread"]),
-            "the native thread is not loaded on this Socket; the owning process must expose its control endpoint"
-        );
-        let snapshot = client.snapshot().await;
-        let cached = &snapshot["threads"][&thread_id]["last_turn"];
-        let turn = if cached["id"] == turn_id {
-            Some(cached.clone())
-        } else {
-            client.request("thread/turns/list",json!({"threadId":thread_id,"limit":100,"itemsView":"full","sortDirection":"desc"}))
-                .await.ok().and_then(|reply| reply["data"].as_array().and_then(|turns|
-                    turns.iter().find(|turn| turn["id"] == turn_id).cloned()))
-        }.context("the original turn is not observed on this native Socket; expose its owning process before registering work")?;
-        let observed_text = snapshot["threads"][&thread_id]["last_assistant"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
         let work = {
             let mut store = self.store.lock().await;
             Self::check_manager_permission(&store, access, true, None)?;
@@ -229,51 +314,108 @@ impl Runtime {
                         && previous.attempt_id == manager.attempt_id,
                     "this native turn already belongs to another task or invocation"
                 );
-                return Ok(json!(previous));
+                if previous.state.terminal() {
+                    return Ok(json!(previous));
+                }
+                previous.clone()
+            } else {
+                ensure!(
+                    works.iter().filter(|work| !work.state.terminal()).count() < MAX_NATIVE_WORK,
+                    "native observation capacity is full"
+                );
+                let work = NativeWork {
+                    work_id: crypto::digest(&serde_json::to_vec(&(
+                        scope,
+                        &manager.attempt_id,
+                        &thread_id,
+                        &turn_id,
+                    ))?),
+                    conversation_id: scope.into(),
+                    task_ref,
+                    origin_trigger: manager.trigger.clone(),
+                    attempt_id: manager.attempt_id.clone(),
+                    target_node: self.identity.peer_id()?,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    state: NativeState::Unknown,
+                    detail: "The original native turn has been recorded but is not yet verified on this Socket. Its outcome is unknown.".into(),
+                    sequence: 0,
+                };
+                save_work(&mut store, &access.network_id, &work)?;
+                let mut ids = works
+                    .into_iter()
+                    .map(|work| work.work_id)
+                    .collect::<Vec<_>>();
+                ids.push(work.work_id.clone());
+                store.local_set(&access.network_id, INDEX, &json!(ids))?;
+                work
             }
-            ensure!(
-                works.iter().filter(|work| !work.state.terminal()).count() < MAX_NATIVE_WORK,
-                "native observation capacity is full"
-            );
-            let work = NativeWork {
-                work_id: crypto::digest(&serde_json::to_vec(&(
-                    scope,
-                    &manager.attempt_id,
-                    &thread_id,
-                    &turn_id,
-                ))?),
-                conversation_id: scope.into(),
-                task_ref,
-                origin_trigger: manager.trigger.clone(),
-                attempt_id: manager.attempt_id.clone(),
-                target_node: self.identity.peer_id()?,
-                thread_id,
-                turn_id: Some(turn_id),
-                state: NativeState::Running,
-                detail: observed_text,
-                sequence: 0,
-            };
-            save_work(&mut store, &access.network_id, &work)?;
-            let mut ids = works
-                .into_iter()
-                .map(|work| work.work_id)
-                .collect::<Vec<_>>();
-            ids.push(work.work_id.clone());
-            store.local_set(&access.network_id, INDEX, &json!(ids))?;
-            work
         };
-        self.refresh_native_subscriptions().await?;
-        self.observe_native(
-            json!({"method":"turn/completed","params":{"threadId":work.thread_id,"turn":turn}}),
-        )
-        .await?;
-        for request in snapshot["pending_requests"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        self.publish_changed(&access.network_id, scope, &work.origin_trigger);
+        let observation = tokio::time::timeout(Duration::from_secs(10), async {
+            let client = self.native_client()?;
+            let mut snapshot = client.snapshot().await;
+            let thread = &snapshot["threads"][&work.thread_id];
+            let observed_here = snapshot["connection"]["state"] == "connected"
+                && loaded_thread(thread)
+                && thread["last_turn"]["id"].as_str() == work.turn_id.as_deref();
+            if !observed_here {
+                let read = client
+                    .request(
+                        "thread/read",
+                        json!({"threadId":work.thread_id,"includeTurns":false}),
+                    )
+                    .await?;
+                ensure!(
+                    read["thread"]["id"] == work.thread_id && loaded_thread(&read["thread"]),
+                    "the original native thread is not loaded on this Socket"
+                );
+                snapshot = client.snapshot().await;
+            }
+            let cached = &snapshot["threads"][&work.thread_id]["last_turn"];
+            let turn = if cached["id"].as_str() == work.turn_id.as_deref() {
+                cached.clone()
+            } else {
+                read_original_turn(client, &work).await?
+            };
+            Ok::<_, anyhow::Error>((turn, snapshot))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("native observation lookup timed out"))
+        .and_then(|result| result);
+        let (turn, snapshot) = match observation {
+            Ok((turn, snapshot)) => (Ok(turn), Some(snapshot)),
+            Err(error) => (Err(error), None),
+        };
         {
-            if event_identity(request) == (Some(work.thread_id.as_str()), work.turn_id.as_deref()) {
-                self.observe_native(request.clone()).await?;
+            let mut store = self.store.lock().await;
+            let mut current: NativeWork = serde_json::from_value(
+                store
+                    .local_value(&access.network_id, &key(&work.work_id))?
+                    .context("native work is missing")?,
+            )?;
+            let assistant = snapshot.as_ref().and_then(|snapshot| {
+                let thread = &snapshot["threads"][&work.thread_id];
+                (thread["last_turn"]["id"].as_str() == work.turn_id.as_deref())
+                    .then(|| thread["last_assistant"].as_str())
+                    .flatten()
+            });
+            if reconcile_work(&mut current, turn, assistant) {
+                save_work(&mut store, &access.network_id, &current)?;
+            }
+        }
+        if let Some(snapshot) = snapshot {
+            self.refresh_native_subscriptions().await?;
+            for request in snapshot["pending_requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if event_identity(request)
+                    == (Some(work.thread_id.as_str()), work.turn_id.as_deref())
+                {
+                    self.observe_native(request.clone()).await?;
+                }
             }
         }
         self.publish_changed(&access.network_id, scope, &work.origin_trigger);
@@ -331,36 +473,45 @@ impl Runtime {
         if snapshot["connection"]["state"] != "connected" {
             return Ok(());
         }
-        for (network, mut work) in all {
+        for (network, work) in all {
             let thread = &snapshot["threads"][&work.thread_id];
-            if !loaded_thread(thread) {
-                if work.state != NativeState::Unknown {
-                    work.state = NativeState::Unknown;
-                    save_work(&mut *self.store.lock().await, &network, &work)?;
-                    self.publish_changed(&network, &work.conversation_id, &work.origin_trigger);
-                }
-                continue;
+            let (turn, assistant) = if !loaded_thread(thread) {
+                (
+                    Err(anyhow::anyhow!(
+                        "the original native thread is not loaded on this Socket"
+                    )),
+                    None,
+                )
+            } else if work.turn_id.is_some()
+                && thread["last_turn"]["id"].as_str() == work.turn_id.as_deref()
+            {
+                (
+                    Ok(thread["last_turn"].clone()),
+                    thread["last_assistant"].as_str(),
+                )
+            } else {
+                let turn = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    read_original_turn(client, &work),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("original native turn history lookup timed out"))
+                .and_then(|result| result);
+                (turn, None)
+            };
+            let mut store = self.store.lock().await;
+            let mut current: NativeWork = serde_json::from_value(
+                store
+                    .local_value(&network, &key(&work.work_id))?
+                    .context("native work is missing")?,
+            )?;
+            let changed = reconcile_work(&mut current, turn, assistant);
+            if changed {
+                save_work(&mut store, &network, &current)?;
             }
-            let turn = &thread["last_turn"];
-            if turn["id"].as_str() != work.turn_id.as_deref() {
-                continue;
-            }
-            if let Some(state) = turn["status"].as_str().and_then(terminal_state) {
-                if let Some(text) = thread["last_assistant"].as_str() {
-                    work.detail = text.chars().take(65536).collect();
-                }
-                work.state = state;
-                let mut store = self.store.lock().await;
-                let current: NativeWork = serde_json::from_value(
-                    store
-                        .local_value(&network, &key(&work.work_id))?
-                        .context("native work is missing")?,
-                )?;
-                if !current.state.terminal() {
-                    save_work(&mut store, &network, &work)?;
-                }
-                drop(store);
-                self.publish_changed(&network, &work.conversation_id, &work.origin_trigger);
+            drop(store);
+            if changed {
+                self.publish_changed(&network, &current.conversation_id, &current.origin_trigger);
             }
         }
         Ok(())
@@ -383,6 +534,7 @@ impl Runtime {
             }
             let works = sessions_from(&store, &network)?;
             for mut work in works {
+                let mut changed_hash = work.origin_trigger.clone();
                 if event["method"] == "bridge.codex_disconnected" && !work.state.terminal() {
                     work.state = NativeState::Unknown;
                     save_work(&mut store, &network, &work)?;
@@ -401,9 +553,10 @@ impl Runtime {
                                 || method == "item/tool/requestUserInput"
                         })
                     {
-                        store.queue_notification(
+                        if let Some(notification) = store.raise_notification_once(
+                            &self.identity,
                             &network,
-                            &Notification {
+                            Notification {
                                 notification_id: format!(
                                     "native-input-{}",
                                     crypto::digest(&serde_json::to_vec(&(
@@ -414,9 +567,12 @@ impl Runtime {
                                 conversation_id: work.conversation_id.clone(),
                                 kind: "needs_input".into(),
                                 text: "后台工作需要你的确认。".into(),
-                                event_hash: work.origin_trigger.clone(),
+                                event_hash: String::new(),
                             },
-                        )?;
+                            now_ms(),
+                        )? {
+                            changed_hash = notification.hash;
+                        }
                     }
                     self.publish_progress(&network, json!({"type":"native_progress","conversation_id":work.conversation_id,
                         "work_id":work.work_id,"target_node":work.target_node,"source_node":work.target_node,
@@ -425,7 +581,7 @@ impl Runtime {
                 } else {
                     continue;
                 }
-                self.publish_changed(&network, &work.conversation_id, &work.origin_trigger);
+                self.publish_changed(&network, &work.conversation_id, &changed_hash);
             }
         }
         Ok(())
@@ -464,10 +620,12 @@ impl Runtime {
             {
                 return Ok(works);
             }
-            if matches!(
-                job.state,
-                JobState::Cancelling { .. } | JobState::Unknown { .. }
-            ) {
+            if works.iter().any(|work| work.state == NativeState::Unknown)
+                || matches!(
+                    job.state,
+                    JobState::Cancelling { .. } | JobState::Unknown { .. }
+                )
+            {
                 return Err(crate::manager::ManagerError {
                     kind: crate::manager::ManagerFailure::Unknown, session_id: None,
                     message: "native work has no confirmed terminal outcome; the original turn was retained for reconciliation".into(),
@@ -538,6 +696,15 @@ impl Runtime {
             .filter(|work| work.conversation_id == scope)
             .map(|work| {
                 let mut value = json!(work);
+                let thread = &snapshot["threads"][&work.thread_id];
+                value["freshness"] = json!("observed");
+                value["can_control"] = json!(
+                    snapshot["connection"]["state"] == "connected"
+                        && loaded_thread(thread)
+                        && work.turn_id.is_some()
+                        && thread["last_turn"]["id"].as_str() == work.turn_id.as_deref()
+                        && matches!(work.state, NativeState::Running | NativeState::Waiting)
+                );
                 value["pending_requests"] = json!(super::chat_controls::pending_requests(
                     &snapshot,
                     Some(&work.thread_id),
@@ -756,6 +923,48 @@ mod tests {
         }
     }
 
+    async fn manager_access(node: &Runtime, network: &str, message_id: &str) -> Result<Access> {
+        let local = node.identity.peer_id()?;
+        let mut store = node.store.lock().await;
+        let (event, _) = store.accept_message(
+            &node.identity,
+            network,
+            "chat",
+            EventBody::MessagePosted {
+                message_id: message_id.into(),
+                role: "user".into(),
+                text: "observe the original native turn".into(),
+                scheduler_node: Some(local.clone()),
+            },
+            vec![],
+            2,
+            &local,
+            &local,
+            false,
+        )?;
+        let job = store
+            .claim_next(network, "chat", &local, "native-observation-test", "sdk")?
+            .context("native observation fixture was not claimed")?
+            .job;
+        let attempt = job
+            .state
+            .attempt()
+            .context("native observation fixture has no attempt")?;
+        store.mark_started(network, "chat", &local, &event.hash, &attempt.id)?;
+        Ok(Access {
+            network_id: network.into(),
+            human: false,
+            conversation_id: Some("chat".into()),
+            manager: Some(ManagerAccess {
+                attempt_id: attempt.id.clone(),
+                trigger: event.hash,
+                target_node: local,
+                read_only: false,
+                followup_version: None,
+            }),
+        })
+    }
+
     #[test]
     fn terminal_events_require_the_original_thread_and_turn_and_are_idempotent() {
         let mut work = work();
@@ -774,6 +983,376 @@ mod tests {
         assert!(apply_event(&mut work, &completed));
         assert!(!apply_event(&mut work, &completed));
         assert!(matches!(outcome(&[work]), Some(JobOutcome::Completed)));
+    }
+
+    #[tokio::test]
+    async fn native_approval_notification_is_signed_deduplicated_and_syncs_without_request_data()
+    -> Result<()> {
+        let dir = crate::runtime::tests::fixture()?;
+        let node = Runtime::open(&dir).await?;
+        let network = crate::runtime::tests::conversation(&node).await?;
+        let mut observed = work();
+        observed.target_node = node.identity.peer_id()?;
+        {
+            let mut store = node.store.lock().await;
+            save_work(&mut store, &network, &observed)?;
+            store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+        }
+        let mut updates = node.events.subscribe();
+        let approval = json!({"id":42,"method":"item/commandExecution/requestApproval",
+            "params":{"threadId":"thread","turnId":"turn",
+            "command":"private-command","secret":"private-key","availableDecisions":["decline"]}});
+        let mut wrong_turn = approval.clone();
+        wrong_turn["params"]["turnId"] = json!("another-turn");
+        node.observe_native(wrong_turn).await?;
+        assert!(
+            node.store
+                .lock()
+                .await
+                .pending_notifications(&network, "phone")?
+                .is_empty()
+        );
+        node.observe_native(approval.clone()).await?;
+        node.observe_native(approval).await?;
+        let (notification, bundle, snapshot) = {
+            let store = node.store.lock().await;
+            let notices = store.pending_notifications(&network, "phone")?;
+            assert_eq!(notices.len(), 1);
+            let notice = notices[0].clone();
+            assert_eq!(notice.kind, "needs_input");
+            assert_eq!(notice.text, "后台工作需要你的确认。");
+            let event = store
+                .event(&network, &notice.event_hash)?
+                .context("native approval notification is not a signed event")?;
+            let body: Event = serde_json::from_str(&event.canonical_body)?;
+            assert!(matches!(body.body, EventBody::NotificationRaised { .. }));
+            assert!(!serde_json::to_string(&event)?.contains("private-"));
+            assert_eq!(
+                sessions_from(&store, &network)?[0].state,
+                NativeState::Waiting
+            );
+            (
+                notice,
+                store.trust_bundle(&network)?.unwrap(),
+                store.export_snapshot(&network, "chat")?,
+            )
+        };
+        assert!(
+            std::iter::from_fn(|| updates.try_recv().ok()).any(|update| {
+                update.payload["type"] == "changed"
+                    && update.payload["event_hash"] == notification.event_hash
+            })
+        );
+        let replica_path = dir.join("replica.sqlite3");
+        let mut replica = Store::open(&replica_path)?;
+        replica.install_trust_bundle(&network, &bundle)?;
+        replica.import_snapshot(&network, &snapshot)?;
+        drop(replica);
+        let replica = Store::open(&replica_path)?;
+        assert_eq!(
+            replica.pending_notifications(&network, "phone")?,
+            vec![notification]
+        );
+        assert!(
+            replica
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
+                .is_empty()
+        );
+        assert!(replica.scheduler_outbox_all(&network)?.is_empty());
+        drop(replica);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_checks_exact_turn_history_and_reports_unsupported_history_as_unknown()
+    -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for history_available in [true, false] {
+            let dir = crate::runtime::tests::fixture()?;
+            let socket_dir =
+                PathBuf::from("/tmp").join(format!("vf-native-recovery-{}", uuid::Uuid::new_v4()));
+            config::private_dir(&socket_dir)?;
+            let socket_path = socket_dir.join("native.sock");
+            let listener = tokio::net::UnixListener::bind(&socket_path)?;
+            let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = requests.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await?;
+                let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                while let Some(message) = socket.next().await {
+                    let message = message?;
+                    if !message.is_text() {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(message.to_text()?)?;
+                    captured.lock().await.push(request.clone());
+                    if request["method"] == "initialized" {
+                        socket
+                            .send(Message::Text(
+                                json!({"method":"turn/completed","params":{"threadId":"thread",
+                            "turn":{"id":"later-turn","status":"completed"}}})
+                                .to_string()
+                                .into(),
+                            ))
+                            .await?;
+                        continue;
+                    }
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => Some(json!({"userAgent":"native-recovery-test"})),
+                        Some("thread/turns/list") if history_available => {
+                            if request["params"]["cursor"] == "older" {
+                                Some(
+                                    json!({"data":[{"id":"turn","status":"completed","items":[{"type":"agentMessage","text":"original result"}]}],"nextCursor":null}),
+                                )
+                            } else {
+                                Some(
+                                    json!({"data":[{"id":"later-turn","status":"completed","items":[{"type":"agentMessage","text":"later result"}]}],"nextCursor":"older"}),
+                                )
+                            }
+                        }
+                        _ => None,
+                    };
+                    let reply = match result {
+                        Some(result) => json!({"id":request["id"],"result":result}),
+                        None => {
+                            json!({"id":request["id"],"error":{"code":-32601,"message":"list_turns is not supported yet"}})
+                        }
+                    };
+                    socket.send(Message::Text(reply.to_string().into())).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            let mut node = Runtime::open(&dir).await?;
+            let (events, _receiver) = mpsc::unbounded_channel();
+            node.codex = Some(vibeface_bridge::codex::CodexClient::start(
+                socket_path,
+                events,
+            ));
+            let node = Arc::new(node);
+            let network = crate::runtime::tests::conversation(&node).await?;
+            let observed = work();
+            {
+                let mut store = node.store.lock().await;
+                save_work(&mut store, &network, &observed)?;
+                store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let snapshot = node.native_client()?.snapshot().await;
+                    if snapshot["connection"]["state"] == "connected"
+                        && snapshot["threads"]["thread"]["last_turn"]["id"] == "later-turn"
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            node.refresh_native_subscriptions().await?;
+            let restored = sessions_from(&*node.store.lock().await, &network)?;
+            assert_eq!(
+                restored[0].state,
+                if history_available {
+                    NativeState::Completed
+                } else {
+                    NativeState::Unknown
+                }
+            );
+            assert!(!restored[0].detail.contains("later result"));
+            if history_available {
+                assert_eq!(restored[0].detail, "original result");
+                assert!(
+                    requests
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|request| request["method"] == "thread/turns/list"
+                            && request["params"]["cursor"] == "older")
+                );
+            } else {
+                assert!(
+                    requests
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|request| request["method"] == "thread/turns/list")
+                );
+            }
+            let access = manager_access(&node, &network, "observed-native-turn").await?;
+            let args = json!({"thread_id":"thread","turn_id":"later-turn"});
+            assert!(node.observe_session(&access, &args, "").await.is_err());
+            let mut stale = access.clone();
+            stale.manager.as_mut().unwrap().attempt_id = "stale-attempt".into();
+            assert!(
+                node.observe_session(&stale, &args, "stale-call")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(sessions_from(&*node.store.lock().await, &network)?.len(), 1);
+            let attached = node
+                .observe_session(&access, &args, "observed-call")
+                .await?;
+            assert_eq!(attached["state"], "completed");
+            assert_eq!(attached["turn_id"], "later-turn");
+            let unverified = node
+                .observe_session(
+                    &access,
+                    &json!({"thread_id":"thread","turn_id":"unverified-turn"}),
+                    "unverified-call",
+                )
+                .await?;
+            assert_eq!(unverified["state"], "unknown");
+            assert_eq!(unverified["turn_id"], "unverified-turn");
+            let manager = access.manager.as_ref().unwrap();
+            let error = node
+                .wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::manager::ManagerError>()
+                    .is_some_and(|error| error.uncertain())
+            );
+            assert!(requests.lock().await.iter().all(|request| {
+                !matches!(
+                    request["method"].as_str(),
+                    Some("thread/start" | "thread/resume" | "turn/start" | "turn/interrupt")
+                )
+            }));
+            server.abort();
+            let _ = server.await;
+            drop(node);
+            std::fs::remove_dir_all(socket_dir)?;
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_uses_the_original_turn_and_preserves_its_persisted_terminal() {
+        let mut observed = work();
+        assert!(reconcile_work(
+            &mut observed,
+            Ok(json!({"id":"later-turn","status":"completed"})),
+            Some("later output")
+        ));
+        assert_eq!(observed.state, NativeState::Unknown);
+        assert!(!observed.detail.contains("later output"));
+        assert!(outcome(std::slice::from_ref(&observed)).is_none());
+        assert!(reconcile_work(
+            &mut observed,
+            Ok(json!({"id":"turn","status":"inProgress"})),
+            None
+        ));
+        assert_eq!(observed.state, NativeState::Running);
+        assert!(observed.detail.is_empty());
+        assert!(reconcile_work(
+            &mut observed,
+            Err(anyhow::anyhow!("history temporarily unavailable")),
+            None
+        ));
+        assert_eq!(observed.state, NativeState::Unknown);
+        assert!(reconcile_work(
+            &mut observed,
+            Ok(json!({"id":"turn","status":"completed",
+            "items":[{"type":"agentMessage","text":"original result"}]})),
+            None
+        ));
+        assert_eq!(observed.state, NativeState::Completed);
+        assert_eq!(observed.detail, "original result");
+        assert!(!reconcile_work(
+            &mut observed,
+            Err(anyhow::anyhow!("history unsupported")),
+            None
+        ));
+        assert_eq!(observed.state, NativeState::Completed);
+        assert_eq!(observed.detail, "original result");
+    }
+
+    #[tokio::test]
+    async fn unavailable_native_history_exits_the_running_task_wait_as_unknown() -> Result<()> {
+        let dir = crate::runtime::tests::fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = crate::runtime::tests::conversation(&node).await?;
+        let local = node.identity.peer_id()?;
+        let (trigger, attempt) = {
+            let mut store = node.store.lock().await;
+            let (event, _) = store.accept_message(
+                &node.identity,
+                &network,
+                "chat",
+                EventBody::MessagePosted {
+                    message_id: "native-recovery".into(),
+                    role: "user".into(),
+                    text: "wait for the original native turn".into(),
+                    scheduler_node: Some(local.clone()),
+                },
+                vec![],
+                2,
+                &local,
+                &local,
+                false,
+            )?;
+            let job = store
+                .claim_next(&network, "chat", &local, "native-recovery-test", "sdk")?
+                .context("native recovery fixture was not claimed")?
+                .job;
+            let attempt = job
+                .state
+                .attempt()
+                .context("native recovery fixture has no attempt")?
+                .id
+                .clone();
+            store.mark_started(&network, "chat", &local, &event.hash, &attempt)?;
+            (event.hash, attempt)
+        };
+        let mut observed = work();
+        observed.target_node = local.clone();
+        observed.origin_trigger = trigger.clone();
+        observed.attempt_id = attempt.clone();
+        assert!(reconcile_work(
+            &mut observed,
+            Err(anyhow::anyhow!("list_turns is not supported yet")),
+            None
+        ));
+        assert_eq!(observed.state, NativeState::Unknown);
+        {
+            let mut store = node.store.lock().await;
+            save_work(&mut store, &network, &observed)?;
+            store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+        }
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            node.wait_native_work(&network, "chat", &trigger, &attempt),
+        )
+        .await
+        .context("unknown native history must not leave the task waiting")?
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::manager::ManagerError>()
+                .is_some_and(|error| error.uncertain())
+        );
+        let store = node.store.lock().await;
+        assert!(matches!(
+            store
+                .scheduler_job(&network, "chat", &trigger, &local)?
+                .unwrap()
+                .state,
+            JobState::Running { .. }
+        ));
+        assert_eq!(
+            sessions_from(&store, &network)?[0].state,
+            NativeState::Unknown
+        );
+        drop(store);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

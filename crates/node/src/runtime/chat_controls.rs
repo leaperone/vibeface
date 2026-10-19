@@ -100,6 +100,90 @@ fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Va
     )
 }
 
+fn native_cache_key(scope: &str, target: &str) -> String {
+    format!(
+        "native-snapshot:v1:{}",
+        crypto::digest(&serde_json::to_vec(&(scope, target)).expect("string tuple serializes"))
+    )
+}
+
+fn remote_native_sessions(reply: &Value, scope: &str, target: &str) -> Result<Vec<Value>> {
+    let sessions = reply["native_sessions"]
+        .as_array()
+        .context("native observation response is invalid")?;
+    for work in sessions {
+        ensure!(
+            work["conversation_id"] == scope
+                && work["target_node"] == target
+                && work["work_id"].as_str().is_some_and(|id| !id.is_empty())
+                && work["thread_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "native observation identity mismatch"
+        );
+    }
+    Ok(sessions.clone())
+}
+
+fn mark_native_freshness(work: &mut Value, cached: bool) {
+    work["freshness"] = json!(if cached { "cached" } else { "observed" });
+    work["can_control"] = json!(
+        !cached
+            && work["can_control"].as_bool() == Some(true)
+            && matches!(work["state"].as_str(), Some("running" | "waiting"))
+    );
+    if cached
+        && !matches!(
+            work["state"].as_str(),
+            Some("completed" | "failed" | "interrupted")
+        )
+    {
+        work["state"] = json!("unknown");
+    }
+}
+
+fn remote_native_projection(
+    store: &mut Store,
+    network: &str,
+    scope: &str,
+    target: &str,
+    reply: Result<Value>,
+) -> Result<Vec<Value>> {
+    let key = native_cache_key(scope, target);
+    let (mut sessions, cached) = match reply.and_then(|reply| {
+        let sessions = remote_native_sessions(&reply, scope, target)?;
+        ensure!(
+            sessions
+                .iter()
+                .all(|work| work["freshness"] == "observed" && work["can_control"].is_boolean()),
+            "native observation control metadata is invalid"
+        );
+        Ok(sessions)
+    }) {
+        Ok(sessions) => {
+            let snapshot =
+                json!({"conversation_id":scope,"target_node":target,"native_sessions":sessions});
+            if store.local_value(network, &key)?.as_ref() != Some(&snapshot) {
+                store.local_set(network, &key, &snapshot)?;
+            }
+            (sessions, false)
+        }
+        Err(error) => {
+            tracing::debug!(network,scope,target,%error,"native observation unavailable; preserving its last authenticated snapshot");
+            let Some(snapshot) = store.local_value(network, &key)? else {
+                return Ok(Vec::new());
+            };
+            ensure!(
+                snapshot["conversation_id"] == scope && snapshot["target_node"] == target,
+                "cached native observation identity mismatch"
+            );
+            (remote_native_sessions(&snapshot, scope, target)?, true)
+        }
+    };
+    for work in &mut sessions {
+        mark_native_freshness(work, cached);
+    }
+    Ok(sessions)
+}
+
 impl Runtime {
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "artifact access requires the user");
@@ -174,6 +258,9 @@ impl Runtime {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        for work in &mut sessions {
+            mark_native_freshness(work, false);
+        }
         let targets = {
             let store = self.store.lock().await;
             store
@@ -207,24 +294,16 @@ impl Runtime {
                 ),
             )
             .await;
-            match result {
-                Ok(Ok(reply)) => {
-                    let remote = reply["native_sessions"]
-                        .as_array()
-                        .context("native observation response is invalid")?;
-                    for work in remote {
-                        ensure!(
-                            work["conversation_id"] == scope
-                                && work["target_node"] == target
-                                && work["work_id"].as_str().is_some_and(|id| !id.is_empty())
-                                && work["thread_id"].as_str().is_some_and(|id| !id.is_empty()),
-                            "native observation identity mismatch"
-                        );
-                        sessions.push(work.clone());
-                    }
-                }
-                _ => {}
-            }
+            let reply = result
+                .context("native observation timed out")
+                .and_then(|result| result);
+            sessions.extend(remote_native_projection(
+                &mut *self.store.lock().await,
+                network,
+                scope,
+                &target,
+                reply,
+            )?);
         }
         Ok(sessions)
     }
@@ -282,9 +361,7 @@ impl Runtime {
             tasks.push(projected);
         }
         targets.retain(|target| store.authorize_node(network, target, None).is_ok());
-        let frozen = jobs
-            .iter()
-            .any(|job| job["write_frozen"] == true || job["state"] == "unknown");
+        let frozen = jobs.iter().any(|job| job["write_frozen"] == true);
         let manager = self.config.manager.as_ref();
         let remote_manager = jobs
             .iter()
@@ -355,5 +432,108 @@ impl Runtime {
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_native_snapshot_survives_reopen_and_unavailable_reads_without_controls() -> Result<()>
+    {
+        let dir = crate::runtime::tests::fixture()?;
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
+        let mut store = Store::open(dir.join("node.sqlite3"))?;
+        store.install_trust_bundle(
+            &network,
+            &identity.sign_network_fixture(
+                1,
+                vec![identity.certificate(vec![NodeRole::Replica, NodeRole::Scheduler])?],
+            )?,
+        )?;
+        let session = json!({"conversation_id":"chat","target_node":"remote","work_id":"work",
+            "task_ref":"task","thread_id":"thread","turn_id":"turn","state":"waiting","detail":"original work",
+            "freshness":"observed","can_control":true,
+            "pending_requests":[{"request_id":7,"kind":"item/commandExecution/requestApproval","text":"confirm the original command",
+                "choices":[{"label":"拒绝","response":{"decision":"decline"}}]}]});
+        let live = remote_native_projection(
+            &mut store,
+            &network,
+            "chat",
+            "remote",
+            Ok(json!({"native_sessions":[session]})),
+        )?;
+        assert_eq!(live[0]["freshness"], "observed");
+        assert_eq!(live[0]["can_control"], true);
+        assert_eq!(live[0]["pending_requests"][0]["request_id"], 7);
+        drop(store);
+        let mut store = Store::open(dir.join("node.sqlite3"))?;
+        let cached = remote_native_projection(
+            &mut store,
+            &network,
+            "chat",
+            "remote",
+            Err(anyhow::anyhow!("peer unavailable")),
+        )?;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0]["work_id"], "work");
+        assert_eq!(cached[0]["thread_id"], "thread");
+        assert_eq!(cached[0]["turn_id"], "turn");
+        assert_eq!(cached[0]["freshness"], "cached");
+        assert_eq!(cached[0]["can_control"], false);
+        assert_eq!(cached[0]["state"], "unknown");
+        assert_eq!(cached[0]["pending_requests"], session["pending_requests"]);
+        let wrong_scope = json!({"native_sessions":[{"conversation_id":"other","target_node":"remote","work_id":"foreign","thread_id":"foreign"}]});
+        assert_eq!(
+            remote_native_projection(&mut store, &network, "chat", "remote", Ok(wrong_scope))?[0]["work_id"],
+            "work"
+        );
+        assert!(
+            remote_native_projection(
+                &mut store,
+                &network,
+                "other",
+                "remote",
+                Err(anyhow::anyhow!("peer unavailable"))
+            )?
+            .is_empty()
+        );
+        let mut invalid_control = session.clone();
+        invalid_control["can_control"] = json!("true");
+        let invalid = remote_native_projection(
+            &mut store,
+            &network,
+            "chat",
+            "remote",
+            Ok(json!({"native_sessions":[invalid_control]})),
+        )?;
+        assert_eq!(invalid[0]["freshness"], "cached");
+        assert_eq!(invalid[0]["can_control"], false);
+        let mut completed = session;
+        completed["state"] = json!("completed");
+        completed["can_control"] = json!(false);
+        completed["pending_requests"] = json!([]);
+        remote_native_projection(
+            &mut store,
+            &network,
+            "chat",
+            "remote",
+            Ok(json!({"native_sessions":[completed]})),
+        )?;
+        let terminal = remote_native_projection(
+            &mut store,
+            &network,
+            "chat",
+            "remote",
+            Err(anyhow::anyhow!("peer unavailable")),
+        )?;
+        assert_eq!(terminal[0]["state"], "completed");
+        assert_eq!(terminal[0]["freshness"], "cached");
+        assert_eq!(terminal[0]["can_control"], false);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

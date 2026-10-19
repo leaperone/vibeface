@@ -349,7 +349,7 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         None
     };
     let local_session = network_id.as_ref().and_then(|network_id| {
-        local_cookie(&headers).and_then(|cookie| {
+        local_cookie(&headers, &peer_id).and_then(|cookie| {
             app.node
                 .local_access
                 .session(cookie, &peer_id, network_id)
@@ -409,7 +409,7 @@ async fn local_exchange(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
             "{}={cookie}; HttpOnly; SameSite=Strict; Path=/api/local; Max-Age={}",
-            crate::local_access::COOKIE,
+            crate::local_access::cookie_name(&peer_id),
             crate::local_access::SESSION_SECONDS
         ))
         .map_err(ApiError::bad)?,
@@ -417,11 +417,12 @@ async fn local_exchange(
     Ok(response)
 }
 
-fn local_cookie(headers: &HeaderMap) -> Option<&str> {
+fn local_cookie<'a>(headers: &'a HeaderMap, peer_id: &str) -> Option<&'a str> {
+    let name = crate::local_access::cookie_name(peer_id);
     let mut cookies = one_header(headers, header::COOKIE.as_str())?
         .split(';')
         .filter_map(|cookie| cookie.trim().split_once('='))
-        .filter(|(name, _)| *name == crate::local_access::COOKIE);
+        .filter(|(cookie_name, _)| *cookie_name == name);
     let (_, value) = cookies.next()?;
     cookies.next().is_none().then_some(value)
 }
@@ -431,17 +432,14 @@ async fn local_websocket(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    let cookie = local_cookie(&headers)
+    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let cookie = local_cookie(&headers, &peer_id)
         .ok_or_else(ApiError::auth)?
         .to_owned();
     let state = app.node.membership_state().await.map_err(ApiError::bad)?;
     app.node
         .local_access
-        .session(
-            &cookie,
-            &app.node.identity.peer_id().map_err(ApiError::bad)?,
-            &state.genesis.network_id,
-        )
+        .session(&cookie, &peer_id, &state.genesis.network_id)
         .map_err(|_| ApiError::auth())?;
     Ok(websocket
         .max_message_size(65535)

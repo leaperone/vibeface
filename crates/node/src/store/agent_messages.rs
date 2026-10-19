@@ -145,7 +145,7 @@ impl Store {
             return Ok(Some(job));
         }
         let mut session = load_scheduler_session(&tx, network, scope, &local)?;
-        match &job.state {
+        let terminal = match &job.state {
             JobState::Queued => {
                 let evidence = "task cancelled before its agent started".to_owned();
                 job.state = JobState::Cancelled {
@@ -153,14 +153,7 @@ impl Store {
                     evidence: evidence.clone(),
                 };
                 session.pending.retain(|pending| pending != task_ref);
-                publish_agent_result_from(
-                    &tx,
-                    identity,
-                    network,
-                    &job,
-                    &JobOutcome::Cancelled(evidence),
-                    at,
-                )?;
+                Some(JobOutcome::Cancelled(evidence))
             }
             JobState::Claimed { attempt } | JobState::Running { attempt } => {
                 ensure!(
@@ -174,11 +167,15 @@ impl Store {
                     .permission_version
                     .checked_add(1)
                     .context("scheduler permission version overflow")?;
+                None
             }
-            _ => {}
-        }
+            _ => None,
+        };
         scheduler_save(&tx, network, &key, &job)?;
         save_scheduler_session(&tx, network, &session)?;
+        if let Some(terminal) = terminal {
+            publish_agent_result_from(&tx, identity, network, &job, &terminal, at)?;
+        }
         tx.commit()?;
         Ok(Some(job))
     }
@@ -356,6 +353,19 @@ impl Store {
             matches!(&job.state, JobState::Running { attempt } if attempt.id == attempt_id && !attempt.read_only),
             "source agent is not running or cannot send tasks"
         );
+        let mut origin = message.origin_trigger.clone();
+        while let EventBody::AgentMessage { message: ancestor } =
+            event_from(&tx, network, scope, &origin)?.body
+        {
+            if ancestor.kind != AgentMessageKind::Task {
+                break;
+            }
+            ensure!(
+                ancestor.target_node != target,
+                "target agent is waiting for this task; run local work directly"
+            );
+            origin = ancestor.origin_trigger;
+        }
         let body = EventBody::AgentMessage {
             message: message.clone(),
         };
@@ -564,6 +574,79 @@ mod tests {
     }
 
     #[test]
+    fn task_delegation_rejects_waiting_agent_ancestors() -> Result<()> {
+        let (mut store, source, target, network) = fixture()?;
+        let child = LocalIdentity::generate();
+        store.install_trust_bundle(
+            &network,
+            &source.sign_network_fixture(
+                2,
+                vec![
+                    source.certificate(roles())?,
+                    target.certificate(roles())?,
+                    child.certificate(roles())?,
+                ],
+            )?,
+        )?;
+        let (human, source_job) = start_human(&mut store, &source, &network)?;
+        let (parent, _) = store.post_agent_task(
+            &source,
+            &network,
+            "chat",
+            task_message("parent", &target.peer_id()?, &human),
+            &source_job.state.attempt().unwrap().id,
+            3,
+        )?;
+        let target_id = target.peer_id()?;
+        store.admit_trigger(&network, "chat", &parent.hash, &target_id, &target_id)?;
+        let parent_job = start_next(&mut store, &network, &target_id)?;
+        let heads = store.context(&network, "chat", &[])?.heads;
+        assert!(
+            store
+                .post_agent_task(
+                    &target,
+                    &network,
+                    "chat",
+                    task_message("self", &target_id, &parent),
+                    &parent_job.state.attempt().unwrap().id,
+                    4,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("target agent is waiting")
+        );
+        assert_eq!(store.context(&network, "chat", &[])?.heads, heads);
+        let child_id = child.peer_id()?;
+        let (nested, _) = store.post_agent_task(
+            &target,
+            &network,
+            "chat",
+            task_message("nested", &child_id, &parent),
+            &parent_job.state.attempt().unwrap().id,
+            5,
+        )?;
+        store.admit_trigger(&network, "chat", &nested.hash, &child_id, &child_id)?;
+        let child_job = start_next(&mut store, &network, &child_id)?;
+        let heads = store.context(&network, "chat", &[])?.heads;
+        assert!(
+            store
+                .post_agent_task(
+                    &child,
+                    &network,
+                    "chat",
+                    task_message("cycle", &target_id, &nested),
+                    &child_job.state.attempt().unwrap().id,
+                    6,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("target agent is waiting")
+        );
+        assert_eq!(store.context(&network, "chat", &[])?.heads, heads);
+        cleanup(store)
+    }
+
+    #[test]
     fn stable_task_ids_reject_changed_content_or_target() -> Result<()> {
         let (mut store, source, target, network) = fixture()?;
         let source_node = source.peer_id()?;
@@ -729,6 +812,117 @@ mod tests {
             let status = store.agent_task_status(&network, "chat", &task.hash)?;
             assert_eq!(status["state"], state);
             assert_eq!(status["result"], serde_json::to_value(expected)?);
+            cleanup(store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn same_node_task_terminals_preserve_the_pending_result_report() -> Result<()> {
+        for cancelled in [false, true] {
+            let (mut store, source, _target, network) = fixture()?;
+            let node = source.peer_id()?;
+            let (origin, human) = start_human(&mut store, &source, &network)?;
+            let human_attempt = &human.state.attempt().context("human attempt missing")?.id;
+            let (task, receipt) = store.post_agent_task(
+                &source,
+                &network,
+                "chat",
+                task_message("local-task", &node, &origin),
+                human_attempt,
+                3,
+            )?;
+            assert_eq!(receipt.state, "queued");
+            assert!(
+                store
+                    .claim_next(&network, "chat", &node, "test-boot", "sdk")?
+                    .is_none()
+            );
+            store.finish_job(
+                &source,
+                &network,
+                "chat",
+                &node,
+                &origin.hash,
+                human_attempt,
+                JobOutcome::Completed,
+                final_reply(&human, "delegated"),
+                4,
+            )?;
+            let kind = if cancelled {
+                let terminal = store
+                    .cancel_agent_task(&source, &network, "chat", &task.hash, &node, 5)?
+                    .context("cancelled task missing")?;
+                assert!(matches!(
+                    terminal.state,
+                    JobState::Cancelled { attempt: None, .. }
+                ));
+                AgentMessageKind::Interrupted
+            } else {
+                let running = start_next(&mut store, &network, &node)?;
+                assert_eq!(running.trigger, task.hash);
+                assert_eq!(running.kind, TriggerKind::AgentTask);
+                store.finish_job(
+                    &source,
+                    &network,
+                    "chat",
+                    &node,
+                    &task.hash,
+                    &running.state.attempt().context("task attempt missing")?.id,
+                    JobOutcome::Completed,
+                    final_reply(&running, "local result"),
+                    5,
+                )?;
+                AgentMessageKind::Completed
+            };
+            let result = result_envelope(&store, &network, &task)?;
+            let result_event = store.verify_event(&network, &result)?;
+            assert_eq!(result_event.author, node);
+            assert!(
+                matches!(result_event.body, EventBody::AgentMessage { message }
+                if message.kind == kind && message.target_node == node
+                    && message.origin_trigger == origin.hash
+                    && message.in_reply_to.as_deref() == Some(task.hash.as_str()))
+            );
+            let path = store.path.clone();
+            drop(store);
+            let mut store = Store::open(path)?;
+            let session = load_scheduler_session(&store.connection, &network, "chat", &node)?;
+            assert_eq!(session.pending, vec![result.hash.clone()]);
+            assert_eq!(session.active, None);
+            let report = start_next(&mut store, &network, &node)?;
+            assert_eq!(report.trigger, result.hash);
+            assert_eq!(report.kind, TriggerKind::AgentResult);
+            let report_attempt = report.state.attempt().context("report attempt missing")?;
+            assert!(report_attempt.read_only);
+            assert!(
+                store
+                    .claim_next(&network, "chat", &node, "test-boot", "sdk")?
+                    .is_none()
+            );
+            store.finish_job(
+                &source,
+                &network,
+                "chat",
+                &node,
+                &result.hash,
+                &report_attempt.id,
+                JobOutcome::Completed,
+                final_reply(&report, "reported"),
+                6,
+            )?;
+            assert_eq!(
+                store
+                    .admit_trigger(&network, "chat", &result.hash, &node, &node)?
+                    .state,
+                "completed"
+            );
+            assert!(
+                store
+                    .claim_next(&network, "chat", &node, "test-boot", "sdk")?
+                    .is_none()
+            );
+            assert_eq!(replies(&store, &network, &task)?.len(), 1);
             cleanup(store)?;
         }
         Ok(())
