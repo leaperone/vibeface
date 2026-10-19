@@ -93,7 +93,9 @@ export function ConnectionScreen() {
     setInvitation(JSON.stringify(parsed))
   }
 
-  const alert = error || device.error && device.phase !== 'reconnecting' ? <InlineError error={error || device.error} /> : null
+  // Not being a member yet is the normal state on this screen, so it reads as a hint rather than an error.
+  const alert = error || device.error && !['reconnecting', 'unpaired'].includes(device.phase) ? <InlineError error={error || device.error} />
+    : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p> : null
   const joining = device.localJoin && device.localJoin.kind !== 'idle' && device.localJoin.kind !== 'joined'
   const focused = Boolean(device.review || device.waiting || joining)
   const setup = device.localSetup?.kind === 'uninitialized'
@@ -168,7 +170,7 @@ export function ConnectionScreen() {
           </fieldset>
         </form>
       </Details> : null}
-      {device.identity ? <Details><DetailRow label="这个浏览器的设备编号" value={device.identity.peerId} mono /></Details> : null}
+      {device.identity && !focused ? <Details><DetailRow label="这个浏览器的设备编号" value={device.identity.peerId} mono /></Details> : null}
     </div>
   </main>
 }

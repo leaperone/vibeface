@@ -42,6 +42,12 @@ export function AddDevice() {
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
   useEffect(() => { setResult(null); setError(""); setStatus("") }, [ready])
+  // While a link is out, look for the new device's request more often than the shell does.
+  useEffect(() => {
+    if (!result) return
+    const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 5000)
+    return () => clearInterval(timer)
+  }, [result, ready])
   if (!ready?.principal.can_manage) return null
 
   // Bound to the connection generation so a late clipboard or invite can't release a newer action.

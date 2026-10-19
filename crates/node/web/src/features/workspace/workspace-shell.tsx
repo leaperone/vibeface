@@ -43,6 +43,14 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
 
   useEffect(() => { setOpenMobile(false) }, [pathname, setOpenMobile])
+  // ponytail: join requests aren't pushed; admins poll every 30s. Push them with the directory if this gets busy.
+  useEffect(() => {
+    if (!device.ready?.principal.can_manage) return
+    const refresh = () => { device.refreshDirectory().catch(() => {}) }
+    refresh()
+    const timer = setInterval(refresh, 30_000)
+    return () => clearInterval(timer)
+  }, [device.ready])
   useEffect(() => {
     for (const pair of joins) {
       if (announced.current.has(pair.request_id)) continue

@@ -85,9 +85,14 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const localEntry = device.localSetup?.kind === 'uninitialized' ? device.localSetup.invitation.entry : device.localSetup?.entry
   const target = device.ready?.entry || device.entry || localEntry
   const { busy, error, status, run } = useGenerationRun()
+  const [open, setOpen] = useState(only)
   if (device.review?.kind === 'recovery') return <RecoveryReview />
+  if (!open) return <div className="flex flex-wrap gap-2">
+    <Button type="button" variant="outline" onClick={() => setOpen('restore')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button>
+    <Button type="button" variant="outline" onClick={() => setOpen('passphrase')}><KeyRound aria-hidden="true" />换恢复密码</Button>
+  </div>
   return <div className="grid gap-4">
-    {only !== 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
+    {open === 'restore' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />用恢复文件找回</h2>
       <p className="text-meta text-muted-foreground">只恢复设备列表和管理权限，对话记录留在原来的设备上。</p>
       <form className="grid gap-4" onSubmit={(event) => {
@@ -107,10 +112,10 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           <Label label="设备编号"><Input className="font-mono" name="peer_id" required pattern="[a-f0-9]{64}" defaultValue={target?.peer_id || ''} autoComplete="off" spellCheck={false} /></Label>
           <Label label="新电脑的本机初始化邀请（可选）"><Textarea className="min-h-20 font-mono text-meta" name="bootstrap" autoComplete="off" spellCheck={false} /></Label>
         </Details>
-        <Button type="submit" className="w-fit"><BusyIcon busy={busy} />下一步</Button>
+        <div className="flex flex-wrap gap-2"><Button type="submit"><BusyIcon busy={busy} />下一步</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
     </section> : null}
-    {only !== 'restore' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
+    {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2>
       <p className="text-meta text-muted-foreground">会下载一份用新密码的恢复文件，旧文件仍可用旧密码打开。</p>
       <form className="grid gap-4" onSubmit={(event) => {
@@ -126,7 +131,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>
         <Label label="新密码（至少 12 个字符）"><Input type="password" name="password" minLength={12} autoComplete="new-password" required /></Label>
         <Label label="再输一次"><Input type="password" name="confirmation" minLength={12} autoComplete="new-password" required /></Label>
-        <Button type="submit" variant="outline" className="w-fit"><BusyIcon busy={busy} />下载新文件</Button>
+        <div className="flex flex-wrap gap-2"><Button type="submit" variant="outline"><BusyIcon busy={busy} />下载新文件</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
     </section> : null}
     {status ? <p role="status" className="text-meta text-success">{status}</p> : null}

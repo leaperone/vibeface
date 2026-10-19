@@ -756,12 +756,12 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   let generation = 1, creation = pendingResult()
   const clipboard = pendingResult()
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', peer_id: 'target' } } }
-  const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: () => creation.promise }
+  const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
     '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false },
     '@/lib/node': { messageOf: (cause: Error) => cause.message, record: (value: unknown) => value, text: (value: unknown) => value },
     '@/lib/enrollment-reference': { invitationLink: () => 'https://node.example/#invite=test' }, cn: { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
-  }, { navigator: { clipboard: { writeText: () => clipboard.promise } } })
+  }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })
   const render = () => app.render('AddDevice')
   const labelled = (label: string) => render().find(({ props }) => [props.children].flat().includes(label))?.props
   try {
