@@ -488,6 +488,56 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         },
         6,
     )?;
+    store.apply_work_signal(
+        &net.a,
+        &net.network,
+        &id,
+        Signal::ApprovalRequested {
+            rpc_id: serde_json::json!(7),
+            method: "item/commandExecution/requestApproval".into(),
+            params: serde_json::json!({}),
+            kind: "command".into(),
+            summary: "npm test".into(),
+            epoch: 1,
+        },
+        7,
+    )?;
+    let request_id = store.works(&net.network, "c")?[0].open_approvals[0]
+        .request_id
+        .clone();
+    let EventBody::ApprovalAnswered { attestation, .. } = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::ApprovalAnswered {
+            work_id: id.clone(),
+            request_id: request_id.clone(),
+            decision: ApprovalDecision::Accept,
+            attestation: None,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    store.apply_work_signal(
+        &net.a,
+        &net.network,
+        &id,
+        Signal::ApprovalAnswered {
+            request_id: request_id.clone(),
+            decision: ApprovalDecision::Accept,
+            attestation: attestation.context("signed answer")?,
+        },
+        8,
+    )?;
+    let works = store.works(&net.network, "c")?;
+    assert!(works[0].open_approvals.is_empty());
+    assert_eq!(
+        (
+            works[0].answered_approvals[0].summary.as_str(),
+            works[0].answered_approvals[0].decision
+        ),
+        ("npm test", ApprovalDecision::Accept)
+    );
     let (_, receipt) = store.apply_work_signal(
         &net.a,
         &net.network,
@@ -498,7 +548,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
             text: "done".into(),
             error: None,
         },
-        7,
+        9,
     )?;
     assert!(receipt.is_some());
     let job = store

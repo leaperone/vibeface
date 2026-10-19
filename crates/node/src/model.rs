@@ -356,12 +356,21 @@ pub struct WorkProjection {
     pub result_text: String,
     pub failure_reason: Option<String>,
     pub open_approvals: Vec<ApprovalProjection>,
+    /// Requests already answered, kept so the conversation shows who decided what.
+    pub answered_approvals: Vec<AnsweredApproval>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApprovalProjection {
     pub request_id: String,
     pub kind: String,
     pub summary: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnsweredApproval {
+    pub request_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub decision: ApprovalDecision,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Autonomy {

@@ -234,7 +234,7 @@ pub(crate) fn works_from(
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut approvals = connection.prepare(
-        "SELECT request_id,kind,summary FROM approvals WHERE network_id=? AND work_id=? AND request_rank IS NOT NULL AND decision IS NULL ORDER BY request_rank",
+        "SELECT request_id,kind,summary,decision FROM approvals WHERE network_id=? AND work_id=? AND request_rank IS NOT NULL ORDER BY request_rank",
     )?;
     let mut works = Vec::with_capacity(rows.len());
     for (work_id, target_node, dispatch, progress, thread_id, turn_id, finish) in rows {
@@ -263,19 +263,34 @@ pub(crate) fn works_from(
                 }) => (Some(outcome), result_text, failure_reason),
                 _ => (None, String::new(), None),
             };
-        let open_approvals = if outcome.is_some() {
-            Vec::new()
-        } else {
-            approvals
-                .query_map(params![network, work_id], |r| {
-                    Ok(ApprovalProjection {
-                        request_id: r.get(0)?,
-                        kind: r.get(1)?,
-                        summary: r.get(2)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
+        let mut open_approvals = Vec::new();
+        let mut answered_approvals = Vec::new();
+        let rows = approvals.query_map(params![network, work_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (request_id, kind, summary, decision) = row?;
+            match decision {
+                Some(decision) => answered_approvals.push(AnsweredApproval {
+                    request_id,
+                    kind,
+                    summary,
+                    decision: serde_json::from_value(serde_json::Value::String(decision))?,
+                }),
+                // A finished work has nothing left to answer.
+                None if outcome.is_none() => open_approvals.push(ApprovalProjection {
+                    request_id,
+                    kind,
+                    summary,
+                }),
+                None => {}
+            }
+        }
         works.push(WorkProjection {
             work_id,
             conversation_id: scope.into(),
@@ -293,6 +308,7 @@ pub(crate) fn works_from(
             result_text,
             failure_reason,
             open_approvals,
+            answered_approvals,
         });
     }
     Ok(works)

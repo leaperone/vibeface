@@ -255,6 +255,27 @@ pub(crate) fn request_form(method: &str, params: &Value) -> Value {
             .collect::<Vec<_>>()
         );
     }
+    // Structured copies so the web can lay out the command, place and files.
+    if let Some(reason) = params["reason"].as_str().filter(|r| !r.trim().is_empty()) {
+        form["reason"] = json!(reason);
+    }
+    let command = params["command"].as_str().map(str::to_owned).or_else(|| {
+        params["command"].as_array().map(|c| {
+            c.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    });
+    if let Some(command) = command {
+        form["command"] = json!(command);
+    }
+    if let Some(cwd) = params["cwd"].as_str().or(params["grantRoot"].as_str()) {
+        form["cwd"] = json!(cwd);
+    }
+    if let Some(changes) = params["changes"].as_object() {
+        form["files"] = json!(changes.keys().collect::<Vec<_>>());
+    }
     if let Some(questions) = params["questions"].as_array() {
         form["questions"] = json!(
             questions
@@ -455,5 +476,35 @@ impl ExecutorHost {
             kill_group(group);
         }
         let _ = std::fs::remove_file(&managed.pidfile);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn approval_forms_carry_command_place_and_files() {
+        let form = super::request_form(
+            "item/commandExecution/requestApproval",
+            &json!({"command":["npm","test"],"cwd":"/p","reason":"run tests","availableDecisions":["accept","decline"]}),
+        );
+        assert_eq!(
+            (
+                form["command"].as_str(),
+                form["cwd"].as_str(),
+                form["reason"].as_str()
+            ),
+            (Some("npm test"), Some("/p"), Some("run tests"))
+        );
+        assert_eq!(form["choices"].as_array().map(Vec::len), Some(2));
+        let form = super::request_form(
+            "item/fileChange/requestApproval",
+            &json!({"grantRoot":"/p","changes":{"a.ts":{}}}),
+        );
+        assert_eq!(
+            (form["cwd"].as_str(), &form["files"]),
+            (Some("/p"), &json!(["a.ts"]))
+        );
     }
 }
