@@ -14,7 +14,7 @@
 
 管理事件含 `version`、`cluster_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`。签名目录验证因果授权，不能通过并发事件自行扩大权限，已知撤销优先。管理恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
 
-所有共享会话、事件、附件、任务及通知按 `cluster_id` 分区。公网发现目录不发布私人集群成员关系、项目或会话。一个物理 Node 可运行自己的调度执行，同时为其他集群转发密文。
+所有共享会话、事件、附件、任务及通知按 `cluster_id` 分区。公网发现目录公开 Peer 签名声明的 Cluster ID、服务和路由，可按已知 Peer ID 或 Cluster ID 查询。声明不证明成员授权，目录不发布签名成员图、设备名称、项目或会话。一个物理 Node 可运行自己的调度执行，同时为其他集群转发密文。
 
 ## Peer ID 术语
 

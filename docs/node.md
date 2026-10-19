@@ -226,7 +226,7 @@ vibeface serve --data-dir "$HOME/.vibeface-relay"
 
 在 Mac mini 的 `config.json` 中把 `network.bootstrap_urls` 设为 `["wss://relay.example/api/network/ws"]`，重启 Mac mini Node。Mac mini 主动登记签名路径并维持中继预约，无需入站公网端口。PVE 不需要加入 Mac mini 的成员目录。
 
-手机打开可信的 PVE 网页，导入含 Mac mini 完整指纹的连接信息。首次访问仍在 Mac mini 完成配对和持钥验证，之后使用手机自己的设备凭据重连。公共目录只按已知 Peer ID 查路由，不枚举私人设备，也不能仅凭设备名称证明它属于你。公开发现和密文转发不要求集群成员身份，业务权限由 Mac mini 验证。
+手机打开可信的 PVE 网页，导入含 Mac mini 完整指纹的连接信息，或填写已知 Cluster ID 查找可用入口。首次访问仍需完成配对和持钥验证，之后使用手机自己的设备凭据重连。公共目录按已知 Peer ID 或 Cluster ID 返回签名声明的服务和路由，其中的 Peer 与 Cluster 关联属于公开自声明。目录不发布签名成员图或设备名称，连接后仍须验证成员授权。公开发现和密文转发不要求集群成员身份，业务权限由接入 Node 验证。
 
 ## 创建机器人并处理结果
 
