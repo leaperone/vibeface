@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 pub const SESSION_SECONDS: u64 = 86400;
+const SESSIONS_FILE: &str = "local-sessions.json";
 
 pub fn cookie_name(node_id: &str) -> String {
     format!("vibeface_local_{node_id}")
@@ -38,13 +39,14 @@ struct Pending {
     expires: Instant,
 }
 
-#[derive(Clone)]
+/// Kept in `local-sessions.json` by cookie digest, so a restarted Node still knows the browser.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalSession {
     pub node_id: String,
     pub network_id: String,
     pub device_id: String,
-    generation: u64,
-    expires: Instant,
+    expires_at_ms: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -71,6 +73,14 @@ impl LocalAccess {
             );
         }
         let (changes, _) = watch::channel(0);
+        let sessions = match std::fs::read(dir.join(SESSIONS_FILE)) {
+            Ok(bytes) => serde_json::from_slice::<HashMap<String, LocalSession>>(&bytes)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, session)| enabled && session.expires_at_ms > now_ms())
+                .collect(),
+            Err(_) => HashMap::new(),
+        };
         Ok(Self {
             dir: dir.to_owned(),
             state: Mutex::new(State {
@@ -79,7 +89,7 @@ impl LocalAccess {
                 launcher_hash: String::new(),
                 origin: None,
                 tokens: HashMap::new(),
-                sessions: HashMap::new(),
+                sessions,
             }),
             changes,
         })
@@ -206,23 +216,22 @@ impl LocalAccess {
         );
         state
             .sessions
-            .retain(|_, session| session.expires > Instant::now());
+            .retain(|_, session| session.expires_at_ms > now_ms());
         ensure!(
             state.sessions.len() < 256,
             "too many local browser sessions"
         );
         let cookie = random_secret();
-        let generation = state.generation;
         state.sessions.insert(
             crypto::digest(cookie.as_bytes()),
             LocalSession {
                 node_id: node_id.to_owned(),
                 network_id: network_id.to_owned(),
                 device_id: device_id.to_owned(),
-                generation,
-                expires: Instant::now() + Duration::from_secs(SESSION_SECONDS),
+                expires_at_ms: now_ms() + SESSION_SECONDS as i64 * 1000,
             },
         );
+        self.save_sessions(&state)?;
         Ok(cookie)
     }
 
@@ -240,8 +249,7 @@ impl LocalAccess {
             .get(&crypto::digest(cookie.as_bytes()))
             .context("local browser session is no longer valid")?;
         ensure!(
-            session.expires > Instant::now()
-                && session.generation == state.generation
+            session.expires_at_ms > now_ms()
                 && session.node_id == node_id
                 && session.network_id == network_id,
             "local browser session no longer matches this node and personal network"
@@ -264,9 +272,21 @@ impl LocalAccess {
         state.generation = state.generation.wrapping_add(1);
         state.tokens.clear();
         state.sessions.clear();
+        self.save_sessions(&state)?;
         self.changes.send_replace(state.generation);
         Ok(())
     }
+
+    fn save_sessions(&self, state: &State) -> Result<()> {
+        config::private_write(
+            &self.dir.join(SESSIONS_FILE),
+            &serde_json::to_vec(&state.sessions)?,
+        )
+    }
+}
+
+fn now_ms() -> i64 {
+    crate::runtime::now_ms()
 }
 
 fn random_secret() -> String {
@@ -306,6 +326,13 @@ mod tests {
             local.session(&cookie, "node", "network")?.device_id,
             browser.device_id()?
         );
+        assert_eq!(
+            LocalAccess::open(&dir, true)?
+                .session(&cookie, "node", "network")?
+                .device_id,
+            browser.device_id()?,
+            "a restarted Node keeps the browser's session"
+        );
         assert!(local.session(&cookie, "other-node", "network").is_err());
         assert!(local.session(&cookie, "node", "other-network").is_err());
         let pending = local.issue(&launcher.capability, "node", "network")?;
@@ -314,6 +341,12 @@ mod tests {
         assert!(changes.has_changed()?);
         assert!(!config::Config::load(&dir)?.local_auto_access);
         assert!(local.session(&cookie, "node", "network").is_err());
+        assert!(
+            LocalAccess::open(&dir, true)?
+                .session(&cookie, "node", "network")
+                .is_err(),
+            "disabling also forgets saved sessions"
+        );
         assert!(
             local
                 .issue(&launcher.capability, "node", "network")
