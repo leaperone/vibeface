@@ -320,4 +320,4 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-业务存储使用 `rusqlite`，没有 ORM。最终 schema 和 Atlas 校验清单位于 `crates/node/migrations/`。业务数据库 `user_version` 为 `3`，直接初始化最终结构，不提供旧库迁移。部署此版本使用全新数据目录和同版本节点，不能把新程序直接接到旧库。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
+业务存储使用 `rusqlite`，没有 ORM。最终 schema 和 Atlas 校验清单位于 `crates/node/migrations/`。业务数据库 `user_version` 为 `4`，直接初始化最终结构，不提供旧库迁移。部署此版本使用全新数据目录和同版本节点，不能把新程序直接接到旧库。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
