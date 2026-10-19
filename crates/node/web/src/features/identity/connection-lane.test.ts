@@ -134,7 +134,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'pair_status') return { status: 'granted' }
         if (method === 'prepare_genesis') {
-          const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
+          const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: String(params.node_name), node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
           return { state: { genesis, checkpoint: null, events: [] }, signing: { domain: 'identity-genesis', payload: canonical(genesis) } }
         }
         return {}
@@ -385,19 +385,17 @@ test('unmounting aborts pending local discovery without publishing setup state',
   assert.equal(app.render().localSetup, null)
 })
 
-test('a node invitation uses the local Node endpoint and requires explicit acceptance of the displayed review', async () => {
+test('a node invitation uses the local Node endpoint and sends its acceptance once the review checks out', async () => {
   const app = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
   try {
     app.render(); await settle()
     app.joinResponses.set('request', receipt)
+    app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
     await app.render().pair(invitation, 'node')
-    assert.equal(app.render().localJoin?.kind, 'review')
-    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 0)
+    assert.equal(app.render().localJoin?.kind, 'pending')
+    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
     assert.equal(app.sockets.length, 0)
     assert.equal(app.render().ready, null)
-    app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
-    await app.render().acceptLocalJoin()
-    assert.equal(app.render().localJoin?.kind, 'pending')
     assert.deepEqual(app.joinRequests.find(request => request.action === 'accept')?.params, { request_id: 'node-pair', review_hash: receipt.review_hash })
     app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
     app.joinResponses.set('status', { kind: 'joined', network_id: network, peer_id: target })
@@ -414,13 +412,15 @@ test('a node invitation uses the local Node endpoint and requires explicit accep
   } finally { app.close() }
 })
 
-test('refreshing a local Node restores its review without resending a request or accepting it', async () => {
+test('refreshing a local Node whose acceptance never landed sends it once without resending the request', async () => {
   const app = deviceHarness({ local: 'fresh' }), { receipt } = nodeJoinFixture()
   app.joinResponses.set('status', receipt)
+  app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
   try {
-    app.render(); await settle(); await settle()
-    assert.equal(app.render().localJoin?.kind, 'review')
-    assert.deepEqual(app.joinRequests.map(request => request.action), ['status'])
+    app.render()
+    for (let tries = 0; tries < 50 && app.render().localJoin?.kind !== 'pending'; tries++) await settle()
+    assert.equal(app.render().localJoin?.kind, 'pending')
+    assert.deepEqual(app.joinRequests.map(request => request.action), ['status', 'accept'])
     assert.equal(app.render().ready, null)
   } finally { app.close() }
 })
@@ -447,10 +447,11 @@ test('a lost Node acceptance response is reconciled through status without autom
   try {
     app.render(); await settle()
     app.joinResponses.set('request', receipt)
-    await app.render().pair(invitation, 'node')
     const hold = deferred(); app.holds.set('local_join:accept', hold)
-    const accepting = app.render().acceptLocalJoin(), rejected = assert.rejects(accepting, /response lost/)
-    await settle(); hold.reject(new Error('response lost')); await rejected
+    const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /response lost/)
+    for (let tries = 0; tries < 50 && !app.calls.includes('local_join:accept'); tries++) await settle()
+    hold.reject(new Error('response lost')); await rejected
+    assert.equal(app.render().localJoin?.kind, 'review')
     assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
     app.joinResponses.set('status', { ...receipt, kind: 'pending' })
     await app.render().refreshLocalJoin()

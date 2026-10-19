@@ -34,7 +34,7 @@ export function JoinCard({ pair }: { pair: PairReceipt }) {
       <Button type="button" disabled={!signed || action.busy !== null} onClick={() => void action.run("allow", () => device.approvePair(pair.request_id), "已允许加入")}>{action.busy ? "处理中" : "允许"}</Button>
     </>}
   >
-    <p className="text-meta text-muted-foreground">{signed ? "两边的核对码一致再允许" : "等对方确认核对码"}</p>
+    <p className="text-meta text-muted-foreground">{signed ? "和新设备上显示的一致再允许" : "等新设备发出请求"}</p>
     {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
     <InlineError error={action.error} />
     <Details>

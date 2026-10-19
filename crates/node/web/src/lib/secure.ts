@@ -73,12 +73,12 @@ export async function openPackage(file: File, password: string) {
     return { payload, root: openedRoot, networkId, epoch, release() { if (!released) { released = true; openedRoot.free(); payload.root_secret_key = '' } } }
   } catch (error) { root?.free(); payload.root_secret_key = ''; throw error }
 }
-export function downloadPackage(bytes: Uint8Array, networkId: string) {
+export function downloadPackage(bytes: Uint8Array) {
   const copy = new Uint8Array(bytes)
   const url = URL.createObjectURL(new Blob([copy.buffer], { type: 'application/json' }))
   const link = document.createElement('a')
   link.href = url
-  link.download = `vibeface-recovery-${networkId.slice(0, 12)}.json`
+  link.download = `vibeface-recovery-${new Date().toLocaleDateString("sv")}.json`
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

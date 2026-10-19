@@ -10,6 +10,8 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@/features/identity/context"
 import { isLoopback } from "@/features/workspace/labels"
+import { JoinRequests } from "./join"
+import { useIgnoredPairs } from "./ignored"
 import { downloadConnectionFile } from "@/lib/connection-file"
 import { invitationLink } from "@/lib/enrollment-reference"
 import { messageOf, record, text } from "@/lib/node"
@@ -41,6 +43,9 @@ export function AddDevice() {
   const pending = useRef<number | null>(null)
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
+  const ignored = useIgnoredPairs()
+  // A join request is the next thing to act on, so it takes the only solid button.
+  const requests = device.pairs.some((pair) => !ignored.includes(pair.request_id))
   useEffect(() => { setResult(null); setError(""); setStatus("") }, [ready])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
@@ -70,11 +75,12 @@ export function AddDevice() {
   const choose = (next: Kind) => { setKind(next); setResult(null); setStatus("") }
 
   return <>
-    <Button type="button" onClick={() => setOpen(true)}><Plus aria-hidden="true" />添加设备</Button>
+    <Button type="button" variant={requests ? "outline" : "default"} onClick={() => setOpen(true)}><Plus aria-hidden="true" />添加设备</Button>
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
-        <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription>在新设备上打开链接，两边核对码一致后允许。</SheetDescription></SheetHeader>
+        <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription>在新设备上打开链接，核对码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+          <JoinRequests />
           <div role="radiogroup" aria-label="设备类型" className="grid grid-cols-2 gap-2">
             {([["client", Smartphone, "手机或浏览器"], ["node", Laptop, "另一台电脑"]] as const).map(([value, Icon, label]) => <button key={value} type="button" role="radio" aria-checked={kind === value} disabled={busy}
               className={cn("grid min-h-20 place-items-center gap-1 rounded-xl border p-3 text-meta", kind === value ? "border-foreground bg-muted" : "hover:bg-muted/50")} onClick={() => choose(value)}>
@@ -82,7 +88,7 @@ export function AddDevice() {
             </button>)}
           </div>
           {kind === "node" ? <p className="text-meta text-muted-foreground">在那台电脑的 vibeface 本机网页里粘贴</p> : null}
-          {!result ? <Button type="button" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} />生成链接</Button> : null}
+          {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} />生成链接</Button> : null}
           {result ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用新设备扫码打开" /> : null}
             {result.kind === "client" && result.local ? <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
@@ -91,7 +97,7 @@ export function AddDevice() {
             </div> : null}
             {result.link ? <Input readOnly aria-label="加入链接" className="font-mono text-meta" value={result.link} onFocus={(event) => event.target.select()} /> : null}
             <div className="flex flex-wrap gap-2">
-              {result.link ? <Button type="button" disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button> : null}
+              {result.link ? <Button type="button" variant={requests ? "outline" : "default"} disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button> : null}
               <Button type="button" variant="outline" disabled={busy} onClick={() => void run(async () => downloadConnectionFile(result.content), "已下载")}><Download aria-hidden="true" />下载文件</Button>
             </div>
             <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</p>

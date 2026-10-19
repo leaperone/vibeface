@@ -9,6 +9,7 @@ import {
 import type { ConnectionEntry, EntryInfo, LocalJoin, LocalSetup, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
 import { shouldAutoConnect } from './connection-lane'
 import { localBrowserEntry } from '@/lib/local-access'
+import { defaultComputerName } from '@/lib/device-name'
 import { parseChanged } from '@/lib/progress'
 import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
@@ -26,7 +27,7 @@ type DeviceContextValue = {
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null; localJoin: LocalJoin | null
   connect(entry: ConnectionEntry): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
-  replaceLostKey(): Promise<void>; pair(invitation: string, name: string, password?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
+  replaceLostKey(): Promise<void>; pair(invitation: string, name: string, password?: string, nodeName?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   acceptLocalJoin(): Promise<void>; refreshLocalJoin(): Promise<void>; useAnotherNodeInvitation(): void
   refreshDirectory(): Promise<void>; createInvitation(kind: 'client' | 'node', roles: NodeRole[]): Promise<string>; approvePair(requestId: string): Promise<void>; revoke(subjectId: string): Promise<void>
@@ -220,6 +221,22 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       }
     }, immediate ? 0 : Math.min(1000 * 2 ** target.attempt++, 10000))
   }
+  /** A join request survives the inviting device restarting: reopen the channel and keep polling the same request. */
+  function resumeWaiting(pending: WaitingPair, attempt = 0) {
+    if (reconnectTimer.current !== null) return
+    reconnectTimer.current = setTimeout(async () => {
+      reconnectTimer.current = null
+      if (waitingRef.current !== pending) return
+      let active: Session
+      try { active = await open(pending.entry, true) }
+      catch { if (waitingRef.current === pending) { setPhase('reconnecting'); resumeWaiting(pending, attempt + 1) } return }
+      if (waitingRef.current !== pending || session.current !== active) return
+      const fresh = { ...pending }; waitingRef.current = fresh; setWaiting(fresh)
+      setEntry(fresh.entry); setPhase('unpaired'); setError('')
+      const settle = fresh.accepted ? checkPair() : acceptPair()
+      settle.catch(cause => { if (waitingRef.current === fresh) setError(messageOf(cause)) })
+    }, attempt === 0 ? 0 : Math.min(1000 * 2 ** attempt, 10000))
+  }
   async function open(entryValue: ConnectionEntry, resuming = false) {
     const parsed = parseEntry(entryValue)
     if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
@@ -242,6 +259,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           if (reconnect.current) {
             setPhase('reconnecting'); setError('连接断了，正在重连。没确认的操作会保留，不会自动重发。')
             scheduleReconnect()
+          } else if (waitingRef.current) {
+            setPhase('reconnecting'); setError('')
+            resumeWaiting(waitingRef.current)
           } else {
             setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
           }
@@ -344,7 +364,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function pair(invitationText: string, nameValue: string, password?: string, nodeNameValue?: string) {
     const invitation = parseInvitation(readInvitation(invitationText))
     const name = deviceName(nameValue)
-    const nodeName = nodeNameValue === undefined ? 'This device' : deviceName(nodeNameValue)
+    const nodeName = deviceName(nodeNameValue ?? defaultComputerName())
     if (invitation.kind === 'node') {
       resetConnection()
       const version = generation.current, controller = new AbortController(); connecting.current = controller
@@ -355,7 +375,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const result = await localJoinRequest('request', { invitation: JSON.stringify(readInvitation(invitationText)), name }, setup.invitation.entry, controller.signal)
       if (version !== generation.current) throw changed()
       if ((result.kind === 'review' || result.kind === 'pending') && (result.review.network_id !== invitation.payload.network_id || result.review.inviter_subject_id !== invitation.payload.inviter_subject_id || result.review.invite_id !== invitation.payload.invite_id || result.review.epoch !== invitation.payload.epoch || result.review.new_member.name !== name || !same(result.review.new_member.node_roles, invitation.payload.node_roles) || result.review.expires_at_ms > integer(invitation.payload.expires_at_ms))) throw new Error('加入确认和链接对不上，已停止。')
+      // The admin compares the check code before allowing, so this side sends its request right away and waits.
       setLocalJoin(result)
+      if (result.kind === 'review') setLocalJoin(await acceptJoin(result, setup.invitation.entry, version, controller.signal))
       if (result.kind === 'joined') await refreshJoinedSetup(setup.invitation.entry, version, controller.signal)
       return
     }
@@ -391,7 +413,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       let cancelled = false
       const flow: Sensitive = {
         cancel() { cancelled = true; recovery.fill(0); invitation.capability = '' },
-        download() { if (cancelled || session.current !== active) throw changed(); downloadPackage(recovery, networkId); downloaded = true },
+        download() { if (cancelled || session.current !== active) throw changed(); downloadPackage(recovery); downloaded = true },
         async bootstrap(saved) {
           if (!saved || !downloaded) throw new Error('请先下载恢复文件并保存好。')
           if (cancelled || session.current !== active) throw changed()
@@ -420,6 +442,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (session.current !== active) throw changed()
     const next = { request_id: text(receipt.request_id), network_id: pairReview.network_id, entry: active.entry, review: pairReview, signing, accepted: false }
     waitingRef.current = next; store('waiting-pair', next); setWaiting(next)
+    // The admin compares the check code before allowing, so the request goes out now and this side waits.
+    await acceptPair()
   }
   async function createLocalNetwork(name: string, password: string, nodeName?: string) {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经在用了。请用加入链接或恢复文件让这个浏览器加入。')
@@ -458,12 +482,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     setLocalJoin(result); setError('')
     if (result.kind === 'joined') await refreshJoinedSetup(entry, version, controller.signal)
   }
+  async function acceptJoin(review: Extract<LocalJoin, { review_hash: string }>, entry: ConnectionEntry, version: number, signal: AbortSignal) {
+    const result = await localJoinRequest('accept', { request_id: review.request_id, review_hash: review.review_hash }, entry, signal)
+    if (version !== generation.current) throw changed()
+    return result
+  }
   async function acceptLocalJoin() {
-    if (!localSetup || localJoin?.kind !== 'review') throw new Error('请先对一下核对码。')
+    if (!localSetup || localJoin?.kind !== 'review') throw new Error('请先打开加入链接。')
     const entry = localSetup.kind === 'uninitialized' ? localSetup.invitation.entry : localSetup.entry
     const version = generation.current, controller = new AbortController(); connecting.current = controller
-    const result = await localJoinRequest('accept', { request_id: localJoin.request_id, review_hash: localJoin.review_hash }, entry, controller.signal)
-    if (version !== generation.current) throw changed()
+    const result = await acceptJoin(localJoin, entry, version, controller.signal)
     setLocalJoin(result); setError('')
     if (result.kind === 'joined') await refreshJoinedSetup(entry, version, controller.signal)
   }
@@ -542,7 +570,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             const { auth, epoch } = verifyRecoveryResult(authValue, { networkId: opened.networkId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint, manager: newManager })
             opened.payload.recovery_epoch = epoch
             const bytes = sealPackage(opened.payload, password)
-            try { downloadPackage(bytes, opened.networkId) } finally { bytes.fill(0) }
+            try { downloadPackage(bytes) } finally { bytes.fill(0) }
             await authenticate(auth, active, { kind: 'root', networkId: opened.networkId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint })
           } finally { if (sensitive.current === flow) releaseSensitive(); else release() }
         },
@@ -558,7 +586,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (version !== generation.current) throw changed()
       if (ready && opened.networkId !== ready.principal.network_id) throw new Error('这个恢复文件属于别的设备组。')
       const bytes = sealPackage(opened.payload, input.password)
-      try { downloadPackage(bytes, opened.networkId) } finally { bytes.fill(0) }
+      try { downloadPackage(bytes) } finally { bytes.fill(0) }
     } finally { opened.release(); input.oldPassword = ''; input.password = '' }
   }
   async function replaceLostKey() { const own = await initClient({ replaceLostKey: true }); identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('') }
@@ -585,10 +613,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       }
       const pending = invitation ? null : loadWaiting()
       if (pending && pending.review.new_member.subject_id === own.peerId) {
-        const opening = open(pending.entry); version = generation.current
-        const active = await opening
+        let active: Session
+        try { const opening = open(pending.entry); version = generation.current; active = await opening }
+        catch {
+          if (!mounted || version !== generation.current) return
+          waitingRef.current = pending; setWaiting(pending); setEntry(pending.entry); setPhase('reconnecting')
+          resumeWaiting(pending, 1); return
+        }
         if (!mounted || session.current !== active) return
         waitingRef.current = pending; setWaiting(pending)
+        if (!pending.accepted) acceptPair().catch(cause => { if (waitingRef.current === pending) setError(messageOf(cause)) })
       } else if (!invitation) {
         let local: LocalSetup | null = null
         try { local = await discoverLocalSetup(setupController.signal) }
@@ -601,6 +635,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             if (!mounted || version !== generation.current) return
             setLocalJoin(result)
             if (result.kind === 'joined') await refreshJoinedSetup(local.invitation.entry, version, setupController.signal)
+            else if (result.kind === 'review') setLocalJoin(await acceptJoin(result, local.invitation.entry, version, setupController.signal))
           } catch (cause) { if (mounted && version === generation.current) setError(messageOf(cause)) }
           return
         }
@@ -619,7 +654,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!waiting?.accepted) return
     const pending = waiting, version = generation.current
-    const timer = setInterval(() => { checkPair().catch(cause => { if (waitingRef.current === pending && version === generation.current) setError(messageOf(cause)) }) }, 3000)
+    const timer = setInterval(() => {
+      if (!session.current) return
+      checkPair().catch(cause => { if (waitingRef.current === pending && version === generation.current) setError(messageOf(cause)) })
+    }, 3000)
     return () => clearInterval(timer)
   }, [waiting])
   useEffect(() => {

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, ShieldAlert, Upload, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, ShieldAlert, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
-import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
+import { Details, DetailRow, EmptyState, FilePicker, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -82,7 +82,7 @@ export function ConnectionScreen() {
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    void run(() => device.pair(invitation, value(form, 'name'), purpose === 'bootstrap' ? passphrase(value(form, 'password'), value(form, 'confirmation')) : undefined))
+    void run(() => purpose === 'bootstrap' ? device.pair(invitation, value(form, 'name'), passphrase(value(form, 'password'), value(form, 'confirmation')), value(form, 'computer')) : device.pair(invitation, value(form, 'name')))
   }
   async function importFile(file: File) {
     const owner = device.connectionGeneration()
@@ -99,7 +99,7 @@ export function ConnectionScreen() {
   const joining = device.localJoin && device.localJoin.kind !== 'idle' && device.localJoin.kind !== 'joined'
   const focused = Boolean(device.review || device.waiting || joining)
   const setup = device.localSetup?.kind === 'uninitialized'
-  const other = !focused && usable ? <div className="grid gap-2">
+  const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
     <p className="text-meta text-muted-foreground">其他方式</p>
     <div className="flex flex-wrap gap-2">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : '这台电脑'}</Button> : null}
@@ -122,33 +122,38 @@ export function ConnectionScreen() {
   else if (active === 'local' && setup && !names) body = <NamesStep onNext={setNames} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => setNames(null)} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localJoin?.kind === 'joined' ? '这台电脑已加入' : '这台电脑'}>
-    {device.localSetup.kind === 'initialized' && device.localSetup.local_launch
-      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开这台电脑</Button>
+    {device.localSetup.kind === 'initialized'
+      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>{device.localJoin?.kind === 'joined' ? '打开这台电脑' : '重新打开这台电脑'}</Button>
       : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.peer_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
       <span className="min-w-0 flex-1 truncate" title={entry.address}>{addressName(entry.address)}</span>
-      <Button type="button" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
+      <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
   else body = <Panel icon={Link2} title={purpose === 'node' ? '把这台电脑加入' : '加入我的设备'}>
     <form className="grid gap-4" onSubmit={submitInvitation}>
       <fieldset disabled={linking || !usable} className="grid gap-4">
-        <Field label="加入链接"><Textarea className="min-h-20 font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
-        <label className="flex w-fit cursor-pointer items-center gap-2 text-meta text-muted-foreground hover:text-foreground"><Upload aria-hidden="true" className="size-4" />或导入文件
-          <input className="sr-only" type="file" accept=".json,application/json,text/plain" onChange={(event) => { const file = event.currentTarget.files?.item(0); event.currentTarget.value = ''; if (file) void run(() => importFile(file)) }} />
-        </label>
+        {purpose === 'empty' || purpose === 'invalid' ? <>
+          <Field label="加入链接"><Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
+          {purpose === 'invalid' ? <p role="alert" className="text-meta text-danger">这不是有效的加入链接</p> : null}
+          <FilePicker label="导入文件" accept=".json,application/json,text/plain" onFile={(file) => void run(() => importFile(file))} />
+        </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
+          <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
+          <span className="min-w-0 flex-1 truncate">已读取加入链接</span>
+          <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
+        </p>}
         <Field label={purpose === 'node' ? '这台电脑叫什么？' : '这个浏览器叫什么？'}><Input name="name" required maxLength={128} autoComplete="off" defaultValue={purpose === 'node' ? defaultComputerName() : defaultBrowserName()} key={purpose === 'node' ? 'node' : 'browser'} /></Field>
         {purpose === 'bootstrap' ? <>
+          <Field label="电脑叫什么？"><Input name="computer" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
           <Field label="恢复密码"><Input type="password" name="password" autoComplete="new-password" minLength={12} required /></Field>
           <Field label="再输一次"><Input type="password" name="confirmation" autoComplete="new-password" minLength={12} required /></Field>
         </> : null}
         <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button>
       </fieldset>
     </form>
-    {purpose === 'node' && device.localSetup ? <Button variant="ghost" type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.refreshLocalJoin)}>再查一次</Button> : null}
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
@@ -161,16 +166,17 @@ export function ConnectionScreen() {
       {alert}
       {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
       {other}
-      {!focused && usable ? <Details label="手填访问地址">
-        <form className="grid gap-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id') }))) }}>
+      {device.identity && !focused ? <Details>
+        <DetailRow label="这个浏览器的设备编号" value={device.identity.peerId} mono />
+        {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id') }))) }}>
           <fieldset disabled={linking} className="grid gap-3">
+            <legend className="mb-3 text-foreground">手填访问地址</legend>
             <Field label="访问地址"><Input type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
             <Field label="设备编号"><Input className="font-mono" name="peer_id" required pattern="[a-f0-9]{64}" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>
-        </form>
+        </form> : null}
       </Details> : null}
-      {device.identity && !focused ? <Details><DetailRow label="这个浏览器的设备编号" value={device.identity.peerId} mono /></Details> : null}
     </div>
   </main>
 }
@@ -225,33 +231,27 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存恢复文件">
     <p className="text-muted-foreground">设备都丢了时，用它找回。</p>
-    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>下载恢复文件</Button>
+    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
-      <Button type="button" variant="ghost" disabled={busy} onClick={device.cancelSensitive}>取消</Button>
+      <Button type="button" variant="ghost" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
       <Button type="button" disabled={!saved || busy} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
     </div>
   </Panel>
 }
 
-/** A browser joining through a link: compare the check code, then wait for an admin. */
+/** A browser joining through a link: its request is already out; the admin compares the code and allows. */
 function BrowserJoin({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
   const waiting = device.waiting!
   const code = useCheckCode(waiting.network_id, waiting.review.inviter_subject_id, waiting.review.new_member.subject_id)
-  useEffect(() => {
-    if (!waiting.accepted) return
-    const timer = setInterval(() => { device.checkPair().catch(() => {}) }, 5000)
-    return () => clearInterval(timer)
-  }, [waiting.accepted, waiting.request_id])
-  return <Panel icon={waiting.accepted ? Hourglass : MonitorSmartphone} title={waiting.accepted ? '等待批准' : '对一下核对码'}>
-    <p className="text-muted-foreground">{waiting.accepted ? '在已有设备上点“允许”后，这里会自动进入。' : '在已有设备的“我的设备”里能看到同一组核对码。'}</p>
+  return <Panel icon={Hourglass} title="等待批准">
+    <p className="text-muted-foreground">在已有设备上看到同样的码再点允许</p>
     {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
+    {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" onClick={() => device.cancelPair()}>取消</Button>
-      {waiting.accepted
-        ? <Button type="button" variant="outline" disabled={busy} onClick={() => void run(device.checkPair)}>再查一次</Button>
-        : <Button type="button" disabled={busy || !code} onClick={() => void run(device.acceptPair)}>核对码一致</Button>}
+      {waiting.accepted ? null : <Button type="button" variant="outline" disabled={busy || !code || device.phase === 'reconnecting'} onClick={() => void run(device.acceptPair)}>重试</Button>}
     </div>
     <Details>
       <DetailRow label="这个浏览器" value={waiting.review.new_member.subject_id} mono />
@@ -267,16 +267,16 @@ function NodeJoin({ busy, run }: { busy: boolean; run: Run }) {
   const join = device.localJoin!
   const review = join.kind === 'review' || join.kind === 'pending' ? join.review : null
   const code = useCheckCode(review?.network_id ?? '', review?.inviter_subject_id ?? '', review?.new_member.subject_id ?? '')
-  return <Panel icon={join.kind === 'pending' ? Hourglass : Laptop} title={join.kind === 'review' ? '对一下核对码' : join.kind === 'pending' ? '等待批准' : '还不确定是否已加入'}>
+  return <Panel icon={join.kind === 'uncertain' ? Laptop : Hourglass} title={join.kind === 'uncertain' ? '还不确定是否已加入' : '等待批准'}>
     {review ? <>
-      <p className="text-muted-foreground">{join.kind === 'review' ? '在已有设备的“我的设备”里能看到同一组核对码。' : '在已有设备上点“允许”后再查一次。'}</p>
+      <p className="text-muted-foreground">在已有设备上点允许后，这里会自动进入</p>
       {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
     </> : <p className="text-muted-foreground">再查一次，不会重复提交。</p>}
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" disabled={busy} onClick={device.useAnotherNodeInvitation}>换一个链接</Button>
       {join.kind === 'review'
-        ? <Button type="button" disabled={busy || !code || join.review.expires_at_ms <= Date.now()} onClick={() => void run(device.acceptLocalJoin)}>核对码一致</Button>
-        : <Button type="button" variant="outline" disabled={busy} onClick={() => void run(device.refreshLocalJoin)}>再查一次</Button>}
+        ? <Button type="button" variant="outline" disabled={busy || !code || join.review.expires_at_ms <= Date.now()} onClick={() => void run(device.acceptLocalJoin)}>重试</Button>
+        : join.kind === 'uncertain' ? <Button type="button" variant="outline" disabled={busy} onClick={() => void run(device.refreshLocalJoin)}>再查一次</Button> : null}
     </div>
     {review ? <Details>
       <DetailRow label="这台电脑" value={review.new_member.subject_id} mono />
