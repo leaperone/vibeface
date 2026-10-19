@@ -5,6 +5,7 @@ import { ChevronRight, CircleAlert, CircleCheck, Copy, Info, LoaderCircle, Trian
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
 import { messageOf } from "@/lib/node"
+import { rawError } from "@/lib/errors"
 
 export type Tone = "neutral" | "success" | "warning" | "danger" | "info"
 
@@ -32,11 +33,12 @@ export function Skeleton({ className }: { className?: string }) {
 
 export function InlineError({ error, action, className }: { error: unknown; action?: { label: string; onClick: () => void }; className?: string }) {
   if (!error) return null
-  const text = messageOf(error)
+  const text = messageOf(error), raw = rawError(error)
   return <div role="alert" className={cn("flex flex-wrap items-start gap-2 text-meta text-danger", className)}>
     <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
     <span className="min-w-0 flex-1 break-words">{text}</span>
     {action ? <button type="button" className="font-medium underline underline-offset-4" onClick={action.onClick}>{action.label}</button> : null}
+    {raw ? <Details className="basis-full ps-6"><code className="font-mono">{raw}</code></Details> : null}
   </div>
 }
 

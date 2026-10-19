@@ -101,12 +101,12 @@ export async function signClient(domain, payload) {
   return sign(signingMessage(domain, typeof payload === "string" ? encoder.encode(payload) : payload));
 }
 
-function openSocket(url, signal, onClose) {
+function openSocket(url, signal, onClose, timeoutMs) {
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
   const incoming = [], waiting = [];
   let failure;
-  const timer = setTimeout(() => close(new Error("连接超时。")), 10000);
+  const timer = setTimeout(() => close(new Error("连接超时。")), timeoutMs);
   function close(error = new Error("无法接通指定设备。")) {
     if (failure) return;
     failure = error;
@@ -120,9 +120,10 @@ function openSocket(url, signal, onClose) {
   signal?.addEventListener("abort", abort, { once: true });
   socket.addEventListener("message", (event) => {
     if (typeof event.data === "string") {
-      let reason = "入口拒绝了连接。";
-      try { reason = JSON.parse(event.data).error || reason; } catch {}
-      close(new Error(reason));
+      // The Gateway refuses in English for logs; `code` is what the page translates.
+      const refusal = new Error("访问地址拒绝了这次连接。");
+      try { const value = JSON.parse(event.data); refusal.message = String(value.error || refusal.message); refusal.code = value.code; } catch {}
+      close(refusal);
       return;
     }
     if (event.data.byteLength > 65535) { close(new Error("设备消息超过通道大小限制。")); return; }
@@ -156,7 +157,7 @@ function openSocket(url, signal, onClose) {
  * Opens a Noise channel to `entry.device_id` through the Gateway at `entry.address`.
  * The Node must prove that device key; any other key closes the connection.
  */
-export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
+export async function connectDevice(entry, { onEvent, onClose, signal, timeoutMs = 10000 } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
   await initClient();
   const target = validTarget(entry.device_id);
@@ -173,7 +174,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(reason); }
     pending.clear();
     onClose?.(reason);
-  });
+  }, timeoutMs);
   const { socket, receive } = wire;
   const fail = (error) => wire.close(error);
   let handshake;
@@ -190,7 +191,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     channel = handshake.finish();
     wire.ready();
   } catch (error) {
-    const reason = /device|identity|Proof|signature/i.test(String(error?.message ?? error)) ? new Error("设备身份与目标编号不符，已拒绝连接。") : error;
+    const reason = !error?.code && /device|identity|Proof|signature/i.test(String(error?.message ?? error)) ? new Error("设备身份与目标编号不符，已拒绝连接。") : error;
     fail(reason);
     throw reason;
   } finally { handshake?.free(); }

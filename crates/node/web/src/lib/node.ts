@@ -1,5 +1,6 @@
 import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
+import { humanError } from './errors'
 
 export type ConnectionEntry = { address: string; device_id: string; local?: boolean }
 export type PublicIdentity = { deviceId: string }
@@ -15,6 +16,8 @@ export type ReadyConnection = {
   rpc(method: string, params?: Record<string, unknown>): Promise<unknown>
   subscribe(listener: (event: ChangedEvent) => void): () => void
   isCurrent(): boolean
+  /** The entry has not yet seen everything this page showed; keep what is on screen meanwhile. */
+  catchingUp?(): boolean
 }
 export type Member = { device_id: string; kind: 'node' | 'client'; name: string; manage: boolean }
 export type Revocation = { device_id: string; cutoff_seq: number }
@@ -148,7 +151,7 @@ export function canonical(value: unknown): string {
   throw new Error('待确认的内容格式不对。')
 }
 export function same(left: unknown, right: unknown): boolean { return canonical(left) === canonical(right) }
-export const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error)
+export const messageOf = (error: unknown) => error instanceof Error ? humanError(error.message, (error as { code?: unknown }).code) : humanError(String(error))
 export function deviceName(value: string): string {
   const name = value.trim()
   if (!name || new TextEncoder().encode(name).length > 128 || /[\u0000-\u001f\u007f]/.test(name)) throw new Error('设备名称需要 1 至 128 字节，不能包含控制字符。')

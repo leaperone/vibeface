@@ -9,6 +9,8 @@ export function connectDevice(entry: { address: string; device_id: string; local
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void
   signal?: AbortSignal
+  /** Connect and handshake must finish within this; entrance switching uses 5 seconds. */
+  timeoutMs?: number
 }): Promise<DeviceChannel>
 export function validTarget(value: unknown): string
 export function validEndpoint(value: string): string
