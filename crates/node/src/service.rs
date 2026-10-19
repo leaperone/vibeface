@@ -15,7 +15,7 @@ pub struct Service {
 
 #[derive(Subcommand, Clone, Copy)]
 enum Action {
-    /// Install and start a user service using the managed current binary.
+    /// Install and start a user service using this installation's native binary.
     Install,
     /// Start the installed node service.
     Start,
@@ -49,16 +49,33 @@ impl Action {
 }
 
 fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Result<Command> {
-    let binary = root.join("current/vibeface");
-    ensure!(
-        std::fs::canonicalize(&binary)? == std::fs::canonicalize(executable)?,
-        "service management requires the current managed binary; run {}",
-        binary.display()
-    );
+    let package = if let Some(npm_root) = update::npm_install_root(executable)? {
+        ensure!(
+            npm_root == root,
+            "npm installation root does not match the program"
+        );
+        ensure!(
+            !matches!(action, Action::InstallUpdater),
+            "npm installations are updated with npm install -g vibeface@nightly"
+        );
+        executable
+            .parent()
+            .context("npm native package is missing")?
+            .to_path_buf()
+    } else {
+        let binary = root.join("current/vibeface");
+        ensure!(
+            std::fs::canonicalize(&binary)? == std::fs::canonicalize(executable)?,
+            "service management requires the current managed binary; run {}",
+            binary.display()
+        );
+        root.join("current")
+    };
+    let binary = package.join("vibeface");
     if matches!(action, Action::Install | Action::Start | Action::Restart) {
         config::Config::load(data)?;
     }
-    let mut command = Command::new(root.join("current/scripts/install-node-service.sh"));
+    let mut command = Command::new(package.join("scripts/install-node-service.sh"));
     command.arg(action.argument()).arg("--data-dir").arg(data);
     if matches!(action, Action::Install | Action::InstallUpdater) {
         command.arg("--binary").arg(binary);
@@ -74,8 +91,23 @@ pub async fn run(options: Service) -> Result<()> {
     let data = std::fs::canonicalize(options.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     config::identity(&data)?;
-    let root = update::managed_install_root(&data)?;
-    let status = command(&root, &data, &std::env::current_exe()?, options.action)?
+    let executable = std::env::current_exe()?;
+    let npm_root = update::npm_install_root(&executable)?;
+    let root = match &npm_root {
+        Some(root) => root.clone(),
+        None => update::managed_install_root(&data)?,
+    };
+    if npm_root.is_some() && matches!(options.action, Action::Install) {
+        let status = command(&root, &data, &executable, Action::UninstallUpdater)?
+            .status()
+            .await
+            .context("disable the managed updater for the npm installation")?;
+        ensure!(
+            status.success(),
+            "could not disable the previous updater: {status}"
+        );
+    }
+    let status = command(&root, &data, &executable, options.action)?
         .status()
         .await
         .context("run user service manager")?;
@@ -141,6 +173,55 @@ mod tests {
         for action in [Action::Install, Action::Start, Action::Restart] {
             assert!(command(&root, &data, &executable, action).is_err());
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn npm_service_uses_the_native_package_and_rejects_a_second_updater() {
+        let root =
+            std::env::temp_dir().join(format!("vibeface-npm-service-{}", uuid::Uuid::new_v4()));
+        let package = root.join("vendor/aarch64-apple-darwin");
+        std::fs::create_dir_all(package.join("scripts")).unwrap();
+        std::fs::create_dir(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("vibeface"), b"binary").unwrap();
+        std::fs::write(package.join("scripts/install-node-service.sh"), b"script").unwrap();
+        std::fs::write(
+            package.join("BUILD-INFO.json"),
+            r#"{"version":"1.2.3-nightly.20261019.1","update_protocol":2,"data_epoch":4}"#,
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let package = root.join("vendor/aarch64-apple-darwin");
+        let binary = package.join("vibeface");
+        let data = root.join("data with spaces");
+        std::fs::create_dir(&data).unwrap();
+        config::Config::local("127.0.0.1:4790".parse().unwrap(), vec![root.clone()], false)
+            .save(&data)
+            .unwrap();
+        let install = command(&root, &data, &binary, Action::Install).unwrap();
+        assert_eq!(
+            install.as_std().get_program(),
+            package.join("scripts/install-node-service.sh")
+        );
+        assert_eq!(
+            install.as_std().get_args().collect::<Vec<_>>(),
+            [
+                std::ffi::OsStr::new("install"),
+                std::ffi::OsStr::new("--data-dir"),
+                data.as_os_str(),
+                std::ffi::OsStr::new("--binary"),
+                binary.as_os_str(),
+            ]
+        );
+        assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
+        assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
+        assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

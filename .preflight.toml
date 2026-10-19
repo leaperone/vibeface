@@ -13,13 +13,13 @@ command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [[domain_check]]
 name = "JavaScript syntax"
-trigger_paths = ["crates/node/sdk/**", "crates/node/web/**", "scripts/crypto-client.mjs"]
-command = "node --check crates/node/sdk/codex-manager.mjs && node --check crates/node/web/transport.js && node --check scripts/crypto-client.mjs"
+trigger_paths = ["crates/node/sdk/**", "crates/node/web/**", "scripts/crypto-client.mjs", "npm/**", "scripts/package-npm.mjs"]
+command = "node --check crates/node/sdk/codex-manager.mjs && node --check crates/node/web/transport.js && node --check scripts/crypto-client.mjs && node --check npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node scripts/package-npm.mjs --self-test"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"
 trigger_paths = ["install.sh", "scripts/*.sh", ".github/workflows/**"]
-command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && actionlint .github/workflows/ci.yml"
+command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && actionlint .github/workflows/ci.yml .github/workflows/npm-publish.yml"
 
 [[domain_check]]
 name = "Migration integrity"

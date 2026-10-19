@@ -146,6 +146,9 @@ jobs:
           node --check crates/node/sdk/codex-manager.mjs
           node --check crates/node/web/transport.js
           node --check scripts/crypto-client.mjs
+          node --check npm/bin/vibeface.mjs
+          node --check scripts/package-npm.mjs
+          node scripts/package-npm.mjs --self-test
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -274,9 +277,78 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+  npm-package:
     needs: [check, package]
+    if: needs.check.outputs.channel == 'nightly'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-package-*-${{ github.sha }}
+          path: .artifacts/npm-input
+          merge-multiple: true
+      - name: Package verified native releases for npm
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: node scripts/package-npm.mjs --input .artifacts/npm-input --source-commit "$SOURCE_COMMIT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: .artifacts/npm/vibeface-*.tgz*
+          if-no-files-found: error
+          retention-days: 14
+
+  npm-smoke:
+    needs: [check, npm-package]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: .artifacts/npm
+      - name: Install npm artifact without lifecycle scripts
+        env:
+          PACKAGE_VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          prefix="$PWD/.artifacts/npm-installed"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/vibeface-$PACKAGE_VERSION.tgz"
+          [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
+          "$prefix/bin/vibeface" --help
+      - name: Verify npm native processes and bundled web
+        env:
+          PACKAGE_TARGET: ${{ matrix.target }}
+        run: |
+          prefix="$PWD/.artifacts/npm-installed"
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --skip-codex
+
+  publish:
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.check.result == 'success' && needs.package.result == 'success' && (needs.check.outputs.channel != 'nightly' || needs.npm-smoke.result == 'success') }}
+    needs: [check, package, npm-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

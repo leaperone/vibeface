@@ -1,0 +1,26 @@
+{
+  "name": "vibeface",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Run a personal Vibeface node on macOS or Linux",
+  "type": "module",
+  "bin": {
+    "vibeface": "bin/vibeface.mjs"
+  },
+  "files": ["bin/", "vendor/", "README.md"],
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leaperone/vibeface.git",
+    "directory": "npm"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public",
+    "tag": "nightly"
+  }
+}

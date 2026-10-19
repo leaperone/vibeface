@@ -27,25 +27,24 @@ Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和�
 
 ## 安装与开始
 
-主程序是 Rust 二进制 CLI `vibeface`。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64（glibc），运行网页不需要 Node.js。首次安装选最新正式版：
+主程序是 Rust 二进制 CLI `vibeface`，支持 macOS Apple Silicon、Linux x64 和 Linux ARM64（glibc）。npm 安装入口需要 Node.js 22+，网页仍由 Rust 程序提供。
+
+npm Nightly 分发已配置，包尚未公开发布。首次发布后使用：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash
+npm install -g vibeface@nightly
+vibeface --version
 ```
 
-当前尚无正式版，需要显式选择 Nightly：
+npm 包包含完整平台程序、SDK sidecar 和服务脚本，不通过 postinstall 下载程序，不初始化身份或启动服务。发布前可从 PR 的 CI 下载 `.tgz`，在隔离 prefix 中安装验收。当前尚无正式版，GitHub 完整包安装入口见 [安装说明](docs/install.md)。
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly
-```
-
-安装器验证完整包及 SHA256，不创建身份、启动服务或配置自动更新；没有 Stable 时也不会自动改装 Nightly。安装后直接启动：
+安装后直接启动：
 
 ```sh
 vibeface
 ```
 
-首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。同一数据格式的节点重启保留原身份和配置。安装和 CLI 管理见 [安装说明](docs/install.md)。本数据格式内的受管更新使用 `vibeface update apply`；从旧版本部署此版本时，使用新的数据目录重新初始化。
+首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。同一数据格式的节点重启保留原身份和配置。npm 安装由 npm 更新；后台节点先确认空闲并停止服务，再更新、重启和核对状态。GitHub 受管安装仍使用 `vibeface update apply`。安装、更新与 CLI 管理见 [安装说明](docs/install.md)。
 
 ## 从源码开始
 
@@ -82,11 +81,11 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 ## 安装、协议与验证
 
-- [首次安装与 CLI 管理](docs/install.md) 包括 Stable/Nightly 一行安装、初始化、状态和后台服务命令。
+- [首次安装与 CLI 管理](docs/install.md) 包括 npm Nightly、GitHub 完整包、初始化、状态和后台服务命令。
 - [部署与使用 Node](docs/node.md) 包括局域网、公网中继、SDK、后台运行和制品安装。
 - [Node 协议参考](docs/node-protocol.md) 包括 HTTP、事件 DAG、操作状态和通知确认。
 - [构建与发布](docs/releasing.md) 说明 Linux x64（`x86_64-unknown-linux-gnu`）、Linux ARM64（`aarch64-unknown-linux-gnu`）和 macOS Apple Silicon（`aarch64-apple-darwin`）三个包、SHA256、Stable 与 Nightly 更新渠道，以及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
-- [选择更新渠道](docs/node.md#选择更新渠道) 可开启空闲时的后台升级；默认 Stable，自动更新默认关闭。
+- [选择更新渠道](docs/node.md#选择更新渠道) 适用于 GitHub 受管安装，可开启空闲时的后台升级；npm 安装由 npm 更新。
 - `scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，默认输出到 `.artifacts/packages/`。
 
 可在仓库根目录运行对应检查。命令本身不代表本次提交已经通过，实际结果以 PR 的验证记录为准。
