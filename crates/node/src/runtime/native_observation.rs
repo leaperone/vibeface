@@ -134,7 +134,6 @@ pub(crate) struct NativeWork {
     pub turn_id: Option<String>,
     pub state: NativeState,
     pub detail: String,
-    #[serde(default)]
     pub sequence: u64,
 }
 

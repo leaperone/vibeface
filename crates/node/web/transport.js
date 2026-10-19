@@ -208,7 +208,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   const target = validTarget(entry.peer_id);
   const endpoint = validEndpoint(entry.address);
   if (entry.local === true) {
-    if (entry.relay === true || endpoint !== location.origin) throw new Error("本机会话只能连接当前本机入口。");
+    if (endpoint !== location.origin) throw new Error("本机会话只能连接当前本机入口。");
     const local = new URL("/api/local/ws", endpoint);
     local.protocol = local.protocol === "https:" ? "wss:" : "ws:";
     return connectPath(local.href, target, null, { onEvent, onClose, signal });
@@ -263,7 +263,6 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
           active.delete(attempt);
           if (finished) return;
           lastError = error;
-          if (candidate.url === entryUrl && candidate.relay) add({ url: entryUrl, relay: false });
           pump();
         });
       }

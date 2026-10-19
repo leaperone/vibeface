@@ -3898,12 +3898,15 @@ mod tests {
         let cancelled = store
             .scheduler_job(&network, "conversation", &event.hash, &target)?
             .unwrap();
-        let legacy = serde_json::json!({
+        let persisted = serde_json::json!({
             "state":"cancelled",
             "attempt":cancelled.state.attempt().unwrap(),
             "evidence":"SDK cancellation confirmed and Node tools fenced",
         });
-        assert_eq!(serde_json::from_value::<JobState>(legacy)?, cancelled.state);
+        assert_eq!(
+            serde_json::from_value::<JobState>(persisted)?,
+            cancelled.state
+        );
         store.scheduler_maintenance_idle(&network)?;
         assert!(
             store
@@ -3916,12 +3919,12 @@ mod tests {
     #[test]
     fn net1_grouped_inventory_preserves_pending_forks_and_cross_scope_heads() -> Result<()> {
         fn equivalent(store: &Store, network: &str) -> Result<()> {
-            let legacy = store
+            let per_scope = store
                 .scopes(network)?
                 .into_iter()
                 .map(|scope| Ok((scope.clone(), store.heads(network, &scope)?)))
                 .collect::<Result<Vec<_>>>()?;
-            assert_eq!(store.inventory_heads(network)?, legacy);
+            assert_eq!(store.inventory_heads(network)?, per_scope);
             Ok(())
         }
         let owner = LocalIdentity::generate();

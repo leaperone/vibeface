@@ -103,12 +103,6 @@ test('sequence gaps request a snapshot and status and tool descriptions remain v
   assert.equal(mergeProgress([], manager(5, { type: 'text_snapshot', text: '错过开头' }))[0].needsRefresh, true)
 })
 
-test('legacy events without a sequence still preserve snapshots and deltas', () => {
-  const event = (type: string, text: string) => parseChanged({ type: 'manager_progress', conversation_id: 'chat-a', trigger: 'turn-a', progress: { type, text } })
-  const state = mergeProgress(mergeProgress([], event('text_snapshot', '开头')), event('text_delta', '结尾'))
-  assert.equal(state[0].text, '开头结尾')
-  assert.equal(state[0].sequence, undefined)
-})
 test('canonical manager status and tool events remain typed progress', () => {
   const samples = [
     { type: 'status', status: 'running' },

@@ -13,7 +13,7 @@ import { invitationLink } from '../../lib/enrollment-reference.ts'
 import { readConnectionFile } from '../../lib/connection-file.ts'
 
 test('connection links preserve the invitation in the fragment of the trusted web page', () => {
-  const content = '{"url":"https://relay.example","peer_id":"pinned-node","relay":true,"capability":"配对凭证"}'
+  const content = '{"url":"https://relay.example","peer_id":"pinned-node","capability":"配对凭证"}'
   const link = new URL(invitationLink(content, 'https://web.example/devices?old=secret#old'))
   assert.equal(link.origin, 'https://web.example')
   assert.equal(link.pathname, '/')
@@ -21,7 +21,7 @@ test('connection links preserve the invitation in the fragment of the trusted we
   const encoded = new URLSearchParams(link.hash.slice(1)).get('invite')
   assert.equal(typeof encoded, 'string')
   assert.ok(encoded)
-  assert.equal(Buffer.from(encoded, 'base64url').toString('utf8'), '{"url":"https://relay.example","peer_id":"pinned-node","relay":true,"capability":"配对凭证"}')
+  assert.equal(Buffer.from(encoded, 'base64url').toString('utf8'), '{"url":"https://relay.example","peer_id":"pinned-node","capability":"配对凭证"}')
   assert.equal(new URL(invitationLink('{}', 'http://localhost:4790')).origin, 'http://localhost:4790')
   for (const page of ['http://relay.example', 'https://user:password@web.example', 'file:///page']) assert.throws(() => invitationLink(content, page), /HTTPS|URL/)
 })
@@ -33,13 +33,13 @@ test('connection files keep the original content and reject empty or oversized f
 })
 
 test('an invitation link opens the configured relay while preserving the pinned target', () => {
-  const content = '{"url":"https://relay.example","peer_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relay":true,"invite":{"capability":"original"}}'
+  const content = '{"url":"https://relay.example","peer_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","invite":{"capability":"original"}}'
   const link = new URL(invitationLink(content, 'https://relay.example'))
   assert.equal(link.origin, 'https://relay.example')
   const encoded = new URLSearchParams(link.hash.slice(1)).get('invite')
   assert.ok(encoded)
   const invitation: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
-  assert.deepEqual(invitation, { url: 'https://relay.example', peer_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', relay: true, invite: { capability: 'original' } })
+  assert.deepEqual(invitation, { url: 'https://relay.example', peer_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', invite: { capability: 'original' } })
   for (const page of ['http://127.0.0.1:4790', 'http://[::1]:4790']) assert.equal(new URL(invitationLink(content, page)).origin, page)
 })
 
@@ -76,7 +76,7 @@ const settle = () => new Promise(setImmediate)
 function nodeJoinFixture() {
   const expires_at_ms = Date.now() + 60000
   const payload = { invite_id: 'node-invite', network_id: network, inviter_subject_id: '9'.repeat(64), new_kind: 'node', manage: false, node_roles: ['relay'], epoch: 1, expires_at_ms }
-  const invitation = JSON.stringify({ url: entry.address, peer_id: '8'.repeat(64), relay: false, invite: { capability: 'one-time-node-invite', invite: { payload, inviter_signature: 'signature' } } })
+  const invitation = JSON.stringify({ url: entry.address, peer_id: '8'.repeat(64), invite: { capability: 'one-time-node-invite', invite: { payload, inviter_signature: 'signature' } } })
   const review = { version: 1, invite_id: payload.invite_id, network_id: network, inviter_subject_id: payload.inviter_subject_id, new_member: { subject_id: target, public_key: publicKey, kind: 'node', name: 'node', node_roles: ['relay'], manage: false }, proposal_hash: '7'.repeat(64), parents: [], epoch: 1, expires_at_ms }
   const receipt = { kind: 'review', request_id: 'node-pair', review, review_hash: createHash('sha256').update(canonical(review)).digest('hex') }
   return { invitation, receipt }
@@ -625,7 +625,7 @@ for (const stage of ['bootstrap', 'subscribe']) test(`cancelSensitive during ${s
   const app = deviceHarness({ bootstrap: true })
   try {
     app.render(); await settle()
-    await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
+    await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
     app.render().downloadBackup()
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
@@ -648,7 +648,7 @@ for (const flow of ['pair', 'sensitive']) test(`cancelling ${flow} after subscri
   try {
     app.render(); await settle(); app.render()
     if (flow === 'sensitive') {
-      await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
+      await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
       app.render().downloadBackup()
     }
     const hold = deferred(); app.holds.set('subscribe', hold)
@@ -749,7 +749,7 @@ test('successful bootstrap releases local material without disconnecting the aut
   const app = deviceHarness({ bootstrap: true })
   try {
     app.render(); await settle()
-    await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
+    await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
     app.render().downloadBackup()
     await app.render().confirmBootstrap(true)
     assert.equal(app.render().ready?.entry.peer_id, target)
@@ -810,10 +810,10 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
 })
 
 
-async function routeHarness({ invalid = '', hold = false, secure = false, legacy = false, local = false, localFail = false } = {}) {
+async function routeHarness({ invalid = '', hold = false, secure = false, local = false, localFail = false } = {}) {
   await initCrypto({ module_or_path: readFileSync(new URL('../../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
   const client = Identity.generate(), targetKey = Identity.generate()
-  const targetUrl = `${secure ? 'wss' : 'ws'}://${local ? 'entry.example/api/local/ws' : legacy ? 'entry.example/api/network/ws' : 'target.example/custom/network'}`
+  const targetUrl = `${secure ? 'wss' : 'ws'}://${local ? 'entry.example/api/local/ws' : 'target.example/custom/network'}`
   const now = Math.floor(Date.now() / 1000)
   const record = { peer_id: targetKey.peerId(), public_key: targetKey.publicKeyHex(), direct_urls: ['ws://offline.example/path'], relay_urls: [targetUrl], issued_at: now, expires_at: now + 120, signature: '' }
   record.signature = targetKey.sign('reachability', new TextEncoder().encode(JSON.stringify(record)))
@@ -848,10 +848,10 @@ async function routeHarness({ invalid = '', hold = false, secure = false, legacy
     send(value: string | Uint8Array) {
       if (typeof value === 'string') {
         const message = JSON.parse(value); controls.push(message)
-        if (message.type === 'lookup') { if (!hold) queueMicrotask(() => this.emit(JSON.stringify({ type: 'record', record: legacy ? null : record }))); return }
+        if (message.type === 'lookup') { if (!hold) queueMicrotask(() => this.emit(JSON.stringify({ type: 'record', record }))); return }
         routes.push(this.url); this.isData = true; data++; maximum = Math.max(maximum, data)
         if (hold) return
-        if (this.url !== targetUrl || legacy && message.type === 'dial') { queueMicrotask(() => this.close()); return }
+        if (this.url !== targetUrl) { queueMicrotask(() => this.close()); return }
         this.handshake = new Handshake(false, targetKey.secretHex(), undefined, new TextEncoder().encode('vibeface:client:v1'))
         queueMicrotask(() => this.emit(JSON.stringify({ type: 'ready' })))
         return
@@ -925,22 +925,9 @@ for (const invalid of ['signature', 'expired', 'target']) test(`automatic transp
   const app = await routeHarness({ invalid })
   try {
     await assert.rejects(app.connect())
-    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws', 'ws://entry.example/api/network/ws'])
-    assert.deepEqual(app.controls.filter(message => ['dial', 'direct'].includes(String(message.type))).map(message => message.type), ['dial', 'direct'])
+    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws'])
+    assert.deepEqual(app.controls.filter(message => ['dial', 'direct'].includes(String(message.type))).map(message => message.type), ['dial'])
     assert.equal(app.closedEvents(), 0)
-    assert.equal(app.open(), 0)
-  } finally { app.close() }
-})
-
-test('an older local entry falls back to direct only after target dial fails and still pins its identity', async () => {
-  const app = await routeHarness({ legacy: true })
-  try {
-    const channel = await app.connect()
-    assert.equal((await channel.request('info')).peer_id, app.entry.peer_id)
-    assert.deepEqual(app.controls.filter(message => ['dial', 'direct'].includes(String(message.type))).map(message => message.type), ['dial', 'direct'])
-    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws', 'ws://entry.example/api/network/ws'])
-    assert.equal(app.maximum(), 1)
-    channel.close(); await settle()
     assert.equal(app.open(), 0)
   } finally { app.close() }
 })
@@ -955,19 +942,6 @@ test('cancelling automatic transport releases the active route and directory que
     assert.equal(app.closedEvents(), 0)
   } finally { app.close() }
 })
-
-test('saved current-format route preferences collapse into one target without losing its identity', async () => {
-  const app = deviceHarness()
-  try {
-    app.stored.set('vibeface.connections', JSON.stringify([{ ...entry, relay: false }, { ...entry, relay: true }]))
-    app.render(); await settle()
-    const entries = app.render().entries
-    assert.equal(entries.length, 1)
-    assert.equal(entries[0].peer_id, entry.peer_id)
-    assert.equal(Object.hasOwn(entries[0], 'relay'), false)
-  } finally { app.close() }
-})
-
 
 test('a secure page skips an unusable insecure candidate while retaining its signed secure relay', async () => {
   const app = await routeHarness({ secure: true })
