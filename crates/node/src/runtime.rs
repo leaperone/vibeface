@@ -2381,10 +2381,40 @@ mod tests {
             }
             let marker = std::fs::read(dir.join("data-epoch.json")).ok();
             assert!(Runtime::open(&dir).await.is_err());
+            assert!(
+                Runtime::open_with_bootstrap_urls(
+                    &dir,
+                    &[String::from("wss://node.test/api/network/ws")]
+                )
+                .await
+                .is_err()
+            );
             assert!(!dir.join("node.sqlite3").exists());
             assert!(!dir.join("identity.sqlite3").exists());
             assert_eq!(std::fs::read(dir.join("config.json"))?, config);
             assert_eq!(std::fs::read(dir.join("data-epoch.json")).ok(), marker);
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_bootstrap_override_does_not_open_runtime_resources() -> Result<()> {
+        let dir = fixture()?;
+        let config = std::fs::read(dir.join("config.json"))?;
+        for urls in [
+            vec![String::from("wss://user:secret@node.test/api/network/ws")],
+            vec![String::from("wss://node.test/api/network/ws"); 9],
+        ] {
+            assert!(
+                Runtime::open_with_bootstrap_urls(&dir, &urls)
+                    .await
+                    .is_err()
+            );
+            assert!(!dir.join("node.lock").exists());
+            assert!(!dir.join("node.sqlite3").exists());
+            assert!(!dir.join("identity.sqlite3").exists());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, config);
         }
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -3076,12 +3106,20 @@ fn require_task_write(
 
 impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
+        Self::open_with_bootstrap_urls(dir, &[]).await
+    }
+
+    pub async fn open_with_bootstrap_urls(dir: &Path, bootstrap_urls: &[String]) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
             epoch == json!({"data_epoch":5}),
             "this Node requires an initialized data epoch 5 directory"
         );
         let mut config = Config::load(dir)?;
+        if !bootstrap_urls.is_empty() {
+            config.network.bootstrap_urls = bootstrap_urls.to_vec();
+            config.network.validate()?;
+        }
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let blob_staging = blob_transfer::BlobStaging::open(dir, process_lock.clone())?;
         let identity = config::identity(dir)?;

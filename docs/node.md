@@ -160,6 +160,18 @@ Node 可启用局域网发现，从候选地址找到已知 Peer ID。公网发�
 
 公网或可达主机运行同一个 Node，也可启用调度或执行能力。启用公共中继时，其他人的设备可预约出站通道并通过它连通。中继只转发端到端密文，不加入对方个人网络，不获得会话、项目目录或执行权限。
 
+用 `--bootstrap-url` 指定自己选择的发现或中继入口。以下是三种独立用法：
+
+```sh
+./vibeface --bootstrap-url https://relay.example
+./vibeface serve --bootstrap-url wss://relay.example/api/network/ws
+./vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
+```
+
+参数可重复，最多指定 8 个入口。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点。URL 不接受凭证、查询参数、片段或其他路径，程序没有内置的公共入口。
+
+首次直接启动或显式 `init` 会保存传入的 URL。已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写原配置与身份；省略参数时沿用配置。`serve` 始终要求已初始化的数据目录。使用子命令时，将 `--bootstrap-url` 写在子命令后。入口提供路由和中继预约，设备仍须获得个人网络授权。
+
 网络配置如下，保留其他字段：
 
 ```json
