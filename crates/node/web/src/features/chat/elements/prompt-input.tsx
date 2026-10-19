@@ -64,7 +64,7 @@ export function PromptInput({
         <InputGroupAddon align="block-end" className="pt-1">
           <InputGroupButton
             type={onStop ? 'button' : 'submit'}
-            variant="default"
+            variant={onStop ? 'outline' : 'default'}
             size="icon-sm"
             disabled={!onStop && (disabled || busy || !value.trim())}
             aria-busy={busy || undefined}

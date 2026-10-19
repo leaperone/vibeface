@@ -1,13 +1,11 @@
 .conversation-screen { display: flex; flex: 1; min-height: 0; min-width: 0; flex-direction: column; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
 .conversation-screen > form { width: 100%; max-width: 48rem; flex-shrink: 0; align-self: center; padding: .5rem max(1rem, env(safe-area-inset-right)) max(.75rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left)); }
 
-.conversation-screen > .chat-activity { width: 100%; max-width: 48rem; flex-shrink: 0; align-self: center; min-width: 0; max-height: 40dvh; overflow-y: auto; overscroll-behavior: contain; padding: 0 max(1rem, env(safe-area-inset-right)) 0 max(1rem, env(safe-area-inset-left)); }
-.chat-approvals { display: grid; gap: .75rem; padding-block: .5rem; }
 @media (min-width: 40rem) {
-  .conversation-screen > form, .conversation-screen > .chat-activity { padding-inline: max(1.5rem, env(safe-area-inset-left)) max(1.5rem, env(safe-area-inset-right)); }
+  .conversation-screen > form { padding-inline: max(1.5rem, env(safe-area-inset-left)) max(1.5rem, env(safe-area-inset-right)); }
 }
 @media (min-width: 64rem) {
-  .conversation-screen > form, .conversation-screen > .chat-activity { padding-inline: max(2rem, env(safe-area-inset-left)) max(2rem, env(safe-area-inset-right)); }
+  .conversation-screen > form { padding-inline: max(2rem, env(safe-area-inset-left)) max(2rem, env(safe-area-inset-right)); }
 }
 .md { display: grid; gap: .75rem; min-width: 0; overflow-wrap: anywhere; }
 .md > * { margin: 0; }

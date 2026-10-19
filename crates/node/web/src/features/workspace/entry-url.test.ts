@@ -522,7 +522,7 @@ test("task cancellation stays on its source or target while native interruption 
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data,
     cancelAgentTask: async (task: string) => { stopped.push(task) }, interruptNative: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null, ready: { entry: { peer_id: peerId } } }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '' } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null, ready: { entry: { peer_id: peerId } } }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', decisionLabel: () => '', approvalKind: () => '', shownState: (session: { state: string }) => session.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   try {
     data.agent_tasks = [{ task_ref: 'task', source_node: 'source', target_node: 'offline', state: 'pending_delivery', text: '工作', detail: '' }]
@@ -756,9 +756,9 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   let generation = 1, creation = pendingResult()
   const clipboard = pendingResult()
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', peer_id: 'target' } } }
-  const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: () => creation.promise, refreshDirectory: async () => {} }
+  const device = { connectionGeneration: () => generation, ready: ready(), pairs: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
-    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false },
+    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false }, './ignored': { useIgnoredPairs: () => [] },
     '@/lib/node': { messageOf: (cause: Error) => cause.message, record: (value: unknown) => value, text: (value: unknown) => value },
     '@/lib/enrollment-reference': { invitationLink: () => 'https://node.example/#invite=test' }, cn: { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
   }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })

@@ -1,5 +1,5 @@
 import type { MembershipView } from "@/lib/node"
-import type { HumanRequest, NodeInfo } from "./types"
+import type { HumanRequest, NativeSessionRecord, NodeInfo } from "./types"
 
 export const roleNames: Record<string, string> = {
   gateway: "对外访问",
@@ -34,6 +34,8 @@ export const stateNames: Record<string, string> = {
   cancelled: "已取消",
   blocked: "受阻",
   ready: "就绪",
+  awaiting_input: "等你处理",
+  finishing: "收尾中",
 }
 
 export type NodeNameLookup = {
@@ -95,7 +97,19 @@ const taskStates: Record<string, string> = {
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "需要确认", unknown: "需要确认",
 }
-export const taskLabel = (state: string) => taskStates[state] ?? state
+export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
+
+// Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
+const progressStates: Record<string, string> = {
+  running: "进行中", in_progress: "进行中", finishing: "收尾中", completed: "已完成", failed: "失败", interrupted: "已中断",
+  unknown: "结果未知", awaiting_input: "等你处理", declined: "已拒绝",
+}
+export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
+
+const decisions: Record<string, string> = { accept: "已同意", decline: "已拒绝", cancel: "已拒绝并停止", answer: "已回答" }
+export const decisionLabel = (decision: string) => decisions[decision] ?? "已处理"
+/** A turn stays `waiting` until its next event; once nothing is left to answer it reads as running. */
+export const shownState = (session: Pick<NativeSessionRecord, "state" | "pending_requests">) => session.state === "waiting" && !session.pending_requests.length ? "running" : session.state
 export const taskActive = (state: string) => ["pending_delivery", "queued", "claimed", "accepted", "running", "waiting", "cancelling", "interrupting"].includes(state)
 
 const kinds: Record<string, string> = {
@@ -103,7 +117,7 @@ const kinds: Record<string, string> = {
   "item/fileChange/requestApproval": "修改文件",
   "item/tool/requestUserInput": "补充信息",
 }
-export const approvalKind = (request: HumanRequest) => kinds[request.kind] ?? "处理请求"
+export const approvalKind = (request: Pick<HumanRequest, "kind">) => kinds[request.kind] ?? "处理请求"
 
 // ponytail: keyword heuristics; a command parser if these miss real cases.
 const risks: [RegExp, string][] = [

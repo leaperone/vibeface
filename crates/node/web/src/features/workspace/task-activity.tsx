@@ -17,10 +17,8 @@ import type { HumanRequest, NativeSessionRecord, PendingCheck } from "./types"
 
 const decisionOf = (response: unknown) => response && typeof response === "object" ? (response as { decision?: unknown }).decision : undefined
 
-/** Shared by the chat (pinned above the composer), the task panel and /inbox. */
-
-
-export function ApprovalCard({ session, request, meta, onAnswered }: { session: NativeSessionRecord; request: HumanRequest; meta?: ReactNode; onAnswered?(text: string): void }) {
+/** Shared by the chat stream, the task panel and /inbox; `stoppable` is off where the view has its own stop button. */
+export function ApprovalCard({ session, request, meta, stoppable = true }: { session: NativeSessionRecord; request: HumanRequest; meta?: ReactNode; stoppable?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
@@ -29,10 +27,9 @@ export function ApprovalCard({ session, request, meta, onAnswered }: { session: 
   const node = workspace.nodes.find((item) => item.peer_id === session.target_node)
   const active = session.state === "running" || session.state === "waiting"
   const disabled = !workspace.writable || !node?.online || Boolean(node.revoked) || !active || session.freshness !== "observed" || !session.can_control
-  const respond = (response: unknown, answered: string) => async () => {
+  const respond = (response: unknown) => async () => {
     if (disabled) return
     await workspace.respondNative(session.work_id, session.target_node, request.request_id, response)
-    onAnswered?.(answered)
   }
   const choice = (decision: string) => request.choices?.find((item) => decisionOf(item.response) === decision)
   const accept = choice("accept"), decline = choice("decline"), cancel = choice("cancel")
@@ -47,15 +44,15 @@ export function ApprovalCard({ session, request, meta, onAnswered }: { session: 
     icon={Hand}
     title={`需要你同意 · ${approvalKind(request)}`}
     meta={meta ?? nodeName(session.target_node, { nodes: workspace.nodes, directory })}
-    menu={decline && cancel ? <Popover.Root>
+    menu={stoppable && decline && cancel ? <Popover.Root>
       <Popover.Trigger asChild><Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="更多" title="更多"><Ellipsis aria-hidden="true" /></Button></Popover.Trigger>
       <Popover.Portal><Popover.Content align="end" sideOffset={4} className="z-50 rounded-xl border bg-popover p-1 shadow-lg">
-        <ActionButton variant="ghost" className="text-danger" disabled={disabled} action={respond(cancel.response, "已停止任务")}>停止这个任务</ActionButton>
+        <ActionButton variant="ghost" className="text-danger" disabled={disabled} action={respond(cancel.response)}>停止这个任务</ActionButton>
       </Popover.Content></Popover.Portal>
     </Popover.Root> : undefined}
     actions={elsewhere || questions.length ? undefined : <>
-      {reject ? <ActionButton disabled={disabled} action={respond(reject.response, decline ? "已拒绝" : "已拒绝并停止")}>{decline ? "拒绝" : "拒绝并停止"}</ActionButton> : null}
-      {accept ? <ActionButton variant="default" disabled={disabled} action={respond(accept.response, "已同意")}>同意一次</ActionButton> : null}
+      {reject ? <ActionButton disabled={disabled} action={respond(reject.response)}>{decline ? "拒绝" : "拒绝并停止"}</ActionButton> : null}
+      {accept ? <ActionButton variant="default" disabled={disabled} action={respond(accept.response)}>同意一次</ActionButton> : null}
     </>}
   >
     {request.command ? <code className="block whitespace-pre-wrap break-all rounded-lg bg-background/70 px-3 py-2 font-mono text-meta">{request.command}</code> : null}
@@ -66,7 +63,7 @@ export function ApprovalCard({ session, request, meta, onAnswered }: { session: 
     {session.freshness !== "observed" ? <p role="status" className="text-meta text-muted-foreground">正在确认最新状态</p> : null}
     {elsewhere ? <p className="text-meta text-muted-foreground">{elsewhere}</p> : single ? <div className="grid gap-2">
       <p>{single.question}</p>
-      <div className="flex flex-wrap gap-2">{single.options!.map((option) => <ActionButton key={option.label} disabled={disabled} action={respond({ answers: { [single.id]: { answers: [option.label] } } }, `已回答：${option.label}`)}>{option.label}</ActionButton>)}</div>
+      <div className="flex flex-wrap gap-2">{single.options!.map((option) => <ActionButton key={option.label} disabled={disabled} action={respond({ answers: { [single.id]: { answers: [option.label] } } })}>{option.label}</ActionButton>)}</div>
     </div> : questions.length ? <form onSubmit={(event) => {
       event.preventDefault()
       if (disabled || busy) return
@@ -81,7 +78,7 @@ export function ApprovalCard({ session, request, meta, onAnswered }: { session: 
           if (!answer) throw new Error("每个问题都要回答。")
           return [question.id, { answers: [answer] }]
         }))
-        await respond({ answers }, "已回答")()
+        await respond({ answers })()
       }).finally(() => setBusyGeneration((owner) => owner === generation ? null : owner))
     }}>
       <fieldset disabled={disabled || busy} className="grid min-w-0 gap-3">
