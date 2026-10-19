@@ -134,8 +134,24 @@ fn cancel_agent_task_from(
             && message.target_node == local,
         "cancellation does not match the original source and target"
     );
-    admit_scheduler_from(connection, network, scope, task_ref, &local, &local)?;
     let key = scheduler_key("job", scope, &local, task_ref);
+    let newly_admitted = scheduler_load::<SchedulerJob>(connection, network, &key)?.is_none();
+    admit_scheduler_from(
+        connection,
+        network,
+        scope,
+        task_ref,
+        &local,
+        &local,
+        if newly_admitted {
+            JobState::Cancelled {
+                attempt: None,
+                evidence: evidence.into(),
+            }
+        } else {
+            JobState::Queued
+        },
+    )?;
     let mut job: SchedulerJob =
         scheduler_load(connection, network, &key)?.context("agent task admission is missing")?;
     if scheduler_publication_from(connection, network, &job)?.is_some() {
@@ -143,6 +159,9 @@ fn cancel_agent_task_from(
     }
     let mut session = load_scheduler_session(connection, network, scope, &local)?;
     let terminal = match &job.state {
+        JobState::Cancelled { attempt: None, .. } if newly_admitted => {
+            Some(JobOutcome::Cancelled(evidence.into()))
+        }
         JobState::Queued => {
             job.state = JobState::Cancelled {
                 attempt: None,
@@ -188,8 +207,13 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut receipt = admit_scheduler_from(&tx, network, scope, trigger, &local, &local)?;
-        if receipt.state == "queued" {
+        let key = scheduler_key("job", scope, &local, trigger);
+        if let Some(job) = scheduler_load::<SchedulerJob>(&tx, network, &key)? {
+            validated_scheduler_trigger(&tx, network, scope, trigger, &local)?;
+            return Ok(job.receipt(network));
+        }
+        let mut state = JobState::Queued;
+        {
             let event = event_from(&tx, network, scope, trigger)?;
             if let EventBody::AgentMessage { message } = &event.body
                 && message.kind == AgentMessageKind::Task
@@ -219,15 +243,28 @@ impl Store {
                                 | JobState::Unknown { .. }
                         )
                     {
-                        receipt = cancel_agent_task_from(
-                            &tx, identity, network, scope, trigger, &event.author,
-                            "target agent is busy with another task in this conversation; nested task was not started",
-                            at,
-                        )?.receipt(network);
+                        state = JobState::Cancelled {
+                            attempt: None,
+                            evidence: "target agent is busy with another task in this conversation; nested task was not started".into(),
+                        };
                         break;
                     }
                 }
             }
+        }
+        let receipt =
+            admit_scheduler_from(&tx, network, scope, trigger, &local, &local, state.clone())?;
+        if let JobState::Cancelled { evidence, .. } = state {
+            let job: SchedulerJob = scheduler_load(&tx, network, &key)?
+                .context("interrupted task admission is missing")?;
+            publish_agent_result_from(
+                &tx,
+                identity,
+                network,
+                &job,
+                &JobOutcome::Cancelled(evidence),
+                at,
+            )?;
         }
         tx.commit()?;
         Ok(receipt)
@@ -463,7 +500,15 @@ impl Store {
         } else {
             append_event_from(&tx, identity, network, scope, body, vec![], created_at_ms)?
         };
-        let receipt = admit_scheduler_from(&tx, network, scope, &envelope.hash, &source, &target)?;
+        let receipt = admit_scheduler_from(
+            &tx,
+            network,
+            scope,
+            &envelope.hash,
+            &source,
+            &target,
+            JobState::Queued,
+        )?;
         tx.commit()?;
         Ok((envelope, receipt))
     }
@@ -524,6 +569,7 @@ pub(super) fn publish_agent_result_from(
         &envelope.hash,
         &identity.peer_id()?,
         &task.author,
+        JobState::Queued,
     )?;
     Ok(Some(envelope.hash))
 }
@@ -728,7 +774,7 @@ mod tests {
     #[test]
     fn parallel_agent_parents_interrupt_mutual_nested_deliveries_without_starting_them()
     -> Result<()> {
-        for unknown in [false, true] {
+        for (unknown, saturated) in [(false, false), (true, false), (false, true)] {
             let (mut store, source, b, network) = fixture()?;
             let c = LocalIdentity::generate();
             let b_id = b.peer_id()?;
@@ -801,6 +847,84 @@ mod tests {
                 )?;
                 store.fence_manager_unknown(&network, "chat", &c_id, &parent_c.hash, attempt)?;
             }
+            if saturated {
+                for (target, target_id) in [(&b, &b_id), (&c, &c_id)] {
+                    for index in 0..MAX_PENDING_JOBS {
+                        let queued = store.append_event(
+                            &source,
+                            &network,
+                            "chat",
+                            EventBody::AgentMessage {
+                                message: task_message(
+                                    &format!("queued-{target_id}-{index}"),
+                                    target_id,
+                                    &human,
+                                ),
+                            },
+                            vec![],
+                            6,
+                        )?;
+                        assert_eq!(
+                            store
+                                .admit_received_trigger(target, &network, "chat", &queued.hash, 6)?
+                                .state,
+                            "queued"
+                        );
+                    }
+                    assert_eq!(
+                        load_scheduler_session(&store.connection, &network, "chat", target_id)?
+                            .pending
+                            .len(),
+                        MAX_PENDING_JOBS
+                    );
+                }
+                let (ordinary_human, _) = store.accept_message(
+                    &source,
+                    &network,
+                    "chat",
+                    EventBody::MessagePosted {
+                        message_id: "full-human".into(),
+                        role: "user".into(),
+                        text: "ordinary work".into(),
+                        scheduler_node: Some(c_id.clone()),
+                    },
+                    vec![],
+                    6,
+                    &source.peer_id()?,
+                    &c_id,
+                    true,
+                )?;
+                let (ordinary_task, _) = store.post_agent_task(
+                    &source,
+                    &network,
+                    "chat",
+                    task_message("full-task", &c_id, &human),
+                    source_attempt,
+                    6,
+                )?;
+                for trigger in [&ordinary_human.hash, &ordinary_task.hash] {
+                    assert_eq!(
+                        store
+                            .admit_received_trigger(&c, &network, "chat", trigger, 6)
+                            .unwrap_err()
+                            .to_string(),
+                        "scheduler inbox is full; trigger was not admitted"
+                    );
+                    assert!(
+                        store
+                            .scheduler_job(&network, "chat", trigger, &c_id)?
+                            .is_none()
+                    );
+                }
+                for (target, parent) in [(&b, &parent_b), (&c, &parent_c)] {
+                    assert_eq!(
+                        store
+                            .admit_received_trigger(target, &network, "chat", &parent.hash, 6)?
+                            .state,
+                        "running"
+                    );
+                }
+            }
             let before_c = store.scheduler_job(&network, "chat", &parent_c.hash, &c_id)?;
             store.connection.execute_batch(
                 "CREATE TEMP TRIGGER reject_busy_result BEFORE INSERT ON events
@@ -810,7 +934,9 @@ mod tests {
             assert!(
                 store
                     .admit_received_trigger(&c, &network, "chat", &nested_c.hash, 7)
-                    .is_err()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected busy result failure")
             );
             assert!(
                 store
@@ -853,6 +979,14 @@ mod tests {
                         .claim_next(&network, "chat", &target_id, "test-boot", "sdk")?
                         .is_none()
                 );
+                if saturated {
+                    assert_eq!(
+                        load_scheduler_session(&store.connection, &network, "chat", &target_id)?
+                            .pending
+                            .len(),
+                        MAX_PENDING_JOBS
+                    );
+                }
             }
             assert_eq!(
                 store.scheduler_job(&network, "chat", &parent_b.hash, &b_id)?,
@@ -979,6 +1113,10 @@ mod tests {
             if order == "nested-first" {
                 assert_eq!(nested_receipt.state, "queued");
             }
+            assert_eq!(
+                store.admit_received_trigger(&c, &network, "chat", &nested.hash, 6)?,
+                nested_receipt
+            );
             let running = start_next(&mut store, &network, &c_id)?;
             if nested_receipt.state == "cancelled" {
                 assert!(parent.sequence < child.sequence);
@@ -1343,79 +1481,121 @@ mod tests {
 
     #[test]
     fn cancellation_before_delivery_survives_late_admission_without_starting() -> Result<()> {
-        let (mut store, source, target, network) = fixture()?;
-        let source_node = source.peer_id()?;
-        let target_node = target.peer_id()?;
-        let (origin, human) = start_human(&mut store, &source, &network)?;
-        let attempt = &human.state.attempt().context("human attempt missing")?.id;
-        let (task, _) = store.post_agent_task(
-            &source,
-            &network,
-            "chat",
-            task_message("task", &target_node, &origin),
-            attempt,
-            3,
-        )?;
-        assert!(
-            store
-                .cancel_agent_task(&target, &network, "chat", &task.hash, &target_node, 4)
-                .is_err()
-        );
-        assert!(
-            store
-                .scheduler_job(&network, "chat", &task.hash, &target_node)?
-                .is_none()
-        );
-        let cancelled = store
-            .cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 4)?
-            .context("cancelled task missing")?;
-        assert_eq!(
-            cancelled.state,
-            JobState::Cancelled {
-                attempt: None,
-                evidence: "task cancelled before its agent started".into(),
+        for saturated in [false, true] {
+            let (mut store, source, target, network) = fixture()?;
+            let source_node = source.peer_id()?;
+            let target_node = target.peer_id()?;
+            let (origin, human) = start_human(&mut store, &source, &network)?;
+            let attempt = &human.state.attempt().context("human attempt missing")?.id;
+            let (task, _) = store.post_agent_task(
+                &source,
+                &network,
+                "chat",
+                task_message("task", &target_node, &origin),
+                attempt,
+                3,
+            )?;
+            if saturated {
+                for index in 0..MAX_PENDING_JOBS {
+                    let queued = store.append_event(
+                        &source,
+                        &network,
+                        "chat",
+                        EventBody::AgentMessage {
+                            message: task_message(
+                                &format!("queued-{index}"),
+                                &target_node,
+                                &origin,
+                            ),
+                        },
+                        vec![],
+                        3,
+                    )?;
+                    assert_eq!(
+                        store
+                            .admit_received_trigger(&target, &network, "chat", &queued.hash, 3)?
+                            .state,
+                        "queued"
+                    );
+                }
             }
-        );
-        assert_eq!(
-            store.cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 5,)?,
-            Some(cancelled)
-        );
-        let path = store.path.clone();
-        drop(store);
-        let mut store = Store::open(path)?;
-        let receipt =
-            store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?;
-        assert_eq!(receipt.state, "cancelled");
-        assert_eq!(
-            store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?,
-            receipt
-        );
-        assert!(
-            store
-                .claim_next(&network, "chat", &target_node, "restarted", "sdk")?
-                .is_none()
-        );
-        let results = replies(&store, &network, &task)?;
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].author, target_node);
-        assert!(
-            matches!(&results[0].body, EventBody::AgentMessage { message }
-            if message.kind == AgentMessageKind::Interrupted
-                && message.target_node == source_node && message.origin_trigger == origin.hash)
-        );
-        assert_eq!(
-            store.agent_task_status(&network, "chat", &task.hash)?["state"],
-            "interrupted"
-        );
-        assert!(
-            store
-                .scheduler_job(&network, "chat", &task.hash, &target_node)?
-                .context("cancelled admission missing")?
-                .state
-                .attempt()
-                .is_none()
-        );
-        cleanup(store)
+            let pending =
+                load_scheduler_session(&store.connection, &network, "chat", &target_node)?.pending;
+            assert_eq!(pending.len(), if saturated { MAX_PENDING_JOBS } else { 0 });
+            assert!(
+                store
+                    .cancel_agent_task(&target, &network, "chat", &task.hash, &target_node, 4)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .scheduler_job(&network, "chat", &task.hash, &target_node)?
+                    .is_none()
+            );
+            let cancelled = store
+                .cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 4)?
+                .context("cancelled task missing")?;
+            assert_eq!(
+                cancelled.state,
+                JobState::Cancelled {
+                    attempt: None,
+                    evidence: "task cancelled before its agent started".into(),
+                }
+            );
+            assert_eq!(
+                store.cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 5,)?,
+                Some(cancelled)
+            );
+            assert_eq!(
+                load_scheduler_session(&store.connection, &network, "chat", &target_node)?.pending,
+                pending
+            );
+            let path = store.path.clone();
+            drop(store);
+            let mut store = Store::open(path)?;
+            let receipt =
+                store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?;
+            assert_eq!(receipt.state, "cancelled");
+            assert_eq!(
+                store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?,
+                receipt
+            );
+            assert_eq!(
+                load_scheduler_session(&store.connection, &network, "chat", &target_node)?.pending,
+                pending
+            );
+            let claimed = store.claim_next(&network, "chat", &target_node, "restarted", "sdk")?;
+            if let Some(first) = pending.first() {
+                assert_eq!(
+                    &claimed.context("original queued task missing")?.job.trigger,
+                    first
+                );
+            } else {
+                assert!(claimed.is_none());
+            }
+            let results = replies(&store, &network, &task)?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].author, target_node);
+            assert!(
+                matches!(&results[0].body, EventBody::AgentMessage { message }
+                if message.kind == AgentMessageKind::Interrupted
+                    && message.target_node == source_node && message.origin_trigger == origin.hash)
+            );
+            assert_eq!(
+                store.agent_task_status(&network, "chat", &task.hash)?["state"],
+                "interrupted"
+            );
+            assert!(
+                store
+                    .scheduler_job(&network, "chat", &task.hash, &target_node)?
+                    .context("cancelled admission missing")?
+                    .state
+                    .attempt()
+                    .is_none()
+            );
+            cleanup(store)?;
+        }
+        Ok(())
     }
 
     #[test]

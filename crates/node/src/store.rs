@@ -432,6 +432,7 @@ impl Store {
             &envelope.hash,
             local_node,
             target,
+            JobState::Queued,
         )?;
         tx.commit()?;
         Ok((envelope, receipt))
@@ -459,8 +460,15 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let receipt =
-            admit_scheduler_from(&tx, network, conversation, trigger, local_node, target)?;
+        let receipt = admit_scheduler_from(
+            &tx,
+            network,
+            conversation,
+            trigger,
+            local_node,
+            target,
+            JobState::Queued,
+        )?;
         tx.commit()?;
         Ok(receipt)
     }
@@ -2123,8 +2131,17 @@ fn admit_scheduler_from(
     trigger: &str,
     local_node: &str,
     target: &str,
+    state: JobState,
 ) -> Result<AdmissionReceipt> {
     let kind = validated_scheduler_trigger(connection, network, conversation, trigger, target)?;
+    let queued = match &state {
+        JobState::Queued => true,
+        JobState::Cancelled {
+            attempt: None,
+            evidence,
+        } if !evidence.is_empty() && local_node == target => false,
+        _ => bail!("scheduler admission requires queued or unstarted cancelled state"),
+    };
     if local_node != target {
         let key = scheduler_key("outbox", conversation, target, trigger);
         if let Some(entry) = scheduler_load::<OutboxEntry>(connection, network, &key)? {
@@ -2151,10 +2168,12 @@ fn admit_scheduler_from(
         return Ok(job.receipt(network));
     }
     let mut session = load_scheduler_session(connection, network, conversation, target)?;
-    ensure!(
-        session.pending.len() < MAX_PENDING_JOBS,
-        "scheduler inbox is full; trigger was not admitted"
-    );
+    if queued {
+        ensure!(
+            session.pending.len() < MAX_PENDING_JOBS,
+            "scheduler inbox is full; trigger was not admitted"
+        );
+    }
     let job = SchedulerJob {
         version: SCHEDULING_VERSION,
         conversation_id: conversation.into(),
@@ -2180,13 +2199,15 @@ fn admit_scheduler_from(
                 target
             ))?)
         ),
-        state: JobState::Queued,
+        state,
     };
     session.next_sequence = session
         .next_sequence
         .checked_add(1)
         .context("scheduler queue sequence overflow")?;
-    session.pending.push(trigger.into());
+    if queued {
+        session.pending.push(trigger.into());
+    }
     scheduler_save(connection, network, &key, &job)?;
     save_scheduler_session(connection, network, &session)?;
     Ok(job.receipt(network))
