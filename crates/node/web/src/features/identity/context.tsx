@@ -42,7 +42,9 @@ function store(key: string, value: unknown) { try { localStorage.setItem(`vibefa
 function savedEntries(): ConnectionEntry[] {
   const value = load('connections')
   if (!Array.isArray(value)) return []
-  return value.flatMap(item => { try { return [parseEntry(item)] } catch { return [] } })
+  const entries = new Map<string, ConnectionEntry>()
+  for (const item of value) { try { const entry = parseEntry(item); entries.set(entryKey(entry), entry) } catch {} }
+  return [...entries.values()]
 }
 function loadAuthenticated(): AuthenticatedEntry | null {
   try {
@@ -312,7 +314,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const result = record(await request('commit_invite', { invite, capability: prepared.capability }))
     if (!same(result.invite, invite) || result.capability !== prepared.capability) throw new Error('保存后的邀请与已签名内容不一致。')
     const route = ready.info.connection_entry ?? ready.entry
-    return JSON.stringify({ url: route.address, peer_id: ready.entry.peer_id, relay: route.relay, invite: result })
+    return JSON.stringify({ url: route.address, peer_id: ready.entry.peer_id, invite: result })
   }
   async function approvePair(requestId: string) {
     if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')

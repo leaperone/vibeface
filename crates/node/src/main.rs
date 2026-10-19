@@ -1134,6 +1134,14 @@ mod tests {
     #[test]
     fn network_urls_normalize_without_accepting_credentials() {
         assert_eq!(
+            network_url("ws://node.test").unwrap(),
+            "ws://node.test/api/network/ws"
+        );
+        assert_eq!(
+            network_url("wss://node.test/custom/network").unwrap(),
+            "wss://node.test/custom/network"
+        );
+        assert_eq!(
             network_url("https://node.test").unwrap(),
             "wss://node.test/api/network/ws"
         );

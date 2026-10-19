@@ -22,7 +22,6 @@ use tokio::sync::Mutex;
 pub struct Invitation {
     url: String,
     peer_id: String,
-    relay: bool,
     invite: InviteSecret,
 }
 
@@ -48,8 +47,12 @@ impl Invitation {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         ensure!(bytes.len() <= 128 * 1024, "invitation is too large");
+        let mut input: Value = serde_json::from_slice(bytes).context("invalid Node invitation")?;
+        if let Some(fields) = input.as_object_mut() {
+            fields.remove("relay");
+        }
         let mut invitation: Self =
-            serde_json::from_slice(bytes).context("invalid Node invitation")?;
+            serde_json::from_value(input).context("invalid Node invitation")?;
         ensure!(
             invitation.peer_id.len() == 64 && hex::decode(&invitation.peer_id).is_ok(),
             "invitation requires a pinned Node identity"
@@ -71,13 +74,14 @@ impl Invitation {
 pub fn network_url(value: &str) -> Result<String> {
     ensure!(value.len() <= 2048, "network URL is too long");
     let mut url = reqwest::Url::parse(value).context("invalid network URL")?;
+    let network_endpoint = matches!(url.scheme(), "ws" | "wss");
     ensure!(
         url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && matches!(url.path(), "/" | "/api/network/ws"),
+            && (network_endpoint || matches!(url.path(), "/" | "/api/network/ws")),
         "network URL must identify the Node WebSocket endpoint without credentials"
     );
     let scheme = match url.scheme() {
@@ -87,7 +91,9 @@ pub fn network_url(value: &str) -> Result<String> {
     };
     url.set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
-    url.set_path("/api/network/ws");
+    if !network_endpoint || url.path() == "/" {
+        url.set_path("/api/network/ws");
+    }
     Ok(url.to_string())
 }
 
@@ -108,7 +114,6 @@ enum Phase {
 struct PendingPair {
     url: String,
     peer_id: String,
-    relay: bool,
     invite_id: String,
     request_id: String,
     name: String,
@@ -174,8 +179,16 @@ impl NodePairing {
             bytes.len() <= 256 * 1024,
             "pending pairing receipt is too large"
         );
+        let mut receipt: Value =
+            serde_json::from_slice(&bytes).context("invalid pending pairing receipt")?;
+        if let Some(fields) = receipt.as_object_mut() {
+            fields.remove("relay");
+        }
+        if let Some(fields) = receipt.get_mut("invitation").and_then(Value::as_object_mut) {
+            fields.remove("relay");
+        }
         Ok(Some(
-            serde_json::from_slice(&bytes).context("invalid pending pairing receipt")?,
+            serde_json::from_value(receipt).context("invalid pending pairing receipt")?,
         ))
     }
 
@@ -210,7 +223,6 @@ impl NodePairing {
         if let Some(pending) = previous.as_mut() {
             let same = pending.url == invitation.url
                 && pending.peer_id == invitation.peer_id
-                && pending.relay == invitation.relay
                 && pending.invite_id == invitation.invite.invite.payload.invite_id
                 && pending.name == name;
             if !same
@@ -233,7 +245,6 @@ impl NodePairing {
             ensure!(
                 pending.url == invitation.url
                     && pending.peer_id == invitation.peer_id
-                    && pending.relay == invitation.relay
                     && pending.invite_id == invitation.invite.invite.payload.invite_id
                     && pending.name == name,
                 "finish the pending pairing with its original invitation and device name"
@@ -255,7 +266,6 @@ impl NodePairing {
             PendingPair {
                 url: invitation.url.clone(),
                 peer_id: invitation.peer_id.clone(),
-                relay: invitation.relay,
                 invite_id: invitation.invite.invite.payload.invite_id.clone(),
                 request_id: uuid::Uuid::new_v4().to_string(),
                 name: name.into(),
@@ -352,13 +362,7 @@ impl NodePairing {
     }
 
     async fn connect(&self, pending: &PendingPair) -> Result<Client> {
-        Client::connect(
-            &pending.url,
-            &self.node.identity,
-            &pending.peer_id,
-            pending.relay,
-        )
-        .await
+        Client::connect(&pending.url, &self.node.identity, &pending.peer_id).await
     }
 
     fn uncertain(pending: &PendingPair, message: &'static str) -> JoinState {
@@ -795,7 +799,6 @@ mod tests {
         Ok(Invitation {
             url: url.into(),
             peer_id: node.identity.peer_id()?,
-            relay: false,
             invite: InviteSecret { invite, capability },
         })
     }
@@ -835,7 +838,7 @@ mod tests {
                 "invite":{"invite":invite,"capability":"fixture capability"}});
             let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire)?);
             let parsed = Invitation::parse(&encoded)?;
-            assert_eq!(parsed.relay, relay);
+            assert!(serde_json::to_value(&parsed)?.get("relay").is_none());
             assert_eq!(parsed.url, "ws://localhost:4790/api/network/ws");
             assert_eq!(
                 Invitation::parse(&wire.to_string())?.peer_id,
@@ -848,7 +851,7 @@ mod tests {
             assert!(Invitation::parse(&old.to_string()).is_err());
             let mut missing = wire.clone();
             missing.as_object_mut().unwrap().remove("relay");
-            assert!(Invitation::parse(&missing.to_string()).is_err());
+            assert!(Invitation::parse(&missing.to_string()).is_ok());
         }
         let request_hash = digest(&request.signing_bytes()?);
         let mut review = PairReview {
@@ -868,7 +871,7 @@ mod tests {
         review.proposal_hash = request_hash.clone();
         review.new_member.name = "Another Node".into();
         assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
-        let wire = json!({"url":"http://localhost:4790", "peer_id":"device", "relay":false,
+        let wire = json!({"url":"http://localhost:4790", "peer_id":"device",
             "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
         let pending: PendingPair = serde_json::from_value(wire.clone())?;
         assert_eq!(pending.peer_id, "device");
@@ -914,6 +917,13 @@ mod tests {
             assert_eq!(review.new_member.subject_id, joiner.identity.peer_id()?);
             assert_eq!(review.new_member.kind, IdentityKind::Node);
             assert_eq!(review.new_member.node_roles, invitation.invite.invite.payload.node_roles);
+            let mut old_receipt: Value = serde_json::from_slice(&fs::read(&pairing.pending_path)?)?;
+            old_receipt["relay"] = json!(true);
+            old_receipt["invitation"]["relay"] = json!(false);
+            config::private_write(&pairing.pending_path, &serde_json::to_vec(&old_receipt)?)?;
+            assert!(matches!(pairing.request(invitation.clone(), "Mac mini").await?, JoinState::Review { request_id: recovered, .. } if recovered == request_id));
+            let saved: Value = serde_json::from_slice(&fs::read(&pairing.pending_path)?)?;
+            assert!(saved.get("relay").is_none() && saved["invitation"].get("relay").is_none());
             assert!(!inviter.store.lock().await.pair_accepted(&request_id)?);
             assert!(!joiner.has_membership().await?);
             assert!(pairing.accept(&request_id, &"0".repeat(64)).await.is_err());
@@ -945,7 +955,7 @@ mod tests {
             assert_eq!(counter.query_row::<i64, _, _>("SELECT count FROM acceptance_writes", [], |row| row.get(0))?, 1);
             pending.url = url.clone();
             pairing.save(&pending)?;
-            let mut manager = Client::connect(&url, &admin, &inviter.identity.peer_id()?, false).await?;
+            let mut manager = Client::connect(&url, &admin, &inviter.identity.peer_id()?).await?;
             let prepared = manager.call("prepare_pair", json!({"request_id":request_id})).await?;
             let mut event: GovernanceEvent = serde_json::from_value(prepared["event"].clone())?;
             event.signature = admin.sign_payload("identity-governance", &event.signing_bytes()?)?;
@@ -1045,7 +1055,6 @@ mod tests {
             let pending = PendingPair {
                 url: invitation.url.clone(),
                 peer_id: invitation.peer_id.clone(),
-                relay: false,
                 invite_id: invitation.invite.invite.payload.invite_id.clone(),
                 request_id: "accepted-request".into(),
                 name: "Mac mini".into(),
@@ -1126,7 +1135,6 @@ mod tests {
         let pending = PendingPair {
             url: invitation.url.clone(),
             peer_id: invitation.peer_id.clone(),
-            relay: false,
             invite_id: invitation.invite.invite.payload.invite_id.clone(),
             request_id: "pending".into(),
             name: "Mac mini".into(),

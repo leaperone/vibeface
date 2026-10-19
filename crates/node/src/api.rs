@@ -408,7 +408,7 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true}}),
     ))
 }
 
@@ -455,7 +455,7 @@ async fn local_exchange(
             &input.public_key,
         )
         .map_err(|_| ApiError::auth())?;
-    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true},"network_id":state.genesis.network_id})).into_response();
+    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true},"network_id":state.genesis.network_id})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
@@ -536,7 +536,6 @@ struct LocalLaunch {
 struct LocalEntry {
     address: String,
     peer_id: String,
-    relay: bool,
 }
 
 #[derive(Serialize)]
@@ -584,7 +583,6 @@ async fn local_setup(
             entry: LocalEntry {
                 address: origin.into(),
                 peer_id,
-                relay: false,
             },
             local_launch,
         }));
@@ -1055,7 +1053,7 @@ mod tests {
             ])?)?;
             node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.peer_id()?)?;
             let initialized: Value = request().send().await?.json().await?;
-            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"peer_id":node.identity.peer_id()?,"relay":false}}));
+            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"peer_id":node.identity.peer_id()?}}));
             assert!(!initialized.to_string().contains(&capability.capability));
             assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
             let local_origin = "http://127.0.0.1:4791";

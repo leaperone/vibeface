@@ -106,8 +106,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
             void run(async () => {
               let work: Promise<void>
               try {
-                const relay = form.elements.namedItem('relay')
-                work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), bootstrap: field(form, 'bootstrap'), entry: parseEntry({ address: field(form, 'address'), peer_id: field(form, 'peer_id'), relay: relay instanceof HTMLInputElement && relay.checked }) })
+                work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), bootstrap: field(form, 'bootstrap'), entry: parseEntry({ address: field(form, 'address'), peer_id: field(form, 'peer_id') }) })
               } finally { form.reset() }
               await work
             })
@@ -117,7 +116,6 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
             <label className="grid gap-2 text-sm">此浏览器名称<Input className={input} name="name" required maxLength={128} /></label>
             <label className="grid gap-2 text-sm">目标入口地址<Input className={input} type="url" name="address" required defaultValue={target?.address || ''} /></label>
             <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="peer_id" required pattern="[a-f0-9]{64}" defaultValue={target?.peer_id || ''} autoComplete="off" spellCheck={false} /></label>
-            <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" name="relay" defaultChecked={target?.relay || false} />通过入口中继到目标节点</label>
             <label className="grid gap-2 text-sm">新节点的本机初始化邀请，可选<Textarea className="min-h-20 font-mono text-xs" name="bootstrap" autoComplete="off" spellCheck={false} /></label>
             <Button className={button} type="submit">解锁并核对恢复授权</Button>
           </fieldset></form>
