@@ -1,5 +1,6 @@
 use crate::{
     identity::local::BootstrapCapability,
+    pairing::{Invitation, JoinState, NodePairing},
     runtime::{Access, Runtime},
 };
 use anyhow::{Context, Result, ensure};
@@ -27,6 +28,7 @@ const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
+    pairing: Arc<NodePairing>,
 }
 
 #[derive(Clone)]
@@ -137,6 +139,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App {
+        pairing: Arc::new(NodePairing::new(node.clone())),
         node,
         sites: vec![site],
     };
@@ -168,13 +171,20 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    let app = App { sites, node };
+    let app = App {
+        pairing: Arc::new(NodePairing::new(node.clone())),
+        sites,
+        node,
+    };
     Router::new()
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
         .route("/api/info", get(info))
         .route("/api/local/setup", post(local_setup))
+        .route("/api/local/join/request", post(local_join_request))
+        .route("/api/local/join/accept", post(local_join_accept))
+        .route("/api/local/join/status", post(local_join_status))
         .route("/peer", get(peer))
         .route("/api/network/ws", get(network))
         .fallback(frontend)
@@ -257,7 +267,7 @@ async fn check_boundary(
     if !http_site_allowed(site, app.node.config.allow_insecure_lan, ip) {
         return Err(ApiError::forbidden());
     }
-    if path == "/api/local/setup" {
+    if path.starts_with("/api/local/") {
         check_local_setup(site, headers, ip)?;
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
@@ -408,6 +418,50 @@ async fn local_setup(
             capability: capability.capability,
         },
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalJoinRequest {
+    invitation: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalJoinAccept {
+    request_id: String,
+    review_hash: String,
+}
+
+async fn local_join_request(
+    State(app): State<App>,
+    Json(input): Json<LocalJoinRequest>,
+) -> ApiResult<Json<JoinState>> {
+    let invitation = Invitation::parse(&input.invitation).map_err(ApiError::bad)?;
+    app.pairing
+        .request(invitation, &input.name)
+        .await
+        .map(Json)
+        .map_err(ApiError::bad)
+}
+
+async fn local_join_accept(
+    State(app): State<App>,
+    Json(input): Json<LocalJoinAccept>,
+) -> ApiResult<Json<JoinState>> {
+    app.pairing
+        .accept(&input.request_id, &input.review_hash)
+        .await
+        .map(Json)
+        .map_err(ApiError::bad)
+}
+
+async fn local_join_status(
+    State(app): State<App>,
+    Json(_): Json<LocalSetupRequest>,
+) -> ApiResult<Json<JoinState>> {
+    app.pairing.status().await.map(Json).map_err(ApiError::bad)
 }
 
 #[derive(Deserialize)]
@@ -772,6 +826,21 @@ mod tests {
             assert_eq!(client.post(&endpoint).json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(request().header("x-forwarded-for", "127.0.0.1").send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
+            for (path, input) in [
+                ("status", json!({})),
+                ("request", json!({"invitation":"invalid","name":"Mac mini"})),
+                ("accept", json!({"request_id":"request","review_hash":"00"})),
+            ] {
+                let endpoint = format!("{origin}/api/local/join/{path}");
+                assert_eq!(client.post(&endpoint).json(&input).send().await?.status(), StatusCode::FORBIDDEN);
+                assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header("x-forwarded-for", "127.0.0.1").json(&input).send().await?.status(), StatusCode::FORBIDDEN);
+                assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&input).send().await?.status(), StatusCode::FORBIDDEN);
+                assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header(header::CONTENT_TYPE, "text/plain").body("{}").send().await?.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                let response = client.post(&endpoint).header(header::ORIGIN, &origin).json(&input).send().await?;
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                if path == "status" { assert_eq!(response.json::<Value>().await?, json!({"kind":"idle"})); }
+                else { assert_eq!(response.status(), StatusCode::BAD_REQUEST); }
+            }
             let public_info: Value = client.get(format!("{origin}/api/info")).send().await?.json().await?;
             assert!(!public_info.to_string().contains(&capability.capability));
             assert!(public_info.get("invitation").is_none());
@@ -786,6 +855,9 @@ mod tests {
             assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"peer_id":node.identity.peer_id()?,"relay":false}}));
             assert!(!initialized.to_string().contains(&capability.capability));
             assert!(node.identities.verify_bootstrap_capability(&capability.capability).is_err());
+            let joined: Value = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?.json().await?;
+            assert_eq!(joined["kind"], "joined");
+            assert_eq!(joined["peer_id"], node.identity.peer_id()?);
             Ok::<(), anyhow::Error>(())
         }.await;
         server.abort();

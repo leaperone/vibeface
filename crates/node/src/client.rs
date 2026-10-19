@@ -588,13 +588,17 @@ async fn dispatch(
                 .authorize_member(&session.subject_id)
                 .is_ok_and(|member| member == review.new_member)
             {
-                Ok(json!({"status":"granted","state":state}))
+                Ok(json!({"status":"granted","state":state,"review":review}))
             } else {
-                ensure!(
-                    review.expires_at_ms > crate::runtime::now_ms(),
-                    "pair review expired"
-                );
-                Ok(json!({"status":"pending","request_id":request_id,"review":review}))
+                let accepted = node.identities.pair_accepted(request_id)?;
+                let status = if review.expires_at_ms > crate::runtime::now_ms() {
+                    "pending"
+                } else {
+                    "expired"
+                };
+                Ok(
+                    json!({"status":status,"request_id":request_id,"review":review,"accepted":accepted}),
+                )
             }
         }
         "prepare_revoke" => {
