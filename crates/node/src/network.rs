@@ -1289,6 +1289,9 @@ impl NetworkHub {
                         Err(AuthenticationFailure::Path(error)) => {
                             self.record_path(target, &candidate.route(), false).await;
                             tracing::debug!(target, route=%candidate.route(), %error, "authenticated path rejected");
+                            if candidate.explicit && candidate.relay {
+                                queue.insert(PathCandidate { relay: false, ..candidate });
+                            }
                         }
                     }
                 }

@@ -336,10 +336,10 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
 })
 
 
-async function routeHarness({ invalid = '', hold = false, secure = false } = {}) {
+async function routeHarness({ invalid = '', hold = false, secure = false, legacy = false } = {}) {
   await initCrypto({ module_or_path: readFileSync(new URL('../../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
   const client = Identity.generate(), targetKey = Identity.generate()
-  const targetUrl = `${secure ? 'wss' : 'ws'}://target.example/custom/network`
+  const targetUrl = `${secure ? 'wss' : 'ws'}://${legacy ? 'entry.example/api/network/ws' : 'target.example/custom/network'}`
   const now = Math.floor(Date.now() / 1000)
   const record = { peer_id: targetKey.peerId(), public_key: targetKey.publicKeyHex(), direct_urls: ['ws://offline.example/path'], relay_urls: [targetUrl], issued_at: now, expires_at: now + 120, signature: '' }
   record.signature = targetKey.sign('reachability', new TextEncoder().encode(JSON.stringify(record)))
@@ -364,10 +364,10 @@ async function routeHarness({ invalid = '', hold = false, secure = false } = {})
     send(value: string | Uint8Array) {
       if (typeof value === 'string') {
         const message = JSON.parse(value); controls.push(message)
-        if (message.type === 'lookup') { if (!hold) queueMicrotask(() => this.emit(JSON.stringify({ type: 'record', record }))); return }
+        if (message.type === 'lookup') { if (!hold) queueMicrotask(() => this.emit(JSON.stringify({ type: 'record', record: legacy ? null : record }))); return }
         routes.push(this.url); this.isData = true; data++; maximum = Math.max(maximum, data)
         if (hold) return
-        if (this.url !== targetUrl) { queueMicrotask(() => this.close()); return }
+        if (this.url !== targetUrl || legacy && message.type === 'dial') { queueMicrotask(() => this.close()); return }
         this.handshake = new Handshake(false, targetKey.secretHex(), undefined, new TextEncoder().encode('vibeface:client:v1'))
         queueMicrotask(() => this.emit(JSON.stringify({ type: 'ready' })))
         return
@@ -421,8 +421,22 @@ for (const invalid of ['signature', 'expired', 'target']) test(`automatic transp
   const app = await routeHarness({ invalid })
   try {
     await assert.rejects(app.connect())
-    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws'])
+    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws', 'ws://entry.example/api/network/ws'])
+    assert.deepEqual(app.controls.filter(message => ['dial', 'direct'].includes(String(message.type))).map(message => message.type), ['dial', 'direct'])
     assert.equal(app.closedEvents(), 0)
+    assert.equal(app.open(), 0)
+  } finally { app.close() }
+})
+
+test('an older local entry falls back to direct only after target dial fails and still pins its identity', async () => {
+  const app = await routeHarness({ legacy: true })
+  try {
+    const channel = await app.connect()
+    assert.equal((await channel.request('info')).peer_id, app.entry.peer_id)
+    assert.deepEqual(app.controls.filter(message => ['dial', 'direct'].includes(String(message.type))).map(message => message.type), ['dial', 'direct'])
+    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws', 'ws://entry.example/api/network/ws'])
+    assert.equal(app.maximum(), 1)
+    channel.close(); await settle()
     assert.equal(app.open(), 0)
   } finally { app.close() }
 })

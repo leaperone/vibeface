@@ -216,7 +216,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     signal?.addEventListener("abort", abort, { once: true });
     function add(candidate) {
       const key = `${candidate.relay}:${candidate.url}`;
-      if (seen.has(key) || candidate.url === entryUrl && !candidate.relay) return;
+      if (seen.has(key)) return;
       if (candidate.relay ? relay >= 8 : direct >= 16) return;
       seen.add(key);
       if (candidate.relay) relay++; else direct++;
@@ -245,6 +245,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
           active.delete(attempt);
           if (finished) return;
           lastError = error;
+          if (candidate.url === entryUrl && candidate.relay) add({ url: entryUrl, relay: false });
           pump();
         });
       }
@@ -255,7 +256,9 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     lookupPaths(entryUrl, target, lookup.signal).then(candidates => {
       looking = false;
       if (finished) return;
-      for (const candidate of candidates) add(candidate);
+      for (const candidate of candidates) {
+        if (candidate.url !== entryUrl || candidate.relay) add(candidate);
+      }
       pump();
     }, error => {
       looking = false;

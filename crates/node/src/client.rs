@@ -1086,7 +1086,8 @@ mod tests {
             client_endpoint("wss://node.test/custom/network")?,
             "wss://node.test/custom/network"
         );
-        for correct_target in [false, true] {
+        for (legacy, correct_target) in [(false, false), (false, true), (true, false), (true, true)]
+        {
             let destination = LocalIdentity::generate();
             let target = if correct_target {
                 destination.peer_id()?
@@ -1119,9 +1120,18 @@ mod tests {
                             .await?;
                         continue;
                     }
+                    if legacy && control["type"] == "dial" {
+                        assert_eq!(control["target"], expected_target);
+                        socket.close(None).await?;
+                        continue;
+                    }
                     assert_eq!(
                         control,
-                        json!({"type":"dial","target":expected_target,"service":"client"})
+                        if legacy {
+                            json!({"type":"direct","service":"client"})
+                        } else {
+                            json!({"type":"dial","target":expected_target,"service":"client"})
+                        }
                     );
                     socket
                         .send(NativeMessage::Text(
