@@ -387,8 +387,11 @@ impl Runtime {
             };
             let Ok(view) = state.project() else { continue };
             let network = view.network_id.clone();
-            if let Err(error) = self.refresh_own_address(&network).await {
-                tracing::debug!(%error, "address record refresh pending");
+            // A new path (say, the relay came up) reaches peers now, not at the next Hello.
+            match self.refresh_own_address(&network).await {
+                Ok(true) => self.wake_sync_all(),
+                Ok(false) => {}
+                Err(error) => tracing::debug!(%error, "address record refresh pending"),
             }
             let local = self.identity.device_id().unwrap_or_default();
             let now = Instant::now();
@@ -606,7 +609,8 @@ impl Runtime {
         }
     }
 
-    async fn refresh_own_address(&self, network: &str) -> Result<()> {
+    /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
+    async fn refresh_own_address(&self, network: &str) -> Result<bool> {
         let net = self.net()?;
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
@@ -625,7 +629,7 @@ impl Runtime {
             .as_ref()
             .is_some_and(|record| record.endpoint == endpoint && record.gateway_url == gateway_url)
         {
-            return Ok(());
+            return Ok(false);
         }
         let record = AddressRecord {
             version: 1,
@@ -646,7 +650,7 @@ impl Runtime {
             payload,
         };
         store.save_address(network, &record, &signed)?;
-        Ok(())
+        Ok(true)
     }
 
     async fn exchange_addresses(&self, network: &str, peer: &str) -> Result<()> {
@@ -672,6 +676,7 @@ impl Runtime {
     ) -> Result<()> {
         let view = self.membership_state().await?.project()?;
         let local = self.identity.device_id()?;
+        let mut learned = false;
         for signed in records.into_iter().take(MAX_ADDRESS_RECORDS) {
             let Ok(record) = signed.open(network) else {
                 continue;
@@ -687,6 +692,11 @@ impl Runtime {
             if changed && let Ok(net) = self.net() {
                 net.learn(&record.endpoint).await;
             }
+            learned |= changed;
+        }
+        // Pass news on so a Node that only reaches this one hears it before the next Hello.
+        if learned {
+            self.wake_sync_all();
         }
         Ok(())
     }
