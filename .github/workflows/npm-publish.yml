@@ -29,11 +29,12 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - name: Validate Nightly tag
+      - name: Validate matching Nightly tag and workflow ref
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
       - uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ inputs.tag }}
@@ -49,6 +50,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           source_commit="$(git rev-parse HEAD)"
+          [[ "$source_commit" == "$GITHUB_SHA" ]]
           git merge-base --is-ancestor "$source_commit" origin/main
           run_id="$(gh run list --workflow ci.yml --event push --commit "$source_commit" --limit 100 --json databaseId,headBranch,status,conclusion --jq '.[] | select(.headBranch == env.RELEASE_TAG and .status == "completed" and .conclusion == "success") | .databaseId' | head -n 1)"
           [[ "$run_id" =~ ^[0-9]+$ ]]

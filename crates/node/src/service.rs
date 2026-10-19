@@ -59,9 +59,11 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
             "npm installations are updated with npm install -g @leaperone/vibeface@nightly"
         );
         if matches!(action, Action::Install) {
-            drop(
-                config::lock_data_dir(data)
-                    .context("stop the node before installing its npm service")?,
+            let _idle = config::lock_data_dir(data)
+                .context("stop the node before installing its npm service")?;
+            ensure!(
+                !data.join("update-pending.json").exists(),
+                "recover the pending update with the previous managed installation before installing its npm service"
             );
         }
         executable
@@ -233,6 +235,14 @@ mod tests {
         assert!(command(&root, &data, &binary, Action::Install).is_err());
         assert!(command(&root, &data, &binary, Action::Stop).is_ok());
         drop(running);
+        let pending = data.join("update-pending.json");
+        std::fs::write(&pending, b"{}").unwrap();
+        let error = command(&root, &data, &binary, Action::Install).unwrap_err();
+        assert!(error.to_string().contains("recover the pending update"));
+        assert!(command(&root, &data, &binary, Action::Status).is_ok());
+        assert_eq!(std::fs::read(&pending).unwrap(), b"{}");
+        std::fs::remove_file(pending).unwrap();
+        assert!(command(&root, &data, &binary, Action::Install).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
