@@ -31,7 +31,7 @@ PR 使用 `merge-base(base, head)..head` 的完整差异。删除与重命名同
 
 `ci-gate` 始终执行，要求计划中的每个任务成功。必需任务失败、取消、缺失或意外跳过都会使 gate 失败。GitHub 仓库还需将 `ci-gate` 设为必需检查，并要求更新到最新 base 或使用 merge queue，才能强制阻止检查未通过的合并；`main` 或定时全量结果不能替代本次 PR 的合并前检查。
 
-版本 tag 必须与 Cargo 版本完全一致且已经进入 `main`。只有全量 gate 与三平台制品成功后才运行发布；SHA256、源提交、存储 epoch、资产清单和下载比对规则保留。
+推送版本 tag 才触发发布，手动全量检查只生成制品。版本 tag 必须与 Cargo 版本完全一致且已经进入 `main`。只有全量 gate 与三平台制品成功后才运行发布；SHA256、源提交、存储 epoch、资产清单和下载比对规则保留。
 
 Nightly 版本的 Ready Node PR 和全量场景还会将三个已验收的原生包组装成 npm 包，在三个平台安装并运行进程烟测。Web-only 和 Draft PR 不组装全平台 npm 包。`npm-package` 和 `npm-smoke` 属于相应计划的必需检查，Nightly tag 必须等这些检查通过才能发布。
 
