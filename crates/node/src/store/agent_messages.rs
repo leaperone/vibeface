@@ -1,24 +1,24 @@
 use super::*;
 use serde_json::json;
 
-fn event_from(connection: &Connection, network: &str, scope: &str, hash: &str) -> Result<Event> {
+fn event_from(connection: &Connection, cluster: &str, scope: &str, hash: &str) -> Result<Event> {
     let encoded: String = connection.query_row(
-        "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND hash=? AND status='ready'",
-        params![network, scope, hash], |row| row.get(0),
+        "SELECT envelope FROM events WHERE cluster_id=? AND scope_id=? AND hash=? AND status='ready'",
+        params![cluster, scope, hash], |row| row.get(0),
     ).optional()?.context("agent message reference is missing or incomplete")?;
     let envelope: SignedEvent = serde_json::from_str(&encoded)?;
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     let key: String = connection.query_row(
-        "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
-        params![network, event.author],
+        "SELECT public_key FROM node_certificates WHERE cluster_id=? AND peer_id=?",
+        params![cluster, event.author],
         |row| row.get(0),
     )?;
-    verify_signed_event(network, &envelope, &key)
+    verify_signed_event(cluster, &envelope, &key)
 }
 
 pub(super) fn validate_agent_trigger_from(
     connection: &Connection,
-    network: &str,
+    cluster: &str,
     event: &Event,
     message: &AgentMessage,
     target: &str,
@@ -29,13 +29,13 @@ pub(super) fn validate_agent_trigger_from(
     );
     authorize_node_from(
         connection,
-        network,
+        cluster,
         &event.author,
         Some(NodeRole::Scheduler),
     )?;
     let origin = event_from(
         connection,
-        network,
+        cluster,
         &event.scope_id,
         &message.origin_trigger,
     )?;
@@ -68,7 +68,7 @@ pub(super) fn validate_agent_trigger_from(
     );
     let task = event_from(
         connection,
-        network,
+        cluster,
         &event.scope_id,
         message
             .in_reply_to
@@ -90,18 +90,18 @@ pub(super) fn validate_agent_trigger_from(
 
 pub(super) fn result_consumed_by_parent(
     connection: &Connection,
-    network: &str,
+    cluster: &str,
     scope: &str,
     trigger: &str,
     target: &str,
 ) -> Result<bool> {
-    let event = event_from(connection, network, scope, trigger)?;
+    let event = event_from(connection, cluster, scope, trigger)?;
     let EventBody::AgentMessage { message } = event.body else {
         bail!("agent result trigger changed");
     };
     let parent: Option<SchedulerJob> = scheduler_load(
         connection,
-        network,
+        cluster,
         &scheduler_key("job", scope, target, &message.origin_trigger),
     )?;
     Ok(parent.is_some_and(|job| {
@@ -116,7 +116,7 @@ pub(super) fn result_consumed_by_parent(
 fn cancel_agent_task_from(
     connection: &Connection,
     identity: &LocalIdentity,
-    network: &str,
+    cluster: &str,
     scope: &str,
     task_ref: &str,
     source_node: &str,
@@ -124,7 +124,7 @@ fn cancel_agent_task_from(
     at: i64,
 ) -> Result<SchedulerJob> {
     let local = identity.peer_id()?;
-    let task = event_from(connection, network, scope, task_ref)?;
+    let task = event_from(connection, cluster, scope, task_ref)?;
     let EventBody::AgentMessage { message } = &task.body else {
         bail!("cancellation must reference an agent task");
     };
@@ -135,10 +135,10 @@ fn cancel_agent_task_from(
         "cancellation does not match the original source and target"
     );
     let key = scheduler_key("job", scope, &local, task_ref);
-    let newly_admitted = scheduler_load::<SchedulerJob>(connection, network, &key)?.is_none();
+    let newly_admitted = scheduler_load::<SchedulerJob>(connection, cluster, &key)?.is_none();
     admit_scheduler_from(
         connection,
-        network,
+        cluster,
         scope,
         task_ref,
         &local,
@@ -153,11 +153,11 @@ fn cancel_agent_task_from(
         },
     )?;
     let mut job: SchedulerJob =
-        scheduler_load(connection, network, &key)?.context("agent task admission is missing")?;
-    if scheduler_publication_from(connection, network, &job)?.is_some() {
+        scheduler_load(connection, cluster, &key)?.context("agent task admission is missing")?;
+    if scheduler_publication_from(connection, cluster, &job)?.is_some() {
         return Ok(job);
     }
-    let mut session = load_scheduler_session(connection, network, scope, &local)?;
+    let mut session = load_scheduler_session(connection, cluster, scope, &local)?;
     let terminal = match &job.state {
         JobState::Cancelled { attempt: None, .. } if newly_admitted => {
             Some(JobOutcome::Cancelled(evidence.into()))
@@ -186,10 +186,10 @@ fn cancel_agent_task_from(
         }
         _ => None,
     };
-    scheduler_save(connection, network, &key, &job)?;
-    save_scheduler_session(connection, network, &session)?;
+    scheduler_save(connection, cluster, &key, &job)?;
+    save_scheduler_session(connection, cluster, &session)?;
     if let Some(terminal) = terminal {
-        publish_agent_result_from(connection, identity, network, &job, &terminal, at)?;
+        publish_agent_result_from(connection, identity, cluster, &job, &terminal, at)?;
     }
     Ok(job)
 }
@@ -198,7 +198,7 @@ impl Store {
     pub(crate) fn admit_received_trigger(
         &mut self,
         identity: &LocalIdentity,
-        network: &str,
+        cluster: &str,
         scope: &str,
         trigger: &str,
         at: i64,
@@ -208,19 +208,19 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = scheduler_key("job", scope, &local, trigger);
-        if let Some(job) = scheduler_load::<SchedulerJob>(&tx, network, &key)? {
-            validated_scheduler_trigger(&tx, network, scope, trigger, &local)?;
-            return Ok(job.receipt(network));
+        if let Some(job) = scheduler_load::<SchedulerJob>(&tx, cluster, &key)? {
+            validated_scheduler_trigger(&tx, cluster, scope, trigger, &local)?;
+            return Ok(job.receipt(cluster));
         }
         let mut state = JobState::Queued;
         {
-            let event = event_from(&tx, network, scope, trigger)?;
+            let event = event_from(&tx, cluster, scope, trigger)?;
             if let EventBody::AgentMessage { message } = &event.body
                 && message.kind == AgentMessageKind::Task
-                && matches!(event_from(&tx, network, scope, &message.origin_trigger)?.body,
+                && matches!(event_from(&tx, cluster, scope, &message.origin_trigger)?.body,
                     EventBody::AgentMessage { message } if message.kind == AgentMessageKind::Task)
             {
-                let session = load_scheduler_session(&tx, network, scope, &local)?;
+                let session = load_scheduler_session(&tx, cluster, scope, &local)?;
                 for other in session
                     .active
                     .iter()
@@ -231,7 +231,7 @@ impl Store {
                         continue;
                     }
                     let job: SchedulerJob =
-                        scheduler_load(&tx, network, &scheduler_key("job", scope, &local, other))?
+                        scheduler_load(&tx, cluster, &scheduler_key("job", scope, &local, other))?
                             .context("scheduler task admission is missing")?;
                     if job.kind == TriggerKind::AgentTask
                         && matches!(
@@ -253,14 +253,14 @@ impl Store {
             }
         }
         let receipt =
-            admit_scheduler_from(&tx, network, scope, trigger, &local, &local, state.clone())?;
+            admit_scheduler_from(&tx, cluster, scope, trigger, &local, &local, state.clone())?;
         if let JobState::Cancelled { evidence, .. } = state {
-            let job: SchedulerJob = scheduler_load(&tx, network, &key)?
+            let job: SchedulerJob = scheduler_load(&tx, cluster, &key)?
                 .context("interrupted task admission is missing")?;
             publish_agent_result_from(
                 &tx,
                 identity,
-                network,
+                cluster,
                 &job,
                 &JobOutcome::Cancelled(evidence),
                 at,
@@ -273,7 +273,7 @@ impl Store {
     pub fn cancel_agent_task(
         &mut self,
         identity: &LocalIdentity,
-        network: &str,
+        cluster: &str,
         scope: &str,
         task_ref: &str,
         source_node: &str,
@@ -285,7 +285,7 @@ impl Store {
         let job = cancel_agent_task_from(
             &tx,
             identity,
-            network,
+            cluster,
             scope,
             task_ref,
             source_node,
@@ -303,7 +303,7 @@ impl Store {
     pub(crate) fn reconcile_native_job(
         &mut self,
         identity: &LocalIdentity,
-        network: &str,
+        cluster: &str,
         scope: &str,
         target: &str,
         trigger: &str,
@@ -325,7 +325,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = scheduler_key("job", scope, target, trigger);
         let mut job: SchedulerJob =
-            scheduler_load(&tx, network, &key)?.context("native job is missing")?;
+            scheduler_load(&tx, cluster, &key)?.context("native job is missing")?;
         ensure!(
             job.state
                 .attempt()
@@ -349,7 +349,7 @@ impl Store {
             } => attempt.clone(),
             _ => bail!("native reconciliation requires a fenced unknown attempt"),
         };
-        let mut session = load_scheduler_session(&tx, network, scope, target)?;
+        let mut session = load_scheduler_session(&tx, cluster, scope, target)?;
         ensure!(
             session
                 .active
@@ -363,11 +363,11 @@ impl Store {
         session.active = Some(trigger.into());
         session.unresolved.remove(trigger);
         validate_scheduler_terminal(&job, &outcome, &events)?;
-        scheduler_save(&tx, network, &key, &job)?;
-        save_scheduler_session(&tx, network, &session)?;
+        scheduler_save(&tx, cluster, &key, &job)?;
+        save_scheduler_session(&tx, cluster, &session)?;
         scheduler_save(
             &tx,
-            network,
+            cluster,
             &scheduler_key("publication", scope, target, trigger),
             &SchedulerTerminalPublication {
                 version: SCHEDULING_VERSION,
@@ -377,26 +377,26 @@ impl Store {
                 created_at_ms: at,
             },
         )?;
-        let publication = publish_scheduler_terminal_from(&tx, identity, network, &job)?;
+        let publication = publish_scheduler_terminal_from(&tx, identity, cluster, &job)?;
         tx.commit()?;
         Ok(publication)
     }
 
     pub fn agent_task_for_message(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
         message_id: &str,
     ) -> Result<Option<SignedEvent>> {
         let encoded: Option<String> = self.connection.query_row(
-            "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.message.message_id')=?",
-            params![network, scope, message_id], |row| row.get(0),
+            "SELECT envelope FROM events WHERE cluster_id=? AND scope_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.message.message_id')=?",
+            params![cluster, scope, message_id], |row| row.get(0),
         ).optional()?;
         optional_json(encoded)
     }
 
-    pub fn agent_task_status(&self, network: &str, scope: &str, task_ref: &str) -> Result<Value> {
-        let task = event_from(&self.connection, network, scope, task_ref)?;
+    pub fn agent_task_status(&self, cluster: &str, scope: &str, task_ref: &str) -> Result<Value> {
+        let task = event_from(&self.connection, cluster, scope, task_ref)?;
         let EventBody::AgentMessage { message } = &task.body else {
             bail!("task reference is not an agent message");
         };
@@ -405,7 +405,7 @@ impl Store {
             "task reference must select a task"
         );
         let result = self
-            .context(network, scope, &[])?
+            .context(cluster, scope, &[])?
             .events
             .into_iter()
             .find_map(|event| {
@@ -424,11 +424,11 @@ impl Store {
                     ))
                 .then_some(reply)
             });
-        let job = self.scheduler_job(network, scope, task_ref, &message.target_node)?;
+        let job = self.scheduler_job(cluster, scope, task_ref, &message.target_node)?;
         let local_state = job.as_ref().map(|job| job.state.name());
         let entry: Option<OutboxEntry> = scheduler_load(
             &self.connection,
-            network,
+            cluster,
             &scheduler_key("outbox", scope, &message.target_node, task_ref),
         )?;
         Ok(
@@ -444,7 +444,7 @@ impl Store {
     pub fn post_agent_task(
         &mut self,
         identity: &LocalIdentity,
-        network: &str,
+        cluster: &str,
         scope: &str,
         message: AgentMessage,
         attempt_id: &str,
@@ -461,7 +461,7 @@ impl Store {
         );
         let job: SchedulerJob = scheduler_load(
             &tx,
-            network,
+            cluster,
             &scheduler_key("job", scope, &source, &message.origin_trigger),
         )?
         .context("agent task requires an admitted source invocation")?;
@@ -471,7 +471,7 @@ impl Store {
         );
         let mut origin = message.origin_trigger.clone();
         while let EventBody::AgentMessage { message: ancestor } =
-            event_from(&tx, network, scope, &origin)?.body
+            event_from(&tx, cluster, scope, &origin)?.body
         {
             if ancestor.kind != AgentMessageKind::Task {
                 break;
@@ -486,8 +486,8 @@ impl Store {
             message: message.clone(),
         };
         let previous: Option<String> = tx.query_row(
-            "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.message.message_id')=?",
-            params![network, scope, message.message_id], |row| row.get(0),
+            "SELECT envelope FROM events WHERE cluster_id=? AND scope_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.message.message_id')=?",
+            params![cluster, scope, message.message_id], |row| row.get(0),
         ).optional()?;
         let envelope = if let Some(previous) = previous {
             let envelope: SignedEvent = serde_json::from_str(&previous)?;
@@ -498,11 +498,11 @@ impl Store {
             );
             envelope
         } else {
-            append_event_from(&tx, identity, network, scope, body, vec![], created_at_ms)?
+            append_event_from(&tx, identity, cluster, scope, body, vec![], created_at_ms)?
         };
         let receipt = admit_scheduler_from(
             &tx,
-            network,
+            cluster,
             scope,
             &envelope.hash,
             &source,
@@ -517,7 +517,7 @@ impl Store {
 pub(super) fn publish_agent_result_from(
     connection: &Connection,
     identity: &LocalIdentity,
-    network: &str,
+    cluster: &str,
     job: &SchedulerJob,
     outcome: &JobOutcome,
     created_at_ms: i64,
@@ -531,7 +531,7 @@ pub(super) fn publish_agent_result_from(
         JobOutcome::Cancelled(detail) => (AgentMessageKind::Interrupted, Some(detail.as_str())),
         JobOutcome::Unknown(_) => return Ok(None),
     };
-    let task = event_from(connection, network, &job.conversation_id, &job.trigger)?;
+    let task = event_from(connection, cluster, &job.conversation_id, &job.trigger)?;
     let EventBody::AgentMessage { message } = task.body else {
         bail!("agent task trigger changed");
     };
@@ -539,15 +539,15 @@ pub(super) fn publish_agent_result_from(
         detail.to_owned()
     } else {
         connection.query_row(
-            "SELECT text FROM messages WHERE network_id=? AND conversation_id=? AND message_id=?",
-            params![network, job.conversation_id, job.message_id],
+            "SELECT text FROM messages WHERE cluster_id=? AND conversation_id=? AND message_id=?",
+            params![cluster, job.conversation_id, job.message_id],
             |row| row.get(0),
         )?
     };
     let envelope = append_event_from(
         connection,
         identity,
-        network,
+        cluster,
         &job.conversation_id,
         EventBody::AgentMessage {
             message: AgentMessage {
@@ -564,7 +564,7 @@ pub(super) fn publish_agent_result_from(
     )?;
     admit_scheduler_from(
         connection,
-        network,
+        cluster,
         &job.conversation_id,
         &envelope.hash,
         &identity.peer_id()?,
@@ -585,21 +585,21 @@ mod tests {
     fn fixture() -> Result<(Store, LocalIdentity, LocalIdentity, String)> {
         let source = LocalIdentity::generate();
         let target = LocalIdentity::generate();
-        let network = source.fixture_network_id()?;
+        let cluster = source.fixture_cluster_id()?;
         let path = std::env::temp_dir()
             .join(format!("vibeface-agent-messages-{}", uuid::Uuid::new_v4()))
             .join("node.sqlite3");
         let mut store = Store::open(path)?;
         store.install_trust_bundle(
-            &network,
-            &source.sign_network_fixture(
+            &cluster,
+            &source.sign_cluster_fixture(
                 1,
                 vec![source.certificate(roles())?, target.certificate(roles())?],
             )?,
         )?;
         store.append_event(
             &source,
-            &network,
+            &cluster,
             "chat",
             EventBody::ConversationCreated {
                 title: "chat".into(),
@@ -607,7 +607,7 @@ mod tests {
             vec![],
             1,
         )?;
-        Ok((store, source, target, network))
+        Ok((store, source, target, cluster))
     }
 
     fn cleanup(store: Store) -> Result<()> {
@@ -621,23 +621,23 @@ mod tests {
         Ok(())
     }
 
-    fn start_next(store: &mut Store, network: &str, node: &str) -> Result<SchedulerJob> {
+    fn start_next(store: &mut Store, cluster: &str, node: &str) -> Result<SchedulerJob> {
         let claimed = store
-            .claim_next(network, "chat", node, "test-boot", "sdk")?
+            .claim_next(cluster, "chat", node, "test-boot", "sdk")?
             .context("scheduler job missing")?;
         let attempt = claimed.job.state.attempt().context("attempt missing")?;
-        store.mark_started(network, "chat", node, &claimed.job.trigger, &attempt.id)
+        store.mark_started(cluster, "chat", node, &claimed.job.trigger, &attempt.id)
     }
 
     fn start_human(
         store: &mut Store,
         identity: &LocalIdentity,
-        network: &str,
+        cluster: &str,
     ) -> Result<(SignedEvent, SchedulerJob)> {
         let node = identity.peer_id()?;
         let (event, receipt) = store.accept_message(
             identity,
-            network,
+            cluster,
             "chat",
             EventBody::MessagePosted {
                 message_id: "request".into(),
@@ -652,7 +652,7 @@ mod tests {
             true,
         )?;
         assert_eq!(receipt.state, "queued");
-        let job = start_next(store, network, &node)?;
+        let job = start_next(store, cluster, &node)?;
         assert_eq!(job.trigger, event.hash);
         Ok((event, job))
     }
@@ -680,9 +680,9 @@ mod tests {
         )]
     }
 
-    fn replies(store: &Store, network: &str, task: &SignedEvent) -> Result<Vec<Event>> {
+    fn replies(store: &Store, cluster: &str, task: &SignedEvent) -> Result<Vec<Event>> {
         Ok(store
-            .context(network, "chat", &[])?
+            .context(cluster, "chat", &[])?
             .events
             .into_iter()
             .filter(|event| {
@@ -692,19 +692,19 @@ mod tests {
             .collect())
     }
 
-    fn result_envelope(store: &Store, network: &str, task: &SignedEvent) -> Result<SignedEvent> {
+    fn result_envelope(store: &Store, cluster: &str, task: &SignedEvent) -> Result<SignedEvent> {
         store
-            .agent_task_for_message(network, "chat", &format!("agent-result-{}", task.hash))?
+            .agent_task_for_message(cluster, "chat", &format!("agent-result-{}", task.hash))?
             .context("agent result missing")
     }
 
     #[test]
     fn task_delegation_rejects_waiting_agent_ancestors() -> Result<()> {
-        let (mut store, source, target, network) = fixture()?;
+        let (mut store, source, target, cluster) = fixture()?;
         let child = LocalIdentity::generate();
         store.install_trust_bundle(
-            &network,
-            &source.sign_network_fixture(
+            &cluster,
+            &source.sign_cluster_fixture(
                 2,
                 vec![
                     source.certificate(roles())?,
@@ -713,24 +713,24 @@ mod tests {
                 ],
             )?,
         )?;
-        let (human, source_job) = start_human(&mut store, &source, &network)?;
+        let (human, source_job) = start_human(&mut store, &source, &cluster)?;
         let (parent, _) = store.post_agent_task(
             &source,
-            &network,
+            &cluster,
             "chat",
             task_message("parent", &target.peer_id()?, &human),
             &source_job.state.attempt().unwrap().id,
             3,
         )?;
         let target_id = target.peer_id()?;
-        store.admit_trigger(&network, "chat", &parent.hash, &target_id, &target_id)?;
-        let parent_job = start_next(&mut store, &network, &target_id)?;
-        let heads = store.context(&network, "chat", &[])?.heads;
+        store.admit_trigger(&cluster, "chat", &parent.hash, &target_id, &target_id)?;
+        let parent_job = start_next(&mut store, &cluster, &target_id)?;
+        let heads = store.context(&cluster, "chat", &[])?.heads;
         assert!(
             store
                 .post_agent_task(
                     &target,
-                    &network,
+                    &cluster,
                     "chat",
                     task_message("self", &target_id, &parent),
                     &parent_job.state.attempt().unwrap().id,
@@ -740,24 +740,24 @@ mod tests {
                 .to_string()
                 .contains("target agent is waiting")
         );
-        assert_eq!(store.context(&network, "chat", &[])?.heads, heads);
+        assert_eq!(store.context(&cluster, "chat", &[])?.heads, heads);
         let child_id = child.peer_id()?;
         let (nested, _) = store.post_agent_task(
             &target,
-            &network,
+            &cluster,
             "chat",
             task_message("nested", &child_id, &parent),
             &parent_job.state.attempt().unwrap().id,
             5,
         )?;
-        store.admit_trigger(&network, "chat", &nested.hash, &child_id, &child_id)?;
-        let child_job = start_next(&mut store, &network, &child_id)?;
-        let heads = store.context(&network, "chat", &[])?.heads;
+        store.admit_trigger(&cluster, "chat", &nested.hash, &child_id, &child_id)?;
+        let child_job = start_next(&mut store, &cluster, &child_id)?;
+        let heads = store.context(&cluster, "chat", &[])?.heads;
         assert!(
             store
                 .post_agent_task(
                     &child,
-                    &network,
+                    &cluster,
                     "chat",
                     task_message("cycle", &target_id, &nested),
                     &child_job.state.attempt().unwrap().id,
@@ -767,7 +767,7 @@ mod tests {
                 .to_string()
                 .contains("target agent is waiting")
         );
-        assert_eq!(store.context(&network, "chat", &[])?.heads, heads);
+        assert_eq!(store.context(&cluster, "chat", &[])?.heads, heads);
         cleanup(store)
     }
 
@@ -775,13 +775,13 @@ mod tests {
     fn parallel_agent_parents_interrupt_mutual_nested_deliveries_without_starting_them()
     -> Result<()> {
         for (unknown, saturated) in [(false, false), (true, false), (false, true)] {
-            let (mut store, source, b, network) = fixture()?;
+            let (mut store, source, b, cluster) = fixture()?;
             let c = LocalIdentity::generate();
             let b_id = b.peer_id()?;
             let c_id = c.peer_id()?;
             store.install_trust_bundle(
-                &network,
-                &source.sign_network_fixture(
+                &cluster,
+                &source.sign_cluster_fixture(
                     2,
                     vec![
                         source.certificate(roles())?,
@@ -790,7 +790,7 @@ mod tests {
                     ],
                 )?,
             )?;
-            let (human, source_job) = start_human(&mut store, &source, &network)?;
+            let (human, source_job) = start_human(&mut store, &source, &cluster)?;
             let source_attempt = &source_job
                 .state
                 .attempt()
@@ -798,7 +798,7 @@ mod tests {
                 .id;
             let (parent_b, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("parent-b", &b_id, &human),
                 source_attempt,
@@ -806,19 +806,19 @@ mod tests {
             )?;
             let (parent_c, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("parent-c", &c_id, &human),
                 source_attempt,
                 3,
             )?;
-            store.admit_received_trigger(&b, &network, "chat", &parent_b.hash, 4)?;
-            store.admit_received_trigger(&c, &network, "chat", &parent_c.hash, 4)?;
-            let running_b = start_next(&mut store, &network, &b_id)?;
-            let running_c = start_next(&mut store, &network, &c_id)?;
+            store.admit_received_trigger(&b, &cluster, "chat", &parent_b.hash, 4)?;
+            store.admit_received_trigger(&c, &cluster, "chat", &parent_c.hash, 4)?;
+            let running_b = start_next(&mut store, &cluster, &b_id)?;
+            let running_c = start_next(&mut store, &cluster, &c_id)?;
             let (nested_c, _) = store.post_agent_task(
                 &b,
-                &network,
+                &cluster,
                 "chat",
                 task_message("b-to-c", &c_id, &parent_b),
                 &running_b.state.attempt().context("B attempt missing")?.id,
@@ -826,7 +826,7 @@ mod tests {
             )?;
             let (nested_b, _) = store.post_agent_task(
                 &c,
-                &network,
+                &cluster,
                 "chat",
                 task_message("c-to-b", &b_id, &parent_c),
                 &running_c.state.attempt().context("C attempt missing")?.id,
@@ -836,7 +836,7 @@ mod tests {
                 let attempt = &running_c.state.attempt().context("C attempt missing")?.id;
                 store.finish_job(
                     &c,
-                    &network,
+                    &cluster,
                     "chat",
                     &c_id,
                     &parent_c.hash,
@@ -845,14 +845,14 @@ mod tests {
                     vec![],
                     6,
                 )?;
-                store.fence_manager_unknown(&network, "chat", &c_id, &parent_c.hash, attempt)?;
+                store.fence_manager_unknown(&cluster, "chat", &c_id, &parent_c.hash, attempt)?;
             }
             if saturated {
                 for (target, target_id) in [(&b, &b_id), (&c, &c_id)] {
                     for index in 0..MAX_PENDING_JOBS {
                         let queued = store.append_event(
                             &source,
-                            &network,
+                            &cluster,
                             "chat",
                             EventBody::AgentMessage {
                                 message: task_message(
@@ -866,13 +866,13 @@ mod tests {
                         )?;
                         assert_eq!(
                             store
-                                .admit_received_trigger(target, &network, "chat", &queued.hash, 6)?
+                                .admit_received_trigger(target, &cluster, "chat", &queued.hash, 6)?
                                 .state,
                             "queued"
                         );
                     }
                     assert_eq!(
-                        load_scheduler_session(&store.connection, &network, "chat", target_id)?
+                        load_scheduler_session(&store.connection, &cluster, "chat", target_id)?
                             .pending
                             .len(),
                         MAX_PENDING_JOBS
@@ -880,7 +880,7 @@ mod tests {
                 }
                 let (ordinary_human, _) = store.accept_message(
                     &source,
-                    &network,
+                    &cluster,
                     "chat",
                     EventBody::MessagePosted {
                         message_id: "full-human".into(),
@@ -896,7 +896,7 @@ mod tests {
                 )?;
                 let (ordinary_task, _) = store.post_agent_task(
                     &source,
-                    &network,
+                    &cluster,
                     "chat",
                     task_message("full-task", &c_id, &human),
                     source_attempt,
@@ -905,27 +905,27 @@ mod tests {
                 for trigger in [&ordinary_human.hash, &ordinary_task.hash] {
                     assert_eq!(
                         store
-                            .admit_received_trigger(&c, &network, "chat", trigger, 6)
+                            .admit_received_trigger(&c, &cluster, "chat", trigger, 6)
                             .unwrap_err()
                             .to_string(),
                         "scheduler inbox is full; trigger was not admitted"
                     );
                     assert!(
                         store
-                            .scheduler_job(&network, "chat", trigger, &c_id)?
+                            .scheduler_job(&cluster, "chat", trigger, &c_id)?
                             .is_none()
                     );
                 }
                 for (target, parent) in [(&b, &parent_b), (&c, &parent_c)] {
                     assert_eq!(
                         store
-                            .admit_received_trigger(target, &network, "chat", &parent.hash, 6)?
+                            .admit_received_trigger(target, &cluster, "chat", &parent.hash, 6)?
                             .state,
                         "running"
                     );
                 }
             }
-            let before_c = store.scheduler_job(&network, "chat", &parent_c.hash, &c_id)?;
+            let before_c = store.scheduler_job(&cluster, "chat", &parent_c.hash, &c_id)?;
             store.connection.execute_batch(
                 "CREATE TEMP TRIGGER reject_busy_result BEFORE INSERT ON events
                  WHEN json_extract(json_extract(NEW.envelope,'$.canonical_body'),'$.body.message.kind')='interrupted'
@@ -933,18 +933,18 @@ mod tests {
             )?;
             assert!(
                 store
-                    .admit_received_trigger(&c, &network, "chat", &nested_c.hash, 7)
+                    .admit_received_trigger(&c, &cluster, "chat", &nested_c.hash, 7)
                     .unwrap_err()
                     .to_string()
                     .contains("injected busy result failure")
             );
             assert!(
                 store
-                    .scheduler_job(&network, "chat", &nested_c.hash, &c_id)?
+                    .scheduler_job(&cluster, "chat", &nested_c.hash, &c_id)?
                     .is_none()
             );
             assert_eq!(
-                store.scheduler_job(&network, "chat", &parent_c.hash, &c_id)?,
+                store.scheduler_job(&cluster, "chat", &parent_c.hash, &c_id)?,
                 before_c
             );
             store
@@ -953,19 +953,19 @@ mod tests {
             for (target, task, source_id) in [(&c, &nested_c, &b_id), (&b, &nested_b, &c_id)] {
                 let target_id = target.peer_id()?;
                 let receipt =
-                    store.admit_received_trigger(target, &network, "chat", &task.hash, 7)?;
+                    store.admit_received_trigger(target, &cluster, "chat", &task.hash, 7)?;
                 assert_eq!(receipt.state, "cancelled");
                 assert_eq!(
-                    store.admit_received_trigger(target, &network, "chat", &task.hash, 8)?,
+                    store.admit_received_trigger(target, &cluster, "chat", &task.hash, 8)?,
                     receipt
                 );
-                assert_eq!(store.scheduler_job(&network, "chat", &task.hash, &target_id)?
+                assert_eq!(store.scheduler_job(&cluster, "chat", &task.hash, &target_id)?
                     .context("interrupted task missing")?.state,
                     JobState::Cancelled {
                         attempt: None,
                         evidence: "target agent is busy with another task in this conversation; nested task was not started".into(),
                     });
-                let results = replies(&store, &network, task)?;
+                let results = replies(&store, &cluster, task)?;
                 assert_eq!(results.len(), 1);
                 assert_eq!(results[0].author, target_id);
                 assert!(
@@ -976,12 +976,12 @@ mod tests {
                 );
                 assert!(
                     store
-                        .claim_next(&network, "chat", &target_id, "test-boot", "sdk")?
+                        .claim_next(&cluster, "chat", &target_id, "test-boot", "sdk")?
                         .is_none()
                 );
                 if saturated {
                     assert_eq!(
-                        load_scheduler_session(&store.connection, &network, "chat", &target_id)?
+                        load_scheduler_session(&store.connection, &cluster, "chat", &target_id)?
                             .pending
                             .len(),
                         MAX_PENDING_JOBS
@@ -989,11 +989,11 @@ mod tests {
                 }
             }
             assert_eq!(
-                store.scheduler_job(&network, "chat", &parent_b.hash, &b_id)?,
+                store.scheduler_job(&cluster, "chat", &parent_b.hash, &b_id)?,
                 Some(running_b)
             );
             assert_eq!(
-                store.scheduler_job(&network, "chat", &parent_c.hash, &c_id)?,
+                store.scheduler_job(&cluster, "chat", &parent_c.hash, &c_id)?,
                 before_c
             );
             cleanup(store)?;
@@ -1004,13 +1004,13 @@ mod tests {
     #[test]
     fn queued_parent_and_nested_admissions_serialize_without_a_wait_cycle() -> Result<()> {
         for order in ["parent-first", "nested-first", "concurrent"] {
-            let (mut store, source, b, network) = fixture()?;
+            let (mut store, source, b, cluster) = fixture()?;
             let c = LocalIdentity::generate();
             let b_id = b.peer_id()?;
             let c_id = c.peer_id()?;
             store.install_trust_bundle(
-                &network,
-                &source.sign_network_fixture(
+                &cluster,
+                &source.sign_cluster_fixture(
                     2,
                     vec![
                         source.certificate(roles())?,
@@ -1019,7 +1019,7 @@ mod tests {
                     ],
                 )?,
             )?;
-            let (human, source_job) = start_human(&mut store, &source, &network)?;
+            let (human, source_job) = start_human(&mut store, &source, &cluster)?;
             let source_attempt = &source_job
                 .state
                 .attempt()
@@ -1027,7 +1027,7 @@ mod tests {
                 .id;
             let (parent_b, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("parent-b", &b_id, &human),
                 source_attempt,
@@ -1035,17 +1035,17 @@ mod tests {
             )?;
             let (parent_c, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("parent-c", &c_id, &human),
                 source_attempt,
                 3,
             )?;
-            store.admit_received_trigger(&b, &network, "chat", &parent_b.hash, 4)?;
-            let running_b = start_next(&mut store, &network, &b_id)?;
+            store.admit_received_trigger(&b, &cluster, "chat", &parent_b.hash, 4)?;
+            let running_b = start_next(&mut store, &cluster, &b_id)?;
             let (nested, _) = store.post_agent_task(
                 &b,
-                &network,
+                &cluster,
                 "chat",
                 task_message("b-to-c", &c_id, &parent_b),
                 &running_b.state.attempt().context("B attempt missing")?.id,
@@ -1065,7 +1065,7 @@ mod tests {
                     }
                     let result = parent_store.admit_received_trigger(
                         &c,
-                        &network,
+                        &cluster,
                         "chat",
                         &parent_c.hash,
                         6,
@@ -1081,7 +1081,7 @@ mod tests {
                         committed.wait();
                     }
                     let result =
-                        nested_store.admit_received_trigger(&c, &network, "chat", &nested.hash, 6);
+                        nested_store.admit_received_trigger(&c, &cluster, "chat", &nested.hash, 6);
                     if order == "nested-first" {
                         committed.wait();
                     }
@@ -1101,10 +1101,10 @@ mod tests {
             assert_eq!(parent_receipt.state, "queued");
             let mut store = Store::open(&path)?;
             let parent = store
-                .scheduler_job(&network, "chat", &parent_c.hash, &c_id)?
+                .scheduler_job(&cluster, "chat", &parent_c.hash, &c_id)?
                 .context("queued parent missing")?;
             let child = store
-                .scheduler_job(&network, "chat", &nested.hash, &c_id)?
+                .scheduler_job(&cluster, "chat", &nested.hash, &c_id)?
                 .context("nested admission missing")?;
             assert_eq!(parent.state, JobState::Queued);
             if order == "parent-first" {
@@ -1114,10 +1114,10 @@ mod tests {
                 assert_eq!(nested_receipt.state, "queued");
             }
             assert_eq!(
-                store.admit_received_trigger(&c, &network, "chat", &nested.hash, 6)?,
+                store.admit_received_trigger(&c, &cluster, "chat", &nested.hash, 6)?,
                 nested_receipt
             );
-            let running = start_next(&mut store, &network, &c_id)?;
+            let running = start_next(&mut store, &cluster, &c_id)?;
             if nested_receipt.state == "cancelled" {
                 assert!(parent.sequence < child.sequence);
                 assert_eq!(running.trigger, parent_c.hash);
@@ -1125,7 +1125,7 @@ mod tests {
                     child.state,
                     JobState::Cancelled { attempt: None, .. }
                 ));
-                let results = replies(&store, &network, &nested)?;
+                let results = replies(&store, &cluster, &nested)?;
                 assert_eq!(results.len(), 1);
                 assert!(
                     matches!(&results[0].body, EventBody::AgentMessage { message }
@@ -1136,21 +1136,21 @@ mod tests {
                 assert!(child.sequence < parent.sequence);
                 assert_eq!(running.trigger, nested.hash);
                 assert_eq!(running.kind, TriggerKind::AgentTask);
-                assert!(replies(&store, &network, &nested)?.is_empty());
+                assert!(replies(&store, &cluster, &nested)?.is_empty());
                 assert_eq!(
                     store
-                        .admit_received_trigger(&c, &network, "chat", &nested.hash, 7)?
+                        .admit_received_trigger(&c, &cluster, "chat", &nested.hash, 7)?
                         .state,
                     "running"
                 );
                 assert_eq!(
-                    store.scheduler_job(&network, "chat", &nested.hash, &c_id)?,
+                    store.scheduler_job(&cluster, "chat", &nested.hash, &c_id)?,
                     Some(running.clone())
                 );
             }
             let (remote_human, _) = store.accept_message(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 EventBody::MessagePosted {
                     message_id: "remote-human".into(),
@@ -1166,13 +1166,13 @@ mod tests {
             )?;
             assert_eq!(
                 store
-                    .admit_received_trigger(&c, &network, "chat", &remote_human.hash, 8)?
+                    .admit_received_trigger(&c, &cluster, "chat", &remote_human.hash, 8)?
                     .state,
                 "queued"
             );
             let (ordinary, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("ordinary", &c_id, &human),
                 source_attempt,
@@ -1180,12 +1180,12 @@ mod tests {
             )?;
             assert_eq!(
                 store
-                    .admit_received_trigger(&c, &network, "chat", &ordinary.hash, 9)?
+                    .admit_received_trigger(&c, &cluster, "chat", &ordinary.hash, 9)?
                     .state,
                 "queued"
             );
             assert_eq!(
-                store.scheduler_job(&network, "chat", &running.trigger, &c_id)?,
+                store.scheduler_job(&cluster, "chat", &running.trigger, &c_id)?,
                 Some(running)
             );
             cleanup(store)?;
@@ -1195,16 +1195,16 @@ mod tests {
 
     #[test]
     fn stable_task_ids_reject_changed_content_or_target() -> Result<()> {
-        let (mut store, source, target, network) = fixture()?;
+        let (mut store, source, target, cluster) = fixture()?;
         let source_node = source.peer_id()?;
         let target_node = target.peer_id()?;
-        let (origin, human) = start_human(&mut store, &source, &network)?;
+        let (origin, human) = start_human(&mut store, &source, &cluster)?;
         let attempt = &human.state.attempt().context("human attempt missing")?.id;
         let message = task_message("stable-task", &target_node, &origin);
         let first =
-            store.post_agent_task(&source, &network, "chat", message.clone(), attempt, 3)?;
+            store.post_agent_task(&source, &cluster, "chat", message.clone(), attempt, 3)?;
         let repeated =
-            store.post_agent_task(&source, &network, "chat", message.clone(), attempt, 4)?;
+            store.post_agent_task(&source, &cluster, "chat", message.clone(), attempt, 4)?;
         assert_eq!(repeated, first);
         assert_eq!(first.1.state, "pending_delivery");
         for changed in [
@@ -1219,43 +1219,43 @@ mod tests {
         ] {
             assert!(
                 store
-                    .post_agent_task(&source, &network, "chat", changed, attempt, 5)
+                    .post_agent_task(&source, &cluster, "chat", changed, attempt, 5)
                     .unwrap_err()
                     .to_string()
                     .contains("agent message ID reused")
             );
         }
-        assert_eq!(store.scheduler_outbox_all(&network)?.len(), 1);
+        assert_eq!(store.scheduler_outbox_all(&cluster)?.len(), 1);
         assert_eq!(
-            store.agent_task_for_message(&network, "chat", "stable-task")?,
+            store.agent_task_for_message(&cluster, "chat", "stable-task")?,
             Some(first.0.clone())
         );
         assert_eq!(
-            store.verify_event(&network, &first.0)?.body,
+            store.verify_event(&cluster, &first.0)?.body,
             EventBody::AgentMessage { message }
         );
         assert_eq!(
-            store.agent_task_status(&network, "chat", &first.0.hash)?["state"],
+            store.agent_task_status(&cluster, "chat", &first.0.hash)?["state"],
             "pending_delivery"
         );
         assert!(
             store
-                .scheduler_job(&network, "chat", &first.0.hash, &target_node)?
+                .scheduler_job(&cluster, "chat", &first.0.hash, &target_node)?
                 .is_none()
         );
         assert_eq!(
-            store.scheduler_jobs(&network, "chat", &source_node)?.len(),
+            store.scheduler_jobs(&cluster, "chat", &source_node)?.len(),
             1
         );
         let receipt =
-            store.admit_trigger(&network, "chat", &first.0.hash, &target_node, &target_node)?;
+            store.admit_trigger(&cluster, "chat", &first.0.hash, &target_node, &target_node)?;
         assert_eq!(receipt.state, "queued");
         assert_eq!(
-            store.admit_trigger(&network, "chat", &first.0.hash, &target_node, &target_node)?,
+            store.admit_trigger(&cluster, "chat", &first.0.hash, &target_node, &target_node)?,
             receipt
         );
         assert_eq!(
-            store.scheduler_jobs(&network, "chat", &target_node)?.len(),
+            store.scheduler_jobs(&cluster, "chat", &target_node)?.len(),
             1
         );
         cleanup(store)
@@ -1283,27 +1283,27 @@ mod tests {
                 "stopped work",
             ),
         ] {
-            let (mut store, source, target, network) = fixture()?;
+            let (mut store, source, target, cluster) = fixture()?;
             let source_node = source.peer_id()?;
             let target_node = target.peer_id()?;
-            let (origin, human) = start_human(&mut store, &source, &network)?;
+            let (origin, human) = start_human(&mut store, &source, &cluster)?;
             let attempt = &human.state.attempt().context("human attempt missing")?.id;
             let (task, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("task", &target_node, &origin),
                 attempt,
                 3,
             )?;
-            store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?;
-            let running = start_next(&mut store, &network, &target_node)?;
+            store.admit_trigger(&cluster, "chat", &task.hash, &target_node, &target_node)?;
+            let running = start_next(&mut store, &cluster, &target_node)?;
             assert_eq!(running.kind, TriggerKind::AgentTask);
             let target_attempt = running.state.attempt().context("target attempt missing")?;
             assert!(!target_attempt.read_only);
             if matches!(&outcome, JobOutcome::Cancelled(_)) {
                 let cancelling = store
-                    .cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 4)?
+                    .cancel_agent_task(&target, &cluster, "chat", &task.hash, &source_node, 4)?
                     .context("cancelled task missing")?;
                 assert!(matches!(cancelling.state, JobState::Cancelling { .. }));
             }
@@ -1314,7 +1314,7 @@ mod tests {
             };
             let terminal = store.finish_job(
                 &target,
-                &network,
+                &cluster,
                 "chat",
                 &target_node,
                 &task.hash,
@@ -1326,7 +1326,7 @@ mod tests {
             assert_eq!(
                 store.finish_job(
                     &target,
-                    &network,
+                    &cluster,
                     "chat",
                     &target_node,
                     &task.hash,
@@ -1337,7 +1337,7 @@ mod tests {
                 )?,
                 terminal
             );
-            let results = replies(&store, &network, &task)?;
+            let results = replies(&store, &cluster, &task)?;
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].author, target_node);
             let expected = AgentMessage {
@@ -1356,7 +1356,7 @@ mod tests {
             );
             assert!(results[0].parents.contains(&origin.hash));
             assert!(results[0].parents.contains(&task.hash));
-            let status = store.agent_task_status(&network, "chat", &task.hash)?;
+            let status = store.agent_task_status(&cluster, "chat", &task.hash)?;
             assert_eq!(status["state"], state);
             assert_eq!(status["result"], serde_json::to_value(expected)?);
             cleanup(store)?;
@@ -1367,13 +1367,13 @@ mod tests {
     #[test]
     fn same_node_task_terminals_preserve_the_pending_result_report() -> Result<()> {
         for cancelled in [false, true] {
-            let (mut store, source, _target, network) = fixture()?;
+            let (mut store, source, _target, cluster) = fixture()?;
             let node = source.peer_id()?;
-            let (origin, human) = start_human(&mut store, &source, &network)?;
+            let (origin, human) = start_human(&mut store, &source, &cluster)?;
             let human_attempt = &human.state.attempt().context("human attempt missing")?.id;
             let (task, receipt) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("local-task", &node, &origin),
                 human_attempt,
@@ -1381,17 +1381,17 @@ mod tests {
             )?;
             assert_eq!(receipt.state, "queued");
             assert_eq!(
-                store.admit_received_trigger(&source, &network, "chat", &task.hash, 3)?,
+                store.admit_received_trigger(&source, &cluster, "chat", &task.hash, 3)?,
                 receipt
             );
             assert!(
                 store
-                    .claim_next(&network, "chat", &node, "test-boot", "sdk")?
+                    .claim_next(&cluster, "chat", &node, "test-boot", "sdk")?
                     .is_none()
             );
             store.finish_job(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 &node,
                 &origin.hash,
@@ -1402,7 +1402,7 @@ mod tests {
             )?;
             let kind = if cancelled {
                 let terminal = store
-                    .cancel_agent_task(&source, &network, "chat", &task.hash, &node, 5)?
+                    .cancel_agent_task(&source, &cluster, "chat", &task.hash, &node, 5)?
                     .context("cancelled task missing")?;
                 assert!(matches!(
                     terminal.state,
@@ -1410,12 +1410,12 @@ mod tests {
                 ));
                 AgentMessageKind::Interrupted
             } else {
-                let running = start_next(&mut store, &network, &node)?;
+                let running = start_next(&mut store, &cluster, &node)?;
                 assert_eq!(running.trigger, task.hash);
                 assert_eq!(running.kind, TriggerKind::AgentTask);
                 store.finish_job(
                     &source,
-                    &network,
+                    &cluster,
                     "chat",
                     &node,
                     &task.hash,
@@ -1426,8 +1426,8 @@ mod tests {
                 )?;
                 AgentMessageKind::Completed
             };
-            let result = result_envelope(&store, &network, &task)?;
-            let result_event = store.verify_event(&network, &result)?;
+            let result = result_envelope(&store, &cluster, &task)?;
+            let result_event = store.verify_event(&cluster, &result)?;
             assert_eq!(result_event.author, node);
             assert!(
                 matches!(result_event.body, EventBody::AgentMessage { message }
@@ -1438,22 +1438,22 @@ mod tests {
             let path = store.path.clone();
             drop(store);
             let mut store = Store::open(path)?;
-            let session = load_scheduler_session(&store.connection, &network, "chat", &node)?;
+            let session = load_scheduler_session(&store.connection, &cluster, "chat", &node)?;
             assert_eq!(session.pending, vec![result.hash.clone()]);
             assert_eq!(session.active, None);
-            let report = start_next(&mut store, &network, &node)?;
+            let report = start_next(&mut store, &cluster, &node)?;
             assert_eq!(report.trigger, result.hash);
             assert_eq!(report.kind, TriggerKind::AgentResult);
             let report_attempt = report.state.attempt().context("report attempt missing")?;
             assert!(report_attempt.read_only);
             assert!(
                 store
-                    .claim_next(&network, "chat", &node, "test-boot", "sdk")?
+                    .claim_next(&cluster, "chat", &node, "test-boot", "sdk")?
                     .is_none()
             );
             store.finish_job(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 &node,
                 &result.hash,
@@ -1464,16 +1464,16 @@ mod tests {
             )?;
             assert_eq!(
                 store
-                    .admit_trigger(&network, "chat", &result.hash, &node, &node)?
+                    .admit_trigger(&cluster, "chat", &result.hash, &node, &node)?
                     .state,
                 "completed"
             );
             assert!(
                 store
-                    .claim_next(&network, "chat", &node, "test-boot", "sdk")?
+                    .claim_next(&cluster, "chat", &node, "test-boot", "sdk")?
                     .is_none()
             );
-            assert_eq!(replies(&store, &network, &task)?.len(), 1);
+            assert_eq!(replies(&store, &cluster, &task)?.len(), 1);
             cleanup(store)?;
         }
         Ok(())
@@ -1482,14 +1482,14 @@ mod tests {
     #[test]
     fn cancellation_before_delivery_survives_late_admission_without_starting() -> Result<()> {
         for saturated in [false, true] {
-            let (mut store, source, target, network) = fixture()?;
+            let (mut store, source, target, cluster) = fixture()?;
             let source_node = source.peer_id()?;
             let target_node = target.peer_id()?;
-            let (origin, human) = start_human(&mut store, &source, &network)?;
+            let (origin, human) = start_human(&mut store, &source, &cluster)?;
             let attempt = &human.state.attempt().context("human attempt missing")?.id;
             let (task, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("task", &target_node, &origin),
                 attempt,
@@ -1499,7 +1499,7 @@ mod tests {
                 for index in 0..MAX_PENDING_JOBS {
                     let queued = store.append_event(
                         &source,
-                        &network,
+                        &cluster,
                         "chat",
                         EventBody::AgentMessage {
                             message: task_message(
@@ -1513,27 +1513,27 @@ mod tests {
                     )?;
                     assert_eq!(
                         store
-                            .admit_received_trigger(&target, &network, "chat", &queued.hash, 3)?
+                            .admit_received_trigger(&target, &cluster, "chat", &queued.hash, 3)?
                             .state,
                         "queued"
                     );
                 }
             }
             let pending =
-                load_scheduler_session(&store.connection, &network, "chat", &target_node)?.pending;
+                load_scheduler_session(&store.connection, &cluster, "chat", &target_node)?.pending;
             assert_eq!(pending.len(), if saturated { MAX_PENDING_JOBS } else { 0 });
             assert!(
                 store
-                    .cancel_agent_task(&target, &network, "chat", &task.hash, &target_node, 4)
+                    .cancel_agent_task(&target, &cluster, "chat", &task.hash, &target_node, 4)
                     .is_err()
             );
             assert!(
                 store
-                    .scheduler_job(&network, "chat", &task.hash, &target_node)?
+                    .scheduler_job(&cluster, "chat", &task.hash, &target_node)?
                     .is_none()
             );
             let cancelled = store
-                .cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 4)?
+                .cancel_agent_task(&target, &cluster, "chat", &task.hash, &source_node, 4)?
                 .context("cancelled task missing")?;
             assert_eq!(
                 cancelled.state,
@@ -1543,28 +1543,28 @@ mod tests {
                 }
             );
             assert_eq!(
-                store.cancel_agent_task(&target, &network, "chat", &task.hash, &source_node, 5,)?,
+                store.cancel_agent_task(&target, &cluster, "chat", &task.hash, &source_node, 5,)?,
                 Some(cancelled)
             );
             assert_eq!(
-                load_scheduler_session(&store.connection, &network, "chat", &target_node)?.pending,
+                load_scheduler_session(&store.connection, &cluster, "chat", &target_node)?.pending,
                 pending
             );
             let path = store.path.clone();
             drop(store);
             let mut store = Store::open(path)?;
             let receipt =
-                store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?;
+                store.admit_trigger(&cluster, "chat", &task.hash, &target_node, &target_node)?;
             assert_eq!(receipt.state, "cancelled");
             assert_eq!(
-                store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?,
+                store.admit_trigger(&cluster, "chat", &task.hash, &target_node, &target_node)?,
                 receipt
             );
             assert_eq!(
-                load_scheduler_session(&store.connection, &network, "chat", &target_node)?.pending,
+                load_scheduler_session(&store.connection, &cluster, "chat", &target_node)?.pending,
                 pending
             );
-            let claimed = store.claim_next(&network, "chat", &target_node, "restarted", "sdk")?;
+            let claimed = store.claim_next(&cluster, "chat", &target_node, "restarted", "sdk")?;
             if let Some(first) = pending.first() {
                 assert_eq!(
                     &claimed.context("original queued task missing")?.job.trigger,
@@ -1573,7 +1573,7 @@ mod tests {
             } else {
                 assert!(claimed.is_none());
             }
-            let results = replies(&store, &network, &task)?;
+            let results = replies(&store, &cluster, &task)?;
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].author, target_node);
             assert!(
@@ -1582,12 +1582,12 @@ mod tests {
                     && message.target_node == source_node && message.origin_trigger == origin.hash)
             );
             assert_eq!(
-                store.agent_task_status(&network, "chat", &task.hash)?["state"],
+                store.agent_task_status(&cluster, "chat", &task.hash)?["state"],
                 "interrupted"
             );
             assert!(
                 store
-                    .scheduler_job(&network, "chat", &task.hash, &target_node)?
+                    .scheduler_job(&cluster, "chat", &task.hash, &target_node)?
                     .context("cancelled admission missing")?
                     .state
                     .attempt()
@@ -1600,20 +1600,20 @@ mod tests {
 
     #[test]
     fn native_reconciliation_requires_the_exact_fenced_unknown_and_never_replays() -> Result<()> {
-        let (mut store, source, target, network) = fixture()?;
+        let (mut store, source, target, cluster) = fixture()?;
         let target_node = target.peer_id()?;
-        let (origin, human) = start_human(&mut store, &source, &network)?;
+        let (origin, human) = start_human(&mut store, &source, &cluster)?;
         let attempt = &human.state.attempt().context("human attempt missing")?.id;
         let (task, _) = store.post_agent_task(
             &source,
-            &network,
+            &cluster,
             "chat",
             task_message("task", &target_node, &origin),
             attempt,
             3,
         )?;
-        store.admit_trigger(&network, "chat", &task.hash, &target_node, &target_node)?;
-        let running = start_next(&mut store, &network, &target_node)?;
+        store.admit_trigger(&cluster, "chat", &task.hash, &target_node, &target_node)?;
+        let running = start_next(&mut store, &cluster, &target_node)?;
         let target_attempt = &running
             .state
             .attempt()
@@ -1623,7 +1623,7 @@ mod tests {
             store
                 .reconcile_native_job(
                     &target,
-                    &network,
+                    &cluster,
                     "chat",
                     &target_node,
                     &task.hash,
@@ -1636,7 +1636,7 @@ mod tests {
         );
         let unknown = store.finish_job(
             &target,
-            &network,
+            &cluster,
             "chat",
             &target_node,
             &task.hash,
@@ -1653,7 +1653,7 @@ mod tests {
             store
                 .reconcile_native_job(
                     &target,
-                    &network,
+                    &cluster,
                     "chat",
                     &target_node,
                     &task.hash,
@@ -1664,13 +1664,13 @@ mod tests {
                 )
                 .is_err()
         );
-        store.fence_manager_unknown(&network, "chat", &target_node, &task.hash, target_attempt)?;
+        store.fence_manager_unknown(&cluster, "chat", &target_node, &task.hash, target_attempt)?;
         let path = store.path.clone();
         drop(store);
         let mut store = Store::open(path)?;
         assert!(
             store
-                .claim_next(&network, "chat", &target_node, "restarted", "sdk")?
+                .claim_next(&cluster, "chat", &target_node, "restarted", "sdk")?
                 .is_none()
         );
         for (identity, attempt, outcome) in [
@@ -1686,7 +1686,7 @@ mod tests {
                 store
                     .reconcile_native_job(
                         identity,
-                        &network,
+                        &cluster,
                         "chat",
                         &target_node,
                         &task.hash,
@@ -1700,7 +1700,7 @@ mod tests {
         }
         let publication = store.reconcile_native_job(
             &target,
-            &network,
+            &cluster,
             "chat",
             &target_node,
             &task.hash,
@@ -1717,12 +1717,12 @@ mod tests {
             .context("completed attempt missing")?;
         assert_eq!(&completed_attempt.id, target_attempt);
         assert!(completed_attempt.read_only);
-        let result = result_envelope(&store, &network, &task)?;
+        let result = result_envelope(&store, &cluster, &task)?;
         assert!(publication.event_hashes.contains(&result.hash));
-        let before = store.messages(&network, "chat")?;
+        let before = store.messages(&cluster, "chat")?;
         let repeated = store.reconcile_native_job(
             &target,
-            &network,
+            &cluster,
             "chat",
             &target_node,
             &task.hash,
@@ -1733,8 +1733,8 @@ mod tests {
         )?;
         assert_eq!(repeated.job, publication.job);
         assert!(repeated.event_hashes.is_empty());
-        assert_eq!(store.messages(&network, "chat")?, before);
-        let results = replies(&store, &network, &task)?;
+        assert_eq!(store.messages(&cluster, "chat")?, before);
+        let results = replies(&store, &cluster, &task)?;
         assert_eq!(results.len(), 1);
         assert!(
             matches!(&results[0].body, EventBody::AgentMessage { message }
@@ -1743,7 +1743,7 @@ mod tests {
         );
         assert!(
             store
-                .claim_next(&network, "chat", &target_node, "restarted", "sdk")?
+                .claim_next(&cluster, "chat", &target_node, "restarted", "sdk")?
                 .is_none()
         );
         cleanup(store)
@@ -1758,14 +1758,14 @@ mod tests {
         ] {
             let completed = matches!(&outcome, JobOutcome::Completed);
             let unknown = matches!(&outcome, JobOutcome::Unknown(_));
-            let (mut store, source, parent, network) = fixture()?;
+            let (mut store, source, parent, cluster) = fixture()?;
             let child = LocalIdentity::generate();
             let source_node = source.peer_id()?;
             let parent_node = parent.peer_id()?;
             let child_node = child.peer_id()?;
             store.install_trust_bundle(
-                &network,
-                &source.sign_network_fixture(
+                &cluster,
+                &source.sign_cluster_fixture(
                     2,
                     vec![
                         source.certificate(roles())?,
@@ -1774,24 +1774,24 @@ mod tests {
                     ],
                 )?,
             )?;
-            let (origin, human) = start_human(&mut store, &source, &network)?;
+            let (origin, human) = start_human(&mut store, &source, &cluster)?;
             let human_attempt = &human.state.attempt().context("human attempt missing")?.id;
             let (parent_task, _) = store.post_agent_task(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 task_message("parent", &parent_node, &origin),
                 human_attempt,
                 3,
             )?;
             store.admit_trigger(
-                &network,
+                &cluster,
                 "chat",
                 &parent_task.hash,
                 &parent_node,
                 &parent_node,
             )?;
-            let parent_job = start_next(&mut store, &network, &parent_node)?;
+            let parent_job = start_next(&mut store, &cluster, &parent_node)?;
             let parent_attempt = &parent_job
                 .state
                 .attempt()
@@ -1799,14 +1799,14 @@ mod tests {
                 .id;
             let (child_task, _) = store.post_agent_task(
                 &parent,
-                &network,
+                &cluster,
                 "chat",
                 task_message("child", &child_node, &parent_task),
                 parent_attempt,
                 4,
             )?;
-            store.admit_trigger(&network, "chat", &child_task.hash, &child_node, &child_node)?;
-            let child_job = start_next(&mut store, &network, &child_node)?;
+            store.admit_trigger(&cluster, "chat", &child_task.hash, &child_node, &child_node)?;
+            let child_job = start_next(&mut store, &cluster, &child_node)?;
             let child_attempt = &child_job
                 .state
                 .attempt()
@@ -1814,7 +1814,7 @@ mod tests {
                 .id;
             store.finish_job(
                 &source,
-                &network,
+                &cluster,
                 "chat",
                 &source_node,
                 &origin.hash,
@@ -1825,7 +1825,7 @@ mod tests {
             )?;
             store.finish_job(
                 &child,
-                &network,
+                &cluster,
                 "chat",
                 &child_node,
                 &child_task.hash,
@@ -1834,9 +1834,9 @@ mod tests {
                 final_reply(&child_job, "child result"),
                 6,
             )?;
-            let child_result = result_envelope(&store, &network, &child_task)?;
+            let child_result = result_envelope(&store, &cluster, &child_task)?;
             store.admit_trigger(
-                &network,
+                &cluster,
                 "chat",
                 &child_result.hash,
                 &parent_node,
@@ -1849,7 +1849,7 @@ mod tests {
             };
             store.finish_job(
                 &parent,
-                &network,
+                &cluster,
                 "chat",
                 &parent_node,
                 &parent_task.hash,
@@ -1860,19 +1860,19 @@ mod tests {
             )?;
             if unknown {
                 store.fence_manager_unknown(
-                    &network,
+                    &cluster,
                     "chat",
                     &parent_node,
                     &parent_task.hash,
                     parent_attempt,
                 )?;
             }
-            let report = store.claim_next(&network, "chat", &parent_node, "test-boot", "sdk")?;
+            let report = store.claim_next(&cluster, "chat", &parent_node, "test-boot", "sdk")?;
             if completed {
                 assert!(report.is_none());
                 assert_eq!(
                     store
-                        .scheduler_job(&network, "chat", &child_result.hash, &parent_node)?
+                        .scheduler_job(&cluster, "chat", &child_result.hash, &parent_node)?
                         .context("child result admission missing")?
                         .state,
                     JobState::Cancelled {
@@ -1895,33 +1895,33 @@ mod tests {
                 );
             }
             assert_eq!(
-                store.event(&network, &child_task.hash)?,
+                store.event(&cluster, &child_task.hash)?,
                 Some(child_task.clone())
             );
             assert!(matches!(
                 store
-                    .scheduler_job(&network, "chat", &child_task.hash, &child_node)?
+                    .scheduler_job(&cluster, "chat", &child_task.hash, &child_node)?
                     .context("child task missing")?
                     .state,
                 JobState::Completed { .. }
             ));
-            let child_replies = replies(&store, &network, &child_task)?;
+            let child_replies = replies(&store, &cluster, &child_task)?;
             assert_eq!(child_replies.len(), 1);
             assert!(
                 matches!(&child_replies[0].body, EventBody::AgentMessage { message }
                 if message.kind == AgentMessageKind::Completed && message.text == "child result")
             );
             if !unknown {
-                let parent_result = result_envelope(&store, &network, &parent_task)?;
+                let parent_result = result_envelope(&store, &cluster, &parent_task)?;
                 store.admit_trigger(
-                    &network,
+                    &cluster,
                     "chat",
                     &parent_result.hash,
                     &source_node,
                     &source_node,
                 )?;
                 let report = store
-                    .claim_next(&network, "chat", &source_node, "test-boot", "sdk")?
+                    .claim_next(&cluster, "chat", &source_node, "test-boot", "sdk")?
                     .context("human source result was incorrectly suppressed")?;
                 assert_eq!(report.job.trigger, parent_result.hash);
                 assert_eq!(report.job.kind, TriggerKind::AgentResult);

@@ -3,8 +3,8 @@
 use crate::{
     crypto::{self, LocalIdentity},
     identity::{
-        self, AuthorizationView, Genesis, GovernanceAction, GovernanceEvent, HistoricalNode,
-        IdentityKind, Member, NetworkState, RootCheckpoint,
+        self, AuthorizationView, ClusterState, Genesis, GovernanceAction, GovernanceEvent,
+        HistoricalNode, IdentityKind, Member, RootCheckpoint,
         local::{InviteEnvelope, InviteRequest, PairConfirm, PairRequest},
     },
     network::{NetworkSocket, Service},
@@ -46,7 +46,7 @@ struct Response {
 #[derive(Clone, Serialize)]
 struct RecoveryChallenge {
     challenge_id: String,
-    network_id: String,
+    cluster_id: String,
     owner_public_key: String,
     subject_id: String,
 
@@ -59,7 +59,7 @@ struct Recovery {
     challenge: RecoveryChallenge,
     genesis: Genesis,
     authorized: bool,
-    state: Option<NetworkState>,
+    state: Option<ClusterState>,
     prepared: Option<RootCheckpoint>,
     authorized_until_ms: Option<i64>,
     minimum_epoch: u64,
@@ -81,7 +81,7 @@ enum SessionSource {
 #[derive(Serialize)]
 struct BrowserPrincipal {
     source: &'static str,
-    network_id: String,
+    cluster_id: String,
     subject_id: String,
     epoch: u64,
     can_manage: bool,
@@ -206,7 +206,7 @@ async fn serve_session(
         } else {
             let local =
                 node.local_access
-                    .session(&cookie, &node.identity.peer_id()?, &view.network_id)?;
+                    .session(&cookie, &node.identity.peer_id()?, &view.cluster_id)?;
             ensure!(
                 local.subject_id == subject_id && local.public_key == public_key,
                 "local browser cookie is bound to another Noise identity"
@@ -258,7 +258,7 @@ async fn serve_session(
             event = events.recv(), if session.subscribed => {
                 let principal = current_principal(&node, &session).await?;
                 match event {
-                    Ok(event) if event.network_id == principal.network_id => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":event.payload})).await?,
+                    Ok(event) if event.cluster_id == principal.cluster_id => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":event.payload})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {},
@@ -291,7 +291,7 @@ async fn dispatch(
                 method,
                 "info" | "authenticate" | "directory" | "subscribe" | "rpc" | "local_access"
             ),
-            "local browser access cannot manage personal-network membership"
+            "local browser access cannot manage cluster membership"
         );
         current_principal(node, session).await?;
     }
@@ -316,13 +316,13 @@ async fn dispatch(
         ),
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
-            if let Some(network) = params
-                .get("network_id")
+            if let Some(cluster) = params
+                .get("cluster_id")
                 .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
             {
                 ensure!(
-                    network == &authenticated["principal"]["network_id"],
-                    "client requested another personal network"
+                    cluster == &authenticated["principal"]["cluster_id"],
+                    "client requested another cluster"
                 );
             }
             Ok(authenticated)
@@ -345,7 +345,7 @@ async fn dispatch(
                 .then(|| params["conversation_id"].as_str().map(String::from))
                 .flatten();
             let access = Access {
-                network_id: principal.network_id,
+                cluster_id: principal.cluster_id,
                 human: true,
                 conversation_id: None,
                 manager: None,
@@ -379,12 +379,9 @@ async fn dispatch(
             Ok(json!({"enabled":node.local_access.enabled()}))
         }
         "prepare_genesis" => {
-            ensure!(
-                !node.has_membership().await?,
-                "personal network already initialized"
-            );
+            ensure!(!node.has_membership().await?, "cluster already initialized");
             let owner_public_key = text(&params, "owner_public_key")?.to_owned();
-            let network_id = crypto::fingerprint(&owner_public_key)?;
+            let cluster_id = crypto::fingerprint(&owner_public_key)?;
             let mut initial_members = vec![
                 Member::node(
                     &node.identity,
@@ -402,18 +399,18 @@ async fn dispatch(
             initial_members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
             let genesis = Genesis {
                 version: identity::IDENTITY_VERSION,
-                network_id,
+                cluster_id,
                 owner_public_key,
                 initial_members,
                 signature: String::new(),
             };
             let signing = signing("identity-genesis", genesis.signing_bytes()?);
             Ok(
-                json!({"state":NetworkState{genesis,checkpoint:None,events:vec![]},"signing":signing}),
+                json!({"state":ClusterState{genesis,checkpoint:None,events:vec![]},"signing":signing}),
             )
         }
         "bootstrap" => {
-            let state: NetworkState = from_field(&params, "state")?;
+            let state: ClusterState = from_field(&params, "state")?;
             validate_local_node(node, &state, true)?;
             if node.has_membership().await? {
                 let current = node.membership_state().await?;
@@ -421,7 +418,7 @@ async fn dispatch(
                     current.genesis == state.genesis
                         && state.checkpoint.is_none()
                         && state.events.is_empty(),
-                    "personal network already initialized"
+                    "cluster already initialized"
                 );
                 ensure!(
                     current
@@ -431,7 +428,7 @@ async fn dispatch(
                     "bootstrap requires its original management identity"
                 );
             } else {
-                node.store.lock().await.bootstrap_network(
+                node.store.lock().await.bootstrap_cluster(
                     state.clone(),
                     text(&params, "capability")?,
                     &session.subject_id,
@@ -452,7 +449,7 @@ async fn dispatch(
             sort_roles(&mut roles)?;
             let payload = node.store.lock().await.create_invite(InviteRequest {
                 request_id: request_id(&params)?,
-                network_id: view.network_id,
+                cluster_id: view.cluster_id,
                 inviter_subject_id: session.subject_id.clone(),
                 epoch: view.epoch,
                 capability: capability.clone(),
@@ -486,11 +483,11 @@ async fn dispatch(
             let state = node.membership_state().await?;
             let view = state.project()?;
             ensure!(
-                invite.payload.network_id == view.network_id && invite.payload.epoch == view.epoch,
-                "invitation is for another network or epoch"
+                invite.payload.cluster_id == view.cluster_id && invite.payload.epoch == view.epoch,
+                "invitation is for another cluster or epoch"
             );
             let inviter = view.authorize_client(&invite.payload.inviter_subject_id)?;
-            ensure!(inviter.manage, "inviter no longer manages this network");
+            ensure!(inviter.manage, "inviter no longer manages this cluster");
             crypto::verify_payload(
                 &inviter.public_key,
                 "identity-invite",
@@ -567,7 +564,7 @@ async fn dispatch(
                 .await
                 .accept_pair(review, text(&params, "signature")?.to_owned())?;
             let _ = node.events.send(crate::runtime::Update {
-                network_id: state.genesis.network_id,
+                cluster_id: state.genesis.cluster_id,
                 payload: json!({"type":"pair_requested"}),
             });
             Ok(serde_json::to_value(receipt)?)
@@ -630,9 +627,9 @@ async fn dispatch(
                 new_subject_signature: pair.new_subject_signature,
             })?;
             let state = node.store.lock().await.store_signed_grant(event)?;
-            let network_id = state.genesis.network_id.clone();
+            let cluster_id = state.genesis.cluster_id.clone();
             node.install_membership(state.clone()).await?;
-            announce_membership(node, &network_id, &state).await;
+            announce_membership(node, &cluster_id, &state).await;
             authentication(node, session).await
         }
         "pair_status" => {
@@ -680,7 +677,7 @@ async fn dispatch(
             );
             let event = GovernanceEvent {
                 version: identity::IDENTITY_VERSION,
-                network_id: view.network_id,
+                cluster_id: view.cluster_id,
                 epoch: view.epoch,
                 parents: view.heads,
                 issuer: session.subject_id.clone(),
@@ -701,9 +698,9 @@ async fn dispatch(
             );
             let mut state = node.membership_state().await?;
             state.append(event)?;
-            let network_id = state.genesis.network_id.clone();
+            let cluster_id = state.genesis.cluster_id.clone();
             node.install_membership(state.clone()).await?;
-            announce_membership(node, &network_id, &state).await;
+            announce_membership(node, &cluster_id, &state).await;
             authentication(node, session).await
         }
         "recovery_challenge" => recovery_challenge(node, session, &params).await,
@@ -718,7 +715,7 @@ async fn dispatch(
             if let Some(latest) = latest {
                 ensure!(
                     latest.genesis == recovery.genesis,
-                    "recovery network changed"
+                    "recovery cluster changed"
                 );
                 recovery.state = Some(latest);
             }
@@ -738,7 +735,7 @@ async fn dispatch(
                 .context("recovery epoch overflow")?;
             let checkpoint = RootCheckpoint {
                 version: identity::IDENTITY_VERSION,
-                network_id: state.genesis.network_id.clone(),
+                cluster_id: state.genesis.cluster_id.clone(),
                 epoch: state
                     .epoch()
                     .checked_add(1)
@@ -783,7 +780,7 @@ async fn dispatch(
             let fresh = !node.has_membership().await?;
             validate_local_node(node, &state, fresh)?;
             if fresh {
-                node.store.lock().await.bootstrap_recovered_network(
+                node.store.lock().await.bootstrap_recovered_cluster(
                     state.clone(),
                     text(&params, "capability")?,
                     &session.subject_id,
@@ -811,7 +808,7 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
     Ok(view)
 }
 fn connection_entry(node: &Runtime) -> Result<Value> {
-    let relay = node.config.network.bootstrap_urls.first();
+    let relay = node.config.cluster.bootstrap_urls.first();
     let mut url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
     let scheme = match url.scheme() {
         "ws" => "http",
@@ -833,7 +830,7 @@ async fn current_principal(node: &Runtime, session: &Session) -> Result<BrowserP
                 .principal(&session.subject_id)?;
             Ok(BrowserPrincipal {
                 source: "membership",
-                network_id: principal.network_id,
+                cluster_id: principal.cluster_id,
                 subject_id: principal.subject_id,
                 epoch: principal.epoch,
                 can_manage: principal.can_manage,
@@ -849,14 +846,14 @@ async fn current_principal(node: &Runtime, session: &Session) -> Result<BrowserP
             );
             let local = node
                 .local_access
-                .session(cookie, &peer_id, &view.network_id)?;
+                .session(cookie, &peer_id, &view.cluster_id)?;
             ensure!(
                 local.subject_id == session.subject_id && local.public_key == session.public_key,
                 "local browser session belongs to another Noise identity"
             );
             Ok(BrowserPrincipal {
                 source: "local_session",
-                network_id: local.network_id,
+                cluster_id: local.cluster_id,
                 subject_id: local.subject_id,
                 epoch: view.epoch,
                 can_manage: false,
@@ -877,8 +874,8 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
     let state = node.membership_state().await?;
     let view = state.project()?;
     ensure!(
-        principal.network_id == view.network_id && principal.epoch == view.epoch,
-        "personal-network membership changed during authentication"
+        principal.cluster_id == view.cluster_id && principal.epoch == view.epoch,
+        "cluster membership changed during authentication"
     );
     Ok(
         json!({"principal":principal,"state":state,"view":view,"local_auto_access":node.local_access.enabled()}),
@@ -902,7 +899,7 @@ fn session_member(
     member.validate()?;
     Ok(member)
 }
-fn validate_local_node(node: &Runtime, state: &NetworkState, required: bool) -> Result<()> {
+fn validate_local_node(node: &Runtime, state: &ClusterState, required: bool) -> Result<()> {
     let view = state.project()?;
     let local = view.authorize_node(&node.identity.peer_id()?, None);
     if required || local.is_ok() {
@@ -918,7 +915,7 @@ fn validate_local_node(node: &Runtime, state: &NetworkState, required: bool) -> 
     }
     Ok(())
 }
-fn recovery_history(state: &NetworkState, members: &[Member]) -> Result<Vec<HistoricalNode>> {
+fn recovery_history(state: &ClusterState, members: &[Member]) -> Result<Vec<HistoricalNode>> {
     let mut history: std::collections::BTreeMap<String, HistoricalNode> = state
         .historical_nodes()?
         .into_iter()
@@ -946,7 +943,7 @@ fn grant_event(review: &crate::identity::local::PairReview) -> Result<Governance
     );
     Ok(GovernanceEvent {
         version: identity::IDENTITY_VERSION,
-        network_id: review.network_id.clone(),
+        cluster_id: review.cluster_id.clone(),
         epoch: review.epoch,
         parents: review.parents.clone(),
         issuer: review.inviter_subject_id.clone(),
@@ -957,10 +954,10 @@ fn grant_event(review: &crate::identity::local::PairReview) -> Result<Governance
     })
 }
 
-async fn announce_membership(node: &Runtime, network_id: &str, state: &NetworkState) {
+async fn announce_membership(node: &Runtime, cluster_id: &str, state: &ClusterState) {
     let _ = node
         .hub
-        .broadcast(network_id, json!({"type":"trust","state":state}))
+        .broadcast(cluster_id, json!({"type":"trust","state":state}))
         .await;
 }
 async fn recovery_challenge(
@@ -968,11 +965,11 @@ async fn recovery_challenge(
     session: &mut Session,
     params: &Value,
 ) -> Result<Value> {
-    let network_id = text(params, "network_id")?.to_owned();
+    let cluster_id = text(params, "cluster_id")?.to_owned();
     let owner_public_key = text(params, "owner_public_key")?.to_owned();
     ensure!(
-        crypto::fingerprint(&owner_public_key)? == network_id,
-        "recovery network ID mismatch"
+        crypto::fingerprint(&owner_public_key)? == cluster_id,
+        "recovery Cluster ID mismatch"
     );
     let genesis = if node.has_membership().await? {
         node.membership_state().await?.genesis
@@ -981,12 +978,12 @@ async fn recovery_challenge(
     };
     genesis.verify()?;
     ensure!(
-        genesis.network_id == network_id && genesis.owner_public_key == owner_public_key,
-        "recovery root differs from pinned network"
+        genesis.cluster_id == cluster_id && genesis.owner_public_key == owner_public_key,
+        "recovery root differs from pinned cluster"
     );
     let challenge = RecoveryChallenge {
         challenge_id: uuid::Uuid::new_v4().to_string(),
-        network_id,
+        cluster_id,
         owner_public_key,
         subject_id: session.subject_id.clone(),
         target_peer_id: node.identity.peer_id()?,
@@ -1098,7 +1095,7 @@ fn client_endpoint(value: &str) -> Result<String> {
     );
     ensure!(
         matches!(url.path(), "/" | "/api/network/ws"),
-        "client URL must be a node base URL or network endpoint"
+        "client URL must be a node base URL or cluster endpoint"
     );
     url.set_path("/api/network/ws");
     Ok(url.into())
@@ -1239,9 +1236,9 @@ mod tests {
                 &dir.join("identity.json"),
                 &serde_json::to_vec(&LocalIdentity::generate())?,
             )?;
-            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
             let node = Arc::new(Runtime::open(dir).await?);
-            node.install_membership(NetworkState::new(Genesis::create(
+            node.install_membership(ClusterState::new(Genesis::create(
                 &LocalIdentity::generate(),
                 vec![
                     Member::node(&node.identity, "local device", node.config.roles.clone())?,
@@ -1440,7 +1437,7 @@ mod tests {
             "new node",
             vec![crate::model::NodeRole::Replica],
         )?;
-        let state = NetworkState::new(Genesis::create(&root, vec![admin.clone(), old.clone()])?)?;
+        let state = ClusterState::new(Genesis::create(&root, vec![admin.clone(), old.clone()])?)?;
         let members = vec![admin, new.clone()];
         let history = recovery_history(&state, &members)?;
         assert!(

@@ -36,15 +36,15 @@ struct BlobChunk {
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct BlobKey {
-    network: String,
+    cluster: String,
     hash: String,
     size: u64,
 }
 impl BlobKey {
-    fn new(network: &str, blob: &BlobRef) -> Result<Self> {
+    fn new(cluster: &str, blob: &BlobRef) -> Result<Self> {
         BlobTransfer::key(blob)?;
         Ok(Self {
-            network: network.into(),
+            cluster: cluster.into(),
             hash: blob.hash.clone(),
             size: blob.size,
         })
@@ -53,7 +53,7 @@ impl BlobKey {
         Ok(CString::new(format!(
             "{}.part",
             crypto::digest(&serde_json::to_vec(&(
-                &self.network,
+                &self.cluster,
                 &self.hash,
                 self.size
             ))?)
@@ -416,18 +416,18 @@ fn test_boundary(stage: &str) {
 }
 
 impl Runtime {
-    fn authorize_blob_source(&self, store: &Store, network: &str, source: &str) -> Result<()> {
+    fn authorize_blob_source(&self, store: &Store, cluster: &str, source: &str) -> Result<()> {
         ensure!(
             self.config.roles.contains(&NodeRole::Replica),
             "node capability is disabled"
         );
         let view = store.public_state()?.project()?;
-        ensure!(view.network_id == network, "wrong personal network");
+        ensure!(view.cluster_id == cluster, "wrong cluster");
         let local = self.identity.peer_id()?;
         view.authorize_node(&local, Some(NodeRole::Replica))?;
         view.authorize_node(source, Some(NodeRole::Replica))?;
-        store.authorize_node(network, &local, Some(NodeRole::Replica))?;
-        store.authorize_node(network, source, Some(NodeRole::Replica))?;
+        store.authorize_node(cluster, &local, Some(NodeRole::Replica))?;
+        store.authorize_node(cluster, source, Some(NodeRole::Replica))?;
         Ok(())
     }
     async fn cleanup_blob_lease(
@@ -443,7 +443,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .prepare_blob_cleanup(&lease.key.network, &expected)
+            .prepare_blob_cleanup(&lease.key.cluster, &expected)
         {
             Ok(true) => {}
             Ok(false) => return (pass, Ok(false)),
@@ -461,9 +461,9 @@ impl Runtime {
             .store
             .lock()
             .await
-            .delete_blob_cleanup(&lease.key.network, &expected);
+            .delete_blob_cleanup(&lease.key.cluster, &expected);
         if result.is_ok() {
-            tracing::debug!(network=%lease.key.network,hash=%expected.hash,size=expected.size,"history blob cleanup finished");
+            tracing::debug!(cluster=%lease.key.cluster,hash=%expected.hash,size=expected.size,"history blob cleanup finished");
         }
         (pass, result.map(|()| true))
     }
@@ -481,7 +481,7 @@ impl Runtime {
                 let after = pass
                     .after
                     .as_ref()
-                    .map(|(network, key)| (network.as_str(), key.as_str()));
+                    .map(|(cluster, key)| (cluster.as_str(), key.as_str()));
                 self.store.lock().await.blob_transfers(after, 1)
             };
             let row = match row {
@@ -491,7 +491,7 @@ impl Runtime {
                     break;
                 }
             };
-            let Some((network, key, raw)) = row else {
+            let Some((cluster, key, raw)) = row else {
                 if wrapped || pass.after.is_none() {
                     break;
                 }
@@ -507,7 +507,7 @@ impl Runtime {
             let transfer = match result {
                 Ok(transfer) => transfer,
                 Err(error) => {
-                    pass.after = Some((network, key));
+                    pass.after = Some((cluster, key));
                     tracing::warn!(%error,"invalid staging manifest retained");
                     continue;
                 }
@@ -515,8 +515,8 @@ impl Runtime {
             if verified_bytes + transfer.blob.size > byte_budget {
                 break;
             }
-            pass.after = Some((network.clone(), key));
-            let Ok(blob_key) = BlobKey::new(&network, &transfer.blob) else {
+            pass.after = Some((cluster.clone(), key));
+            let Ok(blob_key) = BlobKey::new(&cluster, &transfer.blob) else {
                 continue;
             };
             let Some(lease) = self.blob_staging.try_lease(blob_key).await else {
@@ -525,7 +525,7 @@ impl Runtime {
             verified_bytes += transfer.blob.size;
             let (returned, result) = self.cleanup_blob_lease(lease, Some(pass)).await;
             if let Err(error) = result {
-                tracing::warn!(network,hash=%transfer.blob.hash,%error,"staging cleanup pending");
+                tracing::warn!(cluster,hash=%transfer.blob.hash,%error,"staging cleanup pending");
             }
             if let Some(returned) = returned {
                 pass = returned;
@@ -543,8 +543,8 @@ impl Runtime {
         let reservation = self.blob_staging.reservation.clone().lock_owned().await;
         let (lease, _reservation, files) = lease.scan(reservation).await?;
         let mut store = self.store.lock().await;
-        self.authorize_blob_source(&store, &lease.key.network, source)?;
-        if let Some(transfer) = store.blob_transfer(&lease.key.network, blob)? {
+        self.authorize_blob_source(&store, &lease.key.cluster, source)?;
+        if let Some(transfer) = store.blob_transfer(&lease.key.cluster, blob)? {
             return Ok((lease, transfer));
         }
         let manifests = store.blob_transfers(None, 65)?;
@@ -554,7 +554,7 @@ impl Runtime {
         );
         let mut bytes = 0_u64;
         let mut known = HashMap::new();
-        for (network, key, raw) in &manifests {
+        for (cluster, key, raw) in &manifests {
             let transfer: BlobTransfer =
                 serde_json::from_slice(raw).context("invalid staging manifest occupies quota")?;
             transfer.validate(key)?;
@@ -562,7 +562,7 @@ impl Runtime {
                 .checked_add(transfer.blob.size)
                 .context("staging quota overflow")?;
             known.insert(
-                BlobKey::new(network, &transfer.blob)?
+                BlobKey::new(cluster, &transfer.blob)?
                     .filename()?
                     .into_bytes(),
                 transfer.blob.size,
@@ -590,7 +590,7 @@ impl Runtime {
         );
         let transfer = BlobTransfer::receiving(blob, source, 0);
         store.local_set(
-            &lease.key.network,
+            &lease.key.cluster,
             &BlobTransfer::key(blob)?,
             &serde_json::to_value(&transfer)?,
         )?;
@@ -599,25 +599,25 @@ impl Runtime {
     }
     async fn read_blob_chunk(
         &self,
-        network: &str,
+        cluster: &str,
         source: &str,
         blob: &BlobRef,
         offset: u64,
         limit: usize,
         class: ReadClass,
     ) -> Result<BlobChunk> {
-        self.authorize_blob_source(&*self.store.lock().await, network, source)?;
-        tracing::trace!(network,hash=%blob.hash,source,offset,limit,"history blob request");
+        self.authorize_blob_source(&*self.store.lock().await, cluster, source)?;
+        tracing::trace!(cluster,hash=%blob.hash,source,offset,limit,"history blob request");
         let value = self
             .read_history(
-                network,
+                cluster,
                 source,
                 json!({"type":"blob","hash":blob.hash,"offset":offset,"limit":limit}),
                 class,
                 limit * 2 + 1024,
             )
             .await?;
-        self.authorize_blob_source(&*self.store.lock().await, network, source)?;
+        self.authorize_blob_source(&*self.store.lock().await, cluster, source)?;
         ensure!(
             value.value["size"].as_u64() == Some(blob.size),
             "blob response size mismatch"
@@ -649,7 +649,7 @@ impl Runtime {
     }
     async fn commit_blob_progress(
         &self,
-        network: &str,
+        cluster: &str,
         previous: &BlobTransfer,
         source: &str,
         offset: u64,
@@ -661,15 +661,15 @@ impl Runtime {
         );
         let next = BlobTransfer::receiving(&previous.blob, source, offset);
         let mut store = self.store.lock().await;
-        self.authorize_blob_source(&store, network, source)?;
-        store.advance_blob_transfer(network, &self.identity.peer_id()?, previous, &next)?;
+        self.authorize_blob_source(&store, cluster, source)?;
+        store.advance_blob_transfer(cluster, &self.identity.peer_id()?, previous, &next)?;
         test_boundary("offset_committed");
-        tracing::trace!(network,hash=%previous.blob.hash,source,committed_offset=offset,part_length,"history blob committed");
+        tracing::trace!(cluster,hash=%previous.blob.hash,source,committed_offset=offset,part_length,"history blob committed");
         Ok(next)
     }
     pub(super) async fn history_blob(
         &self,
-        network: &str,
+        cluster: &str,
         sources: &[HistorySource],
         blob: &BlobRef,
         class: ReadClass,
@@ -678,20 +678,20 @@ impl Runtime {
         if quantum.remaining == 0 {
             return Ok(BlobStep::Partial);
         }
-        let key = BlobKey::new(network, blob)?;
+        let key = BlobKey::new(cluster, blob)?;
         let lease = self.blob_staging.lease(key).await;
         let (manifest, complete) = {
             let store = self.store.lock().await;
             (
-                store.blob_transfer(network, blob)?,
-                store.has_blob(network, blob)?,
+                store.blob_transfer(cluster, blob)?,
+                store.has_blob(cluster, blob)?,
             )
         };
         if complete {
             if manifest.is_some()
                 && let (_, Err(error)) = self.cleanup_blob_lease(lease, None).await
             {
-                tracing::warn!(network,hash=%blob.hash,%error,"staging cleanup pending");
+                tracing::warn!(cluster,hash=%blob.hash,%error,"staging cleanup pending");
             }
             return Ok(BlobStep::Complete { changed: false });
         }
@@ -725,7 +725,7 @@ impl Runtime {
                 sources
                     .iter()
                     .find(|source| {
-                        self.authorize_blob_source_for_current(&store, network, &source.peer_id)
+                        self.authorize_blob_source_for_current(&store, cluster, &source.peer_id)
                             .is_ok()
                     })
                     .map(|source| source.peer_id.as_str())
@@ -733,14 +733,14 @@ impl Runtime {
             };
 
             transfer = self
-                .commit_blob_progress(network, &transfer, source, offset, part_length)
+                .commit_blob_progress(cluster, &transfer, source, offset, part_length)
                 .await?;
         }
         let bound_source = match &transfer.phase {
             TransferPhase::Receiving { source_peer_id, .. } => source_peer_id.clone(),
             _ => unreachable!(),
         };
-        tracing::debug!(network,hash=%blob.hash,size=blob.size,source=%bound_source,committed_offset=offset,part_length,"history blob opened");
+        tracing::debug!(cluster,hash=%blob.hash,size=blob.size,source=%bound_source,committed_offset=offset,part_length,"history blob opened");
         let mut ordered: Vec<_> = sources
             .iter()
             .filter(|source| !source.failed)
@@ -755,12 +755,12 @@ impl Runtime {
         for source in ordered.iter().copied() {
             if blob.size == 0 {
                 match self
-                    .read_blob_chunk(network, source, blob, 0, 1, class)
+                    .read_blob_chunk(cluster, source, blob, 0, 1, class)
                     .await
                 {
                     Ok(chunk) => {
                         transfer = self
-                            .commit_blob_progress(network, &transfer, source, 0, part_length)
+                            .commit_blob_progress(cluster, &transfer, source, 0, part_length)
                             .await?;
                         empty_received = true;
                         quantum.remaining -= 1;
@@ -770,7 +770,7 @@ impl Runtime {
                     Err(error) => {
                         busy |=
                             error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
-                        tracing::debug!(network,source,%error,"empty blob source unavailable; trying another authorized replica");
+                        tracing::debug!(cluster,source,%error,"empty blob source unavailable; trying another authorized replica");
                         continue;
                     }
                 }
@@ -781,14 +781,14 @@ impl Runtime {
                     return Ok(BlobStep::Partial);
                 }
                 let chunk = match self
-                    .read_blob_chunk(network, source, blob, offset, 65536, class)
+                    .read_blob_chunk(cluster, source, blob, offset, 65536, class)
                     .await
                 {
                     Ok(chunk) => chunk,
                     Err(error) => {
                         busy |=
                             error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
-                        tracing::debug!(network,source,%error,"blob source unavailable; prefix retained");
+                        tracing::debug!(cluster,source,%error,"blob source unavailable; prefix retained");
                         break;
                     }
                 };
@@ -798,7 +798,7 @@ impl Runtime {
                     .await?;
                 writer = returned;
                 transfer = self
-                    .commit_blob_progress(network, &transfer, source, next, part_length)
+                    .commit_blob_progress(cluster, &transfer, source, next, part_length)
                     .await?;
                 offset = next;
                 quantum.remaining -= 1;
@@ -829,13 +829,13 @@ impl Runtime {
                     .find(|source| {
                         *source != first_source
                             && self
-                                .authorize_blob_source_for_current(&store, network, source)
+                                .authorize_blob_source_for_current(&store, cluster, source)
                                 .is_ok()
                     })
                     .unwrap_or(first_source)
             };
             let _ = self
-                .commit_blob_progress(network, &transfer, next, 0, part_length)
+                .commit_blob_progress(cluster, &transfer, next, 0, part_length)
                 .await?;
             drop(writer);
             bail!("blob hash mismatch; prefix reset for another authorized source");
@@ -845,7 +845,7 @@ impl Runtime {
             _ => unreachable!(),
         };
         let source_current = self
-            .authorize_blob_source_for_current(&*self.store.lock().await, network, &source)
+            .authorize_blob_source_for_current(&*self.store.lock().await, cluster, &source)
             .is_ok();
         if !source_current {
             let last_offset = blob.size.saturating_sub(65536);
@@ -858,7 +858,7 @@ impl Runtime {
                 }
                 let chunk = match self
                     .read_blob_chunk(
-                        network,
+                        cluster,
                         candidate,
                         blob,
                         last_offset,
@@ -879,7 +879,7 @@ impl Runtime {
                 };
                 if chunk.bytes == expected {
                     self.commit_blob_progress(
-                        network,
+                        cluster,
                         &transfer,
                         candidate,
                         offset,
@@ -901,9 +901,9 @@ impl Runtime {
         }
         let changed = {
             let mut store = self.store.lock().await;
-            self.authorize_blob_source(&store, network, &source)?;
+            self.authorize_blob_source(&store, cluster, &source)?;
             store.publish_blob_transfer(
-                network,
+                cluster,
                 &self.identity.peer_id()?,
                 blob,
                 &source,
@@ -911,22 +911,22 @@ impl Runtime {
             )?
         };
         test_boundary("published");
-        tracing::debug!(network,hash=%blob.hash,size=blob.size,changed,"history blob published");
+        tracing::debug!(cluster,hash=%blob.hash,size=blob.size,changed,"history blob published");
         if let (_, Err(error)) = self.cleanup_blob_lease(writer.into_lease(), None).await {
-            tracing::warn!(network,hash=%blob.hash,%error,"staging cleanup pending");
+            tracing::warn!(cluster,hash=%blob.hash,%error,"staging cleanup pending");
         }
         Ok(BlobStep::Complete { changed })
     }
     fn authorize_blob_source_for_current(
         &self,
         store: &Store,
-        network: &str,
+        cluster: &str,
         source: &str,
     ) -> Result<()> {
         let view = store.public_state()?.project()?;
         ensure!(
-            self.config.roles.contains(&NodeRole::Replica) && view.network_id == network,
-            "replica network unavailable"
+            self.config.roles.contains(&NodeRole::Replica) && view.cluster_id == cluster,
+            "replica cluster unavailable"
         );
         view.authorize_node(&self.identity.peer_id()?, Some(NodeRole::Replica))?;
         view.authorize_node(source, Some(NodeRole::Replica))?;
@@ -948,18 +948,18 @@ mod tests {
     }
 
     async fn node() -> Result<(PathBuf, Runtime, String)> {
-        let dir = super::super::tests::fixture_under("network-reliability")?;
+        let dir = super::super::tests::fixture_under("cluster-reliability")?;
         let node = Runtime::open(&dir).await?;
-        let network = super::super::tests::conversation(&node).await?;
-        Ok((dir, node, network))
+        let cluster = super::super::tests::conversation(&node).await?;
+        Ok((dir, node, cluster))
     }
 
     async fn reserve(
         node: &Runtime,
-        network: &str,
+        cluster: &str,
         blob: &BlobRef,
     ) -> Result<(BlobLease, BlobTransfer)> {
-        let lease = node.blob_staging.lease(BlobKey::new(network, blob)?).await;
+        let lease = node.blob_staging.lease(BlobKey::new(cluster, blob)?).await;
         node.reserve_blob_transfer(lease, blob, &node.identity.peer_id()?)
             .await
     }
@@ -973,12 +973,12 @@ mod tests {
 
     async fn save_manifest(
         node: &Runtime,
-        network: &str,
+        cluster: &str,
         blob: &BlobRef,
         phase: TransferPhase,
     ) -> Result<()> {
         node.store.lock().await.local_set(
-            network,
+            cluster,
             &BlobTransfer::key(blob)?,
             &serde_json::to_value(BlobTransfer {
                 version: 1,
@@ -988,24 +988,24 @@ mod tests {
         )
     }
 
-    fn part_path(dir: &Path, network: &str, blob: &BlobRef) -> Result<PathBuf> {
+    fn part_path(dir: &Path, cluster: &str, blob: &BlobRef) -> Result<PathBuf> {
         Ok(dir
             .join("net1-blob-staging")
-            .join(BlobKey::new(network, blob)?.filename()?.to_str()?))
+            .join(BlobKey::new(cluster, blob)?.filename()?.to_str()?))
     }
 
-    async fn reservation_error(node: &Runtime, network: &str, blob: &BlobRef) -> Result<String> {
-        match reserve(node, network, blob).await {
+    async fn reservation_error(node: &Runtime, cluster: &str, blob: &BlobRef) -> Result<String> {
+        match reserve(node, cluster, blob).await {
             Err(error) => Ok(error.to_string()),
             Ok(_) => bail!("reservation unexpectedly succeeded"),
         }
     }
 
     #[tokio::test]
-    async fn staging_quota_counts_all_networks_and_cleanup_at_exact_byte_limit() -> Result<()> {
-        let (dir, node, network) = node().await?;
+    async fn staging_quota_counts_all_clusters_and_cleanup_at_exact_byte_limit() -> Result<()> {
+        let (dir, node, cluster) = node().await?;
         let source = node.identity.peer_id()?;
-        let foreign = crypto::digest(b"former personal network");
+        let foreign = crypto::digest(b"former cluster");
         for index in 0..4 {
             let reserved = quota_blob(&format!("full-reservation-{index}"), MAX_BLOB_BYTES as u64);
             let phase = if index % 2 == 0 {
@@ -1018,21 +1018,21 @@ mod tests {
             };
             save_manifest(
                 &node,
-                if index < 2 { &network } else { &foreign },
+                if index < 2 { &cluster } else { &foreign },
                 &reserved,
                 phase,
             )
             .await?;
         }
         let empty = quota_blob("", 0);
-        let (lease, transfer) = reserve(&node, &network, &empty).await?;
+        let (lease, transfer) = reserve(&node, &cluster, &empty).await?;
         assert_eq!(transfer, BlobTransfer::receiving(&empty, &source, 0));
         drop(lease);
         let before = node.store.lock().await.blob_transfers(None, 65)?;
         assert_eq!(before.len(), 5);
         let extra = quota_blob("one byte over the global reservation", 1);
         assert_eq!(
-            reservation_error(&node, &network, &extra).await?,
+            reservation_error(&node, &cluster, &extra).await?,
             "staging quota exceeded"
         );
         assert_eq!(node.store.lock().await.blob_transfers(None, 65)?, before);
@@ -1040,7 +1040,7 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .blob_transfer(&network, &extra)?
+                .blob_transfer(&cluster, &extra)?
                 .is_none()
         );
         assert_eq!(std::fs::read_dir(dir.join("net1-blob-staging"))?.count(), 0);
@@ -1052,12 +1052,12 @@ mod tests {
     #[tokio::test]
     async fn staging_quota_counts_unknown_files_and_known_part_excess() -> Result<()> {
         for known in [false, true] {
-            let (dir, node, network) = node().await?;
+            let (dir, node, cluster) = node().await?;
             let existing = quota_blob("existing sparse prefix", 1);
             let path = if known {
                 save_manifest(
                     &node,
-                    &network,
+                    &cluster,
                     &existing,
                     TransferPhase::Receiving {
                         committed_offset: 0,
@@ -1065,7 +1065,7 @@ mod tests {
                     },
                 )
                 .await?;
-                part_path(&dir, &network, &existing)?
+                part_path(&dir, &cluster, &existing)?
             } else {
                 dir.join("net1-blob-staging/unknown.part")
             };
@@ -1078,13 +1078,13 @@ mod tests {
             file.set_len(MAX_STAGING_BYTES - 1)?;
             drop(file);
             let last = quota_blob("last allowed byte", 1);
-            let (lease, transfer) = reserve(&node, &network, &last).await?;
+            let (lease, transfer) = reserve(&node, &cluster, &last).await?;
             assert_eq!(transfer.blob, last);
             drop(lease);
             let before = node.store.lock().await.blob_transfers(None, 65)?;
             let extra = quota_blob("excess byte", 1);
             assert_eq!(
-                reservation_error(&node, &network, &extra).await?,
+                reservation_error(&node, &cluster, &extra).await?,
                 "staging quota exceeded"
             );
             assert_eq!(node.store.lock().await.blob_transfers(None, 65)?, before);
@@ -1092,7 +1092,7 @@ mod tests {
                 node.store
                     .lock()
                     .await
-                    .blob_transfer(&network, &extra)?
+                    .blob_transfer(&cluster, &extra)?
                     .is_none()
             );
             assert_eq!(std::fs::metadata(&path)?.len(), MAX_STAGING_BYTES - 1);
@@ -1108,13 +1108,13 @@ mod tests {
     #[tokio::test]
     async fn staging_object_quota_counts_empty_objects_and_unknown_files_once() -> Result<()> {
         for unknown in [false, true] {
-            let (dir, node, network) = node().await?;
+            let (dir, node, cluster) = node().await?;
             let count = if unknown { 62 } else { 63 };
             for index in 0..count {
                 let reserved = quota_blob(&format!("empty-reservation-{index}"), 0);
                 save_manifest(
                     &node,
-                    &network,
+                    &cluster,
                     &reserved,
                     TransferPhase::Receiving {
                         committed_offset: 0,
@@ -1123,21 +1123,21 @@ mod tests {
                 )
                 .await?;
             }
-            let matching = part_path(&dir, &network, &quota_blob("empty-reservation-0", 0))?;
+            let matching = part_path(&dir, &cluster, &quota_blob("empty-reservation-0", 0))?;
             config::private_write(&matching, b"")?;
             let unknown_path = dir.join("net1-blob-staging/unknown-empty.part");
             if unknown {
                 config::private_write(&unknown_path, b"")?;
             }
             let last = quota_blob("", 0);
-            let (lease, transfer) = reserve(&node, &network, &last).await?;
+            let (lease, transfer) = reserve(&node, &cluster, &last).await?;
             assert_eq!(transfer.blob, last);
             drop(lease);
             let before = node.store.lock().await.blob_transfers(None, 65)?;
             assert_eq!(before.len(), count + 1);
             let extra = quota_blob("sixty-fifth empty reservation", 0);
             assert_eq!(
-                reservation_error(&node, &network, &extra).await?,
+                reservation_error(&node, &cluster, &extra).await?,
                 if unknown {
                     "staging quota exceeded"
                 } else {
@@ -1149,7 +1149,7 @@ mod tests {
                 node.store
                     .lock()
                     .await
-                    .blob_transfer(&network, &extra)?
+                    .blob_transfer(&cluster, &extra)?
                     .is_none()
             );
             assert_eq!(std::fs::metadata(&matching)?.len(), 0);
@@ -1165,31 +1165,31 @@ mod tests {
     #[tokio::test]
     async fn bad_manifest_bytes_block_reservation_but_do_not_block_cleanup_cursor() -> Result<()> {
         for bad in [b"not-json".as_slice(), b"\x80".as_slice()] {
-            let (dir, node, network) = node().await?;
+            let (dir, node, cluster) = node().await?;
             let invalid = BlobRef {
                 hash: "00".repeat(32),
                 size: 1,
             };
             let invalid_key = BlobTransfer::key(&invalid)?;
-            let invalid_part = part_path(&dir, &network, &invalid)?;
+            let invalid_part = part_path(&dir, &cluster, &invalid)?;
             config::private_write(&invalid_part, b"x")?;
             let complete = blob();
             assert!(invalid_key < BlobTransfer::key(&complete)?);
             node.store
                 .lock()
                 .await
-                .put_blob(&network, &complete, BODY)?;
-            save_manifest(&node, &network, &complete, TransferPhase::Cleanup).await?;
-            let complete_part = part_path(&dir, &network, &complete)?;
+                .put_blob(&cluster, &complete, BODY)?;
+            save_manifest(&node, &cluster, &complete, TransferPhase::Cleanup).await?;
+            let complete_part = part_path(&dir, &cluster, &complete)?;
             config::private_write(&complete_part, BODY)?;
             let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
             connection.execute(
-                "INSERT INTO local_values(network_id,key,value) VALUES(?,?,CAST(? AS TEXT))",
-                rusqlite::params![network, invalid_key, bad],
+                "INSERT INTO local_values(cluster_id,key,value) VALUES(?,?,CAST(? AS TEXT))",
+                rusqlite::params![cluster, invalid_key, bad],
             )?;
             let extra = quota_blob("blocked by an invalid reservation", 1);
             assert_eq!(
-                reservation_error(&node, &network, &extra).await?,
+                reservation_error(&node, &cluster, &extra).await?,
                 "invalid staging manifest occupies quota"
             );
             node.recover_blob_staging(64).await;
@@ -1198,33 +1198,33 @@ mod tests {
                 node.store
                     .lock()
                     .await
-                    .blob_transfer(&network, &complete)?
+                    .blob_transfer(&cluster, &complete)?
                     .is_none()
             );
             assert_eq!(
                 node.store
                     .lock()
                     .await
-                    .get_blob(&network, &complete.hash)?
+                    .get_blob(&cluster, &complete.hash)?
                     .as_deref(),
                 Some(BODY)
             );
             assert_eq!(std::fs::read(&invalid_part)?, b"x");
             let preserved: Vec<u8> = connection.query_row(
-                "SELECT CAST(value AS BLOB) FROM local_values WHERE network_id=? AND key=?",
-                rusqlite::params![network, invalid_key],
+                "SELECT CAST(value AS BLOB) FROM local_values WHERE cluster_id=? AND key=?",
+                rusqlite::params![cluster, invalid_key],
                 |row| row.get(0),
             )?;
             assert_eq!(preserved, bad);
             assert_eq!(
-                reservation_error(&node, &network, &extra).await?,
+                reservation_error(&node, &cluster, &extra).await?,
                 "invalid staging manifest occupies quota"
             );
             assert!(
                 node.store
                     .lock()
                     .await
-                    .blob_transfer(&network, &extra)?
+                    .blob_transfer(&cluster, &extra)?
                     .is_none()
             );
             drop(connection);
@@ -1236,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_budget_keeps_middle_large_object_for_the_next_pass() -> Result<()> {
-        let (dir, node, network) = node().await?;
+        let (dir, node, cluster) = node().await?;
         let mut sides = [vec![0_u8; 32], vec![1_u8; 32]];
         sides.sort_by_key(|bytes| crypto::digest(bytes));
         let lower = crypto::digest(&sides[0]);
@@ -1258,9 +1258,9 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .put_blob(&network, &complete, bytes)?;
-            save_manifest(&node, &network, &complete, TransferPhase::Cleanup).await?;
-            let path = part_path(&dir, &network, &complete)?;
+                .put_blob(&cluster, &complete, bytes)?;
+            save_manifest(&node, &cluster, &complete, TransferPhase::Cleanup).await?;
+            let path = part_path(&dir, &cluster, &complete)?;
             config::private_write(&path, bytes)?;
             objects.push((complete, path));
         }
@@ -1283,14 +1283,14 @@ mod tests {
                     node.store
                         .lock()
                         .await
-                        .blob_transfer(&network, complete)?
+                        .blob_transfer(&cluster, complete)?
                         .is_some(),
                 );
                 assert_eq!(
                     node.store
                         .lock()
                         .await
-                        .get_blob(&network, &complete.hash)?
+                        .get_blob(&cluster, &complete.hash)?
                         .as_deref(),
                     Some(bodies[index].as_slice())
                 );
@@ -1304,16 +1304,16 @@ mod tests {
 
     #[tokio::test]
     async fn staging_recovers_only_committed_prefix_and_rejects_symlinks() -> Result<()> {
-        let (dir, node, network) = node().await?;
+        let (dir, node, cluster) = node().await?;
         let blob = blob();
-        let (lease, manifest) = reserve(&node, &network, &blob).await?;
+        let (lease, manifest) = reserve(&node, &cluster, &blob).await?;
         let (writer, offset, actual) = lease.recover(0).await?;
         assert_eq!((offset, actual), (0, 0));
         let split = 8;
         let (writer, length, _) = writer.write(0, BODY[..split].to_vec(), None).await?;
         let manifest = node
             .commit_blob_progress(
-                &network,
+                &cluster,
                 &manifest,
                 &node.identity.peer_id()?,
                 split as u64,
@@ -1324,7 +1324,7 @@ mod tests {
             .write(split as u64, BODY[split..].to_vec(), None)
             .await?;
         drop(writer);
-        let key = BlobKey::new(&network, &blob)?;
+        let key = BlobKey::new(&cluster, &blob)?;
         let lease = node.blob_staging.lease(key.clone()).await;
         let (mut writer, recovered, length) = lease.recover(split as u64).await?;
         assert_eq!((recovered, length), (split as u64, split as u64));
@@ -1342,7 +1342,7 @@ mod tests {
             "short files are truncated, never zero-filled to old offset"
         );
         let _ = node
-            .commit_blob_progress(&network, &manifest, &node.identity.peer_id()?, 0, length)
+            .commit_blob_progress(&cluster, &manifest, &node.identity.peer_id()?, 0, length)
             .await?;
         drop(writer);
         let path = dir
@@ -1362,7 +1362,7 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .get_blob(&network, &blob.hash)?
+                .get_blob(&cluster, &blob.hash)?
                 .is_none()
         );
         drop(node);
@@ -1387,11 +1387,11 @@ mod tests {
         }
         let mut replicas = Vec::new();
         for _ in 0..5 {
-            let dir = super::super::tests::fixture_under("network-reliability")?;
+            let dir = super::super::tests::fixture_under("cluster-reliability")?;
             replicas.push(Arc::new(Runtime::open(&dir).await?));
         }
         replicas.sort_by_key(|node| node.identity.peer_id().unwrap());
-        let receiver_dir = super::super::tests::fixture_under("network-reliability")?;
+        let receiver_dir = super::super::tests::fixture_under("cluster-reliability")?;
         let receiver = Arc::new(Runtime::open(&receiver_dir).await?);
         let owner = LocalIdentity::generate();
         let retired = LocalIdentity::generate();
@@ -1405,17 +1405,17 @@ mod tests {
                 .certificate(receiver.config.roles.clone())?,
         );
         certificates.push(retired.certificate(vec![NodeRole::Replica])?);
-        let membership = owner.sign_network_fixture(1, certificates.clone())?;
-        let network = membership.genesis.network_id.clone();
+        let membership = owner.sign_cluster_fixture(1, certificates.clone())?;
+        let cluster = membership.genesis.cluster_id.clone();
         let blob = blob();
         for replica in &replicas {
             replica.install_membership(membership.clone()).await?;
-            replica.store.lock().await.put_blob(&network, &blob, BODY)?;
+            replica.store.lock().await.put_blob(&cluster, &blob, BODY)?;
         }
         receiver.install_membership(membership).await?;
         let lease = receiver
             .blob_staging
-            .lease(BlobKey::new(&network, &blob)?)
+            .lease(BlobKey::new(&cluster, &blob)?)
             .await;
         let retired_id = retired.peer_id()?;
         let (lease, manifest) = receiver
@@ -1424,12 +1424,12 @@ mod tests {
         let (writer, _, _) = lease.recover(0).await?;
         let (writer, length, _) = writer.write(0, BODY.to_vec(), None).await?;
         receiver
-            .commit_blob_progress(&network, &manifest, &retired_id, blob.size, length)
+            .commit_blob_progress(&cluster, &manifest, &retired_id, blob.size, length)
             .await?;
         drop(writer);
         let event = receiver.identity.sign_event(Event {
-            version: 1,
-            network_id: network.clone(),
+            version: crate::model::WIRE_VERSION,
+            cluster_id: cluster.clone(),
             scope_id: "rebound".into(),
             author: receiver.identity.peer_id()?,
             sequence: 1,
@@ -1446,12 +1446,12 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .ingest_event(&network, &event)?
+                .ingest_event(&cluster, &event)?
                 .status,
             "pending"
         );
         certificates.last_mut().unwrap().revoked = true;
-        let membership = owner.sign_network_fixture(2, certificates)?;
+        let membership = owner.sign_cluster_fixture(2, certificates)?;
         for replica in &replicas {
             replica.install_membership(membership.clone()).await?;
         }
@@ -1460,7 +1460,7 @@ mod tests {
             receiver
                 .authorize_blob_source_for_current(
                     &*receiver.store.lock().await,
-                    &network,
+                    &cluster,
                     &retired_id
                 )
                 .is_err()
@@ -1480,7 +1480,7 @@ mod tests {
                 let _ = axum::serve(listener, app).await;
             });
             let hub = receiver.hub.clone();
-            let scope = network.clone();
+            let scope = cluster.clone();
             tasks.spawn(async move {
                 let _ = hub.connect(scope, url).await;
             });
@@ -1518,23 +1518,23 @@ mod tests {
             });
         }
         tokio::time::timeout(Duration::from_secs(30), async {
-            while receiver.hub.online(&network).await.len() < 5 {
+            while receiver.hub.online(&cluster).await.len() < 5 {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
-        let sources = receiver.history_sources(&network, &[]).await?;
+        let sources = receiver.history_sources(&cluster, &[]).await?;
         let mut exhausted = BlobQuantum::new(0);
         assert_eq!(
             receiver
-                .history_blob(&network, &sources, &blob, ReadClass::Proof, &mut exhausted)
+                .history_blob(&cluster, &sources, &blob, ReadClass::Proof, &mut exhausted)
                 .await?,
             BlobStep::Partial
         );
         assert!(requests.lock().await.is_empty());
         let mut updates = receiver.events.subscribe();
         let node = receiver.clone();
-        let scope = network.clone();
+        let scope = cluster.clone();
         let source_id = replicas[0].identity.peer_id()?;
         let proof = tokio::spawn(async move {
             node.fetch_closure(&scope, "rebound", &source_id, &[event.hash])
@@ -1546,9 +1546,9 @@ mod tests {
         assert_eq!(&requests.lock().await[..4], &[0, 1, 2, 3]);
         {
             let store = receiver.store.lock().await;
-            assert!(!store.has_blob(&network, &blob)?);
+            assert!(!store.has_blob(&cluster, &blob)?);
             assert!(
-                matches!(store.blob_transfer(&network, &blob)?.unwrap().phase,
+                matches!(store.blob_transfer(&cluster, &blob)?.unwrap().phase,
                 TransferPhase::Receiving { committed_offset, source_peer_id }
                 if committed_offset == blob.size && source_peer_id == retired_id)
             );
@@ -1573,7 +1573,7 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .get_blob(&network, &blob.hash)?
+                .get_blob(&cluster, &blob.hash)?
                 .unwrap(),
             BODY
         );
@@ -1582,7 +1582,7 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .blob_transfer(&network, &blob)?
+                .blob_transfer(&cluster, &blob)?
                 .is_none()
         );
         assert_eq!(updates.try_recv()?.payload["type"], "changed");
@@ -1598,10 +1598,10 @@ mod tests {
     #[tokio::test]
     async fn cancelled_blocking_writer_keeps_object_and_process_locks_until_io_ends() -> Result<()>
     {
-        let dir = super::super::tests::fixture_under("network-reliability")?;
+        let dir = super::super::tests::fixture_under("cluster-reliability")?;
         let lock = Arc::new(config::lock_data_dir(&dir)?);
         let staging = BlobStaging::open(&dir, lock.clone())?;
-        let key = BlobKey::new("network", &blob())?;
+        let key = BlobKey::new("cluster", &blob())?;
         let lease = staging.lease(key.clone()).await;
         let (started, wait_started) = std::sync::mpsc::sync_channel(1);
         let (finish, wait_finish) = std::sync::mpsc::sync_channel(1);
@@ -1646,9 +1646,9 @@ mod tests {
 
     #[tokio::test]
     async fn real_write_error_keeps_manifest_offset_and_never_publishes() -> Result<()> {
-        let (dir, node, network) = node().await?;
+        let (dir, node, cluster) = node().await?;
         let blob = blob();
-        let (lease, manifest) = reserve(&node, &network, &blob).await?;
+        let (lease, manifest) = reserve(&node, &cluster, &blob).await?;
         let (mut writer, _, _) = lease.recover(0).await?;
         // A genuine OS EBADF from write(), using a readonly descriptor of the real part.
         let name = writer.lease.key.filename()?;
@@ -1671,14 +1671,14 @@ mod tests {
         );
         println!("NET1_REAL_IO_ERROR {error:#}");
         assert_eq!(
-            node.store.lock().await.blob_transfer(&network, &blob)?,
+            node.store.lock().await.blob_transfer(&cluster, &blob)?,
             Some(manifest)
         );
         assert!(
             node.store
                 .lock()
                 .await
-                .get_blob(&network, &blob.hash)?
+                .get_blob(&cluster, &blob.hash)?
                 .is_none()
         );
         drop(node);
@@ -1689,14 +1689,14 @@ mod tests {
     #[tokio::test]
     async fn cleanup_preserves_unique_part_when_complete_blob_is_corrupt_then_recovers()
     -> Result<()> {
-        let (dir, node, network) = node().await?;
+        let (dir, node, cluster) = node().await?;
         let blob = blob();
-        let (lease, manifest) = reserve(&node, &network, &blob).await?;
+        let (lease, manifest) = reserve(&node, &cluster, &blob).await?;
         let (writer, _, _) = lease.recover(0).await?;
         let (writer, length, _) = writer.write(0, BODY.to_vec(), None).await?;
         let _ = node
             .commit_blob_progress(
-                &network,
+                &cluster,
                 &manifest,
                 &node.identity.peer_id()?,
                 blob.size,
@@ -1704,7 +1704,7 @@ mod tests {
             )
             .await?;
         node.store.lock().await.publish_blob_transfer(
-            &network,
+            &cluster,
             &node.identity.peer_id()?,
             &blob,
             &node.identity.peer_id()?,
@@ -1716,8 +1716,8 @@ mod tests {
         drop(writer);
         let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
         connection.execute(
-            "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
-            rusqlite::params![vec![0_u8; BODY.len()], network, blob.hash],
+            "UPDATE blobs SET content=? WHERE cluster_id=? AND hash=?",
+            rusqlite::params![vec![0_u8; BODY.len()], cluster, blob.hash],
         )?;
         node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
         assert_eq!(std::fs::read(&path)?, BODY);
@@ -1725,26 +1725,26 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .blob_transfer(&network, &blob)?
+                .blob_transfer(&cluster, &blob)?
                 .unwrap()
                 .phase,
             TransferPhase::Cleanup
         );
-        node.store.lock().await.put_blob(&network, &blob, BODY)?;
+        node.store.lock().await.put_blob(&cluster, &blob, BODY)?;
         node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
         assert!(!path.exists());
         assert!(
             node.store
                 .lock()
                 .await
-                .blob_transfer(&network, &blob)?
+                .blob_transfer(&cluster, &blob)?
                 .is_none()
         );
         assert_eq!(
             node.store
                 .lock()
                 .await
-                .get_blob(&network, &blob.hash)?
+                .get_blob(&cluster, &blob.hash)?
                 .unwrap(),
             BODY
         );
@@ -1761,21 +1761,21 @@ mod tests {
         };
         let dir = PathBuf::from(dir);
         let node = Runtime::open(&dir).await?;
-        let network = super::super::tests::conversation(&node).await?;
+        let cluster = super::super::tests::conversation(&node).await?;
         let durability = node.store.lock().await.test_durability()?;
         std::fs::write(
             dir.join("durability.json"),
             serde_json::to_vec(
-                &json!({"journal_mode":durability.0,"synchronous":durability.1,"network":network}),
+                &json!({"journal_mode":durability.0,"synchronous":durability.1,"cluster":cluster}),
             )?,
         )?;
         let blob = blob();
-        let (lease, manifest) = reserve(&node, &network, &blob).await?;
+        let (lease, manifest) = reserve(&node, &cluster, &blob).await?;
         let (writer, _, _) = lease.recover(0).await?;
         let (writer, length, _) = writer.write(0, BODY.to_vec(), None).await?;
         let _ = node
             .commit_blob_progress(
-                &network,
+                &cluster,
                 &manifest,
                 &node.identity.peer_id()?,
                 blob.size,
@@ -1785,7 +1785,7 @@ mod tests {
         drop(writer);
         assert_eq!(
             node.history_blob(
-                &network,
+                &cluster,
                 &[],
                 &blob,
                 ReadClass::Proof,
@@ -1808,7 +1808,7 @@ mod tests {
             "published",
             "unlinked",
         ] {
-            let dir = super::super::tests::fixture_under("network-reliability")?;
+            let dir = super::super::tests::fixture_under("cluster-reliability")?;
             let marker = dir.join("crash-marker");
             let log = File::create(dir.join("child.log"))?;
             let mut child = std::process::Command::new(&executable)
@@ -1844,23 +1844,23 @@ mod tests {
             let durability: Value =
                 serde_json::from_slice(&std::fs::read(dir.join("durability.json"))?)?;
             assert_eq!(durability["journal_mode"], "wal");
-            let network = durability["network"].as_str().unwrap();
+            let cluster = durability["cluster"].as_str().unwrap();
             let blob = blob();
             let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
             let raw: String = connection.query_row(
-                "SELECT value FROM local_values WHERE network_id=? AND key=?",
-                rusqlite::params![network, BlobTransfer::key(&blob)?],
+                "SELECT value FROM local_values WHERE cluster_id=? AND key=?",
+                rusqlite::params![cluster, BlobTransfer::key(&blob)?],
                 |row| row.get(0),
             )?;
             let manifest: BlobTransfer = serde_json::from_str(&raw)?;
             let count: u64 = connection.query_row(
-                "SELECT count(*) FROM blobs WHERE network_id=? AND hash=?",
-                rusqlite::params![network, blob.hash],
+                "SELECT count(*) FROM blobs WHERE cluster_id=? AND hash=?",
+                rusqlite::params![cluster, blob.hash],
                 |row| row.get(0),
             )?;
             let part = dir
                 .join("net1-blob-staging")
-                .join(BlobKey::new(network, &blob)?.filename()?.to_str()?);
+                .join(BlobKey::new(cluster, &blob)?.filename()?.to_str()?);
             let length = std::fs::metadata(&part).ok().map(|metadata| metadata.len());
             match stage {
                 "reserved" => {
@@ -1909,7 +1909,7 @@ mod tests {
             let node = Runtime::open(&dir).await?;
             match stage {
                 "reserved" | "chunk_fsynced" => {
-                    let lease = node.blob_staging.lease(BlobKey::new(network, &blob)?).await;
+                    let lease = node.blob_staging.lease(BlobKey::new(cluster, &blob)?).await;
                     let (writer, offset, length) = lease.recover(0).await?;
                     assert_eq!((offset, length), (0, 0));
                     drop(writer);
@@ -1917,14 +1917,14 @@ mod tests {
                         node.store
                             .lock()
                             .await
-                            .get_blob(network, &blob.hash)?
+                            .get_blob(cluster, &blob.hash)?
                             .is_none()
                     );
                 }
                 "offset_committed" => {
                     assert_eq!(
                         node.history_blob(
-                            network,
+                            cluster,
                             &[],
                             &blob,
                             ReadClass::Proof,
@@ -1941,7 +1941,7 @@ mod tests {
                         node.store
                             .lock()
                             .await
-                            .blob_transfer(network, &blob)?
+                            .blob_transfer(cluster, &blob)?
                             .is_none()
                     );
                 }
@@ -1951,7 +1951,7 @@ mod tests {
                     node.store
                         .lock()
                         .await
-                        .get_blob(network, &blob.hash)?
+                        .get_blob(cluster, &blob.hash)?
                         .unwrap(),
                     BODY
                 );

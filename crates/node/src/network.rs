@@ -6608,15 +6608,15 @@ mod tests {
     -> Result<()> {
         let owner = LocalIdentity::generate();
         let target_identity = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let roles = vec![
             crate::model::NodeRole::Replica,
             crate::model::NodeRole::Relay,
         ];
         let mut store = crate::store::Store::open(":memory:")?;
         store.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(
+            &cluster,
+            &owner.sign_cluster_fixture(
                 1,
                 vec![
                     owner.certificate(roles.clone())?,
@@ -6671,13 +6671,13 @@ mod tests {
             assert!(result.is_ok(), "{result:?}");
         });
         let driver_peer = peer.clone();
-        let driver_network = network.clone();
+        let driver_cluster = cluster.clone();
         let driver_target = target_identity.peer_id()?;
         let driver_transport = transport.clone();
         let driver = tokio::spawn(async move {
             driver_peer
                 .connect_target(
-                    driver_network,
+                    driver_cluster,
                     driver_target,
                     driver_transport,
                     None,
@@ -6689,8 +6689,8 @@ mod tests {
         let mut revoked = target_identity.certificate(roles.clone())?;
         revoked.revoked = true;
         store.lock().await.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(2, vec![owner.certificate(roles)?, revoked])?,
+            &cluster,
+            &owner.sign_cluster_fixture(2, vec![owner.certificate(roles)?, revoked])?,
         )?;
         resume
             .send(())
@@ -6705,7 +6705,7 @@ mod tests {
             "{error:#}"
         );
         assert!(tokio::time::timeout(Duration::from_secs(2), closed_observed).await??);
-        assert!(peer.online(&network).await.is_empty());
+        assert!(peer.online(&cluster).await.is_empty());
         assert_eq!(transport.admission.snapshot().total, 0);
         assert!(
             transport.state.lock().await.paths.is_empty(),
@@ -7005,15 +7005,15 @@ mod tests {
         let owner = LocalIdentity::generate();
         let target_identity = LocalIdentity::generate();
         let untrusted = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let roles = vec![
             crate::model::NodeRole::Replica,
             crate::model::NodeRole::Relay,
         ];
         let mut store = crate::store::Store::open(":memory:")?;
         store.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(
+            &cluster,
+            &owner.sign_cluster_fixture(
                 1,
                 vec![
                     owner.certificate(roles.clone())?,
@@ -7034,7 +7034,7 @@ mod tests {
         let (bad_rejected, rejected) = oneshot::channel();
         let bad_identity = target_identity.clone();
         let bad_owner = owner.clone();
-        let bad_network = network.clone();
+        let bad_cluster = cluster.clone();
         tasks.spawn(async move {
             let result = async {
                 let mut accepted = bad_incoming.recv().await.context("malformed Hello path missing")?;
@@ -7046,7 +7046,7 @@ mod tests {
                 assert_eq!(hello["peer_id"], bad_owner.peer_id()?);
                 let mut channel = handshake.finish().map_err(anyhow::Error::msg)?;
                 let malformed = serde_json::to_vec(&serde_json::json!({
-                    "version":crate::model::WIRE_VERSION,"network_id":bad_network,"peer_id":untrusted.peer_id()?
+                    "version":crate::model::WIRE_VERSION,"cluster_id":bad_cluster,"peer_id":untrusted.peer_id()?
                 }))?;
                 for record in channel.seal_message(&malformed).map_err(anyhow::Error::msg)? {
                     send_frame(&mut accepted.socket, Message::Binary(record.into())).await?;
@@ -7093,13 +7093,13 @@ mod tests {
             .record_path(&target_id, &format!("direct:{bad_url}"), true)
             .await;
         let driver_peer = peer.clone();
-        let driver_network = network.clone();
+        let driver_cluster = cluster.clone();
         let driver_target = target_id.clone();
         let driver_transport = transport.clone();
         let mut driver = tokio::spawn(async move {
             driver_peer
                 .connect_target(
-                    driver_network,
+                    driver_cluster,
                     driver_target,
                     driver_transport,
                     None,
@@ -7110,14 +7110,14 @@ mod tests {
         tokio::select! {
             result = &mut driver => bail!("malformed Hello terminated the flight: {result:?}"),
             ready = tokio::time::timeout(Duration::from_secs(5), async {
-                while !peer.online(&network).await.contains(&target_id) { tokio::task::yield_now().await; }
+                while !peer.online(&cluster).await.contains(&target_id) { tokio::task::yield_now().await; }
             }) => ready?,
         }
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(2),
                 peer.request(
-                    &network,
+                    &cluster,
                     &target_id,
                     serde_json::json!({"type":"classification_probe"})
                 )
@@ -7143,7 +7143,7 @@ mod tests {
                 .await??
                 .is_err()
         );
-        assert!(peer.online(&network).await.is_empty());
+        assert!(peer.online(&cluster).await.is_empty());
         assert_eq!(transport.admission.snapshot().total, 0);
         eprintln!(
             "NET1_M4 actual_target_noise_complete=true malformed_hello_claim_untrusted=true classified_path_failure=true healthy_same_target_noise_hello_authorization_wins=true encrypted_query_response=true"

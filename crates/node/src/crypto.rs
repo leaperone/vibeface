@@ -5,7 +5,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
+const EVENT_DOMAIN: &[u8] = b"vibeface:event:v2:";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,7 +32,7 @@ impl LocalIdentity {
     pub fn peer_id(&self) -> Result<PeerId> {
         fingerprint(&self.public_key_hex()?)
     }
-    pub fn network_id(&self) -> Result<NetworkId> {
+    pub fn cluster_id(&self) -> Result<ClusterId> {
         self.peer_id()
     }
     pub fn certificate(&self, roles: Vec<NodeRole>) -> Result<NodeCertificate> {
@@ -75,25 +75,25 @@ impl LocalIdentity {
     fn fixture_root(&self) -> Self {
         Self {
             secret_key_hex: digest(
-                format!("vibeface:network-fixture-root:v1:{}", self.secret_key_hex).as_bytes(),
+                format!("vibeface:cluster-fixture-root:v1:{}", self.secret_key_hex).as_bytes(),
             ),
         }
     }
     #[cfg(test)]
-    pub fn fixture_network_id(&self) -> Result<String> {
-        self.fixture_root().network_id()
+    pub fn fixture_cluster_id(&self) -> Result<String> {
+        self.fixture_root().cluster_id()
     }
     #[cfg(test)]
-    pub fn sign_network_fixture(
+    pub fn sign_cluster_fixture(
         &self,
         revision: u64,
         nodes: Vec<NodeCertificate>,
-    ) -> Result<crate::identity::NetworkState> {
+    ) -> Result<crate::identity::ClusterState> {
         use crate::identity::{
-            Genesis, HistoricalNode, IdentityKind, Member, NetworkState, RootCheckpoint,
+            ClusterState, Genesis, HistoricalNode, IdentityKind, Member, RootCheckpoint,
         };
 
-        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
+        let mut admin_seed = b"vibeface:cluster-fixture-admin:v1:".to_vec();
         admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
         let admin_secret = Sha256::digest(admin_seed);
         let admin = LocalIdentity {
@@ -133,10 +133,10 @@ impl LocalIdentity {
             member.validate()?;
             members.push(member);
         }
-        let mut state = NetworkState::new(genesis)?;
+        let mut state = ClusterState::new(genesis)?;
         let epoch = revision
             .checked_add(1)
-            .context("network fixture revision overflow")?;
+            .context("cluster fixture revision overflow")?;
         state.recover(RootCheckpoint::create_with_history(
             &root, epoch, members, history,
         )?)?;
@@ -184,7 +184,7 @@ fn node_role_key(role: &NodeRole) -> &'static str {
     }
 }
 pub fn verify_signed_event(
-    network_id: &str,
+    cluster_id: &str,
     event: &SignedEvent,
     public_key: &str,
 ) -> Result<Event> {
@@ -202,8 +202,8 @@ pub fn verify_signed_event(
         "noncanonical event encoding"
     );
     ensure!(
-        body.network_id == network_id,
-        "event belongs to another network"
+        body.cluster_id == cluster_id,
+        "event belongs to another cluster"
     );
     ensure!(
         body.author == fingerprint(public_key)?,
@@ -242,7 +242,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         !event.scope_id.is_empty() && event.scope_id.len() <= 512,
         "invalid scope"
     );
-    decode32(&event.network_id)?;
+    decode32(&event.cluster_id)?;
     decode32(&event.author)?;
     ensure!(
         event.sequence > 0 && event.sequence <= i64::MAX as u64,
@@ -317,7 +317,7 @@ mod tests {
         let revoked = LocalIdentity::generate();
         let mut revoked_certificate = revoked.certificate(vec![NodeRole::Relay])?;
         revoked_certificate.revoked = true;
-        let state = owner.sign_network_fixture(
+        let state = owner.sign_cluster_fixture(
             1,
             vec![
                 owner.certificate(vec![NodeRole::Gateway])?,
@@ -325,13 +325,13 @@ mod tests {
             ],
         )?;
         let view = state.project()?;
-        assert_eq!(view.network_id, owner.fixture_network_id()?);
+        assert_eq!(view.cluster_id, owner.fixture_cluster_id()?);
         assert!(
             view.authorize_node(&owner.peer_id()?, Some(NodeRole::Replica))
                 .is_ok()
         );
         assert!(view.authorize_node(&revoked.peer_id()?, None).is_err());
-        let all = owner.sign_network_fixture(
+        let all = owner.sign_cluster_fixture(
             1,
             vec![owner.certificate(vec![
                 NodeRole::Scheduler,
@@ -344,7 +344,7 @@ mod tests {
                 .authorize_node(&owner.peer_id()?, Some(NodeRole::Scheduler))
                 .is_ok()
         );
-        let later = owner.sign_network_fixture(2, vec![])?;
+        let later = owner.sign_cluster_fixture(2, vec![])?;
         assert_eq!(state.genesis, later.genesis);
         let signed = owner.sign_payload("peer-request", b"challenge")?;
         verify_payload(
@@ -364,8 +364,8 @@ mod tests {
         );
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
         let body = Event {
-            version: 1,
-            network_id: owner.fixture_network_id()?,
+            version: crate::model::WIRE_VERSION,
+            cluster_id: owner.fixture_cluster_id()?,
             scope_id: "c".into(),
             author: owner.peer_id()?,
             sequence: 1,
@@ -377,14 +377,31 @@ mod tests {
             },
             blobs: vec![],
         };
-        let event = owner.sign_event(body)?;
-        verify_signed_event(&view.network_id, &event, &owner.public_key_hex()?)?;
+        let wire = serde_json::to_string(&body)?;
+        assert_eq!(serde_json::from_str::<Event>(&wire)?, body);
+        assert!(serde_json::from_str::<Event>(&wire.replace("cluster_id", "network_id")).is_err());
+        let event = owner.sign_event(body.clone())?;
+        verify_signed_event(&view.cluster_id, &event, &owner.public_key_hex()?)?;
+        let mut previous = body;
+        previous.version = 1;
+        assert!(owner.sign_event(previous).is_err());
+        let mut previous_domain = event.clone();
+        previous_domain.signature = hex::encode(
+            owner
+                .key()?
+                .sign(&domain_message(b"vibeface:event:v1:", &event.hash))
+                .to_bytes(),
+        );
+        assert!(
+            verify_signed_event(&view.cluster_id, &previous_domain, &owner.public_key_hex()?)
+                .is_err()
+        );
         let mut bad = event.clone();
         bad.canonical_body.push(' ');
-        assert!(verify_signed_event(&view.network_id, &bad, &owner.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&view.cluster_id, &bad, &owner.public_key_hex()?).is_err());
         assert!(verify_signed_event(&"0".repeat(64), &event, &owner.public_key_hex()?).is_err());
         let other = LocalIdentity::generate();
-        assert!(verify_signed_event(&view.network_id, &event, &other.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&view.cluster_id, &event, &other.public_key_hex()?).is_err());
         Ok(())
     }
 
@@ -395,7 +412,7 @@ mod tests {
         let task = digest(b"task");
         let mut event = Event {
             version: WIRE_VERSION,
-            network_id: identity.fixture_network_id()?,
+            cluster_id: identity.fixture_cluster_id()?,
             scope_id: "conversation".into(),
             author: identity.peer_id()?,
             sequence: 1,
@@ -415,7 +432,7 @@ mod tests {
             blobs: vec![],
         };
         let signed = identity.sign_event(event.clone())?;
-        verify_signed_event(&event.network_id, &signed, &identity.public_key_hex()?)?;
+        verify_signed_event(&event.cluster_id, &signed, &identity.public_key_hex()?)?;
         let EventBody::AgentMessage { message } = &mut event.body else {
             unreachable!()
         };

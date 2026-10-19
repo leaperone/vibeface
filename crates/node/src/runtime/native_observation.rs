@@ -43,14 +43,14 @@ fn key(work_id: &str) -> String {
     format!("native-observation:v1:work:{work_id}")
 }
 
-pub(super) fn sessions_from(store: &Store, network: &str) -> Result<Vec<NativeWork>> {
+pub(super) fn sessions_from(store: &Store, cluster: &str) -> Result<Vec<NativeWork>> {
     let ids: Vec<String> =
-        serde_json::from_value(store.local_value(network, INDEX)?.unwrap_or(json!([])))?;
+        serde_json::from_value(store.local_value(cluster, INDEX)?.unwrap_or(json!([])))?;
     ids.into_iter()
         .map(|id| {
             serde_json::from_value(
                 store
-                    .local_value(network, &key(&id))?
+                    .local_value(cluster, &key(&id))?
                     .context("native observation is missing")?,
             )
             .map_err(Into::into)
@@ -58,8 +58,8 @@ pub(super) fn sessions_from(store: &Store, network: &str) -> Result<Vec<NativeWo
         .collect()
 }
 
-fn save_work(store: &mut Store, network: &str, work: &NativeWork) -> Result<()> {
-    store.local_set(network, &key(&work.work_id), &serde_json::to_value(work)?)
+fn save_work(store: &mut Store, cluster: &str, work: &NativeWork) -> Result<()> {
+    store.local_set(cluster, &key(&work.work_id), &serde_json::to_value(work)?)
 }
 
 fn event_identity(event: &Value) -> (Option<&str>, Option<&str>) {
@@ -316,14 +316,14 @@ impl Runtime {
             Self::check_manager_permission(&store, access, true, None)?;
             let job = store
                 .scheduler_job(
-                    &access.network_id,
+                    &access.cluster_id,
                     scope,
                     &manager.trigger,
                     &manager.target_node,
                 )?
                 .context("Agent invocation is missing")?;
             let task_ref = (job.kind == TriggerKind::AgentTask).then(|| job.trigger.clone());
-            let works = sessions_from(&store, &access.network_id)?;
+            let works = sessions_from(&store, &access.cluster_id)?;
             if let Some(previous) = works.iter().find(|work| {
                 work.thread_id == thread_id && work.turn_id.as_deref() == Some(&turn_id)
             }) {
@@ -360,17 +360,17 @@ impl Runtime {
                     detail: "The original native turn has been recorded but is not yet verified on this Socket. Its outcome is unknown.".into(),
                     sequence: 0,
                 };
-                save_work(&mut store, &access.network_id, &work)?;
+                save_work(&mut store, &access.cluster_id, &work)?;
                 let mut ids = works
                     .into_iter()
                     .map(|work| work.work_id)
                     .collect::<Vec<_>>();
                 ids.push(work.work_id.clone());
-                store.local_set(&access.network_id, INDEX, &json!(ids))?;
+                store.local_set(&access.cluster_id, INDEX, &json!(ids))?;
                 work
             }
         };
-        self.publish_changed(&access.network_id, scope, &work.origin_trigger);
+        self.publish_changed(&access.cluster_id, scope, &work.origin_trigger);
         let observation = tokio::time::timeout(Duration::from_secs(10), async {
             let client = self.native_client()?;
             client.set_observed_threads(
@@ -428,7 +428,7 @@ impl Runtime {
                     self.store
                         .lock()
                         .await
-                        .local_value(&access.network_id, &key(&work.work_id))?
+                        .local_value(&access.cluster_id, &key(&work.work_id))?
                         .context("native work is missing")?,
                 )?;
                 if current.state.terminal()
@@ -450,7 +450,7 @@ impl Runtime {
             let mut store = self.store.lock().await;
             let mut current: NativeWork = serde_json::from_value(
                 store
-                    .local_value(&access.network_id, &key(&work.work_id))?
+                    .local_value(&access.cluster_id, &key(&work.work_id))?
                     .context("native work is missing")?,
             )?;
             let assistant = snapshot.as_ref().and_then(|snapshot| {
@@ -463,7 +463,7 @@ impl Runtime {
                 && (turn.is_ok() || current.sequence == work.sequence)
                 && reconcile_work(&mut current, turn, assistant)
             {
-                save_work(&mut store, &access.network_id, &current)?;
+                save_work(&mut store, &access.cluster_id, &current)?;
             }
         }
         if let Some(snapshot) = snapshot {
@@ -479,11 +479,11 @@ impl Runtime {
                 }
             }
         }
-        self.publish_changed(&access.network_id, scope, &work.origin_trigger);
+        self.publish_changed(&access.cluster_id, scope, &work.origin_trigger);
         self.store
             .lock()
             .await
-            .local_value(&access.network_id, &key(&work.work_id))?
+            .local_value(&access.cluster_id, &key(&work.work_id))?
             .context("native observation was not saved")
     }
 
@@ -507,23 +507,23 @@ impl Runtime {
     }
 
     async fn native_observed_work(&self) -> Result<Vec<(String, NativeWork)>> {
-        let networks = self.store.lock().await.networks()?;
+        let clusters = self.store.lock().await.clusters()?;
         let mut all = Vec::new();
-        for network in networks {
+        for cluster in clusters {
             let store = self.store.lock().await;
             if store
                 .authorize_node(
-                    &network,
+                    &cluster,
                     &self.identity.peer_id()?,
                     Some(NodeRole::Scheduler),
                 )
                 .is_ok()
             {
                 all.extend(
-                    sessions_from(&store, &network)?
+                    sessions_from(&store, &cluster)?
                         .into_iter()
                         .filter(|work| !work.state.terminal())
-                        .map(|work| (network.clone(), work)),
+                        .map(|work| (cluster.clone(), work)),
                 );
             }
         }
@@ -539,7 +539,7 @@ impl Runtime {
         if snapshot["connection"]["state"] != "connected" {
             return Ok(());
         }
-        for (network, work) in all {
+        for (cluster, work) in all {
             if let Some(request) = pending_native_request(&snapshot, &work) {
                 if !matches!(work.state, NativeState::Waiting | NativeState::Interrupting) {
                     self.observe_native(request.clone()).await?;
@@ -574,17 +574,17 @@ impl Runtime {
             let mut store = self.store.lock().await;
             let mut current: NativeWork = serde_json::from_value(
                 store
-                    .local_value(&network, &key(&work.work_id))?
+                    .local_value(&cluster, &key(&work.work_id))?
                     .context("native work is missing")?,
             )?;
             let changed = (turn.is_ok() || current.sequence == work.sequence)
                 && reconcile_work(&mut current, turn, assistant);
             if changed {
-                save_work(&mut store, &network, &current)?;
+                save_work(&mut store, &cluster, &current)?;
             }
             drop(store);
             if changed {
-                self.publish_changed(&network, &current.conversation_id, &current.origin_trigger);
+                self.publish_changed(&cluster, &current.conversation_id, &current.origin_trigger);
             }
         }
         Ok(())
@@ -592,12 +592,12 @@ impl Runtime {
 
     pub(super) async fn observe_native(&self, event: Value) -> Result<()> {
         let _work = self.maintenance.enter_when_open().await;
-        let networks = self.store.lock().await.networks()?;
-        for network in networks {
+        let clusters = self.store.lock().await.clusters()?;
+        for cluster in clusters {
             let mut store = self.store.lock().await;
             if store
                 .authorize_node(
-                    &network,
+                    &cluster,
                     &self.identity.peer_id()?,
                     Some(NodeRole::Scheduler),
                 )
@@ -605,23 +605,23 @@ impl Runtime {
             {
                 continue;
             }
-            let works = sessions_from(&store, &network)?;
+            let works = sessions_from(&store, &cluster)?;
             for mut work in works {
                 let mut changed_hash = work.origin_trigger.clone();
                 if event["method"] == "bridge.codex_disconnected" && !work.state.terminal() {
                     work.state = NativeState::Unknown;
-                    save_work(&mut store, &network, &work)?;
+                    save_work(&mut store, &cluster, &work)?;
                 } else if apply_event(&mut work, &event) {
                     work.sequence = work
                         .sequence
                         .checked_add(1)
                         .context("native progress sequence overflow")?;
-                    save_work(&mut store, &network, &work)?;
+                    save_work(&mut store, &cluster, &work)?;
                     let sequence = work.sequence;
                     if native_input_request(&event)
                         && let Some(notification) = store.raise_notification_once(
                             &self.identity,
-                            &network,
+                            &cluster,
                             Notification {
                                 notification_id: format!(
                                     "native-input-{}",
@@ -640,14 +640,14 @@ impl Runtime {
                     {
                         changed_hash = notification.hash;
                     }
-                    self.publish_progress(&network, json!({"type":"native_progress","conversation_id":work.conversation_id,
+                    self.publish_progress(&cluster, json!({"type":"native_progress","conversation_id":work.conversation_id,
                         "work_id":work.work_id,"target_node":work.target_node,"source_node":work.target_node,
                         "thread_id":work.thread_id,"turn_id":work.turn_id,"task_ref":work.task_ref,
                         "sequence":sequence,"progress":observation::native_progress(&event)}));
                 } else {
                     continue;
                 }
-                self.publish_changed(&network, &work.conversation_id, &changed_hash);
+                self.publish_changed(&cluster, &work.conversation_id, &changed_hash);
             }
         }
         Ok(())
@@ -655,24 +655,24 @@ impl Runtime {
 
     pub(crate) async fn wait_native_work(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
         trigger: &str,
         attempt: &str,
     ) -> Result<Vec<NativeWork>> {
         loop {
             let works = self
-                .native_work_for_attempt(network, scope, trigger, attempt)
+                .native_work_for_attempt(cluster, scope, trigger, attempt)
                 .await?;
             let target = self.identity.peer_id()?;
             let job = self
                 .store
                 .lock()
                 .await
-                .scheduler_job(network, scope, trigger, &target)?
+                .scheduler_job(cluster, scope, trigger, &target)?
                 .context("task invocation is missing")?;
             let children = if job.kind == TriggerKind::AgentTask {
-                self.child_agent_tasks(network, scope, trigger).await?
+                self.child_agent_tasks(cluster, scope, trigger).await?
             } else {
                 Vec::new()
             };
@@ -703,13 +703,13 @@ impl Runtime {
 
     pub(crate) async fn child_agent_tasks(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
         trigger: &str,
     ) -> Result<Vec<Value>> {
         let local = self.identity.peer_id()?;
         let store = self.store.lock().await;
-        let context = store.context(network, scope, &[])?;
+        let context = store.context(cluster, scope, &[])?;
         context
             .events
             .iter()
@@ -723,7 +723,7 @@ impl Runtime {
                 (message.kind == AgentMessageKind::Task && message.origin_trigger == trigger).then(
                     || {
                         store.agent_task_status(
-                            network,
+                            cluster,
                             scope,
                             &crypto::digest(&serde_json::to_vec(event)?),
                         )
@@ -735,12 +735,12 @@ impl Runtime {
 
     pub(crate) async fn native_work_for_attempt(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
         trigger: &str,
         attempt: &str,
     ) -> Result<Vec<NativeWork>> {
-        Ok(sessions_from(&*self.store.lock().await, network)?
+        Ok(sessions_from(&*self.store.lock().await, cluster)?
             .into_iter()
             .filter(|work| {
                 work.conversation_id == scope
@@ -750,14 +750,14 @@ impl Runtime {
             .collect())
     }
 
-    pub(super) async fn native_status(&self, network: &str, scope: &str) -> Result<Value> {
+    pub(super) async fn native_status(&self, cluster: &str, scope: &str) -> Result<Value> {
         let snapshot = match &self.codex {
             Some(client) => client.snapshot().await,
             None => Value::Null,
         };
         let store = self.store.lock().await;
-        store.authorize_node(network, &self.identity.peer_id()?, None)?;
-        let sessions = sessions_from(&store, network)?
+        store.authorize_node(cluster, &self.identity.peer_id()?, None)?;
+        let sessions = sessions_from(&store, cluster)?
             .into_iter()
             .filter(|work| work.conversation_id == scope)
             .map(|work| {
@@ -793,20 +793,20 @@ impl Runtime {
         self.require_scope(access, scope).await?;
         let method = field(input, "method")?;
         if target != self.identity.peer_id()? {
-            self.require_role(&access.network_id, NodeRole::Gateway)
+            self.require_role(&access.cluster_id, NodeRole::Gateway)
                 .await?;
             let mut request = input.clone();
             request["type"] = json!(method);
             request["human"] = json!(true);
-            return self.peer_request(&access.network_id, target, request).await;
+            return self.peer_request(&access.cluster_id, target, request).await;
         }
-        self.native_control_local(&access.network_id, input, method)
+        self.native_control_local(&access.cluster_id, input, method)
             .await
     }
 
     pub(super) async fn native_control_local(
         &self,
-        network: &str,
+        cluster: &str,
         input: &Value,
         method: &str,
     ) -> Result<Value> {
@@ -819,13 +819,13 @@ impl Runtime {
         let work: NativeWork = {
             let store = self.store.lock().await;
             store.authorize_node(
-                network,
+                cluster,
                 &self.identity.peer_id()?,
                 Some(NodeRole::Scheduler),
             )?;
             serde_json::from_value(
                 store
-                    .local_value(network, &key(work_id))?
+                    .local_value(cluster, &key(work_id))?
                     .context("native work not found")?,
             )?
         };
@@ -835,7 +835,7 @@ impl Runtime {
         );
         ensure!(!work.state.terminal(), "native turn is already terminal");
         if method == "native_interrupt" {
-            return self.interrupt_native_work(network, work).await;
+            return self.interrupt_native_work(cluster, work).await;
         }
         ensure!(method == "native_respond", "unknown native control");
         let request_id = input
@@ -860,7 +860,7 @@ impl Runtime {
         Ok(json!({"work_id":work_id,"responded":true}))
     }
 
-    async fn interrupt_native_work(&self, network: &str, mut work: NativeWork) -> Result<Value> {
+    async fn interrupt_native_work(&self, cluster: &str, mut work: NativeWork) -> Result<Value> {
         let turn = work
             .turn_id
             .as_deref()
@@ -886,24 +886,24 @@ impl Runtime {
         let mut store = self.store.lock().await;
         let current: NativeWork = serde_json::from_value(
             store
-                .local_value(network, &key(&work.work_id))?
+                .local_value(cluster, &key(&work.work_id))?
                 .context("native work missing")?,
         )?;
         if !current.state.terminal() {
-            save_work(&mut store, network, &work)?;
+            save_work(&mut store, cluster, &work)?;
         }
         drop(store);
-        self.publish_changed(network, &work.conversation_id, &work.origin_trigger);
+        self.publish_changed(cluster, &work.conversation_id, &work.origin_trigger);
         Ok(json!({"work_id":work.work_id,"interrupt_requested":true,"confirmed":false}))
     }
 
     pub(super) async fn interrupt_native_task(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
         trigger: &str,
     ) -> Result<()> {
-        let works = sessions_from(&*self.store.lock().await, network)?
+        let works = sessions_from(&*self.store.lock().await, cluster)?
             .into_iter()
             .filter(|work| {
                 work.conversation_id == scope
@@ -912,7 +912,7 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         for work in works {
-            if let Err(error) = self.interrupt_native_work(network, work).await {
+            if let Err(error) = self.interrupt_native_work(cluster, work).await {
                 tracing::debug!(%error, "native task interruption is unconfirmed");
             }
         }
@@ -989,12 +989,12 @@ mod tests {
         }
     }
 
-    async fn manager_access(node: &Runtime, network: &str, message_id: &str) -> Result<Access> {
+    async fn manager_access(node: &Runtime, cluster: &str, message_id: &str) -> Result<Access> {
         let local = node.identity.peer_id()?;
         let mut store = node.store.lock().await;
         let (event, _) = store.accept_message(
             &node.identity,
-            network,
+            cluster,
             "chat",
             EventBody::MessagePosted {
                 message_id: message_id.into(),
@@ -1009,16 +1009,16 @@ mod tests {
             false,
         )?;
         let job = store
-            .claim_next(network, "chat", &local, "native-observation-test", "sdk")?
+            .claim_next(cluster, "chat", &local, "native-observation-test", "sdk")?
             .context("native observation fixture was not claimed")?
             .job;
         let attempt = job
             .state
             .attempt()
             .context("native observation fixture has no attempt")?;
-        store.mark_started(network, "chat", &local, &event.hash, &attempt.id)?;
+        store.mark_started(cluster, "chat", &local, &event.hash, &attempt.id)?;
         Ok(Access {
-            network_id: network.into(),
+            cluster_id: cluster.into(),
             human: false,
             conversation_id: Some("chat".into()),
             manager: Some(ManagerAccess {
@@ -1056,13 +1056,13 @@ mod tests {
     -> Result<()> {
         let dir = crate::runtime::tests::fixture()?;
         let node = Runtime::open(&dir).await?;
-        let network = crate::runtime::tests::conversation(&node).await?;
+        let cluster = crate::runtime::tests::conversation(&node).await?;
         let mut observed = work();
         observed.target_node = node.identity.peer_id()?;
         {
             let mut store = node.store.lock().await;
-            save_work(&mut store, &network, &observed)?;
-            store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+            save_work(&mut store, &cluster, &observed)?;
+            store.local_set(&cluster, INDEX, &json!([observed.work_id]))?;
         }
         let mut updates = node.events.subscribe();
         let approval = json!({"id":42,"method":"item/commandExecution/requestApproval",
@@ -1075,32 +1075,32 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .pending_notifications(&network, "phone")?
+                .pending_notifications(&cluster, "phone")?
                 .is_empty()
         );
         node.observe_native(approval.clone()).await?;
         node.observe_native(approval).await?;
         let (notification, bundle, snapshot) = {
             let store = node.store.lock().await;
-            let notices = store.pending_notifications(&network, "phone")?;
+            let notices = store.pending_notifications(&cluster, "phone")?;
             assert_eq!(notices.len(), 1);
             let notice = notices[0].clone();
             assert_eq!(notice.kind, "needs_input");
             assert_eq!(notice.text, "后台工作需要你的确认。");
             let event = store
-                .event(&network, &notice.event_hash)?
+                .event(&cluster, &notice.event_hash)?
                 .context("native approval notification is not a signed event")?;
             let body: Event = serde_json::from_str(&event.canonical_body)?;
             assert!(matches!(body.body, EventBody::NotificationRaised { .. }));
             assert!(!serde_json::to_string(&event)?.contains("private-"));
             assert_eq!(
-                sessions_from(&store, &network)?[0].state,
+                sessions_from(&store, &cluster)?[0].state,
                 NativeState::Waiting
             );
             (
                 notice,
-                store.trust_bundle(&network)?.unwrap(),
-                store.export_snapshot(&network, "chat")?,
+                store.trust_bundle(&cluster)?.unwrap(),
+                store.export_snapshot(&cluster, "chat")?,
             )
         };
         assert!(
@@ -1111,20 +1111,20 @@ mod tests {
         );
         let replica_path = dir.join("replica.sqlite3");
         let mut replica = Store::open(&replica_path)?;
-        replica.install_trust_bundle(&network, &bundle)?;
-        replica.import_snapshot(&network, &snapshot)?;
+        replica.install_trust_bundle(&cluster, &bundle)?;
+        replica.import_snapshot(&cluster, &snapshot)?;
         drop(replica);
         let replica = Store::open(&replica_path)?;
         assert_eq!(
-            replica.pending_notifications(&network, "phone")?,
+            replica.pending_notifications(&cluster, "phone")?,
             vec![notification]
         );
         assert!(
             replica
-                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
+                .scheduler_jobs(&cluster, "chat", &node.identity.peer_id()?)?
                 .is_empty()
         );
-        assert!(replica.scheduler_outbox_all(&network)?.is_empty());
+        assert!(replica.scheduler_outbox_all(&cluster)?.is_empty());
         drop(replica);
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1221,12 +1221,12 @@ mod tests {
                 events,
             ));
             let node = Arc::new(node);
-            let network = crate::runtime::tests::conversation(&node).await?;
+            let cluster = crate::runtime::tests::conversation(&node).await?;
             let observed = work();
             {
                 let mut store = node.store.lock().await;
-                save_work(&mut store, &network, &observed)?;
-                store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+                save_work(&mut store, &cluster, &observed)?;
+                store.local_set(&cluster, INDEX, &json!([observed.work_id]))?;
             }
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
@@ -1241,7 +1241,7 @@ mod tests {
             })
             .await??;
             node.refresh_native_subscriptions().await?;
-            let restored = sessions_from(&*node.store.lock().await, &network)?;
+            let restored = sessions_from(&*node.store.lock().await, &cluster)?;
             assert_eq!(
                 restored[0].state,
                 if history_available {
@@ -1270,7 +1270,7 @@ mod tests {
                         .any(|request| request["method"] == "thread/turns/list")
                 );
             }
-            let access = manager_access(&node, &network, "observed-native-turn").await?;
+            let access = manager_access(&node, &cluster, "observed-native-turn").await?;
             let args = json!({"thread_id":"thread","turn_id":"later-turn"});
             assert!(node.observe_session(&access, &args, "").await.is_err());
             let mut stale = access.clone();
@@ -1280,7 +1280,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(sessions_from(&*node.store.lock().await, &network)?.len(), 1);
+            assert_eq!(sessions_from(&*node.store.lock().await, &cluster)?.len(), 1);
             let attached = node
                 .observe_session(&access, &args, "observed-call")
                 .await?;
@@ -1304,7 +1304,7 @@ mod tests {
                     .is_err()
             );
             assert_eq!(
-                sessions_from(&*node.store.lock().await, &network)?
+                sessions_from(&*node.store.lock().await, &cluster)?
                     .iter()
                     .find(|work| work.turn_id.as_deref() == Some("delayed-turn"))
                     .unwrap()
@@ -1320,7 +1320,7 @@ mod tests {
                 node.store
                     .lock()
                     .await
-                    .scheduler_job(&network, "chat", &manager.trigger, &manager.target_node)?
+                    .scheduler_job(&cluster, "chat", &manager.trigger, &manager.target_node)?
                     .unwrap()
                     .state,
                 JobState::Running { .. }
@@ -1328,7 +1328,7 @@ mod tests {
             assert!(
                 tokio::time::timeout(
                     Duration::from_millis(50),
-                    node.wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id),
+                    node.wait_native_work(&cluster, "chat", &manager.trigger, &manager.attempt_id),
                 )
                 .await
                 .is_err()
@@ -1340,7 +1340,7 @@ mod tests {
             assert!(matches!(
                 outcome(
                     &node
-                        .wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id)
+                        .wait_native_work(&cluster, "chat", &manager.trigger, &manager.attempt_id)
                         .await?
                 ),
                 Some(JobOutcome::Completed)
@@ -1355,7 +1355,7 @@ mod tests {
             assert_eq!(unverified["state"], "unknown");
             assert_eq!(unverified["turn_id"], "unverified-turn");
             let error = node
-                .wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id)
+                .wait_native_work(&cluster, "chat", &manager.trigger, &manager.attempt_id)
                 .await
                 .unwrap_err();
             assert!(
@@ -1423,13 +1423,13 @@ mod tests {
     async fn unavailable_native_history_exits_the_running_task_wait_as_unknown() -> Result<()> {
         let dir = crate::runtime::tests::fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
-        let network = crate::runtime::tests::conversation(&node).await?;
+        let cluster = crate::runtime::tests::conversation(&node).await?;
         let local = node.identity.peer_id()?;
         let (trigger, attempt) = {
             let mut store = node.store.lock().await;
             let (event, _) = store.accept_message(
                 &node.identity,
-                &network,
+                &cluster,
                 "chat",
                 EventBody::MessagePosted {
                     message_id: "native-recovery".into(),
@@ -1444,7 +1444,7 @@ mod tests {
                 false,
             )?;
             let job = store
-                .claim_next(&network, "chat", &local, "native-recovery-test", "sdk")?
+                .claim_next(&cluster, "chat", &local, "native-recovery-test", "sdk")?
                 .context("native recovery fixture was not claimed")?
                 .job;
             let attempt = job
@@ -1453,7 +1453,7 @@ mod tests {
                 .context("native recovery fixture has no attempt")?
                 .id
                 .clone();
-            store.mark_started(&network, "chat", &local, &event.hash, &attempt)?;
+            store.mark_started(&cluster, "chat", &local, &event.hash, &attempt)?;
             (event.hash, attempt)
         };
         let mut observed = work();
@@ -1468,12 +1468,12 @@ mod tests {
         assert_eq!(observed.state, NativeState::Unknown);
         {
             let mut store = node.store.lock().await;
-            save_work(&mut store, &network, &observed)?;
-            store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+            save_work(&mut store, &cluster, &observed)?;
+            store.local_set(&cluster, INDEX, &json!([observed.work_id]))?;
         }
         let error = tokio::time::timeout(
             Duration::from_secs(1),
-            node.wait_native_work(&network, "chat", &trigger, &attempt),
+            node.wait_native_work(&cluster, "chat", &trigger, &attempt),
         )
         .await
         .context("unknown native history must not leave the task waiting")?
@@ -1486,13 +1486,13 @@ mod tests {
         let store = node.store.lock().await;
         assert!(matches!(
             store
-                .scheduler_job(&network, "chat", &trigger, &local)?
+                .scheduler_job(&cluster, "chat", &trigger, &local)?
                 .unwrap()
                 .state,
             JobState::Running { .. }
         ));
         assert_eq!(
-            sessions_from(&store, &network)?[0].state,
+            sessions_from(&store, &cluster)?[0].state,
             NativeState::Unknown
         );
         drop(store);
@@ -1505,22 +1505,22 @@ mod tests {
     fn native_progress_sequence_survives_store_reopen() -> Result<()> {
         let dir = crate::runtime::tests::fixture()?;
         let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
+        let cluster = identity.fixture_cluster_id()?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.install_trust_bundle(
-            &network,
-            &identity.sign_network_fixture(
+            &cluster,
+            &identity.sign_cluster_fixture(
                 1,
                 vec![identity.certificate(vec![NodeRole::Replica, NodeRole::Scheduler])?],
             )?,
         )?;
         let mut observed = work();
         observed.sequence = 41;
-        save_work(&mut store, &network, &observed)?;
-        store.local_set(&network, INDEX, &json!([observed.work_id]))?;
+        save_work(&mut store, &cluster, &observed)?;
+        store.local_set(&cluster, INDEX, &json!([observed.work_id]))?;
         drop(store);
         let store = Store::open(dir.join("node.sqlite3"))?;
-        let restored = sessions_from(&store, &network)?;
+        let restored = sessions_from(&store, &cluster)?;
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].sequence, 41);
         assert_eq!(restored[0].thread_id, "thread");

@@ -20,7 +20,7 @@ use vibeface_bridge::agent::CustomToolConfig;
 const PROMPT_LIMIT: usize = 60_000;
 const INLINE_OUTPUT: usize = 16_384;
 const CONSTRAINTS: &[&str] = &[
-    "Operate only inside this personal network and conversation.",
+    "Operate only inside this cluster and conversation.",
     "Use the SDK host Shell and file tools for work on this device. Use send_task to ask another Node's Agent to work on its own host.",
     "When starting native Codex work, use VIBEFACE_CODEX_SOCKET and immediately register its exact thread_id and turn_id with observe_session before returning.",
     "An SDK reply is not completion of background work. Unknown outcomes require reconciliation of the original task or turn, never a new write attempt.",
@@ -33,13 +33,13 @@ pub(crate) fn boot_id() -> &'static str {
     BOOT.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-pub(crate) fn maintenance_idle(store: &Store, network: &str) -> Result<()> {
-    store.scheduler_maintenance_idle(network)
+pub(crate) fn maintenance_idle(store: &Store, cluster: &str) -> Result<()> {
+    store.scheduler_maintenance_idle(cluster)
 }
 
-fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
+fn invocation_value(job: &SchedulerJob, cluster: &str) -> Value {
     let mut value = serde_json::to_value(job).expect("scheduler job serializes");
-    value["network_id"] = json!(network);
+    value["cluster_id"] = json!(cluster);
     value["read_only"] = json!(job.state.attempt().is_some_and(|attempt| attempt.read_only));
     value["reply_message_id"] = if matches!(job.state, JobState::Completed { .. }) {
         json!(job.message_id)
@@ -60,17 +60,17 @@ fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
 
 pub async fn status(
     node: &Runtime,
-    network: &str,
+    cluster: &str,
     conversation: &str,
     trigger: &str,
 ) -> Result<Value> {
     let _work = node.maintenance.enter()?;
     let target = node.identity.peer_id()?;
     let mut store = node.store.lock().await;
-    store.recover_scheduler_jobs(network, &target, boot_id())?;
+    store.recover_scheduler_jobs(cluster, &target, boot_id())?;
     Ok(
-        match store.scheduler_job(network, conversation, trigger, &target)? {
-            Some(job) => invocation_value(&job, network),
+        match store.scheduler_job(cluster, conversation, trigger, &target)? {
+            Some(job) => invocation_value(&job, cluster),
             None => json!({"state":"not_found","trigger":trigger,"result":null}),
         },
     )
@@ -102,24 +102,24 @@ pub async fn run(
         _ => anyhow::bail!("unknown management SDK"),
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
-    let network = access.network_id.clone();
+    let cluster = access.cluster_id.clone();
     let target = node.identity.peer_id()?;
     let claimed = {
         let mut store = node.store.lock().await;
-        store.authorize_node(&network, &target, Some(NodeRole::Scheduler))?;
+        store.authorize_node(&cluster, &target, Some(NodeRole::Scheduler))?;
         let requested = store
-            .scheduler_job(&network, &conversation, &requested_trigger, &target)?
+            .scheduler_job(&cluster, &conversation, &requested_trigger, &target)?
             .context("trigger has not been durably admitted")?;
         if !matches!(requested.state, JobState::Queued) {
-            return Ok(invocation_value(&requested, &network));
+            return Ok(invocation_value(&requested, &cluster));
         }
         let Some(claimed) =
-            store.claim_next(&network, &conversation, &target, boot_id(), &sdk_config)?
+            store.claim_next(&cluster, &conversation, &target, boot_id(), &sdk_config)?
         else {
             let requested = store
-                .scheduler_job(&network, &conversation, &requested_trigger, &target)?
+                .scheduler_job(&cluster, &conversation, &requested_trigger, &target)?
                 .context("admitted trigger missing")?;
-            return Ok(invocation_value(&requested, &network));
+            return Ok(invocation_value(&requested, &cluster));
         };
         claimed
     };
@@ -137,10 +137,10 @@ pub async fn run(
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
         let (context, tasks, facts, targets) = {
             let store = node.store.lock().await;
-            let context = store.context(&network, &conversation, &job.basis_heads)?;
-            let tasks = serde_json::to_value(store.tasks(&network, &conversation)?)?;
+            let context = store.context(&cluster, &conversation, &job.basis_heads)?;
+            let tasks = serde_json::to_value(store.tasks(&cluster, &conversation)?)?;
             let facts = known_facts(&store, &context)?;
-            let view = store.trust_bundle(&network)?.context("missing network trust")?.project()?;
+            let view = store.trust_bundle(&cluster)?.context("missing cluster trust")?.project()?;
             let targets = view.members.into_iter().filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Scheduler)).map(|n| n.subject_id).collect::<Vec<_>>();
             (context,tasks,facts,targets)
         };
@@ -158,35 +158,35 @@ pub async fn run(
             tool_callback_url: Some(local_url.clone()), tool_callback_token: Some(token.clone()), tool_cli: Some(std::env::current_exe()?),
             tool_env: BTreeMap::from([
                 ("VIBEFACE_NODE_URL".into(), local_url), ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
-                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()), ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
+                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()), ("VIBEFACE_NODE_NETWORK".into(), cluster.clone()),
                 ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()), ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
                 ("VIBEFACE_CODEX_SOCKET".into(), node.config.codex_socket.as_ref().map(|socket| socket.to_string_lossy().into_owned()).unwrap_or_default()),
             ]),
         };
         if matches!(job.kind, TriggerKind::Autonomous | TriggerKind::AgentResult) {
-            node.store.lock().await.reserve_budget(&network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
+            node.store.lock().await.reserve_budget(&cluster, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
         }
         let cancel = node.register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, attempt.read_only).await?;
         registered = true;
         let persist_node = node.clone();
-        let persist_network = network.clone();
+        let persist_cluster = cluster.clone();
         let persist_conversation = conversation.clone();
         let persist_target = target.clone();
         let persist_trigger = trigger.clone();
         let persist_attempt = attempt.id.clone();
         let progress_node = node.clone();
-        let progress_network = network.clone();
+        let progress_cluster = cluster.clone();
         let progress_conversation = conversation.clone();
         let progress_trigger = trigger.clone();
         let progress_attempt = attempt.id.clone();
         let progress_sequence = std::sync::atomic::AtomicU64::new(0);
-        node.store.lock().await.mark_started(&network, &conversation, &target, &trigger, &attempt.id)?;
+        node.store.lock().await.mark_started(&cluster, &conversation, &target, &trigger, &attempt.id)?;
         started = true;
         let mut result = manager::run_manager(&config, &prompt, claimed.previous_native_id.as_deref(), move |id| async move {
-            persist_node.store.lock().await.save_scheduler_native_id(&persist_network, &persist_conversation, &persist_target, &persist_trigger, &persist_attempt, &id)
+            persist_node.store.lock().await.save_scheduler_native_id(&persist_cluster, &persist_conversation, &persist_target, &persist_trigger, &persist_attempt, &id)
         }, cancel.clone(), move |progress| {
             let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            progress_node.publish_progress(&progress_network, json!({
+            progress_node.publish_progress(&progress_cluster, json!({
                 "type":"manager_progress", "conversation_id":progress_conversation,
                 "trigger":progress_trigger, "invocation_id":progress_attempt, "source":progress_node.identity.peer_id().ok(), "source_node":progress_node.identity.peer_id().ok(), "sequence":sequence, "progress":progress,
             }));
@@ -194,14 +194,14 @@ pub async fn run(
         }).await?;
         node.seal_manager_tools(&attempt.id).await?;
         tools_fenced = true;
-        node.store.lock().await.local_set(&network, &format!("sdk-returned:v1:{}",attempt.id),
+        node.store.lock().await.local_set(&cluster, &format!("sdk-returned:v1:{}",attempt.id),
             &json!({"sdk_returned":true,"output":result.output,"session_id":result.session_id,"finalization_started":false}))?;
-        let works = node.wait_native_work(&network,&conversation,&trigger,&attempt.id).await?;
-        let children = if job.kind == TriggerKind::AgentTask { node.child_agent_tasks(&network,&conversation,&trigger).await? } else { Vec::new() };
+        let works = node.wait_native_work(&cluster,&conversation,&trigger,&attempt.id).await?;
+        let children = if job.kind == TriggerKind::AgentTask { node.child_agent_tasks(&cluster,&conversation,&trigger).await? } else { Vec::new() };
         let terminal = coordinated_outcome(&works,&children);
         if !works.is_empty() || !children.is_empty() {
-            mark_finalization_started(&node,&network,&attempt.id).await?;
-            result = summarize_work(&node,&config,&network,&conversation,&trigger,&attempt.id,
+            mark_finalization_started(&node,&cluster,&attempt.id).await?;
+            result = summarize_work(&node,&config,&cluster,&conversation,&trigger,&attempt.id,
                 result.session_id.as_deref(), &works, &children, cancel).await?;
         }
 
@@ -210,7 +210,7 @@ pub async fn run(
             "助手已完成本轮处理，可查看对话中的进展与结果。".into()
         } else if result.output.len() > INLINE_OUTPUT {
             let blob = BlobRef { hash: digest(result.output.as_bytes()), size: result.output.len() as u64 };
-            node.store.lock().await.put_blob(&network, &blob, result.output.as_bytes())?;
+            node.store.lock().await.put_blob(&cluster, &blob, result.output.as_bytes())?;
             let text = format!("{}\n\n完整结果可从本条消息的附件打开。", prefix(&result.output, INLINE_OUTPUT));
             blobs.push(blob);
             text
@@ -219,13 +219,13 @@ pub async fn run(
             (EventBody::MessagePosted { message_id: job.message_id.clone(), role:"assistant".into(), text:output, scheduler_node:None },blobs),
             (EventBody::NotificationRaised { notification_id:format!("manager:{}:completed",attempt.id),kind:"manager_response".into(),text:"助手已回复。".into() },vec![]),
         ];
-        job = node.store.lock().await.finish_job(&node.identity, &network, &conversation, &target, &trigger, &attempt.id, terminal, events, crate::runtime::now_ms())?;
-        Ok(invocation_value(&job, &network))
+        job = node.store.lock().await.finish_job(&node.identity, &cluster, &conversation, &target, &trigger, &attempt.id, terminal, events, crate::runtime::now_ms())?;
+        Ok(invocation_value(&job, &cluster))
     }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow::anyhow!("management attempt panicked; reconcile its outcome")));
     let final_result: Result<Value> = async {
         if let Err(error) = outcome {
             if node.store.lock().await.scheduler_publication_pending(
-                &network,
+                &cluster,
                 &conversation,
                 &target,
                 &trigger,
@@ -234,9 +234,9 @@ pub async fn run(
                     .store
                     .lock()
                     .await
-                    .scheduler_job(&network, &conversation, &trigger, &target)?
+                    .scheduler_job(&cluster, &conversation, &trigger, &target)?
                     .context("management job missing")?;
-                let mut value = invocation_value(&current, &network);
+                let mut value = invocation_value(&current, &cluster);
                 value["publication_pending"] = json!(true);
                 return Ok(value);
             }
@@ -257,15 +257,15 @@ pub async fn run(
                 .store
                 .lock()
                 .await
-                .scheduler_job(&network, &conversation, &trigger, &target)?
+                .scheduler_job(&cluster, &conversation, &trigger, &target)?
                 .context("scheduler job missing")?;
             let cancelled_before_start =
                 !started && matches!(current.state, JobState::Cancelling { .. });
             let native = node
-                .native_work_for_attempt(&network, &conversation, &trigger, &attempt.id)
+                .native_work_for_attempt(&cluster, &conversation, &trigger, &attempt.id)
                 .await?;
             let children = if job.kind == TriggerKind::AgentTask {
-                node.child_agent_tasks(&network, &conversation, &trigger)
+                node.child_agent_tasks(&cluster, &conversation, &trigger)
                     .await?
             } else {
                 Vec::new()
@@ -298,7 +298,7 @@ pub async fn run(
             };
             job = node.store.lock().await.finish_job(
                 &node.identity,
-                &network,
+                &cluster,
                 &conversation,
                 &target,
                 &trigger,
@@ -316,27 +316,27 @@ pub async fn run(
             )?;
             if tools_fenced && matches!(job.state, JobState::Unknown { .. }) {
                 node.store.lock().await.fence_manager_unknown(
-                    &network,
+                    &cluster,
                     &conversation,
                     &target,
                     &trigger,
                     &attempt.id,
                 )?;
             }
-            return Ok(invocation_value(&job, &network));
+            return Ok(invocation_value(&job, &cluster));
         }
         outcome
     }
     .await;
     node.finish_manager_attempt(&attempt.id).await;
     if final_result.is_ok() {
-        publish_job(&node, &network, &conversation, &job);
+        publish_job(&node, &cluster, &conversation, &job);
     }
     final_result
 }
 
-fn publish_job(node: &Runtime, network: &str, conversation: &str, job: &SchedulerJob) {
-    let _ = node.events.send(Update { network_id: network.into(), payload: json!({"type":"changed","conversation_id":conversation,"trigger":job.trigger,"state":job.state.name()}) });
+fn publish_job(node: &Runtime, cluster: &str, conversation: &str, job: &SchedulerJob) {
+    let _ = node.events.send(Update { cluster_id: cluster.into(), payload: json!({"type":"changed","conversation_id":conversation,"trigger":job.trigger,"state":job.state.name()}) });
 }
 
 fn known_facts(store: &Store, context: &Context) -> Result<Value> {
@@ -349,7 +349,7 @@ fn known_facts(store: &Store, context: &Context) -> Result<Value> {
             && message.kind == crate::model::AgentMessageKind::Task
         {
             tasks.push(store.agent_task_status(
-                &context.network_id,
+                &context.cluster_id,
                 &context.scope_id,
                 &digest(&serde_json::to_vec(event)?),
             )?);
@@ -367,7 +367,7 @@ pub(crate) fn context_bot(context: &Context) -> Result<Option<Bot>> {
     );
     let mut definition = None;
     for event in &context.events {
-        if event.network_id != context.network_id || event.scope_id != context.scope_id {
+        if event.cluster_id != context.cluster_id || event.scope_id != context.scope_id {
             continue;
         }
         if let EventBody::BotCreated {
@@ -498,7 +498,7 @@ fn materialize(
         })
         .collect::<Vec<_>>();
     let data = json!({
-        "network_id":context.network_id,"conversation_id":context.scope_id,
+        "cluster_id":context.cluster_id,"conversation_id":context.scope_id,
         "trigger_event_hash":trigger,"trigger_event":trigger_event,"event_count":events.len(),"history":history,
         "configured_bot":bot.as_ref().map(|bot| json!({"name":bot.name,"instructions":bot.instructions,"project":bot.project})),
         "saved_goals":bounded(tasks,6_000),"current_work_facts":bounded(facts,6_000),
@@ -582,18 +582,18 @@ fn utc_day(seconds: u64) -> String {
     format!("{:04}-{month:02}-{day:02}", year + i64::from(month <= 2))
 }
 
-async fn mark_finalization_started(node: &Runtime, network: &str, attempt: &str) -> Result<()> {
+async fn mark_finalization_started(node: &Runtime, cluster: &str, attempt: &str) -> Result<()> {
     let key = format!("sdk-returned:v1:{attempt}");
     let mut store = node.store.lock().await;
     let mut marker = store
-        .local_value(network, &key)?
+        .local_value(cluster, &key)?
         .context("initial SDK result is missing")?;
     ensure!(
         marker["sdk_returned"] == true && marker["finalization_started"] == false,
         "this SDK result has already started finalization; reconcile it before retrying"
     );
     marker["finalization_started"] = json!(true);
-    store.local_set(network, &key, &marker)
+    store.local_set(cluster, &key, &marker)
 }
 
 fn coordinated_outcome(
@@ -636,7 +636,7 @@ fn coordinated_outcome(
 async fn summarize_work(
     node: &Arc<Runtime>,
     config: &ManagerConfig,
-    network: &str,
+    cluster: &str,
     conversation: &str,
     trigger: &str,
     attempt: &str,
@@ -668,14 +668,14 @@ async fn summarize_work(
         )
     );
     let node = node.clone();
-    let network = network.to_owned();
+    let cluster = cluster.to_owned();
     let conversation = conversation.to_owned();
     let trigger = trigger.to_owned();
     let attempt = format!("{attempt}:final");
     let sequence = std::sync::atomic::AtomicU64::new(0);
     manager::run_manager(&config,&prompt,session,|_|async {Ok(())},cancel,move |progress| {
         let sequence = sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1;
-        node.publish_progress(&network,json!({"type":"manager_progress","conversation_id":conversation,
+        node.publish_progress(&cluster,json!({"type":"manager_progress","conversation_id":conversation,
             "trigger":trigger,"invocation_id":attempt,"source_node":node.identity.peer_id().ok(),"sequence":sequence,"progress":progress}));
         async {Ok(())}
     }).await
@@ -686,15 +686,15 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
         return Ok(());
     };
     let target = node.identity.peer_id()?;
-    let networks = node.store.lock().await.networks()?;
-    for network in networks {
-        let scopes = node.store.lock().await.scopes(&network)?;
+    let clusters = node.store.lock().await.clusters()?;
+    for cluster in clusters {
+        let scopes = node.store.lock().await.scopes(&cluster)?;
         for scope in scopes {
             let jobs = node
                 .store
                 .lock()
                 .await
-                .scheduler_jobs(&network, &scope, &target)?;
+                .scheduler_jobs(&cluster, &scope, &target)?;
             for job in jobs {
                 let JobState::Unknown {
                     attempt,
@@ -708,17 +708,17 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                     .store
                     .lock()
                     .await
-                    .local_value(&network, &format!("sdk-returned:v1:{}", attempt.id))?;
+                    .local_value(&cluster, &format!("sdk-returned:v1:{}", attempt.id))?;
                 let Some(marker) = marker.filter(|marker| {
                     marker["sdk_returned"] == true && marker["finalization_started"] == false
                 }) else {
                     continue;
                 };
                 let works = node
-                    .native_work_for_attempt(&network, &scope, &job.trigger, &attempt.id)
+                    .native_work_for_attempt(&cluster, &scope, &job.trigger, &attempt.id)
                     .await?;
                 let children = if job.kind == TriggerKind::AgentTask {
-                    node.child_agent_tasks(&network, &scope, &job.trigger)
+                    node.child_agent_tasks(&cluster, &scope, &job.trigger)
                         .await?
                 } else {
                     Vec::new()
@@ -733,7 +733,7 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 let Some(session) = marker["session_id"].as_str() else {
                     continue;
                 };
-                mark_finalization_started(&node, &network, &attempt.id).await?;
+                mark_finalization_started(&node, &cluster, &attempt.id).await?;
                 let config = ManagerConfig {
                     kind: match settings.provider.as_str() {
                         "codex_sdk" => ManagerKind::CodexSdk,
@@ -754,7 +754,7 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 let result = summarize_work(
                     &node,
                     &config,
-                    &network,
+                    &cluster,
                     &scope,
                     &job.trigger,
                     &attempt.id,
@@ -766,7 +766,7 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 .await?;
                 let publication = node.store.lock().await.reconcile_native_job(
                     &node.identity,
-                    &network,
+                    &cluster,
                     &scope,
                     &target,
                     &job.trigger,
@@ -783,7 +783,7 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                     )],
                     crate::runtime::now_ms(),
                 )?;
-                publish_job(&node, &network, &scope, &publication.job);
+                publish_job(&node, &cluster, &scope, &publication.job);
             }
         }
     }
@@ -829,7 +829,7 @@ mod tests {
     fn context_is_bounded_keeps_original_offsets_and_excludes_other_conversations() -> Result<()> {
         let make = |scope: &str, text: String, n| Event {
             version: WIRE_VERSION,
-            network_id: "network".into(),
+            cluster_id: "cluster".into(),
             scope_id: scope.into(),
             author: "node".into(),
             sequence: n,
@@ -853,7 +853,7 @@ mod tests {
             (2..100).map(|n| make("chat", format!("event-{n} {}", "界".repeat(10_000)), n)),
         );
         let context = Context {
-            network_id: "network".into(),
+            cluster_id: "cluster".into(),
             scope_id: "chat".into(),
             heads: vec!["known-frontier".into()],
             events,
@@ -887,9 +887,9 @@ mod tests {
         }
         let identity = crate::crypto::LocalIdentity::generate();
         let proof = identity
-            .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Gateway])?])?;
+            .sign_cluster_fixture(1, vec![identity.certificate(vec![NodeRole::Gateway])?])?;
         let mut context = Context {
-            network_id: "network".into(),
+            cluster_id: "cluster".into(),
             scope_id: "bot".into(),
             heads: vec![],
             events: vec![],
@@ -897,7 +897,7 @@ mod tests {
         };
         let make = |sequence, body| Event {
             version: crate::model::WIRE_VERSION,
-            network_id: "network".into(),
+            cluster_id: "cluster".into(),
             scope_id: "bot".into(),
             author: "gateway".into(),
             sequence,
@@ -953,10 +953,10 @@ mod tests {
     fn bot_prompt_uses_only_the_pinned_conversation_definition() -> Result<()> {
         let identity = crate::crypto::LocalIdentity::generate();
         let role_proof = identity
-            .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Gateway])?])?;
+            .sign_cluster_fixture(1, vec![identity.certificate(vec![NodeRole::Gateway])?])?;
         let make = |scope: &str, name: &str, instructions: &str| Event {
             version: WIRE_VERSION,
-            network_id: "network".into(),
+            cluster_id: "cluster".into(),
             scope_id: scope.into(),
             author: "gateway".into(),
             sequence: 1,
@@ -976,7 +976,7 @@ mod tests {
             blobs: vec![],
         };
         let mut context = Context {
-            network_id: "network".into(),
+            cluster_id: "cluster".into(),
             scope_id: "bot-a-chat".into(),
             heads: vec![],
             events: vec![

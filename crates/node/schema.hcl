@@ -1,6 +1,6 @@
-table "networks" {
+table "clusters" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = true
     type = text
   }
@@ -13,12 +13,12 @@ table "networks" {
     type = text
   }
   primary_key {
-    columns = [column.network_id]
+    columns = [column.cluster_id]
   }
 }
 table "node_certificates" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -31,18 +31,18 @@ table "node_certificates" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.peer_id]
+    columns = [column.cluster_id, column.peer_id]
   }
   foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
+    columns     = [column.cluster_id]
+    ref_columns = [table.clusters.column.cluster_id]
     on_update   = NO_ACTION
     on_delete   = NO_ACTION
   }
 }
 table "local_identities" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -55,18 +55,18 @@ table "local_identities" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.peer_id]
+    columns = [column.cluster_id, column.peer_id]
   }
   foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
+    columns     = [column.cluster_id]
+    ref_columns = [table.clusters.column.cluster_id]
     on_update   = NO_ACTION
     on_delete   = NO_ACTION
   }
 }
 table "events" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -95,24 +95,24 @@ table "events" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.hash]
+    columns = [column.cluster_id, column.hash]
   }
   foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
+    columns     = [column.cluster_id]
+    ref_columns = [table.clusters.column.cluster_id]
     on_update   = NO_ACTION
     on_delete   = NO_ACTION
   }
   index "events_author_sequence" {
-    columns = [column.network_id, column.scope_id, column.author, column.sequence]
+    columns = [column.cluster_id, column.scope_id, column.author, column.sequence]
   }
   index "events_scope" {
-    columns = [column.network_id, column.scope_id]
+    columns = [column.cluster_id, column.scope_id]
   }
 }
 table "blobs" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -129,18 +129,18 @@ table "blobs" {
     type = blob
   }
   primary_key {
-    columns = [column.network_id, column.hash]
+    columns = [column.cluster_id, column.hash]
   }
   foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
+    columns     = [column.cluster_id]
+    ref_columns = [table.clusters.column.cluster_id]
     on_update   = NO_ACTION
     on_delete   = NO_ACTION
   }
 }
 table "conversations" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -153,12 +153,12 @@ table "conversations" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.conversation_id]
+    columns = [column.cluster_id, column.conversation_id]
   }
 }
 table "messages" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -191,12 +191,12 @@ table "messages" {
     type = integer
   }
   primary_key {
-    columns = [column.network_id, column.event_hash]
+    columns = [column.cluster_id, column.event_hash]
   }
 }
 table "tasks" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -233,12 +233,12 @@ table "tasks" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.conversation_id, column.task_id]
+    columns = [column.cluster_id, column.conversation_id, column.task_id]
   }
 }
 table "notification_outbox" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -256,12 +256,12 @@ table "notification_outbox" {
     default = 0
   }
   primary_key {
-    columns = [column.network_id, column.notification_id]
+    columns = [column.cluster_id, column.notification_id]
   }
 }
 table "notification_acks" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -279,12 +279,12 @@ table "notification_acks" {
     default = ""
   }
   primary_key {
-    columns = [column.network_id, column.notification_id, column.client_id]
+    columns = [column.cluster_id, column.notification_id, column.client_id]
   }
 }
 table "budget_days" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -297,12 +297,12 @@ table "budget_days" {
     type = integer
   }
   primary_key {
-    columns = [column.network_id, column.day]
+    columns = [column.cluster_id, column.day]
   }
 }
 table "local_values" {
   schema = schema.main
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }
@@ -315,7 +315,7 @@ table "local_values" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.key]
+    columns = [column.cluster_id, column.key]
   }
 }
 table "identity_meta" {
@@ -368,7 +368,7 @@ table "identity_invites" {
     null = false
     type = text
   }
-  column "network_id" {
+  column "cluster_id" {
     null = false
     type = text
   }

@@ -1,4 +1,4 @@
-//! Independent device identities and signed, recoverable personal-network membership.
+//! Independent device identities and signed, recoverable cluster membership.
 
 use crate::{Identity, decode32};
 use anyhow::{Context, Result, ensure};
@@ -17,7 +17,7 @@ pub trait MembershipSigner {
         fingerprint(&self.public_key_hex()?)
     }
 
-    fn network_id(&self) -> Result<String> {
+    fn cluster_id(&self) -> Result<String> {
         self.peer_id()
     }
 }
@@ -73,7 +73,7 @@ pub struct NodeCertificate {
     pub revoked: bool,
 }
 
-pub const IDENTITY_VERSION: u32 = 1;
+pub const IDENTITY_VERSION: u32 = 2;
 pub const MAX_MEMBERS: usize = 1024;
 pub const MAX_GOVERNANCE_EVENTS: usize = 1024;
 pub const MAX_HISTORICAL_NODES: usize = 4096;
@@ -189,7 +189,7 @@ pub fn role_key(role: &NodeRole) -> &'static str {
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
     pub version: u32,
-    pub network_id: String,
+    pub cluster_id: String,
     pub owner_public_key: String,
     pub initial_members: Vec<Member>,
     pub signature: String,
@@ -200,7 +200,7 @@ impl Genesis {
         initial_members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
         let mut genesis = Self {
             version: IDENTITY_VERSION,
-            network_id: root.network_id()?,
+            cluster_id: root.cluster_id()?,
             owner_public_key: root.public_key_hex()?,
             initial_members,
             signature: String::new(),
@@ -229,8 +229,8 @@ impl Genesis {
             "recovery root cannot be a daily device or client identity"
         );
         ensure!(
-            self.network_id == fingerprint(&self.owner_public_key)?,
-            "network ID mismatch"
+            self.cluster_id == fingerprint(&self.owner_public_key)?,
+            "Cluster ID mismatch"
         );
         validate_members(&self.initial_members)
     }
@@ -268,7 +268,7 @@ impl HistoricalNode {
 #[serde(deny_unknown_fields)]
 pub struct RootCheckpoint {
     pub version: u32,
-    pub network_id: String,
+    pub cluster_id: String,
     pub epoch: u64,
     pub members: Vec<Member>,
     pub historical_nodes: Vec<HistoricalNode>,
@@ -314,7 +314,7 @@ impl RootCheckpoint {
         historical_nodes.extend(member_history(&members));
         let checkpoint = Self {
             version: IDENTITY_VERSION,
-            network_id: root.network_id()?,
+            cluster_id: root.cluster_id()?,
             epoch,
             members,
             historical_nodes: canonical_history(historical_nodes)?,
@@ -332,7 +332,7 @@ impl RootCheckpoint {
     pub fn verify(&self, genesis: &Genesis) -> Result<()> {
         ensure!(
             self.version == IDENTITY_VERSION
-                && self.network_id == genesis.network_id
+                && self.cluster_id == genesis.cluster_id
                 && (2..=MAX_SAFE_INTEGER).contains(&self.epoch),
             "invalid recovery checkpoint"
         );
@@ -432,7 +432,7 @@ fn validate_members(members: &[Member]) -> Result<()> {
         members
             .iter()
             .any(|member| member.manage && member.kind == IdentityKind::Client),
-        "network requires an explicitly authorized management client"
+        "cluster requires an explicitly authorized management client"
     );
     Ok(())
 }
@@ -448,7 +448,7 @@ pub enum GovernanceAction {
 #[serde(deny_unknown_fields)]
 pub struct GovernanceEvent {
     pub version: u32,
-    pub network_id: String,
+    pub cluster_id: String,
     pub epoch: u64,
     pub parents: Vec<String>,
     pub issuer: String,
@@ -511,7 +511,7 @@ impl GovernanceEvent {
         );
         let mut event = Self {
             version: IDENTITY_VERSION,
-            network_id: view.network_id.clone(),
+            cluster_id: view.cluster_id.clone(),
             epoch: view.epoch,
             parents: view.heads.clone(),
             issuer,
@@ -535,7 +535,7 @@ impl GovernanceEvent {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct NetworkState {
+pub struct ClusterState {
     pub genesis: Genesis,
     pub checkpoint: Option<RootCheckpoint>,
     pub events: Vec<GovernanceEvent>,
@@ -544,7 +544,7 @@ pub struct NetworkState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationView {
-    pub network_id: String,
+    pub cluster_id: String,
     pub epoch: u64,
     pub heads: Vec<String>,
     pub members: Vec<Member>,
@@ -554,7 +554,7 @@ pub struct AuthorizationView {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientPrincipal {
-    pub network_id: String,
+    pub cluster_id: String,
     pub subject_id: String,
     pub epoch: u64,
     pub can_manage: bool,
@@ -570,7 +570,7 @@ impl AuthorizationView {
             .iter()
             .find(|member| member.subject_id == subject)
             .cloned()
-            .context("identity is not authorized in this personal network")
+            .context("identity is not authorized in this cluster")
     }
 
     pub fn authorize_client(&self, subject: &str) -> Result<Member> {
@@ -597,7 +597,7 @@ impl AuthorizationView {
     pub fn principal(&self, subject: &str) -> Result<ClientPrincipal> {
         let member = self.authorize_client(subject)?;
         Ok(ClientPrincipal {
-            network_id: self.network_id.clone(),
+            cluster_id: self.cluster_id.clone(),
             subject_id: subject.into(),
             epoch: self.epoch,
             can_manage: member.manage,
@@ -611,7 +611,7 @@ struct ValidEvent {
     depth: usize,
 }
 
-impl NetworkState {
+impl ClusterState {
     pub fn new(genesis: Genesis) -> Result<Self> {
         genesis.verify()?;
         Ok(Self {
@@ -667,7 +667,7 @@ impl NetworkState {
         incoming.project()?;
         ensure!(
             self.genesis == incoming.genesis,
-            "different personal-network genesis"
+            "different cluster genesis"
         );
         ensure!(
             incoming.epoch() >= self.epoch(),
@@ -716,9 +716,9 @@ impl NetworkState {
         for event in &self.events {
             ensure!(
                 event.version == IDENTITY_VERSION
-                    && event.network_id == self.genesis.network_id
+                    && event.cluster_id == self.genesis.cluster_id
                     && event.epoch == epoch,
-                "management event network or epoch mismatch"
+                "management event cluster or epoch mismatch"
             );
             ensure!(
                 event.parents.len() <= MAX_PARENTS
@@ -837,7 +837,7 @@ impl NetworkState {
             "too many concurrent management heads"
         );
         Ok(AuthorizationView {
-            network_id: self.genesis.network_id.clone(),
+            cluster_id: self.genesis.cluster_id.clone(),
             epoch,
             heads: heads.into_iter().collect(),
             members: members.into_values().collect(),
@@ -863,7 +863,7 @@ impl NetworkState {
     }
 }
 
-fn preserve_history(previous: &NetworkState, next: &NetworkState) -> Result<()> {
+fn preserve_history(previous: &ClusterState, next: &ClusterState) -> Result<()> {
     let kept: BTreeMap<_, _> = next
         .historical_nodes()?
         .into_iter()
@@ -993,7 +993,7 @@ pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct VerifiedMembership {
-    state: NetworkState,
+    state: ClusterState,
     view: AuthorizationView,
     historical_nodes: Vec<HistoricalNode>,
 }
@@ -1001,29 +1001,29 @@ pub struct VerifiedMembership {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = verifyMembership))]
 pub fn verify_membership(
     state_json: &str,
-    expected_network: &str,
+    expected_cluster: &str,
     owner_public_key: &str,
 ) -> crate::Result<VerifiedMembership> {
     fn verify(
         state_json: &str,
-        expected_network: &str,
+        expected_cluster: &str,
         owner_public_key: &str,
     ) -> Result<VerifiedMembership> {
         ensure!(
             state_json.len() <= crate::MAX_APPLICATION_MESSAGE,
             "identity payload too large"
         );
-        validate_id(expected_network)?;
+        validate_id(expected_cluster)?;
         validate_id(owner_public_key)?;
         ensure!(
-            fingerprint(owner_public_key)? == expected_network,
-            "network ID mismatch"
+            fingerprint(owner_public_key)? == expected_cluster,
+            "Cluster ID mismatch"
         );
-        let state: NetworkState = serde_json::from_str(state_json)?;
+        let state: ClusterState = serde_json::from_str(state_json)?;
         ensure!(
-            state.genesis.network_id == expected_network
+            state.genesis.cluster_id == expected_cluster
                 && state.genesis.owner_public_key == owner_public_key,
-            "membership belongs to another personal network"
+            "membership belongs to another cluster"
         );
         let view = state.project()?;
         let historical_nodes = state.historical_nodes()?;
@@ -1033,7 +1033,7 @@ pub fn verify_membership(
             historical_nodes,
         })
     }
-    verify(state_json, expected_network, owner_public_key).map_err(|error| format!("{error:#}"))
+    verify(state_json, expected_cluster, owner_public_key).map_err(|error| format!("{error:#}"))
 }
 
 #[derive(Deserialize)]
@@ -1091,7 +1091,7 @@ impl VerifiedMembership {
         ) -> Result<String> {
             ensure!(
                 root.public_key_hex() == verified.state.genesis.owner_public_key,
-                "recovery root does not own this personal network"
+                "recovery root does not own this cluster"
             );
             ensure!(
                 backup_epoch.is_finite()
@@ -1157,11 +1157,11 @@ mod tests {
         Identity::generate().expect("test identity randomness")
     }
 
-    fn setup() -> Result<(Identity, Identity, Identity, NetworkState)> {
+    fn setup() -> Result<(Identity, Identity, Identity, ClusterState)> {
         let root = identity();
         let a = identity();
         let b = identity();
-        let state = NetworkState::new(Genesis::create(
+        let state = ClusterState::new(Genesis::create(
             &root,
             vec![
                 Member::client(&a, "a", true)?,
@@ -1169,6 +1169,30 @@ mod tests {
             ],
         )?)?;
         Ok((root, a, b, state))
+    }
+
+    #[test]
+    fn cluster_contract_binds_the_root_and_rejects_previous_identity_format() -> Result<()> {
+        let (root, admin, _, state) = setup()?;
+        let wire = serde_json::to_value(&state.genesis)?;
+        assert_eq!(wire["version"], 2);
+        assert_eq!(wire["cluster_id"], root.peer_id());
+        assert_ne!(state.genesis.cluster_id, admin.peer_id());
+        let restored: Genesis = serde_json::from_value(wire.clone())?;
+        restored.verify()?;
+        let mut legacy = wire;
+        let cluster_id = legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("cluster_id")
+            .unwrap();
+        legacy["network_id"] = cluster_id;
+        assert!(serde_json::from_value::<Genesis>(legacy).is_err());
+        let mut previous = state.genesis;
+        previous.version = 1;
+        previous.signature = root.sign_payload("identity-genesis", &previous.signing_bytes()?)?;
+        assert!(previous.verify().is_err());
+        Ok(())
     }
 
     #[test]
@@ -1294,8 +1318,8 @@ mod tests {
         );
         assert!(GovernanceEvent::revoke(&a, &state.project()?, &b.peer_id()).is_err());
         let mut forged = GovernanceEvent {
-            version: 1,
-            network_id: state.genesis.network_id.clone(),
+            version: IDENTITY_VERSION,
+            cluster_id: state.genesis.cluster_id.clone(),
             epoch: 1,
             parents: vec![],
             issuer: a.peer_id(),
@@ -1307,8 +1331,8 @@ mod tests {
         forged.signature = a.sign_payload("identity-governance", &forged.signing_bytes()?)?;
         assert!(state.append(forged).is_err());
         let mut remove = GovernanceEvent {
-            version: 1,
-            network_id: state.genesis.network_id.clone(),
+            version: IDENTITY_VERSION,
+            cluster_id: state.genesis.cluster_id.clone(),
             epoch: 1,
             parents: vec![],
             issuer: a.peer_id(),
@@ -1323,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_changes_admins_and_epoch_but_preserves_network() -> Result<()> {
+    fn recovery_changes_admins_and_epoch_but_preserves_cluster() -> Result<()> {
         let (root, a, _, mut state) = setup()?;
         let original = state.clone();
         let recovered = identity();
@@ -1333,7 +1357,7 @@ mod tests {
             vec![Member::client(&recovered, "recovered", true)?],
         )?;
         state.recover(checkpoint.clone())?;
-        assert_eq!(state.project()?.network_id, original.genesis.network_id);
+        assert_eq!(state.project()?.cluster_id, original.genesis.cluster_id);
         assert!(state.project()?.principal(&recovered.peer_id())?.can_manage);
         assert!(state.project()?.authorize_client(&a.peer_id()).is_err());
         assert!(state.merge(&original).is_err());
@@ -1439,7 +1463,7 @@ mod tests {
         let members = vec![Member::client(&admin, "admin", true)?];
         let incomplete = RootCheckpoint::create(&root, 2, members.clone())?;
         assert!(state.recover(incomplete.clone()).is_err());
-        let incoming = NetworkState {
+        let incoming = ClusterState {
             genesis: state.genesis.clone(),
             checkpoint: Some(incomplete),
             events: vec![],
@@ -1483,17 +1507,17 @@ mod tests {
             Member::node(&retired_node, "retired Node", vec![NodeRole::Replica])?,
         )?)?;
         let state_json = serde_json::to_string(&state)?;
-        let network = &state.genesis.network_id;
-        let verified = verify_membership(&state_json, network, &root.public_key_hex())
+        let cluster = &state.genesis.cluster_id;
+        let verified = verify_membership(&state_json, cluster, &root.public_key_hex())
             .map_err(anyhow::Error::msg)?;
         assert!(verify_membership(&state_json, &"0".repeat(64), &root.public_key_hex()).is_err());
-        assert!(verify_membership(&state_json, network, &admin.public_key_hex()).is_err());
+        assert!(verify_membership(&state_json, cluster, &admin.public_key_hex()).is_err());
         let mut forged_state = state.clone();
         forged_state.events[0].signature = "0".repeat(128);
         assert!(
             verify_membership(
                 &serde_json::to_string(&forged_state)?,
-                network,
+                cluster,
                 &root.public_key_hex()
             )
             .is_err()

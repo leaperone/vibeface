@@ -34,14 +34,14 @@ struct State {
 
 struct Pending {
     peer_id: String,
-    network_id: String,
+    cluster_id: String,
     expires: Instant,
 }
 
 #[derive(Clone)]
 pub struct LocalSession {
     pub peer_id: String,
-    pub network_id: String,
+    pub cluster_id: String,
     pub subject_id: String,
     pub public_key: String,
     generation: u64,
@@ -134,7 +134,7 @@ impl LocalAccess {
         self.changes.subscribe()
     }
 
-    pub fn issue(&self, capability: &str, peer_id: &str, network_id: &str) -> Result<String> {
+    pub fn issue(&self, capability: &str, peer_id: &str, cluster_id: &str) -> Result<String> {
         let mut state = self
             .state
             .lock()
@@ -157,7 +157,7 @@ impl LocalAccess {
             crypto::digest(token.as_bytes()),
             Pending {
                 peer_id: peer_id.to_owned(),
-                network_id: network_id.to_owned(),
+                cluster_id: cluster_id.to_owned(),
                 expires: Instant::now() + TOKEN_LIFETIME,
             },
         );
@@ -168,7 +168,7 @@ impl LocalAccess {
         &self,
         token: &str,
         peer_id: &str,
-        network_id: &str,
+        cluster_id: &str,
         subject_id: &str,
         public_key: &str,
     ) -> Result<String> {
@@ -191,8 +191,8 @@ impl LocalAccess {
         ensure!(
             pending.expires > Instant::now()
                 && pending.peer_id == peer_id
-                && pending.network_id == network_id,
-            "local entry belongs to another node or personal network"
+                && pending.cluster_id == cluster_id,
+            "local entry belongs to another node or cluster"
         );
         state
             .sessions
@@ -207,7 +207,7 @@ impl LocalAccess {
             crypto::digest(cookie.as_bytes()),
             LocalSession {
                 peer_id: peer_id.to_owned(),
-                network_id: network_id.to_owned(),
+                cluster_id: cluster_id.to_owned(),
                 subject_id: subject_id.to_owned(),
                 public_key: public_key.to_owned(),
                 generation,
@@ -217,7 +217,7 @@ impl LocalAccess {
         Ok(cookie)
     }
 
-    pub fn session(&self, cookie: &str, peer_id: &str, network_id: &str) -> Result<LocalSession> {
+    pub fn session(&self, cookie: &str, peer_id: &str, cluster_id: &str) -> Result<LocalSession> {
         let state = self
             .state
             .lock()
@@ -234,8 +234,8 @@ impl LocalAccess {
             session.expires > Instant::now()
                 && session.generation == state.generation
                 && session.peer_id == peer_id
-                && session.network_id == network_id,
-            "local browser session no longer matches this node and personal network"
+                && session.cluster_id == cluster_id,
+            "local browser session no longer matches this node and cluster"
         );
         Ok(session.clone())
     }
@@ -283,14 +283,14 @@ mod tests {
         let browser = crypto::LocalIdentity::generate();
         assert!(
             local
-                .issue("forwarded-from-loopback", "node", "network")
+                .issue("forwarded-from-loopback", "node", "cluster")
                 .is_err()
         );
-        let token = local.issue(&launcher.capability, "node", "network")?;
+        let token = local.issue(&launcher.capability, "node", "cluster")?;
         let cookie = local.exchange(
             &token,
             "node",
-            "network",
+            "cluster",
             &browser.peer_id()?,
             &browser.public_key_hex()?,
         )?;
@@ -299,27 +299,27 @@ mod tests {
                 .exchange(
                     &token,
                     "node",
-                    "network",
+                    "cluster",
                     &browser.peer_id()?,
                     &browser.public_key_hex()?
                 )
                 .is_err()
         );
         assert_eq!(
-            local.session(&cookie, "node", "network")?.subject_id,
+            local.session(&cookie, "node", "cluster")?.subject_id,
             browser.peer_id()?
         );
-        assert!(local.session(&cookie, "other-node", "network").is_err());
-        assert!(local.session(&cookie, "node", "other-network").is_err());
-        let pending = local.issue(&launcher.capability, "node", "network")?;
+        assert!(local.session(&cookie, "other-node", "cluster").is_err());
+        assert!(local.session(&cookie, "node", "other-cluster").is_err());
+        let pending = local.issue(&launcher.capability, "node", "cluster")?;
         let mut changes = local.subscribe();
         local.set_enabled(false)?;
         assert!(changes.has_changed()?);
         assert!(!config::Config::load(&dir)?.local_auto_access);
-        assert!(local.session(&cookie, "node", "network").is_err());
+        assert!(local.session(&cookie, "node", "cluster").is_err());
         assert!(
             local
-                .issue(&launcher.capability, "node", "network")
+                .issue(&launcher.capability, "node", "cluster")
                 .is_err()
         );
         local.set_enabled(true)?;
@@ -328,13 +328,13 @@ mod tests {
                 .exchange(
                     &pending,
                     "node",
-                    "network",
+                    "cluster",
                     &browser.peer_id()?,
                     &browser.public_key_hex()?
                 )
                 .is_err()
         );
-        assert!(local.session(&cookie, "node", "network").is_err());
+        assert!(local.session(&cookie, "node", "cluster").is_err());
         changes.borrow_and_update();
         std::fs::remove_dir_all(&dir)?;
         Ok(())

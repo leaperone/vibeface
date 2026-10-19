@@ -5,22 +5,22 @@ import type { Member, PublicIdentity } from './node'
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
 export { Identity, verifyMembership }
-export function verifyState(state: unknown, networkId: string, owner: string) {
-  return verifyMembership(JSON.stringify(state), networkId, owner)
+export function verifyState(state: unknown, clusterId: string, owner: string) {
+  return verifyMembership(JSON.stringify(state), clusterId, owner)
 }
-export function verifiedView(state: unknown, networkId: string, owner: string) {
-  const verified = verifyState(state, networkId, owner)
+export function verifiedView(state: unknown, clusterId: string, owner: string) {
+  const verified = verifyState(state, clusterId, owner)
   try { return parseView(JSON.parse(verified.viewJson())) } finally { verified.free() }
 }
-export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; peerId: string; nodePublicKey: string }
+export type AuthenticationTrust = { kind: 'cluster'; clusterId: string } | { kind: 'root'; clusterId: string; ownerPublicKey: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; clusterId: string; peerId: string; nodePublicKey: string }
 export function verifyAuthentication(value: unknown, own: PublicIdentity, expected: AuthenticationTrust | null) {
   const auth = record(value)
   const principal = parsePrincipal(auth.principal)
   const state = record(auth.state)
-  if (principal.subject_id !== own.peerId || expected && principal.network_id !== expected.networkId) throw new Error('认证返回的个人网络或浏览器身份不一致。')
+  if (principal.subject_id !== own.peerId || expected && principal.cluster_id !== expected.clusterId) throw new Error('认证返回的集群或浏览器身份不一致。')
   if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
   const owner = expected?.kind === 'root' ? expected.ownerPublicKey : text(record(state.genesis).owner_public_key)
-  const view = verifiedView(state, expected?.networkId ?? principal.network_id, owner)
+  const view = verifiedView(state, expected?.clusterId ?? principal.cluster_id, owner)
   if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('认证目录与已签名的成员记录不一致。')
   if (principal.source === 'local_session') {
     const node = expected?.kind === 'local' ? view.members.find(member => member.subject_id === expected.peerId) : undefined
@@ -31,7 +31,7 @@ export function verifyAuthentication(value: unknown, own: PublicIdentity, expect
   if (!member || view.revoked.includes(own.peerId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
   return { auth, principal, view }
 }
-export function verifyRecoveryResult(value: unknown, expected: { networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint: unknown; manager: Member }) {
+export function verifyRecoveryResult(value: unknown, expected: { clusterId: string; ownerPublicKey: string; genesis: unknown; checkpoint: unknown; manager: Member }) {
   const epoch = integer(record(expected.checkpoint).epoch)
   const { auth, principal, view } = verifyAuthentication(value, { peerId: expected.manager.subject_id, publicKey: expected.manager.public_key }, { kind: 'root', ...expected })
   const manager = view.members.find(member => member.subject_id === expected.manager.subject_id)
@@ -47,15 +47,15 @@ export function sealPackage(payload: Record<string, unknown>, password: string):
   const cleartext = encoder.encode(JSON.stringify(payload))
   try {
     const envelope: unknown = JSON.parse(decoder.decode(recoverySeal(cleartext, password)))
-    return encoder.encode(JSON.stringify({ version: 1, network_id: payload.network_id, recovery_epoch: payload.recovery_epoch, envelope }))
+    return encoder.encode(JSON.stringify({ version: 2, cluster_id: payload.cluster_id, recovery_epoch: payload.recovery_epoch, envelope }))
   } finally { cleartext.fill(0) }
 }
 export async function openPackage(file: File, password: string) {
   if (!file.size || file.size > 256 * 1024) throw new Error('选择不超过 256 KiB 的加密恢复包。')
   const bundle = record(JSON.parse(await file.text()), '恢复包')
-  if (bundle.version !== 1) throw new Error('恢复包版本无效。')
+  if (bundle.version !== 2) throw new Error('恢复包版本无效。')
   const epoch = integer(bundle.recovery_epoch)
-  const networkId = text(bundle.network_id)
+  const clusterId = text(bundle.cluster_id)
   let cleartext: Uint8Array
   try { cleartext = recoveryOpen(encoder.encode(JSON.stringify(record(bundle.envelope))), password) }
   catch { throw new Error('无法解锁恢复包。请核对口令，并使用未修改的原始文件。') }
@@ -64,21 +64,21 @@ export async function openPackage(file: File, password: string) {
   let root: Identity | undefined
   try {
     root = Identity.fromSecretHex(text(payload.root_secret_key))
-    if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.peerId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复包身份与加密内容不一致。')
+    if (payload.version !== 2 || payload.cluster_id !== clusterId || payload.recovery_epoch !== epoch || root.peerId() !== clusterId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复包身份与加密内容不一致。')
     const state = { genesis: record(payload.genesis), checkpoint: null, events: [] }
-    const verified = verifyState(state, networkId, root.publicKeyHex())
+    const verified = verifyState(state, clusterId, root.publicKeyHex())
     verified.free()
     const openedRoot = root
     let released = false
-    return { payload, root: openedRoot, networkId, epoch, release() { if (!released) { released = true; openedRoot.free(); payload.root_secret_key = '' } } }
+    return { payload, root: openedRoot, clusterId, epoch, release() { if (!released) { released = true; openedRoot.free(); payload.root_secret_key = '' } } }
   } catch (error) { root?.free(); payload.root_secret_key = ''; throw error }
 }
-export function downloadPackage(bytes: Uint8Array, networkId: string) {
+export function downloadPackage(bytes: Uint8Array, clusterId: string) {
   const copy = new Uint8Array(bytes)
   const url = URL.createObjectURL(new Blob([copy.buffer], { type: 'application/json' }))
   const link = document.createElement('a')
   link.href = url
-  link.download = `vibeface-recovery-${networkId.slice(0, 12)}.json`
+  link.download = `vibeface-recovery-${clusterId.slice(0, 12)}.json`
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

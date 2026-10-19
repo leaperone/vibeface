@@ -102,10 +102,10 @@ pub struct SchedulerJob {
 }
 
 impl SchedulerJob {
-    pub fn receipt(&self, network: &str) -> AdmissionReceipt {
+    pub fn receipt(&self, cluster: &str) -> AdmissionReceipt {
         AdmissionReceipt {
             version: self.version,
-            network_id: network.into(),
+            cluster_id: cluster.into(),
             conversation_id: self.conversation_id.clone(),
             trigger: self.trigger.clone(),
             target_node: self.target_node.clone(),
@@ -118,7 +118,7 @@ impl SchedulerJob {
 #[serde(deny_unknown_fields)]
 pub struct AdmissionReceipt {
     pub version: u32,
-    pub network_id: String,
+    pub cluster_id: String,
     pub conversation_id: String,
     pub trigger: String,
     pub target_node: String,
@@ -128,7 +128,7 @@ pub struct AdmissionReceipt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
     pub version: u32,
-    pub network_id: String,
+    pub cluster_id: String,
     pub conversation_id: String,
     pub trigger: String,
     pub target_node: String,
@@ -139,7 +139,7 @@ impl OutboxEntry {
     pub fn receipt(&self) -> AdmissionReceipt {
         AdmissionReceipt {
             version: self.version,
-            network_id: self.network_id.clone(),
+            cluster_id: self.cluster_id.clone(),
             conversation_id: self.conversation_id.clone(),
             trigger: self.trigger.clone(),
             target_node: self.target_node.clone(),

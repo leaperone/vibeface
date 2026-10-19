@@ -142,7 +142,7 @@ fn mark_native_freshness(work: &mut Value, cached: bool) {
 
 fn remote_native_projection(
     store: &mut Store,
-    network: &str,
+    cluster: &str,
     scope: &str,
     target: &str,
     reply: Result<Value>,
@@ -161,14 +161,14 @@ fn remote_native_projection(
         Ok(sessions) => {
             let snapshot =
                 json!({"conversation_id":scope,"target_node":target,"native_sessions":sessions});
-            if store.local_value(network, &key)?.as_ref() != Some(&snapshot) {
-                store.local_set(network, &key, &snapshot)?;
+            if store.local_value(cluster, &key)?.as_ref() != Some(&snapshot) {
+                store.local_set(cluster, &key, &snapshot)?;
             }
             (sessions, false)
         }
         Err(error) => {
-            tracing::debug!(network,scope,target,%error,"native observation unavailable; preserving its last authenticated snapshot");
-            let Some(snapshot) = store.local_value(network, &key)? else {
+            tracing::debug!(cluster,scope,target,%error,"native observation unavailable; preserving its last authenticated snapshot");
+            let Some(snapshot) = store.local_value(cluster, &key)? else {
                 return Ok(Vec::new());
             };
             ensure!(
@@ -195,7 +195,7 @@ impl Runtime {
             "invalid artifact hash"
         );
         let store = self.store.lock().await;
-        let context = store.context(&access.network_id, scope, &[])?;
+        let context = store.context(&access.cluster_id, scope, &[])?;
         let reference = context
             .events
             .iter()
@@ -204,7 +204,7 @@ impl Runtime {
             .find(|blob| blob.hash == hash)
             .context("artifact is not referenced by this conversation")?;
         let bytes = store
-            .get_blob(&access.network_id, hash)?
+            .get_blob(&access.cluster_id, hash)?
             .context("artifact content is pending synchronization")?;
         ensure!(
             reference.size == bytes.len() as u64 && crypto::digest(&bytes) == hash,
@@ -222,11 +222,11 @@ impl Runtime {
 impl Runtime {
     pub(super) async fn agent_task_projections(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
     ) -> Result<Vec<Value>> {
         let store = self.store.lock().await;
-        let context = store.context(network, scope, &[])?;
+        let context = store.context(cluster, scope, &[])?;
         let mut tasks = Vec::new();
         for event in context
             .events
@@ -240,7 +240,7 @@ impl Runtime {
                 continue;
             }
             let task_ref = crypto::digest(&serde_json::to_vec(event)?);
-            let status = store.agent_task_status(network, scope, &task_ref)?;
+            let status = store.agent_task_status(cluster, scope, &task_ref)?;
             tasks.push(json!({"task_ref":task_ref,"source_node":event.author,"target_node":message.target_node,
                 "origin_trigger":message.origin_trigger,"state":status["state"],"text":message.text,
                 "detail":status["result"]["text"].as_str().unwrap_or("")}));
@@ -250,11 +250,11 @@ impl Runtime {
 
     pub(super) async fn native_session_projections(
         &self,
-        network: &str,
+        cluster: &str,
         scope: &str,
     ) -> Result<Vec<Value>> {
         let local = self.identity.peer_id()?;
-        let mut sessions = self.native_status(network, scope).await?["native_sessions"]
+        let mut sessions = self.native_status(cluster, scope).await?["native_sessions"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -264,7 +264,7 @@ impl Runtime {
         let targets = {
             let store = self.store.lock().await;
             store
-                .context(network, scope, &[])?
+                .context(cluster, scope, &[])?
                 .events
                 .into_iter()
                 .filter_map(|event| match event.body {
@@ -279,7 +279,7 @@ impl Runtime {
                 .filter(|target| {
                     target != &local
                         && store
-                            .authorize_node(network, target, Some(NodeRole::Scheduler))
+                            .authorize_node(cluster, target, Some(NodeRole::Scheduler))
                             .is_ok()
                 })
                 .collect::<BTreeSet<_>>()
@@ -288,7 +288,7 @@ impl Runtime {
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
                 self.read_peer(
-                    network,
+                    cluster,
                     &target,
                     json!({"type":"native_status","conversation_id":scope}),
                 ),
@@ -299,7 +299,7 @@ impl Runtime {
                 .and_then(|result| result);
             sessions.extend(remote_native_projection(
                 &mut *self.store.lock().await,
-                network,
+                cluster,
                 scope,
                 &target,
                 reply,
@@ -315,12 +315,12 @@ impl Runtime {
     ) -> Result<Value> {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
-        let network = &access.network_id;
-        let jobs = self.scheduler_snapshot_jobs(network, scope).await?;
-        let agent_tasks = self.agent_task_projections(network, scope).await?;
-        let native_sessions = self.native_session_projections(network, scope).await?;
+        let cluster = &access.cluster_id;
+        let jobs = self.scheduler_snapshot_jobs(cluster, scope).await?;
+        let agent_tasks = self.agent_task_projections(cluster, scope).await?;
+        let native_sessions = self.native_session_projections(cluster, scope).await?;
         let store = self.store.lock().await;
-        let context = store.context(network, scope, &heads(input)?)?;
+        let context = store.context(cluster, scope, &heads(input)?)?;
         let mut targets = jobs
             .iter()
             .filter_map(|job| job["target_node"].as_str().map(String::from))
@@ -334,19 +334,19 @@ impl Runtime {
             }
         }
         let mut messages = Vec::new();
-        for message in store.messages(network, scope)? {
+        for message in store.messages(cluster, scope)? {
             let mut projected = json!(message);
             let envelope = store
-                .event(network, &message.event_hash)?
+                .event(cluster, &message.event_hash)?
                 .context("message event is missing")?;
-            let event = store.verify_event(network, &envelope)?;
+            let event = store.verify_event(cluster, &envelope)?;
             projected["blobs"] = json!(event.blobs);
             messages.push(projected);
         }
         let mut tasks = Vec::new();
-        for task in store.tasks(network, scope)? {
+        for task in store.tasks(cluster, scope)? {
             let mut projected = json!(task);
-            match store.followup_policy(network, scope, &task.task_id) {
+            match store.followup_policy(cluster, scope, &task.task_id) {
                 Ok(policy) => {
                     projected["followup_mode"] = json!(policy.mode);
                     projected["followup_version"] = json!(policy.version);
@@ -360,7 +360,7 @@ impl Runtime {
             }
             tasks.push(projected);
         }
-        targets.retain(|target| store.authorize_node(network, target, None).is_ok());
+        targets.retain(|target| store.authorize_node(cluster, target, None).is_ok());
         let frozen = jobs.iter().any(|job| job["write_frozen"] == true);
         let manager = self.config.manager.as_ref();
         let remote_manager = jobs
@@ -372,16 +372,16 @@ impl Runtime {
             "model":manager.map(|manager|&manager.model),"capabilities":manager.and_then(|manager| match manager.provider.as_str() {
                 "codex_sdk"=>Some(crate::manager::ManagerKind::CodexSdk.capabilities()),
                 "cursor_sdk"=>Some(crate::manager::ManagerKind::CursorSdk.capabilities()),_=>None})}));
-        let current_heads = store.heads(network, scope)?;
+        let current_heads = store.heads(cluster, scope)?;
         let needs_sync = !store
-            .missing_dependencies(network, &current_heads)?
+            .missing_dependencies(cluster, &current_heads)?
             .is_complete();
-        let snapshot = json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),
+        let snapshot = json!({"bot":store.bot_for_conversation(cluster,scope)?,"conversation":store.conversations(cluster)?.into_iter().find(|conversation|conversation.conversation_id==scope),
             "messages":messages,"tasks":tasks,"agent_tasks":agent_tasks,"native_sessions":native_sessions,"heads":context.heads,"missing":context.missing,
             "facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets});
         drop(store);
         if needs_sync {
-            let _ = self.request_scope_sync(network, scope, current_heads).await;
+            let _ = self.request_scope_sync(cluster, scope, current_heads).await;
         }
         Ok(snapshot)
     }
@@ -402,14 +402,14 @@ impl Runtime {
             self.store
                 .lock()
                 .await
-                .agent_task_status(&access.network_id, scope, task_ref)?;
-        self.cancel_known_task(&access.network_id, scope, task_ref, &status)
+                .agent_task_status(&access.cluster_id, scope, task_ref)?;
+        self.cancel_known_task(&access.cluster_id, scope, task_ref, &status)
             .await
     }
 
     pub(super) async fn cancel_known_task(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         task_ref: &str,
         status: &Value,
@@ -418,7 +418,7 @@ impl Runtime {
         let source = field(status, "source_node")?;
         let local = self.identity.peer_id()?;
         if target == local {
-            self.cancel_agent_task(network, scope, task_ref, source)
+            self.cancel_agent_task(cluster, scope, task_ref, source)
                 .await
         } else {
             ensure!(
@@ -426,7 +426,7 @@ impl Runtime {
                 "cancel this task through its source or target device"
             );
             self.peer_request(
-                network,
+                cluster,
                 target,
                 json!({"type":"cancel_agent_task","conversation_id":scope,"task_ref":task_ref}),
             )
@@ -444,11 +444,11 @@ mod tests {
     {
         let dir = crate::runtime::tests::fixture()?;
         let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
+        let cluster = identity.fixture_cluster_id()?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.install_trust_bundle(
-            &network,
-            &identity.sign_network_fixture(
+            &cluster,
+            &identity.sign_cluster_fixture(
                 1,
                 vec![identity.certificate(vec![NodeRole::Replica, NodeRole::Scheduler])?],
             )?,
@@ -460,7 +460,7 @@ mod tests {
                 "choices":[{"label":"拒绝","response":{"decision":"decline"}}]}]});
         let live = remote_native_projection(
             &mut store,
-            &network,
+            &cluster,
             "chat",
             "remote",
             Ok(json!({"native_sessions":[session]})),
@@ -472,7 +472,7 @@ mod tests {
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         let cached = remote_native_projection(
             &mut store,
-            &network,
+            &cluster,
             "chat",
             "remote",
             Err(anyhow::anyhow!("peer unavailable")),
@@ -487,13 +487,13 @@ mod tests {
         assert_eq!(cached[0]["pending_requests"], session["pending_requests"]);
         let wrong_scope = json!({"native_sessions":[{"conversation_id":"other","target_node":"remote","work_id":"foreign","thread_id":"foreign"}]});
         assert_eq!(
-            remote_native_projection(&mut store, &network, "chat", "remote", Ok(wrong_scope))?[0]["work_id"],
+            remote_native_projection(&mut store, &cluster, "chat", "remote", Ok(wrong_scope))?[0]["work_id"],
             "work"
         );
         assert!(
             remote_native_projection(
                 &mut store,
-                &network,
+                &cluster,
                 "other",
                 "remote",
                 Err(anyhow::anyhow!("peer unavailable"))
@@ -504,7 +504,7 @@ mod tests {
         invalid_control["can_control"] = json!("true");
         let invalid = remote_native_projection(
             &mut store,
-            &network,
+            &cluster,
             "chat",
             "remote",
             Ok(json!({"native_sessions":[invalid_control]})),
@@ -517,14 +517,14 @@ mod tests {
         completed["pending_requests"] = json!([]);
         remote_native_projection(
             &mut store,
-            &network,
+            &cluster,
             "chat",
             "remote",
             Ok(json!({"native_sessions":[completed]})),
         )?;
         let terminal = remote_native_projection(
             &mut store,
-            &network,
+            &cluster,
             "chat",
             "remote",
             Err(anyhow::anyhow!("peer unavailable")),

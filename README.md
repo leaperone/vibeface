@@ -17,13 +17,13 @@ flowchart LR
     C <-->|出站 WebSocket| G
 ```
 
-所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以按需启用 Agent，也可以只提供网页和公共中继。纯中继不加入个人设备网络。每个人拥有独立的设备网络，程序为每次请求选择已授权的可用节点，并固定已投递任务的目标。
+所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以按需启用 Agent，也可以只提供网页和公共中继。纯中继不加入个人集群。每个人拥有独立的集群，程序为每次请求选择已授权的可用节点，并固定已投递任务的目标。
 
 网页使用 React 和 TanStack Start 构建静态 SPA，随 Rust 程序内嵌分发，生产运行不需要 Node.js Web 服务。可信网页通过设备密钥和 Noise 通道连接指定 Node。
 
 Rust 核心负责认证、路由、DAG 同步、SQLite 存储、任务调度、去重和通知。Cursor SDK 聊天 Agent 通过原生自定义工具回调协调 Node，不需要 MCP。宿主命令和文件操作直接使用 SDK 工具；Codex 使用薄原生客户端访问 App Server，不经过独立执行适配层。机器人定义和共享聊天历史独立于本机 SDK 缓存，创建机器人不会启动模型。
 
-本版本使用新的机器人和数据库结构，部署时使用全新的数据目录重新初始化。旧数据库不自动升级，个人网络中的节点使用同一新版本。
+本版本使用新的机器人和数据库结构，部署时使用全新的数据目录重新初始化。旧数据库不自动升级，集群中的节点使用同一新版本。
 
 ## 安装与开始
 
@@ -61,17 +61,17 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 5，数据库 `user_version` 为 5。不注册网站账号，也不保存个人根私钥。`serve` 和 `pair` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 6，数据库 `user_version` 为 6。不注册网站账号，也不保存个人根私钥。`serve` 和 `pair` 用目录锁独占该目录。
 
 ```sh
 ./target/release/vibeface access --data-dir "$HOME/.vibeface"
 ```
 
-首次在自己信任的浏览器打开 `access` 打印的链接，填写设备名称，核对个人网络指纹，并保存加密恢复包。保存密钥的页面需要安全上下文。网络建立后，默认开启的本机自动访问会通过独立回环入口建立本机会话，不必重复配对；可在网页或 `config.json` 关闭。公网访问仍验证设备身份。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。已启用 Agent 的 Node 可以启动私有 Codex App Server；网页可用不代表 Codex 已安装、登录或模型可用。
+首次在自己信任的浏览器打开 `access` 打印的链接，填写设备名称，核对集群指纹，并保存加密恢复包。保存密钥的页面需要安全上下文。集群建立后，默认开启的本机自动访问会通过独立回环入口建立本机会话，不必重复配对；可在网页或 `config.json` 关闭。公网访问仍验证设备身份。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。已启用 Agent 的 Node 可以启动私有 Codex App Server；网页可用不代表 Codex 已安装、登录或模型可用。
 
 PVE 只提供网页和中继时，使用 `init --relay-only`，然后让 Mac mini 的 `network.bootstrap_urls` 指向它。在手机上打开可信网页，导入 Mac mini 的连接信息并完成设备配对，实际认证目标是 Mac mini。见 [纯 Web 与 Relay](docs/node.md#纯-web-与-relay)。
 
-另一台 Node 使用独立的空数据目录先 `init`。管理客户端复制的 base64url 配对信息传给 `pair --invite`。`pair --invite-file` 读取解码后的 JSON 邀请，不是这段原文。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
+另一台 Node 使用独立的空数据目录先 `init`。管理客户端复制的 base64url 配对信息传给 `pair --invite`。`pair --invite-file` 读取解码后的 JSON 邀请，不是这段原文。不要用新建集群代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
 ## 接续工作与通知
 

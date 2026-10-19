@@ -1,4 +1,4 @@
-//! Node-local storage and shared signed personal-network membership.
+//! Node-local storage and shared signed cluster membership.
 
 pub use vibeface_secure::membership::*;
 
@@ -14,7 +14,7 @@ mod tests {
     fn historical_author_signature_survives_recovery_without_online_authority() -> Result<()> {
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
-        let mut state = NetworkState::new(Genesis::create(
+        let mut state = ClusterState::new(Genesis::create(
             &root,
             vec![Member::client(&admin, "admin", true)?],
         )?)?;
@@ -25,8 +25,8 @@ mod tests {
             Member::node(&old_node, "retired", vec![NodeRole::Replica])?,
         )?)?;
         let event = old_node.sign_event(crate::model::Event {
-            version: 1,
-            network_id: state.genesis.network_id.clone(),
+            version: crate::model::WIRE_VERSION,
+            cluster_id: state.genesis.cluster_id.clone(),
             scope_id: "archive".into(),
             author: old_node.peer_id()?,
             sequence: 1,
@@ -52,14 +52,14 @@ mod tests {
             retained.clone(),
         )?)?;
         assert!(state.events.is_empty());
-        let fresh: NetworkState = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
+        let fresh: ClusterState = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
         let author = fresh
             .historical_nodes()?
             .into_iter()
             .find(|node| node.subject_id == old_node.peer_id().unwrap())
             .unwrap();
         assert_eq!(
-            crypto::verify_signed_event(&fresh.genesis.network_id, &event, &author.public_key)?
+            crypto::verify_signed_event(&fresh.genesis.cluster_id, &event, &author.public_key)?
                 .scope_id,
             "archive"
         );

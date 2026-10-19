@@ -18,7 +18,7 @@ use vibeface::{
     config::{self, Config, ManagerSettings},
     crypto::{LocalIdentity, digest},
     identity::{
-        IdentityKind, Member, NetworkState,
+        ClusterState, IdentityKind, Member,
         local::{BootstrapCapability, InviteEnvelope, PairRequest, PairReview},
     },
     local_access::Launcher,
@@ -36,7 +36,7 @@ const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 #[derive(Parser)]
 #[command(
     version,
-    about = "Personal device network for local coding agents. Run without a command to start this node.",
+    about = "Personal device cluster for local coding agents. Run without a command to start this node.",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -64,7 +64,7 @@ enum Action {
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
-    /// Join a personal network using its invite and pinned Peer ID.
+    /// Join a cluster using its invite and pinned Peer ID.
     Pair(Pair),
     /// Send a native Codex App Server method without retrying writes.
     Codex {
@@ -134,7 +134,7 @@ struct Init {
     /// Existing project directories available to this device's Agent. May be repeated.
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
-    /// Serve Web and public discovery/relay without joining a personal network or starting an Agent.
+    /// Serve Web and public discovery/relay without joining a cluster or starting an Agent.
     #[arg(long, conflicts_with_all = ["manager", "roots", "codex_socket"])]
     relay_only: bool,
     /// Require ordinary device pairing for local browser access.
@@ -166,7 +166,7 @@ struct Init {
     advertise_urls: Vec<String>,
     #[arg(long)]
     mdns: bool,
-    /// Offer bounded encrypted forwarding to other personal networks.
+    /// Offer bounded encrypted forwarding to other personal clusters.
     #[arg(long)]
     public_relay: bool,
 }
@@ -465,7 +465,7 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
     println!("Initialized device with Peer ID {}", identity.peer_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
@@ -540,13 +540,13 @@ async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":5}),
+        epoch == json!({"data_epoch":6}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
     let identity = config::identity(dir)?;
     let store = Store::open_readonly(dir.join("node.sqlite3"))?;
-    let initialized = store.has_network()?;
+    let initialized = store.has_cluster()?;
     let capability = if initialized {
         None
     } else {
@@ -693,7 +693,7 @@ fn verify_review(
     ensure!(
         review.version == payload.version
             && review.invite_id == payload.invite_id
-            && review.network_id == payload.network_id
+            && review.cluster_id == payload.cluster_id
             && review.inviter_subject_id == payload.inviter_subject_id
             && review.epoch == payload.epoch
             && review.expires_at_ms == payload.expires_at_ms
@@ -715,8 +715,8 @@ async fn pair(options: Pair) -> Result<()> {
     if runtime.has_membership().await? {
         ensure!(
             pending_path.exists()
-                && runtime.membership_state().await?.genesis.network_id == payload.network_id,
-            "this Node already belongs to a personal network; existing membership was preserved"
+                && runtime.membership_state().await?.genesis.cluster_id == payload.cluster_id,
+            "this Node already belongs to a cluster; existing membership was preserved"
         );
     }
     ensure!(
@@ -769,16 +769,16 @@ async fn pair(options: Pair) -> Result<()> {
             .context("invalid pairing status")?
         {
             "granted" => {
-                let state: NetworkState = serde_json::from_value(
+                let state: ClusterState = serde_json::from_value(
                     status
                         .get("state")
-                        .context("paired network state is missing")?
+                        .context("paired cluster state is missing")?
                         .clone(),
                 )?;
                 let view = state.project()?;
                 ensure!(
-                    view.network_id == payload.network_id,
-                    "paired network does not match the invitation"
+                    view.cluster_id == payload.cluster_id,
+                    "paired cluster does not match the invitation"
                 );
                 let authorized = view.authorize_node(&identity.peer_id()?, None)?;
                 ensure!(
@@ -787,13 +787,13 @@ async fn pair(options: Pair) -> Result<()> {
                             .node_roles
                             .iter()
                             .all(|role| configuration.roles.contains(role)),
-                    "paired network grants unexpected local permissions"
+                    "paired cluster grants unexpected local permissions"
                 );
                 let installed = runtime.install_membership(state).await?;
                 let current = installed.authorize_node(&identity.peer_id()?, None)?;
                 ensure!(
                     current == member,
-                    "installed network no longer grants the requested local membership"
+                    "installed cluster no longer grants the requested local membership"
                 );
                 configuration.roles = current.node_roles;
                 if !configuration.network.bootstrap_urls.contains(&url) {
@@ -802,11 +802,11 @@ async fn pair(options: Pair) -> Result<()> {
                 configuration.save(&options.data.data_dir)?;
                 fs::remove_file(pending_path)?;
                 println!(
-                    "Paired node {} with network {}",
+                    "Paired node {} with cluster {}",
                     identity.peer_id()?,
-                    payload.network_id
+                    payload.cluster_id
                 );
-                println!("Start the Node to connect to its personal network.");
+                println!("Start the Node to connect to its cluster.");
                 return Ok(());
             }
             "not_found" => {
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_only_initialization_does_not_join_a_personal_network() -> Result<()> {
+    fn relay_only_initialization_does_not_join_a_cluster() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-relay-only-{}", uuid::Uuid::new_v4()));
         let cli = Cli::try_parse_from([
@@ -1369,7 +1369,7 @@ mod tests {
         assert!(configuration.manager.is_none() && configuration.roots.is_empty());
         assert!(!configuration.local_auto_access);
         let store = Store::open_readonly(dir.join("node.sqlite3"))?;
-        assert!(!store.has_network()?);
+        assert!(!store.has_cluster()?);
         drop(store);
         assert!(
             Cli::try_parse_from([
@@ -1429,10 +1429,10 @@ mod tests {
         let member = Member::node(&device, "Build Node", vec![NodeRole::Replica]).unwrap();
         let invite = InviteEnvelope {
             payload: InvitePayload {
-                version: 1,
+                version: vibeface::identity::IDENTITY_VERSION,
                 invite_id: "invite".into(),
                 request_id: "invite-request".into(),
-                network_id: "ab".repeat(32),
+                cluster_id: "ab".repeat(32),
                 inviter_subject_id: "cd".repeat(32),
                 capability_hash: digest(b"fixture capability"),
                 new_kind: IdentityKind::Node,
@@ -1481,9 +1481,9 @@ mod tests {
         }
         let request_hash = digest(&request.signing_bytes().unwrap());
         let mut review = PairReview {
-            version: 1,
+            version: vibeface::identity::IDENTITY_VERSION,
             invite_id: "invite".into(),
-            network_id: "ab".repeat(32),
+            cluster_id: "ab".repeat(32),
             inviter_subject_id: "cd".repeat(32),
             new_member: member.clone(),
             proposal_hash: request_hash.clone(),

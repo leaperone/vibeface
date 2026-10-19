@@ -70,7 +70,7 @@ bash install.sh --channel nightly
 ~/.local/bin/vibeface -> ~/.local/share/vibeface/current/vibeface
 ```
 
-它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后按提示把 `~/.local/bin` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
+它不创建节点数据、不创建集群、不启动后台服务、不安装 Provider，也不开启自动更新。安装后按提示把 `~/.local/bin` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
 
 已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。包协议 2 的受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。包协议 1 的旧预览版需要 [一次性手动更换程序](releasing.md#手动建立受管安装或更换程序)，不支持自动跨命名更新。不要只复制 binary；更新和服务管理需要完整包。
 
@@ -96,7 +96,7 @@ vibeface
 vibeface access
 ```
 
-在可信浏览器打开本机链接，创建个人网络并保存加密恢复包。已有个人网络时应配对，不能重新创建网络代替配对。见 [添加自己的设备](node.md#添加自己的设备)。编码执行需要另装并登录 Codex 等 Provider；聊天调度需要 [配置管理 Agent](node.md#配置管理-agent)。
+在可信浏览器打开本机链接，创建集群并保存加密恢复包。已有集群时应配对，不能重新创建网络代替配对。见 [添加自己的设备](node.md#添加自己的设备)。编码执行需要另装并登录 Codex 等 Provider；聊天调度需要 [配置管理 Agent](node.md#配置管理-agent)。
 
 使用自定义数据目录可以直接执行 `vibeface --data-dir /absolute/path/to/data`。根 `--data-dir` 只用于直接启动；有子命令时，把该参数写在子命令后，例如 `vibeface status --data-dir /absolute/path/to/data`。混用根参数与子命令会报错，避免操作错误的数据目录。
 

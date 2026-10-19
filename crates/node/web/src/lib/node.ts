@@ -3,7 +3,7 @@ import type { ChangedEvent } from './progress'
 
 export type ConnectionEntry = { address: string; peer_id: string; relay: boolean; local?: boolean }
 export type PublicIdentity = { peerId: string; publicKey: string }
-export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
+export type ClientPrincipal = { cluster_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
 export type EntryInfo = { peer_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
@@ -17,11 +17,11 @@ export type ReadyConnection = {
   isCurrent(): boolean
 }
 export type Member = { subject_id: string; public_key: string; kind: 'node' | 'client'; name: string; node_roles: NodeRole[]; manage: boolean }
-export type MembershipView = { network_id: string; epoch: number; heads: string[]; members: Member[]; revoked: string[] }
-export type PairReview = { version: number; invite_id: string; network_id: string; inviter_subject_id: string; new_member: Member; proposal_hash: string; parents: string[]; epoch: number; expires_at_ms: number }
+export type MembershipView = { cluster_id: string; epoch: number; heads: string[]; members: Member[]; revoked: string[] }
+export type PairReview = { version: number; invite_id: string; cluster_id: string; inviter_subject_id: string; new_member: Member; proposal_hash: string; parents: string[]; epoch: number; expires_at_ms: number }
 export type PairReceipt = { request_id: string; review: PairReview; new_subject_signature: string }
 export type Signing = { domain: string; payload: string }
-export type WaitingPair = { request_id: string; network_id: string; entry: ConnectionEntry; review: PairReview; signing: Signing; accepted: boolean }
+export type WaitingPair = { request_id: string; cluster_id: string; entry: ConnectionEntry; review: PairReview; signing: Signing; accepted: boolean }
 export type Invitation = { kind: 'bootstrap'; entry: ConnectionEntry; capability: string } | { kind: 'pair'; entry: ConnectionEntry; invite: Record<string, unknown>; capability: string; payload: Record<string, unknown> }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -63,11 +63,11 @@ export function parseMember(value: unknown): Member {
 }
 export function parseView(value: unknown): MembershipView {
   const v = record(value)
-  return { network_id: validTarget(v.network_id), epoch: integer(v.epoch), heads: strings(v.heads), members: array(v.members).map(parseMember), revoked: strings(v.revoked) }
+  return { cluster_id: validTarget(v.cluster_id), epoch: integer(v.epoch), heads: strings(v.heads), members: array(v.members).map(parseMember), revoked: strings(v.revoked) }
 }
 export function parsePrincipal(value: unknown): ClientPrincipal {
   const v = record(value)
-  const principal = { network_id: validTarget(v.network_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch) }
+  const principal = { cluster_id: validTarget(v.cluster_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch) }
   if (v.source === 'local_session') {
     if (v.can_manage !== false) throw new Error('本机会话不能取得设备管理权限。')
     return { ...principal, source: 'local_session', can_manage: false }
@@ -77,8 +77,8 @@ export function parsePrincipal(value: unknown): ClientPrincipal {
 }
 export function parseReview(value: unknown): PairReview {
   const v = record(value)
-  const review = { version: integer(v.version), invite_id: text(v.invite_id), network_id: validTarget(v.network_id), inviter_subject_id: validTarget(v.inviter_subject_id), new_member: parseMember(v.new_member), proposal_hash: validTarget(v.proposal_hash), parents: strings(v.parents), epoch: integer(v.epoch), expires_at_ms: integer(v.expires_at_ms) }
-  if (review.version !== 1 || review.new_member.manage) throw new Error('普通配对不能授予管理权限。')
+  const review = { version: integer(v.version), invite_id: text(v.invite_id), cluster_id: validTarget(v.cluster_id), inviter_subject_id: validTarget(v.inviter_subject_id), new_member: parseMember(v.new_member), proposal_hash: validTarget(v.proposal_hash), parents: strings(v.parents), epoch: integer(v.epoch), expires_at_ms: integer(v.expires_at_ms) }
+  if (review.version !== 2 || review.new_member.manage) throw new Error('普通配对不能授予管理权限。')
   return review
 }
 export function parseSigning(value: unknown): Signing { const v = record(value); return { domain: text(v.domain), payload: text(v.payload) } }
@@ -94,9 +94,10 @@ export function parseInvitation(value: unknown): Invitation {
   const envelope = record(v.invite, '配对邀请')
   const invite = record(envelope.invite, '配对授权')
   const payload = record(invite.payload, '邀请权限')
+  if (payload.version !== 2) throw new Error('邀请版本无效。请创建新邀请。')
   if (payload.new_kind !== 'client') throw new Error('这是运行节点邀请。请在目标电脑上运行 vibeface pair。')
   if (payload.manage !== false || roles(payload.node_roles).length || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请已过期或权限无效。请创建新邀请。')
-  validTarget(payload.network_id)
+  validTarget(payload.cluster_id)
   return { kind: 'pair', entry, invite, capability: text(envelope.capability), payload }
 }
 export function canonical(value: unknown): string {

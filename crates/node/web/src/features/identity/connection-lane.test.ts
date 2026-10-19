@@ -53,10 +53,10 @@ test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(primaryLane({ hasInvitation: false, savedCount: 2 }), 'saved')
 })
 
-const target = 'a'.repeat(64), network = 'b'.repeat(64), subject = 'c'.repeat(64), publicKey = 'd'.repeat(64)
+const target = 'a'.repeat(64), cluster = 'b'.repeat(64), subject = 'c'.repeat(64), publicKey = 'd'.repeat(64)
 const entry: ConnectionEntry = { address: 'https://node.example', peer_id: target, relay: true }
-const genesis = { version: 1, network_id: network, owner_public_key: publicKey }
-const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1 }
+const genesis = { version: 2, cluster_id: cluster, owner_public_key: publicKey }
+const membership = { cluster_id: cluster, members: [], revoked: [], heads: [], epoch: 1 }
 const canonical = (value: unknown): string => value && typeof value === 'object'
   ? Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`
   : JSON.stringify(value)
@@ -92,8 +92,8 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
       })
     },
   }
-  const review = { version: 1, invite_id: 'invite', network_id: network, inviter_subject_id: target, new_member: { subject_id: subject, public_key: publicKey, kind: 'client', name: 'browser', node_roles: [], manage: false }, proposal_hash: 'e'.repeat(64), parents: [], epoch: 1, expires_at_ms: Date.now() + 60000 }
-  if (pairing) stored.set('vibeface.waiting-pair', JSON.stringify({ request_id: 'pair', network_id: network, entry, review, signing: { domain: 'identity-pair-review', payload: canonical(review) }, accepted: true }))
+  const review = { version: 2, invite_id: 'invite', cluster_id: cluster, inviter_subject_id: target, new_member: { subject_id: subject, public_key: publicKey, kind: 'client', name: 'browser', node_roles: [], manage: false }, proposal_hash: 'e'.repeat(64), parents: [], epoch: 1, expires_at_ms: Date.now() + 60000 }
+  if (pairing) stored.set('vibeface.waiting-pair', JSON.stringify({ request_id: 'pair', cluster_id: cluster, entry, review, signing: { domain: 'identity-pair-review', payload: canonical(review) }, accepted: true }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
@@ -109,11 +109,11 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
         calls.push(method)
         if (holds.has(method)) return holds.get(method)?.promise
         if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['relay'], initialized: !bootstrap }
-        if (method === 'authenticate' && local) return { principal: { network_id: network } }
+        if (method === 'authenticate' && local) return { principal: { cluster_id: cluster } }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'pair_status') return { status: 'granted' }
         if (method === 'prepare_genesis') {
-          const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
+          const genesis = { version: 2, cluster_id: cluster, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
           return { state: { genesis, checkpoint: null, events: [] }, signing: { domain: 'identity-genesis', payload: canonical(genesis) } }
         }
         return {}
@@ -122,10 +122,10 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   }
   let verifications = 0, released = 0
   const secure = {
-    verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: local ? 'local_session' : 'membership', network_id: network, subject_id: subject, epoch: 1, can_manage: false }, view: membership } },
+    verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: local ? 'local_session' : 'membership', cluster_id: cluster, subject_id: subject, epoch: 1, can_manage: false }, view: membership } },
     verifiedView: () => membership,
-    openPackage: async () => ({ networkId: network, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
-    Identity: { generate: () => ({ peerId: () => network, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
+    openPackage: async () => ({ clusterId: cluster, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
+    Identity: { generate: () => ({ peerId: () => cluster, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {}, verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
@@ -134,13 +134,13 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
     location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, Uint8Array, Error, crypto: globalThis.crypto,
     fetch: async (url: string, options: RequestInit) => {
       if (!local) return { ok: false }
-      if (url === '/api/local/info') return { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, subject_id: subject, network_id: network, entry: localEntry }) }
+      if (url === '/api/local/info') return { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, subject_id: subject, cluster_id: cluster, entry: localEntry }) }
       assert.equal(url, '/api/local/exchange')
       assert.equal(options.credentials, 'same-origin')
       assert.equal(options.redirect, 'error')
       assert.deepEqual(JSON.parse(String(options.body)), { token: 'f'.repeat(64), peer_id: target, subject_id: subject, public_key: publicKey })
       calls.push('local-exchange')
-      return { ok: true, json: async () => ({ network_id: network, entry: localEntry }) }
+      return { ok: true, json: async () => ({ cluster_id: cluster, entry: localEntry }) }
     },
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
   })
@@ -314,7 +314,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     let work: Promise<void>
     if (flow === 'directory') work = app.render().refreshDirectory()
     else {
-      const challenge = { network_id: network, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+      const challenge = { cluster_id: cluster, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
       const challengeHold = deferred(); app.holds.set('recovery_challenge', challengeHold)
       challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
       work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })
@@ -377,7 +377,7 @@ test('revoked authorization stops reconnection and releases the rejected session
     hold.reject(Object.assign(new Error('authorization revoked'), { responded: true })); await settle()
     assert.equal(app.render().ready, null)
     assert.equal(app.render().phase, 'unpaired')
-    assert.match(app.render().error, /无法恢复原网络授权/)
+    assert.match(app.render().error, /无法恢复原集群授权/)
     assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
     assert.equal(app.timers.size, 0)
     app.sockets[1].drop(); assert.equal(app.timers.size, 0)

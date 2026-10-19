@@ -187,7 +187,7 @@ def verify_direct_start(run, binary):
             try:
                 if attempt == 0:
                     wait_for("direct startup initialization", lambda: (directory / "data-epoch.json").exists())
-                    require(json.loads((directory / "data-epoch.json").read_text()) == {"data_epoch": 5},
+                    require(json.loads((directory / "data-epoch.json").read_text()) == {"data_epoch": 6},
                             "direct startup writes the current data epoch")
                     configuration = json.loads((directory / "config.json").read_text())
                     require(configuration["listen"] == "127.0.0.1:4790"
@@ -608,8 +608,8 @@ for await (const line of createInterface({input:process.stdin})) {
     else if (input.op === 'backup') {
       const root = identity(input.identity || 'root');
       const epoch = input.recovery_epoch || 1;
-      const payload = encoder.encode(JSON.stringify({version:1,network_id:root.peerId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:epoch,decryption_keys:[]}));
-      try { result = {version:1,network_id:root.peerId(),recovery_epoch:epoch,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
+      const payload = encoder.encode(JSON.stringify({version:2,cluster_id:root.peerId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:epoch,decryption_keys:[]}));
+      try { result = {version:2,cluster_id:root.peerId(),recovery_epoch:epoch,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
       finally { payload.fill(0); }
     }
     else if (input.op === 'recover_material') {
@@ -618,7 +618,7 @@ for await (const line of createInterface({input:process.stdin})) {
         const payload = JSON.parse(decoder.decode(plaintext));
         const root = Identity.fromSecretHex(payload.root_secret_key);
         keys.get('recovered')?.free(); keys.set('recovered',root);
-        result = {network_id:root.peerId(),recovery_epoch:payload.recovery_epoch,genesis:payload.genesis};
+        result = {cluster_id:root.peerId(),recovery_epoch:payload.recovery_epoch,genesis:payload.genesis};
       } finally { plaintext.fill(0); }
     }
     else if (input.op === 'recovery_checkpoint') {
@@ -651,7 +651,7 @@ class Client:
         self.helper = helper
         self.module = module
         self.identity_file = identity_file
-        self.network_id = None
+        self.cluster_id = None
         self.principal = None
         self.process = None
         self.peer_id = None
@@ -689,11 +689,11 @@ class Client:
             require(error["status"] == status, f"encrypted {method} rejection status")
         return response
 
-    def authenticate(self, network=None):
-        self.network_id = network or self.network_id
-        result = self.call("authenticate", {"network_id": self.network_id})
+    def authenticate(self, cluster=None):
+        self.cluster_id = cluster or self.cluster_id
+        result = self.call("authenticate", {"cluster_id": self.cluster_id})
         self.principal = result["principal"]
-        require(self.principal["network_id"] == self.network_id, "client authenticates the pinned personal network")
+        require(self.principal["cluster_id"] == self.cluster_id, "client authenticates the pinned cluster")
         return result
 
     def rpc(self, method, *, status=200, **arguments):
@@ -724,7 +724,7 @@ class Client:
                                                  "request_id": uuid.uuid4().hex})
         prepared["invite"]["inviter_signature"] = self.command("sign", **prepared["signing"])
         tampered = copy.deepcopy(prepared["invite"])
-        tampered["payload"]["network_id"] = "ab" * 32
+        tampered["payload"]["cluster_id"] = "ab" * 32
         self.call("commit_invite", {"invite": tampered, "capability": prepared["capability"]}, status=400)
         return self.call("commit_invite", {"invite": prepared["invite"], "capability": prepared["capability"]})
 
@@ -735,7 +735,7 @@ class Client:
         return self.call("pair_confirm", {"request_id": request_id, "event": prepared["event"],
                                            "inviter_signature": review_signature})
 
-    def pair_client(self, owner, network, name):
+    def pair_client(self, owner, cluster, name):
         self.url = owner.url
         self.connect(owner.peer_id)
         invitation = owner.invite("client")
@@ -751,7 +751,7 @@ class Client:
         owner.approve(receipt["request_id"])
         result = self.call("pair_status", {"request_id": receipt["request_id"]})
         require(result["status"] == "granted", "new client pairing completes after both signatures")
-        self.authenticate(network)
+        self.authenticate(cluster)
         self.call("prepare_revoke", {"subject_id": owner.peer_id}, status=403)
 
     def close(self):
@@ -784,7 +784,7 @@ class Node:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds")
-        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 5},
+        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 6},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
         result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
@@ -837,7 +837,7 @@ class Node:
             self.log = None
             return returncode
 
-    def pair(self, owner, network, *, relay_url=None):
+    def pair(self, owner, cluster, *, relay_url=None):
         original_config = json.loads((self.directory / "config.json").read_text())
         network_config = original_config["network"]
         invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler"])
@@ -872,7 +872,7 @@ class Node:
                         process.wait(timeout=5)
             finally:
                 log.close()
-        self.client.pair_client(owner.client, network, f"{self.name} independent client")
+        self.client.pair_client(owner.client, cluster, f"{self.name} independent client")
         self.client.url = self.url
         self.client.peer_id = self.peer_id
         paired_config = json.loads((self.directory / "config.json").read_text())
@@ -894,10 +894,10 @@ class Node:
         self.client.command("forget_root")
         self.client.call("bootstrap", {"capability": "invalid-capability", "state": state}, status=400)
         result = self.client.call("bootstrap", {"capability": self.access["capability"], "state": state})
-        self.client.network_id = state["genesis"]["network_id"]
+        self.client.cluster_id = state["genesis"]["cluster_id"]
         self.client.principal = result["principal"]
         require(self.client.principal["can_manage"], "bootstrap grants the local management client")
-        return self.client.network_id
+        return self.client.cluster_id
 
 
 def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
@@ -1592,7 +1592,7 @@ def network_fixture_noise(caller, target, caller_identity, target_identity):
     caller_identity.command("finish")
     target_identity.command("finish")
     return {"caller_peer_id": caller_identity.peer_id, "target_peer_id": target_identity.peer_id,
-            "context": context, "scope": "fixture Noise over the original public relay; not personal-network member authorization"}
+            "context": context, "scope": "fixture Noise over the original public relay; not cluster member authorization"}
 
 
 def network_fixture_canary(sender, receiver, sender_identity, receiver_identity, label):
@@ -1958,17 +1958,17 @@ def verify_snapshot(snapshot):
         require(hashlib.sha256(signed["canonical_body"].encode()).hexdigest() == event_hash,
                 "exported event content hash matches")
         event = json.loads(signed["canonical_body"])
-        require(event["network_id"] == snapshot["network_id"], "snapshot remains in its network")
+        require(event["cluster_id"] == snapshot["cluster_id"], "snapshot remains in its cluster")
         dependencies = event["parents"] + ([event["previous"]] if event["previous"] else [])
         require(all(dependency in events for dependency in dependencies), "export includes complete event closure")
     require(all(head in events for head in snapshot["heads"]), "snapshot contains advertised heads")
     return len(events)
 
 
-def verify_blobs(node, network):
+def verify_blobs(node, cluster):
     connection = sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True)
     try:
-        rows = connection.execute("SELECT hash,size,content FROM blobs WHERE network_id=?", (network,)).fetchall()
+        rows = connection.execute("SELECT hash,size,content FROM blobs WHERE cluster_id=?", (cluster,)).fetchall()
         for digest, size, content in rows:
             require(size == len(content) and hashlib.sha256(content).hexdigest() == digest,
                     "replicated blob length and digest match")
@@ -2127,7 +2127,7 @@ def recover_fresh_node(node, backup, password):
     node.client.connect(node.peer_id)
     material = node.client.command("recover_material", backup=backup, password=password)
     state = {"genesis": material["genesis"], "checkpoint": None, "events": []}
-    challenge = node.client.call("recovery_challenge", {"network_id": material["network_id"],
+    challenge = node.client.call("recovery_challenge", {"cluster_id": material["cluster_id"],
                                  "owner_public_key": material["genesis"]["owner_public_key"],
                                  "genesis": material["genesis"]})
     signature = node.client.command("sign", identity="recovered", **challenge["signing"])
@@ -2135,7 +2135,7 @@ def recover_fresh_node(node, backup, password):
               "recovery_epoch": material["recovery_epoch"], "state": state}
     node.client.call("recovery_context", params, status=400)
     context = node.client.call("recovery_context", {**params, "capability": node.access["capability"]})
-    require(context["view"]["network_id"] == backup["network_id"], "fresh recovery proves the original root network")
+    require(context["view"]["cluster_id"] == backup["cluster_id"], "fresh recovery proves the original root cluster")
     identity = node.client.command("identity")
     info = node.client.call("info")
     members = [
@@ -2151,7 +2151,7 @@ def recover_fresh_node(node, backup, password):
                                                    backup_epoch=backup["recovery_epoch"], prepared=prepared)
     result = node.client.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"],
                                           "capability": node.access["capability"]})
-    node.client.network_id = backup["network_id"]
+    node.client.cluster_id = backup["cluster_id"]
     require(result["principal"]["can_manage"] and result["view"]["epoch"] == backup["recovery_epoch"] + 1,
             "fresh node restores independent management at the next recovery epoch")
     node.client.authenticate()
@@ -2163,7 +2163,7 @@ def recover_fresh_node(node, backup, password):
     return updated
 
 
-def verify_recovery(node, other, nodes, network):
+def verify_recovery(node, other, nodes, cluster):
     wrong = other.command("recover_material", backup=node.backup,
                           password="wrong-acceptance-passphrase", check=False)
     require(wrong["ok"] is False, "encrypted recovery package rejects a wrong password")
@@ -2173,10 +2173,10 @@ def verify_recovery(node, other, nodes, network):
                              password=node.backup_password, check=False)
     require(rejected["ok"] is False, "recovery rejects missing encrypted key material")
     material = other.command("recover_material", backup=node.backup, password=node.backup_password)
-    require(material["network_id"] == network, "recovered root retains the original personal fingerprint")
+    require(material["cluster_id"] == cluster, "recovered root retains the original personal fingerprint")
     other.url = node.url
     other.connect(node.peer_id)
-    wrong_challenge = other.call("recovery_challenge", {"network_id": network,
+    wrong_challenge = other.call("recovery_challenge", {"cluster_id": cluster,
                                  "owner_public_key": material["genesis"]["owner_public_key"],
                                  "genesis": material["genesis"]})
     wrong_signature = other.command("sign", **wrong_challenge["signing"])
@@ -2184,7 +2184,7 @@ def verify_recovery(node, other, nodes, network):
                                               "signature": wrong_signature}, status=403)
     require(not response.get("result") and "state" not in response and "view" not in response,
             "wrong root proof reveals no private membership")
-    challenge = other.call("recovery_challenge", {"network_id": network,
+    challenge = other.call("recovery_challenge", {"cluster_id": cluster,
                            "owner_public_key": material["genesis"]["owner_public_key"],
                            "genesis": material["genesis"]})
     signature = other.command("sign", identity="recovered", **challenge["signing"])
@@ -2207,7 +2207,7 @@ def verify_recovery(node, other, nodes, network):
     prepared["checkpoint"] = other.command("recovery_checkpoint", state=context["state"], members=keep,
                                             backup_epoch=node.backup["recovery_epoch"], prepared=prepared)
     result = other.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"]})
-    other.network_id = network
+    other.cluster_id = cluster
     require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
             "root recovery establishes an independent manager in a higher epoch")
     history = other.rpc("conversation", conversation_id="acceptance-conversation")
@@ -2223,7 +2223,7 @@ def verify_recovery(node, other, nodes, network):
         require("closed" in rejected.get("error", "").lower(),
                 "old authorization is explicitly rejected or disconnected")
     node.client.connect()
-    node.client.call("authenticate", {"network_id": network}, status=403)
+    node.client.call("authenticate", {"cluster_id": cluster}, status=403)
     for peer in nodes:
         if peer is node or peer.name == "C":
             continue
@@ -2239,7 +2239,7 @@ def verify_channel_security(node):
     for kind in ("tamper", "replay"):
         connection = "negative-" + kind
         node.client.connect(connection=connection)
-        node.client.call("authenticate", {"network_id": node.client.network_id}, connection=connection)
+        node.client.call("authenticate", {"cluster_id": node.client.cluster_id}, connection=connection)
         result = node.client.command("attack", kind=kind, connection=connection)
         require(result == {"rejected": True}, "invalid protected record closes the real Node channel")
     require(node.client.rpc("nodes")["nodes"], "valid channel remains usable after separate attack connections")
@@ -2255,15 +2255,15 @@ def verify_browser_origins(node, origins):
     node.client.request("/api/info", headers={"Host": "unconfigured.invalid"}, origin=False, status=403)
 
 
-def scheduler_records(node, network, kind="job"):
+def scheduler_records(node, cluster, kind="job"):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key LIKE ?",
-                                  (network, "scheduler:v1:" + kind + ":%"))
+        rows = connection.execute("SELECT value FROM local_values WHERE cluster_id=? AND key LIKE ?",
+                                  (cluster, "scheduler:v1:" + kind + ":%"))
         return [json.loads(row[0]) for row in rows]
 
 
-def scheduler_record(node, network, trigger, kind="job"):
-    return next((row for row in scheduler_records(node, network, kind) if row["trigger"] == trigger), None)
+def scheduler_record(node, cluster, trigger, kind="job"):
+    return next((row for row in scheduler_records(node, cluster, kind) if row["trigger"] == trigger), None)
 
 
 def require_quiet(description, predicate):
@@ -2274,10 +2274,10 @@ def require_quiet(description, predicate):
         time.sleep(0.2)
 
 
-def local_events(node, network, conversation):
+def local_events(node, cluster, conversation):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT envelope FROM events WHERE network_id=? AND scope_id=?",
-                                  (network, conversation)).fetchall()
+        rows = connection.execute("SELECT envelope FROM events WHERE cluster_id=? AND scope_id=?",
+                                  (cluster, conversation)).fetchall()
     return [json.loads(json.loads(row[0])["canonical_body"]) for row in rows]
 
 
@@ -2301,7 +2301,7 @@ def agent_tool_result(run, conversation, call_ref):
                if row["conversation_id"] == conversation and row.get("call_ref") == call_ref and row.get("result")]
     return records[-1] if records else None
 
-def chat_agent_checks(run, workspace, a, b, c, network, passed):
+def chat_agent_checks(run, workspace, a, b, c, cluster, passed):
     def calls(name, label=None):
         return [row for row in fixture_records(run) if row["conversation_id"] == name and not row.get("finalization")
                 and (label is None or row["label"] == label)]
@@ -2317,7 +2317,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
                             text=json.dumps({"chat_agent": True, "label": label, **directive}))
 
     def completed(receipt):
-        job = scheduler_record(a, network, receipt["trigger"])
+        job = scheduler_record(a, cluster, receipt["trigger"])
         if job and job["state"] in {"failed", "unknown", "cancelled"}:
             raise RuntimeError("Agent source reached " + job["state"] + ": " + job.get("detail", ""))
         return job if job and job["state"] == "completed" else None
@@ -2344,7 +2344,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     history = c.client.rpc("conversation", conversation_id=name)
     require(history["tasks"] == [] and len(history["agent_tasks"]) == 1,
             "ordinary Agent work creates no hidden business Task or execution binding")
-    endings = [event["body"]["message"] for event in local_events(c, network, name)
+    endings = [event["body"]["message"] for event in local_events(c, cluster, name)
                if event["body"].get("type") == "agent_message" and event["body"]["message"].get("in_reply_to") == task["task_ref"]
                and event["body"]["message"]["kind"] in {"completed", "failed", "interrupted"}]
     require(len(endings) == 1 and endings[0]["kind"] == "completed", "exactly one signed terminal reply returns from B")
@@ -2374,7 +2374,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     task = wait_for("restart target task is recorded", lambda: agent_tool_result(run, name, "task-target-restart"))
     wait_for("restart task has one real side effect", lambda: (directory / "count.txt").exists())
     running = wait_for("target task is Running before crash", lambda:
-        (row := scheduler_record(b, network, task["task_ref"])) and row["state"] == "running" and row)
+        (row := scheduler_record(b, cluster, task["task_ref"])) and row["state"] == "running" and row)
     b.stop(crash=True)
     for row in calls(name, "target-restart"):
         try:
@@ -2385,19 +2385,19 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     b.client.connect()
     b.client.authenticate()
     unknown = wait_for("running target task recovers as Unknown", lambda:
-        row if (row := scheduler_record(b, network, task["task_ref"])) and row["state"] == "unknown" else None)
+        row if (row := scheduler_record(b, cluster, task["task_ref"])) and row["state"] == "unknown" else None)
     require(unknown["attempt"]["id"] == running["attempt"]["id"], "Unknown retains the original attempt identity")
     require_quiet("Unknown recovery never replays or reports success", lambda:
         (directory / "count.txt").read_text() == "once" and len(invocations(run, "target-restart")) == 1
-        and (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "unknown")
-    endings = [event for event in local_events(b, network, name) if event["body"].get("type") == "agent_message"
+        and (scheduler_record(b, cluster, task["task_ref"]) or {}).get("state") == "unknown")
+    endings = [event for event in local_events(b, cluster, name) if event["body"].get("type") == "agent_message"
                and event["body"]["message"].get("in_reply_to") == task["task_ref"]
                and event["body"]["message"]["kind"] in {"completed", "failed", "interrupted"}]
     require(not endings, "Unknown work cannot manufacture a terminal Agent result")
     passed("target crash preserves the original Unknown attempt and file effect without replay or a false successful result",
            task_ref=task["task_ref"], attempt_id=unknown["attempt"]["id"])
 
-def bot_checks(run, workspace, a, b, c, network, passed, outsider):
+def bot_checks(run, workspace, a, b, c, cluster, passed, outsider):
     definitions = [{"bot_id": "bot-" + label, "conversation_id": "bot-history-" + label,
                     "name": label.capitalize(), "instructions": "bot-" + label + "-instructions-sentinel",
                     "project": {"target_node": b.peer_id, "cwd": str(workspace)}} for label in ("alpha", "beta")]
@@ -2413,18 +2413,18 @@ def bot_checks(run, workspace, a, b, c, network, passed, outsider):
         stored.append(original)
     require(sorted(a.client.rpc("bots")["bots"], key=lambda bot: bot["bot_id"]) == stored,
             "Bot listing contains the two exact persisted definitions")
-    require(outsider.client.rpc("bots")["bots"] == [], "another personal network cannot list these Bots")
-    independent = outsider.client.rpc("create_bot", **{**definitions[0], "name": "Other network", "project": None})["bot"]
+    require(outsider.client.rpc("bots")["bots"] == [], "another cluster cannot list these Bots")
+    independent = outsider.client.rpc("create_bot", **{**definitions[0], "name": "Other cluster", "project": None})["bot"]
     require(outsider.client.rpc("bots")["bots"] == [independent]
             and sorted(a.client.rpc("bots")["bots"], key=lambda bot: bot["bot_id"]) == stored,
-            "the same Bot identity in another network cannot replace or reveal this network's definition")
+            "the same Bot identity in another cluster cannot replace or reveal this cluster's definition")
     require_quiet("creating Bot definitions does not launch a model", lambda: len(fixture_records(run)) == before_calls)
 
     def send(definition, label):
         receipt = a.client.rpc("message", conversation_id=definition["conversation_id"], message_id=label,
                                text=json.dumps({"chat_agent": True, "label": label}))
         wait_for("Bot message gets one final reply", lambda:
-            (scheduler_record(a, network, receipt["trigger"]) or {}).get("state") == "completed")
+            (scheduler_record(a, cluster, receipt["trigger"]) or {}).get("state") == "completed")
         return next(row for row in fixture_records(run) if row["trigger"] == receipt["trigger"])
 
     first = [send(definition, "bot-message-" + definition["bot_id"]) for definition in definitions]
@@ -2449,7 +2449,7 @@ def bot_checks(run, workspace, a, b, c, network, passed, outsider):
     a.client.connect()
     a.client.authenticate()
     require_quiet("restart and activating a Manager on imported Bot history never run a model", lambda:
-        len(fixture_records(run)) == before_calls and not scheduler_records(c, network))
+        len(fixture_records(run)) == before_calls and not scheduler_records(c, cluster))
     require(sorted(a.client.rpc("bots")["bots"], key=lambda bot: bot["bot_id"]) == stored,
             "Bot definitions and their signed identity survive restart")
     resumed = send(definitions[0], "bot-alpha-after-restart")
@@ -2465,7 +2465,7 @@ def bot_checks(run, workspace, a, b, c, network, passed, outsider):
            bot_ids=[bot["bot_id"] for bot in stored])
 
 
-def startup_subscription_checks(run, workspace, a, b, c, network, passed):
+def startup_subscription_checks(run, workspace, a, b, c, cluster, passed):
     def rpc(method):
         return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method]
 
@@ -2476,7 +2476,7 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
     def approval_notifications(name):
         with sqlite3.connect(f"file:{b.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
             rows = [json.loads(row[0]) for row in connection.execute(
-                "SELECT record FROM notification_outbox WHERE network_id=?", (network,))]
+                "SELECT record FROM notification_outbox WHERE cluster_id=?", (cluster,))]
         return [row for row in rows if row["conversation_id"] == name and row["kind"] == "needs_input"]
 
     def start(name, approval=False):
@@ -2491,12 +2491,12 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
         native = wait_for("SDK registers the original native thread and turn", lambda: next(
             (row for row in fixture_records(run, "manager-native-work.jsonl") if row["label"] == name), None))
         def sdk_returned():
-            job = scheduler_record(b, network, task["task_ref"])
+            job = scheduler_record(b, cluster, task["task_ref"])
             if not job or job["state"] != "running":
                 return None
             with sqlite3.connect(f"file:{b.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-                row = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key=?",
-                                         (network, "sdk-returned:v1:" + job["attempt"]["id"])).fetchone()
+                row = connection.execute("SELECT value FROM local_values WHERE cluster_id=? AND key=?",
+                                         (cluster, "sdk-returned:v1:" + job["attempt"]["id"])).fetchone()
             return job if row and json.loads(row[0]).get("sdk_returned") else None
         running = wait_for("SDK return leaves the original background native task Running", sdk_returned)
         return directory, task, native, running
@@ -2517,7 +2517,7 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
     verify_snapshot(snapshot)
     events = {signed["hash"]: json.loads(signed["canonical_body"]) for signed in snapshot["events"]}
     raised = events.get(notification["event_hash"])
-    require(raised is not None and raised["network_id"] == network and raised["scope_id"] == name
+    require(raised is not None and raised["cluster_id"] == cluster and raised["scope_id"] == name
             and raised["author"] == b.peer_id and raised["body"] == {
                 "type": "notification_raised", "notification_id": notification["notification_id"],
                 "kind": notification["kind"], "text": notification["text"]},
@@ -2559,7 +2559,7 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
                  request_id=request_id, response={"decision": "decline"})
     directory.joinpath("release").touch()
     wait_for("exact native completion reconciles the original target Agent task", lambda:
-        (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "completed")
+        (scheduler_record(b, cluster, task["task_ref"]) or {}).get("state") == "completed")
     wait_for("completion reaches C from the original signed Agent reply", lambda:
         (row := agent_task_snapshot(c.client, name, task["task_ref"])) and row["state"] == "completed")
     require(len(rpc("turn/start")) == 1, "startup and reconnect never replay the original native turn")
@@ -2590,7 +2590,7 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
     private_json(state_path, state)
     b.start()
     wait_for("startup reads the precise completion missed while offline", lambda:
-        (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "completed")
+        (scheduler_record(b, cluster, task["task_ref"]) or {}).get("state") == "completed")
     require(len(rpc("turn/start")) == 2, "missed completion recovery never starts another native turn")
     for node in (a, b, c):
         node.client.connect()
@@ -2605,7 +2605,7 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
     reply = c.client.rpc("native_interrupt", conversation_id=name, work_id=native["work_id"], target_node=b.peer_id)
     require(reply["interrupt_requested"] and not reply["confirmed"], "interrupt admission is distinct from native terminal confirmation")
     wait_for("native interrupted event confirms the exact original turn", lambda:
-        (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "cancelled")
+        (scheduler_record(b, cluster, task["task_ref"]) or {}).get("state") == "cancelled")
     interrupted = rpc("turn/interrupt")
     require(len(interrupted) == 1 and interrupted[0]["message"]["params"] == {
         "threadId": native["thread_id"], "turnId": native["turn_id"]}, "native interruption cannot select another thread or turn")
@@ -2635,7 +2635,7 @@ def chat_agent_acceptance(options):
         print("PASS " + description, flush=True)
 
     try:
-        for name in ("A", "B", "C", "BOT-OTHER-NETWORK"):
+        for name in ("A", "B", "C", "BOT-OTHER-CLUSTER"):
             node = Node(run, name, binary, workspace, fixture, helper, module)
             node.configure(timeout_secs=600, manager=fixture_manager_settings(run, workspace) if name == "B" else None,
                            codex_bin=str(codex) if name == "B" else sys.executable)
@@ -2644,23 +2644,23 @@ def chat_agent_acceptance(options):
         a.configure(manager=fixture_manager_settings(run, workspace), daily_decision_limit=100,
                     network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True})
         a.start()
-        network = a.bootstrap()
+        cluster = a.bootstrap()
         outsider.start()
         outsider.bootstrap()
         for node in (b, c):
             node.configure(network={"bootstrap_urls": [a.url.replace("http:", "ws:") + "/api/network/ws"],
                                     "advertise_urls": [node.url.replace("http:", "ws:") + "/api/network/ws"],
                                     "mdns": False, "relay_enabled": True})
-            node.pair(a, network)
+            node.pair(a, cluster)
             node.start()
             node.client.connect()
             wait_for(node.name + " receives its paired client grant", lambda: node.client.authenticate())
         wait_for("private Nodes can reach each other", lambda:
             all(any(row["peer_id"] == target.peer_id and row["online"] for row in a.client.rpc("nodes")["nodes"])
                 for target in (b, c)))
-        bot_checks(run, workspace, a, b, c, network, passed, outsider)
-        chat_agent_checks(run, workspace, a, b, c, network, passed)
-        startup_subscription_checks(run, workspace, a, b, c, network, passed)
+        bot_checks(run, workspace, a, b, c, cluster, passed, outsider)
+        chat_agent_checks(run, workspace, a, b, c, cluster, passed)
+        startup_subscription_checks(run, workspace, a, b, c, cluster, passed)
         report["status"] = "passed"
         report["manager_invocations"] = len(fixture_records(run))
         report["host_command_invocations"] = len(invocations(run))
@@ -2727,17 +2727,17 @@ def phase1_acceptance(options):
         require(receipt["accepted"] is True and receipt["message_id"] == label
                 and receipt["scheduler_node"] == a.peer_id, "acceptance pins message and Scheduler")
         proof = receipt["receipt"]
-        require(proof["version"] == 1 and proof["network_id"] == network
+        require(proof["version"] == 1 and proof["cluster_id"] == cluster
                 and proof["conversation_id"] == name and proof["trigger"] == receipt["trigger"]
                 and proof["target_node"] == a.peer_id, "durable receipt has the exact accepted identity")
         return receipt, text
 
     def state(receipt, expected):
-        record = scheduler_record(a, network, receipt["trigger"])
+        record = scheduler_record(a, cluster, receipt["trigger"])
         return record if record and record["state"] == expected else None
 
     def completed(receipt):
-        record = scheduler_record(a, network, receipt["trigger"])
+        record = scheduler_record(a, cluster, receipt["trigger"])
         if record and record["state"] in {"failed", "unknown", "cancelled"}:
             raise RuntimeError("management job reached " + record["state"] + ": " + record.get("detail", ""))
         return record if record and record["state"] == "completed" else None
@@ -2767,13 +2767,13 @@ def phase1_acceptance(options):
                     network={"bootstrap_urls": [], "advertise_urls": [a.url.replace("http:", "ws:") + "/api/network/ws"],
                              "mdns": False, "relay_enabled": True})
         a.start()
-        network = a.bootstrap()
+        cluster = a.bootstrap()
         for node in (b, c):
             node.configure(manager=manager if node is b else None, codex_bin=sys.executable,
                            network={"bootstrap_urls": [a.url.replace("http:", "ws:") + "/api/network/ws"],
                                     "advertise_urls": [node.url.replace("http:", "ws:") + "/api/network/ws"],
                                     "mdns": False, "relay_enabled": True})
-            node.pair(a, network)
+            node.pair(a, cluster)
             node.start()
             reconnect(node)
         wait_for("three private Nodes become mutually reachable", lambda:
@@ -2897,7 +2897,7 @@ def phase1_acceptance(options):
         def cached_remote_session():
             with sqlite3.connect(f"file:{c.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
                 sessions = [json.loads(row[0]) for row in connection.execute(
-                    "SELECT value FROM local_values WHERE network_id=? AND key LIKE 'scheduler:v1:remote-session:%'", (network,))]
+                    "SELECT value FROM local_values WHERE cluster_id=? AND key LIKE 'scheduler:v1:remote-session:%'", (cluster,))]
             return next((session for session in sessions if any(job.get("trigger") == interrupted["trigger"]
                          for job in session.get("jobs", []))), None)
 
@@ -2946,7 +2946,7 @@ def phase1_acceptance(options):
         require(remote["queued"] is False and remote["state"] == "pending_delivery",
                 "source acceptance never masquerades as a remote durable queue ACK")
         wait_for("remote target commits its only reply despite source receipt loss", lambda: completed(remote))
-        pending = scheduler_record(c, network, remote["trigger"], "outbox")
+        pending = scheduler_record(c, cluster, remote["trigger"], "outbox")
         require(pending and not pending["delivered"], "injected receipt failure leaves durable source outbox pending")
         c.stop()
         with sqlite3.connect(c.directory / "node.sqlite3") as connection:
@@ -2954,7 +2954,7 @@ def phase1_acceptance(options):
         c.start()
         reconnect(c)
         wait_for("restarted source reconciles original target receipt", lambda:
-                 scheduler_record(c, network, remote["trigger"], "outbox")["delivered"])
+                 scheduler_record(c, cluster, remote["trigger"], "outbox")["delivered"])
         duplicate = c.client.rpc("message", conversation_id=name, message_id="remote-receipt", text=remote_text,
                                  scheduler_node=a.peer_id, report_results=False)
         require(duplicate["trigger"] == remote["trigger"] and len(calls(name)) == 1,
@@ -2962,21 +2962,21 @@ def phase1_acceptance(options):
         passed("durable ACK loss and source restart retry only the original target without duplicate invocation",
                fault="source ACK persistence rejected after target admission", trigger=remote["trigger"])
 
-        chat_agent_checks(run, workspace, a, b, c, network, passed)
+        chat_agent_checks(run, workspace, a, b, c, cluster, passed)
 
         name = new_conversation("phase1-budget")
         with sqlite3.connect(a.directory / "node.sqlite3") as connection:
-            connection.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) "
-                "ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",
-                (network, time.strftime("%Y-%m-%d", time.gmtime()), 100))
+            connection.execute("INSERT INTO budget_days(cluster_id,day,used) VALUES(?,?,?) "
+                "ON CONFLICT(cluster_id,day) DO UPDATE SET used=excluded.used",
+                (cluster, time.strftime("%Y-%m-%d", time.gmtime()), 100))
         human, _ = send(a.client, name, "human-after-autonomous-budget")
         wait_for("human chat ignores exhausted autonomous budget", lambda: completed(human))
         wait_for("remote entry knows the budget-test conversation", lambda: conversation(c.client, name))
         remote_human, _ = send(c.client, name, "remote-human-after-autonomous-budget")
         wait_for("verified remote human chat also ignores exhausted autonomous budget", lambda: completed(remote_human))
         with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-            used = connection.execute("SELECT used FROM budget_days WHERE network_id=? AND day=?",
-                                      (network, time.strftime("%Y-%m-%d", time.gmtime()))).fetchone()[0]
+            used = connection.execute("SELECT used FROM budget_days WHERE cluster_id=? AND day=?",
+                                      (cluster, time.strftime("%Y-%m-%d", time.gmtime()))).fetchone()[0]
         require(used == 100, "local and remote human chat do not consume or reset existing autonomous usage")
         passed("local and remote human chat remain available without consuming or resetting exhausted autonomous budget")
         before = len(calls())
@@ -2987,7 +2987,7 @@ def phase1_acceptance(options):
         c.start()
         reconnect(c)
         require_quiet("imported shared DAG never manufactures local execution jobs after Manager activation", lambda:
-                      len(calls()) == before and not scheduler_records(c, network))
+                      len(calls()) == before and not scheduler_records(c, cluster))
         passed("activating a Manager on imported history does not replay shared business events")
         report["status"] = "passed"
         report["manager_invocations"] = len(calls())
@@ -3037,7 +3037,7 @@ def verify_local_access(node):
                 "local session binds to the browser key that exchanged the one-time credential")
         members = node.client.call("directory")["view"]["members"]
         require(not any(member["subject_id"] == identity["subject_id"] for member in members),
-                "local access creates no permanent personal-network member")
+                "local access creates no permanent cluster member")
         node.client.call("local_access", {"enabled": False})
         require(not json.loads((node.directory / "config.json").read_text())["local_auto_access"]
                 and not browser.request("/api/local/info", headers={"Cookie": cookie})["has_session"],
@@ -3104,7 +3104,7 @@ def acceptance(options):
 
     try:
         verify_direct_start(run, binary)
-        for name in ("A", "B", "C", "R", "OTHER-NETWORK"):
+        for name in ("A", "B", "C", "R", "OTHER-CLUSTER"):
             node = Node(run, name, binary, workspace, fixture, helper, module, relay_only=name == "R")
             node.configure(codex_bin=sys.executable, timeout_secs=600)
             nodes.append(node)
@@ -3135,7 +3135,7 @@ def acceptance(options):
         a.client.call("directory", status=401)
         for path in ("/api/register", "/api/login", "/api/rpc"):
             a.client.request(path, {}, status=404)
-        network = a.bootstrap()
+        cluster = a.bootstrap()
         verify_web_assets(a, module)
         verify_web_assets(relay, module)
         verify_channel_security(a)
@@ -3152,9 +3152,9 @@ def acceptance(options):
         a.client.connect()
         a.client.authenticate()
         verify_browser_origins(a, origins)
-        b.pair(a, network)
+        b.pair(a, cluster)
         report["relay_readiness"] = wait_for_relay_target(a, capture, after_connection)
-        c.pair(a, network, relay_url=capture.url)
+        c.pair(a, cluster, relay_url=capture.url)
         for node in (b, c):
             node.start()
             node.client.connect()
@@ -3162,26 +3162,26 @@ def acceptance(options):
         wait_for("three personal Nodes are reachable through the pure relay", lambda: all(
             any(row["peer_id"] == node.peer_id and row["online"] for row in a.client.rpc("nodes")["nodes"]) for node in (b, c)))
         phone_client = Client(capture.url, helper, module)
-        phone_client.pair_client(a.client, network, "phone through pure relay")
+        phone_client.pair_client(a.client, cluster, "phone through pure relay")
         phone_client.url = capture.url
         phone_client.connect(a.peer_id, relay=True)
-        phone_client.authenticate(network)
+        phone_client.authenticate(cluster)
         require(phone_client.call("info")["peer_id"] == a.peer_id, "relay client authenticates the pinned personal Node")
         with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-            require(connection.execute("SELECT COUNT(*) FROM networks").fetchone()[0] == 0,
-                    "public relay remains outside every personal network")
+            require(connection.execute("SELECT COUNT(*) FROM clusters").fetchone()[0] == 0,
+                    "public relay remains outside every cluster")
         outsider.start()
-        other_network = outsider.bootstrap()
+        other_cluster = outsider.bootstrap()
         other = outsider.client
         require(len({a.peer_id, b.peer_id, c.peer_id}) == 3, "Nodes have distinct stable Peer IDs")
         require(len({node.client.command("identity")["subject_id"] for node in (a, b, c)}) == 3,
                 "each browser installation owns an independent identity")
-        require(c.client.network_id == b.client.network_id == network and other_network != network,
-                "paired clients share one network and the outsider retains its independent network")
-        report["topology"] = {"network_id": network, "peers": [node.peer_id for node in (a, b, c)],
-                              "relay_peer_id": relay.peer_id, "relay_network_id": None}
+        require(c.client.cluster_id == b.client.cluster_id == cluster and other_cluster != cluster,
+                "paired clients share one cluster and the outsider retains its independent cluster")
+        report["topology"] = {"cluster_id": cluster, "peers": [node.peer_id for node in (a, b, c)],
+                              "relay_peer_id": relay.peer_id, "relay_cluster_id": None}
         other.command("connect", url=a.url, peer_id=a.peer_id, connection="foreign")
-        other.call("authenticate", {"network_id": network}, connection="foreign", status=401)
+        other.call("authenticate", {"cluster_id": cluster}, connection="foreign", status=401)
         other.call("rpc", {"method": "nodes"}, connection="foreign", status=401)
         conversation, task_id = "acceptance-conversation", "acceptance-task"
         a.client.rpc("create_conversation", conversation_id=conversation, title="Failover acceptance")
@@ -3193,7 +3193,7 @@ def acceptance(options):
                 "same user message retries retain their original trigger")
         a.client.rpc("message", conversation_id=conversation, message_id="message-original", text="changed", status=400)
         other.rpc("conversation", conversation_id=conversation, status=400)
-        require(other.rpc("conversations")["conversations"] == [], "another network cannot list private conversation history")
+        require(other.rpc("conversations")["conversations"] == [], "another cluster cannot list private conversation history")
         wait_for("C imports the exact private history", lambda: shared_history(c.client, conversation, task_id))
         require(text.encode() not in b"".join(capture.payloads) and not capture.errors,
                 "public relay never receives the private conversation as plaintext")
@@ -3211,7 +3211,7 @@ def acceptance(options):
         task = wait_for("Agent delegation is durable", lambda: agent_tool_result(run, conversation, "task-delayed"))
         wait_for("B performs the real host effect", lambda: (directory / "count.txt").exists())
         running = wait_for("B keeps its Agent task Running", lambda:
-            row if (row := scheduler_record(b, network, task["task_ref"])) and row["state"] == "running" else None)
+            row if (row := scheduler_record(b, cluster, task["task_ref"])) and row["state"] == "running" else None)
         a.stop()
         c.stop()
         c.start()
@@ -3219,7 +3219,7 @@ def acceptance(options):
         c.client.authenticate()
         c.client.call("subscribe")
         gate.touch()
-        wait_for("B finishes without its source Node", lambda: (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "completed")
+        wait_for("B finishes without its source Node", lambda: (scheduler_record(b, cluster, task["task_ref"]) or {}).get("state") == "completed")
         wait_for("fresh C observes the original target's signed completion", lambda:
             (row := agent_task_snapshot(c.client, conversation, task["task_ref"])) and row["state"] == "completed")
         notification = "manager:" + running["attempt"]["id"] + ":completed"
@@ -3229,7 +3229,7 @@ def acceptance(options):
                  for row in c.client.rpc("notifications", client_id=phone)["notifications"]))
         require((directory / "count.txt").read_text() == "once" and len(invocations(run, "delayed")) == 1,
                 "source loss and entry restart never repeat a target-host side effect")
-        wait_for("C imports the complete result attachment", lambda: verify_blobs(c, network) >= 1)
+        wait_for("C imports the complete result attachment", lambda: verify_blobs(c, cluster) >= 1)
         count = verify_snapshot(c.client.rpc("export", conversation_id=conversation))
         require(next(row for row in c.client.rpc("conversation", conversation_id=conversation)["tasks"]
                      if row["task_id"] == task_id)["status"] != "accepted", "Agent completion never accepts the user's business Task")
@@ -3253,7 +3253,7 @@ def acceptance(options):
             (row := agent_task_snapshot(a.client, conversation, task["task_ref"])) and row["state"] == "completed")
         passed("source A goes offline; fresh C keeps B's one result, exact attachments and per-client durable notifications",
                task_ref=task["task_ref"], event_count=count)
-        chat_agent_checks(run, workspace, a, b, c, network, passed)
+        chat_agent_checks(run, workspace, a, b, c, cluster, passed)
         if options.skip_codex:
             report["not_checked"].append("installed Codex native transport (--skip-codex)")
         else:
@@ -3267,7 +3267,7 @@ def acceptance(options):
         require(not any(row["peer_id"] == c.peer_id and row["online"] for row in a.client.rpc("nodes")["nodes"]),
                 "known revoked Nodes lose usable remote routing")
         recovery_client = Client(a.url, helper, module)
-        backup = verify_recovery(a, recovery_client, [a, b, c], network)
+        backup = verify_recovery(a, recovery_client, [a, b, c], cluster)
         for name in ("FRESH-EPOCH-2", "FRESH-EPOCH-3"):
             fresh = Node(run, name, binary, workspace, fixture, helper, module)
             nodes.append(fresh)
@@ -3295,7 +3295,7 @@ def acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 def history_sync_fields(line):
-    fields = re.findall(r'\b(network|target|source|origin|request_id|scope|state|processed|changed|missing_events|missing_blobs|conflicts|hash|size|offset|limit|committed_offset|part_length|returned_bytes|phase|peer|link_id|outbound|route|flight_id|jobs)=("[^"]*"|[^\s]+)', line)
+    fields = re.findall(r'\b(cluster|target|source|origin|request_id|scope|state|processed|changed|missing_events|missing_blobs|conflicts|hash|size|offset|limit|committed_offset|part_length|returned_bytes|phase|peer|link_id|outbound|route|flight_id|jobs)=("[^"]*"|[^\s]+)', line)
     return {key: value[1:-1] if value.startswith('"') else value for key, value in fields}
 
 
@@ -3321,9 +3321,9 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                                     "advertise_urls": [node.url.replace("http:", "ws:") + "/api/network/ws"],
                                     "mdns": False, "relay_enabled": False})
         head_source.start()
-        network = head_source.bootstrap()
+        cluster = head_source.bootstrap()
         for node in (parent_source, blob_source, receiver):
-            node.pair(head_source, network)
+            node.pair(head_source, cluster)
             node.configure(roles=["gateway", "replica"] + (["scheduler"] if node is receiver else []),
                            manager=fixture_manager_settings(run, workspace) if node is receiver else None,
                            codex_bin=sys.executable)
@@ -3346,7 +3346,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
         scope = "net1-continuation-history"
         payload = b"NET-1 closure attachment supplied by replica C\n"
         blob = {"hash": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
-        event = {"version": 1, "network_id": network, "scope_id": scope, "author": head_source.peer_id,
+        event = {"version": 2, "cluster_id": cluster, "scope_id": scope, "author": head_source.peer_id,
                  "sequence": 1, "previous": None, "parents": [], "created_at_ms": 1,
                  "body": {}, "blobs": []}
         chain_path = run / "signed-history.ndjson"
@@ -3361,12 +3361,12 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
         chain = result["result"]
         require(chain["count"] == event_count and file_sha256(chain_path) == chain["envelopes_sha256"],
                 "private streamed history has the exact requested count and digest")
-        case.update({"network_id": network, "scope_id": scope, "head": chain["head"], "blob": blob,
+        case.update({"cluster_id": cluster, "scope_id": scope, "head": chain["head"], "blob": blob,
                      "expected_envelopes_sha256": chain["envelopes_sha256"], "fixture_artifact": str(chain_path),
                      "sources": {node.name: node.peer_id for node in nodes[1:-1]},
                      "receiver_log": str(receiver.directory / "process.log")})
         sequences = {}
-        with sqlite3.connect(head_source.directory / "node.sqlite3", timeout=10) as heads, \
+        with sqlite3.connect(head_source.directory / "node.sqlite3", timeout=10) as heads,\
                 sqlite3.connect(parent_source.directory / "node.sqlite3", timeout=10) as parents:
             with chain_path.open() as source:
                 for line in source:
@@ -3375,8 +3375,8 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                     sequence = body["sequence"]
                     sequences[envelope["hash"]] = sequence
                     connection = heads if sequence == event_count else parents
-                    connection.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
-                                       (network, envelope["hash"], scope, head_source.peer_id, sequence,
+                    connection.execute("INSERT INTO events(cluster_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
+                                       (cluster, envelope["hash"], scope, head_source.peer_id, sequence,
                                         json.dumps(envelope, separators=(",", ":")), "pending" if sequence == event_count else "ready"))
         require(len(sequences) == event_count and sequences[chain["head"]] == event_count,
                 "seeded history contains every unique signed event exactly once")
@@ -3400,14 +3400,14 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                 line = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode(errors="replace"))
                 fields = history_sync_fields(line)
                 if "history sync flight" in line:
-                    if fields.get("network") == network and fields.get("scope") == scope:
+                    if fields.get("cluster") == cluster and fields.get("scope") == scope:
                         scope_flights.add(fields["flight_id"])
                     if "history sync flight yielded" in line and fields.get("scope") == scope:
                         scope_flights.add(fields["flight_id"])
                         case["batches"].append(fields)
                     if "history sync flight finished" in line and fields.get("flight_id") in scope_flights:
                         case["scope_flight_completions"].append(fields)
-                if fields.get("network") != network:
+                if fields.get("cluster") != cluster:
                     continue
                 if "history event fetched" in line:
                     target, digest = fields["target"], fields["hash"]
@@ -3422,13 +3422,13 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                     source_blobs[fields["source"]].add(fields["hash"])
             with sqlite3.connect(database, timeout=10) as connection:
                 count, ready, pending, invalid = connection.execute(
-                    "SELECT COUNT(*),COALESCE(SUM(status='ready'),0),COALESCE(SUM(status='pending'),0),COALESCE(SUM(status IN ('invalid','conflict')),0) FROM events WHERE network_id=? AND scope_id=?",
-                    (network, scope)).fetchone()
-                has_head = bool(connection.execute("SELECT 1 FROM events WHERE network_id=? AND hash=?", (network, chain["head"])).fetchone())
-                has_blob = bool(connection.execute("SELECT 1 FROM blobs WHERE network_id=? AND hash=?", (network, blob["hash"])).fetchone())
-                has_conversation = bool(connection.execute("SELECT 1 FROM conversations WHERE network_id=? AND conversation_id=?", (network, scope)).fetchone())
+                    "SELECT COUNT(*),COALESCE(SUM(status='ready'),0),COALESCE(SUM(status='pending'),0),COALESCE(SUM(status IN ('invalid','conflict')),0) FROM events WHERE cluster_id=? AND scope_id=?",
+                    (cluster, scope)).fetchone()
+                has_head = bool(connection.execute("SELECT 1 FROM events WHERE cluster_id=? AND hash=?", (cluster, chain["head"])).fetchone())
+                has_blob = bool(connection.execute("SELECT 1 FROM blobs WHERE cluster_id=? AND hash=?", (cluster, blob["hash"])).fetchone())
+                has_conversation = bool(connection.execute("SELECT 1 FROM conversations WHERE cluster_id=? AND conversation_id=?", (cluster, scope)).fetchone())
                 continuations = []
-                for key, value in connection.execute("SELECT key,value FROM local_values WHERE network_id=? AND key LIKE 'net1:v1:closure:%'", (network,)):
+                for key, value in connection.execute("SELECT key,value FROM local_values WHERE cluster_id=? AND key LIKE 'net1:v1:closure:%'", (cluster,)):
                     progress = json.loads(value)
                     if progress["scope"] == scope:
                         continuations.append({"key": key, "heads": progress["heads"], "next_events": progress["events"],
@@ -3462,7 +3462,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                                      "host_command": "printf forbidden >> incomplete-effect", "host_cwd": str(workspace)}), status=400)
                 require("context is incomplete; wait for synchronization" in str(rejection.get("error")),
                         "pending signed history is rejected before SDK work is admitted")
-                accepted = len(scheduler_records(receiver, network))
+                accepted = len(scheduler_records(receiver, cluster))
                 require(accepted == 0 and not invocations(run) and not (workspace / "incomplete-effect").exists(),
                         "incomplete history never admits a Scheduler job or starts the host fixture")
                 blocked_message = {"message_id": message_id, "target_node": receiver.peer_id,
@@ -3470,8 +3470,8 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                                    "accepted_jobs": accepted, "fixture_invocations": 0}
                 case["pending_message"] = blocked_message
                 with sqlite3.connect(blob_source.directory / "node.sqlite3", timeout=10) as connection:
-                    connection.execute("INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?)",
-                                       (network, blob["hash"], blob["size"], payload))
+                    connection.execute("INSERT INTO blobs(cluster_id,hash,size,content) VALUES(?,?,?,?)",
+                                       (cluster, blob["hash"], blob["size"], payload))
                 case["blob_supply"] = "replica C supplies the missing attachment after the incomplete-message rejection"
             complete = bool(case["scope_flight_completions"]) and any(
                 progress["heads"] == [chain["head"]] and not progress["next_events"]
@@ -3490,19 +3490,19 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                 "large history yields across real bounded coordinator steps before completing its signed frontier")
         digest = hashlib.sha256()
         with sqlite3.connect(database, timeout=10) as connection:
-            for envelope, in connection.execute("SELECT envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY sequence", (network, scope)):
+            for envelope, in connection.execute("SELECT envelope FROM events WHERE cluster_id=? AND scope_id=? ORDER BY sequence", (cluster, scope)):
                 parsed = json.loads(envelope)
                 require(hashlib.sha256(parsed["canonical_body"].encode()).hexdigest() == parsed["hash"],
                         "every persisted event matches its signed content hash")
                 digest.update((json.dumps(parsed, separators=(",", ":")) + "\n").encode())
-            stored_blob = connection.execute("SELECT size,content FROM blobs WHERE network_id=? AND hash=?", (network, blob["hash"])).fetchone()
+            stored_blob = connection.execute("SELECT size,content FROM blobs WHERE cluster_id=? AND hash=?", (cluster, blob["hash"])).fetchone()
         require(digest.hexdigest() == chain["envelopes_sha256"], "receiver preserves the entire exact signed event history")
         require(stored_blob and stored_blob[0] == len(stored_blob[1]) == blob["size"]
                 and hashlib.sha256(stored_blob[1]).hexdigest() == blob["hash"], "receiver attachment size and final hash match")
         for node, expected_count in ((head_source, 1), (parent_source, event_count - 1), (blob_source, 0)):
             with sqlite3.connect(node.directory / "node.sqlite3", timeout=10) as connection:
-                count = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=? AND scope_id=?", (network, scope)).fetchone()[0]
-                blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE network_id=?", (network,)).fetchone()[0]
+                count = connection.execute("SELECT COUNT(*) FROM events WHERE cluster_id=? AND scope_id=?", (cluster, scope)).fetchone()[0]
+                blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE cluster_id=?", (cluster,)).fetchone()[0]
             require(count == expected_count and blobs == int(node is blob_source), "source distribution remains fixed throughout transfer")
         require(source_events[head_source.peer_id] == {chain["head"]}
                 and len(source_events[parent_source.peer_id]) == event_count - 1
@@ -3524,15 +3524,15 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
             lease.close()
 
 
-def seed_net1_attachment(source, network, conversation, size, module):
+def seed_net1_attachment(source, cluster, conversation, size, module):
     repository = Path(__file__).resolve().parents[1]
     payload = b"n" * size
     blob = {"hash": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
     with sqlite3.connect(source.directory / "node.sqlite3", timeout=10) as connection:
         previous, sequence = connection.execute(
-            "SELECT hash,sequence FROM events WHERE network_id=? AND scope_id=? AND author=? ORDER BY sequence DESC LIMIT 1",
-            (network, conversation, source.peer_id)).fetchone()
-        event = {"version": 1, "network_id": network, "scope_id": conversation, "author": source.peer_id,
+            "SELECT hash,sequence FROM events WHERE cluster_id=? AND scope_id=? AND author=? ORDER BY sequence DESC LIMIT 1",
+            (cluster, conversation, source.peer_id)).fetchone()
+        event = {"version": 2, "cluster_id": cluster, "scope_id": conversation, "author": source.peer_id,
                  "sequence": sequence + 1, "previous": previous, "parents": [previous],
                  "created_at_ms": int(time.time() * 1000),
                  "body": {"type": "message_posted", "message_id": f"net1-attachment-{size}",
@@ -3544,10 +3544,10 @@ def seed_net1_attachment(source, network, conversation, size, module):
         result = json.loads(signed.stdout)
         require(result.get("ok"), "fixture event signing succeeds")
         envelope = result["result"]
-        connection.execute("INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?)",
-                           (network, blob["hash"], blob["size"], payload))
-        connection.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",
-                           (network, envelope["hash"], conversation, source.peer_id, sequence + 1,
+        connection.execute("INSERT INTO blobs(cluster_id,hash,size,content) VALUES(?,?,?,?)",
+                           (cluster, blob["hash"], blob["size"], payload))
+        connection.execute("INSERT INTO events(cluster_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",
+                           (cluster, envelope["hash"], conversation, source.peer_id, sequence + 1,
                             json.dumps(envelope, separators=(",", ":"))))
     del payload
     return blob, envelope
@@ -3601,12 +3601,12 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
         relay.configure(allowed_origins=[capture.url])
         relay.start(env=trace_env)
         relay_url = capture.url.replace("http:", "ws:") + "/api/network/ws"
-        device_network = {"bootstrap_urls": [relay_url], "advertise_urls": [], "mdns": False, "relay_enabled": False}
+        transport_config = {"bootstrap_urls": [relay_url], "advertise_urls": [], "mdns": False, "relay_enabled": False}
         for node in (source, receiver):
-            node.configure(network=device_network)
+            node.configure(network=transport_config)
         source.start(env=trace_env)
-        network = source.bootstrap()
-        receiver.pair(source, network, relay_url=capture.url)
+        cluster = source.bootstrap()
+        receiver.pair(source, cluster, relay_url=capture.url)
         for node in (source, receiver):
             node.configure(roles=["gateway", "replica"])
         receiver.start(env=trace_env)
@@ -3624,12 +3624,12 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
         probe.close()
         require(health["status"] == "healthy", "source PendingActivation preserves its read listener")
         receiver.stop()
-        case.update({"network_id": network, "scope_id": scope, "relay_url": relay_url,
+        case.update({"cluster_id": cluster, "scope_id": scope, "relay_url": relay_url,
                      "nodes": {node.name: node.peer_id for node in nodes},
                      "process_logs": {node.name: str(node.directory / "process.log") for node in nodes},
                      "temporary_configurations": {node.name: {key: json.loads((node.directory / "config.json").read_text())[key] for key in ("roles", "network", "manager", "codex_socket")} for node in nodes}})
         for node in (source, receiver):
-            require(json.loads((node.directory / "config.json").read_text())["network"] == device_network,
+            require(json.loads((node.directory / "config.json").read_text())["network"] == transport_config,
                     "A/B retain only the isolated relay and no direct discovery")
         with read_only(receiver) as connection:
             case["receiver_sqlite"] = {"journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
@@ -3637,10 +3637,10 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                                        "synchronous_note": "observer connection pragma; not a measurement of the writer connection"}
 
         for size in (32 * 1024 * 1024, 64 * 1024 * 1024):
-            blob, envelope = seed_net1_attachment(source, network, scope, size, module)
+            blob, envelope = seed_net1_attachment(source, cluster, scope, size, module)
             digest = blob["hash"]
             key = f"net1:v1:blob:{digest}:{size}"
-            part_name = hashlib.sha256(json.dumps([network, digest, size], separators=(",", ":")).encode()).hexdigest() + ".part"
+            part_name = hashlib.sha256(json.dumps([cluster, digest, size], separators=(",", ":")).encode()).hexdigest() + ".part"
             staging = receiver.directory / "net1-blob-staging"
             part = staging / part_name
             item = {"status": "running", "blob": blob, "event_hash": envelope["hash"], "manifest_key": key,
@@ -3652,9 +3652,9 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
 
             def snapshot():
                 with read_only(receiver) as connection:
-                    row = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key=?", (network, key)).fetchone()
-                    complete = connection.execute("SELECT size,length(content) FROM blobs WHERE network_id=? AND hash=?", (network, digest)).fetchone()
-                    status = connection.execute("SELECT status FROM events WHERE network_id=? AND hash=?", (network, envelope["hash"])).fetchone()
+                    row = connection.execute("SELECT value FROM local_values WHERE cluster_id=? AND key=?", (cluster, key)).fetchone()
+                    complete = connection.execute("SELECT size,length(content) FROM blobs WHERE cluster_id=? AND hash=?", (cluster, digest)).fetchone()
+                    status = connection.execute("SELECT status FROM events WHERE cluster_id=? AND hash=?", (cluster, envelope["hash"])).fetchone()
                     manifests = connection.execute("SELECT value FROM local_values WHERE key>=? AND key<?", ("net1:v1:blob:", "net1:v1:blob;")).fetchall()
                 manifest = json.loads(row[0]) if row else None
                 if manifest:
@@ -3666,7 +3666,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                 reserved = sum(json.loads(value)["blob"]["size"] for value, in manifests)
                 actual_bytes = sum(path.lstat().st_size for path in files)
                 require(len(manifests) <= 64 and len(files) <= 64 and reserved <= 4 * 64 * 1024 * 1024,
-                        "all-network staging manifest/object reservation stays within the fixed budget")
+                        "all-cluster staging manifest/object reservation stays within the fixed budget")
                 require(actual_bytes <= 4 * 64 * 1024 * 1024, "observed staging body bytes remain within budget")
                 result = {"elapsed_seconds": time.monotonic() - started, "manifest": manifest, "committed_offset": offset,
                           "part_length": part.lstat().st_size if part.exists() else None,
@@ -3700,9 +3700,9 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                     return None
                 request_entry = queued[served["fields"]["request_id"]]
                 fields = request_entry["fields"]
-                require(fields.get("network") == network and fields.get("target") == source.peer_id,
-                        "queued request keeps the original network and source target")
-                require(served["fields"].get("network") == network and served["fields"].get("origin") == receiver.peer_id,
+                require(fields.get("cluster") == cluster and fields.get("target") == source.peer_id,
+                        "queued request keeps the original cluster and source target")
+                require(served["fields"].get("cluster") == cluster and served["fields"].get("origin") == receiver.peer_id,
                         "actual source range read authenticates the original receiver")
                 preceding = [entry for entry in b_logs if entry["log_offset"] < request_entry["log_offset"]
                              and ("history blob committed" in entry["message"] or "history blob opened" in entry["message"])]
@@ -3780,13 +3780,13 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             published = [entry for entry in records(receiver, start_b, digest=digest) if "history blob published" in entry["message"]]
             require(published, "receiver logs actual publication of this exact attachment")
             complete_scope = wait_for("completed attachment scope reports Complete", lambda: [entry for entry in records(receiver, start_b)
-                if entry["log_offset"] >= published[-1]["log_end"] and "history scope sync finished" in entry["message"] and entry["fields"].get("network") == network
+                if entry["log_offset"] >= published[-1]["log_end"] and "history scope sync finished" in entry["message"] and entry["fields"].get("cluster") == cluster
                 and entry["fields"].get("target") == source.peer_id
                 and entry["fields"].get("scope") == scope and entry["fields"].get("state") == "Complete"
                 and all(entry["fields"].get(field) == "0" for field in ("missing_events", "missing_blobs", "conflicts"))], timeout=35)
             with read_only(receiver) as connection:
-                actual_size, content = connection.execute("SELECT size,content FROM blobs WHERE network_id=? AND hash=?", (network, digest)).fetchone()
-                actual_envelope, event_status = connection.execute("SELECT envelope,status FROM events WHERE network_id=? AND hash=?", (network, envelope["hash"])).fetchone()
+                actual_size, content = connection.execute("SELECT size,content FROM blobs WHERE cluster_id=? AND hash=?", (cluster, digest)).fetchone()
+                actual_envelope, event_status = connection.execute("SELECT envelope,status FROM events WHERE cluster_id=? AND hash=?", (cluster, envelope["hash"])).fetchone()
             require(actual_size == len(content) == size and hashlib.sha256(content).hexdigest() == digest, "completed receiver body has the exact signed size and hash")
             require(event_status == "ready" and json.loads(actual_envelope) == envelope, "receiver publishes the original exact signed envelope as ready")
             del content
@@ -3808,7 +3808,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             for served_entry in all_served:
                 served_fields = served_entry["fields"]
                 queued_entry = queued_by_id.get(served_fields.get("request_id"))
-                require(queued_entry is not None and served_fields.get("network") == network
+                require(queued_entry is not None and served_fields.get("cluster") == cluster
                         and served_fields.get("origin") == receiver.peer_id
                         and served_fields["offset"] == queued_entry["fields"]["offset"]
                         and int(served_fields["size"]) == size
@@ -3848,14 +3848,14 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                                     "first_actual_positive_request_after_new_circuit": {"receiver_queued": later_requests[0], "source_served": served[later_requests[0]["fields"]["request_id"]]}})
             require(size != 64 * 1024 * 1024 or natural, "64 MiB completes after natural relay byte-budget closure and further positive-offset circuits")
             with read_only(source) as connection:
-                source_size, source_content = connection.execute("SELECT size,content FROM blobs WHERE network_id=? AND hash=?", (network, digest)).fetchone()
-                source_envelope = connection.execute("SELECT envelope FROM events WHERE network_id=? AND hash=?", (network, envelope["hash"])).fetchone()[0]
+                source_size, source_content = connection.execute("SELECT size,content FROM blobs WHERE cluster_id=? AND hash=?", (cluster, digest)).fetchone()
+                source_envelope = connection.execute("SELECT envelope FROM events WHERE cluster_id=? AND hash=?", (cluster, envelope["hash"])).fetchone()[0]
             require(source_size == len(source_content) == size and hashlib.sha256(source_content).hexdigest() == digest and json.loads(source_envelope) == envelope, "source object and signed envelope remain unchanged")
             del source_content
             with read_only(relay) as connection:
-                relay_events = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=?", (network,)).fetchone()[0]
-                relay_blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE network_id=?", (network,)).fetchone()[0]
-            require(relay_events == relay_blobs == 0, "the sole relay never stores this personal network's private history or blobs")
+                relay_events = connection.execute("SELECT COUNT(*) FROM events WHERE cluster_id=?", (cluster,)).fetchone()[0]
+                relay_blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE cluster_id=?", (cluster,)).fetchone()[0]
+            require(relay_events == relay_blobs == 0, "the sole relay never stores this cluster's private history or blobs")
             receiver.client.connect(receiver.peer_id)
             wait_for("completed receiver client authorization", lambda: receiver.client.authenticate())
             signed_records = {node.name: wait_for(f"{node.name} signed relay-only directory record", lambda node=node: relay.client.command("network_probe", kind="record", url=relay.url, target=node.peer_id)) for node in (source, receiver)}
@@ -3899,7 +3899,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
 
 def network_trace_records(node, offset=0, *, messages=None):
     result = []
-    names = "source|class|target|reason|generation|previous|previous_source|previous_authenticated_secs|current|removed_pending|directory|outcome|cached|error|circuit|event|direction|queued_frames|queued_bytes|reader_held_bytes|writer_held_bytes|accepted_bytes|window_bytes|held_bytes|bytes|active|network|peer|neighbor|next_hop|link_id|flight_id|selection|request_id|origin|method|operation_id|request_type|delivered|fullname|epoch|urls|listen|addr_auto|addresses|original|new_name|interface|state|signed_at_ms|remaining_ms|removed_sources|remaining_sources|removed_routes|outbound|path|kind|trigger|timeout_ms|rr_type|ip|mode|status|deadline_seconds|route|route_kind|cancelled"
+    names = "source|class|target|reason|generation|previous|previous_source|previous_authenticated_secs|current|removed_pending|directory|outcome|cached|error|circuit|event|direction|queued_frames|queued_bytes|reader_held_bytes|writer_held_bytes|accepted_bytes|window_bytes|held_bytes|bytes|active|cluster|peer|neighbor|next_hop|link_id|flight_id|selection|request_id|origin|method|operation_id|request_type|delivered|fullname|epoch|urls|listen|addr_auto|addresses|original|new_name|interface|state|signed_at_ms|remaining_ms|removed_sources|remaining_sources|removed_routes|outbound|path|kind|trigger|timeout_ms|rr_type|ip|mode|status|deadline_seconds|route|route_kind|cancelled"
     path = node.directory / "process.log"
     if not path.exists():
         return result
@@ -3926,17 +3926,17 @@ def network_trace_records(node, offset=0, *, messages=None):
 
 
 def network_peer_query(caller, target, label):
-    network, scope = caller.client.network_id, "net1-read-" + label
+    cluster, scope = caller.client.cluster_id, "net1-read-" + label
     database = caller.directory / "node.sqlite3"
     with sqlite3.connect(database) as connection:
-        seeded = connection.execute("SELECT 1 FROM conversations WHERE network_id=? AND conversation_id=?", (network, scope)).fetchone()
+        seeded = connection.execute("SELECT 1 FROM conversations WHERE cluster_id=? AND conversation_id=?", (cluster, scope)).fetchone()
     if not seeded:
         repository = Path(__file__).resolve().parents[1]
         envelopes, previous = [], None
         for sequence, body in enumerate(({"type": "conversation_created", "title": "Read-only native status"},
                 {"type": "message_posted", "message_id": label, "role": "user", "text": "Observe existing native work only",
                  "scheduler_node": target.peer_id}), 1):
-            event = {"version": 1, "network_id": network, "scope_id": scope, "author": caller.peer_id,
+            event = {"version": 2, "cluster_id": cluster, "scope_id": scope, "author": caller.peer_id,
                      "sequence": sequence, "previous": previous, "parents": [previous] if previous else [],
                      "created_at_ms": sequence, "body": body, "blobs": []}
             signed = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(caller.client.module)],
@@ -3950,27 +3950,27 @@ def network_peer_query(caller, target, label):
             previous = envelope["hash"]
         with sqlite3.connect(database) as connection:
             for event, envelope in envelopes:
-                connection.execute("INSERT OR IGNORE INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
-                    (network, envelope["hash"], scope, caller.peer_id, event["sequence"], json.dumps(envelope, separators=(",", ":")), "ready"))
-            connection.execute("INSERT OR IGNORE INTO conversations(network_id,conversation_id,title) VALUES(?,?,?)", (network, scope, "Read-only native status"))
-            connection.execute("INSERT OR IGNORE INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",
-                (network, scope, envelopes[-1][1]["hash"], label, "user", "Observe existing native work only", 2, 2))
+                connection.execute("INSERT OR IGNORE INTO events(cluster_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
+                    (cluster, envelope["hash"], scope, caller.peer_id, event["sequence"], json.dumps(envelope, separators=(",", ":")), "ready"))
+            connection.execute("INSERT OR IGNORE INTO conversations(cluster_id,conversation_id,title) VALUES(?,?,?)", (cluster, scope, "Read-only native status"))
+            connection.execute("INSERT OR IGNORE INTO messages(cluster_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",
+                (cluster, scope, envelopes[-1][1]["hash"], label, "user", "Observe existing native work only", 2, 2))
     target_offset = (target.directory / "process.log").stat().st_size
     result = caller.client.rpc("conversation", conversation_id=scope)
     require(result["native_sessions"] == [], "read-only target has no native work to invent")
     handled = wait_for("the fixed original target handles an authenticated native status read", lambda: [entry
         for entry in network_trace_records(target, target_offset, messages=["peer business request handled"])
-        if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.peer_id
+        if entry["fields"].get("cluster") == cluster and entry["fields"].get("origin") == caller.peer_id
         and entry["fields"].get("request_type") == "native_status" and entry["fields"].get("outcome") == "ok"])
     require(len(handled) == 1, "the read reaches its original authenticated target once")
     return {"native_sessions": result["native_sessions"]}
 
 
-def network_peer_read_evidence(caller, target, network, label, caller_offset, target_offset,
+def network_peer_read_evidence(caller, target, cluster, label, caller_offset, target_offset,
                                *, next_hop, link_id, route_kind):
     def handled_reads():
         return [entry for entry in network_trace_records(target, target_offset, messages=["peer business request handled"])
-                if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.peer_id
+                if entry["fields"].get("cluster") == cluster and entry["fields"].get("origin") == caller.peer_id
                 and entry["fields"].get("request_type") == "native_status"]
 
     handled = wait_for("the original target handles this exact native status read", handled_reads)
@@ -3979,7 +3979,7 @@ def network_peer_read_evidence(caller, target, network, label, caller_offset, ta
     request_id = handled[0]["fields"]["request_id"]
     queued = wait_for("the same native status request is queued to the expected current next hop", lambda: [
         entry for entry in network_trace_records(caller, caller_offset, messages=["peer packet queued"])
-        if entry["fields"].get("network") == network and entry["fields"].get("request_id") == request_id
+        if entry["fields"].get("cluster") == cluster and entry["fields"].get("request_id") == request_id
         and entry["fields"].get("kind") == "Request"])
     require(len(queued) == 1 and queued[0]["fields"].get("target") == target.peer_id
             and queued[0]["fields"].get("next_hop") == next_hop and queued[0]["fields"].get("link_id") == link_id
@@ -3987,7 +3987,7 @@ def network_peer_read_evidence(caller, target, network, label, caller_offset, ta
             "the exact read uses only its expected next-hop link generation")
     response = wait_for("the caller accepts the matching original-target signed response", lambda: next(
         (entry for entry in network_trace_records(caller, caller_offset, messages=["peer response matched"])
-         if entry["fields"].get("network") == network and entry["fields"].get("request_id") == request_id
+         if entry["fields"].get("cluster") == cluster and entry["fields"].get("request_id") == request_id
          and entry["fields"].get("origin") == target.peer_id and entry["fields"].get("delivered") == "true"), None))
     require(len(handled_reads()) == 1, "the exact native status read is handled once")
     return {"observation": label, "request_id": request_id, "target_handled": handled[0],
@@ -4725,8 +4725,8 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         case["first_start_a_network"] = json.loads((a.directory / "config.json").read_text())["network"]
         b.configure(network={"bootstrap_urls": [relay_url, directory_url], "advertise_urls": [], "mdns": False, "relay_enabled": False})
         a.start(env=trace_env)
-        network = a.bootstrap()
-        b.pair(a, network)
+        cluster = a.bootstrap()
+        b.pair(a, cluster)
         b.configure(roles=["gateway", "replica", "scheduler"])
         b.start(env=trace_env)
 
@@ -4768,7 +4768,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         controls_offset = len(capture.controls)
         cold_start = {"wall_time": time.time(), "monotonic": time.monotonic(), "a_log_offset": log_offset,
                       "query_deadline_seconds": 10, "deadline_basis": "lower bound before spawning cold A; actual production queries start later"}
-        case.update({"network_id": network, "target_peer_id": b.peer_id, "source_peer_id": a.peer_id,
+        case.update({"cluster_id": cluster, "target_peer_id": b.peer_id, "source_peer_id": a.peer_id,
                      "healthy_record": healthy.record, "wrong_identity_record_peer_id": wrong_record["peer_id"],
                      "cold_start": cold_start, "a_process_log": str(a.directory / "process.log"),
                      "configurations": {node.name: json.loads((node.directory / "config.json").read_text())["network"] for node in nodes}})
@@ -5036,8 +5036,8 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         a, b = node("mdns-A"), node("mdns-B")
         a.configure(roles=["gateway", "replica"], network={"bootstrap_urls": [], "advertise_urls": [], "mdns": True, "relay_enabled": False})
         a.start(env=trace_env)
-        network = a.bootstrap()
-        b.pair(a, network)
+        cluster = a.bootstrap()
+        b.pair(a, cluster)
         b.configure(roles=["gateway", "replica", "scheduler"])
         b.set_url(address)
         proxy = RelayCapture(b.port, retain_payloads=False, listen_host=address, upstream_host=address)
@@ -5068,7 +5068,7 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         target_sources = {key: entry for key, entry in observed_sources["sources"].items() if entry["fields"]["target"] == b.peer_id}
         require(renamed["canonical_fullname"] in target_sources and first_resolution["canonical_fullname"] in target_sources,
                 "Node source keys match the independently observed actual DNS-SD fullnames")
-        wait_for("mDNS target's previously paired client grant", lambda: b.client.authenticate(network))
+        wait_for("mDNS target's previously paired client grant", lambda: b.client.authenticate(cluster))
         verify_offset = (a.directory / "process.log").stat().st_size
         verified = wait_for("new real DNS cache verify of the renamed instance", lambda: next(
             (entry for entry in network_trace_records(a, verify_offset, messages=["mdns source verify"])
@@ -5107,12 +5107,12 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
                 "actual Node removal log identifies the same target, fullname and daemon epoch")
         old_link = wait_for("original target has an installed peer link before its restart", lambda: next(
             (entry for entry in reversed(network_trace_records(a, messages=["peer link ready"]))
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.peer_id), None))
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("peer") == b.peer_id), None))
         restart_offset = (a.directory / "process.log").stat().st_size
         b.stop()
         old_removed = wait_for("the current original peer link is actually removed", lambda: next(
             (entry for entry in network_trace_records(a, restart_offset, messages=["peer link removed"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.peer_id
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("peer") == b.peer_id
              and entry["fields"].get("link_id") == old_link["fields"]["link_id"]
              and entry["fields"].get("current") == "true"), None))
         b.start(env=trace_env)
@@ -5129,11 +5129,11 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
              and entry["fields"].get("route") in ["direct:" + url for url in surviving_urls]), None))
         new_link = wait_for("the restarted original target installs a distinct peer link", lambda: next(
             (entry for entry in network_trace_records(a, restart_offset, messages=["peer link ready"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.peer_id
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("peer") == b.peer_id
              and entry["fields"].get("link_id") != old_link["fields"]["link_id"]
              and entry["fields"].get("outbound") == "true" and entry["log_end"] <= read_end
              and entry["log_offset"] > selected["log_offset"]), None))
-        read_evidence = network_peer_read_evidence(a, b, network, "net1-lane7-mdns-read-only", read_offset, target_read_offset,
+        read_evidence = network_peer_read_evidence(a, b, cluster, "net1-lane7-mdns-read-only", read_offset, target_read_offset,
                                                    next_hop=b.peer_id, link_id=new_link["fields"]["link_id"], route_kind="direct")
         require(source_state(a)["epoch"] == observed_sources["epoch"], "reconnecting the target does not reset the observer's mDNS epoch")
         last_removal_offset = (a.directory / "process.log").stat().st_size
@@ -5153,7 +5153,7 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         registration_mapping = [{"port": port, "registration": registration.snapshot(),
                                  "resolved_fullname": renamed["canonical_fullname"] if port == renamed["port"] else remaining_fullname}
                                 for port, registration in registrations.items()]
-        case["source_lifecycle"] = {"target": b.peer_id, "network": network, "first_resolution": first_resolution,
+        case["source_lifecycle"] = {"target": b.peer_id, "cluster_id": cluster, "first_resolution": first_resolution,
                                     "original_resolution_after_conflict": current_original,
                                     "actual_conflict": {"browse": conflict, "resolve": renamed}, "initial_sources": target_sources,
                                     "owned_registration_mapping": registration_mapping,
@@ -5228,7 +5228,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
         current = {}
         for entry in network_trace_records(value, messages=["peer link ready", "peer link removed"]):
             fields = entry["fields"]
-            if fields.get("network") != network:
+            if fields.get("cluster") != cluster:
                 continue
             peer = fields["peer"]
             if "peer link ready" in entry["message"]:
@@ -5265,9 +5265,9 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
             allowed.update({a.peer_id: {middle.peer_id, u.peer_id}, middle.peer_id: {t.peer_id}, t.peer_id: set(), u.peer_id: set()})
         a.configure(roles=["gateway", "replica"])
         a.start(env=trace_env)
-        network = a.bootstrap()
+        cluster = a.bootstrap()
         for value in (middle, t, u):
-            value.pair(a, network)
+            value.pair(a, cluster)
             value.client.close()
             value.configure(roles=["gateway", "replica", "relay"] if value is middle else ["gateway", "replica", "scheduler"])
         for value in (t, u, middle):
@@ -5288,14 +5288,14 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
             state if t.peer_id in state else None) if (state := links(middle)) else None)
         presence = wait_for("the original target is reached through the authenticated M link generation", lambda: next(
             (entry for entry in network_trace_records(a, messages=["peer presence route observed"])
-             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.peer_id
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("target") == t.peer_id
              and entry["fields"].get("neighbor") == middle.peer_id
              and entry["fields"].get("link_id") == initial_a_links[middle.peer_id]["fields"]["link_id"]), None))
         initial_request_offset = (a.directory / "process.log").stat().st_size
         initial_target_offset = (t.directory / "process.log").stat().st_size
         initial_query = network_peer_query(a, t, "net1-lane7-via-middle-read-only")
         require(initial_query == {"native_sessions": []}, "the fixed target answers the initial read across its live intermediate neighbor")
-        initial_read = network_peer_read_evidence(a, t, network, "net1-lane7-via-middle-read-only", initial_request_offset, initial_target_offset,
+        initial_read = network_peer_read_evidence(a, t, cluster, "net1-lane7-via-middle-read-only", initial_request_offset, initial_target_offset,
                                                   next_hop=middle.peer_id, link_id=initial_a_links[middle.peer_id]["fields"]["link_id"], route_kind="presence")
         require(t.peer_id not in links(a), "the initial target read has no direct A-T peer link")
         cut_offset = (a.directory / "process.log").stat().st_size
@@ -5303,7 +5303,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
         cut = captures[middle.peer_id].pause()
         removed = wait_for("A revokes the exact current M link and its learned routes", lambda: next(
             (entry for entry in network_trace_records(a, cut_offset, messages=["peer link removed"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == middle.peer_id
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("peer") == middle.peer_id
              and entry["fields"].get("link_id") == initial_a_links[middle.peer_id]["fields"]["link_id"]
              and entry["fields"].get("current") == "true" and int(entry["fields"]["removed_routes"]) > 0), None))
         offline = wait_for("the target loses indirect online status while unrelated U stays online", online_snapshot)
@@ -5323,7 +5323,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
             try:
                 on_demand = wait_for("the single read starts or joins the target's shared connection flight", lambda: next(
                     (entry for entry in network_trace_records(a, request_offset, messages=["peer route flight started", "peer route flight joined"])
-                     if entry["fields"].get("network") == network and entry["fields"].get("target") == t.peer_id
+                     if entry["fields"].get("cluster") == cluster and entry["fields"].get("target") == t.peer_id
                      and entry["fields"].get("trigger") == "on_demand"
                      and entry["fields"].get("request_type") == "native_status"), None), timeout=8)
             finally:
@@ -5333,11 +5333,11 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
         require(recovered == {"native_sessions": []}, "the single new read returns the original target's native status result")
         restored = wait_for("the original target installs a new direct link within the single read", lambda: next(
             (entry for entry in network_trace_records(a, request_offset, messages=["peer link ready"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == t.peer_id
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("peer") == t.peer_id
              and entry["fields"].get("outbound") == "true" and entry["log_end"] <= request_end), None))
         ready = wait_for("the same shared flight reports the installed target link ready", lambda: next(
             (entry for entry in network_trace_records(a, request_offset, messages=["peer route flight ready"])
-             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.peer_id
+             if entry["fields"].get("cluster") == cluster and entry["fields"].get("target") == t.peer_id
              and entry["fields"].get("flight_id") == on_demand["fields"]["flight_id"]
              and entry["fields"].get("link_id") == restored["fields"]["link_id"] and entry["fields"].get("state") == "ready"), None))
         selected = wait_for("the alternate path authenticates the actual original target endpoint", lambda: next(
@@ -5345,13 +5345,13 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
              if entry["fields"].get("target") == t.peer_id
              and entry["fields"].get("route") == "direct:" + captures[t.peer_id].url.replace("http:", "ws:") + "/api/network/ws"
              and entry["log_end"] <= restored["log_offset"]), None))
-        recovered_read = network_peer_read_evidence(a, t, network, query_label, request_offset, target_offset,
+        recovered_read = network_peer_read_evidence(a, t, cluster, query_label, request_offset, target_offset,
                                                     next_hop=t.peer_id, link_id=restored["fields"]["link_id"], route_kind="direct")
         require(middle.peer_id not in links(a), "the disabled original next hop is not silently restored")
         require(links(a)[u.peer_id]["fields"]["link_id"] == initial_a_links[u.peer_id]["fields"]["link_id"]
                 and links(middle)[t.peer_id]["fields"]["link_id"] == initial_m_links[t.peer_id]["fields"]["link_id"],
                 "alternate recovery leaves both unaffected link generations intact")
-        case.update(network=network, targets={value.name: value.peer_id for value in owned_nodes}, publications=publications,
+        case.update(cluster=cluster, targets={value.name: value.peer_id for value in owned_nodes}, publications=publications,
                     initial_a_links=initial_a_links, initial_m_links=initial_m_links, presence=presence,
                     initial_query=initial_query, initial_read_evidence=initial_read,
                     cut=cut, cut_log_offset=cut_offset, middle_cut_log_offset=middle_cut_offset,
@@ -5436,14 +5436,14 @@ def network_reliability_acceptance(options):
               "binary_sha256": file_sha256(binary), "artifacts": str(run),
               "command": [sys.executable, *sys.argv], "provider_calls": 0, "cases": {},
               "not_checked": ["mixed resolver replies and full resolver cache", "slow consumers and source quotas",
-                              "attachment crash recovery and 64 MiB completion", "rendered browser UI", "production networks"]}
+                              "attachment crash recovery and 64 MiB completion", "rendered browser UI", "production clusters"]}
     nodes, capture = [], None
     try:
         if lane == 7:
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
             report["tracked_diff_sha256"] = hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--", "crates/node", "scripts/verify-node.py", "scripts/crypto-client.mjs"], cwd=repository)).hexdigest()
             report["verification_scripts"] = {name: file_sha256(repository / "scripts" / name) for name in ("verify-node.py", "crypto-client.mjs")}
-            report["not_checked"] = ["actual host interface IP add/delete", "IPv6 listener advertisement", "other NET-1 lanes", "rendered browser UI", "production networks"]
+            report["not_checked"] = ["actual host interface IP add/delete", "IPv6 listener advertisement", "other NET-1 lanes", "rendered browser UI", "production clusters"]
             network_reliability_mdns(run, binary, workspace, fixture, helper, module, report, nodes)
             network_reliability_routes(run, binary, workspace, fixture, helper, module, report, nodes)
             require(all(case["status"] == "passed" for case in report["cases"].values()), "both mDNS and route lifecycle cases and their cleanup pass")
@@ -5456,12 +5456,12 @@ def network_reliability_acceptance(options):
             return
         if lane in (5, 6):
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
-            report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production networks"]
+            report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production clusters"]
             (network_reliability_reservation if lane == 5 else network_reliability_budgets)(run, binary, workspace, fixture, helper, module, report, nodes, options.evidence_dir)
             return
         if lane == 4:
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
-            report["not_checked"] = ["packaged Node full private-cache workload", "other NET-1 lanes", "rendered browser UI", "production networks"]
+            report["not_checked"] = ["packaged Node full private-cache workload", "other NET-1 lanes", "rendered browser UI", "production clusters"]
             network_reliability_directory(run, binary, workspace, fixture, helper, module, report, nodes, options.evidence_dir)
             return
         if lane == 2:
@@ -5476,7 +5476,7 @@ def network_reliability_acceptance(options):
                     fingerprint.update(raw + b"\0" + file_sha256(path).encode() + b"\n")
             report["source_files_sha256"] = fingerprint.hexdigest()
             report["source_files_counter"] = "path and SHA256 for tracked or nonignored Rust workspace files plus both acceptance scripts; includes untracked core modules"
-            report["not_checked"] = ["core fsync/SQL boundary crash matrix", "physical SQLite VFS read amplification", "other NET-1 lanes", "rendered browser UI", "production networks"]
+            report["not_checked"] = ["core fsync/SQL boundary crash matrix", "physical SQLite VFS read amplification", "other NET-1 lanes", "rendered browser UI", "production clusters"]
             if options.evidence_dir:
                 baseline = options.evidence_dir / "base-release-probe.json"
                 if baseline.exists():
@@ -5485,7 +5485,7 @@ def network_reliability_acceptance(options):
             return
         if lane == 3:
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
-            report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production networks"]
+            report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production clusters"]
             network_reliability_closure_progress(run, binary, workspace, fixture, helper, module, report, nodes)
             return
         if lane == 1:
@@ -5501,7 +5501,7 @@ def network_reliability_acceptance(options):
             report["baseline"] = {"evidence": str(baseline_path), "binary_sha256": baseline_report["binary_sha256"],
                                   "noop_sync": baseline_report["cases"]["noop_sync"]}
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
-            report["not_checked"] = ["base/head interleaved perf probes", "other NET-1 lanes", "rendered browser UI", "production networks"]
+            report["not_checked"] = ["base/head interleaved perf probes", "other NET-1 lanes", "rendered browser UI", "production clusters"]
         for name in ("R", "A", "B"):
             nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
         relay, source, receiver = nodes
@@ -5533,9 +5533,9 @@ def network_reliability_acceptance(options):
         with capture.lock:
             source_relay_start_connection = capture.next_connection
         source.start()
-        network = source.bootstrap()
+        cluster = source.bootstrap()
         report["relay_readiness"] = wait_for_relay_target(source, capture, source_relay_start_connection)
-        receiver.pair(source, network, relay_url=capture.url)
+        receiver.pair(source, cluster, relay_url=capture.url)
         receiver.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=debug", "NO_COLOR": "1"} if lane == 1 else None)
         receiver.client.connect(receiver.peer_id)
         wait_for("receiver client authorization", lambda: receiver.client.authenticate())
@@ -5571,7 +5571,7 @@ def network_reliability_acceptance(options):
                     if "history sync flight" not in line:
                         continue
                     fields = history_sync_fields(line)
-                    if fields.get("network") == network and fields.get("scope") == conversation:
+                    if fields.get("cluster") == cluster and fields.get("scope") == conversation:
                         flights.add(fields["flight_id"])
                     if "history sync flight finished" in line and fields.get("flight_id") in flights:
                         completed.append(line)
@@ -5635,17 +5635,17 @@ def network_reliability_acceptance(options):
 
         def blob_complete(reference):
             with sqlite3.connect(database, timeout=10) as connection:
-                return connection.execute("SELECT EXISTS(SELECT 1 FROM blobs WHERE network_id=? AND hash=?)",
-                                          (network, reference["hash"])).fetchone()[0] == 1
+                return connection.execute("SELECT EXISTS(SELECT 1 FROM blobs WHERE cluster_id=? AND hash=?)",
+                                          (cluster, reference["hash"])).fetchone()[0] == 1
 
-        small, _ = seed_net1_attachment(source, network, conversation, 4096, module)
+        small, _ = seed_net1_attachment(source, cluster, conversation, 4096, module)
         source.start()
         receiver.start()
         wait_for("small signed attachment validates the transfer fixture", lambda: blob_complete(small), timeout=25)
-        require(verify_blobs(receiver, network) == 1, "small attachment fixture passes real peer signature, size and hash checks")
+        require(verify_blobs(receiver, cluster) == 1, "small attachment fixture passes real peer signature, size and hash checks")
         receiver.stop()
         source.stop()
-        blob, envelope = seed_net1_attachment(source, network, conversation, 32 * 1024 * 1024, module)
+        blob, envelope = seed_net1_attachment(source, cluster, conversation, 32 * 1024 * 1024, module)
         source.start()
         receiver.start()
         receiver.client.connect(receiver.peer_id)
@@ -5660,10 +5660,10 @@ def network_reliability_acceptance(options):
         observations, complete = [], False
         while time.monotonic() - started < 90:
             with sqlite3.connect(database, timeout=10) as connection:
-                complete = connection.execute("SELECT EXISTS(SELECT 1 FROM blobs WHERE network_id=? AND hash=?)",
-                                              (network, blob["hash"])).fetchone()[0] == 1
-                pending = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=? AND hash=? AND status='pending'",
-                                             (network, envelope["hash"])).fetchone()[0]
+                complete = connection.execute("SELECT EXISTS(SELECT 1 FROM blobs WHERE cluster_id=? AND hash=?)",
+                                              (cluster, blob["hash"])).fetchone()[0] == 1
+                pending = connection.execute("SELECT COUNT(*) FROM events WHERE cluster_id=? AND hash=? AND status='pending'",
+                                             (cluster, envelope["hash"])).fetchone()[0]
             observation = {"elapsed_seconds": time.monotonic() - started,
                            "wire_payload_bytes": capture.payload_bytes - starting_bytes,
                            "complete_blob": complete, "pending_envelopes": pending}
@@ -5673,7 +5673,7 @@ def network_reliability_acceptance(options):
             time.sleep(1)
         private_json(run / "blob-progress.json", observations)
         if complete:
-            require(verify_blobs(receiver, network) >= 1, "complete receiver blob passes final size and hash")
+            require(verify_blobs(receiver, cluster) >= 1, "complete receiver blob passes final size and hash")
         report["cases"]["single_relay_attachment"] = {"status": "observed", "blob": blob,
             "small_fixture_verified": small, "complete": complete, "verified_complete_bytes": blob["size"] if complete else 0,
             "wire_payload_bytes": capture.payload_bytes - starting_bytes,

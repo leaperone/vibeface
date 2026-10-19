@@ -27,6 +27,6 @@ export async function localBrowserEntry(own: PublicIdentity, launch: LocalLaunch
     body: JSON.stringify({ token: launch.token, peer_id: launch.peerId, subject_id: own.peerId, public_key: own.publicKey }),
   })))
   const authorized = parseEntry(exchanged.entry)
-  if (entryKey(authorized) !== entryKey(entry) || text(exchanged.network_id) !== info.network_id) throw new Error('兑换后的本机会话与原设备或网络不一致。')
+  if (entryKey(authorized) !== entryKey(entry) || text(exchanged.cluster_id) !== info.cluster_id) throw new Error('兑换后的本机会话与原设备或集群不一致。')
   return authorized
 }

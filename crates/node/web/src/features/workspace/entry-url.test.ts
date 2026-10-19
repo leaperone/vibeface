@@ -34,7 +34,7 @@ test("missing integrity fields fail closed instead of authorizing writes", () =>
 test("nodeName prefers rpc and directory names over truncated peer ids", () => {
   const id = "a".repeat(64)
   assert.equal(nodeName(id, { nodes: [{ peer_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
-  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ subject_id: id, public_key: id, kind: "node", name: "工作机", node_roles: [], manage: false }], revoked: [] } }), "工作机")
+  assert.equal(nodeName(id, { directory: { cluster_id: "n", epoch: 1, heads: [], members: [{ subject_id: id, public_key: id, kind: "node", name: "工作机", node_roles: [], manage: false }], revoked: [] } }), "工作机")
   assert.equal(nodeName(id), `${id.slice(0, 10)}…`)
 })
 
@@ -188,7 +188,7 @@ test("workspace preserves bot and message requests while routing native decision
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
     generation: 1, entry: { peer_id: "gateway", address: "https://node.example", relay: false },
-    principal: { network_id: "network", subject_id: "client", epoch: 1, can_manage: true, source: "membership" },
+    principal: { cluster_id: "cluster", subject_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { peer_id: "gateway", public_key: "key", version: "test", roles: ["gateway"], initialized: true },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async () => { throw new Error("unexpected request") },
     async rpc(method, body = {}) {
@@ -199,7 +199,7 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, agent_tasks: [agentTask], native_sessions: [session] }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
-        assert.deepEqual(JSON.parse(JSON.stringify(parseCreateBot(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")))), creations.at(-1))
+        assert.deepEqual(JSON.parse(JSON.stringify(parseCreateBot(JSON.parse(stored.get("vibeface.pending-bot.client.cluster") ?? "null")))), creations.at(-1))
         if (createMode === "unknown") throw new Error("connection lost")
         if (createMode === "rejected") throw Object.assign(new Error("project unavailable"), { responded: true })
         const created = parseBot({ ...body, event_hash: "new-bot-event" })
@@ -271,7 +271,7 @@ test("workspace preserves bot and message requests while routing native decision
     await render().refresh()
     assert.equal(controls.length, beforeUnknown + 1)
     assert.equal(render().writable, true)
-    assert.equal(stored.has("vibeface.pending.client.network"), false)
+    assert.equal(stored.has("vibeface.pending.client.cluster"), false)
     session.turn_id = null
     await render().refresh()
     await assert.rejects(render().interruptNative("work", "worker"), /可中断/)
@@ -710,7 +710,7 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
 test("an outstanding clipboard permission cannot keep new device controls busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
   const clipboard = pendingResult()
-  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', peer_id: 'target', relay: true } } }
+  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, cluster_id: 'cluster' }, entry: { address: 'https://node.example', peer_id: 'target', relay: true } } }
   const device = { connectionGeneration: () => generation, ready: ready(), identity: null, entries: [], directory: null, pairs: [], refreshDirectory: async () => {}, createInvitation: () => creation.promise }
   const app = componentHarness('../identity/device-controls.tsx', { './context': { useDevice: () => device } }, { navigator: { clipboard: { writeText: () => clipboard.promise } } })
   const render = () => app.render('DeviceControls')
@@ -734,7 +734,7 @@ test("an outstanding clipboard permission cannot keep new device controls busy o
   } finally { app.close() }
 })
 
-test("Peer ID boundaries require the peer_id field", () => {
+test("Cluster and Peer boundaries require the current fields and identity version", () => {
   const id = "ab".repeat(32), other = "cd".repeat(32)
   const transportSource = readFileSync(new URL("../../../transport.js", import.meta.url), "utf8")
     .replace(/^import[^\n]+\n/, "").replace(/\bexport /g, "")
@@ -742,6 +742,16 @@ test("Peer ID boundaries require the peer_id field", () => {
   const source = readFileSync(new URL("../../lib/node.ts", import.meta.url), "utf8")
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
   const parsers = new Script(`(function(require, exports) { ${compiled}\nreturn exports })`).runInNewContext()(() => transport, {})
+  const view = { cluster_id: id, epoch: 1, heads: [], members: [], revoked: [] }
+  assert.equal(parsers.parseView(view).cluster_id, id)
+  assert.throws(() => parsers.parseView({ ...view, cluster_id: undefined, network_id: id }), /64 位/)
+  const review = { version: 2, invite_id: "invite", cluster_id: id, inviter_subject_id: other, new_member: { subject_id: id, public_key: other, kind: "client", name: "browser", node_roles: [], manage: false }, proposal_hash: other, parents: [], epoch: 1, expires_at_ms: Date.now() + 60000 }
+  assert.equal(parsers.parseReview(review).version, 2)
+  assert.throws(() => parsers.parseReview({ ...review, version: 1 }), /普通配对/)
+  const payload = { version: 2, cluster_id: id, new_kind: "client", node_roles: [], manage: false, expires_at_ms: Date.now() + 60000 }
+  const invitation = { url: "https://node.example", peer_id: id, invite: { invite: { payload }, capability: "pairing" } }
+  assert.equal(parsers.parseInvitation(invitation).payload.cluster_id, id)
+  assert.throws(() => parsers.parseInvitation({ ...invitation, invite: { ...invitation.invite, invite: { payload: { ...payload, version: 1 } } } }), /邀请版本/)
   assert.equal(parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: id }).peer_id, id)
   assert.equal(parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, peer_id: id }).peer_id, id)
   assert.equal(parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", peer_id: id }).entry.peer_id, id)

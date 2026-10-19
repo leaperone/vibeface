@@ -89,7 +89,7 @@ impl MetadataPool {
 
 pub(super) struct SyncSpec {
     key: SyncKey,
-    pub(super) network: String,
+    pub(super) cluster: String,
     pub(super) scope: String,
     pub(super) sources: Vec<String>,
     pub(super) roots: Box<[String]>,
@@ -216,7 +216,7 @@ struct RpcLease {
     _background: Option<OwnedSemaphorePermit>,
     class: ReadClass,
     active: Arc<ActiveReads>,
-    network: String,
+    cluster: String,
     source: String,
 }
 impl Drop for RpcLease {
@@ -233,7 +233,7 @@ impl Drop for RpcLease {
         if self.class == ReadClass::Background {
             self.active.background.fetch_sub(1, Ordering::AcqRel);
         }
-        tracing::debug!(network=%self.network, source=%self.source, ?self.class, active, source_active=0, "history rpc quota released");
+        tracing::debug!(cluster=%self.cluster, source=%self.source, ?self.class, active, source_active=0, "history rpc quota released");
     }
 }
 
@@ -292,13 +292,13 @@ impl SyncCoordinator {
     ) -> Result<Arc<SyncSpec>> {
         roots.sort();
         roots.dedup();
-        let (network, scope, class) = match &key {
-            SyncKey::Inventory(network, _) => (network.as_str(), "", ReadClass::Background),
-            SyncKey::Scope(network, scope) => {
-                (network.as_str(), scope.as_str(), ReadClass::Background)
+        let (cluster, scope, class) = match &key {
+            SyncKey::Inventory(cluster, _) => (cluster.as_str(), "", ReadClass::Background),
+            SyncKey::Scope(cluster, scope) => {
+                (cluster.as_str(), scope.as_str(), ReadClass::Background)
             }
-            SyncKey::Proof(network, scope, ..) => {
-                (network.as_str(), scope.as_str(), ReadClass::Proof)
+            SyncKey::Proof(cluster, scope, ..) => {
+                (cluster.as_str(), scope.as_str(), ReadClass::Proof)
             }
         };
         ensure!(
@@ -306,7 +306,7 @@ impl SyncCoordinator {
             "invalid history scope"
         );
         let bytes = std::mem::size_of::<SyncSpec>()
-            + network.len()
+            + cluster.len()
             + scope.len()
             + sources
                 .iter()
@@ -324,7 +324,7 @@ impl SyncCoordinator {
         );
         let charge = self.metadata.charge(bytes, class)?;
         Ok(Arc::new(SyncSpec {
-            network: network.into(),
+            cluster: cluster.into(),
             scope: scope.into(),
             key,
             sources,
@@ -373,7 +373,7 @@ impl SyncCoordinator {
                     entry.revision += 1;
                 }
             }
-            tracing::debug!(network=%spec.network, scope=%spec.scope, flight_id=entry.id, waiters=entry.updates.receiver_count()+1,
+            tracing::debug!(cluster=%spec.cluster, scope=%spec.scope, flight_id=entry.id, waiters=entry.updates.receiver_count()+1,
                 kind=?spec.key, "history sync flight joined");
             return Ok(entry.updates.subscribe());
         }
@@ -400,7 +400,7 @@ impl SyncCoordinator {
         let id = queue.next_id;
         let key = spec.key.clone();
         let (updates, receiver) = watch::channel(SyncUpdate::Queued);
-        tracing::debug!(network=%spec.network, scope=%spec.scope, flight_id=id, jobs=queue.entries.len()+1,
+        tracing::debug!(cluster=%spec.cluster, scope=%spec.scope, flight_id=id, jobs=queue.entries.len()+1,
             limit=MAX_SYNC_JOBS, metadata_bytes=self.metadata.total.load(Ordering::Acquire), kind=?spec.key, "history sync flight created");
         queue.entries.insert(
             key.clone(),
@@ -465,7 +465,7 @@ impl SyncCoordinator {
             entry.updates.receiver_count() < MAX_WAITERS,
             RequestFailure::Busy
         );
-        tracing::debug!(network=%entry.spec.network,scope=%entry.spec.scope,flight_id=entry.id,
+        tracing::debug!(cluster=%entry.spec.cluster,scope=%entry.spec.scope,flight_id=entry.id,
             waiters=entry.updates.receiver_count()+1,kind=?key,"history sync flight joined");
         Ok(Some(entry.updates.subscribe()))
     }
@@ -576,7 +576,7 @@ impl SyncCoordinator {
                             queue.entries.insert(key.clone(), entry);
                             let parent = &queue.entries[&key];
                             let child_key =
-                                SyncKey::Scope(parent.spec.network.clone(), child.scope.clone());
+                                SyncKey::Scope(parent.spec.cluster.clone(), child.scope.clone());
                             let result = if child.error.is_some() {
                                 Ok(())
                             } else {
@@ -745,7 +745,7 @@ impl SyncCoordinator {
 
     fn reserve_read(
         &self,
-        network: &str,
+        cluster: &str,
         source: &str,
         class: ReadClass,
         bound: usize,
@@ -760,7 +760,7 @@ impl SyncCoordinator {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             sources.retain(|_, source| source.strong_count() != 0);
-            let key = (network.to_owned(), source.to_owned());
+            let key = (cluster.to_owned(), source.to_owned());
             let semaphore = sources
                 .get(&key)
                 .and_then(Weak::upgrade)
@@ -802,7 +802,7 @@ impl SyncCoordinator {
         }
         let held = self.active.bytes.fetch_add(bound, Ordering::AcqRel) + bound;
         tracing::debug!(
-            network,
+            cluster,
             source,
             ?class,
             active,
@@ -820,7 +820,7 @@ impl SyncCoordinator {
                 _background: background,
                 class,
                 active: self.active.clone(),
-                network: network.into(),
+                cluster: cluster.into(),
                 source: source.into(),
             },
             ResponseLease {
@@ -868,7 +868,7 @@ impl Runtime {
 
     pub(super) async fn read_history(
         &self,
-        network: &str,
+        cluster: &str,
         source: &str,
         payload: Value,
         class: ReadClass,
@@ -877,11 +877,11 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, source, Some(NodeRole::Replica))?;
-        let (rpc, lease) = self.sync.reserve_read(network, source, class, bound)?;
+            .authorize_node(cluster, source, Some(NodeRole::Replica))?;
+        let (rpc, lease) = self.sync.reserve_read(cluster, source, class, bound)?;
         let value = tokio::time::timeout(
             Duration::from_secs(5),
-            self.raw_peer_request(network, source, payload),
+            self.raw_peer_request(cluster, source, payload),
         )
         .await
         .map_err(|_| RequestFailure::Unknown)??;
@@ -892,7 +892,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, source, Some(NodeRole::Replica))?;
+            .authorize_node(cluster, source, Some(NodeRole::Replica))?;
         Ok(HistoryReply {
             value,
             _lease: lease,
@@ -910,18 +910,18 @@ impl Runtime {
             SyncKey::Inventory(_, source) => {
                 let reply = self
                     .read_history(
-                        &spec.network,
+                        &spec.cluster,
                         source,
                         json!({"type":"inventory"}),
                         ReadClass::Background,
                         crate::peer::MAX_PACKET_BYTES,
                     )
                     .await?;
-                let state: NetworkState =
+                let state: ClusterState =
                     serde_json::from_value(reply.value["membership"].clone())?;
                 ensure!(
-                    state.genesis.network_id == spec.network,
-                    "wrong membership network"
+                    state.genesis.cluster_id == spec.cluster,
+                    "wrong membership cluster"
                 );
                 self.install_membership(state).await?;
                 let mut scopes = Vec::new();
@@ -957,7 +957,7 @@ impl Runtime {
 
     fn enqueue_scope(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         sources: Vec<String>,
         mut roots: Vec<String>,
@@ -977,7 +977,7 @@ impl Runtime {
             );
         }
         self.submit_sync(
-            SyncKey::Scope(network.into(), scope.into()),
+            SyncKey::Scope(cluster.into(), scope.into()),
             sources,
             roots,
             budget,
@@ -987,26 +987,26 @@ impl Runtime {
 
     pub(super) async fn request_scope_sync(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         roots: Vec<String>,
     ) -> Result<()> {
-        self.require_role(network, NodeRole::Replica).await?;
+        self.require_role(cluster, NodeRole::Replica).await?;
         let sources = self
-            .history_sources(network, &[])
+            .history_sources(cluster, &[])
             .await?
             .into_iter()
             .map(|source| source.peer_id)
             .collect::<Vec<_>>();
         if !sources.is_empty() {
-            self.enqueue_scope(network, scope, sources, roots, false, 1024)?;
+            self.enqueue_scope(cluster, scope, sources, roots, false, 1024)?;
         }
         Ok(())
     }
 
-    pub(super) async fn enqueue_sync_all(self: &Arc<Self>, network: &str) -> Result<()> {
-        self.require_role(network, NodeRole::Replica).await?;
-        let mut sources = self.history_sources(network, &[]).await?;
+    pub(super) async fn enqueue_sync_all(self: &Arc<Self>, cluster: &str) -> Result<()> {
+        self.require_role(cluster, NodeRole::Replica).await?;
+        let mut sources = self.history_sources(cluster, &[]).await?;
         if !sources.is_empty() {
             let length = sources.len();
             let cursor = self.sync.inventory_cursor.fetch_add(4, Ordering::AcqRel);
@@ -1014,7 +1014,7 @@ impl Runtime {
         }
         for source in sources.into_iter().take(4) {
             let _ = self.submit_sync(
-                SyncKey::Inventory(network.into(), source.peer_id.clone()),
+                SyncKey::Inventory(cluster.into(), source.peer_id.clone()),
                 vec![source.peer_id],
                 vec![],
                 1024,
@@ -1024,15 +1024,15 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn sync_all(self: &Arc<Self>, network: &str) -> Result<SyncReport> {
+    pub async fn sync_all(self: &Arc<Self>, cluster: &str) -> Result<SyncReport> {
         let _work = self.maintenance.enter()?;
-        self.require_role(network, NodeRole::Replica).await?;
-        let sources = self.history_sources(network, &[]).await?;
+        self.require_role(cluster, NodeRole::Replica).await?;
+        let sources = self.history_sources(cluster, &[]).await?;
         let count = sources.len();
         let mut scopes = Vec::new();
         let mut unreachable_sources = Vec::new();
         for source in sources {
-            match self.sync_from(network, &source.peer_id).await {
+            match self.sync_from(cluster, &source.peer_id).await {
                 Ok(reports) => scopes.extend(reports),
                 Err(_) => unreachable_sources.push(source.peer_id),
             }
@@ -1057,11 +1057,11 @@ impl Runtime {
 
     pub(super) async fn sync_from(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         target: &str,
     ) -> Result<Vec<ClosureSync>> {
         let updates = self.submit_sync(
-            SyncKey::Inventory(network.into(), target.into()),
+            SyncKey::Inventory(cluster.into(), target.into()),
             vec![target.into()],
             vec![],
             1024,
@@ -1079,7 +1079,7 @@ impl Runtime {
                 Err(anyhow::anyhow!(error.clone()))
             } else {
                 match self.enqueue_scope(
-                    network,
+                    cluster,
                     &scope.scope,
                     vec![target.into()],
                     scope.heads.clone(),
@@ -1114,7 +1114,7 @@ impl Runtime {
 
     pub(super) async fn fetch_closure(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         target: &str,
         wanted: &[String],
@@ -1123,7 +1123,7 @@ impl Runtime {
         roots.sort();
         roots.dedup();
         if roots.is_empty() {
-            roots = self.store.lock().await.heads(network, scope)?;
+            roots = self.store.lock().await.heads(cluster, scope)?;
         }
         for root in &roots {
             ensure!(
@@ -1133,7 +1133,7 @@ impl Runtime {
         }
         let digest = crypto::digest(&serde_json::to_vec(&roots)?);
         let updates = self.submit_sync(
-            SyncKey::Proof(network.into(), scope.into(), target.into(), digest),
+            SyncKey::Proof(cluster.into(), scope.into(), target.into(), digest),
             vec![target.into()],
             roots,
             1024,
@@ -1150,25 +1150,25 @@ impl Runtime {
     #[cfg(test)]
     pub(super) async fn fetch_scope(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         target: &str,
         wanted: &[String],
     ) -> Result<ClosureSync> {
-        self.fetch_closure_batch(network, scope, target, wanted, 1024)
+        self.fetch_closure_batch(cluster, scope, target, wanted, 1024)
             .await
     }
     #[cfg(test)]
     pub(super) async fn fetch_closure_batch(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         target: &str,
         wanted: &[String],
         budget: usize,
     ) -> Result<ClosureSync> {
         let updates = self.enqueue_scope(
-            network,
+            cluster,
             scope,
             vec![target.into()],
             wanted.to_vec(),
@@ -1197,7 +1197,7 @@ mod tests {
             .collect::<Vec<_>>();
         let spec = scheduler.make_spec(
             SyncKey::Proof(
-                "network".into(),
+                "cluster".into(),
                 "chat".into(),
                 "source".into(),
                 "digest".into(),
@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn m5_retained_errors_and_spare_capacity_remain_charged() -> Result<()> {
         let scheduler = SyncCoordinator::default();
-        let key = SyncKey::Inventory("network".into(), "source".into());
+        let key = SyncKey::Inventory("cluster".into(), "source".into());
         let spec = scheduler.make_spec(key.clone(), vec!["source".into()], vec![], 1024, true)?;
         let updates = scheduler.register(&mut scheduler.queue.lock().unwrap(), spec)?;
         scheduler.finish(&key, Err(anyhow::anyhow!("e".repeat(128 * 1024))));
@@ -1243,7 +1243,7 @@ mod tests {
         drop(result);
         assert_eq!(scheduler.metadata.total.load(Ordering::Acquire), 0);
         let compact = scheduler.make_spec(
-            SyncKey::Scope("network".into(), "chat".into()),
+            SyncKey::Scope("cluster".into(), "chat".into()),
             vec!["source".into()],
             vec![],
             1024,
@@ -1252,7 +1252,7 @@ mod tests {
         let mut sources = Vec::with_capacity(64);
         sources.push("source".into());
         let spare = scheduler.make_spec(
-            SyncKey::Scope("network".into(), "chat".into()),
+            SyncKey::Scope("cluster".into(), "chat".into()),
             sources,
             vec![],
             1024,
@@ -1264,7 +1264,7 @@ mod tests {
         );
         drop(compact);
         drop(spare);
-        let key = SyncKey::Scope("network".into(), "chat".into());
+        let key = SyncKey::Scope("cluster".into(), "chat".into());
         let sources = vec!["source".into()];
         let roots = vec!["1".repeat(64), "0".repeat(64), "1".repeat(64)];
         let spec = scheduler.make_spec(key.clone(), sources.clone(), roots.clone(), 1024, false)?;
@@ -1333,7 +1333,7 @@ mod tests {
         let mut ordinary = Vec::new();
         for index in 0..3 {
             ordinary.push(scheduler.reserve_read(
-                "network",
+                "cluster",
                 &format!("source-{index}"),
                 ReadClass::Background,
                 crate::peer::MAX_PACKET_BYTES,
@@ -1341,16 +1341,16 @@ mod tests {
         }
         assert!(
             scheduler
-                .reserve_read("network", "source-3", ReadClass::Background, 1024)
+                .reserve_read("cluster", "source-3", ReadClass::Background, 1024)
                 .is_err()
         );
         assert!(
             scheduler
-                .reserve_read("network", "source-0", ReadClass::Proof, 1024)
+                .reserve_read("cluster", "source-0", ReadClass::Proof, 1024)
                 .is_err()
         );
         let (proof, response) = scheduler.reserve_read(
-            "network",
+            "cluster",
             "source-3",
             ReadClass::Proof,
             crate::peer::MAX_PACKET_BYTES,
@@ -1364,12 +1364,12 @@ mod tests {
         assert_eq!(scheduler.active.total.load(Ordering::Acquire), 3);
         assert!(
             scheduler
-                .reserve_read("network", "source-4", ReadClass::Proof, 1024)
+                .reserve_read("cluster", "source-4", ReadClass::Proof, 1024)
                 .is_err()
         );
         drop(response);
         let fourth = scheduler.reserve_read(
-            "network",
+            "cluster",
             "source-4",
             ReadClass::Proof,
             crate::peer::MAX_PACKET_BYTES,
@@ -1401,12 +1401,12 @@ mod tests {
                 let _ = hub.accept(socket).await;
             })
         }
-        let source_dir = crate::runtime::tests::fixture_under("network-reliability")?;
-        let receiver_dir = crate::runtime::tests::fixture_under("network-reliability")?;
+        let source_dir = crate::runtime::tests::fixture_under("cluster-reliability")?;
+        let receiver_dir = crate::runtime::tests::fixture_under("cluster-reliability")?;
         let source = Arc::new(Runtime::open(&source_dir).await?);
         let receiver = Arc::new(Runtime::open(&receiver_dir).await?);
         let owner = LocalIdentity::generate();
-        let membership = owner.sign_network_fixture(
+        let membership = owner.sign_cluster_fixture(
             1,
             vec![
                 source.identity.certificate(source.config.roles.clone())?,
@@ -1415,7 +1415,7 @@ mod tests {
                     .certificate(receiver.config.roles.clone())?,
             ],
         )?;
-        let network = membership.genesis.network_id.clone();
+        let cluster = membership.genesis.cluster_id.clone();
         source.install_membership(membership.clone()).await?;
         receiver.install_membership(membership).await?;
         let source_id = source.identity.peer_id()?;
@@ -1426,10 +1426,10 @@ mod tests {
         };
         let (head, ready_root) = {
             let mut store = source.store.lock().await;
-            store.put_blob(&network, &blob, &content)?;
+            store.put_blob(&cluster, &blob, &content)?;
             let created = store.append_event(
                 &source.identity,
-                &network,
+                &cluster,
                 "chat",
                 EventBody::ConversationCreated {
                     title: "m5 live scope".into(),
@@ -1439,7 +1439,7 @@ mod tests {
             )?;
             let message = store.append_event(
                 &source.identity,
-                &network,
+                &cluster,
                 "chat",
                 EventBody::MessagePosted {
                     message_id: "m5-message".into(),
@@ -1455,7 +1455,7 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .ingest_events(&network, &[created, message.clone()])?;
+                .ingest_events(&cluster, &[created, message.clone()])?;
             (message.hash, ready_root)
         };
         let mut tasks = tokio::task::JoinSet::new();
@@ -1468,7 +1468,7 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         let hub = receiver.hub.clone();
-        let scope = network.clone();
+        let scope = cluster.clone();
         tasks.spawn(async move {
             let _ = hub.connect(scope, url).await;
         });
@@ -1517,19 +1517,19 @@ mod tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !receiver.hub.online(&network).await.contains(&source_id) {
+            while !receiver.hub.online(&cluster).await.contains(&source_id) {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
         let cancelled_node = receiver.clone();
-        let cancelled_network = network.clone();
+        let cancelled_cluster = cluster.clone();
         let cancelled_source = source_id.clone();
         let cancelled_head = head.clone();
         let cancelled = tokio::spawn(async move {
             cancelled_node
                 .fetch_closure(
-                    &cancelled_network,
+                    &cancelled_cluster,
                     "chat",
                     &cancelled_source,
                     &[cancelled_head],
@@ -1544,7 +1544,7 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .local_value(&network, &checkpoint)?
+                .local_value(&cluster, &checkpoint)?
                 .is_none()
         );
         let remaining_metadata =
@@ -1554,13 +1554,13 @@ mod tests {
             .metadata
             .charge(remaining_metadata, ReadClass::Proof)?;
         let survivor_node = receiver.clone();
-        let survivor_network = network.clone();
+        let survivor_cluster = cluster.clone();
         let survivor_source = source_id.clone();
         let survivor_head = head.clone();
         let survivor = tokio::spawn(async move {
             survivor_node
                 .fetch_closure(
-                    &survivor_network,
+                    &survivor_cluster,
                     "chat",
                     &survivor_source,
                     &[survivor_head],
@@ -1594,7 +1594,7 @@ mod tests {
         drop(metadata_fill);
         let independent = tokio::time::timeout(
             Duration::from_secs(1),
-            receiver.fetch_closure(&network, "chat", &source_id, &[ready_root]),
+            receiver.fetch_closure(&cluster, "chat", &source_id, &[ready_root]),
         )
         .await??;
         independent.require_complete()?;
@@ -1616,7 +1616,7 @@ mod tests {
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         let access = Access {
-            network_id: network.clone(),
+            cluster_id: cluster.clone(),
             human: true,
             conversation_id: None,
             manager: None,
@@ -1667,7 +1667,7 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .get_blob(&network, &blob.hash)?
+                .get_blob(&cluster, &blob.hash)?
                 .unwrap(),
             content
         );
@@ -1687,13 +1687,13 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .local_value(&network, &checkpoint)?
+                .local_value(&cluster, &checkpoint)?
                 .unwrap()["frontier_generation"]
                 .is_u64()
         );
         source.store.lock().await.append_event(
             &source.identity,
-            &network,
+            &cluster,
             "scope-128",
             EventBody::ConversationCreated {
                 title: "real signed tail scope".into(),
@@ -1704,7 +1704,7 @@ mod tests {
         println!("M5_STAGE inventory starting");
         let reports = tokio::time::timeout(
             Duration::from_secs(120),
-            receiver.sync_from(&network, &source_id),
+            receiver.sync_from(&cluster, &source_id),
         )
         .await?
         .context("m5 inventory traversal")?;
@@ -1720,7 +1720,7 @@ mod tests {
                 .store
                 .lock()
                 .await
-                .scopes(&network)?
+                .scopes(&cluster)?
                 .contains(&"scope-128".to_owned())
         );
         assert_eq!(receiver.sync.active.total.load(Ordering::Acquire), 0);

@@ -17,7 +17,7 @@ fn fixture() -> Result<(
     LocalIdentity,
     LocalIdentity,
     LocalIdentity,
-    NetworkState,
+    ClusterState,
 )> {
     let root_dir = std::env::temp_dir().join(format!("vibeface-identity-tests-{}", random_id()));
     fs::create_dir_all(&root_dir)?;
@@ -35,8 +35,8 @@ fn fixture() -> Result<(
             Member::client(&peer_admin, "peer-admin", true)?,
         ],
     )?;
-    let state = NetworkState::new(genesis)?;
-    store.init_network(state.clone())?;
+    let state = ClusterState::new(genesis)?;
+    store.init_cluster(state.clone())?;
     Ok((root_dir, store, admin, peer_admin, node, state))
 }
 
@@ -49,7 +49,7 @@ fn invite_request(
     let view = store.public_state()?.project()?;
     let payload = store.create_invite(InviteRequest {
         request_id: random_id(),
-        network_id: view.network_id,
+        cluster_id: view.cluster_id,
         inviter_subject_id: admin.peer_id()?,
         epoch: view.epoch,
         capability: capability.to_owned(),
@@ -78,25 +78,25 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
     assert!(store.bootstrap_capability().is_err());
     let root = LocalIdentity::generate();
     let admin = LocalIdentity::generate();
-    let state = NetworkState::new(Genesis::create(
+    let state = ClusterState::new(Genesis::create(
         &root,
         vec![Member::client(&admin, "admin", true)?],
     )?)?;
     assert!(
         store
-            .bootstrap_network(state.clone(), &cap.capability, &root.peer_id()?)
+            .bootstrap_cluster(state.clone(), &cap.capability, &root.peer_id()?)
             .is_err()
     );
     assert!(
         store
-            .bootstrap_network(state.clone(), "00".repeat(32).as_str(), &admin.peer_id()?)
+            .bootstrap_cluster(state.clone(), "00".repeat(32).as_str(), &admin.peer_id()?)
             .is_err()
     );
-    store.bootstrap_network(state, &cap.capability, &admin.peer_id()?)?;
+    store.bootstrap_cluster(state, &cap.capability, &admin.peer_id()?)?;
     assert!(
         store
-            .bootstrap_network(
-                NetworkState::new(Genesis::create(
+            .bootstrap_cluster(
+                ClusterState::new(Genesis::create(
                     &root,
                     vec![Member::client(&admin, "admin", true)?]
                 )?)?,

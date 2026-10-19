@@ -31,7 +31,7 @@ struct Cursor {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct Stream {
-    network: String,
+    cluster: String,
     scope: String,
     source: String,
 }
@@ -90,7 +90,7 @@ impl Progress {
 }
 
 struct Lease {
-    network: String,
+    cluster: String,
     scope: String,
     targets: BTreeSet<String>,
     expires: Instant,
@@ -118,7 +118,7 @@ impl ObservationState {
             .values()
             .flat_map(|lease| {
                 lease.targets.iter().map(|source| Stream {
-                    network: lease.network.clone(),
+                    cluster: lease.cluster.clone(),
                     scope: lease.scope.clone(),
                     source: source.clone(),
                 })
@@ -226,7 +226,7 @@ pub(super) fn native_progress(event: &Value) -> Value {
 
 impl Runtime {
     /// Only locally produced progress enters this ring. Proxied reads use events.send directly.
-    pub(crate) fn publish_progress(&self, network: &str, mut payload: Value) {
+    pub(crate) fn publish_progress(&self, cluster: &str, mut payload: Value) {
         let Ok(source) = self.identity.peer_id() else {
             return;
         };
@@ -243,7 +243,7 @@ impl Runtime {
         };
         if let Ok(mut state) = self.observation.lock() {
             state.prune();
-            let key = (network.to_owned(), scope.to_owned());
+            let key = (cluster.to_owned(), scope.to_owned());
             if !state.progress.contains_key(&key)
                 && state.progress.len() >= MAX_SCOPES
                 && let Some(oldest) = state
@@ -261,7 +261,7 @@ impl Runtime {
                 .push(payload.clone(), bytes.len());
         }
         let _ = self.events.send(Update {
-            network_id: network.into(),
+            cluster_id: cluster.into(),
             payload,
         });
     }
@@ -283,7 +283,7 @@ impl Runtime {
         {
             let store = self.store.lock().await;
             for target in &targets {
-                store.authorize_node(&access.network_id, target, None)?;
+                store.authorize_node(&access.cluster_id, target, None)?;
             }
         }
         let mut state = self
@@ -299,7 +299,7 @@ impl Runtime {
         state.leases.insert(
             id.clone(),
             Lease {
-                network: access.network_id.clone(),
+                cluster: access.cluster_id.clone(),
                 scope: scope.into(),
                 targets,
                 expires: Instant::now() + LEASE,
@@ -318,7 +318,7 @@ impl Runtime {
     /// Called only from authenticated peer request dispatch, never from broadcast handling.
     pub(crate) async fn read_progress(
         &self,
-        network: &str,
+        cluster: &str,
         origin: &str,
         input: &Value,
     ) -> Result<Value> {
@@ -330,7 +330,7 @@ impl Runtime {
         self.membership_state().await?;
         self.require_scope(
             &Access {
-                network_id: network.into(),
+                cluster_id: cluster.into(),
                 human: false,
                 conversation_id: Some(scope.into()),
                 manager: None,
@@ -341,7 +341,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, origin, None)?;
+            .authorize_node(cluster, origin, None)?;
         let since = input
             .get("cursor")
             .filter(|cursor| !cursor.is_null())
@@ -359,7 +359,7 @@ impl Runtime {
             .lock()
             .map_err(|_| anyhow::anyhow!("progress observer unavailable"))?;
         state.prune();
-        let key = (network.to_owned(), scope.to_owned());
+        let key = (cluster.to_owned(), scope.to_owned());
         let mut reply = if let Some(progress) = state.progress.get(&key) {
             progress.read(since.as_ref())
         } else {
@@ -408,10 +408,10 @@ impl Runtime {
             self.store
                 .lock()
                 .await
-                .authorize_node(&stream.network, &stream.source, None)?;
+                .authorize_node(&stream.cluster, &stream.source, None)?;
             self.require_scope(
                 &Access {
-                    network_id: stream.network.clone(),
+                    cluster_id: stream.cluster.clone(),
                     human: true,
                     conversation_id: Some(stream.scope.clone()),
                     manager: None,
@@ -424,7 +424,7 @@ impl Runtime {
         if let Err(error) = authorized {
             if let Ok(mut state) = self.observation.lock() {
                 state.leases.retain(|_, lease| {
-                    lease.network != stream.network || lease.scope != stream.scope
+                    lease.cluster != stream.cluster || lease.scope != stream.scope
                 });
                 state.prune();
             }
@@ -443,7 +443,7 @@ impl Runtime {
         let reply = tokio::time::timeout(
             Duration::from_secs(2),
             self.peer_request(
-                &stream.network,
+                &stream.cluster,
                 &stream.source,
                 json!({
                     "type":"progress_read", "version":VERSION,
@@ -489,8 +489,8 @@ impl Runtime {
         );
         {
             let store = self.store.lock().await;
-            store.authorize_node(&stream.network, &stream.source, None)?;
-            store.authorize_node(&stream.network, &self.identity.peer_id()?, None)?;
+            store.authorize_node(&stream.cluster, &stream.source, None)?;
+            store.authorize_node(&stream.cluster, &self.identity.peer_id()?, None)?;
         }
         {
             let mut state = self
@@ -510,13 +510,13 @@ impl Runtime {
         // Forward locally only: capturing these frames would create proxy loops and false sources.
         if reply["reset"].as_bool() == Some(true) {
             let _ = self.events.send(Update {
-                network_id: stream.network.clone(),
+                cluster_id: stream.cluster.clone(),
                 payload: json!({"type":"changed","conversation_id":stream.scope}),
             });
         }
         for payload in events {
             let _ = self.events.send(Update {
-                network_id: stream.network.clone(),
+                cluster_id: stream.cluster.clone(),
                 payload: payload.clone(),
             });
         }
@@ -588,12 +588,12 @@ mod tests {
     }
 
     #[test]
-    fn streams_are_network_scope_and_source_isolated_and_expire() {
+    fn streams_are_cluster_scope_and_source_isolated_and_expire() {
         let mut state = ObservationState::default();
         state.leases.insert(
             "live".into(),
             Lease {
-                network: "mine".into(),
+                cluster: "mine".into(),
                 scope: "chat".into(),
                 targets: BTreeSet::from(["manager".into(), "executor".into()]),
                 expires: Instant::now() + LEASE,
@@ -602,7 +602,7 @@ mod tests {
         state.leases.insert(
             "expired".into(),
             Lease {
-                network: "other".into(),
+                cluster: "other".into(),
                 scope: "chat".into(),
                 targets: BTreeSet::from(["private".into()]),
                 expires: Instant::now() - Duration::from_secs(1),
@@ -614,7 +614,7 @@ mod tests {
             state
                 .streams()
                 .iter()
-                .all(|stream| stream.network == "mine" && stream.scope == "chat")
+                .all(|stream| stream.cluster == "mine" && stream.scope == "chat")
         );
         state.remove("live");
         assert!(state.streams().is_empty());

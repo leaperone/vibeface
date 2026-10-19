@@ -7,7 +7,7 @@ const AGENT_BLOB_IDLE_TTL: Duration = Duration::from_secs(300);
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct AgentBlobKey {
     attempt_id: Option<String>,
-    network_id: String,
+    cluster_id: String,
     scope_id: String,
     hash: String,
     expected_size: u64,
@@ -66,7 +66,7 @@ impl Runtime {
             "nodes" => self.rpc_inner(access, json!({"method":"nodes"})).await,
             "context" => self.agent_context(&access, &args).await,
             "task_status" => self.store.lock().await.agent_task_status(
-                &access.network_id,
+                &access.cluster_id,
                 scope,
                 field(&args, "task_ref")?,
             ),
@@ -79,12 +79,12 @@ impl Runtime {
                 let store = self.store.lock().await;
                 let task = store
                     .agent_task_for_message(
-                        &access.network_id,
+                        &access.cluster_id,
                         scope,
                         &task_message_id(scope, &manager.attempt_id, reference)?,
                     )?
                     .context("task call reference was not found in this invocation")?;
-                store.agent_task_status(&access.network_id, scope, &task.hash)
+                store.agent_task_status(&access.cluster_id, scope, &task.hash)
             }
             "send_task" => {
                 let manager = access
@@ -106,20 +106,20 @@ impl Runtime {
                 };
                 let (event, receipt) = self.store.lock().await.post_agent_task(
                     &self.identity,
-                    &access.network_id,
+                    &access.cluster_id,
                     scope,
                     message,
                     &manager.attempt_id,
                     now_ms(),
                 )?;
-                self.publish_changed(&access.network_id, scope, &event.hash);
-                self.spawn_scheduler(access.network_id.clone(), scope.into(), event.hash.clone())?;
+                self.publish_changed(&access.cluster_id, scope, &event.hash);
+                self.spawn_scheduler(access.cluster_id.clone(), scope.into(), event.hash.clone())?;
                 Ok(json!({"task_ref":event.hash,"call_ref":reference,"receipt":receipt}))
             }
             "cancel_task" => {
                 let reference = field(&args, "task_ref")?;
                 let status = self.store.lock().await.agent_task_status(
-                    &access.network_id,
+                    &access.cluster_id,
                     scope,
                     reference,
                 )?;
@@ -131,11 +131,11 @@ impl Runtime {
                 let target = field(&status["task"], "target_node")?;
                 drop(lease);
                 if target == source {
-                    self.cancel_agent_task(&access.network_id, scope, reference, &source)
+                    self.cancel_agent_task(&access.cluster_id, scope, reference, &source)
                         .await
                 } else {
                     self.peer_request(
-                        &access.network_id,
+                        &access.cluster_id,
                         target,
                         json!({"type":"cancel_agent_task",
                         "conversation_id":scope,"task_ref":reference}),
@@ -149,27 +149,27 @@ impl Runtime {
 
     pub(super) async fn cancel_agent_task(
         self: &Arc<Self>,
-        network: &str,
+        cluster: &str,
         scope: &str,
         reference: &str,
         source: &str,
     ) -> Result<Value> {
-        if self.store.lock().await.event(network, reference)?.is_none() {
-            self.fetch_closure(network, scope, source, &[reference.into()])
+        if self.store.lock().await.event(cluster, reference)?.is_none() {
+            self.fetch_closure(cluster, scope, source, &[reference.into()])
                 .await?;
         }
         let job = self
             .store
             .lock()
             .await
-            .cancel_agent_task(&self.identity, network, scope, reference, source, now_ms())?
+            .cancel_agent_task(&self.identity, cluster, scope, reference, source, now_ms())?
             .context("agent task was not found")?;
         if let crate::scheduling::JobState::Cancelling { attempt } = &job.state {
-            self.interrupt_native_task(network, scope, reference)
+            self.interrupt_native_task(cluster, scope, reference)
                 .await?;
             self.fence_manager_attempt(&attempt.id).await?;
         }
-        self.publish_changed(network, scope, reference);
+        self.publish_changed(cluster, scope, reference);
         Ok(json!({"task_ref":reference,"job":job}))
     }
 
@@ -187,7 +187,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .context(&access.network_id, scope, &[])?;
+            .context(&access.cluster_id, scope, &[])?;
         let events = context
             .events
             .into_iter()
@@ -230,18 +230,18 @@ impl Runtime {
             let store = self.store.lock().await;
             let local = self.identity.peer_id()?;
             let current = store.public_state()?;
-            ensure!(current.genesis.network_id == access.network_id, "wrong personal network");
+            ensure!(current.genesis.cluster_id == access.cluster_id, "wrong cluster");
             current.project()?.authorize_node(&local, None)?;
-            store.authorize_node(&access.network_id, &local, None)?;
-            ensure!(store.has_conversation(&access.network_id, scope)?, "conversation not found");
+            store.authorize_node(&access.cluster_id, &local, None)?;
+            ensure!(store.has_conversation(&access.cluster_id, scope)?, "conversation not found");
             Self::check_manager_permission(&store, access, false, None)?;
-            let expected = store.context_blob_ref(&access.network_id, scope, hash)?;
+            let expected = store.context_blob_ref(&access.cluster_id, scope, hash)?;
             let size = usize::try_from(expected.size)?;
             ensure!(size <= MAX_BLOB_BYTES, "blob size limit exceeded");
             ensure!(offset <= size, "invalid blob offset");
             let key = AgentBlobKey {
                 attempt_id: attempt.clone(),
-                network_id: access.network_id.clone(),
+                cluster_id: access.cluster_id.clone(),
                 scope_id: scope.into(),
                 hash: hash.into(),
                 expected_size: expected.size,
@@ -257,7 +257,7 @@ impl Runtime {
                         && used.checked_add(size).is_some_and(|total| total <= AGENT_BLOB_BYTES),
                     Busy("Agent attachment snapshots are full; finish an existing read before retrying".into())
                 );
-                let bytes = store.get_blob_for_ref(&access.network_id, &expected)?
+                let bytes = store.get_blob_for_ref(&access.cluster_id, &expected)?
                     .context("blob not available")?;
                 ensure!(bytes.len() == size, "blob size mismatch");
                 entry.insert(AgentBlobSnapshot { bytes, last_used: now });
@@ -274,7 +274,7 @@ impl Runtime {
         if result.is_err() {
             snapshots.retain(|key, _| {
                 !(key.attempt_id == attempt
-                    && key.network_id == access.network_id
+                    && key.cluster_id == access.cluster_id
                     && key.scope_id == scope
                     && key.hash == hash)
             });
@@ -307,9 +307,9 @@ mod tests {
         node.store
             .lock()
             .await
-            .put_blob(&access.network_id, &blob, bytes)?;
+            .put_blob(&access.cluster_id, &blob, bytes)?;
         node.append_blobs(
-            &access.network_id,
+            &access.cluster_id,
             access.conversation_id.as_deref().unwrap(),
             EventBody::MessagePosted {
                 message_id: name.into(),
@@ -331,16 +331,16 @@ mod tests {
         BlobRef,
         Vec<u8>,
     )> {
-        let dir = crate::runtime::tests::fixture_under("network-reliability")?;
+        let dir = crate::runtime::tests::fixture_under("cluster-reliability")?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let owner = LocalIdentity::generate();
-        let state = owner.sign_network_fixture(
+        let state = owner.sign_cluster_fixture(
             1,
             vec![node.identity.certificate(node.config.roles.clone())?],
         )?;
-        let network = node.install_membership(state).await?.network_id;
+        let cluster = node.install_membership(state).await?.cluster_id;
         node.append(
-            &network,
+            &cluster,
             "chat",
             EventBody::ConversationCreated {
                 title: "blob pages".into(),
@@ -348,7 +348,7 @@ mod tests {
         )
         .await?;
         let access = Access {
-            network_id: network,
+            cluster_id: cluster,
             human: false,
             conversation_id: Some("chat".into()),
             manager: None,
@@ -367,7 +367,7 @@ mod tests {
             let mut store = node.store.lock().await;
             let (message, _) = store.accept_message(
                 &node.identity,
-                &access.network_id,
+                &access.cluster_id,
                 scope,
                 EventBody::MessagePosted {
                     message_id: name.into(),
@@ -383,7 +383,7 @@ mod tests {
             )?;
             let claimed = store
                 .claim_next(
-                    &access.network_id,
+                    &access.cluster_id,
                     scope,
                     &target,
                     "blob-page-test",
@@ -397,7 +397,7 @@ mod tests {
                 .context("manager attempt missing")?
                 .id
                 .clone();
-            store.mark_started(&access.network_id, scope, &target, &message.hash, &attempt)?;
+            store.mark_started(&access.cluster_id, scope, &target, &message.hash, &attempt)?;
             (message.hash, attempt)
         };
         node.register_manager_attempt(name.into(), access.clone(), &attempt, &trigger, false)
@@ -432,14 +432,14 @@ mod tests {
         );
         let corrupt = vec![0xee_u8; bytes.len()];
         rusqlite::Connection::open(dir.join("node.sqlite3"))?.execute(
-            "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
-            rusqlite::params![corrupt, access.network_id, blob.hash],
+            "UPDATE blobs SET content=? WHERE cluster_id=? AND hash=?",
+            rusqlite::params![corrupt, access.cluster_id, blob.hash],
         )?;
         assert!(
             node.store
                 .lock()
                 .await
-                .get_blob(&access.network_id, &blob.hash)
+                .get_blob(&access.cluster_id, &blob.hash)
                 .is_err()
         );
         let second = node
@@ -467,7 +467,7 @@ mod tests {
         node.store
             .lock()
             .await
-            .put_blob(&access.network_id, &blob, &bytes)?;
+            .put_blob(&access.cluster_id, &blob, &bytes)?;
         let mut received = Vec::new();
         for offset in [0, 1024, 2048] {
             let page = node
@@ -508,7 +508,7 @@ mod tests {
         )
         .await?;
         node.append(
-            &access.network_id,
+            &access.cluster_id,
             "other",
             EventBody::ConversationCreated {
                 title: "other".into(),
@@ -700,7 +700,7 @@ mod tests {
         .await;
         let mut certificate = node.identity.certificate(node.config.roles.clone())?;
         certificate.revoked = true;
-        node.install_membership(owner.sign_network_fixture(2, vec![certificate])?)
+        node.install_membership(owner.sign_cluster_fixture(2, vec![certificate])?)
             .await?;
         drop(snapshots);
         assert!(request.await.is_err());

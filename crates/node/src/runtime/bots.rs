@@ -7,7 +7,7 @@ impl Runtime {
         input: &Value,
     ) -> Result<Value> {
         ensure!(access.human, "only the user creates Bots");
-        self.require_role(&access.network_id, NodeRole::Gateway)
+        self.require_role(&access.cluster_id, NodeRole::Gateway)
             .await?;
         let bot_id = id(input, "bot_id")?;
         let scope = id(input, "conversation_id")?;
@@ -29,16 +29,16 @@ impl Runtime {
             .store
             .lock()
             .await
-            .bots(&access.network_id)?
+            .bots(&access.cluster_id)?
             .iter()
             .any(|bot| bot.bot_id == bot_id);
         if !existing && let Some(project) = &project {
-            self.validate_bot_project(&access.network_id, project)
+            self.validate_bot_project(&access.cluster_id, project)
                 .await?;
         }
         let bot = self.store.lock().await.create_bot(
             &self.identity,
-            &access.network_id,
+            &access.cluster_id,
             &BotCreateSpec {
                 conversation_id: scope.clone(),
                 bot_id,
@@ -48,7 +48,7 @@ impl Runtime {
             },
             now_ms(),
         )?;
-        self.publish_changed(&access.network_id, &scope, &bot.event_hash);
+        self.publish_changed(&access.cluster_id, &scope, &bot.event_hash);
         Ok(json!({"bot":bot}))
     }
 
@@ -59,13 +59,13 @@ impl Runtime {
         );
         let state = self.membership_state().await?;
         ensure!(
-            state.genesis.network_id == access.network_id,
-            "wrong personal network"
+            state.genesis.cluster_id == access.cluster_id,
+            "wrong cluster"
         );
         let store = self.store.lock().await;
-        store.authorize_node(&access.network_id, &self.identity.peer_id()?, None)?;
+        store.authorize_node(&access.cluster_id, &self.identity.peer_id()?, None)?;
         let bots = store
-            .bots(&access.network_id)?
+            .bots(&access.cluster_id)?
             .into_iter()
             .filter(|bot| {
                 access
@@ -77,9 +77,9 @@ impl Runtime {
         Ok(json!({"bots":bots}))
     }
 
-    async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {
+    async fn validate_bot_project(&self, cluster: &str, project: &BotProject) -> Result<()> {
         self.store.lock().await.authorize_node(
-            network,
+            cluster,
             &project.target_node,
             Some(NodeRole::Scheduler),
         )?;
@@ -103,7 +103,7 @@ impl Runtime {
         } else {
             let capabilities = self
                 .peer_request(
-                    network,
+                    cluster,
                     &project.target_node,
                     json!({"type":"capabilities"}),
                 )

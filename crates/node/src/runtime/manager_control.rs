@@ -47,7 +47,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .scheduler_job(&access.network_id, scope, trigger, &target)?
+            .scheduler_job(&access.cluster_id, scope, trigger, &target)?
             .context("manager job missing")?;
         let attempt = job.state.attempt().context("manager attempt missing")?;
         ensure!(
@@ -92,7 +92,7 @@ impl Runtime {
                 .as_ref()
                 .context("manager metadata missing")?;
             self.store.lock().await.fence_manager_permission(
-                &active.access.network_id,
+                &active.access.cluster_id,
                 active
                     .access
                     .conversation_id
@@ -142,7 +142,7 @@ impl Runtime {
             "management invocation has been stopped"
         );
         ensure!(
-            active.access.network_id == access.network_id
+            active.access.cluster_id == access.cluster_id
                 && active.access.conversation_id == access.conversation_id,
             "management invocation scope mismatch"
         );
@@ -169,7 +169,7 @@ impl Runtime {
             .context("missing management scope")?;
         ensure!(
             store.manager_attempt_allowed(
-                &access.network_id,
+                &access.cluster_id,
                 scope,
                 &manager.target_node,
                 &manager.trigger,
@@ -186,7 +186,7 @@ impl Runtime {
                 );
             }
             store.validate_latest_manager_policy(
-                &access.network_id,
+                &access.cluster_id,
                 scope,
                 &manager.trigger,
                 &manager.target_node,
@@ -197,16 +197,16 @@ impl Runtime {
         Ok(())
     }
 
-    async fn manager_target(&self, network: &str, scope: &str, trigger: &str) -> Result<String> {
+    async fn manager_target(&self, cluster: &str, scope: &str, trigger: &str) -> Result<String> {
         let local = self.identity.peer_id()?;
         let store = self.store.lock().await;
         if store
-            .scheduler_job(network, scope, trigger, &local)?
+            .scheduler_job(cluster, scope, trigger, &local)?
             .is_some()
         {
             return Ok(local);
         }
-        let context = store.context(network, scope, &[])?;
+        let context = store.context(cluster, scope, &[])?;
         let event = context
             .events
             .iter()
@@ -231,18 +231,18 @@ impl Runtime {
         let scope = super::field(input, "conversation_id")?;
         let trigger = super::field(input, "trigger")?;
         self.require_scope(access, scope).await?;
-        let network = &access.network_id;
-        let target = self.manager_target(network, scope, trigger).await?;
+        let cluster = &access.cluster_id;
+        let target = self.manager_target(cluster, scope, trigger).await?;
         if target != self.identity.peer_id()? {
-            self.require_role(network, NodeRole::Gateway).await?;
-            return self.peer_request(network, &target, json!({"type":"cancel_manager","conversation_id":scope,"trigger":trigger,"human":true})).await;
+            self.require_role(cluster, NodeRole::Gateway).await?;
+            return self.peer_request(cluster, &target, json!({"type":"cancel_manager","conversation_id":scope,"trigger":trigger,"human":true})).await;
         }
         let job = {
             let mut store = self.store.lock().await;
             let job = store
-                .request_manager_cancel(network, scope, &target, trigger)?
+                .request_manager_cancel(cluster, scope, &target, trigger)?
                 .context("management job missing")?;
-            if store.scheduler_publication_pending(network, scope, &target, trigger)? {
+            if store.scheduler_publication_pending(cluster, scope, &target, trigger)? {
                 return Ok(json!({"job":job,"cancel_requested":false,"publication_pending":true}));
             }
             job
@@ -254,7 +254,7 @@ impl Runtime {
             job.state,
             JobState::Cancelling { .. } | JobState::Cancelled { .. }
         );
-        self.publish_changed(network, scope, trigger);
+        self.publish_changed(cluster, scope, trigger);
         Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
@@ -267,21 +267,21 @@ impl Runtime {
             access.human,
             "only the user resolves an unknown management reply"
         );
-        let network = &access.network_id;
+        let cluster = &access.cluster_id;
         let scope = super::field(input, "conversation_id")?;
         let trigger = super::field(input, "trigger")?;
         let evidence = super::field(input, "evidence")?;
         self.require_scope(access, scope).await?;
-        let target = self.manager_target(network, scope, trigger).await?;
+        let target = self.manager_target(cluster, scope, trigger).await?;
         if target != self.identity.peer_id()? {
-            self.require_role(network, NodeRole::Gateway).await?;
-            return self.peer_request(network, &target, json!({"type":"resolve_manager_unknown","conversation_id":scope,"trigger":trigger,"evidence":evidence,"human":true})).await;
+            self.require_role(cluster, NodeRole::Gateway).await?;
+            return self.peer_request(cluster, &target, json!({"type":"resolve_manager_unknown","conversation_id":scope,"trigger":trigger,"evidence":evidence,"human":true})).await;
         }
         let job = self
             .store
             .lock()
             .await
-            .scheduler_job(network, scope, trigger, &target)?
+            .scheduler_job(cluster, scope, trigger, &target)?
             .context("management job missing")?;
         ensure!(
             matches!(job.state, JobState::Unknown { .. }),
@@ -294,17 +294,17 @@ impl Runtime {
             .id;
         self.fence_manager_attempt(attempt).await?;
         let native = self
-            .native_work_for_attempt(network, scope, trigger, attempt)
+            .native_work_for_attempt(cluster, scope, trigger, attempt)
             .await?;
         ensure!(
             native.iter().all(|work| work.state.terminal()),
             "verify the original native turns have stopped before resolving this Agent invocation"
         );
         let mut store = self.store.lock().await;
-        store.fence_manager_unknown(network, scope, &target, trigger, attempt)?;
-        store.resolve_manager_unknown(network, scope, &target, trigger, attempt, evidence)?;
+        store.fence_manager_unknown(cluster, scope, &target, trigger, attempt)?;
+        store.resolve_manager_unknown(cluster, scope, &target, trigger, attempt, evidence)?;
         drop(store);
-        self.publish_changed(network, scope, trigger);
+        self.publish_changed(cluster, scope, trigger);
         Ok(json!({"resolved":true,"trigger":trigger}))
     }
 }

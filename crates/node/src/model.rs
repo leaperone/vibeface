@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub type NetworkId = String;
+pub type ClusterId = String;
 pub type PeerId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
-pub const WIRE_VERSION: u32 = 1;
+pub const WIRE_VERSION: u32 = 2;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
@@ -52,7 +52,7 @@ pub enum EventBody {
         instructions: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<BotProject>,
-        membership_role_proof: Box<crate::identity::NetworkState>,
+        membership_role_proof: Box<crate::identity::ClusterState>,
     },
     MessagePosted {
         message_id: String,
@@ -97,7 +97,7 @@ pub enum EventBody {
 #[serde(deny_unknown_fields)]
 pub struct Event {
     pub version: u32,
-    pub network_id: NetworkId,
+    pub cluster_id: ClusterId,
     pub scope_id: ScopeId,
     pub author: PeerId,
     pub sequence: u64,
@@ -133,7 +133,7 @@ impl MissingDependencies {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
-    pub network_id: NetworkId,
+    pub cluster_id: ClusterId,
     pub scope_id: ScopeId,
     pub heads: Vec<EventHash>,
     pub events: Vec<SignedEvent>,
@@ -141,7 +141,7 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
-    pub network_id: NetworkId,
+    pub cluster_id: ClusterId,
     pub scope_id: ScopeId,
     pub heads: Vec<EventHash>,
     pub events: Vec<Event>,

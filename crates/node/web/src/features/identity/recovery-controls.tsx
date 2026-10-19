@@ -37,17 +37,17 @@ export function RecoveryReview() {
   }
   return <Card className={panel} aria-labelledby="recovery-review-title">
     <h2 id="recovery-review-title" className="font-semibold">{review.kind === 'bootstrap' ? '先保存加密恢复包' : '确认恢复后的设备授权'}</h2>
-    <p className="break-all font-mono text-xs">个人网络 {review.networkId}</p>
+    <p className="break-all font-mono text-xs">集群 {review.clusterId}</p>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    <p role="status" className="text-sm text-muted-foreground">{busy ? '正在提交授权，请等待设备确认。' : review.kind === 'bootstrap' ? '创建网络的根私钥只在此浏览器里使用，不会发给节点。' : '恢复根私钥只在此可信客户端使用。未加密私钥不会发送给节点。'}</p>
+    <p role="status" className="text-sm text-muted-foreground">{busy ? '正在提交授权，请等待设备确认。' : review.kind === 'bootstrap' ? '创建集群的根私钥只在此浏览器里使用，不会发给节点。' : '恢复根私钥只在此可信客户端使用。未加密私钥不会发送给节点。'}</p>
     {review.kind === 'bootstrap' ? <form className="space-y-4" onSubmit={event => {
       event.preventDefault(); const checkbox = event.currentTarget.elements.namedItem('saved')
       void run(() => device.confirmBootstrap(checkbox instanceof HTMLInputElement && checkbox.checked))
     }}>
-      <p className="text-sm text-muted-foreground">下载恢复包，并独立保存口令。保存后才能创建个人网络。</p>
+      <p className="text-sm text-muted-foreground">下载恢复包，并独立保存口令。保存后才能创建集群。</p>
       <Button variant="outline" className={button} type="button" disabled={busy} onClick={() => void run(async () => device.downloadBackup())}>下载加密恢复包</Button>
       <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" name="saved" required disabled={busy} />我已保存恢复包，并妥善保存口令</label>
-      <Button className={button} type="submit" disabled={busy}>确认保存并创建网络</Button>
+      <Button className={button} type="submit" disabled={busy}>确认保存并创建集群</Button>
     </form> : <form ref={formRef} className="space-y-4" onSubmit={event => {
       event.preventDefault(); const form = event.currentTarget
       void run(async () => {

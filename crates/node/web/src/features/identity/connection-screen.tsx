@@ -85,7 +85,7 @@ export function ConnectionScreen() {
     setInvitation(JSON.stringify(parsed))
     setLane('invite')
   }
-  const subtitle = device.review?.kind === 'bootstrap' ? '先保存恢复包，再创建网络。'
+  const subtitle = device.review?.kind === 'bootstrap' ? '先保存恢复包，再创建集群。'
     : device.review ? '选择要留下的设备。'
     : device.waiting ? '核对后等待确认。'
     : active === 'saved' && device.entries.length === 1 && ['connecting', 'reconnecting'].includes(device.phase) ? '正在连接。'
@@ -97,7 +97,7 @@ export function ConnectionScreen() {
     : purpose === 'pair' ? '提交加入请求。'
     : '用邀请加入或创建。'
   const inviteAction = purpose === 'bootstrap' ? '连接并准备创建' : purpose === 'pair' ? '提交加入请求' : '连接'
-  const inviteDetail = purpose === 'bootstrap' ? '保存恢复包之后才会创建网络。'
+  const inviteDetail = purpose === 'bootstrap' ? '保存恢复包之后才会创建集群。'
     : purpose === 'pair' ? '还要等管理设备确认。'
     : purpose === 'node' ? '到那台机器运行 vibeface pair，这张网页不能接受。'
     : ''
@@ -117,10 +117,10 @@ export function ConnectionScreen() {
       {device.phase === 'key_lost' && <Card className={panel} aria-labelledby="lost-key-title"><h2 id="lost-key-title" className="font-semibold">密钥已丢失</h2><p className="text-sm text-muted-foreground">新密钥需要重新配对。</p><Button variant="outline" className={`${button} self-start`} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新密钥</Button></Card>}
       {device.review && <RecoveryReview />}
       {device.waiting && <Card className={panel} aria-labelledby="pair-review-title">
-        <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入网络'}</h2>
+        <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入集群'}</h2>
         <p className="text-sm text-muted-foreground">{device.waiting.accepted ? '等待对方确认。' : '核对设备编号后确认。'}</p>
-        <dl className="grid gap-3 text-sm"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono text-xs">{device.waiting.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono text-xs">{device.waiting.review.inviter_subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">此浏览器</dt><dd className="break-all font-mono text-xs">{device.waiting.review.new_member.subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">设备名称</dt><dd className="break-all">{device.waiting.review.new_member.name}</dd></div></dl>
-        {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对个人网络及双方设备编号</label>}
+        <dl className="grid gap-3 text-sm"><div className="space-y-1"><dt className="text-muted-foreground">集群</dt><dd className="break-all font-mono text-xs">{device.waiting.cluster_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono text-xs">{device.waiting.review.inviter_subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">此浏览器</dt><dd className="break-all font-mono text-xs">{device.waiting.review.new_member.subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">设备名称</dt><dd className="break-all">{device.waiting.review.new_member.name}</dd></div></dl>
+        {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对集群及双方设备编号</label>}
         <div className="flex flex-wrap gap-2"><Button className={button} type="button" disabled={busy || !device.waiting.accepted && !confirmed} onClick={() => void run(device.waiting?.accepted ? device.checkPair : device.acceptPair)}>{device.waiting.accepted ? '检查配对进度' : '确认加入'}</Button><Button variant="outline" className={button} type="button" onClick={() => { device.cancelPair(); setConfirmed(false) }}>取消本地配对</Button></div>
         <p className="text-xs text-muted-foreground">只取消本机记录。</p>
       </Card>}
@@ -133,7 +133,7 @@ export function ConnectionScreen() {
         {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
       </Card>}
       {!focused && active === 'invite' && <Card className={panel} aria-labelledby="invite-title">
-        <h2 id="invite-title" className="font-semibold">{purpose === 'bootstrap' ? '准备创建网络' : purpose === 'pair' ? '申请加入网络' : '使用邀请'}</h2>
+        <h2 id="invite-title" className="font-semibold">{purpose === 'bootstrap' ? '准备创建集群' : purpose === 'pair' ? '申请加入集群' : '使用邀请'}</h2>
         <p className="text-sm text-muted-foreground">{purpose === 'bootstrap' ? '口令至少 12 个字符。' : '粘贴连接链接或邀请，也可以导入连接文件。'}</p>
         <form className="space-y-4" onSubmit={submitInvitation}>
           <fieldset disabled={linking || !usable || !!device.review} className="space-y-4 disabled:opacity-70">

@@ -23,8 +23,8 @@ export function writeStorage(key: string, value: unknown, required = false) {
   }
 }
 
-export function networkKey(key: string, networkId: string) {
-  return `${key}.${networkId}`
+export function clusterKey(key: string, clusterId: string) {
+  return `${key}.${clusterId}`
 }
 
 export function newId() {

@@ -12,14 +12,14 @@ import {
   parsePendingMessages, parseBot, parseBots, parseCreateBot, parsePendingBot, record,
   parseArtifactPage, hasQueuedMessage,
 } from "./model"
-import { networkKey, newId, readStorage, writeStorage } from "./storage"
+import { clusterKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   ConversationPayload, NodeInfo, NotificationRecord,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject,
 } from "./types"
 
 function useWorkspaceState(connection: ReadyConnection) {
-  const networkId = connection.principal.network_id
+  const clusterId = connection.principal.cluster_id
   const clientId = connection.principal.subject_id
   const [booted, setBooted] = useState(false)
   const [error, setError] = useState("")
@@ -68,8 +68,8 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (!booted) throw new Error("本地待核对记录尚未读取，已暂停写入。")
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
   }
-  const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
-  const readFrontiers = () => frontierMap(readStorage<unknown>(networkKey("frontiers", networkId), {}, true))
+  const scoped = (key: string) => clusterKey(`${key}.${clientId}`, clusterId)
+  const readFrontiers = () => frontierMap(readStorage<unknown>(clusterKey("frontiers", clusterId), {}, true))
   const replaceMessages = (next: PendingMessage[]) => {
     requireWritable()
     writeStorage(scoped("pending-messages"), next, true)
@@ -95,7 +95,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (!isIncomplete(next.missing)) {
       const latest = readFrontiers()
       const concurrent = (latest[id] ?? []).filter((head) => !basis.includes(head))
-      writeStorage(networkKey("frontiers", networkId), { ...latest, [id]: [...new Set([...next.heads, ...concurrent])] }, true)
+      writeStorage(clusterKey("frontiers", clusterId), { ...latest, [id]: [...new Set([...next.heads, ...concurrent])] }, true)
     }
     dataRef.current = next
     setData(next)
@@ -122,15 +122,15 @@ function useWorkspaceState(connection: ReadyConnection) {
   }
   const refreshNotificationButton = () => {
     if (!("Notification" in window)) { setNotificationButton({ label: "浏览器不支持提醒", disabled: true }); return }
-    const enabled = readStorage(networkKey("notify", networkId), false)
+    const enabled = readStorage(clusterKey("notify", clusterId), false)
     setNotificationButton(Notification.permission === "granted"
-      ? { label: enabled ? "浏览器提醒已开启" : "启用此网络提醒", disabled: enabled }
+      ? { label: enabled ? "浏览器提醒已开启" : "启用此集群提醒", disabled: enabled }
       : Notification.permission === "denied" ? { label: "请在浏览器设置允许提醒", disabled: true }
       : { label: "开启浏览器提醒", disabled: false })
   }
   const notifyBrowser = (items: NotificationRecord[]) => {
-    if (!("Notification" in window) || Notification.permission !== "granted" || !readStorage(networkKey("notify", networkId), false)) return
-    const seen = new Set(readStorage<string[]>(networkKey("seen", networkId), []))
+    if (!("Notification" in window) || Notification.permission !== "granted" || !readStorage(clusterKey("notify", clusterId), false)) return
+    const seen = new Set(readStorage<string[]>(clusterKey("seen", clusterId), []))
     for (const item of items) {
       if (seen.has(item.notification_id)) continue
       seen.add(item.notification_id)
@@ -144,7 +144,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         }
       } catch { /* The persisted inbox remains available when browser notifications fail. */ }
     }
-    writeStorage(networkKey("seen", networkId), [...seen].slice(-1000))
+    writeStorage(clusterKey("seen", clusterId), [...seen].slice(-1000))
   }
   const scheduleRefresh = () => {
     if (!current() || refreshTimer.current !== null) return
@@ -208,7 +208,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       setConversationId(activeId.current)
       const frontiers = readFrontiers(), heads = frontiers[activeId.current] ?? []
       const basis = mergeBasis(heads, params.get("basis"))
-      if (activeId.current && basis !== heads) writeStorage(networkKey("frontiers", networkId), { ...frontiers, [activeId.current]: basis }, true)
+      if (activeId.current && basis !== heads) writeStorage(clusterKey("frontiers", clusterId), { ...frontiers, [activeId.current]: basis }, true)
       setBooted(true)
     } catch (caught) { showError(caught) }
     return () => { alive.current = false }
@@ -440,8 +440,8 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (!("Notification" in window)) return
       const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission()
       requireCurrent()
-      writeStorage(networkKey("notify", networkId), permission === "granted")
-      if (permission === "granted") { writeStorage(networkKey("seen", networkId), notificationsRef.current.map((item) => item.notification_id)); setNoticeText("浏览器提醒已开启。已有未读提醒保留在对话列表中。") }
+      writeStorage(clusterKey("notify", clusterId), permission === "granted")
+      if (permission === "granted") { writeStorage(clusterKey("seen", clusterId), notificationsRef.current.map((item) => item.notification_id)); setNoticeText("浏览器提醒已开启。已有未读提醒保留在对话列表中。") }
       refreshNotificationButton()
     },
   }

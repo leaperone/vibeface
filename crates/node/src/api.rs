@@ -336,28 +336,28 @@ async fn info(State(app): State<App>) -> Json<Value> {
 
 async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
-    let network_id = if app.node.has_membership().await.map_err(ApiError::bad)? {
+    let cluster_id = if app.node.has_membership().await.map_err(ApiError::bad)? {
         Some(
             app.node
                 .membership_state()
                 .await
                 .map_err(ApiError::bad)?
                 .genesis
-                .network_id,
+                .cluster_id,
         )
     } else {
         None
     };
-    let local_session = network_id.as_ref().and_then(|network_id| {
+    let local_session = cluster_id.as_ref().and_then(|cluster_id| {
         local_cookie(&headers, &peer_id).and_then(|cookie| {
             app.node
                 .local_access
-                .session(cookie, &peer_id, network_id)
+                .session(cookie, &peer_id, cluster_id)
                 .ok()
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"cluster_id":cluster_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true}}),
     ))
 }
 
@@ -368,7 +368,7 @@ async fn local_launch(State(app): State<App>, headers: HeaderMap) -> ApiResult<J
     let token = app
         .node
         .local_access
-        .issue(capability, &peer_id, &state.genesis.network_id)
+        .issue(capability, &peer_id, &state.genesis.cluster_id)
         .map_err(|_| ApiError::auth())?;
     Ok(Json(
         json!({"url":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"token":token}),
@@ -399,12 +399,12 @@ async fn local_exchange(
         .exchange(
             &input.token,
             &peer_id,
-            &state.genesis.network_id,
+            &state.genesis.cluster_id,
             &input.subject_id,
             &input.public_key,
         )
         .map_err(|_| ApiError::auth())?;
-    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true},"network_id":state.genesis.network_id})).into_response();
+    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true},"cluster_id":state.genesis.cluster_id})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
@@ -439,7 +439,7 @@ async fn local_websocket(
     let state = app.node.membership_state().await.map_err(ApiError::bad)?;
     app.node
         .local_access
-        .session(&cookie, &peer_id, &state.genesis.network_id)
+        .session(&cookie, &peer_id, &state.genesis.cluster_id)
         .map_err(|_| ApiError::auth())?;
     Ok(websocket
         .max_message_size(65535)

@@ -1,9 +1,9 @@
-//! Private, local state for identity handshakes and network membership.
+//! Private, local state for identity handshakes and cluster membership.
 //!
 //! One-time capability secrets stay on the client; this database stores their
 //! hashes and signed pairing receipts, never a recovery root or client private key.
 
-use super::{AuthorizationView, IdentityKind, Member, NetworkState};
+use super::{AuthorizationView, ClusterState, IdentityKind, Member};
 use crate::crypto;
 use crate::model::NodeRole;
 use crate::store::Store;
@@ -34,7 +34,7 @@ pub struct InvitePayload {
     pub version: u32,
     pub invite_id: String,
     pub request_id: String,
-    pub network_id: String,
+    pub cluster_id: String,
     pub inviter_subject_id: String,
     pub capability_hash: String,
     pub new_kind: IdentityKind,
@@ -72,7 +72,7 @@ impl InviteEnvelope {
 #[serde(deny_unknown_fields)]
 pub struct InviteRequest {
     pub request_id: String,
-    pub network_id: String,
+    pub cluster_id: String,
     pub inviter_subject_id: String,
     pub epoch: u64,
     pub capability: String,
@@ -85,7 +85,7 @@ impl std::fmt::Debug for InviteRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InviteRequest")
             .field("request_id", &self.request_id)
-            .field("network_id", &self.network_id)
+            .field("cluster_id", &self.cluster_id)
             .field("inviter_subject_id", &self.inviter_subject_id)
             .field("capability", &"[redacted]")
             .field("new_kind", &self.new_kind)
@@ -135,7 +135,7 @@ impl PairRequest {
 pub struct PairReview {
     pub version: u32,
     pub invite_id: String,
-    pub network_id: String,
+    pub cluster_id: String,
     pub inviter_subject_id: String,
     pub new_member: Member,
     pub proposal_hash: String,
@@ -199,7 +199,7 @@ impl Store {
     pub fn bootstrap_capability(&self) -> Result<BootstrapCapability> {
         let capability = random_hex(32);
         self.transaction(|tx| {
-            ensure!(!has_network_in(tx)?, "network already installed");
+            ensure!(!has_cluster_in(tx)?, "cluster already installed");
             let issued: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM identity_meta WHERE key='bootstrap_capability_hash'",
                 [],
@@ -215,9 +215,9 @@ impl Store {
         Ok(BootstrapCapability { capability })
     }
 
-    pub fn bootstrap_network(
+    pub fn bootstrap_cluster(
         &self,
-        state: NetworkState,
+        state: ClusterState,
         capability: &str,
         remote_client_id: &str,
     ) -> Result<AuthorizationView> {
@@ -225,12 +225,12 @@ impl Store {
             state.checkpoint.is_none() && state.events.is_empty(),
             "bootstrap accepts genesis only"
         );
-        self.bootstrap_network_inner(state, capability, remote_client_id)
+        self.bootstrap_cluster_inner(state, capability, remote_client_id)
     }
 
-    pub fn bootstrap_recovered_network(
+    pub fn bootstrap_recovered_cluster(
         &self,
-        state: NetworkState,
+        state: ClusterState,
         capability: &str,
         remote_client_id: &str,
     ) -> Result<AuthorizationView> {
@@ -238,7 +238,7 @@ impl Store {
             state.checkpoint.is_some() && state.events.is_empty(),
             "recovery bootstrap requires a signed checkpoint"
         );
-        self.bootstrap_network_inner(state, capability, remote_client_id)
+        self.bootstrap_cluster_inner(state, capability, remote_client_id)
     }
 
     pub fn verify_bootstrap_capability(&self, capability: &str) -> Result<()> {
@@ -246,9 +246,9 @@ impl Store {
         verify_bootstrap_in(conn, capability)
     }
 
-    fn bootstrap_network_inner(
+    fn bootstrap_cluster_inner(
         &self,
-        state: NetworkState,
+        state: ClusterState,
         capability: &str,
         remote_client_id: &str,
     ) -> Result<AuthorizationView> {
@@ -258,7 +258,7 @@ impl Store {
             "remote bootstrap identity must manage"
         );
         self.transaction(|tx|{
-            ensure!(!has_network_in(tx)?,"network already installed");
+            ensure!(!has_cluster_in(tx)?,"cluster already installed");
             verify_bootstrap_in(tx,capability)?;
             save_state(tx,&state)?;
             tx.execute("UPDATE identity_meta SET value='consumed:' || value WHERE key='bootstrap_capability_hash'",[])?;
@@ -267,32 +267,32 @@ impl Store {
         Ok(view)
     }
 
-    pub fn init_network(&self, state: NetworkState) -> Result<AuthorizationView> {
+    pub fn init_cluster(&self, state: ClusterState) -> Result<AuthorizationView> {
         let view = state.project()?;
         self.transaction(|tx| {
-            ensure!(!has_network_in(tx)?, "network already installed");
+            ensure!(!has_cluster_in(tx)?, "cluster already installed");
             save_state(tx, &state)
         })?;
         Ok(view)
     }
 
-    pub fn public_state(&self) -> Result<NetworkState> {
+    pub fn public_state(&self) -> Result<ClusterState> {
         let conn = &self.connection;
         let state = load_state(conn)?;
         state.project()?;
         Ok(state)
     }
 
-    pub fn has_network(&self) -> Result<bool> {
+    pub fn has_cluster(&self) -> Result<bool> {
         let conn = &self.connection;
-        has_network_in(conn)
+        has_cluster_in(conn)
     }
 
-    pub fn install_state(&mut self, incoming: NetworkState) -> Result<AuthorizationView> {
+    pub fn install_state(&mut self, incoming: ClusterState) -> Result<AuthorizationView> {
         incoming.project()?;
-        self.retire_identity_readers(&incoming.genesis.network_id);
+        self.retire_identity_readers(&incoming.genesis.cluster_id);
         self.transaction(|tx| {
-            let next = if has_network_in(tx)? {
+            let next = if has_cluster_in(tx)? {
                 let current = load_state(tx)?;
                 let merged = current.merge(&incoming)?;
                 if merged.epoch() > current.epoch() {
@@ -320,7 +320,7 @@ impl Store {
             version: super::IDENTITY_VERSION,
             invite_id: random_id(),
             request_id: request.request_id,
-            network_id: request.network_id,
+            cluster_id: request.cluster_id,
             inviter_subject_id: request.inviter_subject_id,
             capability_hash: crypto::digest(request.capability.as_bytes()),
             new_kind: request.new_kind,
@@ -347,7 +347,7 @@ impl Store {
             }
             let pending:i64=tx.query_row("SELECT COUNT(*) FROM identity_invites WHERE used=0 AND expires_at_ms>?",[now_ms()],|r|r.get(0))?;
             ensure!(pending<32,"too many pending invitations");
-            tx.execute("INSERT INTO identity_invites(invite_id,request_id,network_id,inviter_subject_id,payload,payload_hash,capability_hash,inviter_signature,epoch,expires_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",params![payload.invite_id,payload.request_id,payload.network_id,payload.inviter_subject_id,serde_json::to_string(payload)?,payload.hash()?,payload.capability_hash,envelope.inviter_signature,payload.epoch,payload.expires_at_ms])?;
+            tx.execute("INSERT INTO identity_invites(invite_id,request_id,cluster_id,inviter_subject_id,payload,payload_hash,capability_hash,inviter_signature,epoch,expires_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",params![payload.invite_id,payload.request_id,payload.cluster_id,payload.inviter_subject_id,serde_json::to_string(payload)?,payload.hash()?,payload.capability_hash,envelope.inviter_signature,payload.epoch,payload.expires_at_ms])?;
             Ok(invite_receipt(payload))
         })
     }
@@ -392,7 +392,7 @@ impl Store {
                 let previous:PairReview=serde_json::from_str(&record?)?;
                 ensure!(previous.epoch!=view.epoch||previous.expires_at_ms<=now_ms(),"identity already has a pending pairing request");
             }
-            let review=PairReview{version:super::IDENTITY_VERSION,invite_id:request.invite_id.clone(),network_id:payload.network_id,inviter_subject_id:payload.inviter_subject_id,new_member:request.member.clone(),proposal_hash,parents:view.heads,epoch:payload.epoch,expires_at_ms:payload.expires_at_ms};
+            let review=PairReview{version:super::IDENTITY_VERSION,invite_id:request.invite_id.clone(),cluster_id:payload.cluster_id,inviter_subject_id:payload.inviter_subject_id,new_member:request.member.clone(),proposal_hash,parents:view.heads,epoch:payload.epoch,expires_at_ms:payload.expires_at_ms};
             tx.execute("INSERT INTO identity_pair_requests(request_id,invite_id,subject_id,review,review_hash,new_subject_signature) VALUES(?,?,?,?,?,'')",params![request.request_id,review.invite_id,review.new_member.subject_id,serde_json::to_string(&review)?,review.hash()?])?;
             Ok(review)
         })
@@ -478,8 +478,8 @@ impl Store {
         })
     }
 
-    pub fn store_signed_grant(&mut self, event: super::GovernanceEvent) -> Result<NetworkState> {
-        self.retire_identity_readers(&event.network_id);
+    pub fn store_signed_grant(&mut self, event: super::GovernanceEvent) -> Result<ClusterState> {
+        self.retire_identity_readers(&event.cluster_id);
         let super::GovernanceAction::Grant { member } = &event.action else {
             bail!("pairing requires a grant")
         };
@@ -491,7 +491,7 @@ impl Store {
             for row in rows {
                 let (encoded,inviter_signature,new_subject_signature)=row?;
                 let review:PairReview=serde_json::from_str(&encoded)?;
-                if event.network_id==review.network_id&&event.epoch==review.epoch&&event.issuer==review.inviter_subject_id&&event.parents==review.parents&&member==review.new_member {
+                if event.cluster_id==review.cluster_id&&event.epoch==review.epoch&&event.issuer==review.inviter_subject_id&&event.parents==review.parents&&member==review.new_member {
                     ensure!(matching.is_none(),"ambiguous confirmed pairing");
                     matching=Some((review,inviter_signature,new_subject_signature));
                 }
@@ -521,7 +521,7 @@ impl Store {
         invite_id: &str,
         capability: &str,
         subject_id: &str,
-    ) -> Result<Option<NetworkState>> {
+    ) -> Result<Option<ClusterState>> {
         super::validate_id(capability)?;
         let conn = &self.connection;
         let hash: String = conn.query_row(
@@ -559,7 +559,7 @@ impl Store {
         let state = load_state(conn)?;
         let view = state.project()?;
         ensure!(
-            view.network_id == review.network_id && view.epoch == review.epoch,
+            view.cluster_id == review.cluster_id && view.epoch == review.epoch,
             "pairing epoch is stale"
         );
         view.authorize_member(subject_id)?;
@@ -567,23 +567,23 @@ impl Store {
     }
 }
 
-fn load_state(conn: &Connection) -> Result<NetworkState> {
+fn load_state(conn: &Connection) -> Result<ClusterState> {
     let encoded: String = conn
-        .query_row("SELECT bundle FROM networks LIMIT 1", [], |r| r.get(0))
+        .query_row("SELECT bundle FROM clusters LIMIT 1", [], |r| r.get(0))
         .optional()?
-        .context("personal network is not installed")?;
+        .context("cluster is not installed")?;
     Ok(serde_json::from_str(&encoded)?)
 }
-fn save_state(conn: &Connection, state: &NetworkState) -> Result<()> {
-    crate::store::install_trust_bundle_in(conn, &state.genesis.network_id, state)?;
+fn save_state(conn: &Connection, state: &ClusterState) -> Result<()> {
+    crate::store::install_trust_bundle_in(conn, &state.genesis.cluster_id, state)?;
     Ok(())
 }
-fn has_network_in(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM networks", [], |r| r.get::<_, i64>(0))? > 0)
+fn has_cluster_in(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM clusters", [], |r| r.get::<_, i64>(0))? > 0)
 }
 fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
     super::validate_id(capability)?;
-    ensure!(!has_network_in(conn)?, "network already installed");
+    ensure!(!has_cluster_in(conn)?, "cluster already installed");
     let expected: String = conn
         .query_row(
             "SELECT value FROM identity_meta WHERE key='bootstrap_capability_hash'",
@@ -600,9 +600,9 @@ fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
 fn validate_invite(payload: &InvitePayload, view: &AuthorizationView) -> Result<Member> {
     ensure!(
         payload.version == super::IDENTITY_VERSION
-            && payload.network_id == view.network_id
+            && payload.cluster_id == view.cluster_id
             && payload.epoch == view.epoch,
-        "invitation network or epoch mismatch"
+        "invitation cluster or epoch mismatch"
     );
     validate_text(&payload.invite_id, 64)?;
     validate_text(&payload.request_id, 128)?;
@@ -632,9 +632,9 @@ fn validate_invite(payload: &InvitePayload, view: &AuthorizationView) -> Result<
 fn validate_review(review: &PairReview, view: &AuthorizationView) -> Result<Member> {
     ensure!(
         review.version == super::IDENTITY_VERSION
-            && review.network_id == view.network_id
+            && review.cluster_id == view.cluster_id
             && review.epoch == view.epoch,
-        "pair review network or epoch mismatch"
+        "pair review cluster or epoch mismatch"
     );
     ensure!(review.expires_at_ms > now_ms(), "pair review expired");
     review.new_member.validate()?;

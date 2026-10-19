@@ -4,13 +4,13 @@ use tokio::sync::watch;
 async fn running_manager() -> Result<(PathBuf, Arc<Runtime>, Access, watch::Receiver<bool>)> {
     let dir = tests::fixture()?;
     let node = Arc::new(Runtime::open(&dir).await?);
-    let network = tests::conversation(&node).await?;
+    let cluster = tests::conversation(&node).await?;
     let target = node.identity.peer_id()?;
     let (trigger, attempt) = {
         let mut store = node.store.lock().await;
         let (message, _) = store.accept_message(
             &node.identity,
-            &network,
+            &cluster,
             "chat",
             EventBody::MessagePosted {
                 message_id: "manager-fence-message".into(),
@@ -25,7 +25,7 @@ async fn running_manager() -> Result<(PathBuf, Arc<Runtime>, Access, watch::Rece
             false,
         )?;
         let claimed = store
-            .claim_next(&network, "chat", &target, "fence-test-boot", "test-sdk")?
+            .claim_next(&cluster, "chat", &target, "fence-test-boot", "test-sdk")?
             .context("management job was not claimed")?;
         let attempt = claimed
             .job
@@ -34,7 +34,7 @@ async fn running_manager() -> Result<(PathBuf, Arc<Runtime>, Access, watch::Rece
             .context("claimed job has no attempt")?
             .id
             .clone();
-        store.mark_started(&network, "chat", &target, &message.hash, &attempt)?;
+        store.mark_started(&cluster, "chat", &target, &message.hash, &attempt)?;
         (message.hash, attempt)
     };
     let token = "manager-fence-token".to_string();
@@ -42,7 +42,7 @@ async fn running_manager() -> Result<(PathBuf, Arc<Runtime>, Access, watch::Rece
         .register_manager_attempt(
             token.clone(),
             Access {
-                network_id: network,
+                cluster_id: cluster,
                 human: false,
                 conversation_id: Some("chat".into()),
                 manager: None,
@@ -77,7 +77,7 @@ async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messag
             Ok(store
                 .accept_message(
                     &node.identity,
-                    &access.network_id,
+                    &access.cluster_id,
                     "chat",
                     EventBody::MessagePosted {
                         message_id: id.into(),
@@ -97,7 +97,7 @@ async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messag
         let queued = accept("cancel-this-queued-message")?;
         let remaining = accept("keep-this-queued-message")?;
         let original = store
-            .scheduler_job(&access.network_id, "chat", &queued, &manager.target_node)?
+            .scheduler_job(&access.cluster_id, "chat", &queued, &manager.target_node)?
             .unwrap();
         (queued, remaining, original)
     };
@@ -118,10 +118,10 @@ async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messag
     assert!(!*cancel.borrow());
     let mut store = node.store.lock().await;
     Runtime::check_manager_permission(&store, &access, true, None)?;
-    assert_eq!(store.messages(&access.network_id, "chat")?.len(), 3);
+    assert_eq!(store.messages(&access.cluster_id, "chat")?.len(), 3);
     store.finish_job(
         &node.identity,
-        &access.network_id,
+        &access.cluster_id,
         "chat",
         &manager.target_node,
         &manager.trigger,
@@ -133,7 +133,7 @@ async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messag
     assert_eq!(
         store
             .claim_next(
-                &access.network_id,
+                &access.cluster_id,
                 "chat",
                 &manager.target_node,
                 "fence-test-boot",

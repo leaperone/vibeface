@@ -13,7 +13,7 @@ function Home() {
 function ConnectedWorkspace() {
   const { ready } = useDevice()
   if (!ready) return <ConnectionScreen />
-  const key = `${ready.principal.network_id}:${ready.principal.subject_id}`
+  const key = `${ready.principal.cluster_id}:${ready.principal.subject_id}`
   return (
     <WorkspaceProvider key={key} connection={ready}>
       <WorkspaceShell />

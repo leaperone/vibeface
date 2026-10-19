@@ -132,7 +132,7 @@ export function DeviceControls() {
           <MemberDetails member={pair.review.new_member} />
           {!pair.new_subject_signature ? <p role="status" className="text-sm text-muted-foreground">等待新设备核对并确认。</p> : currentReview?.request_id === pair.request_id ? <div className="space-y-3">
             <p className="text-sm">请与新设备核对完整设备编号、类型和角色。</p>
-            <dl className="grid gap-3 text-xs"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{pair.review.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{pair.review.inviter_subject_id}</dd></div></dl>
+            <dl className="grid gap-3 text-xs"><div className="space-y-1"><dt className="text-muted-foreground">集群</dt><dd className="break-all font-mono">{pair.review.cluster_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{pair.review.inviter_subject_id}</dd></div></dl>
             <label className="flex min-h-11 items-start gap-2 text-sm"><input className="mt-1" type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} />我已通过可信渠道核对以上设备信息</label>
             <div className="flex flex-wrap gap-2">
               <Button type="button" className={button} disabled={busy || !reviewConfirmed} onClick={() => void run(async () => { await device.approvePair(pair.request_id); if (ready?.isCurrent()) { setReview(null); setReviewConfirmed(false) } }, '设备已获授权。')}>确认授权</Button>
@@ -156,7 +156,7 @@ export function DeviceControls() {
               {canManage && !member.manage && revokeSubject !== member.subject_id && <Button type="button" variant="ghost" className={`${button} text-destructive`} disabled={busy} onClick={() => setRevokeSubject(member.subject_id)}>撤销授权</Button>}
             </div>
             {canManage && !member.manage && revokeSubject === member.subject_id && <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
-              <p className="break-all text-sm">撤销后，此设备将失去网络访问权限。确认撤销「{member.name || member.subject_id}」？</p>
+              <p className="break-all text-sm">撤销后，此设备将失去集群访问权限。确认撤销「{member.name || member.subject_id}」？</p>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="destructive" className={button} disabled={busy} onClick={() => void run(async () => { await device.revoke(member.subject_id); if (ready?.isCurrent()) setRevokeSubject('') }, '设备授权已撤销。')}>确认撤销</Button>
                 <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => setRevokeSubject('')}>取消</Button>
@@ -266,7 +266,7 @@ export function DeviceControls() {
         <CollapsibleTrigger asChild><Button type="button" variant="ghost" className={disclosure}><span className="font-semibold">当前连接详情</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
         <CollapsibleContent className="space-y-4 px-5 pb-5">
           <dl className="grid gap-3 text-xs">
-            <div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{directory?.network_id || ready?.principal.network_id || '尚未连接'}</dd></div>
+            <div className="space-y-1"><dt className="text-muted-foreground">集群</dt><dd className="break-all font-mono">{directory?.cluster_id || ready?.principal.cluster_id || '尚未连接'}</dd></div>
             {directory && <div className="space-y-1"><dt className="text-muted-foreground">授权版本</dt><dd>{directory.epoch}</dd></div>}
             <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的设备编号</dt><dd className="break-all font-mono">{identity?.peerId || '正在读取'}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的公钥</dt><dd className="break-all font-mono">{identity?.publicKey || '正在读取'}</dd></div>

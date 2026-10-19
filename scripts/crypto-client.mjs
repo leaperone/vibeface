@@ -66,7 +66,7 @@ function endpoint() {
           const signed = event => {
             const canonical_body = JSON.stringify(event);
             const hash = createHash('sha256').update(canonical_body).digest('hex');
-            return {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v1:${hash}`),key).toString('hex')};
+            return {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v2:${hash}`),key).toString('hex')};
           };
           if (input.op === 'fixture_event') { result = signed(input.event); break; }
           assert(Number.isInteger(input.count) && input.count >= 2 && input.count <= 100001, 'fixture chain count must be between 2 and 100001');

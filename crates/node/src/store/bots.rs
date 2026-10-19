@@ -51,19 +51,19 @@ fn validate_definition(
 
 fn validate_gateway_proof_from(
     connection: &Connection,
-    network: &str,
+    cluster: &str,
     author: &str,
-    proof: &NetworkState,
+    proof: &ClusterState,
 ) -> Result<()> {
     let encoded: String = connection.query_row(
-        "SELECT bundle FROM networks WHERE network_id=?",
-        [network],
+        "SELECT bundle FROM clusters WHERE cluster_id=?",
+        [cluster],
         |row| row.get(0),
     )?;
-    let trusted: NetworkState = serde_json::from_str(&encoded)?;
+    let trusted: ClusterState = serde_json::from_str(&encoded)?;
     ensure!(
-        proof.genesis.network_id == network && proof.genesis == trusted.genesis,
-        "Bot Gateway role proof belongs to another personal network"
+        proof.genesis.cluster_id == cluster && proof.genesis == trusted.genesis,
+        "Bot Gateway role proof belongs to another cluster"
     );
     proof
         .project()?
@@ -92,8 +92,8 @@ fn project_bot(hash: &str, event: &Event) -> Option<Bot> {
     })
 }
 
-fn bots_from(connection: &Connection, network: &str) -> Result<Vec<Bot>> {
-    let events = load_events_from(connection, network)?;
+fn bots_from(connection: &Connection, cluster: &str) -> Result<Vec<Bot>> {
+    let events = load_events_from(connection, cluster)?;
     let mut bots = Vec::new();
     let mut identifiers = BTreeSet::new();
     let mut scopes = BTreeSet::new();
@@ -120,7 +120,7 @@ fn bots_from(connection: &Connection, network: &str) -> Result<Vec<Bot>> {
         };
         validate_gateway_proof_from(
             connection,
-            network,
+            cluster,
             &stored.event.author,
             membership_role_proof,
         )?;
@@ -136,7 +136,7 @@ fn bots_from(connection: &Connection, network: &str) -> Result<Vec<Bot>> {
 
 pub(super) fn validate_bot_projections_from(
     connection: &Connection,
-    network: &str,
+    cluster: &str,
     events: &mut BTreeMap<String, StoredEvent>,
     ordered: &[String],
 ) {
@@ -182,7 +182,7 @@ pub(super) fn validate_bot_projections_from(
             .is_err()
             || validate_gateway_proof_from(
                 connection,
-                network,
+                cluster,
                 &stored.event.author,
                 membership_role_proof,
             )
@@ -219,7 +219,7 @@ impl Store {
     pub fn create_bot(
         &mut self,
         identity: &LocalIdentity,
-        network: &str,
+        cluster: &str,
         spec: &BotCreateSpec,
         created_at_ms: i64,
     ) -> Result<Bot> {
@@ -232,13 +232,13 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &identity.peer_id()?, Some(NodeRole::Gateway))?;
-        let membership_role_proof: NetworkState = serde_json::from_str(&tx.query_row(
-            "SELECT bundle FROM networks WHERE network_id=?",
-            [network],
+        authorize_node_from(&tx, cluster, &identity.peer_id()?, Some(NodeRole::Gateway))?;
+        let membership_role_proof: ClusterState = serde_json::from_str(&tx.query_row(
+            "SELECT bundle FROM clusters WHERE cluster_id=?",
+            [cluster],
             |row| row.get::<_, String>(0),
         )?)?;
-        let bots = bots_from(&tx, network)?;
+        let bots = bots_from(&tx, cluster)?;
         if let Some(existing) = bots.iter().find(|bot| bot.bot_id == bot_id) {
             ensure!(
                 existing.conversation_id == conversation
@@ -253,7 +253,7 @@ impl Store {
             !bots.iter().any(|bot| bot.conversation_id == conversation),
             "conversation already belongs to another Bot"
         );
-        let events = load_events_from(&tx, network)?;
+        let events = load_events_from(&tx, cluster)?;
         let heads = heads_from_events(&events, conversation);
         ensure!(
             heads.is_empty(),
@@ -262,7 +262,7 @@ impl Store {
         append_event_from(
             &tx,
             identity,
-            network,
+            cluster,
             conversation,
             EventBody::ConversationCreated { title: name.into() },
             vec![],
@@ -271,7 +271,7 @@ impl Store {
         let event = append_event_from(
             &tx,
             identity,
-            network,
+            cluster,
             conversation,
             EventBody::BotCreated {
                 bot_id: bot_id.into(),
@@ -283,7 +283,7 @@ impl Store {
             vec![],
             created_at_ms,
         )?;
-        let bot = bots_from(&tx, network)?
+        let bot = bots_from(&tx, cluster)?
             .into_iter()
             .find(|bot| bot.event_hash == event.hash)
             .context("created Bot could not be projected")?;
@@ -291,13 +291,13 @@ impl Store {
         Ok(bot)
     }
 
-    pub fn bots(&self, network: &str) -> Result<Vec<Bot>> {
-        bots_from(&self.connection, network)
+    pub fn bots(&self, cluster: &str) -> Result<Vec<Bot>> {
+        bots_from(&self.connection, cluster)
     }
 
-    pub fn bot_for_conversation(&self, network: &str, scope: &str) -> Result<Option<Bot>> {
+    pub fn bot_for_conversation(&self, cluster: &str, scope: &str) -> Result<Option<Bot>> {
         Ok(self
-            .bots(network)?
+            .bots(cluster)?
             .into_iter()
             .find(|bot| bot.conversation_id == scope))
     }
@@ -310,8 +310,8 @@ mod tests {
     fn memory(owner: &LocalIdentity) -> Result<Store> {
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
-            &owner.fixture_network_id()?,
-            &owner.sign_network_fixture(
+            &owner.fixture_cluster_id()?,
+            &owner.sign_cluster_fixture(
                 1,
                 vec![owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?],
             )?,
@@ -323,19 +323,19 @@ mod tests {
     fn invalid_bot_collisions_do_not_poison_a_legitimate_definition_or_history() -> Result<()> {
         let owner = LocalIdentity::generate();
         let replica = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let mut store = Store::open(":memory:")?;
-        let state = owner.sign_network_fixture(
+        let state = owner.sign_cluster_fixture(
             1,
             vec![
                 owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
                 replica.certificate(vec![NodeRole::Replica])?,
             ],
         )?;
-        store.install_trust_bundle(&network, &state)?;
+        store.install_trust_bundle(&cluster, &state)?;
         let legitimate = store.create_bot(
             &owner,
-            &network,
+            &cluster,
             &BotCreateSpec {
                 conversation_id: "legitimate-history".into(),
                 bot_id: "legitimate-bot".into(),
@@ -347,7 +347,7 @@ mod tests {
         )?;
         let message = store.append_event(
             &owner,
-            &network,
+            &cluster,
             "legitimate-history",
             EventBody::MessagePosted {
                 message_id: "human".into(),
@@ -360,7 +360,7 @@ mod tests {
         )?;
         store.append_event(
             &replica,
-            &network,
+            &cluster,
             "attacker-history",
             EventBody::ConversationCreated {
                 title: "attacker".into(),
@@ -370,7 +370,7 @@ mod tests {
         )?;
         let invalid = store.append_event(
             &replica,
-            &network,
+            &cluster,
             "attacker-history",
             EventBody::BotCreated {
                 bot_id: "legitimate-bot".into(),
@@ -382,31 +382,31 @@ mod tests {
             vec![],
             4,
         )?;
-        assert_eq!(store.bots(&network)?, vec![legitimate.clone()]);
+        assert_eq!(store.bots(&cluster)?, vec![legitimate.clone()]);
         assert_eq!(
-            store.bot_for_conversation(&network, "legitimate-history")?,
+            store.bot_for_conversation(&cluster, "legitimate-history")?,
             Some(legitimate)
         );
         assert!(
             store
-                .context(&network, "legitimate-history", &[])?
+                .context(&cluster, "legitimate-history", &[])?
                 .missing
                 .is_complete()
         );
-        assert_eq!(store.messages(&network, "legitimate-history")?.len(), 1);
+        assert_eq!(store.messages(&cluster, "legitimate-history")?.len(), 1);
         assert_eq!(
-            store.messages(&network, "legitimate-history")?[0].event_hash,
+            store.messages(&cluster, "legitimate-history")?[0].event_hash,
             message.hash
         );
         let invalid_status: String = store.connection.query_row(
-            "SELECT status FROM events WHERE network_id=? AND hash=?",
-            params![network, invalid.hash],
+            "SELECT status FROM events WHERE cluster_id=? AND hash=?",
+            params![cluster, invalid.hash],
             |row| row.get(0),
         )?;
         assert_eq!(invalid_status, "invalid");
         let descendant = owner.sign_event(Event {
             version: WIRE_VERSION,
-            network_id: network.clone(),
+            cluster_id: cluster.clone(),
             scope_id: "attacker-history".into(),
             author: owner.peer_id()?,
             sequence: 1,
@@ -418,32 +418,32 @@ mod tests {
                 name: "Invalid descendant".into(),
                 instructions: String::new(),
                 project: None,
-                membership_role_proof: store.trust_bundle(&network)?.unwrap().into(),
+                membership_role_proof: store.trust_bundle(&cluster)?.unwrap().into(),
             },
             blobs: vec![],
         })?;
-        assert_eq!(store.ingest_event(&network, &descendant)?.status, "invalid");
-        assert_eq!(store.bots(&network)?.len(), 1);
+        assert_eq!(store.ingest_event(&cluster, &descendant)?.status, "invalid");
+        assert_eq!(store.bots(&cluster)?.len(), 1);
         assert!(
             store
-                .context(&network, "legitimate-history", &[])?
+                .context(&cluster, "legitimate-history", &[])?
                 .missing
                 .is_complete()
         );
-        assert_eq!(store.messages(&network, "legitimate-history")?.len(), 1);
+        assert_eq!(store.messages(&cluster, "legitimate-history")?.len(), 1);
         Ok(())
     }
 
     #[test]
     fn oversized_bot_instructions_are_rejected_before_creating_history() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let mut store = memory(&owner)?;
         assert!(
             store
                 .create_bot(
                     &owner,
-                    &network,
+                    &cluster,
                     &BotCreateSpec {
                         conversation_id: "oversized-history".into(),
                         bot_id: "oversized-bot".into(),
@@ -455,13 +455,13 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(store.conversations(&network)?.is_empty());
-        assert!(store.bots(&network)?.is_empty());
+        assert!(store.conversations(&cluster)?.is_empty());
+        assert!(store.bots(&cluster)?.is_empty());
         assert!(
             store
                 .create_bot(
                     &owner,
-                    &network,
+                    &cluster,
                     &BotCreateSpec {
                         conversation_id: "bounded-history".into(),
                         bot_id: "bounded-bot".into(),
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn retries_preserve_the_complete_definition_and_scope_isolation() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let mut store = memory(&owner)?;
         let project = Some(BotProject {
             target_node: owner.peer_id()?,
@@ -487,7 +487,7 @@ mod tests {
         });
         let first = store.create_bot(
             &owner,
-            &network,
+            &cluster,
             &BotCreateSpec {
                 conversation_id: "first-history".into(),
                 bot_id: "first-bot".into(),
@@ -499,7 +499,7 @@ mod tests {
         )?;
         let retry = store.create_bot(
             &owner,
-            &network,
+            &cluster,
             &BotCreateSpec {
                 conversation_id: "first-history".into(),
                 bot_id: "first-bot".into(),
@@ -530,7 +530,7 @@ mod tests {
                 store
                     .create_bot(
                         &owner,
-                        &network,
+                        &cluster,
                         &BotCreateSpec {
                             conversation_id: scope.to_owned(),
                             bot_id: "first-bot".into(),
@@ -547,7 +547,7 @@ mod tests {
             store
                 .create_bot(
                     &owner,
-                    &network,
+                    &cluster,
                     &BotCreateSpec {
                         conversation_id: "first-history".into(),
                         bot_id: "second-bot".into(),
@@ -561,7 +561,7 @@ mod tests {
         );
         let second = store.create_bot(
             &owner,
-            &network,
+            &cluster,
             &BotCreateSpec {
                 conversation_id: "second-history".into(),
                 bot_id: "second-bot".into(),
@@ -572,12 +572,12 @@ mod tests {
             12,
         )?;
         assert_ne!(first.conversation_id, second.conversation_id);
-        assert_eq!(store.conversations(&network)?.len(), 2);
-        assert_eq!(store.bots(&network)?.len(), 2);
-        assert!(store.bots("another-network")?.is_empty());
+        assert_eq!(store.conversations(&cluster)?.len(), 2);
+        assert_eq!(store.bots(&cluster)?.len(), 2);
+        assert!(store.bots("another-cluster")?.is_empty());
         let count: i64 = store.connection.query_row(
-            "SELECT count(*) FROM events WHERE network_id=?",
-            [&network],
+            "SELECT count(*) FROM events WHERE cluster_id=?",
+            [&cluster],
             |row| row.get(0),
         )?;
         assert_eq!(count, 4);
@@ -587,11 +587,11 @@ mod tests {
     #[test]
     fn bot_creation_rejects_an_existing_conversation_scope() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let mut store = memory(&owner)?;
         store.append_event(
             &owner,
-            &network,
+            &cluster,
             "existing-history",
             EventBody::ConversationCreated {
                 title: "Old discussion".into(),
@@ -601,7 +601,7 @@ mod tests {
         )?;
         let message = store.append_event(
             &owner,
-            &network,
+            &cluster,
             "existing-history",
             EventBody::MessagePosted {
                 message_id: "original-message".into(),
@@ -616,7 +616,7 @@ mod tests {
             store
                 .create_bot(
                     &owner,
-                    &network,
+                    &cluster,
                     &BotCreateSpec {
                         conversation_id: "existing-history".into(),
                         bot_id: "adopted-bot".into(),
@@ -630,12 +630,12 @@ mod tests {
                 .to_string()
                 .contains("new conversation scope")
         );
-        assert!(store.bots(&network)?.is_empty());
-        let messages = store.messages(&network, "existing-history")?;
+        assert!(store.bots(&cluster)?.is_empty());
+        let messages = store.messages(&cluster, "existing-history")?;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].event_hash, message.hash);
         assert_eq!(messages[0].message_id, "original-message");
-        assert_eq!(store.conversations(&network)?[0].title, "Old discussion");
+        assert_eq!(store.conversations(&cluster)?[0].title, "Old discussion");
         Ok(())
     }
 
@@ -643,11 +643,11 @@ mod tests {
     fn signed_gateway_snapshot_preserves_bot_after_recovery_and_import() -> Result<()> {
         let owner = LocalIdentity::generate();
         let replica = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let mut source = memory(&owner)?;
         let original = source.create_bot(
             &owner,
-            &network,
+            &cluster,
             &BotCreateSpec {
                 conversation_id: "history".into(),
                 bot_id: "bot".into(),
@@ -659,25 +659,25 @@ mod tests {
         )?;
         let mut retired = owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?;
         retired.revoked = true;
-        let recovered = owner.sign_network_fixture(
+        let recovered = owner.sign_cluster_fixture(
             2,
             vec![retired, replica.certificate(vec![NodeRole::Replica])?],
         )?;
-        source.install_trust_bundle(&network, &recovered)?;
-        source.rebuild_projections(&network)?;
-        assert_eq!(source.bots(&network)?[0].event_hash, original.event_hash);
+        source.install_trust_bundle(&cluster, &recovered)?;
+        source.rebuild_projections(&cluster)?;
+        assert_eq!(source.bots(&cluster)?[0].event_hash, original.event_hash);
         assert!(
             source
-                .authorize_node(&network, &owner.peer_id()?, Some(NodeRole::Gateway))
+                .authorize_node(&cluster, &owner.peer_id()?, Some(NodeRole::Gateway))
                 .is_err()
         );
         let mut imported = Store::open(":memory:")?;
-        imported.install_trust_bundle(&network, &recovered)?;
-        for stored in load_events_from(&source.connection, &network)?.into_values() {
-            imported.ingest_event(&network, &stored.envelope)?;
+        imported.install_trust_bundle(&cluster, &recovered)?;
+        for stored in load_events_from(&source.connection, &cluster)?.into_values() {
+            imported.ingest_event(&cluster, &stored.envelope)?;
         }
-        imported.rebuild_projections(&network)?;
-        let bot = imported.bot_for_conversation(&network, "history")?.unwrap();
+        imported.rebuild_projections(&cluster)?;
+        let bot = imported.bot_for_conversation(&cluster, "history")?.unwrap();
         assert_eq!(bot.event_hash, original.event_hash);
         assert_eq!(bot.instructions, "Preserve signed responsibilities");
         Ok(())
@@ -687,10 +687,10 @@ mod tests {
     fn foreign_or_forged_gateway_proof_cannot_create_a_bot() -> Result<()> {
         let owner = LocalIdentity::generate();
         let stranger = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
+        let cluster = owner.fixture_cluster_id()?;
         let mut store = memory(&owner)?;
-        let valid = store.trust_bundle(&network)?.unwrap();
-        let foreign = stranger.sign_network_fixture(
+        let valid = store.trust_bundle(&cluster)?.unwrap();
+        let foreign = stranger.sign_cluster_fixture(
             1,
             vec![owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?],
         )?;
@@ -699,7 +699,7 @@ mod tests {
         for (scope, proof) in [("foreign", foreign), ("forged", forged)] {
             store.append_event(
                 &owner,
-                &network,
+                &cluster,
                 scope,
                 EventBody::ConversationCreated {
                     title: scope.into(),
@@ -709,7 +709,7 @@ mod tests {
             )?;
             let envelope = store.append_event(
                 &owner,
-                &network,
+                &cluster,
                 scope,
                 EventBody::BotCreated {
                     bot_id: scope.into(),
@@ -722,31 +722,31 @@ mod tests {
                 2,
             )?;
             let status: String = store.connection.query_row(
-                "SELECT status FROM events WHERE network_id=? AND hash=?",
-                params![network, envelope.hash],
+                "SELECT status FROM events WHERE cluster_id=? AND hash=?",
+                params![cluster, envelope.hash],
                 |row| row.get(0),
             )?;
             assert_eq!(status, "invalid");
         }
-        assert!(store.bots(&network)?.is_empty());
+        assert!(store.bots(&cluster)?.is_empty());
         Ok(())
     }
 
     #[test]
     fn replica_cannot_create_a_bot_or_leave_a_partial_conversation() -> Result<()> {
         let replica = LocalIdentity::generate();
-        let network = replica.fixture_network_id()?;
+        let cluster = replica.fixture_cluster_id()?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
-            &network,
+            &cluster,
             &replica
-                .sign_network_fixture(1, vec![replica.certificate(vec![NodeRole::Replica])?])?,
+                .sign_cluster_fixture(1, vec![replica.certificate(vec![NodeRole::Replica])?])?,
         )?;
         assert!(
             store
                 .create_bot(
                     &replica,
-                    &network,
+                    &cluster,
                     &BotCreateSpec {
                         conversation_id: "history".into(),
                         bot_id: "bot".into(),
@@ -758,10 +758,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(store.conversations(&network)?.is_empty());
-        let proof = store.trust_bundle(&network)?.unwrap();
+        assert!(store.conversations(&cluster)?.is_empty());
+        let proof = store.trust_bundle(&cluster)?.unwrap();
         assert!(
-            validate_gateway_proof_from(&store.connection, &network, &replica.peer_id()?, &proof)
+            validate_gateway_proof_from(&store.connection, &cluster, &replica.peer_id()?, &proof)
                 .is_err()
         );
         Ok(())

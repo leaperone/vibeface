@@ -22,13 +22,13 @@ pub(super) struct Metadata {
 
 pub(super) fn metadata(
     connection: &Connection,
-    network: &str,
+    cluster: &str,
     hash: &str,
 ) -> Result<Option<Metadata>> {
     let row: Option<(i64, i64, i64, String)> = connection
         .query_row(
-            "SELECT rowid,size,length(content),typeof(content) FROM blobs WHERE network_id=? AND hash=?",
-            params![network, hash],
+            "SELECT rowid,size,length(content),typeof(content) FROM blobs WHERE cluster_id=? AND hash=?",
+            params![cluster, hash],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
@@ -47,16 +47,16 @@ pub(super) fn metadata(
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(super) struct ReaderKey {
-    network: String,
+    cluster: String,
     origin: String,
     hash: String,
     rowid: i64,
     size: u64,
 }
 impl ReaderKey {
-    pub(super) fn new(network: &str, origin: &str, hash: &str, metadata: Metadata) -> Self {
+    pub(super) fn new(cluster: &str, origin: &str, hash: &str, metadata: Metadata) -> Self {
         Self {
-            network: network.into(),
+            cluster: cluster.into(),
             origin: origin.into(),
             hash: hash.into(),
             rowid: metadata.rowid,
@@ -133,13 +133,13 @@ impl BlobReaders {
         self.workers.retain(|_, worker| !worker.finished());
     }
 
-    pub fn retire_network(&mut self, network: &str) {
-        self.workers.retain(|key, _| key.network != network);
+    pub fn retire_cluster(&mut self, cluster: &str) {
+        self.workers.retain(|key, _| key.cluster != cluster);
     }
 
-    pub fn retire_blob(&mut self, network: &str, hash: &str) {
+    pub fn retire_blob(&mut self, cluster: &str, hash: &str) {
         self.workers
-            .retain(|key, _| key.network != network || key.hash != hash);
+            .retain(|key, _| key.cluster != cluster || key.hash != hash);
     }
 
     pub fn read(
@@ -221,7 +221,7 @@ fn open_reader(path: &Path, key: &ReaderKey) -> Result<Connection> {
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("PRAGMA cache_size=-64; PRAGMA mmap_size=0;")?;
     ensure!(
-        metadata(&connection, &key.network, &key.hash)?
+        metadata(&connection, &key.cluster, &key.hash)?
             == Some(Metadata {
                 rowid: key.rowid,
                 size: key.size,
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn range_metadata_rejects_non_blob_content_before_allocating() -> Result<()> {
         let connection = Connection::open_in_memory()?;
-        connection.execute_batch("CREATE TABLE blobs(network_id TEXT,hash TEXT,size INTEGER,content BLOB); INSERT INTO blobs VALUES('n','h',4,X'01020304');")?;
+        connection.execute_batch("CREATE TABLE blobs(cluster_id TEXT,hash TEXT,size INTEGER,content BLOB); INSERT INTO blobs VALUES('n','h',4,X'01020304');")?;
         assert_eq!(metadata(&connection, "n", "h")?.unwrap().size, 4);
         connection.execute("UPDATE blobs SET content='abcd'", [])?;
         assert!(
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn timed_out_readers_remain_charged_until_join_and_full_channels_close() -> Result<()> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts/network-reliability")
+            .join("../../.artifacts/cluster-reliability")
             .join(format!("reader-closing-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let lock = Arc::new(std::fs::File::create(dir.join("process-lock"))?);
@@ -329,7 +329,7 @@ mod tests {
         let mut finishers = Vec::new();
         for index in 0..2 {
             let key = ReaderKey {
-                network: "n".into(),
+                cluster: "n".into(),
                 origin: format!("origin-{index}"),
                 hash: format!("hash-{index}"),
                 rowid: index,
@@ -368,7 +368,7 @@ mod tests {
             finishers.push(finish);
         }
         let another = ReaderKey {
-            network: "n".into(),
+            cluster: "n".into(),
             origin: "new-origin".into(),
             hash: "new".into(),
             rowid: 3,
@@ -386,7 +386,7 @@ mod tests {
             finish.send(())?;
         }
         // Retiring really joins both threads; this is when their reservations and locks disappear.
-        readers.retire_network("n");
+        readers.retire_cluster("n");
         assert!(readers.workers.is_empty());
         assert_eq!(Arc::strong_count(&lock), 1);
         let (requests, receiver) = mpsc::sync_channel(1);
@@ -417,14 +417,14 @@ mod tests {
     #[test]
     fn readonly_cursor_pins_a_read_transaction_and_releases_wal_after_close() -> Result<()> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts/network-reliability")
+            .join("../../.artifacts/cluster-reliability")
             .join(format!("reader-wal-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("node.sqlite3");
         let writer = Connection::open(&path)?;
-        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE blobs(network_id TEXT,hash TEXT,size INTEGER,content BLOB); INSERT INTO blobs VALUES('n','h',4,X'01020304'); PRAGMA wal_checkpoint(TRUNCATE);")?;
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE blobs(cluster_id TEXT,hash TEXT,size INTEGER,content BLOB); INSERT INTO blobs VALUES('n','h',4,X'01020304'); PRAGMA wal_checkpoint(TRUNCATE);")?;
         let key = ReaderKey {
-            network: "n".into(),
+            cluster: "n".into(),
             origin: "o".into(),
             hash: "h".into(),
             rowid: 1,
@@ -467,9 +467,9 @@ mod tests {
     #[test]
     fn idle_and_busy_readers_end_at_request_boundaries_and_close_the_snapshot() -> Result<()> {
         let connection = Connection::open_in_memory()?;
-        connection.execute_batch("CREATE TABLE blobs(network_id TEXT,hash TEXT,size INTEGER,content BLOB); INSERT INTO blobs VALUES('n','h',4,X'01020304');")?;
+        connection.execute_batch("CREATE TABLE blobs(cluster_id TEXT,hash TEXT,size INTEGER,content BLOB); INSERT INTO blobs VALUES('n','h',4,X'01020304');")?;
         let key = ReaderKey {
-            network: "n".into(),
+            cluster: "n".into(),
             origin: "o".into(),
             hash: "h".into(),
             rowid: 1,
