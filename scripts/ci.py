@@ -35,6 +35,8 @@ SLOW_TESTS = (
     "runtime::tests::net1_closure_switches_authorized_replicas_and_isolates_bad_scopes",
     "runtime::tests::net1_history_batch_advances_with_only_64_replay_slots",
     "runtime::sync::tests::m5_real_noise_scope_join_cancelled_proof_quantum_and_inventory_window",
+    "store::agent_messages::tests::cancellation_before_delivery_survives_late_admission_without_starting",
+    "store::agent_messages::tests::parallel_agent_parents_interrupt_mutual_nested_deliveries_without_starting_them",
 )
 PLATFORMS = (
     {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},

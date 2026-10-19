@@ -27,7 +27,7 @@ PR 使用 `merge-base(base, head)..head` 的完整差异。删除与重命名同
 
 只改 PR 标题或描述时跳过任务，并使用独立的并发组与检查名称，保留正在运行的代码检查和必需的 `ci-gate` 结果。
 
-`rust-fast`、`rust-slow` 与 `rust-check` 独立运行。慢测试名单集中在 `scripts/ci.py` 的 `SLOW_TESTS`，包含五条重型 NET-1/真实 Noise 同步用例。快测试跳过这些用例，慢测试按完整名称精确选择。运行前用 `cargo test -- --list` 验证每个慢测试恰好存在一次，并拒绝会多匹配的过滤器，避免重命名后出现零测试成功。正式全量覆盖所有默认测试；原本 `ignored` 的用例仍由 Rust 默认忽略。
+`rust-fast`、`rust-slow` 与 `rust-check` 独立运行。慢测试名单集中在 `scripts/ci.py` 的 `SLOW_TESTS`，包含七条重型用例，覆盖 NET-1、真实 Noise 同步和队列饱和场景。快测试跳过这些用例，慢测试按完整名称精确选择。运行前用 `cargo test -- --list` 验证每个慢测试恰好存在一次，并拒绝会多匹配的过滤器，避免重命名后出现零测试成功。正式全量覆盖所有默认测试；原本 `ignored` 的用例仍由 Rust 默认忽略。
 
 `ci-gate` 始终执行，要求计划中的每个任务成功。必需任务失败、取消、缺失或意外跳过都会使 gate 失败。GitHub 仓库还需将 `ci-gate` 设为必需检查，并要求更新到最新 base 或使用 merge queue，才能强制阻止检查未通过的合并；`main` 或定时全量结果不能替代本次 PR 的合并前检查。
 
