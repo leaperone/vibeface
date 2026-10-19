@@ -2,7 +2,43 @@
 
 Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 包尚无 Apple 开发者签名或 notarization。
 
-## 选择安装渠道
+## npm Nightly
+
+Node.js 22+ 可通过 npm 安装 Nightly。npm 包尚未公开发布，首次发布后使用：
+
+```sh
+npm install -g @leaperone/vibeface@nightly
+vibeface --version
+vibeface
+```
+
+一个 npm 包包含三个平台的完整程序及随包资源，按本机平台启动 Rust 程序。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。发布前从 PR 的 `npm-package-<SHA>` CI artifact 下载 `.tgz`，可用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
+
+初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝运行中的 updater、仍被运行中节点锁定或存在未完成更新记录的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。安装期间持续持有同一更新锁，避免旧 updater 并发改写状态。存在 `update-pending.json` 时，先使用原受管安装的 `update apply` 恢复，再迁移服务。
+
+npm 安装由 npm 更新，内建 `update apply`、`update check`、`update configure` 会提示使用 npm，`update status` 报告 npm 来源及关闭的自动更新。先等待操作结束并对账所有结果未知的写入，再停止后台服务、更新和重启：
+
+```sh
+vibeface service stop
+npm install -g @leaperone/vibeface@nightly
+```
+
+若使用随包 Codex SDK 管理 Agent，首次安装及每次升级后都需为新包安装锁定依赖。将下面的 `<target>` 替换为本机平台：macOS ARM64 使用 `aarch64-apple-darwin`，Linux x64 使用 `x86_64-unknown-linux-gnu`，Linux ARM64 使用 `aarch64-unknown-linux-gnu`。隔离安装时，改用对应 prefix 下的包路径。
+
+```sh
+npm ci --prefix "$(npm root -g)/@leaperone/vibeface/vendor/<target>/sidecars" --omit=dev --ignore-scripts
+```
+
+完成所需依赖安装后，再启动服务并核对状态：
+
+```sh
+vibeface service start
+vibeface status
+```
+
+前台节点先正常退出再更新。更新不转换数据库，不跨数据 epoch 复用旧目录。卸载前先执行 `vibeface service uninstall`，再运行 `npm uninstall -g @leaperone/vibeface`；数据目录保留。
+
+## GitHub 完整包安装
 
 首次安装最新正式版，默认渠道是 Stable：
 
@@ -96,7 +132,7 @@ vibeface service start
 vibeface service restart
 ```
 
-macOS 使用 launchd 用户服务，Linux 使用 `systemd --user`。CLI 管理当前用户的一套受管节点服务，服务通过固定的 `current` 路径启动，以便升级后使用新程序。卸载服务保留数据：
+macOS 使用 launchd 用户服务，Linux 使用 `systemd --user`。CLI 管理当前用户的一套节点服务。GitHub 受管安装通过固定的 `current` 路径启动；npm 安装通过 npm 包中固定的原生程序路径启动。卸载服务保留数据：
 
 ```sh
 vibeface service uninstall
@@ -105,6 +141,8 @@ vibeface service uninstall
 使用自定义数据目录时，在对应节点命令中显式传入 `--data-dir /absolute/path/to/data`。服务命令不能用另一个数据目录操作已绑定的节点服务。更多平台要求见 [作为后台应用运行](node.md#作为后台应用运行)。
 
 ## 选择更新渠道
+
+本节只适用于 GitHub 受管安装。npm 安装按上面的 npm 命令更新。
 
 首次下载渠道与运行时更新策略分别配置。默认运行时策略是 Stable，自动更新关闭。Nightly 安装初始化后建议明确配置：
 
