@@ -32,6 +32,6 @@ vibeface service start
 vibeface status
 ```
 
-An upgrade preserves data but does not convert an incompatible database. Different data epochs require the documented manual migration or a separate data directory. Removing the npm package does not delete node data. Uninstall a background service with `vibeface service uninstall` before `npm uninstall -g @leaperone/vibeface`.
+An upgrade preserves data but does not convert an incompatible database. Different data epochs require a fresh data directory. Removing the npm package does not delete node data. Uninstall a background service with `vibeface service uninstall` before `npm uninstall -g @leaperone/vibeface`.
 
 Provider runtimes and credentials are configured separately. See [installation](https://github.com/leaperone/vibeface/blob/main/docs/install.md) and [releases](https://github.com/leaperone/vibeface/releases).
