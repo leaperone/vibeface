@@ -4,7 +4,6 @@ use crate::{
     model::{BlobRef, EventBody},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 pub const SCHEDULING_VERSION: u32 = 1;
 pub const MAX_PENDING_JOBS: usize = 256;
@@ -53,10 +52,9 @@ pub enum JobState {
         attempt: Option<ManagerAttempt>,
         evidence: String,
     },
-    Unknown {
+    Interrupted {
         attempt: ManagerAttempt,
         detail: String,
-        fenced: bool,
     },
 }
 
@@ -70,7 +68,7 @@ impl JobState {
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
             Self::Cancelled { .. } => "cancelled",
-            Self::Unknown { .. } => "unknown",
+            Self::Interrupted { .. } => "interrupted",
         }
     }
     pub fn attempt(&self) -> Option<&ManagerAttempt> {
@@ -82,7 +80,7 @@ impl JobState {
             | Self::Cancelling { attempt }
             | Self::Completed { attempt }
             | Self::Failed { attempt, .. }
-            | Self::Unknown { attempt, .. } => Some(attempt),
+            | Self::Interrupted { attempt, .. } => Some(attempt),
         }
     }
 }
@@ -165,7 +163,11 @@ pub enum JobOutcome {
     Completed,
     Failed(String),
     Cancelled(String),
-    Unknown(String),
+    /// `process_unconfirmed` records a pending check for the SDK process in the same transaction.
+    Interrupted {
+        detail: String,
+        process_unconfirmed: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +199,6 @@ pub(crate) struct SchedulerSession {
     pub next_sequence: u64,
     pub pending: Vec<String>,
     pub active: Option<String>,
-    pub unresolved: BTreeSet<String>,
     pub native_id: Option<String>,
     pub sdk_config: Option<String>,
     pub permission_version: u64,
@@ -212,7 +213,6 @@ impl SchedulerSession {
             next_sequence: 1,
             pending: Vec::new(),
             active: None,
-            unresolved: BTreeSet::new(),
             native_id: None,
             sdk_config: None,
             permission_version: 1,
@@ -220,9 +220,38 @@ impl SchedulerSession {
     }
 }
 
+/// A side effect whose real outcome this Node cannot prove. Only the user resolves it, with evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingCheck {
+    pub version: u32,
+    pub check_id: String,
+    pub conversation_id: String,
+    pub target_node: String,
+    pub trigger: String,
+    pub attempt_id: String,
+    pub detail: String,
+    pub process_groups: Vec<u32>,
+    pub created_at_ms: i64,
+}
+
+impl PendingCheck {
+    pub fn id(attempt_id: &str) -> String {
+        format!("manager:{attempt_id}")
+    }
+}
+
 pub(crate) fn scheduler_key(kind: &str, conversation: &str, target: &str, trigger: &str) -> String {
     format!(
         "scheduler:v1:{kind}:{}",
+        digest(
+            &serde_json::to_vec(&(conversation, target, trigger)).expect("string tuple serializes")
+        )
+    )
+}
+
+pub(crate) fn remote_job_key(conversation: &str, target: &str, trigger: &str) -> String {
+    format!(
+        "scheduler:v1:remote:{}",
         digest(
             &serde_json::to_vec(&(conversation, target, trigger)).expect("string tuple serializes")
         )

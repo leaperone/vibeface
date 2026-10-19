@@ -24,6 +24,11 @@ const MAX_PROMPT_BYTES: usize = 86_016;
 const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 
+/// Durably records an SDK process group before the agent can act.
+pub type ProcessStarted = std::sync::Arc<
+    dyn Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+>;
+
 /// Cursor SDK configuration for a local agent run.
 #[derive(Clone)]
 pub struct SdkAgentConfig {
@@ -35,6 +40,7 @@ pub struct SdkAgentConfig {
     pub tool_env: BTreeMap<String, String>,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_callback: Option<ToolCallbackConfig>,
+    pub process_started: Option<ProcessStarted>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -191,6 +197,11 @@ where
         }.into()),
     };
     let process_group = process.group.context("Cursor SDK process has no group")?;
+    if let Some(record) = &config.process_started {
+        record(process_group)
+            .await
+            .context("record Cursor SDK process group before sending")?;
+    }
     let mut agent_id = previous_session_id.map(str::to_owned);
     let mut state = RunState::default();
     let mut send_started = false;
@@ -1372,6 +1383,7 @@ mod tests {
             model: "fixture-model".into(),
             read_only: false,
             tool_env: BTreeMap::new(),
+            process_started: None,
             custom_tools: BTreeMap::from([(
                 "context".into(),
                 CustomToolConfig {

@@ -50,6 +50,8 @@ pub struct ManagerConfig {
     pub tool_cli: Option<PathBuf>,
     #[serde(skip)]
     pub tool_env: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub process_started: Option<agent::ProcessStarted>,
 }
 
 impl Default for ManagerConfig {
@@ -70,6 +72,7 @@ impl Default for ManagerConfig {
             tool_callback_token: None,
             tool_cli: None,
             tool_env: BTreeMap::new(),
+            process_started: None,
         }
     }
 }
@@ -84,8 +87,8 @@ impl ManagerKind {
             "resume_local_session": true,
             "text_stream_mode": match self { ManagerKind::CursorSdk => "delta_and_snapshot", ManagerKind::CodexSdk => "snapshot" },
             "cancel_request": true,
-            "cancel_confirmation": self == ManagerKind::CursorSdk,
-            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "unavailable_for_detached_sdk_tools" },
+            "cancel_confirmation": true,
+            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "managed_process_tree_exit" },
             "native_steer": false,
             "run_reconcile": false,
         })
@@ -162,6 +165,7 @@ where
                     tool_env: config.tool_env.clone(),
                     custom_tools: config.custom_tools.clone(),
                     tool_callback: callback,
+                    process_started: config.process_started.clone(),
                 },
                 prompt,
                 previous_session_id,
@@ -253,6 +257,17 @@ where
         .spawn()
         .context("start official Codex SDK sidecar; install the pinned SDK dependencies first")?;
     let process_group = child.id().context("Codex SDK sidecar has no process id")?;
+    if let Some(record) = &config.process_started
+        && let Err(error) = record(process_group).await
+    {
+        let _ = agent::terminate_process_group(&mut child, process_group).await;
+        return Err(ManagerError {
+            kind: ManagerFailure::Failed,
+            session_id: native,
+            message: format!("record Codex SDK process group before start: {error}"),
+        }
+        .into());
+    }
     let mut stdin = child.stdin.take().context("Codex SDK input unavailable")?;
     let stdout = child
         .stdout
@@ -394,6 +409,16 @@ where
                                 "Codex SDK sidecar failed after cancellation"
                             );
                             return Ok::<(), anyhow::Error>(());
+                        }
+                        Some("session") if native.is_none() => {
+                            let id = message["session_id"]
+                                .as_str()
+                                .context("Codex SDK session event has no native ID")?;
+                            vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
+                            native = Some(id.into());
+                            if let Some(persist) = persist.take() {
+                                persist(id.into()).await?;
+                            }
                         }
                         Some("event") => {}
                         _ => return Err(anyhow!("Codex SDK cancellation was not confirmed")),
@@ -762,9 +787,20 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
             std::env::temp_dir().join(format!("vibeface-manager-cancel-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let script = directory.join("fixture.sh");
-        for (session, expected) in [
-            ("fixture-native", ManagerFailure::Cancelled),
-            ("wrong-native", ManagerFailure::Unknown),
+        // Exact lines codex-manager.mjs writes after confirmed and unconfirmed process-tree exit.
+        for (reply, expected) in [
+            (
+                r#"{"type":"cancelled","session_id":"fixture-native","confirmation":"managed_processes_exited"}"#,
+                ManagerFailure::Cancelled,
+            ),
+            (
+                r#"{"type":"cancelled","session_id":"wrong-native","confirmation":"managed_processes_exited"}"#,
+                ManagerFailure::Unknown,
+            ),
+            (
+                r#"{"type":"error","message":"Codex cancellation could not confirm managed process exit","uncertain":true}"#,
+                ManagerFailure::Unknown,
+            ),
         ] {
             let fixture = format!(
                 r#"IFS= read -r init || exit 1
@@ -773,7 +809,7 @@ IFS= read -r ack || exit 2
 printf '%s\n' '{{"type":"event","event":{{"type":"turn.started"}}}}'
 IFS= read -r cancel || exit 3
 case "$cancel" in *cancel*) ;; *) exit 4 ;; esac
-printf '%s\n' '{{"type":"cancelled","session_id":"{session}","confirmation":"managed_processes_exited"}}'
+printf '%s\n' '{reply}'
 "#
             );
             tokio::fs::write(&script, fixture).await.unwrap();

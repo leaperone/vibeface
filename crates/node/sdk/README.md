@@ -42,20 +42,25 @@ adds conversation, trigger, attempt, source, and sequence identities before
 forwarding progress to the client. Native SDK events are not the browser
 protocol, and temporary progress is not durable conversation history.
 
-Cancellation confirms less than normal completion. The pinned CLI can start
-tools in separate process groups, so exiting the sidecar and CLI does not
-prove that every tool process has exited. After a cancellation request, this
-sidecar reports an uncertain `error` with `confirmation=managed_cli_exited`.
-The real adapter therefore keeps the manager job `unknown`, rather than
-claiming that cancellation succeeded. Node tool credentials are fenced and
-admitted tools are accounted for separately. Already dispatched background
+The pinned CLI can start tools in separate process groups, so exiting the CLI
+alone does not prove that every tool process has exited. On stop, the sidecar
+repeatedly snapshots the CLI process tree with `ps -A -o pid=,ppid=,pgid=`,
+signals the CLI group and every descendant's group (SIGTERM, then SIGKILL), and
+confirms that every recorded process and group is gone. Only then does it write
+`{"type":"cancelled","session_id":...,"confirmation":"managed_processes_exited"}`.
+If `ps` fails, a process survives, or the platform is Windows, it reports an
+uncertain `error`; the Node then marks the manager job `interrupted` and
+registers a pending check. A process that already left the tree before stop
+(re-parented after a double fork) is not visible here, exactly as on normal
+completion. Node tool credentials are fenced and admitted tools are accounted
+for separately. Already dispatched background
 tasks and external side effects retain their original task and native session
 identities.
 An uncertain invocation must not be retried under a new ID.
 
 Manager capabilities advertise streaming, cancellation requests, and local
 thread resume. Native steer and Provider run reconciliation are unavailable.
-`cancel_confirmation=false` records the process limit above; `verified=false`
+`cancel_confirmation=true` with evidence `managed_process_tree_exit` records the check above; `verified=false`
 does not assert that the configured account and model have passed acceptance.
 Cursor SDK uses its separate native callback adapter and supports deltas as
 well as snapshots. Its cancellation also needs matching terminal or managed

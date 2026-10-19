@@ -59,7 +59,7 @@
 
 该对象作为 `manager` 的值，保留 `config.json` 的其他字段。`provider` 也可为 `codex_sdk`，Cursor 模式不启动 Node.js sidecar。模型名和程序路径需替换为本机可用配置。
 
-`manager_capabilities` 声明本机 SDK 能力。两种 Manager 均支持流式进度、取消请求和本机原生会话延续，均不支持原生 steer 或 Provider run 对账。Cursor 文本支持增量和快照，Codex 文本是按 item 替换的快照。`cancel=true` 表示可请求取消；Codex 的 `cancel_confirmation=false` 表示 CLI 退出不能证明分离的工具进程已退出。`verified=false` 不表示已通过当前环境的真实模型验收。配置存在、进程可达和已验证是不同状态。
+`manager_capabilities` 声明本机 SDK 能力。两种 Manager 均支持流式进度、取消请求和本机原生会话延续，均不支持原生 steer 或 Provider run 对账。Cursor 文本支持增量和快照，Codex 文本是按 item 替换的快照。`cancel=true` 表示可请求取消；`cancel_confirmation=true` 表示取消可被确认：Codex 以停止时受管进程树（含另建进程组的子进程）全部退出为证据，Cursor 以 Provider 终态或受管进程退出为证据。`verified=false` 不表示已通过当前环境的真实模型验收。配置存在、进程可达和已验证是不同状态。
 
 ## HTTP 与客户端通道
 
@@ -149,11 +149,12 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project` | 本人显式创建机器人并绑定独立聊天历史；完整请求精确去重 |
 | `conversations` | 无 | 本地已知业务会话 |
 | `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
-| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、`autonomy`、`agent_tasks`、`native_sessions`、观察目标、heads、missing、调度队列及事实新鲜度 |
+| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、`autonomy`、`agent_tasks`、`native_sessions`、`pending_checks`、观察目标、heads、missing、调度队列及事实新鲜度 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node`、`report_results` | 原子保存用户消息、汇报意图和本机 inbox 或 outbox，返回调度回执 |
 | `set_autonomy` | `conversation_id`、`mode`、`expected_version`、可选 `scheduler_node` | 本人设置该机器人聊天的后续权限，模式为 `off`、`report` 或 `continue` |
 | `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示后台任务已停止 |
-| `resolve_manager_unknown` | `conversation_id`、`trigger`、`evidence` | 本人核对旧管理轮、子任务及原生工作后解除管理写冻结，不重做旧触发 |
+| `reconcile` | `conversation_id`、`target_node`、`check_id` | 向原目标复查一条待核对记录，只读，不重发 |
+| `resolve` | `conversation_id`、`target_node`、`check_id`、`evidence`，原生项另需 `outcome` | 本人附证据结清待核对记录，不重做原触发 |
 | `cancel_agent_task` | `conversation_id`、`task_ref` | 沿原任务向目标 Agent 请求取消，核对实际停止后回传终态 |
 | `native_interrupt` | `conversation_id`、`work_id`、`target_node` | 请求中断已登记的准确原生 turn |
 | `native_respond` | `conversation_id`、`work_id`、`target_node`、`request_id`、`response` | 本人回答该原生 turn 当前仍有效的请求 |
@@ -170,7 +171,7 @@ Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模
 
 `send_task` 在同一事务保存带稳定调用引用的签名任务及调度记录，固定原目标。恢复先用 `call_lookup` 或 `task_status` 查询原任务，不能根据同一文本猜测是否重复，也不能换目标重派。宿主 SDK 的 Shell 和原生写请求没有旧 Operation 账本，结果不明时必须核对真实副作用。
 
-`conversation.scheduler` 包含 `jobs`、`provider`、`model`、`capabilities` 和 `write_frozen`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human`、`autonomous`、`agent_task` 或 `agent_result`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
+`conversation.scheduler` 包含 `jobs`、`provider`、`model` 和 `capabilities`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state`、`pending_check` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human`、`autonomous`、`agent_task` 或 `agent_result`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
 
 `autonomy` 包含 `mode`、`version` 和 `scheduler_node`；授权链无法验证时 `mode` 为 `off`、`version` 为 `null` 并附带 `error`。`agent_tasks` 包含 `task_ref`、来源与目标 Node、`origin_trigger`、`state`、任务文本和结果说明。`native_sessions` 包含 `work_id`、可选 `task_ref`、目标 Node、准确 thread 与 turn、状态、说明和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
 
@@ -197,15 +198,26 @@ Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模
 
 入口仅写入 outbox 时，`accepted=true`、`queued=false`、`state=pending_delivery`。只有目标提交 inbox 后的匹配回执才能确认已入队，HTTP 成功或本机已保存不替代这个确认。`queued=true` 表示已经可靠接收，查询时 `state` 可能已推进至运行或终态。
 
-投递以网络、会话、trigger、原目标和版本核对回执。未确认的 outbox 先向原目标查询同一 trigger 的 `manager_status`，只有经过完整身份、版本、历史和状态校验的新鲜 `not_found` 才允许投递原 trigger。已有匹配持久 job 和回执时直接确认接单，job 为 `unknown` 也不能重派。查询失败、过期或矛盾结果不能作为不存在。发送前再次读取持久 outbox，已经确认的条目不再投递。已投递项继续向原目标查询进展和结果，不因离线或超时改派另一台。
+投递以网络、会话、trigger、原目标和版本核对回执。未确认的 outbox 先向原目标查询同一 trigger 的 `manager_status`，只有经过完整身份、版本、历史和状态校验的新鲜 `not_found` 才允许投递原 trigger。已有匹配持久 job 和回执时直接确认接单，job 为 `interrupted` 也不能重派。查询失败、过期或矛盾结果不能作为不存在。发送前再次读取持久 outbox，已经确认的条目不再投递。已投递项继续向原目标查询进展和结果，不因离线或超时改派另一台。
 
 每个会话的本机管理队列有界，最多保留 256 个待处理触发；本机每个网络的未投递 outbox 也上限为 256。单消费者按持久状态领取，本人待处理消息优先于自主后续。提示通知只负责唤醒，周期扫描补上丢失的唤醒。每轮按持久固定的依据准备上下文，后发消息不会隐式算作已处理。
 
-job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `unknown`。`queued` 和确认尚未跨启动边界的 `claimed` 可恢复首次执行。跨重启的 `running` 与 `cancelling` 进入 `unknown`，不自动重新调用 SDK。最终回答和 job 终态一次提交。导入 DAG 或重建视图不创建 job，也不重放模型、工具或执行操作。
+job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `interrupted`，后四种是终态。`queued` 和确认尚未跨启动边界的 `claimed` 可恢复首次执行。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。最终回答和 job 终态一次提交。导入 DAG 或重建视图不创建 job，也不重放模型、工具或执行操作。
 
-取消先封存旧 attempt 的工具权限并排空已接纳工具，再检查 SDK 和关联原生工作的取消证据。`cancelling` 不是停止成功，无法证明终止时进入 `unknown`。旧管理轮保持未知，工具权限隔离后可创建新的只读管理轮。`resolve_manager_unknown` 核对原 attempt 关联的任务及原生工作，仍在运行或结果未知时不解除冻结。人工结论不重跑旧 trigger，已有只读 token 不自动获得写权限。
+```text
+queued → claimed → running ─→ completed | failed
+             │        └─ cancelling ─→ cancelled（SDK 确认受管进程已退出）
+             │                     └─→ interrupted（进程退出未确认，登记待核对）
+             └ 重启时 running / cancelling ─→ interrupted（登记待核对）
+```
 
-本机版本化队列、outbox、原生 SDK 会话及观察记录不通过 DAG 迁移。维护空闲检查包含待投递、排队、活动和未知项，新进程通过更新健康门后才消费。存在新调度记录时不承诺任意降级旧程序。
+停止回复只停止管理轮。Node 封存旧 attempt 的工具权限并排空已接纳工具，SDK 确认受管进程已退出后 job 进入 `cancelled`；已发起的原生 turn 和 Agent 任务继续独立观察和汇报，停止原生 turn 用 `native_interrupt`。`cancelling` 不是停止成功。SDK 进程退出无法确认时 job 进入 `interrupted`，并在原目标登记一条 `manager:<attempt>` 待核对记录。`interrupted` 是终态，不冻结会话，后续消息照常处理。
+
+待核对记录统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `native_turn`，`freshness` 表示本机观察或缓存。管理进程记录关联该 attempt 的 SDK 进程组、它登记的原生 turn 和它发起的 Agent 任务 job；它签发的工具 token 已封存，不需再核对。`reconcile` 在原目标只读复查：管理进程项探测记录的进程组是否已退出，并列出关联原生 turn 和 Agent 任务的当前状态；原生项只读补查原 turn。管理 SDK 的文件系统只读、网络仅限本机回环；进程存活期间经回环产生的副作用无法查询，只能由本人附证据 `resolve`。管理进程项要求记录的进程组均已退出、关联原生 turn 均有终态；原生项由本人给出 `completed`、`failed` 或 `interrupted`。模型不能结清待核对，结论不重跑旧 trigger。
+
+`interrupted` 的 Agent 任务在待核对结清、关联工作结束前不回传结果，来源端 `agent_tasks` 显示 `pending_check`，不显示运行中。结清后目标端汇报实际结果或中断结果，不重发原任务。
+
+本机版本化队列、outbox、原生 SDK 会话及观察记录不通过 DAG 迁移。维护空闲检查包含待投递、排队、活动和待核对项，新进程通过更新健康门后才消费。存在新调度记录时不承诺任意降级旧程序。
 
 ## Agent 任务与原生会话
 
@@ -237,7 +249,7 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 
 原生状态为 `running`、`waiting`、`interrupting`、`completed`、`failed`、`interrupted` 或 `unknown`。只有对应 thread 和 turn 的精确事件或只读补查可确认终态。协调 SDK 一轮返回、原生 turn 结束和用户任务完成分别表达，不能互相替代。SDK 已返回而子任务或原生工作仍运行时，调度任务继续等待；工作结束后恢复同一 SDK 会话做只读收尾。
 
-取消沿原任务和原目标发送。排队任务可在启动前原子取消；运行中的任务封存旧工具权限并请求中断真实工作。`cancelling` 或 `interrupting` 仅表示请求中，不能直接回报已停止。无法证明 SDK 或后台进程停止时保留 `unknown`，不换 ID 或设备重跑。一个原生 turn 结束不能解除存在其他未知副作用的管理轮。
+取消沿原任务和原目标发送。排队任务可在启动前原子取消；运行中的任务封存旧工具权限并请求中断真实工作。`cancelling` 或 `interrupting` 仅表示请求中，不能直接回报已停止。无法证明原生 turn 停止时保留 `unknown` 并列入待核对；无法证明管理进程停止时登记管理进程待核对。都不换 ID 或设备重跑。一个原生 turn 结束不能结清管理进程待核对。
 
 本地自动访问与授权记录都使用当前数据格式。单一 `node.sqlite3` 使用 `user_version=5`，制品声明 `data_epoch=5`。Atlas HCL 为 `crates/node/schema.hcl`，`migrations/` 只保留 `202610180001_initial.sql` 和 `atlas.sum`。此版本不迁移或清理旧数据目录。
 

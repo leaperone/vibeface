@@ -2377,7 +2377,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
 
     def completed(receipt):
         job = scheduler_record(a, network, receipt["trigger"])
-        if job and job["state"] in {"failed", "unknown", "cancelled"}:
+        if job and job["state"] in {"failed", "interrupted", "cancelled"}:
             raise RuntimeError("Agent source reached " + job["state"] + ": " + job.get("detail", ""))
         return job if job and job["state"] == "completed" else None
 
@@ -2443,17 +2443,24 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     b.start()
     b.client.connect()
     b.client.authenticate()
-    unknown = wait_for("running target task recovers as Unknown", lambda:
-        row if (row := scheduler_record(b, network, task["task_ref"])) and row["state"] == "unknown" else None)
-    require(unknown["attempt"]["id"] == running["attempt"]["id"], "Unknown retains the original attempt identity")
-    require_quiet("Unknown recovery never replays or reports success", lambda:
+    unknown = wait_for("running target task recovers as Interrupted", lambda:
+        row if (row := scheduler_record(b, network, task["task_ref"])) and row["state"] == "interrupted" else None)
+    require(unknown["attempt"]["id"] == running["attempt"]["id"], "Interrupted retains the original attempt identity")
+    check_id = "manager:" + unknown["attempt"]["id"]
+    require(any(check["check_id"] == check_id and check["kind"] == "manager_process"
+                for check in b.client.rpc("conversation", conversation_id=name)["pending_checks"]),
+            "the target lists one manager process pending check for the interrupted attempt")
+    wait_for("the source sees a pending check instead of a running task", lambda: any(
+        item["task_ref"] == task["task_ref"] and item["state"] == "pending_check"
+        for item in a.client.rpc("conversation", conversation_id=name)["agent_tasks"]))
+    require_quiet("Interrupted recovery never replays or reports success", lambda:
         (directory / "count.txt").read_text() == "once" and len(invocations(run, "target-restart")) == 1
-        and (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "unknown")
+        and (scheduler_record(b, network, task["task_ref"]) or {}).get("state") == "interrupted")
     endings = [event for event in local_events(b, network, name) if event["body"].get("type") == "agent_message"
                and event["body"]["message"].get("in_reply_to") == task["task_ref"]
                and event["body"]["message"]["kind"] in {"completed", "failed", "interrupted"}]
-    require(not endings, "Unknown work cannot manufacture a terminal Agent result")
-    passed("target crash preserves the original Unknown attempt and file effect without replay or a false successful result",
+    require(not endings, "a pending check blocks any terminal Agent result")
+    passed("target crash interrupts the original attempt, registers a pending check and keeps the file effect without replay or a false result",
            task_ref=task["task_ref"], attempt_id=unknown["attempt"]["id"])
 
 def bot_checks(run, workspace, a, b, c, network, passed, outsider):
@@ -2803,7 +2810,7 @@ def phase1_acceptance(options):
 
     def completed(receipt):
         record = scheduler_record(a, network, receipt["trigger"])
-        if record and record["state"] in {"failed", "unknown", "cancelled"}:
+        if record and record["state"] in {"failed", "interrupted", "cancelled"}:
             raise RuntimeError("management job reached " + record["state"] + ": " + record.get("detail", ""))
         return record if record and record["state"] == "completed" else None
 
@@ -2931,9 +2938,20 @@ def phase1_acceptance(options):
             wait_for("controlled management call starts before cancel", lambda: calls(name))
             reply = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled["trigger"])
             require(reply.get("cancel_requested") is True, "cancel request has an explicit pending state")
-            terminal = "unknown" if unconfirmed else "cancelled"
-            wait_for("cancel reflects actual confirmation evidence", lambda: state(cancelled, terminal))
+            terminal = "interrupted" if unconfirmed else "cancelled"
+            stopped = wait_for("cancel reflects actual confirmation evidence", lambda: state(cancelled, terminal))
             require(len(calls(name)) == 1, "cancel does not restart the same management trigger")
+            checks = conversation(a.client, name)["pending_checks"]
+            require([check["check_id"] for check in checks] == (["manager:" + stopped["attempt"]["id"]] if unconfirmed else []),
+                    "only an unconfirmed process exit registers a pending check")
+            if unconfirmed:
+                reconciled = a.client.rpc("reconcile", conversation_id=name, target_node=a.peer_id, check_id=checks[0]["check_id"])
+                require(reconciled["process_groups"] and all(group["exited"] for group in reconciled["process_groups"]),
+                        "reconcile only probes the recorded manager process groups")
+                a.client.rpc("resolve", conversation_id=name, target_node=a.peer_id, check_id=checks[0]["check_id"],
+                             evidence="Owned fixture sidecar exited; it started no tools or native turns.")
+                require(not conversation(a.client, name)["pending_checks"] and state(cancelled, "interrupted"),
+                        "resolve clears the check without changing or replaying the interrupted job")
             passed("management cancellation becomes " + terminal + " according to controlled evidence",
                    trigger=cancelled["trigger"], evidence_kind="controlled sidecar protocol only")
 
@@ -2947,17 +2965,14 @@ def phase1_acceptance(options):
         stop_managers()
         a.start()
         reconnect(a)
-        unknown = wait_for("restarted running attempt stays unknown", lambda: state(interrupted, "unknown"))
+        stopped = wait_for("restarted running attempt becomes interrupted", lambda: state(interrupted, "interrupted"))
         wait_for("queued trigger performs its first call after restart", lambda: completed(queued))
-        require(unknown["attempt"]["id"] == old_attempt and len(calls(name, label="restart-running")) == 1
+        require(stopped["attempt"]["id"] == old_attempt and len(calls(name, label="restart-running")) == 1
                 and len(calls(name, label="restart-queued")) == 1, "recovery preserves original attempt and never replays running work")
-        require(calls(name, label="restart-queued")[0]["read_only"]
-                and conversation(a.client, name)["scheduler"]["write_frozen"], "unknown recovery stays server-enforced read-only")
-        readonly, _ = send(a.client, name, "unknown-readonly", tools=[{
-            "name": "send_task", "arguments": {"target_node": b.peer_id,
-                "text": "forbidden restart work"}, "accepted": False}])
-        wait_for("new read-only recovery conversation remains usable", lambda: completed(readonly))
-        require(not (workspace / "forbidden-restart").exists(), "read-only recovery cannot create business work")
+        check_id = "manager:" + old_attempt
+        require(not calls(name, label="restart-queued")[0]["read_only"]
+                and [check["check_id"] for check in conversation(a.client, name)["pending_checks"]] == [check_id],
+                "an interrupted attempt registers one pending check without freezing later work")
 
         def cached_remote_session():
             with sqlite3.connect(f"file:{c.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
@@ -2966,40 +2981,42 @@ def phase1_acceptance(options):
             return next((session for session in sessions if any(job.get("trigger") == interrupted["trigger"]
                          for job in session.get("jobs", []))), None)
 
-        def remote_frozen(expected):
+        def remote_pending(expected):
             snapshot = conversation(c.client, name)
             cached = cached_remote_session()
-            unknown = next((job for job in snapshot["scheduler"]["jobs"] if job["trigger"] == interrupted["trigger"]), None)
-            return cached if (cached and cached["write_frozen"] is expected
-                and snapshot["scheduler"]["write_frozen"] is expected and unknown and unknown["state"] == "unknown") else None
+            job = next((job for job in snapshot["scheduler"]["jobs"] if job["trigger"] == interrupted["trigger"]), None)
+            listed = [check["check_id"] for check in snapshot["pending_checks"]]
+            return cached if (cached and [check["check_id"] for check in cached["pending_checks"]] == ([check_id] if expected else [])
+                and listed == ([check_id] if expected else []) and job and job["state"] == "interrupted"
+                and job.get("pending_check") is expected) else None
 
-        cached_frozen = wait_for("C caches the original remote Unknown as write frozen", lambda: remote_frozen(True))
+        cached_pending = wait_for("C caches the original remote pending check", lambda: remote_pending(True))
         c.stop()
-        require(cached_remote_session()["write_frozen"], "remote frozen status is persisted before C restarts")
+        require(cached_remote_session()["pending_checks"], "remote pending check is persisted before C restarts")
         c.start()
         reconnect(c)
-        wait_for("restarted C restores the same remote frozen status", lambda: remote_frozen(True))
-        a.client.rpc("resolve_manager_unknown", conversation_id=name, trigger=interrupted["trigger"],
+        wait_for("restarted C restores the same remote pending check", lambda: remote_pending(True))
+        reconciled = a.client.rpc("reconcile", conversation_id=name, target_node=a.peer_id, check_id=check_id)
+        require(reconciled["process_groups"] and all(group["exited"] for group in reconciled["process_groups"])
+                and not reconciled["native_sessions"] and not reconciled["agent_tasks"],
+                "reconcile reports the recorded process groups and linked work of the original attempt")
+        a.client.rpc("resolve", conversation_id=name, target_node=a.peer_id, check_id=check_id,
                      evidence="Owned fixture process terminated; original attempt admitted no business operations.")
-        cached_resolved = wait_for("remote reconciliation releases C's cached freeze without a new job", lambda: remote_frozen(False))
-        require(cached_resolved["status_revision"] > cached_frozen["status_revision"],
-                "remote permission changes advance the original target's observed status revision")
+        cached_resolved = wait_for("resolution clears C's cached pending check without a new job", lambda: remote_pending(False))
+        require(cached_resolved["status_revision"] > cached_pending["status_revision"],
+                "resolution advances the original target's observed status revision")
         c.stop()
-        require(cached_remote_session()["write_frozen"] is False, "remote freeze release persists before C restarts")
+        require(not cached_remote_session()["pending_checks"], "resolved remote check persists before C restarts")
         c.start()
         reconnect(c)
-        wait_for("restarted C keeps reconciled remote history writable", lambda: remote_frozen(False))
-        writable, _ = send(a.client, name, "after-human-reconcile",
-                           host_command="printf allowed > after-reconcile", host_cwd=str(workspace))
-        wait_for("new human round receives normal authority only after reconciliation", lambda: completed(writable))
-        require((workspace / "after-reconcile").read_text() == "allowed" and not conversation(a.client, name)["scheduler"]["write_frozen"]
-                and state(interrupted, "unknown") and len(calls(name, label="restart-running")) == 1,
-                "reconciliation restores future writes without changing or replaying the original Unknown")
-        passed("restart preserves Unknown, enforces read-only recovery and restores only future writes after human reconciliation",
+        wait_for("restarted C keeps the resolved remote history", lambda: remote_pending(False))
+        require(state(interrupted, "interrupted") and len(calls(name, label="restart-running")) == 1,
+                "resolution neither changes nor replays the original interrupted job")
+        passed("restart interrupts the running attempt, registers one pending check and never replays it",
                attempt_id=old_attempt)
-        passed("cached remote Unknown survives C restart, then reconciliation releases and persists the freeze without replay",
-               attempt_id=old_attempt, frozen_revision=cached_frozen["status_revision"],
-               reconciled_revision=cached_resolved["status_revision"])
+        passed("cached remote pending check survives C restart, then resolution clears and persists without replay",
+               attempt_id=old_attempt, pending_revision=cached_pending["status_revision"],
+               resolved_revision=cached_resolved["status_revision"])
 
         name = new_conversation("phase1-remote-ack")
         wait_for("remote source knows conversation", lambda: conversation(c.client, name))
@@ -6033,15 +6050,16 @@ def auto_route_acceptance(options):
         snapshot = browser.rpc("conversation", conversation_id=conversation)
         message = next(row for row in snapshot["messages"] if row["message_id"] == original["message_id"])
         job = next(row for row in snapshot["scheduler"]["jobs"] if row["trigger"] == trigger)
-        require(message["event_hash"] == trigger and job["state"] == "unknown"
-                and job["attempt"]["id"] == attempt_id and snapshot["scheduler"]["write_frozen"],
-                "reconnected reads retain the original unknown write and frozen attempt")
+        require(message["event_hash"] == trigger and job["state"] == "interrupted"
+                and job["attempt"]["id"] == attempt_id and job["pending_check"]
+                and any(check["check_id"] == "manager:" + attempt_id for check in snapshot["pending_checks"]),
+                "reconnected reads retain the original interrupted write and its pending check")
         require(marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1
                 and not any(item.get("rpc_method") == "message" for item in browser.command("route_stats")["calls"]),
                 "changed path restores reads without replaying the original write")
         duplicate = browser.rpc("message", **original)
-        require(duplicate["trigger"] == trigger and duplicate["state"] == "unknown",
-                "an explicit same-ID retry returns the original unknown job")
+        require(duplicate["trigger"] == trigger and duplicate["state"] == "interrupted",
+                "an explicit same-ID retry returns the original interrupted job")
         require_quiet("a same-ID retry never repeats the original host write", lambda:
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         passed("uncertain-write-and-path-change", message_id=original["message_id"], trigger=trigger,

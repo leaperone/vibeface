@@ -11,7 +11,7 @@ import { ActionButton } from '@/features/workspace/present'
 import { Chat } from './elements/chat'
 import { PromptInput } from './elements/prompt-input'
 import { canSend, composerHint } from './protocol'
-import { AgentTaskActivity, NativeSessionActivity } from '@/features/workspace/task-activity'
+import { AgentTaskActivity, NativeSessionActivity, PendingCheckItem } from '@/features/workspace/task-activity'
 import { stateLabel } from '@/features/workspace/labels'
 import type { AutonomyMode } from '@/features/workspace/types'
 import { ManagerStatus, managerTraceStatus, managerTraceTitle } from './elements/manager-status'
@@ -25,9 +25,10 @@ export function ConversationScreen() {
   const text = drafts.get(conversationId) ?? ''
   const originalEntry = !messagePending || messagePending.entry_node === workspace.info.peer_id
   const jobs = data?.scheduler?.jobs ?? []
-  const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
+  const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling'].includes(job.state))
+  const pendingChecks = data?.pending_checks ?? []
   const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)
-  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'unknown', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0 }))
+  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'interrupted', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0 }))
   const messages = [...(data?.messages ?? []), ...liveMessages]
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const sendDisabled = !workspace.writable || !workspace.selectedBot || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
@@ -37,9 +38,9 @@ export function ConversationScreen() {
     ? [{ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0 }]
     : []
   const shown = [...messages, ...pendingShown]
-  const needsCheck = Boolean(messagePending && !messageBusy && !assistantBusy) || Boolean(data?.scheduler?.write_frozen) || data?.agent_tasks.some((item) => item.state === 'unknown') || data?.native_sessions.some((item) => item.state === 'unknown')
-  const hint = !workspace.connectionOnline ? '连接中断，稍等。' : needsCheck && messagePending ? (originalEntry ? '上一条还没发出。' : '请回到原来的入口。') : workspace.writeNotice || (!workspace.selectedBot ? '' : composerHint(gate)) || (data?.scheduler?.write_frozen ? '先核对上一条。' : '')
-  const hasDetails = Boolean(data && (visibleJobs.length > 0 || data.agent_tasks.length > 0 || data.native_sessions.length > 0 || messagePending))
+  const needsCheck = Boolean(messagePending && !messageBusy && !assistantBusy) || pendingChecks.length > 0 || data?.agent_tasks.some((item) => item.state === 'pending_check')
+  const hint = !workspace.connectionOnline ? '连接中断，稍等。' : needsCheck && messagePending ? (originalEntry ? '上一条还没发出。' : '请回到原来的入口。') : workspace.writeNotice || (!workspace.selectedBot ? '' : composerHint(gate)) || (pendingChecks.length ? '有待核对的工作。' : '')
+  const hasDetails = Boolean(data && (visibleJobs.length > 0 || pendingChecks.length > 0 || data.agent_tasks.length > 0 || data.native_sessions.length > 0 || messagePending))
   const reasoning = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   const awaitingDecision = data?.native_sessions.some((session) => session.pending_requests.length > 0)
   const workRunning = data?.agent_tasks.some((task) => ['pending_delivery', 'queued', 'claimed', 'accepted', 'running', 'cancelling'].includes(task.state)) || data?.native_sessions.some((session) => ['running', 'waiting', 'interrupting'].includes(session.state))
@@ -100,10 +101,11 @@ export function ConversationScreen() {
                 <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>解除</ActionButton>
               </div> : null}
               <Trace>
+                {pendingChecks.map((check) => <Task key={`${check.target_node}:${check.check_id}`} title="待核对" status="pending"><PendingCheckItem check={check} /></Task>)}
                 {visibleJobs.map((job) => <Tool key={job.trigger} title={managerTraceTitle(job)} status={managerTraceStatus(job.state)}>
                   <ManagerStatus job={job} progress={workspace.liveProgress.find((item) => item.kind === 'manager' && item.trigger === job.trigger)?.status} hasLiveProgress={workspace.liveProgress.some((item) => item.kind === 'manager' && item.trigger === job.trigger)} />
                 </Tool>)}
-                {data?.agent_tasks.map((task) => <Task key={task.task_ref} title={`Agent 任务 · ${stateLabel(task.state)}`} status={task.state === 'failed' ? 'error' : task.state === 'unknown' ? 'pending' : ['completed', 'interrupted', 'cancelled'].includes(task.state) ? undefined : 'running'}>
+                {data?.agent_tasks.map((task) => <Task key={task.task_ref} title={`Agent 任务 · ${stateLabel(task.state)}`} status={task.state === 'failed' ? 'error' : task.state === 'pending_check' ? 'pending' : ['completed', 'interrupted', 'cancelled'].includes(task.state) ? undefined : 'running'}>
                   <AgentTaskActivity task={task} sessions={data.native_sessions.filter((session) => session.task_ref === task.task_ref)} />
                 </Task>)}
                 {data?.native_sessions.filter((session) => !session.task_ref || !data.agent_tasks.some((task) => task.task_ref === session.task_ref)).map((session) => <Task key={`${session.target_node}:${session.work_id}`} title={`原生工作 · ${stateLabel(session.state)}`} status={session.state === 'failed' ? 'error' : session.state === 'unknown' || session.state === 'waiting' ? 'pending' : ['running', 'interrupting'].includes(session.state) ? 'running' : undefined}>

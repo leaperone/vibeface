@@ -23,7 +23,7 @@ const CONSTRAINTS: &[&str] = &[
     "Operate only inside this personal network and conversation.",
     "Your SDK host Shell and file tools can read this device but not change it. Change code on this device through native Codex work started with the codex tool. Use send_task to ask another Node's Agent to work on its own host.",
     "After starting native Codex work, immediately register its exact thread_id and turn_id with observe_session before returning.",
-    "An SDK reply is not completion of background work. Unknown outcomes require reconciliation of the original task or turn, never a new write attempt.",
+    "An SDK reply is not completion of background work. Interrupted work awaits the user's reconciliation of the original task or turn, never a new write attempt.",
     "Use device names from nodes when talking about devices; Peer IDs belong in details.",
     "Never approve a native request, grant authority or accept a deliverable for the human.",
 ];
@@ -47,7 +47,7 @@ fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
         Value::Null
     };
     value["error"] = match &job.state {
-        JobState::Failed { detail, .. } | JobState::Unknown { detail, .. } => json!(detail),
+        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => json!(detail),
         _ => Value::Null,
     };
     value["result"] = if matches!(job.state, JobState::Completed { .. }) {
@@ -102,6 +102,10 @@ pub async fn run(
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
     let manager_settings = serde_json::to_value(&settings)?;
+    // Claiming before the tool listener exists would turn a startup race into a failed job.
+    node.tool_url
+        .get()
+        .context("local tool listener is not ready")?;
     let network = access.network_id.clone();
     let target = node.identity.peer_id()?;
     let claimed = {
@@ -134,6 +138,7 @@ pub async fn run(
     let mut started = false;
     let mut tools_fenced = false;
     let mut registered = false;
+    let mut sdk_live = false;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
         let (context, facts, targets) = {
             let store = node.store.lock().await;
@@ -160,6 +165,7 @@ pub async fn run(
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()), ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
                 ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()), ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
             ]),
+            process_started: Some(process_recorder(&node, &network, &attempt.id)),
         };
         if matches!(job.kind, TriggerKind::Autonomous | TriggerKind::AgentResult) {
             node.store.lock().await.reserve_budget(&network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
@@ -180,6 +186,7 @@ pub async fn run(
         let progress_sequence = std::sync::atomic::AtomicU64::new(0);
         node.store.lock().await.mark_started(&network, &conversation, &target, &trigger, &attempt.id)?;
         started = true;
+        sdk_live = true;
         let mut result = manager::run_manager(&config, &prompt, claimed.previous_native_id.as_deref(), move |id| async move {
             persist_node.store.lock().await.save_scheduler_native_id(&persist_network, &persist_conversation, &persist_target, &persist_trigger, &persist_attempt, &id)
         }, cancel.clone(), move |progress| {
@@ -190,17 +197,27 @@ pub async fn run(
             }));
             async { Ok(()) }
         }).await?;
+        sdk_live = false;
         node.seal_manager_tools(&attempt.id).await?;
         tools_fenced = true;
         node.store.lock().await.local_set(&network, &format!("sdk-returned:v1:{}",attempt.id),
             &json!({"sdk_returned":true,"output":result.output,"session_id":result.session_id,"manager":manager_settings,"finalization_started":false}))?;
-        let works = node.wait_native_work(&network,&conversation,&trigger,&attempt.id).await?;
+        let mut stop = cancel.clone();
+        let works = tokio::select! {
+            works = node.wait_native_work(&network,&conversation,&trigger,&attempt.id) => works?,
+            _ = vibeface_bridge::agent::wait_for_cancel(&mut stop) => return Err(ManagerError {
+                kind: manager::ManagerFailure::Cancelled, session_id: result.session_id.clone(),
+                message: "reply stopped; native turns and Agent tasks stay independently tracked".into(),
+            }.into()),
+        };
         let children = if job.kind == TriggerKind::AgentTask { node.child_agent_tasks(&network,&conversation,&trigger).await? } else { Vec::new() };
         let terminal = coordinated_outcome(&works,&children);
         if !works.is_empty() || !children.is_empty() {
             mark_finalization_started(&node,&network,&attempt.id).await?;
+            sdk_live = true;
             result = summarize_work(&node,&config,&network,&conversation,&trigger,&attempt.id,
                 result.session_id.as_deref(), &works, &children, cancel).await?;
+            sdk_live = false;
         }
 
         let mut blobs = Vec::new();
@@ -241,10 +258,10 @@ pub async fn run(
             let cancellation = error
                 .downcast_ref::<ManagerError>()
                 .is_some_and(|e| e.cancelled());
-            let uncertain = error
-                .downcast_ref::<ManagerError>()
-                .map(|e| e.uncertain())
-                .unwrap_or(started);
+            let uncertain = sdk_live
+                && error
+                    .downcast_ref::<ManagerError>()
+                    .is_none_or(|e| e.uncertain());
             if !registered {
                 tools_fenced = true;
             }
@@ -270,26 +287,33 @@ pub async fn run(
             };
             let work_confirmed = !matches!(
                 coordinated_outcome(&native, &children),
-                JobOutcome::Unknown(_)
+                JobOutcome::Interrupted { .. }
             );
-            let terminal =
-                if (cancellation || cancelled_before_start) && tools_fenced && work_confirmed {
-                    JobOutcome::Cancelled(
-                        if cancelled_before_start {
-                            "cancelled before the SDK start boundary"
-                        } else {
-                            "SDK confirmed cancellation; Node tools are fenced"
-                        }
-                        .into(),
-                    )
-                } else if uncertain || !tools_fenced || !work_confirmed {
-                    JobOutcome::Unknown(error.to_string())
-                } else {
-                    JobOutcome::Failed(error.to_string())
-                };
+            // Stopping a reply ends only the management turn; native turns and Agent tasks keep their own tracking.
+            let terminal = if (cancellation || cancelled_before_start) && tools_fenced {
+                JobOutcome::Cancelled(
+                    if cancelled_before_start {
+                        "cancelled before the SDK start boundary"
+                    } else {
+                        "SDK confirmed cancellation; Node tools are fenced"
+                    }
+                    .into(),
+                )
+            } else if uncertain || !tools_fenced || !work_confirmed {
+                JobOutcome::Interrupted {
+                    detail: error.to_string(),
+                    process_unconfirmed: uncertain || !tools_fenced,
+                }
+            } else {
+                JobOutcome::Failed(error.to_string())
+            };
             let text = match terminal {
-                JobOutcome::Unknown(_) => {
-                    "管理调用的结果未知。系统已保留原调用，不会重发；请核对执行状态。"
+                JobOutcome::Interrupted {
+                    process_unconfirmed: true,
+                    ..
+                } => "管理调用已中断，不会重发。请在待核对中确认它启动的工作已停止。",
+                JobOutcome::Interrupted { .. } => {
+                    "管理调用已中断，不会重发。后台工作结束后再汇报结果。"
                 }
                 JobOutcome::Cancelled(_) => "当前回复已停止，已派发的后台任务继续单独跟踪。",
                 _ => "管理调用失败，可检查本机 SDK 配置或自主调用额度。",
@@ -312,15 +336,6 @@ pub async fn run(
                 )],
                 crate::runtime::now_ms(),
             )?;
-            if tools_fenced && matches!(job.state, JobState::Unknown { .. }) {
-                node.store.lock().await.fence_manager_unknown(
-                    &network,
-                    &conversation,
-                    &target,
-                    &trigger,
-                    &attempt.id,
-                )?;
-            }
             return Ok(invocation_value(&job, &network));
         }
         outcome
@@ -331,6 +346,27 @@ pub async fn run(
         publish_job(&node, &network, &conversation, &job);
     }
     final_result
+}
+
+fn process_recorder(
+    node: &Arc<Runtime>,
+    network: &str,
+    attempt: &str,
+) -> vibeface_bridge::agent::ProcessStarted {
+    let node = node.clone();
+    let network = network.to_owned();
+    let attempt = attempt.to_owned();
+    Arc::new(move |group| {
+        let node = node.clone();
+        let network = network.clone();
+        let attempt = attempt.clone();
+        Box::pin(async move {
+            node.store
+                .lock()
+                .await
+                .record_manager_process(&network, &attempt, group)
+        })
+    })
 }
 
 fn publish_job(node: &Runtime, network: &str, conversation: &str, job: &SchedulerJob) {
@@ -609,12 +645,17 @@ fn coordinated_outcome(
             Some("completed" | "failed" | "interrupted" | "cancelled")
         )
     }) {
-        return JobOutcome::Unknown(
-            "a delegated Agent task has no confirmed terminal result".into(),
-        );
+        return JobOutcome::Interrupted {
+            detail: "a delegated Agent task has no confirmed terminal result".into(),
+            process_unconfirmed: false,
+        };
     }
-    let native = crate::runtime::native_observation::outcome(works)
-        .unwrap_or_else(|| JobOutcome::Unknown("native work has no confirmed outcome".into()));
+    let native = crate::runtime::native_observation::outcome(works).unwrap_or_else(|| {
+        JobOutcome::Interrupted {
+            detail: "native work has no confirmed outcome".into(),
+            process_unconfirmed: false,
+        }
+    });
     if !matches!(native, JobOutcome::Completed) {
         return native;
     }
@@ -689,12 +730,14 @@ fn recovery_settings(
     }
 }
 
-pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
+/// Interrupted jobs report only after nothing they started awaits reconciliation; nothing is replayed.
+pub(crate) async fn settle_interrupted_jobs(node: Arc<Runtime>) -> Result<()> {
     let local_settings = node.settings_snapshot();
     let target = node.identity.peer_id()?;
     let networks = node.store.lock().await.networks()?;
     for network in networks {
         let scopes = node.store.lock().await.scopes(&network)?;
+        let pending = node.store.lock().await.pending_checks(&network)?;
         for scope in scopes {
             let jobs = node
                 .store
@@ -702,24 +745,15 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 .await
                 .scheduler_jobs(&network, &scope, &target)?;
             for job in jobs {
-                let JobState::Unknown {
-                    attempt,
-                    fenced: true,
-                    ..
-                } = &job.state
-                else {
+                let JobState::Interrupted { attempt, .. } = &job.state else {
                     continue;
                 };
-                let marker = node
-                    .store
-                    .lock()
-                    .await
-                    .local_value(&network, &format!("sdk-returned:v1:{}", attempt.id))?;
-                let Some(marker) = marker.filter(|marker| {
-                    marker["sdk_returned"] == true && marker["finalization_started"] == false
-                }) else {
+                if pending
+                    .iter()
+                    .any(|check| check.conversation_id == scope && check.trigger == job.trigger)
+                {
                     continue;
-                };
+                }
                 let works = node
                     .native_work_for_attempt(&network, &scope, &job.trigger, &attempt.id)
                     .await?;
@@ -729,26 +763,52 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 } else {
                     Vec::new()
                 };
-                if works.is_empty() && children.is_empty() {
-                    continue;
-                }
                 let outcome = coordinated_outcome(&works, &children);
-                if matches!(outcome, JobOutcome::Unknown(_)) {
+                if matches!(outcome, JobOutcome::Interrupted { .. }) {
                     continue;
                 }
-                let Some(session) = marker["session_id"].as_str() else {
-                    continue;
+                let marker = node
+                    .store
+                    .lock()
+                    .await
+                    .local_value(&network, &format!("sdk-returned:v1:{}", attempt.id))?
+                    .filter(|marker| {
+                        marker["sdk_returned"] == true && marker["finalization_started"] == false
+                    });
+                let session = marker
+                    .as_ref()
+                    .and_then(|marker| marker["session_id"].as_str().map(str::to_owned));
+                let settings = match &marker {
+                    Some(marker) => recovery_settings(marker, local_settings.manager.as_ref())?,
+                    None => None,
                 };
-                let Some(settings) = recovery_settings(&marker, local_settings.manager.as_ref())?
-                else {
+                let kind =
+                    settings
+                        .as_ref()
+                        .and_then(|settings| match settings.provider.as_str() {
+                            "codex_sdk" => Some(ManagerKind::CodexSdk),
+                            "cursor_sdk" => Some(ManagerKind::CursorSdk),
+                            _ => None,
+                        });
+                let (Some(session), Some(settings), Some(kind), false) = (
+                    session,
+                    settings,
+                    kind,
+                    works.is_empty() && children.is_empty(),
+                ) else {
+                    let published = node.store.lock().await.publish_interrupted_task_result(
+                        &node.identity,
+                        &network,
+                        &job,
+                        crate::runtime::now_ms(),
+                    )?;
+                    if published.is_some() {
+                        publish_job(&node, &network, &scope, &job);
+                    }
                     continue;
                 };
                 let config = ManagerConfig {
-                    kind: match settings.provider.as_str() {
-                        "codex_sdk" => ManagerKind::CodexSdk,
-                        "cursor_sdk" => ManagerKind::CursorSdk,
-                        _ => continue,
-                    },
+                    kind,
                     workspace: settings.workspace.clone(),
                     model: settings.model.clone(),
                     read_only: true,
@@ -759,41 +819,66 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                     codex_sdk_script: settings.codex_sdk_script.clone(),
                     ..ManagerConfig::default()
                 };
+                if !node.store.lock().await.reopen_interrupted_job(
+                    &network,
+                    &scope,
+                    &target,
+                    &job.trigger,
+                    &attempt.id,
+                )? {
+                    continue;
+                }
                 mark_finalization_started(&node, &network, &attempt.id).await?;
                 let (_cancel, receiver) = tokio::sync::watch::channel(false);
-                let result = summarize_work(
+                let summary = summarize_work(
                     &node,
                     &config,
                     &network,
                     &scope,
                     &job.trigger,
                     &attempt.id,
-                    Some(session),
+                    Some(&session),
                     &works,
                     &children,
                     receiver,
                 )
-                .await?;
-                let publication = node.store.lock().await.reconcile_native_job(
+                .await;
+                let (terminal, events) = match summary {
+                    Ok(result) => (
+                        outcome,
+                        vec![(
+                            EventBody::MessagePosted {
+                                message_id: job.message_id.clone(),
+                                role: "assistant".into(),
+                                text: result.output,
+                                scheduler_node: None,
+                            },
+                            vec![],
+                        )],
+                    ),
+                    // The summarizer is read-only, but an unconfirmed exit still becomes a pending check.
+                    Err(error) => (
+                        JobOutcome::Interrupted {
+                            detail: error.to_string(),
+                            process_unconfirmed: error
+                                .downcast_ref::<ManagerError>()
+                                .is_none_or(|e| e.uncertain()),
+                        },
+                        vec![],
+                    ),
+                };
+                let finished = node.store.lock().await.finish_job(
                     &node.identity,
                     &network,
                     &scope,
                     &target,
                     &job.trigger,
                     &attempt.id,
-                    outcome,
-                    vec![(
-                        EventBody::MessagePosted {
-                            message_id: job.message_id.clone(),
-                            role: "assistant".into(),
-                            text: result.output,
-                            scheduler_node: None,
-                        },
-                        vec![],
-                    )],
+                    terminal,
+                    events,
                     crate::runtime::now_ms(),
                 )?;
-                publish_job(&node, &network, &scope, &publication.job);
+                publish_job(&node, &network, &scope, &finished);
             }
         }
     }
@@ -847,10 +932,10 @@ mod tests {
             detail: "native failed after writing its report".into(),
             sequence: 3,
         };
-        for state in ["pending_delivery", "queued", "running", "unknown"] {
+        for state in ["pending_delivery", "queued", "running", "pending_check"] {
             assert!(matches!(
                 coordinated_outcome(std::slice::from_ref(&failed), &[json!({"state":state})]),
-                JobOutcome::Unknown(_)
+                JobOutcome::Interrupted { .. }
             ));
         }
         let JobOutcome::Failed(detail) =

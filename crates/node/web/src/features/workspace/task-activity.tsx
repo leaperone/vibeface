@@ -8,19 +8,19 @@ import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
 import { ActionButton, StatusBadge, SubmitButton } from "./present"
-import type { AgentTaskRecord, HumanRequest, NativeSessionRecord } from "./types"
+import type { AgentTaskRecord, HumanRequest, NativeSessionRecord, PendingCheck } from "./types"
 
 export function AgentTaskActivity({ task, sessions }: { task: AgentTaskRecord; sessions: NativeSessionRecord[] }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const lookup = { nodes: workspace.nodes, directory }
-  const canCancel = ["pending_delivery", "queued", "claimed", "accepted", "running", "unknown"].includes(task.state)
+  const canCancel = ["pending_delivery", "queued", "claimed", "accepted", "running"].includes(task.state)
   const canCancelHere = ready?.entry.peer_id === task.source_node || ready?.entry.peer_id === task.target_node
   return <section className="grid min-w-0 gap-3" aria-label="Agent 任务">
     <div className="flex flex-wrap items-center gap-2"><StatusBadge value={task.state} /><span className="text-xs text-muted-foreground">由 {nodeName(task.source_node, lookup)} 交给 {nodeName(task.target_node, lookup)}</span></div>
     <p className="whitespace-pre-wrap break-words text-sm">{task.text}</p>
     {task.detail && task.detail !== task.text ? <p className="whitespace-pre-wrap break-words text-sm">{task.detail}</p> : null}
-    {task.state === "unknown" ? <p role="status" className="text-sm">结果未知。请核对原任务和外部结果，避免重复派发。</p> : null}
+    {task.state === "pending_check" ? <p role="status" className="text-sm">原任务已中断，目标设备结清后再汇报，不会重派。</p> : null}
     {canCancel ? <div><ActionButton className="min-h-11" variant="destructive" disabled={!workspace.writable || !workspace.selectedBot || !canCancelHere} action={async () => { if (canCancelHere) await workspace.run(() => workspace.cancelAgentTask(task.task_ref)) }}>请求取消任务</ActionButton></div> : null}
     {canCancel && !canCancelHere ? <p className="text-sm text-muted-foreground">请连接任务来源或目标设备后取消任务。</p> : null}
     {sessions.map((session) => <NativeSessionActivity key={`${session.target_node}:${session.work_id}`} session={session} />)}
@@ -42,7 +42,7 @@ export function NativeSessionActivity({ session, compact = false }: { session: N
     {progress?.status ? <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{progress.status}</p> : null}
     {progress?.text ? <p className="whitespace-pre-wrap break-words text-sm">{progress.text}</p> : null}
     {session.detail && session.detail !== progress?.text ? <p className="whitespace-pre-wrap break-words text-sm">{session.detail}</p> : null}
-    {session.state === "unknown" ? <p role="status" className="text-sm">结果未知。请核对原生进程和外部结果，不会自动重跑。</p> : null}
+    {session.state === "unknown" ? <p role="status" className="text-sm">结果未知，已列入待核对，不会自动重跑。</p> : null}
     {!targetOnline ? <p role="status" className="text-sm text-muted-foreground">设备恢复连接后可核对最新进展。</p> : null}
     {active && !session.turn_id ? <p className="text-sm text-muted-foreground">尚未关联当前轮次，暂不能停止。</p> : null}
     <div className="flex flex-wrap gap-2">
@@ -113,4 +113,47 @@ export function NativeApproval({ session, request, disabled }: { session: Native
       ) : <p className="text-sm text-muted-foreground">{questions.some((question) => question.is_secret) ? '此请求包含敏感输入，请在工作设备填写。' : '此请求暂无可用的回复选项，请到工作设备人工核对。'}</p>}
     </section>
   )
+}
+
+function reconcileSummary(result: Record<string, unknown>): string {
+  if (result.pending === false) return "原生工作已有最终结果。"
+  const groups = Array.isArray(result.process_groups) ? result.process_groups as { process_group: number; exited: boolean }[] : []
+  const running = groups.filter((group) => !group.exited).map((group) => group.process_group)
+  if (!groups.length) return "原生工作仍无法确认结果。"
+  return running.length ? `进程组 ${running.join("、")} 仍在运行或无法检查。` : "记录的进程组均已退出；脱离的工具和外部副作用仍需本人核对。"
+}
+
+export function PendingCheckItem({ check }: { check: PendingCheck }) {
+  const workspace = useWorkspace()
+  const { directory } = useDevice()
+  const fieldId = useId()
+  const [busy, setBusy] = useState(false)
+  const [summary, setSummary] = useState("")
+  const disabled = !workspace.writable || !workspace.selectedBot
+  return <section className="grid min-w-0 gap-3 rounded-lg border p-3" aria-label="待核对">
+    <div className="flex flex-wrap items-center gap-2"><StatusBadge value="pending" label={check.kind === "native_turn" ? "原生工作待核对" : "管理进程待核对"} /><span className="text-xs text-muted-foreground">{nodeName(check.target_node, { nodes: workspace.nodes, directory })}{check.freshness === "cached" ? " · 上次记录" : ""}</span></div>
+    {check.detail ? <p className="whitespace-pre-wrap break-words text-sm">{check.detail}</p> : null}
+    <p className="text-sm text-muted-foreground">{check.kind === "native_turn" ? "复查只读取原轮次。查不到时，请本人确认实际结果。" : "复查只确认进程是否退出。进程运行期间的副作用需本人核对后提交证据。"}</p>
+    {summary ? <p role="status" className="text-sm">{summary}</p> : null}
+    <div><ActionButton className="min-h-11" disabled={disabled} action={() => workspace.run(async () => { setSummary(reconcileSummary(await workspace.reconcileCheck(check))) })}>复查原目标</ActionButton></div>
+    <form className="space-y-3" onSubmit={(event) => {
+      event.preventDefault()
+      const form = event.currentTarget
+      if (!form.reportValidity()) return
+      const data = new FormData(form)
+      setBusy(true)
+      void workspace.run(() => workspace.resolveCheck(check, String(data.get("evidence") ?? ""), check.kind === "native_turn" ? String(data.get("outcome") ?? "") : undefined)).finally(() => setBusy(false))
+    }}>
+      <FieldGroup>
+        {check.kind === "native_turn" ? <Field><FieldLabel htmlFor={`${fieldId}-outcome`}>实际结果</FieldLabel><NativeSelect id={`${fieldId}-outcome`} name="outcome" required defaultValue="" disabled={disabled}>
+          <NativeSelectOption value="" disabled>请选择</NativeSelectOption>
+          <NativeSelectOption value="completed">已完成</NativeSelectOption>
+          <NativeSelectOption value="failed">已失败</NativeSelectOption>
+          <NativeSelectOption value="interrupted">已停止</NativeSelectOption>
+        </NativeSelect></Field> : null}
+        <Field><FieldLabel htmlFor={`${fieldId}-evidence`}>本人核查证据</FieldLabel><Textarea id={`${fieldId}-evidence`} name="evidence" rows={3} required minLength={6} disabled={disabled} /></Field>
+      </FieldGroup>
+      <SubmitButton busy={busy} disabled={disabled}>确认已核对</SubmitButton>
+    </form>
+  </section>
 }

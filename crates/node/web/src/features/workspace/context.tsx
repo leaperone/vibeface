@@ -15,7 +15,7 @@ import {
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AutonomyMode, ConversationPayload, NodeInfo, NotificationRecord,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck,
 } from "./types"
 
 function useWorkspaceState(connection: ReadyConnection) {
@@ -105,7 +105,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     setLiveProgress((previous) => previous.filter((progress) => {
       if (progress.kind === "native") return next.native_sessions.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.thread_id === progress.thread_id && item.turn_id === (progress.turn_id ?? null))
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
-      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "unknown", "rejected"].includes(job.state)
+      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
     if (current() && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
@@ -425,11 +425,20 @@ function useWorkspaceState(connection: ReadyConnection) {
       setNoticeText("本人决定已提交，请查看原生工作的最新状态。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    resolveManagerUnknown: (trigger: string, evidence: string) => withMutation(`resolve-manager:${trigger}`, async () => {
+    reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.target_node}:${check.check_id}`, async () => {
+      const id = activeId.current
+      requireBotContext(id)
+      const result = record(await connection.rpc("reconcile", { conversation_id: id, target_node: check.target_node, check_id: check.check_id }))
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+      return result
+    }),
+    resolveCheck: (check: PendingCheck, evidence: string, outcome?: string) => withMutation(`pending-check:${check.target_node}:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
       if (new TextEncoder().encode(evidence.trim()).length < 12) throw new Error("请填写至少 12 字节的本人核查证据。")
-      await connection.rpc("resolve_manager_unknown", { conversation_id: id, trigger, evidence: evidence.trim() })
+      if (check.kind === "native_turn" && !outcome) throw new Error("请选择原生工作的实际结果。")
+      await connection.rpc("resolve", { conversation_id: id, target_node: check.target_node, check_id: check.check_id, evidence: evidence.trim(), ...(outcome ? { outcome } : {}) })
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
