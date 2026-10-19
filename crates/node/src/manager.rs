@@ -18,6 +18,7 @@ pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
 use vibeface_bridge::agent::{
     self, AgentResult, CustomToolConfig, SdkAgentConfig, ToolCallbackConfig,
 };
+use vibeface_bridge::redaction::{redact, redact_string};
 
 const MAX_LINE: usize = 1_048_576;
 const MAX_STREAM: usize = 16_777_216;
@@ -608,31 +609,6 @@ fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
     keys.dedup();
     Ok(keys)
 }
-fn redact_string(mut text: String, secrets: &[String]) -> String {
-    for secret in secrets.iter().filter(|value| !value.is_empty()) {
-        text = text.replace(secret, "[redacted]");
-    }
-    text
-}
-fn redact(value: Value, secrets: &[String]) -> Value {
-    match value {
-        Value::String(text) => Value::String(redact_string(text, secrets)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| redact(item, secrets))
-                .collect(),
-        ),
-        Value::Object(items) => Value::Object(
-            items
-                .into_iter()
-                .map(|(key, value)| (key, redact(value, secrets)))
-                .collect(),
-        ),
-        value => value,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

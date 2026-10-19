@@ -1,3 +1,4 @@
+use crate::redaction::{redact, redact_string};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -244,11 +245,8 @@ where
             |value| progress(redact_stream_progress(value, &secrets, &mut pending_text));
         rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
         let mut result = state.finish(id)?;
-        result.output = match redact_progress(Value::String(result.output), &secrets) {
-            Value::String(output) => output,
-            _ => unreachable!("redacting an agent result must preserve its string type"),
-        };
-        result.usage = result.usage.map(|usage| redact_progress(usage, &secrets));
+        result.output = redact_string(result.output, &secrets);
+        result.usage = result.usage.map(|usage| redact(usage, &secrets));
         Ok(result)
     };
     let mut cancellation_requested = false;
@@ -326,23 +324,15 @@ where
         process.group = None;
     }
     outcome.map_err(|error| {
-        let mut message = error
-            .to_string()
-            .replace(&api_key, "[redacted]")
-            .replace(&rpc.bearer, "[redacted]");
-        for secret in config
-            .tool_env
-            .values()
-            .chain(
-                config
-                    .tool_callback
-                    .iter()
-                    .map(|callback| &callback.auth_token),
-            )
-            .filter(|value| !value.is_empty())
-        {
-            message = message.replace(secret, "[redacted]");
-        }
+        let mut secrets = vec![api_key.as_str(), rpc.bearer.as_str()];
+        secrets.extend(config.tool_env.values().map(String::as_str));
+        secrets.extend(
+            config
+                .tool_callback
+                .iter()
+                .map(|callback| callback.auth_token.as_str()),
+        );
+        let message = redact_string(error.to_string(), &secrets);
         AgentRunError {
             kind: if cancellation_requested {
                 provider_cancel_failure(native_terminal)
@@ -1155,30 +1145,6 @@ fn safe_progress_event(kind: &str, event: &Value) -> Option<Value> {
     (output.len() > 1).then_some(Value::Object(output))
 }
 
-fn redact_progress(value: Value, secrets: &[&str]) -> Value {
-    match value {
-        Value::String(mut text) => {
-            for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
-                text = text.replace(secret, "[redacted]");
-            }
-            Value::String(text)
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| redact_progress(item, secrets))
-                .collect(),
-        ),
-        Value::Object(items) => Value::Object(
-            items
-                .into_iter()
-                .map(|(key, value)| (key, redact_progress(value, secrets)))
-                .collect(),
-        ),
-        value => value,
-    }
-}
-
 fn redact_stream_progress(
     mut value: Value,
     secrets: &[&str],
@@ -1197,9 +1163,7 @@ fn redact_stream_progress(
         {
             let buffered = pending.entry(item).or_default();
             buffered.push_str(text);
-            let Value::String(clean) = redact_progress(json!(buffered), secrets) else {
-                unreachable!()
-            };
+            let clean = redact_string(buffered.clone(), secrets);
             let max_prefix = secrets
                 .iter()
                 .map(|secret| secret.len().saturating_sub(1))
@@ -1219,7 +1183,7 @@ fn redact_stream_progress(
             value["text"] = json!(&clean[..split]);
         }
     }
-    redact_progress(value, secrets)
+    redact(value, secrets)
 }
 
 fn finished(status: Option<&Value>) -> bool {
@@ -1561,7 +1525,7 @@ mod tests {
 
     #[test]
     fn progress_redaction_covers_nested_values() {
-        let redacted = redact_progress(
+        let redacted = redact(
             json!({"text": "prefix api-key bearer-token", "items": ["api-key"]}),
             &["api-key", "bearer-token"],
         );
@@ -1570,14 +1534,14 @@ mod tests {
             json!({"text": "prefix [redacted] [redacted]", "items": ["[redacted]"]})
         );
         assert_eq!(
-            redact_progress(
+            redact(
                 json!({"abc": ["abcdef 密钥", null, true, 7]}),
                 &["", "abc", "abcdef", "密钥"]
             ),
             json!({"abc": ["[redacted]def [redacted]", null, true, 7]})
         );
         assert_eq!(
-            redact_progress(json!("abcdef"), &["abcdef", "abc"]),
+            redact(json!("abcdef"), &["abcdef", "abc"]),
             json!("[redacted]")
         );
     }
