@@ -68,12 +68,15 @@ MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 
 binary=/absolute/path/to/package/vibeface
 crypto=/absolute/path/to/package/web/vibeface_secure.js
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-node --skip-codex
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-auto-route --auto-route
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-queue --phase1
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-net --network-reliability --net1-lane 7
 ```
 
-队列、follow-up 和调度持久化改动跑 `--phase1`；工具调用、取消和启动恢复改动跑 `--chat-agent`；网络改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
+Peer ID 自动选路和入口切换改动跑 `--auto-route`，覆盖本机、同入口、跨入口、签名与目标校验、邀请与恢复、撤销、取消及未知写入不重放。
+
+队列、follow-up 和调度持久化改动跑 `--phase1`；工具调用、取消和启动恢复改动跑 `--chat-agent`；其他网络协议、同步历史与附件传输改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
 
 默认模式省略 `--skip-codex` 时还需要本机安装的 Codex，`--codex-bin` 可指定路径；它检查真实会话协议，不发起模型生成。真正模型调用、浏览器渲染、实体设备授权、实际公网与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
