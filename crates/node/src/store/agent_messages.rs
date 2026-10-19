@@ -221,12 +221,7 @@ impl Store {
                     EventBody::AgentMessage { message } if message.kind == AgentMessageKind::Task)
             {
                 let session = load_scheduler_session(&tx, network, scope, &local)?;
-                for other in session
-                    .active
-                    .iter()
-                    .chain(&session.pending)
-                    .chain(&session.unresolved)
-                {
+                for other in session.active.iter().chain(&session.pending) {
                     if other == trigger {
                         continue;
                     }
@@ -240,7 +235,6 @@ impl Store {
                                 | JobState::Claimed { .. }
                                 | JobState::Running { .. }
                                 | JobState::Cancelling { .. }
-                                | JobState::Unknown { .. }
                         )
                     {
                         state = JobState::Cancelled {
@@ -298,88 +292,45 @@ impl Store {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "reconciliation binds the exact fenced attempt and its terminal publication"
+        reason = "finalization binds the exact interrupted attempt and its terminal publication"
     )]
-    pub(crate) fn reconcile_native_job(
+    /// Reopens an interrupted attempt read-only so its report goes through `finish_job`.
+    /// Returns false while another invocation holds the conversation; the caller retries later.
+    pub(crate) fn reopen_interrupted_job(
         &mut self,
-        identity: &LocalIdentity,
         network: &str,
         scope: &str,
         target: &str,
         trigger: &str,
         attempt_id: &str,
-        outcome: JobOutcome,
-        events: Vec<(EventBody, Vec<BlobRef>)>,
-        at: i64,
-    ) -> Result<SchedulerPublication> {
-        ensure!(
-            identity.peer_id()? == target,
-            "native reconciliation belongs to another device"
-        );
-        ensure!(
-            !matches!(outcome, JobOutcome::Unknown(_)),
-            "native outcome is still unknown"
-        );
+    ) -> Result<bool> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = scheduler_key("job", scope, target, trigger);
         let mut job: SchedulerJob =
-            scheduler_load(&tx, network, &key)?.context("native job is missing")?;
-        ensure!(
-            job.state
-                .attempt()
-                .is_some_and(|attempt| attempt.id == attempt_id),
-            "native reconciliation attempt changed"
-        );
-        if matches!(
-            job.state,
-            JobState::Completed { .. } | JobState::Failed { .. } | JobState::Cancelled { .. }
-        ) {
-            return Ok(SchedulerPublication {
-                job,
-                event_hashes: Vec::new(),
-            });
-        }
-        let mut attempt = match &job.state {
-            JobState::Unknown {
-                attempt,
-                fenced: true,
-                ..
-            } => attempt.clone(),
-            _ => bail!("native reconciliation requires a fenced unknown attempt"),
+            scheduler_load(&tx, network, &key)?.context("interrupted job is missing")?;
+        let JobState::Interrupted { attempt, .. } = &job.state else {
+            bail!("finalization requires an interrupted attempt");
         };
-        let mut session = load_scheduler_session(&tx, network, scope, target)?;
+        ensure!(attempt.id == attempt_id, "interrupted attempt changed");
+        let mut attempt = attempt.clone();
         ensure!(
-            session
-                .active
-                .as_deref()
-                .is_none_or(|active| active == trigger),
-            "another scheduler invocation is active"
+            !agent_result_published_from(&tx, network, &job)?,
+            "the interrupted task result was already reported"
         );
+        let mut session = load_scheduler_session(&tx, network, scope, target)?;
+        if session.active.is_some() {
+            return Ok(false);
+        }
         attempt.read_only = true;
         attempt.permission_version = session.permission_version;
         job.state = JobState::Running { attempt };
         session.active = Some(trigger.into());
-        session.unresolved.remove(trigger);
-        validate_scheduler_terminal(&job, &outcome, &events)?;
         scheduler_save(&tx, network, &key, &job)?;
         save_scheduler_session(&tx, network, &session)?;
-        scheduler_save(
-            &tx,
-            network,
-            &scheduler_key("publication", scope, target, trigger),
-            &SchedulerTerminalPublication {
-                version: SCHEDULING_VERSION,
-                job: job.clone(),
-                outcome,
-                events,
-                created_at_ms: at,
-            },
-        )?;
-        let publication = publish_scheduler_terminal_from(&tx, identity, network, &job)?;
         tx.commit()?;
-        Ok(publication)
+        Ok(true)
     }
 
     pub fn agent_task_for_message(
@@ -425,7 +376,20 @@ impl Store {
                 .then_some(reply)
             });
         let job = self.scheduler_job(network, scope, task_ref, &message.target_node)?;
-        let local_state = job.as_ref().map(|job| job.state.name());
+        let remote: Option<Value> = scheduler_load(
+            &self.connection,
+            network,
+            &remote_job_key(scope, &message.target_node, task_ref),
+        )?;
+        // An interrupted task is not finished until what it started has been reconciled.
+        let local_state = match (&job, &remote) {
+            (Some(job), _) if matches!(job.state, JobState::Interrupted { .. }) => {
+                Some("pending_check")
+            }
+            (Some(job), _) => Some(job.state.name()),
+            (None, Some(remote)) if remote["state"] == "interrupted" => Some("pending_check"),
+            _ => None,
+        };
         let entry: Option<OutboxEntry> = scheduler_load(
             &self.connection,
             network,
@@ -514,6 +478,21 @@ impl Store {
     }
 }
 
+pub(super) fn agent_result_published_from(
+    connection: &Connection,
+    network: &str,
+    job: &SchedulerJob,
+) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM events WHERE network_id=? AND scope_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.message.message_id')=?",
+            params![network, job.conversation_id, format!("agent-result-{}", job.trigger)],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 pub(super) fn publish_agent_result_from(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -529,7 +508,7 @@ pub(super) fn publish_agent_result_from(
         JobOutcome::Completed => (AgentMessageKind::Completed, None),
         JobOutcome::Failed(detail) => (AgentMessageKind::Failed, Some(detail.as_str())),
         JobOutcome::Cancelled(detail) => (AgentMessageKind::Interrupted, Some(detail.as_str())),
-        JobOutcome::Unknown(_) => return Ok(None),
+        JobOutcome::Interrupted { .. } => return Ok(None),
     };
     let task = event_from(connection, network, &job.conversation_id, &job.trigger)?;
     let EventBody::AgentMessage { message } = task.body else {
@@ -774,7 +753,7 @@ mod tests {
     #[test]
     fn parallel_agent_parents_interrupt_mutual_nested_deliveries_without_starting_them()
     -> Result<()> {
-        for (unknown, saturated) in [(false, false), (true, false), (false, true)] {
+        for saturated in [false, true] {
             let (mut store, source, b, network) = fixture()?;
             let c = LocalIdentity::generate();
             let b_id = b.peer_id()?;
@@ -832,21 +811,6 @@ mod tests {
                 &running_c.state.attempt().context("C attempt missing")?.id,
                 5,
             )?;
-            if unknown {
-                let attempt = &running_c.state.attempt().context("C attempt missing")?.id;
-                store.finish_job(
-                    &c,
-                    &network,
-                    "chat",
-                    &c_id,
-                    &parent_c.hash,
-                    attempt,
-                    JobOutcome::Unknown("parent connection lost".into()),
-                    vec![],
-                    6,
-                )?;
-                store.fence_manager_unknown(&network, "chat", &c_id, &parent_c.hash, attempt)?;
-            }
             if saturated {
                 for (target, target_id) in [(&b, &b_id), (&c, &c_id)] {
                     for index in 0..MAX_PENDING_JOBS {
@@ -1599,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn native_reconciliation_requires_the_exact_fenced_unknown_and_never_replays() -> Result<()> {
+    fn interrupted_report_reopens_only_the_exact_idle_attempt_and_never_replays() -> Result<()> {
         let (mut store, source, target, network) = fixture()?;
         let target_node = target.peer_id()?;
         let (origin, human) = start_human(&mut store, &source, &network)?;
@@ -1621,84 +1585,50 @@ mod tests {
             .id;
         assert!(
             store
-                .reconcile_native_job(
-                    &target,
-                    &network,
-                    "chat",
-                    &target_node,
-                    &task.hash,
-                    target_attempt,
-                    JobOutcome::Completed,
-                    final_reply(&running, "native result"),
-                    4,
-                )
+                .reopen_interrupted_job(&network, "chat", &target_node, &task.hash, target_attempt)
                 .is_err()
         );
-        let unknown = store.finish_job(
+        let interrupted = store.finish_job(
             &target,
             &network,
             "chat",
             &target_node,
             &task.hash,
             target_attempt,
-            JobOutcome::Unknown("native connection lost".into()),
+            JobOutcome::Interrupted {
+                detail: "native work still running".into(),
+                process_unconfirmed: false,
+            },
             vec![],
             4,
         )?;
-        assert!(matches!(
-            unknown.state,
-            JobState::Unknown { fenced: false, .. }
-        ));
-        assert!(
-            store
-                .reconcile_native_job(
-                    &target,
-                    &network,
-                    "chat",
-                    &target_node,
-                    &task.hash,
-                    target_attempt,
-                    JobOutcome::Completed,
-                    final_reply(&running, "native result"),
-                    5,
-                )
-                .is_err()
+        assert!(matches!(interrupted.state, JobState::Interrupted { .. }));
+        assert_eq!(
+            store.agent_task_status(&network, "chat", &task.hash)?["state"],
+            "pending_check"
         );
-        store.fence_manager_unknown(&network, "chat", &target_node, &task.hash, target_attempt)?;
+        assert!(replies(&store, &network, &task)?.is_empty());
         let path = store.path.clone();
         drop(store);
         let mut store = Store::open(path)?;
         assert!(
             store
-                .claim_next(&network, "chat", &target_node, "restarted", "sdk")?
-                .is_none()
+                .reopen_interrupted_job(&network, "chat", &target_node, &task.hash, "another-attempt")
+                .is_err()
         );
-        for (identity, attempt, outcome) in [
-            (&source, target_attempt.as_str(), JobOutcome::Completed),
-            (&target, "another-attempt", JobOutcome::Completed),
-            (
-                &target,
-                target_attempt.as_str(),
-                JobOutcome::Unknown("still unknown".into()),
-            ),
-        ] {
-            assert!(
-                store
-                    .reconcile_native_job(
-                        identity,
-                        &network,
-                        "chat",
-                        &target_node,
-                        &task.hash,
-                        attempt,
-                        outcome,
-                        final_reply(&running, "must not publish"),
-                        5,
-                    )
-                    .is_err()
-            );
-        }
-        let publication = store.reconcile_native_job(
+        assert!(store.reopen_interrupted_job(
+            &network,
+            "chat",
+            &target_node,
+            &task.hash,
+            target_attempt
+        )?);
+        assert!(
+            store
+                .reopen_interrupted_job(&network, "chat", &target_node, &task.hash, target_attempt)
+                .is_err()
+        );
+        let completed = store.finish_job(
             &target,
             &network,
             "chat",
@@ -1709,31 +1639,18 @@ mod tests {
             final_reply(&running, "native result"),
             6,
         )?;
-        assert!(matches!(publication.job.state, JobState::Completed { .. }));
-        let completed_attempt = publication
-            .job
+        let completed_attempt = completed
             .state
             .attempt()
             .context("completed attempt missing")?;
+        assert!(matches!(completed.state, JobState::Completed { .. }));
         assert_eq!(&completed_attempt.id, target_attempt);
         assert!(completed_attempt.read_only);
-        let result = result_envelope(&store, &network, &task)?;
-        assert!(publication.event_hashes.contains(&result.hash));
-        let before = store.messages(&network, "chat")?;
-        let repeated = store.reconcile_native_job(
-            &target,
-            &network,
-            "chat",
-            &target_node,
-            &task.hash,
-            target_attempt,
-            JobOutcome::Completed,
-            final_reply(&running, "duplicate result"),
-            7,
-        )?;
-        assert_eq!(repeated.job, publication.job);
-        assert!(repeated.event_hashes.is_empty());
-        assert_eq!(store.messages(&network, "chat")?, before);
+        assert!(
+            store
+                .reopen_interrupted_job(&network, "chat", &target_node, &task.hash, target_attempt)
+                .is_err()
+        );
         let results = replies(&store, &network, &task)?;
         assert_eq!(results.len(), 1);
         assert!(
@@ -1754,10 +1671,13 @@ mod tests {
         for outcome in [
             JobOutcome::Completed,
             JobOutcome::Failed("parent failed".into()),
-            JobOutcome::Unknown("parent disconnected".into()),
+            JobOutcome::Interrupted {
+                detail: "parent disconnected".into(),
+                process_unconfirmed: true,
+            },
         ] {
             let completed = matches!(&outcome, JobOutcome::Completed);
-            let unknown = matches!(&outcome, JobOutcome::Unknown(_));
+            let interrupted = matches!(&outcome, JobOutcome::Interrupted { .. });
             let (mut store, source, parent, network) = fixture()?;
             let child = LocalIdentity::generate();
             let source_node = source.peer_id()?;
@@ -1858,15 +1778,6 @@ mod tests {
                 events,
                 7,
             )?;
-            if unknown {
-                store.fence_manager_unknown(
-                    &network,
-                    "chat",
-                    &parent_node,
-                    &parent_task.hash,
-                    parent_attempt,
-                )?;
-            }
             let report = store.claim_next(&network, "chat", &parent_node, "test-boot", "sdk")?;
             if completed {
                 assert!(report.is_none());
@@ -1911,7 +1822,7 @@ mod tests {
                 matches!(&child_replies[0].body, EventBody::AgentMessage { message }
                 if message.kind == AgentMessageKind::Completed && message.text == "child result")
             );
-            if !unknown {
+            if !interrupted {
                 let parent_result = result_envelope(&store, &network, &parent_task)?;
                 store.admit_trigger(
                     &network,

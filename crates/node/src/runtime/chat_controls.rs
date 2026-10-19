@@ -140,6 +140,13 @@ fn mark_native_freshness(work: &mut Value, cached: bool) {
     }
 }
 
+fn native_pending_check(work: &Value) -> Value {
+    json!({"check_id":format!("native:{}",work["work_id"].as_str().unwrap_or_default()),"kind":"native_turn",
+        "conversation_id":work["conversation_id"],"target_node":work["target_node"],"trigger":work["origin_trigger"],
+        "attempt_id":work["attempt_id"],"work_id":work["work_id"],"thread_id":work["thread_id"],"turn_id":work["turn_id"],
+        "detail":work["detail"],"freshness":work["freshness"]})
+}
+
 fn remote_native_projection(
     store: &mut Store,
     network: &str,
@@ -316,9 +323,15 @@ impl Runtime {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
-        let jobs = self.scheduler_snapshot_jobs(network, scope).await?;
+        let (jobs, mut pending_checks) = self.scheduler_snapshot_jobs(network, scope).await?;
         let agent_tasks = self.agent_task_projections(network, scope).await?;
         let native_sessions = self.native_session_projections(network, scope).await?;
+        pending_checks.extend(
+            native_sessions
+                .iter()
+                .filter(|work| work["state"] == "unknown")
+                .map(native_pending_check),
+        );
         let store = self.store.lock().await;
         let context = store.context(network, scope, &heads(input)?)?;
         let mut targets = jobs
@@ -350,7 +363,6 @@ impl Runtime {
             Err(error) => json!({"mode":"off","version":null,"error":error.to_string()}),
         };
         targets.retain(|target| store.authorize_node(network, target, None).is_ok());
-        let frozen = jobs.iter().any(|job| job["write_frozen"] == true);
         let settings = self.settings_snapshot();
         let manager = settings.manager.as_ref();
         let remote_manager = jobs
@@ -368,7 +380,8 @@ impl Runtime {
             .is_complete();
         let snapshot = json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),
             "messages":messages,"autonomy":autonomy,"agent_tasks":agent_tasks,"native_sessions":native_sessions,"heads":context.heads,"missing":context.missing,
-            "facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets});
+            "pending_checks":pending_checks,
+            "facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"]},"observation_targets":targets});
         drop(store);
         if needs_sync {
             let _ = self.request_scope_sync(network, scope, current_heads).await;

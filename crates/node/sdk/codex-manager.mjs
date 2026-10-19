@@ -415,26 +415,55 @@ function manageCodexProcess(executable, signal) {
     return child;
   };
   syncBuiltinESMExports();
-  const groupExists = () => {
+  const alive = (pid) => {
     try {
-      process.kill(-child.pid, 0);
+      process.kill(pid, 0);
       return true;
     } catch (error) {
       return error.code !== "ESRCH";
     }
   };
-  const killGroup = (name) => {
-    try { process.kill(-child.pid, name); } catch {}
+  // Every process that was in the CLI tree while it was stopped, with its group.
+  const tracked = new Map();
+  const track = () => {
+    let table;
+    try {
+      table = childProcess.execFileSync("/bin/ps", ["-A", "-o", "pid=,ppid=,pgid="], { encoding: "utf8", timeout: 1_000 });
+    } catch {
+      return false;
+    }
+    const rows = table.trim().split("\n").map((line) => line.trim().split(/\s+/).map(Number));
+    const roots = new Set([child.pid, ...tracked.keys()]);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const [pid, ppid, pgid] of rows) {
+        if (!roots.has(ppid) || roots.has(pid)) continue;
+        roots.add(pid);
+        tracked.set(pid, pgid);
+        grew = true;
+      }
+    }
+    return true;
   };
+  const signalTree = (name) => {
+    for (const pgid of new Set([child.pid, ...tracked.values()])) {
+      try { process.kill(-pgid, name); } catch {}
+    }
+  };
+  const treeExited = () => !alive(-child.pid)
+    && [...tracked].every(([pid, pgid]) => !alive(pid) && !alive(-pgid));
   const stop = () => stopping ??= (async () => {
     if (!child) return true;
     if (child.pid && process.platform !== "win32") {
-      // shortcut: Codex tools create separate groups; CLI-group exit cannot confirm tool exit without OS containment.
-      killGroup("SIGTERM");
+      // Tools may leave the CLI group, so each descendant group seen while the tree is alive is killed and checked.
+      // Processes that already left the tree (re-parented away) before stop are invisible here, as on normal completion.
+      let observed = track();
+      signalTree("SIGTERM");
       const started = performance.now();
       while (performance.now() - started < 1_500) {
-        if (closed && !groupExists()) return true;
-        if (performance.now() - started >= 300) killGroup("SIGKILL");
+        observed &&= track();
+        if (observed && closed && treeExited()) return true;
+        if (performance.now() - started >= 300) signalTree("SIGKILL");
         await delay(20);
       }
     } else {
@@ -559,8 +588,12 @@ async function run(input, reader, secrets) {
   closeInput();
   if (!exited) throw new ProtocolError("Codex cancellation could not confirm managed process exit");
   if (signalCancelled || control.cancelled) {
-    write({ type: "error", session_id: nativeSessionId, confirmation: "managed_cli_exited", message: "Codex CLI exited; detached tool process exit is unconfirmed", uncertain: true });
-    process.exitCode = 1;
+    if (process.platform === "win32") {
+      write({ type: "error", session_id: nativeSessionId, confirmation: "managed_cli_exited", message: "Codex CLI exited; tool process exit is unconfirmed on Windows", uncertain: true });
+      process.exitCode = 1;
+      return;
+    }
+    write({ type: "cancelled", session_id: nativeSessionId, confirmation: "managed_processes_exited" });
     return;
   }
   if (control.failure) throw control.failure;

@@ -1,6 +1,7 @@
 use super::*;
 use crate::scheduling::{
-    AdmissionReceipt, JobOutcome, JobState, OutboxEntry, SCHEDULING_VERSION, SchedulerJob,
+    AdmissionReceipt, JobOutcome, JobState, OutboxEntry, PendingCheck, SCHEDULING_VERSION,
+    SchedulerJob,
 };
 use futures_util::{FutureExt, StreamExt};
 
@@ -139,17 +140,11 @@ fn register_observation(store: &mut Store, network: &str, scope: &str, now: i64)
 }
 
 fn remote_key(entry: &OutboxEntry) -> String {
-    format!(
-        "scheduler:v1:remote:{}",
-        crypto::digest(
-            &serde_json::to_vec(&(&entry.conversation_id, &entry.target_node, &entry.trigger,))
-                .expect("string tuple serializes")
-        )
-    )
+    crate::scheduling::remote_job_key(&entry.conversation_id, &entry.target_node, &entry.trigger)
 }
 
 fn terminal(state: &str) -> bool {
-    matches!(state, "completed" | "failed" | "cancelled" | "unknown")
+    matches!(state, "completed" | "failed" | "cancelled" | "interrupted")
 }
 
 fn job_value(job: &SchedulerJob) -> Result<Value> {
@@ -159,7 +154,7 @@ fn job_value(job: &SchedulerJob) -> Result<Value> {
         value["reply_message_id"] = json!(job.message_id);
     }
     match &job.state {
-        JobState::Failed { detail, .. } | JobState::Unknown { detail, .. } => {
+        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => {
             value["error"] = json!(detail);
         }
         _ => {}
@@ -167,20 +162,20 @@ fn job_value(job: &SchedulerJob) -> Result<Value> {
     Ok(value)
 }
 
-fn write_frozen(store: &Store, network: &str, scope: &str, target: &str) -> Result<bool> {
-    for job in store.scheduler_jobs(network, scope, target)? {
-        if matches!(job.state, JobState::Unknown { .. })
-            && store
-                .local_value(
-                    network,
-                    &crate::scheduling::scheduler_key("resolution", scope, target, &job.trigger),
-                )?
-                .is_none()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+fn scope_pending_checks(store: &Store, network: &str, scope: &str) -> Result<Vec<PendingCheck>> {
+    Ok(store
+        .pending_checks(network)?
+        .into_iter()
+        .filter(|check| check.conversation_id == scope)
+        .collect())
+}
+
+fn mark_pending(job: &mut Value, checks: &[PendingCheck]) {
+    job["pending_check"] = json!(
+        checks
+            .iter()
+            .any(|check| job["trigger"].as_str() == Some(check.trigger.as_str()))
+    );
 }
 
 fn origin_message_id(store: &Store, network: &str, trigger: &str) -> Result<Option<String>> {
@@ -461,10 +456,9 @@ impl Runtime {
                     tracing::warn!(%error, "known management outcome awaits history publication");
                 }
                 let workers = self.schedule_workers.lock().await.clone();
-                let (unknown, abandoned) = {
+                let abandoned = {
                     let mut store = self.store.lock().await;
                     store.recover_scheduler_jobs(&network, &local, crate::scheduler::boot_id())?;
-                    let mut unknown = Vec::new();
                     let mut abandoned = Vec::new();
                     for scope in store.scopes(&network)? {
                         for job in store.scheduler_jobs(&network, &scope, &local)? {
@@ -476,14 +470,7 @@ impl Runtime {
                             )? {
                                 continue;
                             }
-                            if let JobState::Unknown {
-                                attempt,
-                                fenced: false,
-                                ..
-                            } = &job.state
-                            {
-                                unknown.push((scope.clone(), job.trigger, attempt.id.clone()));
-                            } else if matches!(
+                            if matches!(
                                 job.state,
                                 JobState::Claimed { .. }
                                     | JobState::Running { .. }
@@ -502,27 +489,14 @@ impl Runtime {
                             }
                         }
                     }
-                    (unknown, abandoned)
+                    abandoned
                 };
                 for (scope, trigger, attempt) in abandoned {
                     self.fence_manager_attempt(&attempt).await?;
                     self.store.lock().await.finish_job(&self.identity,&network,&scope,&local,&trigger,&attempt,
-                        JobOutcome::Unknown("management consumer ended before a durable terminal outcome; reconcile the original attempt".into()),vec![],now_ms())?;
-                    self.store
-                        .lock()
-                        .await
-                        .fence_manager_unknown(&network, &scope, &local, &trigger, &attempt)?;
+                        JobOutcome::Interrupted { detail: "management consumer ended before a durable terminal outcome".into(), process_unconfirmed: true },vec![],now_ms())?;
                     self.finish_manager_attempt(&attempt).await;
                     self.publish_changed(&network, &scope, &trigger);
-                }
-                for (scope, trigger, attempt) in unknown {
-                    // Tokens are process-local; draining the admission lease also accounts for live tools.
-                    self.fence_manager_attempt(&attempt).await?;
-                    self.store
-                        .lock()
-                        .await
-                        .fence_manager_unknown(&network, &scope, &local, &trigger, &attempt)?;
-                    self.finish_manager_attempt(&attempt).await;
                 }
                 if self.settings_snapshot().manager.is_some() {
                     let scopes = self
@@ -918,6 +892,7 @@ impl Runtime {
         let local = self.identity.peer_id()?;
         let mut store = self.store.lock().await;
         store.recover_scheduler_jobs(network, &local, crate::scheduler::boot_id())?;
+        let checks = scope_pending_checks(&store, network, scope)?;
         let mut jobs = Vec::new();
         let mut recent_terminal = 0;
         for job in store
@@ -925,18 +900,7 @@ impl Runtime {
             .into_iter()
             .rev()
         {
-            let unresolved = matches!(job.state, JobState::Unknown { .. })
-                && store
-                    .local_value(
-                        network,
-                        &crate::scheduling::scheduler_key(
-                            "resolution",
-                            scope,
-                            &local,
-                            &job.trigger,
-                        ),
-                    )?
-                    .is_none();
+            let unresolved = checks.iter().any(|check| check.trigger == job.trigger);
             let pending = matches!(
                 job.state,
                 JobState::Queued
@@ -969,7 +933,7 @@ impl Runtime {
         let mut reply = json!({"state":"not_found","trigger":trigger,"version":SCHEDULING_VERSION,
             "network_id":network,"conversation_id":scope,"target_node":local,"status_revision":revision,
             "jobs":jobs,"heads":store.heads(network,scope)?,"manager":self.scheduler_manager_metadata(),
-            "write_frozen":write_frozen(&store,network,scope,&local)?});
+            "pending_checks":checks});
         if let Some(job) = store.scheduler_job(network, scope, trigger, &local)? {
             reply["accepted"] = json!(true);
             reply["queued"] = json!(true);
@@ -1007,7 +971,7 @@ impl Runtime {
                 .local_value(&entry.network_id, &key)?
                 .is_some_and(|value| {
                     terminal(value["state"].as_str().unwrap_or(""))
-                        && !(value["state"] == "unknown" && value["write_frozen"] != false)
+                        && value["pending_check"] != true
                 })
         {
             return Ok(());
@@ -1120,9 +1084,14 @@ impl Runtime {
         } else {
             SchedulePresence::NotFound { revision }
         };
+        let checks: Vec<PendingCheck> = serde_json::from_value(reply["pending_checks"].clone())
+            .context("scheduler omitted its pending checks")?;
         ensure!(
-            reply["write_frozen"].is_boolean(),
-            "scheduler omitted its write-frozen state"
+            checks.len() <= MAX_STATUS_JOBS
+                && checks.iter().all(|check| check.version == SCHEDULING_VERSION
+                    && check.conversation_id == entry.conversation_id
+                    && check.target_node == entry.target_node),
+            "scheduler pending checks do not match this conversation and target"
         );
         {
             let wanted: Vec<String> = serde_json::from_value(reply["heads"].clone())?;
@@ -1187,8 +1156,9 @@ impl Runtime {
             for value in &mut observed {
                 value["status_revision"] = json!(revision);
                 value["freshness"] = json!("observed");
+                mark_pending(value, &checks);
             }
-            let session = json!({"manager":reply["manager"],"write_frozen":reply["write_frozen"],"checked_at_ms":now_ms(),
+            let session = json!({"manager":reply["manager"],"pending_checks":checks,"checked_at_ms":now_ms(),
                 "freshness":"observed","status_revision":revision,"jobs":observed});
             let mut changed = previous.is_none_or(|mut previous| {
                 previous["checked_at_ms"] = session["checked_at_ms"].clone();
@@ -1197,7 +1167,7 @@ impl Runtime {
             });
             if let Some(mut value) = primary_value {
                 value["manager"] = reply["manager"].clone();
-                value["write_frozen"] = reply["write_frozen"].clone();
+                mark_pending(&mut value, &checks);
                 value["freshness"] = json!("observed");
                 value["checked_at_ms"] = session["checked_at_ms"].clone();
                 value["status_revision"] = json!(revision);
@@ -1219,11 +1189,12 @@ impl Runtime {
         Ok(presence)
     }
 
+    /// Returns the conversation's jobs and the pending checks their targets reported.
     pub(super) async fn scheduler_snapshot_jobs(
         &self,
         network: &str,
         scope: &str,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
         let local = self.identity.peer_id()?;
         let mut store = self.store.lock().await;
         register_observation(&mut store, network, scope, now_ms())?;
@@ -1232,10 +1203,19 @@ impl Runtime {
             .iter()
             .map(job_value)
             .collect::<Result<Vec<_>>>()?;
-        let frozen = write_frozen(&store, network, scope, &local)?;
+        let checks = scope_pending_checks(&store, network, scope)?;
+        let mut pending = checks
+            .iter()
+            .map(|check| {
+                let mut value = json!(check);
+                value["kind"] = json!("manager_process");
+                value["freshness"] = json!("observed");
+                value
+            })
+            .collect::<Vec<_>>();
         for job in &mut jobs {
             job["manager"] = self.scheduler_manager_metadata();
-            job["write_frozen"] = json!(frozen);
+            mark_pending(job, &checks);
             let trigger = field(job, "trigger")?.to_owned();
             job["message_id"] = json!(origin_message_id(&store, network, &trigger)?);
         }
@@ -1284,6 +1264,7 @@ impl Runtime {
                 }
             }
         }
+        let mut remote_targets = BTreeSet::new();
         for job in &mut jobs {
             let Some(target) = job["target_node"].as_str() else {
                 continue;
@@ -1292,8 +1273,21 @@ impl Runtime {
                 continue;
             }
             if let Some(session) = store.local_value(network, &remote_session_key(scope, target))? {
+                if remote_targets.insert(target.to_owned()) {
+                    let fresh = session["freshness"] == "observed"
+                        && session["checked_at_ms"]
+                            .as_i64()
+                            .unwrap_or(0)
+                            .saturating_add(WATCH_LEASE_MS)
+                            >= now_ms();
+                    for check in session["pending_checks"].as_array().into_iter().flatten() {
+                        let mut value = check.clone();
+                        value["kind"] = json!("manager_process");
+                        value["freshness"] = json!(if fresh { "observed" } else { "cached" });
+                        pending.push(value);
+                    }
+                }
                 job["manager"] = session["manager"].clone();
-                job["write_frozen"] = session["write_frozen"].clone();
                 if session["freshness"] != "observed"
                     || session["checked_at_ms"]
                         .as_i64()
@@ -1305,7 +1299,7 @@ impl Runtime {
                 }
             }
         }
-        Ok(jobs)
+        Ok((jobs, pending))
     }
 }
 
@@ -1544,7 +1538,7 @@ mod tests {
             "version",
             "heads",
             "jobs",
-            "write_frozen",
+            "pending_checks",
             "status_revision",
         ] {
             let mut reply = absence.clone();
@@ -1629,10 +1623,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m4_observed_unknown_job_acknowledges_without_schedule() -> Result<()> {
+    async fn m4_observed_interrupted_job_with_pending_check_acknowledges_without_schedule()
+    -> Result<()> {
         let fixture =
-            DeliveryFixture::open(|_, _| "unknown remains on original target".into()).await?;
+            DeliveryFixture::open(|_, _| "pending check remains on original target".into()).await?;
         let mut reply = fixture.absence(10).await?;
+        let attempt = crate::scheduling::ManagerAttempt {
+            id: "original-attempt".into(),
+            boot: "original-boot".into(),
+            read_only: false,
+            permission_version: 1,
+            followup_version: None,
+        };
         let job = SchedulerJob {
             version: 1,
             conversation_id: fixture.entry.conversation_id.clone(),
@@ -1641,23 +1643,27 @@ mod tests {
             kind: TriggerKind::Human,
             sequence: 1,
             basis_heads: vec![fixture.entry.trigger.clone()],
-            message_id: "unknown-reply".into(),
-            state: JobState::Unknown {
-                attempt: crate::scheduling::ManagerAttempt {
-                    id: "original-attempt".into(),
-                    boot: "original-boot".into(),
-                    read_only: false,
-                    permission_version: 1,
-                    followup_version: None,
-                },
-                detail: "outcome needs reconciliation".into(),
-                fenced: false,
+            message_id: "interrupted-reply".into(),
+            state: JobState::Interrupted {
+                attempt: attempt.clone(),
+                detail: "manager process exit is unconfirmed".into(),
             },
         };
-        reply["state"] = json!("unknown");
+        let check = PendingCheck {
+            version: SCHEDULING_VERSION,
+            check_id: PendingCheck::id(&attempt.id),
+            conversation_id: job.conversation_id.clone(),
+            target_node: job.target_node.clone(),
+            trigger: job.trigger.clone(),
+            attempt_id: attempt.id.clone(),
+            detail: "manager process exit is unconfirmed".into(),
+            process_groups: vec![4242],
+            created_at_ms: 1,
+        };
+        reply["state"] = json!("interrupted");
         reply["accepted"] = json!(true);
         reply["queued"] = json!(true);
-        reply["write_frozen"] = json!(true);
+        reply["pending_checks"] = json!([check]);
         reply["receipt"] = json!(job.receipt(&fixture.entry.network_id));
         reply["job"] = json!(job);
         reply["jobs"] = json!([job]);
@@ -1672,10 +1678,10 @@ mod tests {
             .await
             .local_value(&fixture.entry.network_id, &remote_key(&fixture.entry))?
             .unwrap();
-        assert_eq!(observed["state"], "unknown");
-        assert_eq!(observed["write_frozen"], true);
+        assert_eq!(observed["state"], "interrupted");
+        assert_eq!(observed["pending_check"], true);
         println!(
-            "NET1_M4 valid_observed_unknown_job_acknowledged=true schedule_packets=0 write_frozen_preserved=true"
+            "NET1_M4 valid_observed_interrupted_job_acknowledged=true schedule_packets=0 pending_check_preserved=true"
         );
         Ok(())
     }

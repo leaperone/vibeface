@@ -675,7 +675,7 @@ impl Runtime {
                 {
                     tracing::debug!(%error, "native observation recovery is pending");
                 }
-                if let Err(error) = crate::scheduler::recover_native_results(node.clone()).await {
+                if let Err(error) = crate::scheduler::settle_interrupted_jobs(node.clone()).await {
                     tracing::debug!(%error, "native result finalization is pending");
                 }
             }
@@ -862,15 +862,14 @@ impl Runtime {
             {
                 return Ok(works);
             }
+            // Stopping the reply is the caller's race; native turns are observed independently of it.
             if works.iter().any(|work| work.state == NativeState::Unknown)
-                || matches!(
-                    job.state,
-                    JobState::Cancelling { .. } | JobState::Unknown { .. }
-                )
+                || children.iter().any(|task| task["state"] == "pending_check")
+                || matches!(job.state, JobState::Interrupted { .. })
             {
                 return Err(crate::manager::ManagerError {
                     kind: crate::manager::ManagerFailure::Unknown, session_id: None,
-                    message: "native work has no confirmed terminal outcome; the original turn was retained for reconciliation".into(),
+                    message: "started work awaits reconciliation; nothing was replayed".into(),
                 }.into());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1071,6 +1070,68 @@ impl Runtime {
         drop(store);
         self.publish_changed(network, &work.conversation_id, &work.origin_trigger);
         Ok(json!({"work_id":work.work_id,"interrupt_requested":true,"confirmed":false}))
+    }
+
+    fn local_native_work(store: &Store, network: &str, scope: &str, work_id: &str) -> Result<NativeWork> {
+        let work: NativeWork = serde_json::from_value(
+            store
+                .local_value(network, &key(work_id))?
+                .context("native work not found")?,
+        )?;
+        ensure!(work.conversation_id == scope, "native work belongs to another conversation");
+        Ok(work)
+    }
+
+    /// Reads the original turn again; it never starts or replays native work.
+    pub(super) async fn reconcile_native_work(
+        &self,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+    ) -> Result<NativeWork> {
+        let work = Self::local_native_work(&*self.store.lock().await, network, scope, work_id)?;
+        if work.state.terminal() {
+            return Ok(work);
+        }
+        let client = self.native_client()?;
+        let turn = tokio::time::timeout(Duration::from_secs(10), read_original_turn(client, &work))
+            .await
+            .map_err(|_| anyhow::anyhow!("original native turn history lookup timed out"))
+            .and_then(|result| result);
+        let mut store = self.store.lock().await;
+        let mut current = Self::local_native_work(&store, network, scope, work_id)?;
+        if (turn.is_ok() || current.sequence == work.sequence)
+            && reconcile_work(&mut current, turn, None)
+        {
+            save_work(&mut store, network, &current)?;
+        }
+        Ok(current)
+    }
+
+    /// Records the user's evidence for a native turn this Node can no longer observe.
+    pub(super) async fn resolve_native_work(
+        &self,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+        state: NativeState,
+        evidence: &str,
+    ) -> Result<NativeWork> {
+        ensure!(state.terminal(), "a confirmed native outcome must be terminal");
+        let mut store = self.store.lock().await;
+        let mut work = Self::local_native_work(&store, network, scope, work_id)?;
+        ensure!(
+            work.state == NativeState::Unknown,
+            "only an unknown native turn needs confirmation"
+        );
+        work.state = state;
+        work.detail = format!("用户核对确认：{evidence}").chars().take(65536).collect();
+        work.sequence = work
+            .sequence
+            .checked_add(1)
+            .context("native progress sequence overflow")?;
+        save_work(&mut store, network, &work)?;
+        Ok(work)
     }
 
     pub(super) async fn interrupt_native_task(

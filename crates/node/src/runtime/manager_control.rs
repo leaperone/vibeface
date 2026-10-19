@@ -1,5 +1,9 @@
 use super::{Access, Runtime};
-use crate::{model::*, scheduling::JobState};
+use super::native_observation::NativeState;
+use crate::{
+    model::*,
+    scheduling::{JobState, PendingCheck},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::sync::{
@@ -250,53 +254,130 @@ impl Runtime {
         Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
-    pub(super) async fn resolve_manager_invocation(
-        &self,
+    /// Routes a pending check to the Node that owns it; only that Node can observe the original work.
+    pub(super) async fn pending_check_control(
+        self: &Arc<Self>,
         access: &Access,
         input: &Value,
+        kind: &str,
     ) -> Result<Value> {
-        ensure!(
-            access.human,
-            "only the user resolves an unknown management reply"
-        );
-        let network = &access.network_id;
+        ensure!(access.human, "only the user reconciles pending checks");
         let scope = super::field(input, "conversation_id")?;
-        let trigger = super::field(input, "trigger")?;
-        let evidence = super::field(input, "evidence")?;
+        let target = super::field(input, "target_node")?;
+        super::field(input, "check_id")?;
         self.require_scope(access, scope).await?;
-        let target = self.manager_target(network, scope, trigger).await?;
         if target != self.identity.peer_id()? {
-            self.require_role(network, NodeRole::Gateway).await?;
-            return self.peer_request(network, &target, json!({"type":"resolve_manager_unknown","conversation_id":scope,"trigger":trigger,"evidence":evidence,"human":true})).await;
+            self.require_role(&access.network_id, NodeRole::Gateway)
+                .await?;
+            let mut request = input.clone();
+            request["type"] = json!(kind);
+            request["human"] = json!(true);
+            return self.peer_request(&access.network_id, target, request).await;
         }
-        let job = self
-            .store
-            .lock()
-            .await
-            .scheduler_job(network, scope, trigger, &target)?
-            .context("management job missing")?;
-        ensure!(
-            matches!(job.state, JobState::Unknown { .. }),
-            "management job is not unknown"
-        );
-        let attempt = &job
-            .state
-            .attempt()
-            .context("management attempt missing")?
-            .id;
-        self.fence_manager_attempt(attempt).await?;
+        if kind == "reconcile" {
+            self.reconcile_local(&access.network_id, input).await
+        } else {
+            self.resolve_local(&access.network_id, input).await
+        }
+    }
+
+    pub(super) async fn reconcile_local(&self, network: &str, input: &Value) -> Result<Value> {
+        let scope = super::field(input, "conversation_id")?;
+        let check_id = super::field(input, "check_id")?;
+        if let Some(work_id) = check_id.strip_prefix("native:") {
+            let work = self.reconcile_native_work(network, scope, work_id).await?;
+            self.publish_changed(network, scope, &work.origin_trigger);
+            return Ok(json!({"check_id":check_id,"pending":work.state == NativeState::Unknown,"native_session":work}));
+        }
+        let check = self.local_pending_check(network, scope, check_id).await?;
+        let processes = process_groups(&check.process_groups).await;
         let native = self
-            .native_work_for_attempt(network, scope, trigger, attempt)
+            .native_work_for_attempt(network, scope, &check.trigger, &check.attempt_id)
+            .await?;
+        let tasks = self
+            .child_agent_tasks(network, scope, &check.trigger)
+            .await?;
+        Ok(json!({"check_id":check_id,"pending":true,"check":check,"process_groups":processes,
+            "native_sessions":native,"agent_tasks":tasks,
+            "note":"Exited process groups do not prove that detached tools or external side effects stopped."}))
+    }
+
+    pub(super) async fn resolve_local(&self, network: &str, input: &Value) -> Result<Value> {
+        let scope = super::field(input, "conversation_id")?;
+        let check_id = super::field(input, "check_id")?;
+        let evidence = super::field(input, "evidence")?;
+        ensure!(evidence.len() <= 4096, "evidence is too long");
+        if let Some(work_id) = check_id.strip_prefix("native:") {
+            let state = match super::field(input, "outcome")? {
+                "completed" => NativeState::Completed,
+                "failed" => NativeState::Failed,
+                "interrupted" => NativeState::Interrupted,
+                _ => anyhow::bail!("outcome must be completed, failed or interrupted"),
+            };
+            let work = self
+                .resolve_native_work(network, scope, work_id, state, evidence)
+                .await?;
+            self.publish_changed(network, scope, &work.origin_trigger);
+            return Ok(json!({"check_id":check_id,"resolved":true}));
+        }
+        let check = self.local_pending_check(network, scope, check_id).await?;
+        let running = process_groups(&check.process_groups)
+            .await
+            .into_iter()
+            .filter(|group| group["exited"] != true)
+            .filter_map(|group| group["process_group"].as_u64())
+            .collect::<Vec<_>>();
+        ensure!(
+            running.is_empty(),
+            "process groups {running:?} are still running or cannot be checked; stop them before confirming"
+        );
+        let native = self
+            .native_work_for_attempt(network, scope, &check.trigger, &check.attempt_id)
             .await?;
         ensure!(
             native.iter().all(|work| work.state.terminal()),
-            "verify the original native turns have stopped before resolving this Agent invocation"
+            "confirm the native turns this invocation started before confirming the invocation"
         );
-        let mut store = self.store.lock().await;
-        store.fence_manager_unknown(network, scope, &target, trigger, attempt)?;
-        store.resolve_manager_unknown(network, scope, &target, trigger, attempt, evidence)?;
-        drop(store);
-        self.publish_changed(network, scope, trigger);
-        Ok(json!({"resolved":true,"trigger":trigger}))
+        self.fence_manager_attempt(&check.attempt_id).await?;
+        self.store
+            .lock()
+            .await
+            .resolve_pending_check(network, check_id, evidence, super::now_ms())?;
+        self.publish_changed(network, scope, &check.trigger);
+        Ok(json!({"check_id":check_id,"resolved":true}))
     }
+
+    async fn local_pending_check(
+        &self,
+        network: &str,
+        scope: &str,
+        check_id: &str,
+    ) -> Result<PendingCheck> {
+        let check = self
+            .store
+            .lock()
+            .await
+            .pending_check(network, check_id)?
+            .context("pending check not found")?;
+        ensure!(
+            check.conversation_id == scope && check.target_node == self.identity.peer_id()?,
+            "pending check belongs to another conversation or device"
+        );
+        Ok(check)
+    }
+}
+
+/// Signal 0 only checks the recorded group; it never stops a group whose ID may have been reused.
+async fn process_groups(groups: &[u32]) -> Vec<Value> {
+    let mut result = Vec::new();
+    for group in groups {
+        let probe = tokio::process::Command::new("/bin/kill")
+            .args(["-0", &format!("-{group}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        result.push(json!({"process_group":group,"exited":matches!(probe, Ok(status) if !status.success())}));
+    }
+    result
 }

@@ -2505,7 +2505,7 @@ mod tests {
         let missing = crypto::digest(b"not present on the receiver");
         let schedule = json!({"type":"schedule","version":1,"target_node":node.identity.peer_id()?,
             "conversation_id":"chat","trigger":missing,"basis_heads":[missing]});
-        let resolution = json!({"type":"resolve_manager_unknown","conversation_id":"chat","trigger":"missing","human":true,"evidence":"verified fixture stopped"});
+        let resolution = json!({"type":"resolve","conversation_id":"chat","target_node":"missing","check_id":"manager:missing","human":true,"evidence":"verified fixture stopped"});
         for origin in [&replica, &relay] {
             let message = Inbound {
                 network_id: network.clone(),
@@ -4113,7 +4113,7 @@ impl Runtime {
             "bots" => self.bots(&access).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
-            "resolve_manager_unknown" => self.resolve_manager_invocation(&access, &input).await,
+            "reconcile" | "resolve" => self.pending_check_control(&access, &input, method).await,
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
             ),
@@ -4360,7 +4360,7 @@ impl Runtime {
                 ensure!(input["human"] == true, "native controls require the user");
                 self.native_control_local(network, input, kind).await
             }
-            "cancel_manager" | "resolve_manager_unknown" => {
+            "cancel_manager" | "reconcile" | "resolve" => {
                 self.store.lock().await.authorize_node(
                     network,
                     &message.origin,
@@ -4376,10 +4376,19 @@ impl Runtime {
                     conversation_id: Some(field(input, "conversation_id")?.into()),
                     manager: None,
                 };
-                if kind == "cancel_manager" {
-                    self.cancel_manager(&access, input).await
-                } else {
-                    self.resolve_manager_invocation(&access, input).await
+                match kind {
+                    "cancel_manager" => self.cancel_manager(&access, input).await,
+                    _ => {
+                        ensure!(
+                            field(input, "target_node")? == self.identity.peer_id()?,
+                            "pending check target mismatch"
+                        );
+                        if kind == "reconcile" {
+                            self.reconcile_local(network, input).await
+                        } else {
+                            self.resolve_local(network, input).await
+                        }
+                    }
                 }
             }
             _ => bail!("unknown peer message"),
