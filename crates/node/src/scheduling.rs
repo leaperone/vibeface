@@ -14,6 +14,8 @@ pub const MAX_PENDING_JOBS: usize = 256;
 pub enum TriggerKind {
     Human,
     Autonomous,
+    AgentTask,
+    AgentResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

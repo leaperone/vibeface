@@ -51,19 +51,15 @@ pub enum NodeRole {
     Relay,
     Replica,
     Scheduler,
-    Executor,
 }
 
 pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
     anyhow::ensure!(
         roles.contains(&NodeRole::Replica)
-            || !roles.iter().any(|role| {
-                matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
-                )
-            }),
-        "gateway, scheduler and executor roles require replica"
+            || !roles
+                .iter()
+                .any(|role| { matches!(role, NodeRole::Gateway | NodeRole::Scheduler) }),
+        "gateway and scheduler roles require replica"
     );
     Ok(())
 }
@@ -186,7 +182,6 @@ pub fn role_key(role: &NodeRole) -> &'static str {
         NodeRole::Relay => "relay",
         NodeRole::Replica => "replica",
         NodeRole::Scheduler => "scheduler",
-        NodeRole::Executor => "executor",
     }
 }
 
@@ -1265,7 +1260,7 @@ mod tests {
         right.append(GovernanceEvent::grant(
             &b,
             &right.project()?,
-            Member::node(&c, "c", vec![NodeRole::Replica, NodeRole::Executor])?,
+            Member::node(&c, "c", vec![NodeRole::Replica, NodeRole::Gateway])?,
         )?)?;
         assert_eq!(
             left.merge(&right)?

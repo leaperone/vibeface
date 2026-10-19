@@ -114,12 +114,10 @@ impl LocalIdentity {
             let peer_id = certificate.peer_id;
             let public_key = certificate.public_key;
             let mut roles = certificate.roles;
-            if roles.iter().any(|role| {
-                matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
-                )
-            }) && !roles.contains(&NodeRole::Replica)
+            if roles
+                .iter()
+                .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler))
+                && !roles.contains(&NodeRole::Replica)
             {
                 roles.push(NodeRole::Replica);
             }
@@ -183,7 +181,6 @@ fn node_role_key(role: &NodeRole) -> &'static str {
         NodeRole::Relay => "relay",
         NodeRole::Replica => "replica",
         NodeRole::Scheduler => "scheduler",
-        NodeRole::Executor => "executor",
     }
 }
 pub fn verify_signed_event(
@@ -282,6 +279,31 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             );
         }
     }
+    if let EventBody::AgentMessage { message } = &event.body {
+        vibeface_protocol::validate_id(&message.message_id).map_err(anyhow::Error::msg)?;
+        decode32(&message.target_node)?;
+        decode32(&message.origin_trigger)?;
+        ensure!(
+            event.parents.contains(&message.origin_trigger),
+            "agent origin must be a parent"
+        );
+        if message.kind == AgentMessageKind::Task {
+            ensure!(
+                message.in_reply_to.is_none() && !message.text.trim().is_empty(),
+                "agent task requires text and cannot reply to another task"
+            );
+        } else {
+            let reference = message
+                .in_reply_to
+                .as_ref()
+                .context("agent reply has no task reference")?;
+            decode32(reference)?;
+            ensure!(
+                event.parents.contains(reference),
+                "agent task reference must be a parent"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -313,14 +335,13 @@ mod tests {
             1,
             vec![owner.certificate(vec![
                 NodeRole::Scheduler,
-                NodeRole::Executor,
                 NodeRole::Relay,
                 NodeRole::Gateway,
             ])?],
         )?;
         assert!(
             all.project()?
-                .authorize_node(&owner.peer_id()?, Some(NodeRole::Executor))
+                .authorize_node(&owner.peer_id()?, Some(NodeRole::Scheduler))
                 .is_ok()
         );
         let later = owner.sign_network_fixture(2, vec![])?;
@@ -364,6 +385,54 @@ mod tests {
         assert!(verify_signed_event(&"0".repeat(64), &event, &owner.public_key_hex()?).is_err());
         let other = LocalIdentity::generate();
         assert!(verify_signed_event(&view.network_id, &event, &other.public_key_hex()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_messages_bind_valid_ids_and_causal_references() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let origin = digest(b"origin");
+        let task = digest(b"task");
+        let mut event = Event {
+            version: WIRE_VERSION,
+            network_id: identity.fixture_network_id()?,
+            scope_id: "conversation".into(),
+            author: identity.peer_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![origin.clone()],
+            created_at_ms: 0,
+            body: EventBody::AgentMessage {
+                message: AgentMessage {
+                    message_id: "work-1".into(),
+                    target_node: identity.peer_id()?,
+                    origin_trigger: origin,
+                    in_reply_to: None,
+                    kind: AgentMessageKind::Task,
+                    text: "inspect the project".into(),
+                },
+            },
+            blobs: vec![],
+        };
+        let signed = identity.sign_event(event.clone())?;
+        verify_signed_event(&event.network_id, &signed, &identity.public_key_hex()?)?;
+        let EventBody::AgentMessage { message } = &mut event.body else {
+            unreachable!()
+        };
+        message.kind = AgentMessageKind::Completed;
+        assert!(identity.sign_event(event.clone()).is_err());
+        let EventBody::AgentMessage { message } = &mut event.body else {
+            unreachable!()
+        };
+        message.in_reply_to = Some(task.clone());
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.parents.push(task);
+        assert!(identity.sign_event(event.clone()).is_ok());
+        let EventBody::AgentMessage { message } = &mut event.body else {
+            unreachable!()
+        };
+        message.target_node = "not-a-device-key".into();
+        assert!(identity.sign_event(event).is_err());
         Ok(())
     }
 }

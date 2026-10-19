@@ -3,7 +3,6 @@
 pub use vibeface_secure::membership::*;
 
 pub mod local;
-pub use local::IdentityStore;
 
 #[cfg(test)]
 mod tests {

@@ -13,8 +13,9 @@ the Codex CLI, and npm dependencies are not included in the archive.
 
 The first frame must be an `init` object. It contains `prompt`, `session_id`,
 `cwd`, optional `model`, and `codex_path`, plus optional `tool_cli` and
-`tool_env`. Paths are absolute and all fields have byte and
-count limits. An omitted or empty model uses the account's configured default.
+`tool_env`, and `read_only`, which defaults to `false`. Paths are absolute.
+All fields have byte and count limits. An omitted or empty model uses the
+account's configured default.
 The sidecar emits one `ready` frame containing the requested `session_id` and
 waits for an `ack` before invoking the model. For a fresh request, the SDK's
 first `thread.started` event is converted to a `session` frame. The sidecar
@@ -48,7 +49,8 @@ sidecar reports an uncertain `error` with `confirmation=managed_cli_exited`.
 The real adapter therefore keeps the manager job `unknown`, rather than
 claiming that cancellation succeeded. Node tool credentials are fenced and
 admitted tools are accounted for separately. Already dispatched background
-tasks and external side effects retain their original operation identities.
+tasks and external side effects retain their original task and native session
+identities.
 An uncertain invocation must not be retried under a new ID.
 
 Manager capabilities advertise streaming, cancellation requests, and local
@@ -63,16 +65,49 @@ The sidecar uses the official TypeScript SDK, which wraps `codex exec
 --experimental-json`. The SDK has no native custom-tool callback. `tool_cli` is
 therefore available through the Codex shell tool with the `vibeface_manager`
 permissions profile. Code mode, its host, and unified exec are enabled so the
-model can call that CLI. The profile denies filesystem writes; shell execution
-and network access remain available. The Codex child process and its shell use
-explicit environment-variable lists. The shell receives scoped Node tool
-credentials without the inherited Provider credential variables.
-The sidecar disables child-agent features, web search, apps, plugins, and host
-skill discovery. It requests loopback network rules, but the standalone exec
-path has not demonstrated an enforced external-domain allow-list. There is no
-shell command allow-list. Prompt instructions and the scoped CLI do not sandbox
-other shell commands; do not use this adapter as an isolation boundary for an
+model can call that CLI. Normal invocations have host filesystem write access,
+network access, and explicit access to `VIBEFACE_CODEX_SOCKET`. They can work in
+the configured directory with shell and file tools. `read_only=true` keeps
+filesystem writes disabled, retains the limited network profile, and exposes
+only the scoped read tools supplied by the Node. There is no shell command
+allow-list. Prompt instructions and scoped CLI credentials do not isolate an
 untrusted model or plugin.
+
+The Codex child process and its shell use explicit environment-variable lists.
+Normal calls pass every supplied `tool_env` entry to the child and shell, including
+`VIBEFACE_CODEX_SOCKET`, `VIBEFACE_NODE_TRIGGER`, and
+`VIBEFACE_MANAGER_ATTEMPT`. Provider credential variables stay outside the shell
+list. Cursor SDK receives the same tool environment in its actual bridge
+process. Normal Cursor calls use its default host toolset. Read-only Cursor
+calls keep the MCP-only tool selection.
+Read-only calls omit `VIBEFACE_CODEX_SOCKET`; use the scoped Node status tools
+to observe existing work. The Codex read-only profile enforces filesystem
+restrictions, but does not isolate arbitrary Unix socket access on macOS.
+The sidecar disables child-agent features, web search, apps, plugins, and host
+skill discovery. Native App Server requests retain their own approval policy.
+Neither the sidecar nor the native client answers those approvals automatically.
+
+`vibeface codex METHOD --json 'JSON_OBJECT' --socket /absolute/codex.sock`
+sends the native method and parameters without translating them into Node
+commands. `--socket` can be omitted when `VIBEFACE_CODEX_SOCKET` is set. `--watch`
+keeps the connection open and prints native notifications as JSON lines.
+To answer a pending native request, provide an explicit stdin line such as
+`{"id":27,"result":{"decision":"decline"}}`. The response must match a request
+on that connection. Closing the watcher does not interrupt background work.
+The CLI does not retry a method after disconnect or an uncertain result.
+
+After starting native work, call the Node `observe_session` tool with its exact
+thread and turn IDs. The coordinating SDK's final response does not mark that
+background work complete. The observer reads current metadata, subscribes only
+to threads already loaded on the configured Socket, and attempts read-only
+history queries to recover missed progress. The installed Codex `0.163.0`
+backend can reject resume and turn pagination with `list_turns is not supported
+yet`; live broadcasts and the exact turn cache remain usable on that connection.
+An observer connection can answer a broadcast approval and interrupt the
+original turn after the caller's short CLI connection has closed. The Node
+still requires a human response and the original task, thread, and turn match.
+A `notLoaded` thread remains unconfirmed; historical turns do not prove another
+stdio process is controllable or stopped.
 
 Select a model through `manager.model` that the configured account supports.
 An empty model uses the Codex account default. `auto` or a fast model name does

@@ -421,7 +421,7 @@ impl Runtime {
             self.config.roles.contains(&NodeRole::Replica),
             "node capability is disabled"
         );
-        let view = self.identities.public_state()?.project()?;
+        let view = store.public_state()?.project()?;
         ensure!(view.network_id == network, "wrong personal network");
         let local = self.identity.peer_id()?;
         view.authorize_node(&local, Some(NodeRole::Replica))?;
@@ -720,14 +720,18 @@ impl Runtime {
         };
         let (mut writer, mut offset, part_length) = lease.recover(committed_offset).await?;
         if offset != committed_offset {
-            let source = sources
-                .iter()
-                .find(|source| {
-                    self.authorize_blob_source_for_current(network, &source.peer_id)
-                        .is_ok()
-                })
-                .map(|source| source.peer_id.as_str())
-                .unwrap_or(&source_peer_id);
+            let source = {
+                let store = self.store.lock().await;
+                sources
+                    .iter()
+                    .find(|source| {
+                        self.authorize_blob_source_for_current(&store, network, &source.peer_id)
+                            .is_ok()
+                    })
+                    .map(|source| source.peer_id.as_str())
+                    .unwrap_or(&source_peer_id)
+            };
+
             transfer = self
                 .commit_blob_progress(network, &transfer, source, offset, part_length)
                 .await?;
@@ -816,17 +820,20 @@ impl Runtime {
         if crypto::digest(&bytes) != blob.hash {
             let (returned, part_length) = writer.reset().await?;
             writer = returned;
-            let next = ordered
-                .iter()
-                .copied()
-                .skip(1)
-                .find(|source| {
-                    *source != first_source
-                        && self
-                            .authorize_blob_source_for_current(network, source)
-                            .is_ok()
-                })
-                .unwrap_or(first_source);
+            let next = {
+                let store = self.store.lock().await;
+                ordered
+                    .iter()
+                    .copied()
+                    .skip(1)
+                    .find(|source| {
+                        *source != first_source
+                            && self
+                                .authorize_blob_source_for_current(&store, network, source)
+                                .is_ok()
+                    })
+                    .unwrap_or(first_source)
+            };
             let _ = self
                 .commit_blob_progress(network, &transfer, next, 0, part_length)
                 .await?;
@@ -837,10 +844,10 @@ impl Runtime {
             TransferPhase::Receiving { source_peer_id, .. } => source_peer_id.clone(),
             _ => unreachable!(),
         };
-        if self
-            .authorize_blob_source_for_current(network, &source)
-            .is_err()
-        {
+        let source_current = self
+            .authorize_blob_source_for_current(&*self.store.lock().await, network, &source)
+            .is_ok();
+        if !source_current {
             let last_offset = blob.size.saturating_sub(65536);
             let expected = &bytes[usize::try_from(last_offset)?..];
             let mut rebound = false;
@@ -910,8 +917,13 @@ impl Runtime {
         }
         Ok(BlobStep::Complete { changed })
     }
-    fn authorize_blob_source_for_current(&self, network: &str, source: &str) -> Result<()> {
-        let view = self.identities.public_state()?.project()?;
+    fn authorize_blob_source_for_current(
+        &self,
+        store: &Store,
+        network: &str,
+        source: &str,
+    ) -> Result<()> {
+        let view = store.public_state()?.project()?;
         ensure!(
             self.config.roles.contains(&NodeRole::Replica) && view.network_id == network,
             "replica network unavailable"
@@ -1446,7 +1458,11 @@ mod tests {
         receiver.install_membership(membership).await?;
         assert!(
             receiver
-                .authorize_blob_source_for_current(&network, &retired_id)
+                .authorize_blob_source_for_current(
+                    &*receiver.store.lock().await,
+                    &network,
+                    &retired_id
+                )
                 .is_err()
         );
         let requests = Arc::new(Mutex::new(Vec::<usize>::new()));

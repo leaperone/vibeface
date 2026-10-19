@@ -298,7 +298,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("this package needs a manual bootstrap to the updater-enabled release")?;
     ensure!(
-        manifest.update_protocol == 2 && manifest.data_epoch == 4,
+        manifest.update_protocol == 2 && manifest.data_epoch == 5,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
@@ -893,7 +893,7 @@ mod tests {
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":4}}"#),
+            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":5}}"#),
         )
         .unwrap();
         directory
@@ -926,13 +926,13 @@ mod tests {
         assert_eq!(installed(&root).unwrap(), new);
         fs::write(
             old.join("BUILD-INFO.json"),
-            r#"{"version":"1.0.0","update_protocol":2,"data_epoch":2}"#,
+            r#"{"version":"1.0.0","update_protocol":2,"data_epoch":4}"#,
         )
         .unwrap();
         assert!(manifest(&old).is_err());
         fs::write(
             old.join("BUILD-INFO.json"),
-            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":4}"#,
+            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":5}"#,
         )
         .unwrap();
         assert!(manifest(&old).is_err());
@@ -1058,8 +1058,7 @@ mod tests {
             .unwrap();
         let identity = crate::crypto::LocalIdentity::generate();
         persist(&data.join("identity.json"), &identity).unwrap();
-        fs::write(data.join("auth.sqlite3"), b"account-session-history").unwrap();
-        fs::write(data.join("node.sqlite3"), b"operations-and-deduplication").unwrap();
+        fs::write(data.join("node.sqlite3"), b"tasks-and-deduplication").unwrap();
         fs::write(data.join("node.sqlite3-wal"), b"uncheckpointed-events").unwrap();
         let previous = package(&root, "1.0.0");
         let candidate = package(&root, "1.1.0");
@@ -1090,7 +1089,6 @@ mod tests {
                 "identity.json",
                 "config.json",
                 "node.sqlite3",
-                "auth.sqlite3",
                 "node.sqlite3-wal",
             ];
             let before: Vec<_> = filenames
@@ -1151,7 +1149,7 @@ mod tests {
         assert!(!data.join("update-pending.json").exists());
         assert_eq!(
             fs::read(data.join("node.sqlite3")).unwrap(),
-            b"operations-and-deduplication"
+            b"tasks-and-deduplication"
         );
         drop(lock);
         assert!(update_lock(&data).is_ok());
