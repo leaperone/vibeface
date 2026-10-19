@@ -4710,7 +4710,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
                                           "directory_stream_delivers_before_slow_reply_and_drop_releases_sockets",
                                           "records_expiring_while_waiting_for_state_are_not_stored_or_delivered"]),
                                   ("d2", ["publication_preserves_relay_changes_during_an_inflight_publish",
-                                          "legacy_reservation_publish_full_keeps_reservation_but_invalid_record_closes_it",
+                                          "reservation_rejects_publish_and_public_full_publish_is_not_acknowledged",
                                           "relay_refusal_does_not_republish_and_duplicate_entries_do_not_duplicate_tasks",
                                           "directory_operations_have_one_deadline_across_welcome_and_reply"])):
             manifest_path = evidence_dir / f"m3-{slice_name}-core-slice.json"
