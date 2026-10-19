@@ -82,7 +82,10 @@ function withCode(request: JoinRequest): JoinRequest {
 async function discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | null> {
   const url = new URL(location.href)
   if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null
-  const response = await fetch('/api/local/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', cache: 'no-store', credentials: 'omit', signal })
+  let response: Response
+  // The Gateway serving this origin may be down while the shell comes from the service worker.
+  try { response = await fetch('/api/local/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', cache: 'no-store', credentials: 'omit', signal }) }
+  catch (cause) { if (signal.aborted) throw cause; return null }
   if (response.status === 404) return null
   if (!response.ok) throw new Error('无法读取这台电脑的本机设置。请检查本机地址并刷新页面。')
   return parseLocalSetup(await response.json(), url.origin)
@@ -633,6 +636,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (local?.kind === 'initialized') {
           const opening = connect(local.entry); version = generation.current
           void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
+          return
+        }
+        const last = loadAuthenticated()
+        if (last && !last.entry.local) {
+          // Resume this browser's network through its entrances, starting with the last one used.
+          reconnect.current = { entry: last.entry, networkId: last.networkId, attempt: 0 }
+          setPhase('reconnecting'); scheduleReconnect(true)
           return
         }
         if (!shouldAutoConnect({ hasInvitation: false, savedCount: savedEntries().length })) return

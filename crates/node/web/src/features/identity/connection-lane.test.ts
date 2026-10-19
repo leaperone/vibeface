@@ -655,6 +655,20 @@ test('unexpected closure reconnects the same target with fresh authentication an
   } finally { app.close() }
 })
 
+test('a reload resumes the last network through its entrances even with several saved addresses', async () => {
+  const other: ConnectionEntry = { address: 'https://other.example', device_id: remote }
+  const storage = new Map([['vibeface.connections', JSON.stringify([other, entry])], ['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])
+  const app = deviceHarness({ storage })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().phase, 'reconnecting')
+    const [id, resume] = [...app.timers.entries()][0]
+    app.timers.delete(id); resume(); await settle()
+    assert.equal(app.render().ready?.entry.device_id, target)
+    assert.deepEqual(app.calls.slice(0, 3), [`open:${target}`, 'info', 'authenticate'])
+  } finally { app.close() }
+})
+
 test('revoked authorization stops reconnection and releases the rejected session', async () => {
   const app = deviceHarness({ saved: true })
   try {
