@@ -1,5 +1,6 @@
 import { HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'
 import { ViewportHeight } from '@/components/viewport-height'
+import { themeScript } from '@/lib/theme'
 
 import appCss from '../styles.css?url'
 
@@ -17,6 +18,7 @@ export const Route = createRootRoute({
         title: 'Vibeface',
       },
     ],
+    scripts: [{ children: themeScript }],
     links: [
       {
         rel: 'stylesheet',
