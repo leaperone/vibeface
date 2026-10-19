@@ -3,6 +3,7 @@ import { Reasoning } from '@/components/ai-elements/reasoning'
 import { Task } from '@/components/ai-elements/task'
 import { Tool } from '@/components/ai-elements/tool'
 import { StatusOrb } from '@/components/status-orb'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceLine, TraceTitle } from '@/components/ui/trace'
 import type { OrbPlace } from './orb-state'
 import { useWorkspace } from '@/features/workspace/context'
@@ -12,6 +13,7 @@ import { PromptInput } from './elements/prompt-input'
 import { canSend, composerHint } from './protocol'
 import { AgentTaskActivity, NativeSessionActivity } from '@/features/workspace/task-activity'
 import { stateLabel } from '@/features/workspace/labels'
+import type { AutonomyMode } from '@/features/workspace/types'
 import { ManagerStatus, managerTraceStatus, managerTraceTitle } from './elements/manager-status'
 import './chat.css'
 
@@ -111,6 +113,18 @@ export function ConversationScreen() {
             </TraceCollapsibleContent>
           </TraceCollapsible>
         </Trace>
+      </div> : null}
+      {data && workspace.selectedBot ? <div className="autonomy-control">
+        <label htmlFor="autonomy-mode">收到结果后</label>
+        <NativeSelect id="autonomy-mode" size="sm" value={data.autonomy.mode} disabled={!workspace.writable || data.autonomy.version === null} onChange={(event) => {
+          const mode = event.currentTarget.value as AutonomyMode
+          void workspace.run(() => workspace.setAutonomy(mode))
+        }}>
+          <NativeSelectOption value="off">停止后续</NativeSelectOption>
+          <NativeSelectOption value="report">只汇报</NativeSelectOption>
+          <NativeSelectOption value="continue">继续工作</NativeSelectOption>
+        </NativeSelect>
+        <span>{data.autonomy.version === null ? '授权记录无法读取' : `版本 ${data.autonomy.version}`}</span>
       </div> : null}
       <PromptInput
         value={text}

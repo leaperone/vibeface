@@ -134,7 +134,7 @@ WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"d
 
 独立回环 listener 提供 `/api/local/info`、`/api/local/launch`、`/api/local/exchange` 和 `/api/local/ws`。`launch` 仅接受本机私有启动凭据，`exchange` 消费单次 token 后签发绑定浏览器公钥的 Cookie，`ws` 仍执行 Noise 握手。公开 router 不挂这些入口。仅检查来源 IP、Host 或代理头不足以建立本机授权。关闭 `local_auto_access` 会撤销本机会话、待兑换 token 和连接，普通成员会话保留。
 
-`/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不是供外部 Bot 保存的长期身份，不能添加或撤销设备、回答审批或验收工单。管理 SDK 使用独立随机端口的回环 listener，不依赖公网或 LAN 地址。
+`/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不是供外部 Bot 保存的长期身份，不能添加或撤销设备、回答审批或修改后续授权。管理 SDK 使用独立随机端口的回环 listener，不依赖公网或 LAN 地址。
 
 HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目标入队以版本化调度回执为准，工作是否完成仍查询持久任务、准确原生 turn 及结果。
 
@@ -149,11 +149,9 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project` | 本人显式创建机器人并绑定独立聊天历史；完整请求精确去重 |
 | `conversations` | 无 | 本地已知业务会话 |
 | `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
-| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、`agent_tasks`、`native_sessions`、观察目标、heads、missing、调度队列及事实新鲜度 |
+| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、`autonomy`、`agent_tasks`、`native_sessions`、观察目标、heads、missing、调度队列及事实新鲜度 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node`、`report_results` | 原子保存用户消息、汇报意图和本机 inbox 或 outbox，返回调度回执 |
-| `create_task` | `conversation_id`、`task_id`、`title`、`goal`、`acceptance` | 创建显式长期任务；`auto_followup=true` 被拒绝，授权使用 `set_followup` |
-| `update_task` | `conversation_id`、`task_id`、`status`、`detail` | 追加长期任务状态变化 |
-| `set_followup` | `conversation_id`、`task_id`、`mode`、`expected_version`、可选 `scheduler_node` | 本人设置具体任务的后续权限，模式为 `off`、`report` 或 `continue` |
+| `set_autonomy` | `conversation_id`、`mode`、`expected_version`、可选 `scheduler_node` | 本人设置该机器人聊天的后续权限，模式为 `off`、`report` 或 `continue` |
 | `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示后台任务已停止 |
 | `resolve_manager_unknown` | `conversation_id`、`trigger`、`evidence` | 本人核对旧管理轮、子任务及原生工作后解除管理写冻结，不重做旧触发 |
 | `cancel_agent_task` | `conversation_id`、`task_ref` | 沿原任务向目标 Agent 请求取消，核对实际停止后回传终态 |
@@ -164,9 +162,7 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | `ack` | `notification_id`、`client_id` | 记录该客户端已读 |
 | `export` | `conversation_id` | 导出包含签名事件的快照 |
 
-长期任务状态为 `open`、`working`、`blocked`、`needs_review`、`accepted` 或 `cancelled`。`accepted` 和 `cancelled` 只能由本人设置，Agent 不能将它们改回活动状态。
-
-`bot_id`、`message_id`、`conversation_id`、`task_id`、`task_ref` 和 `call_ref` 标识业务写入及原调用。重试保留原身份、内容和目标；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`send_task`、`task_status`、`call_lookup`、`cancel_task` 和 `observe_session`。只读结果回调只得到查询工具，本机 Shell 和文件工作使用宿主 SDK 工具。
+`bot_id`、`message_id`、`conversation_id`、`task_ref` 和 `call_ref` 标识业务写入及原调用。重试保留原身份、内容和目标；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`send_task`、`task_status`、`call_lookup`、`cancel_task` 和 `observe_session`。只读结果回调只得到查询工具，本机 Shell 和文件工作使用宿主 SDK 工具。
 
 Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入或重建同版本定义不启动模型。
 
@@ -176,7 +172,7 @@ Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模
 
 `conversation.scheduler` 包含 `jobs`、`provider`、`model`、`capabilities` 和 `write_frozen`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human`、`autonomous`、`agent_task` 或 `agent_result`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
 
-长期任务保留 `followup_mode` 和 `followup_version`。`agent_tasks` 包含 `task_ref`、来源与目标 Node、`origin_trigger`、`state`、任务文本和结果说明。`native_sessions` 包含 `work_id`、可选 `task_ref`、目标 Node、准确 thread 与 turn、状态、说明和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
+`autonomy` 包含 `mode`、`version` 和 `scheduler_node`；授权链无法验证时 `mode` 为 `off`、`version` 为 `null` 并附带 `error`。`agent_tasks` 包含 `task_ref`、来源与目标 Node、`origin_trigger`、`state`、任务文本和结果说明。`native_sessions` 包含 `work_id`、可选 `task_ref`、目标 Node、准确 thread 与 turn、状态、说明和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
 
 原生控制按已登记的 `work_id` 找到原 thread 和 turn，再核对目标、会话及当前有效请求。审批仅本人可回答，过期请求被拒绝。中断请求发出或 SDK 进程退出都不直接证明后台工作已经停止。
 
@@ -243,7 +239,7 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 
 取消沿原任务和原目标发送。排队任务可在启动前原子取消；运行中的任务封存旧工具权限并请求中断真实工作。`cancelling` 或 `interrupting` 仅表示请求中，不能直接回报已停止。无法证明 SDK 或后台进程停止时保留 `unknown`，不换 ID 或设备重跑。一个原生 turn 结束不能解除存在其他未知副作用的管理轮。
 
-本地自动访问与任务、授权记录都使用当前数据格式。单一 `node.sqlite3` 使用 `user_version=5`，制品声明 `data_epoch=5`。Atlas HCL 为 `crates/node/schema.hcl`，`migrations/` 只保留 `202610180001_initial.sql` 和 `atlas.sum`。此版本不迁移或清理旧数据目录。
+本地自动访问与授权记录都使用当前数据格式。单一 `node.sqlite3` 使用 `user_version=5`，制品声明 `data_epoch=5`。Atlas HCL 为 `crates/node/schema.hcl`，`migrations/` 只保留 `202610180001_initial.sql` 和 `atlas.sum`。此版本不迁移或清理旧数据目录。
 
 ## 事件 DAG
 
@@ -265,7 +261,7 @@ Event {
 
 `previous` 和 `sequence` 校验同一作者的来源链，`parents` 引用当前事件依据的因果前项。父引用和附件列表按序去重。`created_at_ms` 不决定唯一全局顺序，也不能覆盖并发分支。
 
-正文类型包括 `conversation_created`、`bot_created`、`message_posted`、`task_created`、`task_changed`、`agent_message`、`decision_recorded`、`notification_raised`、`notification_acknowledged` 和 `context_checkpoint`。
+正文类型包括 `conversation_created`、`bot_created`、`message_posted`、`agent_message`、`decision_recorded`、`notification_raised`、`notification_acknowledged` 和 `context_checkpoint`。
 
 投影前检查网络、作者证书、签名、hash、来源链、因果依赖及附件。缺口和来源分叉分别保留在 `missing.events`、`missing.blobs` 与 `missing.conflicts`。必要历史未齐或冲突未处理时，禁止继续调度和执行。
 
@@ -362,13 +358,13 @@ Presence 的每个来源绑定邻居和 `Link.id`，有效期由原签名时间�
 
 普通进度、审批提醒和结果通知不调用管理模型。无人在线时保留通知，重新连接后读取。浏览器系统提醒是可选客户端功能，不等于网页关闭后的手机推送。
 
-后续权限使用 `DecisionRecorded.tool_configuration` 中带类型的签名记录，类型为 `followup_intent_v1`、`task_origin_v1` 和 `task_followup_grant_v1`。自然语言或模型传入的参数不构成授权。
+后续权限使用 `DecisionRecorded.tool_configuration` 中带类型的签名记录，类型为 `followup_intent_v1` 和 `conversation_autonomy_v1`。自然语言或模型传入的参数不构成授权。
 
 `message.report_results` 默认 `true`。汇报意图固定原消息 hash、网络、会话和目标 Scheduler，Agent 任务通过签名消息中的 `origin_trigger` 关联原消息，终态只触发只读总结，不创建隐藏 Task。`false` 保存明确的 `off` 意图，重试不能改变。原始结果与通知始终保留，模型不能借回调获得新的写权限。
 
-`set_followup` 仅本人可用，固定到现有任务的 `task_ref`。`off` 禁止自主后续，`report` 只允许读取结果并保存最终 assistant 回答，`continue` 允许在本任务范围内继续业务工作。稳定 grant ID 配合单调版本，`expected_version` 必须使用会话快照返回的当前 `followup_version`。并发或旧版本修改被拒绝，既有授权不能用重试改变目标。
+`set_autonomy` 仅本人可用，Agent token 不能调用，授权按机器人聊天生效。`off` 停止该聊天的自主后续，`report` 只允许读取结果并保存最终 assistant 回答，`continue` 允许固定的 Scheduler 收到结果后继续业务工作。未设置时等同版本 `0` 的 `report`。每条记录携带递增 `version` 和上一版本的 `previous_head`，`expected_version` 必须使用会话快照返回的当前 `autonomy.version`。并发或旧版本修改被拒绝；同一版本出现两条记录或版本链断开时，后续失效直到本人核对。省略 `scheduler_node` 时沿用当前目标，首次授权按新消息的规则选择 Scheduler。其他 Scheduler 收到的结果只做只读汇报。
 
-领取后续、签发工具权限及每次业务写入前都复核本机已验证的最新授权、任务状态和版本。撤销封存旧权限；离线节点尚未获知撤销时，不保证全网立即停止。审批、验收与未知确认始终由本人处理。
+领取后续、签发工具权限及每次工具调用前都复核本机已验证的最新会话授权和版本，写入还要求 `continue`。撤销封存旧权限；离线节点尚未获知撤销时，不保证全网立即停止。审批、验收与未知确认始终由本人处理。
 
 目标 Agent 的终态、关联结果事件及回投 outbox 在同一事务保存。来源验证原任务和汇报政策后调度一次只读收尾。原生 turn 结束与协调 SDK 结束分别记录，只有所有已登记工作均有真实终态才完成任务。结果未知时保留状态并查询原调用，不因超时再派给另一台。未授权模型后续不影响原始结果与通知保存。
 

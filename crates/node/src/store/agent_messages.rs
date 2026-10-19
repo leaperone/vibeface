@@ -1931,7 +1931,7 @@ mod tests {
                     .attempt()
                     .context("human report attempt missing")?;
                 assert!(attempt.read_only);
-                assert_eq!(attempt.followup_version, Some(1));
+                assert_eq!(attempt.followup_version, Some(0));
             }
             cleanup(store)?;
         }

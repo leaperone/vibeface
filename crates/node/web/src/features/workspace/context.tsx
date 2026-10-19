@@ -14,7 +14,7 @@ import {
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
-  ConversationPayload, NodeInfo, NotificationRecord,
+  AutonomyMode, ConversationPayload, NodeInfo, NotificationRecord,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject,
 } from "./types"
 
@@ -375,6 +375,23 @@ function useWorkspaceState(connection: ReadyConnection) {
       else if (receipt.cancel_requested === true && job.state === "cancelled") setNoticeText("本轮回复已停止。已派出的任务和原生工作会继续。")
       else if (receipt.cancel_requested === true) setNoticeText("已提交停止本轮回复。已派出的任务和原生工作会继续，最终状态以核对结果为准。")
       else setNoticeText("本轮当前状态未接受停止请求，请核对最新状态。")
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    setAutonomy: (mode: AutonomyMode) => withMutation(`autonomy:${activeId.current}`, async () => {
+      const id = activeId.current, context = requireBotContext(id)
+      const version = context.autonomy.version
+      if (version === null) throw new Error("后续授权记录无法读取，请先核对对话。")
+      try { await connection.rpc("set_autonomy", { conversation_id: id, mode, expected_version: version }) }
+      catch (caught) {
+        if (messageOf(caught).includes("refresh")) {
+          if (activeId.current === id) await refreshRef.current()
+          throw new Error("后续授权已在别处更改，已刷新。请确认当前设置后再改。")
+        }
+        requireControlRefresh()
+        throw caught
+      }
+      requireCurrent()
+      setNoticeText(mode === "off" ? "已停止这个对话的后续。" : mode === "report" ? "后续只汇报结果，不再继续动手。" : "已允许 Agent 收到结果后继续工作。")
       if (activeId.current === id) await refreshRef.current()
     }),
     cancelAgentTask: (taskRef: string) => withMutation(`cancel-task:${taskRef}`, async () => {

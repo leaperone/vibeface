@@ -16,8 +16,6 @@ CREATE TABLE `blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `size` i
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
 CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `message_id` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `ordinal` integer NOT NULL, PRIMARY KEY (`network_id`, `event_hash`));
--- Create "tasks" table
-CREATE TABLE `tasks` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `task_id` text NOT NULL, `title` text NOT NULL, `goal` text NOT NULL, `acceptance` text NOT NULL, `status` text NOT NULL, `detail` text NOT NULL, `event_hash` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `task_id`));
 -- Create "notification_outbox" table
 CREATE TABLE `notification_outbox` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `record` text NOT NULL, `derived` integer NOT NULL DEFAULT 0, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table

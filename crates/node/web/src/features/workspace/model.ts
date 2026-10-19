@@ -1,6 +1,6 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
-  AgentTaskRecord, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
+  AgentTaskRecord, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
   HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot,
 } from "./types"
 
@@ -108,12 +108,25 @@ function nativeSession(value: unknown): NativeSessionRecord {
     detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
   }
 }
+function autonomyMode(value: unknown): AutonomyMode {
+  switch (value) {
+    case "off": case "report": case "continue": return value
+    default: throw new Error("未知的后续授权模式。")
+  }
+}
+function autonomy(value: unknown): ConversationAutonomy {
+  const data = record(value)
+  return {
+    mode: autonomyMode(data.mode), version: data.version === null ? null : number(data.version),
+    scheduler_node: data.scheduler_node == null ? "" : text(data.scheduler_node), error: optionalText(data.error),
+  }
+}
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
   const data = record(value), missing = record(data.missing)
   const owner = data.conversation === null ? null : conversation(data.conversation)
   if (expectedId && owner?.conversation_id !== expectedId) throw new Error("节点返回了其他会话，已暂停操作。")
   return {
-    conversation: owner, messages: list(data.messages).map(message), heads: texts(data.heads),
+    conversation: owner, messages: list(data.messages).map(message), autonomy: autonomy(data.autonomy), heads: texts(data.heads),
     missing: { events: texts(missing.events), blobs: list(missing.blobs), conflicts: texts(missing.conflicts) },
     agent_tasks: list(data.agent_tasks).map(agentTask),
     native_sessions: list(data.native_sessions).map(nativeSession),

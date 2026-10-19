@@ -56,9 +56,12 @@ export type SchedulerSnapshot = {
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type MissingContext = { events: string[]; blobs: unknown[]; conflicts: string[] }
+export type AutonomyMode = "off" | "report" | "continue"
+export type ConversationAutonomy = { mode: AutonomyMode; version: number | null; scheduler_node: string; error?: string }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
+  autonomy: ConversationAutonomy
   heads: string[]
   missing: MissingContext
   agent_tasks: AgentTaskRecord[]

@@ -124,7 +124,6 @@ impl Runtime {
         &self,
         access: &Access,
         write: bool,
-        task: Option<&str>,
     ) -> Result<Option<OwnedRwLockReadGuard<()>>> {
         let Some(manager) = &access.manager else {
             return Ok(None);
@@ -150,7 +149,7 @@ impl Runtime {
             !write || !manager.read_only,
             "this management invocation is read-only"
         );
-        Self::check_manager_permission(&*self.store.lock().await, access, write, task)?;
+        Self::check_manager_permission(&*self.store.lock().await, access, write)?;
         Ok(Some(guard))
     }
 
@@ -158,7 +157,6 @@ impl Runtime {
         store: &crate::store::Store,
         access: &Access,
         write: bool,
-        task: Option<&str>,
     ) -> Result<()> {
         let Some(manager) = &access.manager else {
             return Ok(());
@@ -179,19 +177,13 @@ impl Runtime {
             "management invocation permission is no longer valid"
         );
         if let Some(version) = manager.followup_version {
-            if write {
-                ensure!(
-                    task.is_some(),
-                    "autonomous follow-up cannot create unrelated work"
-                );
-            }
             store.validate_latest_manager_policy(
                 &access.network_id,
                 scope,
                 &manager.trigger,
                 &manager.target_node,
                 version,
-                if write { task } else { None },
+                write,
             )?;
         }
         Ok(())

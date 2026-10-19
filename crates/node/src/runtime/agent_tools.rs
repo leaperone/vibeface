@@ -57,7 +57,7 @@ impl Runtime {
         );
         let lease = tokio::time::timeout(
             Duration::from_secs(20),
-            self.manager_tool_lease(&access, write, None),
+            self.manager_tool_lease(&access, write),
         )
         .await
         .context("agent tool admission timed out")??;
@@ -234,7 +234,7 @@ impl Runtime {
             current.project()?.authorize_node(&local, None)?;
             store.authorize_node(&access.network_id, &local, None)?;
             ensure!(store.has_conversation(&access.network_id, scope)?, "conversation not found");
-            Self::check_manager_permission(&store, access, false, None)?;
+            Self::check_manager_permission(&store, access, false)?;
             let expected = store.context_blob_ref(&access.network_id, scope, hash)?;
             let size = usize::try_from(expected.size)?;
             ensure!(size <= MAX_BLOB_BYTES, "blob size limit exceeded");

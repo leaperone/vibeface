@@ -194,48 +194,6 @@ table "messages" {
     columns = [column.network_id, column.event_hash]
   }
 }
-table "tasks" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "conversation_id" {
-    null = false
-    type = text
-  }
-  column "task_id" {
-    null = false
-    type = text
-  }
-  column "title" {
-    null = false
-    type = text
-  }
-  column "goal" {
-    null = false
-    type = text
-  }
-  column "acceptance" {
-    null = false
-    type = text
-  }
-  column "status" {
-    null = false
-    type = text
-  }
-  column "detail" {
-    null = false
-    type = text
-  }
-  column "event_hash" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.conversation_id, column.task_id]
-  }
-}
 table "notification_outbox" {
   schema = schema.main
   column "network_id" {

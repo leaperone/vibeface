@@ -2398,8 +2398,8 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     require((directory / "count.txt").read_text() == "once" and len(invocations(run, "task-once")) == 1,
             "retried send_task performs exactly one target-host side effect")
     history = c.client.rpc("conversation", conversation_id=name)
-    require(history["tasks"] == [] and len(history["agent_tasks"]) == 1,
-            "ordinary Agent work creates no hidden business Task or execution binding")
+    require("tasks" not in history and history["autonomy"]["version"] == 0 and len(history["agent_tasks"]) == 1,
+            "ordinary Agent work creates no hidden business Task and grants no conversation autonomy")
     endings = [event["body"]["message"] for event in local_events(c, network, name)
                if event["body"].get("type") == "agent_message" and event["body"]["message"].get("in_reply_to") == task["task_ref"]
                and event["body"]["message"]["kind"] in {"completed", "failed", "interrupted"}]
@@ -3273,10 +3273,11 @@ def acceptance(options):
         other.command("connect", url=a.url, peer_id=a.peer_id, connection="foreign")
         other.call("authenticate", {"network_id": network}, connection="foreign", status=401)
         other.call("rpc", {"method": "nodes"}, connection="foreign", status=401)
-        conversation, task_id = "acceptance-conversation", "acceptance-task"
+        conversation = "acceptance-conversation"
         a.client.rpc("create_conversation", conversation_id=conversation, title="Failover acceptance")
-        a.client.rpc("create_task", conversation_id=conversation, task_id=task_id, title="Explicit acceptance",
-                     goal="Keep history across node changes", acceptance="User accepts explicitly")
+        require(a.client.rpc("set_autonomy", conversation_id=conversation, mode="report", expected_version=0)["autonomy"]["version"] == 1,
+                "the user's explicit conversation autonomy grant starts a version chain")
+        a.client.rpc("set_autonomy", conversation_id=conversation, mode="continue", expected_version=0, status=400)
         text = "Keep this context after A disconnects."
         initial = a.client.rpc("message", conversation_id=conversation, message_id="message-original", text=text)
         require(a.client.rpc("message", conversation_id=conversation, message_id="message-original", text=text)["trigger"] == initial["trigger"],
@@ -3284,7 +3285,7 @@ def acceptance(options):
         a.client.rpc("message", conversation_id=conversation, message_id="message-original", text="changed", status=400)
         other.rpc("conversation", conversation_id=conversation, status=400)
         require(other.rpc("conversations")["conversations"] == [], "another network cannot list private conversation history")
-        wait_for("C imports the exact private history", lambda: shared_history(c.client, conversation, task_id))
+        wait_for("C imports the exact private history", lambda: shared_history(c.client, conversation))
         require(text.encode() not in b"".join(capture.payloads) and not capture.errors,
                 "public relay never receives the private conversation as plaintext")
         with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
@@ -3321,8 +3322,8 @@ def acceptance(options):
                 "source loss and entry restart never repeat a target-host side effect")
         wait_for("C imports the complete result attachment", lambda: verify_blobs(c, network) >= 1)
         count = verify_snapshot(c.client.rpc("export", conversation_id=conversation))
-        require(next(row for row in c.client.rpc("conversation", conversation_id=conversation)["tasks"]
-                     if row["task_id"] == task_id)["status"] != "accepted", "Agent completion never accepts the user's business Task")
+        autonomy = c.client.rpc("conversation", conversation_id=conversation)["autonomy"]
+        require((autonomy["mode"], autonomy["version"]) == ("report", 1), "Agent completion never changes the user's conversation autonomy")
         c.client.rpc("notifications", client_id=laptop, status=403)
         c.client.rpc("ack", notification_id=notification, client_id=laptop, status=403)
         c.client.rpc("ack", notification_id=notification, client_id=phone)
@@ -5637,12 +5638,11 @@ def network_reliability_acceptance(options):
         database = receiver.directory / "node.sqlite3"
         with sqlite3.connect(database, timeout=10) as connection:
             connection.execute("CREATE TABLE net1_projection_audit(table_name TEXT, operation TEXT)")
-            for table in ("conversations", "messages", "tasks", "events"):
+            for table in ("conversations", "messages", "events"):
                 for operation in ("INSERT", "UPDATE", "DELETE"):
                     connection.execute(f"CREATE TRIGGER net1_{table}_{operation.lower()} AFTER {operation} ON {table} "
                                        f"BEGIN INSERT INTO net1_projection_audit VALUES('{table}','{operation}'); END")
-        source.client.rpc("create_task", conversation_id=conversation, task_id="net1-baseline-task",
-                          title="NET-1 baseline", goal="Preserve signed history", acceptance="Verified fixture")
+        source.client.rpc("set_autonomy", conversation_id=conversation, mode="off", expected_version=0)
         baseline = wait_for("audit positive control imports a real new event",
                             lambda: (value if len(value["events"]) == 2 else None)
                             if (value := receiver.client.rpc("export", conversation_id=conversation)) else None)
@@ -5676,7 +5676,7 @@ def network_reliability_acceptance(options):
             require(positive_writes > 0, "database audit observes actual projection writes before the no-op check")
             if lane == 1:
                 projection = {table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
-                              for table in ("conversations", "messages", "tasks")}
+                              for table in ("conversations", "messages")}
             connection.execute("DELETE FROM net1_projection_audit")
         started = time.monotonic()
         if lane == 1:
@@ -5805,10 +5805,10 @@ def network_reliability_acceptance(options):
             private_json(evidence_path, report)
 
 
-def shared_history(client, conversation, task):
+def shared_history(client, conversation):
     result = client.rpc("conversation", conversation_id=conversation)
     return result if (any(message["message_id"] == "message-original" for message in result["messages"])
-                      and any(row["task_id"] == task for row in result["tasks"])
+                      and result["autonomy"]["version"] == 1
                       and not any(result["missing"].values())) else None
 
 
