@@ -213,7 +213,7 @@ queued → claimed → running ─→ completed | failed
 
 停止回复只停止管理轮。Node 封存旧 attempt 的工具权限并排空已接纳工具，SDK 确认受管进程已退出后 job 进入 `cancelled`；已发起的原生 turn 和 Agent 任务继续独立观察和汇报，停止原生 turn 用 `native_interrupt`。`cancelling` 不是停止成功。SDK 进程退出无法确认时 job 进入 `interrupted`，并在原目标登记一条 `manager:<attempt>` 待核对记录。`interrupted` 是终态，不冻结会话，后续消息照常处理。
 
-待核对记录统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `native_turn`，`freshness` 表示本机观察或缓存。管理进程记录关联该 attempt 的 SDK 进程组、它登记的原生 turn 和它发起的 Agent 任务 job；它签发的工具 token 已封存，不需再核对。`reconcile` 在原目标只读复查：管理进程项探测记录的进程组是否已退出，并列出关联原生 turn 和 Agent 任务的当前状态；原生项只读补查原 turn。shell 和网络副作用无法查询，只能由本人附证据 `resolve`。管理进程项要求记录的进程组均已退出、关联原生 turn 均有终态；原生项由本人给出 `completed`、`failed` 或 `interrupted`。模型不能结清待核对，结论不重跑旧 trigger。
+待核对记录统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `native_turn`，`freshness` 表示本机观察或缓存。管理进程记录关联该 attempt 的 SDK 进程组、它登记的原生 turn 和它发起的 Agent 任务 job；它签发的工具 token 已封存，不需再核对。`reconcile` 在原目标只读复查：管理进程项探测记录的进程组是否已退出，并列出关联原生 turn 和 Agent 任务的当前状态；原生项只读补查原 turn。管理 SDK 的文件系统只读、网络仅限本机回环；进程存活期间经回环产生的副作用无法查询，只能由本人附证据 `resolve`。管理进程项要求记录的进程组均已退出、关联原生 turn 均有终态；原生项由本人给出 `completed`、`failed` 或 `interrupted`。模型不能结清待核对，结论不重跑旧 trigger。
 
 `interrupted` 的 Agent 任务在待核对结清、关联工作结束前不回传结果，来源端 `agent_tasks` 显示 `pending_check`，不显示运行中。结清后目标端汇报实际结果或中断结果，不重发原任务。
 

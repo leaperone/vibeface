@@ -133,7 +133,7 @@ export function PendingCheckItem({ check }: { check: PendingCheck }) {
   return <section className="grid min-w-0 gap-3 rounded-lg border p-3" aria-label="待核对">
     <div className="flex flex-wrap items-center gap-2"><StatusBadge value="pending" label={check.kind === "native_turn" ? "原生工作待核对" : "管理进程待核对"} /><span className="text-xs text-muted-foreground">{nodeName(check.target_node, { nodes: workspace.nodes, directory })}{check.freshness === "cached" ? " · 上次记录" : ""}</span></div>
     {check.detail ? <p className="whitespace-pre-wrap break-words text-sm">{check.detail}</p> : null}
-    <p className="text-sm text-muted-foreground">{check.kind === "native_turn" ? "复查只读取原轮次。查不到时，请本人确认实际结果。" : "复查只确认进程是否退出。shell 和网络副作用需本人核对后提交证据。"}</p>
+    <p className="text-sm text-muted-foreground">{check.kind === "native_turn" ? "复查只读取原轮次。查不到时，请本人确认实际结果。" : "复查只确认进程是否退出。进程运行期间的副作用需本人核对后提交证据。"}</p>
     {summary ? <p role="status" className="text-sm">{summary}</p> : null}
     <div><ActionButton className="min-h-11" disabled={disabled} action={() => workspace.run(async () => { setSummary(reconcileSummary(await workspace.reconcileCheck(check))) })}>复查原目标</ActionButton></div>
     <form className="space-y-3" onSubmit={(event) => {
