@@ -14,6 +14,7 @@ Vibeface 现在用自研的 WebSocket 会合目录、relay 预约、Presence 多
 - 同步只交换 `{设备: 最大序号}`，按 `(作者, 起始序号)` 批量拉取，事件入库时验签一次，投影增量更新。
 - 任何 Web 入口和任何调度节点看到同一份会话上下文，协调层每轮上下文只从 DAG 构造。
 - 浏览器、手机和 Node 用同一种 ticket 加入，用户只核对一次 6 位短码。
+- 本人的某台 Gateway 离线时，浏览器自动切到同一个人网络中另一台可用的 Gateway，设备身份不变，继续读写同一份会话。入口地址只在个人网络内部传播。
 
 非目标：
 
@@ -57,7 +58,7 @@ flowchart LR
 
 每台 Node 运行一个 iroh `Endpoint`，用自己的设备密钥作为 `SecretKey`。Node 之间只走 iroh QUIC，连接优先打洞直连，失败时经 relay 转发密文。启用 `relay` 的 Node 同时运行 iroh relay 服务，个人网络的其他 Node 把它作为 home relay。
 
-浏览器不运行 iroh。它连接 HTTPS 页面所在 Gateway Node 的 `/api/client` WebSocket，在其上与目标 Node 完成 Noise 握手。目标就是 Gateway 时，Noise 在 Gateway 终止。目标是另一台 Node 时，Gateway 经 iroh 的 `vibeface/client/1` 原样转发 Noise 密文，Gateway 和它前面的 TLS 终止方都看不到明文。第 4.3 节说明这条链路。
+浏览器不运行 iroh。网页应用固定在本人选定的一个客户端 origin 下，由 service worker 缓存应用外壳。浏览器从本机保存的入口列表中选一台 Gateway Node，连接它的 `/api/client` WebSocket，在其上与目标 Node 完成 Noise 握手，当前入口不可达时换下一台（4.5 节）。目标就是 Gateway 时，Noise 在 Gateway 终止。目标是另一台 Node 时，Gateway 经 iroh 的 `vibeface/client/1` 原样转发 Noise 密文，Gateway 和它前面的 TLS 终止方都看不到明文。第 4.3 节说明这条链路。
 
 跨设备工作有两条路径。一条是委派目标 Node 上的 Codex App Server，另一条是把任务发给目标 Node 的协调 Agent，由它用本机工具执行。两条路径的内部事件都只在本机观察和实时展示，DAG 只记录派发、阶段变化、审批和结果。第 6 节说明两条路径的授权和审批边界。
 
@@ -134,11 +135,11 @@ Ticket {
 }
 ```
 
-字符串形式为 `vibeface1` 加 Ticket postcard 编码的小写 base32，与 iroh `EndpointTicket` 的编码方式相同。浏览器使用 `https://<入口 origin>/join#<ticket>`，二维码编码这个 URL。`invite_id` 为 `SHA256(secret)` 的前 16 字节，入口只保存 `SHA256(secret)`。Ticket 默认 10 分钟过期，只能被一个加入请求消耗。Ticket 不包含设备类型、角色和管理权，也不需要单独的签名邀请信封。
+字符串形式为 `vibeface1` 加 Ticket postcard 编码的小写 base32，与 iroh `EndpointTicket` 的编码方式相同。浏览器使用 `https://<客户端 origin>/join#<ticket>`，二维码编码这个 URL。客户端 origin 默认取发起邀请的管理浏览器自己的客户端 origin（4.5 节），新浏览器的设备 CryptoKey 因此生成在这个 origin 下。`invite_id` 为 `SHA256(secret)` 的前 16 字节，入口只保存 `SHA256(secret)`。Ticket 默认 10 分钟过期，只能被一个加入请求消耗。Ticket 不包含设备类型、角色和管理权，也不需要单独的签名邀请信封。
 
 ### 3.4 加入流程
 
-所有设备走同一个流程。新设备 J 可以是浏览器、手机或 Node，入口 E 是 ticket 中的 Node，A 是批准加入的管理设备。浏览器 J 经 E 的 `/api/client` 与 E 完成 Noise 握手，Node J 经 iroh `vibeface/join/1` 连接。两种连接都先核对 E 的设备编号等于 ticket 中的 `entry.id`，浏览器依据 E 的 Noise `Proof`，Node 依据 iroh 的 `remote_id()`。
+所有设备走同一个流程。新设备 J 可以是浏览器、手机或 Node，入口 E 是 ticket 中的 Node，A 是批准加入的管理设备。浏览器 J 经客户端 origin 所在 Gateway 的 `/api/client` 与 E 完成 Noise 握手（这台 Gateway 不是 E 时经 iroh 转发，见 4.5 节），Node J 经 iroh `vibeface/join/1` 连接。两种连接都先核对 E 的设备编号等于 ticket 中的 `entry.id`，浏览器依据 E 的 Noise `Proof`，Node 依据 iroh 的 `remote_id()`。
 
 ```mermaid
 sequenceDiagram
@@ -253,7 +254,7 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 
 连接过程如下：
 
-1. 浏览器打开 Gateway Node 的 HTTPS 页面，连接同源的 `/api/client` WebSocket，首帧为 `{ "type": "connect", "target": "DEVICE_ID" }`。
+1. 浏览器在客户端 origin 下打开网页应用，从入口列表中选一台 Gateway Node，连接它的 `/api/client` WebSocket（与页面同源或跨源，见 4.5 节），首帧为 `{ "type": "connect", "target": "DEVICE_ID" }`。
 2. `target` 等于 Gateway 自己时，Noise 在 Gateway 终止。`target` 是另一台成员 Node 时，Gateway 经 iroh 的 `vibeface/client/1` 打开一条流，双向原样转发二进制帧，不解析内容。
 3. 浏览器与目标 Node 执行 Noise XX 握手，协议仍为 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。
 4. 握手完成后，RPC 和 `changed` 推送都是 Noise 加密记录，大消息仍按现有 `Channel` 分片重组。
@@ -267,9 +268,9 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 
 这样设备私钥从不参与加密运算，也从不离开 `CryptoKey`，泄露一次会话的 Noise 密钥不影响其他会话。`crates/secure/src/lib.rs` 的 `Handshake` 和 `Channel` 保留给这条链路。`Handshake` 改为先输出本次静态公钥，再接收外部签名的 `Proof`，不再持有设备私钥（现在由 `Identity` 在 crate 内签名，`lib.rs:109-284`）。
 
-这条链路保持现在的安全性质。Gateway 不是目标时只转发密文，Gateway 前面的第三方 TLS 终止方也只能看到 Noise 密文。与现状相比，删除的是会合目录 `lookup`、签名 `Reachability` 记录、`direct` 与 `dial` 控制消息、候选路径竞速和 relay 预约。浏览器总是连接自己页面所在的 Gateway，由 Gateway 经 iroh 到达任意成员 Node。
+这条链路保持现在的安全性质。Gateway 不是目标时只转发密文，Gateway 前面的第三方 TLS 终止方也只能看到 Noise 密文。与现状相比，删除的是会合目录 `lookup`、签名 `Reachability` 记录、`direct` 与 `dial` 控制消息、候选路径竞速和 relay 预约。浏览器连接入口列表中当前可用的一台 Gateway，由它经 iroh 到达任意成员 Node。
 
-浏览器只在需要读写某台 Node 本机设置时直接把它作为 `target`。业务操作默认以 Gateway 为目标。需要其他 Node 处理的控制请求，例如回答某台 Node 上的审批或中断某个工作，由会话所在 Node 经 `vibeface/rpc/1` 转给目标 Node，请求带浏览器的设备签名，目标 Node 自行验证。
+浏览器只在需要读写某台 Node 本机设置时直接把它作为 `target`。业务操作默认以当前所连的 Gateway 为目标。需要其他 Node 处理的控制请求，例如回答某台 Node 上的审批或中断某个工作，由会话所在 Node 经 `vibeface/rpc/1` 转给目标 Node，请求带浏览器的设备签名，目标 Node 自行验证。
 
 ### 4.4 个人网络隔离
 
@@ -282,6 +283,42 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 3. 事件入库时核对 `network_id`、作者成员资格和撤销 `cutoff_seq`。
 
 SQLite 表不再需要 `network_id` 列，跨网络读取在结构上不可能发生。一个数据目录只属于一个个人网络是已决定事项，见第 9 节。
+
+### 4.5 固定客户端 origin 与入口切换
+
+本人的某台 Gateway 离线时，浏览器要能自动换到同一个人网络中另一台启用 `gateway` 的 Node，设备身份不变，继续读写同一份会话。浏览器设备的 CryptoKey 按 origin 隔离，换一个 origin 就是另一台设备。所以网页应用固定在一个客户端 origin 下，切换的只是 WebSocket 连接的入口。
+
+**客户端 origin。** 每台 Gateway 仍内嵌并提供完整网页，任何成员 Gateway 的 `public_url` 都可以作为客户端 origin，不需要另外的静态托管。浏览器设备的客户端 origin 就是它加入时打开的 ticket 链接的 origin（3.3 节）。管理端生成邀请链接时从入口列表中选一个 `gateway_url`，默认取上次选用的那个。加入时页面连接同源 Gateway 的 `/api/client`，以 ticket 中的 `entry.id` 为目标，入口不是这台 Gateway 时由它经 iroh 转发。加入后，这个浏览器只在这个 origin 下使用，CryptoKey、入口列表和待确认写入都存在这个 origin 的 IndexedDB 中。直接打开另一台 Gateway 的 origin 得到的是一台没有密钥的新浏览器，需要重新加入。本机会话（3.6 节）的 origin 是 loopback 地址，只连接本机 Node，不参与入口切换。
+
+网页应用注册 service worker，缓存应用外壳，包括 HTML、脚本、样式和 WASM。客户端 origin 所在的 Gateway 离线时，service worker 从缓存打开应用，应用再连接其他入口。外壳只在这台 Gateway 在线时按 service worker 的常规更新检查升级。
+
+**入口列表。** 4.1 节的成员间地址簿由每台 Node 自己签名的记录组成：
+
+```text
+AddressRecord {
+	version: 1,
+	network_id: NetworkId,
+	device_id: DeviceId,          // 签名的 Node
+	seq: u64,                     // 同一设备严格递增，取较大者
+	endpoint: EndpointAddr,       // iroh 地址，供 Node 之间连接
+	gateway_url: Option<Url>,     // 启用 gateway 时为该 Node 的 HTTPS public_url
+	signature,                    // 该 Node 的设备密钥，对 "vibeface:address:v1:" ‖ 规范字节
+}
+```
+
+成员 Node 之间经 `vibeface/rpc/1` 交换地址簿，只接受未撤销成员 Node 签名的记录。浏览器连接任一成员 Node 并通过成员授权后，调用 `entrances` 取得所有带 `gateway_url` 的记录，用 `NetworkState` 中的成员目录验证签名，再与本机已有列表合并保存。每项保存 `device_id`、`gateway_url` 和最近一次成功连接的时间。成员目录撤销某台 Node 后，浏览器从列表中删除它。
+
+入口地址只在个人网络内部传播。`AddressRecord` 只在成员 Node 之间和已授权浏览器的 Noise 通道内传输，不向 n0 的 DNS、pkarr 或任何公共 relay 发布。iroh relay 只看到连接它的 `EndpointId`，看不到 `gateway_url`，也看不到哪些设备属于同一个人。
+
+**跨源连接。** `/api/client` 接受的 Origin 是本机 `public_url`、`allowed_origins`、本机别名，以及本机地址簿中未撤销成员 Node 的 `gateway_url`。客户端 origin 总是某台成员 Gateway 的 `public_url`，所以不需要在每台 Gateway 上手动配置 `allowed_origins`。其他 HTTP 路径仍要求同源。Origin 检查只限制哪些网页能使用这台 Gateway，访问控制仍由 Noise 握手和成员授权完成。
+
+**自动切换。** 当前入口的 WebSocket 断开，或连接和握手在 5 秒内未完成时，浏览器按最近成功时间从新到旧依次尝试列表中的其他入口。全部失败时按指数退避循环重试，界面显示离线。每次连接都以该入口的 `DeviceId` 为目标完成 Noise 握手，用 `AddressRecord` 中钉住的 `DeviceId` 验证 Node 的 `Proof`，目标 Node 照常验证浏览器的 `Proof` 和成员授权。Gateway 的域名和 TLS 证书只用于传输，浏览器不额外信任它们。冒充 `gateway_url` 的服务器拿不到对应设备密钥，握手会失败。
+
+切换后：
+
+- 读取和订阅自动恢复。浏览器为打开的会话重新订阅，并带上自己已经看到的版本向量。新入口也是副本，它的向量尚未覆盖浏览器已看到的内容时，界面显示“同步中”，等 `changed` 推送补齐，不删除已显示的内容。
+- 未确认的写入只核对，不改派，不重签。浏览器在入口确认前保存每个带 `Attestation` 的写入请求原文，包括消息、审批回答、`AutonomySet` 和通知确认。切换后先按业务 ID（`message_id`、`request_id` 等）向新入口查询，已入库则标为已确认。未入库时原样提交同一份已签名请求，`message_id`、`scheduler_node` 和 `Attestation` 都不变。
+- 旧入口恢复后可能从自己的 outbox 再写一次同一条消息。5.5 节把同一 `message_id` 且签名内容相同的 `MessagePosted` 合并为一条，调度 Node 按 `message_id` 去重 job，所以消息只被调度一次。这与第 6 节“重试保留原 ID、结果不明时向原目标查询、不改派”的规则一致。
 
 ## 5. 同步与 DAG
 
@@ -396,7 +433,7 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 
 | 投影 | 合并规则 |
 |---|---|
-| 会话与消息 | 按 `(因果顺序, created_at_ms, hash)` 在读取时排序，不在入库时分配 `ordinal` |
+| 会话与消息 | 按 `(因果顺序, created_at_ms, hash)` 在读取时排序，不在入库时分配 `ordinal`。同一 `message_id` 的多条 `MessagePosted(user)` 若 `Attestation` 覆盖的内容相同，视为同一条消息，保留因果最早者，并发时取 hash 较小者，浏览器不会为同一 `message_id` 签两份内容，万一出现，投影只采用最早者并在界面标出另一条。这对应 4.5 节切换入口后的重复提交 |
 | Bot | 同一 `bot_id` 取因果最早的 `BotCreated`，并发时取 hash 较小者 |
 | 工作 | 每个 `work_id` 的状态只前进，`WorkFinished` 为终态，只有 `unverified` 可被取代 |
 | 审批 | 同一 `request_id` 首个有效 `ApprovalAnswered` 生效，执行层拒绝过期回答 |
@@ -546,7 +583,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 | `crates/node/src/client.rs` | 17 个身份 RPC 合并为 6 个。Noise 客户端通道保留 | 1868 行，删除约 600 |
 | `crates/secure/src/membership.rs` | `node_roles`、`NodeCertificate.roles`、“管理权只能由根 checkpoint 授予”规则（约 468 行处） | 约 150 行 |
 | `crates/node/src/local_access.rs`、`api.rs` | 随机端口发布，`/api/network/ws`、`/peer`、`/api/local/join/*` 三个路由 | 约 200 行 |
-| `crates/node/web/transport.js` | `lookupPaths` 签名记录查询、`connectDevice` 中的候选竞速与 `direct`/`dial` 控制（176-289 行）、明文种子存储。Noise 握手和记录分片保留，设备签名改用 CryptoKey | 361 行，删除约 130 |
+| `crates/node/web/transport.js` | `lookupPaths` 签名记录查询、`connectDevice` 中的候选竞速与 `direct`/`dial` 控制（176-289 行）、明文种子存储，以及只连接页面同源入口的假设，改为 4.5 节的入口列表和自动切换。Noise 握手和记录分片保留，设备签名改用 CryptoKey | 361 行，删除约 130 |
 | `crates/node/web/src/features/identity/` | 邀请类型和角色选择、三方编号核对、review 勾选、恢复建立管理客户端 | 生产 1330 行，重写 |
 | SQLite 表 | `identity_invites`、`identity_pair_reviews`、`identity_pair_requests`、`identity_requests`、`node_certificates`、`blobs`、`notification_outbox` 的 `derived` 列 | 7 处 |
 | RPC | `prepare_genesis`、`bootstrap`、`prepare_invite`、`commit_invite`、`prepare_pair_request`、`pair_request`、`pair_accept`、`pair_requests`、`prepare_pair`、`pair_confirm`、`pair_status`、`prepare_revoke`、`recovery_challenge`、`recovery_context`、`prepare_recovery`，协调工具 `send_task`、`task_status`、`cancel_task`、`observe_session`、`codex`，后五个合并进 `dispatch_work`、`work_status` 和 `interrupt_work` | 20 个 |
@@ -566,20 +603,26 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 单 Node 真实进程能完成本人消息、本机 Codex 派发、审批和结果，DAG 中出现对应事件且不含执行层内部内容。
 - 在 10 万事件的数据目录上追加一条事件不触发全表读取，用 SQLite 查询计数核对。
 
-**第二期：身份与浏览器接入。** `DeviceId` 改为公钥本身，成员目录删除角色并放开管理授权。实现 6 个身份 RPC、承诺加短码流程、浏览器 CryptoKey、`/api/client` 网关和固定端口本机会话。浏览器 Noise 握手中的设备签名改由 CryptoKey 产生。删除 `pairing.rs`、`lookupPaths`、候选竞速和旧身份表。验收标准如下：
+**第二期：身份与浏览器接入。** `DeviceId` 改为公钥本身，成员目录删除角色并放开管理授权。实现 6 个身份 RPC、承诺加短码流程、浏览器 CryptoKey、`/api/client` 网关和固定端口本机会话。网页应用改为固定客户端 origin，注册 service worker 缓存应用外壳，`/api/client` 接受跨源连接（4.5 节）。浏览器 Noise 握手中的设备签名改由 CryptoKey 产生。删除 `pairing.rs`、`lookupPaths`、候选竞速和旧身份表。验收标准如下：
 
 - 浏览器端到端测试完成建网、浏览器加入、授予管理权、撤销和根恢复。
 - 承诺不匹配或短码被拒绝时请求作废。
 - 页面脚本无法导出设备私钥，Noise 握手仍验证双方设备编号，编号不符时关闭连接。
 - 本机会话重启后 origin 不变。
+- 客户端 origin 所在的 Gateway 停止后，浏览器仍能从 service worker 缓存打开应用并显示离线状态，设备编号不变。
+- `/api/client` 接受 `allowed_origins` 中的跨源连接并完成 Noise 握手，其他 HTTP 路径仍拒绝跨源请求。
 
-**第三期：iroh 传输与版本向量同步。** 接入 `iroh` Endpoint、`Router`、5 个 ALPN 和 relay 访问控制，实现 `Hello`、`Pull`、`Have`、附件续传和 `vibeface/client/1` 密文转发。Node 经 `vibeface/join/1` 加入。删除 `network.rs`、`network/admission.rs`、`peer.rs` 和 `mdns-sd`。验收标准如下：
+**第三期：iroh 传输与版本向量同步。** 接入 `iroh` Endpoint、`Router`、5 个 ALPN 和 relay 访问控制，实现 `Hello`、`Pull`、`Have`、附件续传和 `vibeface/client/1` 密文转发。实现签名地址簿、`entrances`、按地址簿放行成员 Gateway 的 Origin，以及浏览器入口列表和自动切换（4.5 节）。入口切换依赖地址簿和多 Node 同步，所以放在本期。Node 经 `vibeface/join/1` 加入。删除 `network.rs`、`network/admission.rs`、`peer.rs` 和 `mdns-sd`。验收标准如下：
 
 - `scripts/verify-node.py` 用三个真实 Node 进程，覆盖 NAT 后两台经自建 relay 互通。
 - 非成员 `EndpointId` 连接被拒绝。
 - 浏览器经 Gateway 连到 NAT 后的 Node，在 Gateway 上抓取的转发内容只有 Noise 密文。
 - 中断后按区间续拉。
 - 64 MiB 附件在传输中途重启后续传并通过哈希校验。
+- 两台 Gateway 加一台调度 Node。浏览器在一台 Gateway 上发送消息后关闭这台 Gateway，浏览器不重新加入、不刷新设备身份，自动切到另一台，看到同一会话的完整历史并继续发送消息。
+- 关闭入口时有一条消息尚未确认，切换后不重签、不改 `scheduler_node`。旧入口恢复后该消息在会话中只出现一次，调度 Node 只执行一次。
+- 伪造或由非成员签名的入口记录被浏览器丢弃，冒充 `gateway_url` 的服务器无法完成握手。
+- 入口地址在 n0 DNS、pkarr 和自建 relay 中都查不到，用抓包和 relay 日志核对。
 - 按 `docs/ci.md` 补跑同步与恢复专项并记录结果。
 
 **第四期：协调层与跨入口上下文。** 调度依据改为版本向量，原生会话缓存记录已覆盖向量。实现 `dispatch_work`、`continue_work` 和 `interrupt_work` 的 `codex` 与 `agent` 两种执行器，审批回答经网关转发并验证设备签名。验收标准如下：
@@ -607,6 +650,8 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 恢复备份后若本人误确认解除只读，仍会产生分叉。5.7 节的处理保证不锁死会话，但分叉设备需要重新加入。
 - `executor=agent` 发往 Cursor SDK 协调层时没有逐条审批，本机 shell 的权限取决于目标 Node 的 Provider 配置。
 - iroh 1.x 承诺协议稳定，`iroh-blobs` 等上层库仍为 0.x，本设计只依赖 `iroh` 和 `iroh-relay`。
+- 客户端 origin 所在的 Gateway 离线期间，缓存的应用外壳无法升级。其他 Gateway 已升级到不兼容的协议时握手失败，页面提示等待这台 Gateway 恢复。项目不保留兼容，不做版本协商。
+- 客户端 origin 所在的 Gateway 永久下线且浏览器清除了缓存后，这个浏览器设备无法再打开，本人需要撤销它并在另一个 origin 下重新加入。
 
 ### 已决定事项
 
@@ -624,3 +669,4 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 7. **`WorkDispatched` 在目标确认后才写入。** 确认前的派发只在本机 outbox 中，见 5.2 节。
 8. **分叉设备撤销后重新加入。** 分叉的作者 Node 停止写入，本人撤销其设备编号后用新密钥重新加入，见 5.7 节。
 9. **附件不用 `iroh-blobs`。** 附件使用按 SHA256 命名的文件和自有的 `vibeface/blob/1`，见 5.6 节。
+10. **入口切换并入本设计，替代 #38。** #38（`feat/collaborative-cluster`）要解决的需求成立，即本人的某台入口离线时，浏览器应自动连到同一个人网络中另一台已授权的入口，继续读写同一份会话。本设计用固定客户端 origin、service worker、签名地址簿中的入口列表和跨源 `/api/client` 实现这一需求，见 4.5 节。#38 的实现不保留，原因有三。它依赖的 `Control::LookupCluster` 和签名 `Reachability` 中的 Cluster 声明属于第 7 节删除的自研发现与 relay 目录。它把 cluster 归属发布到公共 relay 目录，等于向公共服务暴露哪些设备属于同一个人，本设计的入口地址只在个人网络内部传播。它把“个人网络”全量改名为 Cluster，牵动签名身份、事件、数据库、恢复和网页，与需求无关。本设计不采纳这次改名，继续使用“个人网络”和 `NetworkId`。
