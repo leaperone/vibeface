@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArchiveRestore, KeyRound, Laptop, Monitor } from 'lucide-react'
-import { BusyIcon, Details, DetailRow, InlineError } from '@/components/app/kit'
+import { BusyIcon, Details, DetailRow, FilePicker, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -104,7 +104,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           await work
         })
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
-        <Label label="恢复文件"><Input className="h-auto py-2" type="file" name="bundle" accept="application/json,.json" required /></Label>
+        <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="恢复密码"><Input type="password" name="password" autoComplete="off" required /></Label>
         <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
         <Details label="连接到哪台电脑" open={!target}>
@@ -127,7 +127,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           await work
         }, '新的恢复文件已下载')
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
-        <Label label="恢复文件"><Input className="h-auto py-2" type="file" name="bundle" accept="application/json,.json" required /></Label>
+        <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>
         <Label label="新密码（至少 12 个字符）"><Input type="password" name="password" minLength={12} autoComplete="new-password" required /></Label>
         <Label label="再输一次"><Input type="password" name="confirmation" minLength={12} autoComplete="new-password" required /></Label>

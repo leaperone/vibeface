@@ -186,6 +186,8 @@ body {
     color-scheme: light dark;
     overflow-x: clip;
   }
+  /* Grid items default to min-width:auto, so one long path or id would widen the whole card on phones. */
+  :where(.grid) > * { min-width: 0; }
 }
 [hidden] { display: none !important; }
 .skip-link { position: absolute; top: .5rem; left: 1rem; transform: translateY(-200%); z-index: 50; padding: .75rem; background: var(--background); }

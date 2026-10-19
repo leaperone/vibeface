@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, Copy, Info, LoaderCircle, TriangleAlert, X, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, Copy, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
 import { messageOf } from "@/lib/node"
@@ -84,8 +84,30 @@ export function Details({ children, label = "详细信息", className, open }: {
   </details>
 }
 
+/** Long hex ids show their first 10 characters; a click reveals the rest. */
+function LongId({ value }: { value: string }) {
+  const [full, setFull] = useState(false)
+  return <button type="button" className="w-fit text-left font-mono text-foreground break-all" title={full ? undefined : value} aria-expanded={full} onClick={() => setFull(!full)}>{full ? value : `${value.slice(0, 10)}…`}</button>
+}
+
 export function DetailRow({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
-  return <div className="grid gap-0.5"><span>{label}</span><span className={cn("text-foreground", mono && "font-mono")}>{value}</span></div>
+  return <div className="grid gap-0.5"><span>{label}</span>{typeof value === "string" && /^[0-9a-f]{20,}$/.test(value) ? <LongId value={value} /> : <span className={cn("text-foreground", mono && "font-mono")}>{value}</span>}</div>
+}
+
+/** File input with a Chinese button; the native control's label follows the browser language. */
+export function FilePicker({ name, accept, required, disabled, label = "选择文件", onFile }: { name?: string; accept?: string; required?: boolean; disabled?: boolean; label?: string; onFile?(file: File): void }) {
+  const [chosen, setChosen] = useState("")
+  return <span className="flex min-w-0 items-center gap-3">
+    <label className={cn("relative inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border bg-background px-3 text-sm font-medium hover:bg-muted max-md:h-11 has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50", disabled && "pointer-events-none opacity-50")}>
+      <Upload aria-hidden="true" className="size-4" />{label}
+      <input className="absolute inset-0 size-full cursor-pointer opacity-0" type="file" name={name} accept={accept} required={required} disabled={disabled} onChange={(event) => {
+        const file = event.currentTarget.files?.item(0)
+        setChosen(file?.name ?? "")
+        if (file && onFile) { event.currentTarget.value = ""; setChosen(""); onFile(file) }
+      }} />
+    </label>
+    <span className="min-w-0 truncate text-meta text-muted-foreground">{chosen || (onFile ? "" : "未选择")}</span>
+  </span>
 }
 
 type ToastItem = { id: number; text: string; tone: Tone; action?: { label: string; onClick: () => void } }
