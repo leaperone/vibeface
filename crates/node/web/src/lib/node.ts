@@ -1,6 +1,5 @@
-import { readPeerId, validEndpoint, validTarget } from '../../transport.js'
+import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
-export { readPeerId }
 
 export type ConnectionEntry = { address: string; peer_id: string; relay: boolean }
 export type PublicIdentity = { peerId: string; publicKey: string }
@@ -43,12 +42,12 @@ export function roles(value: unknown): NodeRole[] {
 }
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '连接入口')
-  return { address: validEndpoint(text(v.address)), peer_id: readPeerId(v), relay: boolean(v.relay) }
+  return { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id), relay: boolean(v.relay) }
 }
 export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.relay}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
-  return { peer_id: readPeerId(v), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized) }
+  return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized) }
 }
 export function parseMember(value: unknown): Member {
   const v = record(value)
@@ -79,7 +78,7 @@ export function parsePairReceipt(value: unknown): PairReceipt {
 }
 export function parseInvitation(value: unknown): Invitation {
   const v = record(value, '邀请')
-  const entry = parseEntry({ address: v.url, peer_id: readPeerId(v), relay: v.relay ?? false })
+  const entry = parseEntry({ address: v.url, peer_id: v.peer_id, relay: v.relay ?? false })
   if (typeof v.capability === 'string' && !v.invite && !v.payload) return { kind: 'bootstrap', entry, capability: text(v.capability) }
   const envelope = record(v.invite, '配对邀请')
   const invite = record(envelope.invite, '配对授权')

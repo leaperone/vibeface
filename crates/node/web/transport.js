@@ -12,11 +12,6 @@ export function validTarget(value) {
   return value;
 }
 
-export function readPeerId(value) {
-  if (value.peer_id !== undefined && value.node_id !== undefined && value.peer_id !== value.node_id) throw new Error("设备编号不一致，已拒绝连接。");
-  return validTarget(value.peer_id === undefined ? value.node_id : value.peer_id);
-}
-
 export function validEndpoint(value) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || !["", "/"].includes(url.pathname)) throw new Error("填写 HTTP 或 HTTPS 入口地址，不包含路径、账号或密钥。");
@@ -122,7 +117,7 @@ export function signClient(domain, payload) {
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
   if (!identity) await initClient();
-  const target = readPeerId(entry);
+  const target = validTarget(entry.peer_id);
   const endpoint = validEndpoint(entry.address);
   const url = new URL("/api/network/ws", endpoint);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";

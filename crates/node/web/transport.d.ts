@@ -10,7 +10,6 @@ export function connectDevice(entry: { address: string; peer_id: string; relay: 
   onClose?: (error: unknown) => void
   signal?: AbortSignal
 }): Promise<DeviceChannel>
-export function readPeerId(value: { peer_id?: unknown; node_id?: unknown }): string
 export function validTarget(value: unknown): string
 export function validEndpoint(value: string): string
 export function readInvitation(value: string): unknown

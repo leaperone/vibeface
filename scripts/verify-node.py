@@ -121,7 +121,7 @@ def verify_maintenance(node):
     stream, value = maintenance(node, "acquire")
     try:
         require(value["status"] == "ready", "idle node enters maintenance")
-        require(value["health"]["node_id"] == node.peer_id, "lease pins the running node")
+        require(value["health"]["peer_id"] == node.peer_id, "lease pins the running node")
         node.client.rpc("nodes", status=503)
         probe, health = maintenance(node, "probe")
         probe.close()
@@ -354,7 +354,7 @@ class RelayCapture:
                             require(len(self.controls) < 4096, "bounded captured relay controls")
                             self.controls.append({"connection": connection, "generation": generation,
                                                   "direction": direction, "monotonic": received_monotonic, "wall_time": received_wall_time,
-                                                  "node_id": control.get("node_id") or (control.get("record") or {}).get("node_id"),
+                                                  "peer_id": control.get("peer_id") or (control.get("record") or {}).get("peer_id"),
                                                   **{key: control[key] for key in ("type", "target", "service") if key in control}})
                     del buffer[:offset + length]
         except (OSError, ValueError, AssertionError) as error:
@@ -452,8 +452,8 @@ async function networkProbe(input) {
   function key() { const value = Identity.generate(); identities.push(value); return value; }
   async function reserve(owner) {
     const connection = await control();
-    const proof = JSON.stringify({nonce:connection.nonce,node_id:owner.peerId()});
-    connection.socket.send(JSON.stringify({type:'reserve',node_id:owner.peerId(),public_key:owner.publicKeyHex(),signature:owner.sign('relay-reserve',encoder.encode(proof))}));
+    const proof = JSON.stringify({nonce:connection.nonce,peer_id:owner.peerId()});
+    connection.socket.send(JSON.stringify({type:'reserve',peer_id:owner.peerId(),public_key:owner.publicKeyHex(),signature:owner.sign('relay-reserve',encoder.encode(proof))}));
     const response = await connection.next();
     return { connection, accepted:response?.type === 'reserved',outcome:response?.type || (connection.closed ? 'closed' : 'timeout') };
   }
@@ -465,8 +465,8 @@ async function networkProbe(input) {
     if (input.kind === 'record') {
       const reply = await exchange({type:'lookup',target:input.target});
       const record = reply?.record;
-      if (reply?.type !== 'record' || !record || record.node_id !== input.target) throw new Error('requested signed directory record is unavailable');
-      if (createHash('sha256').update(Buffer.from(record.public_key,'hex')).digest('hex') !== record.node_id) throw new Error('directory identity mismatch');
+      if (reply?.type !== 'record' || !record || record.peer_id !== input.target) throw new Error('requested signed directory record is unavailable');
+      if (createHash('sha256').update(Buffer.from(record.public_key,'hex')).digest('hex') !== record.peer_id) throw new Error('directory identity mismatch');
       const now = Math.floor(Date.now()/1000);
       if (!Number.isSafeInteger(record.issued_at) || !Number.isSafeInteger(record.expires_at) || record.issued_at > now+30 || record.expires_at <= now || record.expires_at <= record.issued_at || record.expires_at > record.issued_at+180) throw new Error('directory lifetime invalid');
       if (![record.direct_urls,record.relay_urls].every(urls => Array.isArray(urls) && urls.length <= 8 && urls.every(url => typeof url === 'string'))) throw new Error('directory URLs invalid');
@@ -476,7 +476,7 @@ async function networkProbe(input) {
     if (input.kind === 'directory') {
       const now = Math.floor(Date.now() / 1000), short = key(), healthy = key();
       async function publish(owner, expires) {
-        const record = {node_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:expires,signature:''};
+        const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:expires,signature:''};
         record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
         if ((await exchange({type:'publish',record}))?.type !== 'published') throw new Error('signed fixture record was rejected');
       }
@@ -485,7 +485,7 @@ async function networkProbe(input) {
       await new Promise(resolve => setTimeout(resolve, Math.max(0, (now + 2) * 1000 - Date.now()) + 100));
       const expired = await exchange({type:'lookup',target:short.peerId()});
       const good = await exchange({type:'lookup',target:healthy.peerId()});
-      return {short_record_present_before_expiry:before?.record?.node_id === short.peerId(),expired_record_removed:expired?.type === 'record' && expired.record === null,healthy_record_retained:good?.record?.node_id === healthy.peerId()};
+      return {short_record_present_before_expiry:before?.record?.peer_id === short.peerId(),expired_record_removed:expired?.type === 'record' && expired.record === null,healthy_record_retained:good?.record?.peer_id === healthy.peerId()};
     }
     if (input.kind === 'reservations') {
       const owner = key(), first = await reserve(owner), duplicate = await reserve(owner);
@@ -499,12 +499,12 @@ async function networkProbe(input) {
         else throw new Error(`unexpected reservation reply ${result.outcome}`);
       }
       const now = Math.floor(Date.now() / 1000);
-      const record = {node_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:now+120,signature:''};
+      const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:now+120,signature:''};
       record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
       first.connection.socket.send(JSON.stringify({type:'publish',record}));
       await new Promise(resolve => setTimeout(resolve, 100));
       const lookup = await exchange({type:'lookup',target:owner.peerId()});
-      return {unique_identities:65,reserve_requests:66,accepted,rejected,timeouts,duplicate_identity_outcome:duplicate.outcome,duplicate_identity_accepted:duplicate.accepted,first_reservation_still_open:!first.connection.closed,first_reservation_published_after_capacity:lookup?.record?.node_id === owner.peerId(),directory_query_after_capacity:lookup?.type === 'record'};
+      return {unique_identities:65,reserve_requests:66,accepted,rejected,timeouts,duplicate_identity_outcome:duplicate.outcome,duplicate_identity_accepted:duplicate.accepted,first_reservation_still_open:!first.connection.closed,first_reservation_published_after_capacity:lookup?.record?.peer_id === owner.peerId(),directory_query_after_capacity:lookup?.type === 'record'};
     }
     throw new Error('unknown network probe');
   } finally {
@@ -890,7 +890,7 @@ def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
             controls = list(capture.controls)
         attempts = {item["connection"] for item in controls
                     if item["connection"] > after_connection and item["direction"] == "to_relay"
-                    and item["type"] == "reserve" and item["node_id"] == node.peer_id}
+                    and item["type"] == "reserve" and item["peer_id"] == node.peer_id}
         return next((item for item in reversed(controls)
                      if item["connection"] in attempts and item["direction"] == "from_relay"
                      and item["type"] == "reserved"), None)
@@ -907,7 +907,7 @@ def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
                 "current relay reaches the original target through pinned Noise and an encrypted read")
         return {"target": node.peer_id, "relay_url": capture.url,
                 "after_connection": after_connection, "reservation_connection": candidate["connection"],
-                "capture_generation": candidate["generation"], "read_node_id": response["result"]["peer_id"],
+                "capture_generation": candidate["generation"], "read_peer_id": response["result"]["peer_id"],
                 "probe_seconds": time.monotonic() - started, "kind": "pinned Noise and encrypted read-only info"}
     finally:
         if probe.process is not None and deadline - time.monotonic() <= 5:
@@ -1263,14 +1263,14 @@ class NetworkDirectoryFixture:
                 control = json.loads(payload)
                 break
             kind = control.get("type")
-            self.note("control_received", connection, control=kind, target=control.get("target"), node_id=control.get("node_id") or control.get("record", {}).get("node_id"))
+            self.note("control_received", connection, control=kind, target=control.get("target"), peer_id=control.get("peer_id") or control.get("record", {}).get("peer_id"))
             if kind == "publish":
                 while not self.publish_gate.wait(.1):
                     if self.stopped.is_set():
                         return
                 if self.publications is not None:
                     record = control["record"]
-                    target = record["node_id"]
+                    target = record["peer_id"]
                     require(re.fullmatch(r"[0-9a-f]{64}", target), "published fixture record names a complete Node identity")
                     with self.lock:
                         require(len(self.publications) < 16 or target in self.publications, "bounded fixture public record capture")
@@ -1293,7 +1293,7 @@ class NetworkDirectoryFixture:
                 if self.stopped.is_set():
                     return
                 self.note("record_send_started", connection, target=control["target"],
-                          record_node_id=record.get("node_id") if record else None,
+                          record_peer_id=record.get("peer_id") if record else None,
                           issued_at=record.get("issued_at") if record else None, expires_at=record.get("expires_at") if record else None,
                           signature_sha256=hashlib.sha256(record["signature"].encode()).hexdigest() if record else None)
                 websocket_send(stream, {"type": "record", "record": record})
@@ -1495,8 +1495,8 @@ class NetworkControlSocket:
         raise AssertionError("bounded raw binary frames before response")
 
     def reserve(self, owner):
-        proof = json.dumps({"nonce": self.nonce, "node_id": owner.peer_id}, separators=(",", ":"))
-        self.send_control({"type": "reserve", "node_id": owner.peer_id, "public_key": owner.public_key,
+        proof = json.dumps({"nonce": self.nonce, "peer_id": owner.peer_id}, separators=(",", ":"))
+        self.send_control({"type": "reserve", "peer_id": owner.peer_id, "public_key": owner.public_key,
                            "signature": owner.sign("relay-reserve", proof.encode())})
         return self.control()
 
@@ -1520,7 +1520,7 @@ class NetworkControlSocket:
 
 class NetworkCryptoFixture:
     """One fixed, private fixture identity and Noise channel; never starts a model."""
-    def __init__(self, run, name, module, *, expected_node_id=None, deadline=None):
+    def __init__(self, run, name, module, *, expected_peer_id=None, deadline=None):
         repository = Path(__file__).resolve().parents[1]
         self.identity_file = run / f"{name}-identity.json"
         self.deadline = deadline
@@ -1529,7 +1529,7 @@ class NetworkCryptoFixture:
         self.process = subprocess.Popen(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         try:
-            identity = self.command("fixture_identity", identity_file=str(self.identity_file), expected_node_id=expected_node_id)
+            identity = self.command("fixture_identity", identity_file=str(self.identity_file), expected_peer_id=expected_peer_id)
             self.peer_id, self.public_key = identity["peer_id"], identity["public_key"]
         except BaseException:
             self.close()
@@ -1595,7 +1595,7 @@ def network_fixture_noise(caller, target, caller_identity, target_identity):
             and target_identity.command("remote") == caller_identity.peer_id, "fixture Noise authenticates both fixed original identities")
     caller_identity.command("finish")
     target_identity.command("finish")
-    return {"caller_node_id": caller_identity.peer_id, "target_node_id": target_identity.peer_id,
+    return {"caller_peer_id": caller_identity.peer_id, "target_peer_id": target_identity.peer_id,
             "context": context, "scope": "fixture Noise over the original public relay; not personal-network member authorization"}
 
 
@@ -1613,7 +1613,7 @@ def network_fixture_canary(sender, receiver, sender_identity, receiver_identity,
             break
     require(opened is not None and bytes.fromhex(opened) == payload, "the fixed receiving identity decrypts the exact end-to-end canary")
     return {"label": label, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
-            "sender_node_id": sender_identity.peer_id, "receiver_node_id": receiver_identity.peer_id, "decrypted_exactly": True}
+            "sender_peer_id": sender_identity.peer_id, "receiver_peer_id": receiver_identity.peer_id, "decrypted_exactly": True}
 
 
 def fixture_codex(arguments):
@@ -3091,7 +3091,7 @@ def acceptance(options):
         other_network = relay.bootstrap()
         require(other_network != network, "public relay owns an independent personal network")
         report["topology"] = {"network_id": network, "nodes": [node.peer_id for node in (a, b, c)],
-                              "relay_node_id": relay.peer_id, "relay_network_id": other_network}
+                              "relay_peer_id": relay.peer_id, "relay_network_id": other_network}
         other.command("connect", url=a.url, peer_id=a.peer_id, connection="foreign")
         other.call("authenticate", {"network_id": network}, connection="foreign", status=401)
         other.call("rpc", {"method": "nodes"}, connection="foreign", status=401)
@@ -3645,7 +3645,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                     require(manifest["version"] == 1 and manifest["blob"] == blob, "durable manifest binds the exact signed object")
                 offset = manifest["phase"].get("committed_offset") if manifest and manifest["phase"]["state"] == "receiving" else None
                 if offset is not None:
-                    require(0 <= offset <= size and manifest["phase"]["source_node_id"] == source.peer_id, "progress stays within this authorized source object")
+                    require(0 <= offset <= size and manifest["phase"]["source_peer_id"] == source.peer_id, "progress stays within this authorized source object")
                 files = list(staging.iterdir()) if staging.exists() else []
                 reserved = sum(json.loads(value)["blob"]["size"] for value, in manifests)
                 actual_bytes = sum(path.lstat().st_size for path in files)
@@ -4155,7 +4155,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         core = network_core_evidence(evidence_dir, "a1", ["full_data_capacity_refuses_only_the_incoming_and_recovers_on_the_same_reservation"])
         generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_cancels_blocked_publish_and_preserves_ready_circuit",
             "a2_outer_abort_drops_an_attached_socket_waiting_in_the_receiver", "a2_real_full_source_and_global_handoff_uses_a_full_logical_table_fixture"])
-        case.update({"status": "passed", "target_node_id": owner.peer_id, "old_generation": old_generation, "new_generation": generation,
+        case.update({"status": "passed", "target_peer_id": owner.peer_id, "old_generation": old_generation, "new_generation": generation,
                      "old_ready": old_ready, "new_installed": installed, "previous_socket_closed": previous_closed,
                      "old_cleanup": removed, "new_ready": new_ready, "old_token_sha256": token_tag, "stale_failure": stale_failure,
                      "stale_trace": stale_trace, "old_noise": noise, "canary_before": before, "old_circuit_canary_after": after,
@@ -4345,9 +4345,9 @@ def network_reliability_duplex(run, binary, workspace, fixture, helper, module, 
             "x1_each_silent_endpoint_expires_despite_continuous_opposite_traffic", "x1_stopped_tcp_reader_keeps_reverse_noise_and_other_target_progress",
             "x1_two_real_writers_share_the_production_rate_and_total_byte_limit",
             "x1_abort_and_timeout_during_rate_or_slow_write_release_io_and_allow_reuse"])
-        case.update({"status": "passed", "relay_node_id": relay.peer_id, "target_node_id": target_owner.peer_id, "circuit": circuit,
+        case.update({"status": "passed", "relay_peer_id": relay.peer_id, "target_peer_id": target_owner.peer_id, "circuit": circuit,
             "noise": noise, "reader_paused": paused, "continuous_backpressure": blocked, "reverse_canary": reverse,
-            "directory_control": {"type": lookup_reply["type"], "target_node_id": other_target_owner.peer_id,
+            "directory_control": {"type": lookup_reply["type"], "target_peer_id": other_target_owner.peer_id,
                                   "has_record": lookup_reply.get("record") is not None, "scope": "Control query progress; fixture target has no published directory record"},
             "other_target_noise": other_noise, "other_target_canary": other_canary, "progress_done": progress_done, "reader_resumed": resumed,
             "first_write_resumed_after_progress": interruptions[0], "decrypted_message_sha256": decrypted, "flood": flood,
@@ -4421,11 +4421,11 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         value = open_at(node, source)
         value.send_control({"type": "lookup", "target": node.peer_id})
         reply = value.control()
-        require(reply.get("type") == "record" and reply.get("record", {}).get("node_id") == node.peer_id,
+        require(reply.get("type") == "record" and reply.get("record", {}).get("peer_id") == node.peer_id,
                 "other legal source completes a real target lookup")
         summary = dict(value.summary)
         value.close()
-        return {"source_socket": summary, "target_node_id": node.peer_id, "record_received": True}
+        return {"source_socket": summary, "target_peer_id": node.peer_id, "record_received": True}
 
     def closed_after_control(value):
         try:
@@ -4473,8 +4473,8 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         extra_owner = identity("long-source-extra")
         cursor = (relay.directory / "process.log").stat().st_size
         extra = open_at(relay, "v4", forwarded_for="198.51.100.62")
-        proof = json.dumps({"nonce": extra.nonce, "node_id": extra_owner.peer_id}, separators=(",", ":"))
-        extra.send_control({"type": "reserve", "node_id": extra_owner.peer_id, "public_key": extra_owner.public_key,
+        proof = json.dumps({"nonce": extra.nonce, "peer_id": extra_owner.peer_id}, separators=(",", ":"))
+        extra.send_control({"type": "reserve", "peer_id": extra_owner.peer_id, "public_key": extra_owner.public_key,
                             "signature": extra_owner.sign("relay-reserve", proof.encode())})
         long_closed = closed_after_control(extra)
         long_reason = reason(relay, cursor, "source_established_socket")
@@ -4555,7 +4555,7 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         network_assert_source(rate_reason, rate_rejected)
         rate_other = lookup(rate_relay, "v6")
         require(time.monotonic() < window_start + 60, "all 120 requests and denial fit the unchanged source rate window")
-        case["groups"]["source_request_rate"] = {"status": "passed", "fresh_relay_node_id": rate_relay.peer_id,
+        case["groups"]["source_request_rate"] = {"status": "passed", "fresh_relay_peer_id": rate_relay.peer_id,
             "accepted": len(rate_results), "source_limit": 120, "rejected": rate_rejected,
             "server_rejection": rate_reason, "other_real_source_lookup": rate_other,
             "window_seconds_observed": time.monotonic() - window_start, "forwarded_header_ignored": True,
@@ -4637,7 +4637,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
     def signed_short_record():
         result = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
                                 input=json.dumps({"op": "fixture_reachability", "identity_file": str(b.directory / "identity.json"),
-                                                  "expected_node_id": b.peer_id, "relay_urls": [unavailable.url], "ttl_secs": 2}) + "\n",
+                                                  "expected_peer_id": b.peer_id, "relay_urls": [unavailable.url], "ttl_secs": 2}) + "\n",
                                 capture_output=True, text=True, timeout=15)
         require(result.returncode == 0, "temporary original target signs a short-lived reachability fixture")
         response = json.loads(result.stdout)
@@ -4711,8 +4711,8 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         controls_offset = len(capture.controls)
         cold_start = {"wall_time": time.time(), "monotonic": time.monotonic(), "a_log_offset": log_offset,
                       "query_deadline_seconds": 10, "deadline_basis": "lower bound before spawning cold A; actual production queries start later"}
-        case.update({"network_id": network, "target_node_id": b.peer_id, "source_node_id": a.peer_id,
-                     "healthy_record": healthy.record, "wrong_identity_record_node_id": wrong_record["node_id"],
+        case.update({"network_id": network, "target_peer_id": b.peer_id, "source_peer_id": a.peer_id,
+                     "healthy_record": healthy.record, "wrong_identity_record_peer_id": wrong_record["peer_id"],
                      "cold_start": cold_start, "a_process_log": str(a.directory / "process.log"),
                      "configurations": {node.name: json.loads((node.directory / "config.json").read_text())["network"] for node in nodes}})
         a.start(env=trace_env)
@@ -4770,7 +4770,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
                    "relay_control_offset": len(capture.controls), "directory_control_offset": len(directory_capture.controls)}
         b.start(env=trace_env)
         held_publish = wait_for("B's independent slow publication actually enters the unreleased fixture", lambda: next((event for event in slow_publication.snapshot()["events"]
-            if event["kind"] == "control_received" and event.get("control") == "publish" and event.get("node_id") == b.peer_id), None), timeout=5)
+            if event["kind"] == "control_received" and event.get("control") == "publish" and event.get("peer_id") == b.peer_id), None), timeout=5)
         d_publication = wait_for("B's fresh publication to actual directory D is acknowledged despite slow publication elsewhere",
             lambda: next((entry for entry in directory_logs(b, restart["b_log_offset"], "directory publication completed")
                           if entry["fields"].get("directory") == directory_url and entry["fields"].get("outcome") == "published"), None), timeout=5)
@@ -4787,13 +4787,13 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
                 and not any(event["kind"] == "publish_acknowledged_locally" for event in slow_publication.snapshot()["events"]),
                 "the slow publication has not replied while other relay work completes")
         b_reservations = [event for event in capture.controls[restart["relay_control_offset"]:]
-                          if event.get("type") == "reserve" and event.get("node_id") == b.peer_id]
+                          if event.get("type") == "reserve" and event.get("peer_id") == b.peer_id]
         require(len(b_reservations) == 1, "one actual B reservation establishes the healthy relay during the held publication")
         reservation_connection = b_reservations[0]["connection"]
-        wait_for("actual directory D receives a signed B publication", lambda: any(event.get("type") == "publish" and event.get("node_id") == b.peer_id
+        wait_for("actual directory D receives a signed B publication", lambda: any(event.get("type") == "publish" and event.get("peer_id") == b.peer_id
                  for event in directory_capture.controls[restart["directory_control_offset"]:]), timeout=5)
         wait_for("startup relay-change publications settle across the first rejected directory retry", lambda: len([event for event in directory_capture.controls[restart["directory_control_offset"]:]
-                 if event.get("type") == "reserve" and event.get("node_id") == b.peer_id]) >= 2, timeout=10)
+                 if event.get("type") == "reserve" and event.get("peer_id") == b.peer_id]) >= 2, timeout=10)
         stable = {"wall_time": time.time(), "monotonic": time.monotonic(), "directory_control_offset": len(directory_capture.controls),
                   "relay_control_offset": len(capture.controls),
                   "directory_log_offset": (directory.directory / "process.log").stat().st_size,
@@ -4802,10 +4802,10 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
 
         def refused_without_republication():
             fresh = list(directory_capture.controls[stable["directory_control_offset"]:])
-            reserves = [event for event in fresh if event.get("type") == "reserve" and event.get("node_id") == b.peer_id]
-            publications = [event for event in fresh if event.get("type") == "publish" and event.get("node_id") == b.peer_id]
+            reserves = [event for event in fresh if event.get("type") == "reserve" and event.get("peer_id") == b.peer_id]
+            publications = [event for event in fresh if event.get("type") == "publish" and event.get("peer_id") == b.peer_id]
             require(not publications, "directory Reserve rejection does not drive a new B publication inside the stable pre-refresh window")
-            require(not any(event.get("type") == "reserve" and event.get("node_id") == b.peer_id for event in capture.controls[stable["relay_control_offset"]:]),
+            require(not any(event.get("type") == "reserve" and event.get("peer_id") == b.peer_id for event in capture.controls[stable["relay_control_offset"]:]),
                     "the healthy B reservation remains the same during refused directory retries")
             value = a.client.rpc("operation", target_node=b.peer_id, operation_id="net1-lane4-d2-read-only")
             require(value == {"operation": None}, "original B remains queryable during repeated directory Reserve rejection")
@@ -4961,7 +4961,7 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
                 client.connect(expected_id)
                 encrypted = client.call("info")
                 require(encrypted["peer_id"] == expected_id, "each observed address completes pinned Noise and encrypted info")
-                accepted.append({"address": advertised, "http_node_id": info["peer_id"], "encrypted_node_id": encrypted["peer_id"]})
+                accepted.append({"address": advertised, "http_peer_id": info["peer_id"], "encrypted_peer_id": encrypted["peer_id"]})
                 client.close()
             time.sleep(1)
             require(ipv6.process.poll() is None and "DNSServiceQueryRecord failed" not in ipv6.text(),
@@ -5219,7 +5219,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
         for value in (middle, t, u):
             publication = wait_for("real signed target publication at its own isolated directory",
                                    lambda value=value: by_target[value.peer_id].published(value.peer_id))
-            require(publication["node_id"] == value.peer_id
+            require(publication["peer_id"] == value.peer_id
                     and publication["direct_urls"] == [captures[value.peer_id].url.replace("http:", "ws:") + "/api/network/ws"]
                     and not publication["relay_urls"] and publication["expires_at"] > time.time(),
                     "directory returns the unmodified original target's live direct-only publication")
