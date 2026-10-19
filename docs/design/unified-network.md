@@ -638,6 +638,16 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 所有 Gateway 都没有公网 HTTPS 地址时，邀请界面不显示二维码，明确提示“只能本机打开”，并引导本人配置公网入口。管理端在 loopback 本机页面生成邀请时，默认选用入口列表中可公网访问的 `gateway_url`，没有则按前述提示。
 - 提供面向用户的“配置公网入口（HTTPS 反代加 Gateway）”指引文档和界面入口。
 
+第二期实施记录（PR #63）。分两步：第一步为后端、传输与密码学和不依赖页面的前端状态模块；第二步在 UX PR #64 合入后接入页面并完成浏览器端到端验收。与上文的差异和推迟项如下：
+
+- `DeviceId` 即 Ed25519 公钥，成员目录只有 `device_id`、`kind`、`name` 和 `manage`。Node 的角色只在本机 `config.json` 声明。`data_epoch` 保持 6。
+- 身份 RPC 为 `invite`、`join`、`join_status`、`approve`、`revoke` 和 `recover`，另有只读的 `recovery_state` 供根身份读取目录。建网也经 `recover`（带 `genesis` 和一次性 capability）。
+- `Attestation` 落在 `MessagePosted(user)`、`BotCreated`、`ApprovalAnswered`、`AutonomySet` 和 `NotificationAcked`。`WorkFinished` 的本人结清和 `ConversationOwner` 的本人签名推迟到第四期，与跨设备工作和调度切换一起做。
+- `/api/client` 只接通本 Node；目标是其他设备时回文本错误帧。跨入口转发随 iroh 在第三期实现，`verify-node.py --auto-route` 中的跨入口用例同期恢复。`network.rs` 和 `peer.rs` 保留到第三期。
+- 本机会话端口被占用时的提示为“端口 X 被占用，可用 --local-listen 更换”，公开端口为 `--listen`。
+- 链接状态机、IndexedDB outbox 和 Web Locks 主标签页模块已实现并有单元测试，第二步接入页面。service worker 与 manifest 已注册；未带哈希的外壳文件以 `no-cache` 提供。
+- 公网入口指引写在 `docs/node.md` 的“配置公网入口”，界面入口、二维码和“只能本机打开”提示在第二步接入页面。
+
 **第三期：iroh 传输与版本向量同步。** 接入 `iroh` Endpoint、`Router`、5 个 ALPN 和 relay 访问控制，实现 `Hello`、`Pull`、`Have`、附件续传和 `vibeface/client/1` 密文转发。实现签名地址簿、`entrances`、按地址簿放行成员 Gateway 的 Origin，以及浏览器入口列表和自动切换（4.5 节）。入口切换依赖地址簿和多 Node 同步，所以放在本期。Node 经 `vibeface/join/1` 加入。删除 `network.rs`、`network/admission.rs`、`peer.rs` 和 `mdns-sd`。验收标准如下：
 
 - `scripts/verify-node.py` 用三个真实 Node 进程，覆盖 NAT 后两台经自建 relay 互通。

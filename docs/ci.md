@@ -74,7 +74,7 @@ python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --ar
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-net --network-reliability --net1-lane 7
 ```
 
-Peer ID 自动选路和入口切换改动跑 `--auto-route`，覆盖本机、同入口、跨入口、签名与目标校验、邀请与恢复、撤销、取消及未知写入不重放。
+身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、根恢复保留管理设备及未知写入不重放。跨入口转发在第三期随 iroh 恢复。
 
 队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、审批、中断、App Server 托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。统一网络第一期删除了多 Node 同步，不带模式参数的多 Node 全量验收在第三期恢复前不可用。其他网络协议、同步历史与附件传输改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
 

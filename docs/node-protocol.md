@@ -4,23 +4,15 @@
 
 ## 身份与数据范围
 
-`network_id` 是个人网络根公钥原始字节的 SHA256，`peer_id` 是设备公钥原始字节的 SHA256，均编码为 64 个小写十六进制字符。地址不参与身份计算。
+`network_id` 是个人网络根公钥，`device_id` 是设备 Ed25519 公钥本身，均编码为 64 个小写十六进制字符。地址不参与身份计算。
 
 个人网络使用 `NetworkState { genesis, checkpoint, events }`。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
 
-`Member` 包含 `subject_id`、`public_key`、`kind`、`name`、`node_roles` 和 `manage`。`kind` 为 `node` 或 `client`。Node 成员只能具有本机启用角色，不能持有管理权限。客户端没有 Node 角色，只有明确授权的管理客户端能签署成员变更。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新成员；Node 成员不能持有管理权限。Node 能做什么由本机 `config.json` 的 `roles` 声明，不写入成员目录。
 
-角色为 `gateway`、`relay`、`replica` 和 `scheduler`。`config.json` 控制本机能力，个人网络成员授权限制设备在该网络中的权限。公共中继能力独立于私人网络授权。
+管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`。签名目录验证因果授权，已知撤销优先。根恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
 
-管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`。签名目录验证因果授权，不能通过并发事件自行扩大权限，已知撤销优先。管理恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
-
-所有共享会话、事件、附件、任务及通知按 `network_id` 分区。公网发现目录不发布私人网络成员关系、项目或会话。一个物理 Node 可运行自己的调度执行，同时为其他网络转发密文。
-
-## Peer ID 术语
-
-内部类型使用 `PeerId`，身份方法使用 `peer_id()`，浏览器 SDK 使用 `peerId()`。JSON、RPC、邀请、连接记录、Peer 握手、发现记录、中转签名、维护响应和更新日志统一使用 `peer_id`。mDNS 只广告和读取 `peer_id`。
-
-Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制字符。恢复挑战使用 `target_peer_id`，blob 下载清单使用 `source_peer_id`。`network_id` 是网络编号，`subject_id` 是签名成员编号。
+一个数据目录只属于一个个人网络。公网发现目录不发布私人网络成员关系、项目或会话。
 
 ## 本机配置
 
@@ -29,6 +21,7 @@ Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制�
 | 字段 | 含义 |
 |---|---|
 | `listen` | 实际 HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡 |
+| `local_listen` | 本机会话的固定回环地址，默认 `127.0.0.1:4791`；固定端口让本机 origin 和浏览器存储跨重启不变 |
 | `public_url` | 配对和展示使用的主入口 origin，公网为 HTTPS |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
@@ -69,14 +62,13 @@ Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制�
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
-| `/`、`/app.js`、`/transport.js`、`/style.css` | GET | 内置可信网页客户端 |
+| `/`、`/assets/*`、`/transport.js` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
+| `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
 | `/api/info` | GET | Node 公开身份与能力信息 |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口 |
-| `/api/local/join/request` | POST | 本机运行中的 Node 提交节点邀请和名称，保存申请收据 |
-| `/api/local/join/accept` | POST | 本人以申请编号及完整 review hash 确认节点身份和权限 |
-| `/api/local/join/status` | POST | 核对原申请并安装已授予的 Node 成员授权，不重发申请 |
-| `/api/network/ws` | GET，WebSocket upgrade | 直连、发现、中继及端到端客户端通道 |
+| `/api/client` | GET，WebSocket upgrade | 浏览器客户端网关，唯一接受 `allowed_origins` 跨源连接的路径 |
+| `/api/network/ws` | GET，WebSocket upgrade | Node 之间的对等通道，第三期由 iroh 取代 |
 | `/api/tools` | POST | 本地管理 Agent 的受限工具调用 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | Cursor SDK 原生工具回调 |
 
@@ -84,11 +76,9 @@ Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制�
 
 `/api/local/setup` 要求正文为 JSON 空对象 `{}`。全部本机设置及加入路径要求实际 TCP 来源为 loopback、Host 为允许的字面 localhost 或 loopback 地址，且 Origin 与该入口完整一致。不接受 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP` 请求头，`0.0.0.0`、`::` 和公网入口不能使用。响应禁止缓存，初始化材料不进入公开的 `/api/info`。
 
-未初始化时返回 `{ kind: "uninitialized", invitation: { url, peer_id, capability } }`，其中一次性能力仍由原有签名建网或恢复协议消耗。已有网络时返回 `{ kind: "initialized", entry: { address, peer_id }, local_launch?: { url, peer_id, token } }`。先尝试原入口的签名身份；可选启动凭据仅用于本人明确选择本机自动访问时导航到独立回环入口，不自动切换浏览器来源。该响应不授予永久成员资格，也不重建个人网络。
+未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，一次性能力由签名建网消耗。已有网络时返回 `{ kind: "initialized", entry: { address, device_id }, local_launch?: { url, device_id, token } }`。该响应不授予成员资格，也不重建个人网络。
 
-节点加入的响应状态为 `idle`、`review`、`pending`、`joined` 或 `uncertain`。`review` 与 `pending` 带 `request_id`、现有 `PairReview` 及其 canonical JSON 的 SHA256 `review_hash`。接受需要明确提交同一编号与 hash，原网络的管理客户端仍须批准。`joined` 只表示 Node 入网，不授予浏览器客户端权限。未知结果先查 `status`，不重新创建请求身份。
-
-WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"PEER_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。客户端钉住目标 Peer ID，服务端在加密通道内验证客户端个人网络授权。
+`/api/client` 检查 Origin：必须属于 `public_url`、`allowed_origins` 或本机别名，不带 Origin 的非浏览器客户端放行。WebSocket 建立后客户端先发送文本帧 `{"type":"connect","target":"DEVICE_ID"}`。目标不是本 Node 时网关回一条 `{"type":"error","error":...}` 文本帧并关闭；跨入口转发在第三期随 iroh 实现。随后两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。浏览器每次会话生成临时 Noise 静态密钥，并用不可导出的 Ed25519 CryptoKey 对其签名（`Proof`）。客户端钉住目标 `device_id`，对端证明的编号不符时关闭连接；服务端在加密通道内验证客户端成员授权。
 
 握手后的应用消息均为二进制加密记录。文本应用消息、身份错配、篡改及重放关闭通道。大消息通过 `sealMessage` 和 `openRecord` 分片重组，不能直接把一个超长 JSON 塞入单个 Noise record。
 
@@ -96,41 +86,31 @@ WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"d
 
 | method | params | 用途 |
 | --- | --- | --- |
-| `info` | `{}` | 当前 Node 的公开身份、角色、版本和初始化状态 |
-| `prepare_genesis` | `owner_public_key`、`client_name` | 构造首个成员目录及待签名内容 |
-| `bootstrap` | `capability`、`state` | 一次性本机授权安装根签名目录 |
+| `info` | `{}` | 当前 Node 的公开身份、主机名、角色、版本和初始化状态 |
 | `authenticate` | `network_id` | 验证握手客户端的成员授权，或独立入口已验证的本机会话 |
 | `local_access` | 可选 `enabled` | 查询本机自动访问；管理客户端可开关，本机会话可关闭 |
 | `directory` | `{}` | 返回当前签名目录及投影 |
-| `node_settings` | `{}` | 管理客户端或有效本机会话读取当前节点 manager、roots、默认程序路径及角色和依赖准备状态 |
-| `configure_node` | `manager`、`roots` | 管理客户端或有效本机会话验证并保存当前节点设置，更新后续操作读取的本机快照 |
+| `node_settings` | `{}` | 管理客户端或有效本机会话读取当前节点 manager、roots 和依赖准备状态 |
+| `configure_node` | `manager`、`roots` | 管理客户端或有效本机会话保存当前节点设置 |
 | `rpc` | 下节 RPC 对象 | 执行业务读写 |
 | `subscribe` | `{}` | 订阅本网络的 `changed` 消息及其语义 payload |
-| `prepare_invite` | `kind`、`node_roles`、`request_id` | 生成邀请正文与管理客户端待签名内容 |
-| `commit_invite` | `invite`、`capability` | 验证管理客户端签名并登记一次性邀请 |
-| `prepare_pair_request` | `invite`、`capability`、`name`、可选 `request_id` | 构造新设备的持钥证明 |
-| `pair_request` | `request` | 提交新设备签名的配对申请 |
-| `pair_accept` | `request_id`、`signature` | 新设备签名确认本次 review |
-| `pair_requests` | `{}` | 管理客户端查看待确认申请 |
-| `prepare_pair` | `request_id` | 返回 review、治理事件及两份待签名内容 |
-| `pair_confirm` | `request_id`、`inviter_signature`、`event` | 管理客户端签名后授予设备权限 |
-| `pair_status` | `request_id` | 查询当前持钥设备的 pending 或 granted 状态 |
-| `prepare_revoke` | `subject_id` | 生成客户端待签名撤销事件 |
-| `revoke` | `event` | 验证并同步签名撤销 |
-| `recovery_challenge` | `network_id`、`owner_public_key`、可选 `genesis` | 生成根身份持钥挑战 |
-| `recovery_context` | `challenge_id`、`signature`、新节点的 `state` 与 `capability` | 验证根签名后读取恢复上下文 |
-| `prepare_recovery` | `challenge_id`、`members` | 生成更高 epoch checkpoint 及根待签名内容 |
-| `recover` | `challenge_id`、`checkpoint`、新节点的 `state` 与 `capability` | 安装根签 checkpoint 并授权新管理客户端 |
+| `invite` | `record` | 管理设备登记自己签名的邀请记录，返回 `join_id` 和 `entry_id` |
+| `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
+| `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数；不带 `join_id` 时管理设备列出待处理请求 |
+| `approve` | `join_id` 加 `admin_nonce`、`event` 或 `reject: true` | 管理设备给出随机数、签名授予或拒绝 |
+| `revoke` | `event` | 管理设备签名撤销成员 |
+| `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的短期签名读取当前目录 |
+| `recover` | `genesis`、`checkpoint`、`capability` | 空 Node 安装根签目录；已建网 Node 安装更高 epoch checkpoint |
 
-`prepare_genesis` 返回 `state` 和 `signing { domain, payload }`。客户端使用本地根身份签名并写入 `state.genesis.signature`。`bootstrap` 和 `authenticate` 返回 `principal`、`state` 和 `view`。`principal` 包含 `network_id`、`subject_id`、`epoch`、`can_manage` 和 `source`，不能由客户端自行声明。`source=membership` 使用签名成员目录；`source=local_session` 绑定本机 Node、当前网络和浏览器 Noise 公钥，`can_manage=false`，不参加成员治理。本机设置写入在取得配置锁后重新核对 Cookie 的有效性、Node、网络及浏览器身份；关闭本机访问后，旧 Cookie 不能保存设置。已有签名管理身份优先保留其成员权限。
+加入流程使用承诺加短码。管理设备生成 ticket（入口 `device_id`、邀请编号、邀请哈希和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备生成随机数 `joiner_nonce`，提交 `commit = SHA256(device_id ‖ joiner_nonce)`；管理设备随后给出 `admin_nonce`，状态变为 `confirming`；新设备再揭示 `joiner_nonce`。揭示值与承诺不符时请求作废为 `rejected`。两端用双方公钥和随机数计算同一个 6 位短码，本人核对一致后管理设备签名 `grant`，否则选择拒绝，请求作废。请求只能由同一设备推进，过期即作废。
 
-邀请含管理客户端签名的 `InviteEnvelope`，新设备还要签署持钥证明和最终 review。管理客户端分别签署 review 与治理事件。只有一次性邀请，或只取得未确认的申请，都不能成为成员。在线新增成员不授予管理权限，管理客户端由根签初始化或恢复 checkpoint 明确建立。
+浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ApprovalAnswered`、`AutonomySet` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`。签名覆盖 `attestation_payload(network_id, scope, 去掉 attestation 的 body 规范 JSON)`，domain 为 `attestation`。签名设备必须是会话本身且是未撤销的客户端成员，其他事件类型不得带签名。入库和签发事件都检查这一点，换文本、换会话或别人的签名都会被拒绝。
 
-恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`。加密正文包含 `version`、`network_id`、`root_secret_key`、`genesis`、`recovery_epoch` 和 `decryption_keys`。恢复加密复用 Rust/WASM 的 Argon2id 与 XChaCha20-Poly1305，实现同时验证格式、KDF 参数、身份及完整性。口令和明文根私钥不发给 Node。
+恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`。加密正文包含 `version`、`network_id`、`root_secret_key`、`genesis`、`recovery_epoch` 和 `decryption_keys`。恢复加密复用 Rust/WASM 的 Argon2id 与 XChaCha20-Poly1305。口令和明文根私钥不发给 Node。
 
-恢复流程先验证根签 challenge，再返回可核对的设备目录。客户端明确选择保留成员，生成新的独立管理客户端，并使用本地解锁的根身份签署 checkpoint。已初始化 Node 只能恢复该个人网络。新 Node 另需本机 capability，持有其他网络的根私钥不能抢占公共主机。业务正文和项目文件不在根恢复包中。
+根恢复先用 `recovery_state` 读取目录，默认保留现有管理设备，由本人取舍后用根身份签署更高 epoch checkpoint。新 Node 另需本机 capability，持有其他网络的根私钥不能抢占公共主机。业务正文和项目文件不在根恢复包中。
 
-未初始化时，本机 `access --json` 输出含 Peer ID 与一次性 bootstrap capability。个人网络建立且本机自动访问开启时，它输出独立回环入口，URL fragment 包含短期单次 token。凭据不放入服务日志、公共目录或 DAG。知道 Node 地址或公开身份不能抢占初始化，也不能取得私人网络权限。
+未初始化时，本机 `access --json` 输出 `device_id` 与一次性 bootstrap capability。个人网络建立且本机自动访问开启时，它输出独立回环入口，URL fragment 包含短期单次 token。凭据不放入服务日志、公共目录或 DAG。
 
 独立回环 listener 提供 `/api/local/info`、`/api/local/launch`、`/api/local/exchange` 和 `/api/local/ws`。`launch` 仅接受本机私有启动凭据，`exchange` 消费单次 token 后签发绑定浏览器公钥的 Cookie，`ws` 仍执行 Noise 握手。公开 router 不挂这些入口。仅检查来源 IP、Host 或代理头不足以建立本机授权。关闭 `local_auto_access` 会撤销本机会话、待兑换 token 和连接，普通成员会话保留。
 
