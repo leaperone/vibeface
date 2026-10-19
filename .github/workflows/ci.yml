@@ -2,19 +2,92 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
   push:
     branches: [main]
     tags: ['v*']
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.action == 'edited' && !github.event.changes.base && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  plan:
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    runs-on: ubuntu-24.04
+    outputs:
+      plan: ${{ steps.select.outputs.plan }}
+      web: ${{ steps.select.outputs.web }}
+      rust: ${{ steps.select.outputs.rust }}
+      slow: ${{ steps.select.outputs.slow }}
+      package: ${{ steps.select.outputs.package }}
+      package_matrix: ${{ steps.select.outputs.package_matrix }}
+      package_mode: ${{ steps.select.outputs.package_mode }}
+      npm: ${{ steps.select.outputs.npm }}
+      version: ${{ steps.select.outputs.version }}
+      msrv: ${{ steps.select.outputs.msrv }}
+      channel: ${{ steps.select.outputs.channel }}
+      prerelease: ${{ steps.select.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Select checks from the complete change and event
+        id: select
+        run: python3 scripts/ci.py plan --github-output "$GITHUB_OUTPUT"
+
+  quick-check:
+    needs: plan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: ariga/setup-atlas@d1698c9cc991e6d65a02ce8bb9cd69fba6223cff # v0
+        if: needs.plan.outputs.rust == 'true'
+        with:
+          version: v1.3.0
+      - name: Validate migration files without opening a database
+        if: needs.plan.outputs.rust == 'true'
+        run: atlas migrate validate --dir file://crates/node/migrations
+      - name: Check workflow, selectors and shell scripts
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          python3 scripts/ci.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py")]'
+          bash -n install.sh
+          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
+          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
+          bash install.sh --self-test
+      - name: Check JavaScript syntax
+        run: |
+          node --check crates/node/sdk/codex-manager.mjs
+          node --check crates/node/web/transport.js
+          node --check scripts/crypto-client.mjs
+          node --check npm/bin/vibeface.mjs
+          node --check scripts/package-npm.mjs
+          node scripts/package-npm.mjs --self-test
+      - run: cargo fmt --all -- --check
+
   crypto-web:
+    needs: plan
+    if: needs.plan.outputs.web == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +119,8 @@ jobs:
           retention-days: 14
 
   web:
-    needs: crypto-web
+    needs: [plan, crypto-web]
+    if: needs.plan.outputs.web == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -74,17 +148,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  check:
-    needs: [crypto-web, web]
+  rust-check:
+    needs: [plan, quick-check, crypto-web, web]
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.metadata.outputs.version }}
-      channel: ${{ steps.metadata.outputs.channel }}
-      prerelease: ${{ steps.metadata.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -96,82 +166,74 @@ jobs:
           path: crates/node/web/dist/client
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Read package metadata and validate release tag
-        id: metadata
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          cargo metadata --no-deps --format-version 1 --locked > "$RUNNER_TEMP/cargo-metadata.json"
-          python3 - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
-          import datetime, json, os, re, sys
-          package = next(p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "vibeface")
-          version = package["version"]
-          number = r"(?:0|[1-9][0-9]*)"
-          match = re.fullmatch(rf"{number}\.{number}\.{number}(?:-(nightly)\.([0-9]{{8}})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?", version)
-          assert match, "Expected X.Y.Z, X.Y.Z-nightly.YYYYMMDD.N or X.Y.Z-rc.N"
-          channel = "nightly" if match[1] else "rc" if match[4] else "stable"
-          if channel == "nightly":
-              date = match[2]
-              datetime.date(int(date[:4]), int(date[4:6]), int(date[6:]))
-          if os.environ["REF_TYPE"] == "tag":
-              assert os.environ["REF_NAME"] == f"v{version}", "Release tag must exactly match the Cargo version"
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f'version={version}\nmsrv={package["rust_version"]}\nchannel={channel}\nprerelease={str(channel != "stable").lower()}\n')
-          PY
-          if [[ "$REF_TYPE" == tag ]]; then
-            git merge-base --is-ancestor HEAD origin/main
-          fi
-      - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-      - uses: ariga/setup-atlas@d1698c9cc991e6d65a02ce8bb9cd69fba6223cff # v0
-        with:
-          version: v1.3.0
-      - name: Validate migration files without opening a database
-        run: |
-          atlas migrate validate --dir file://crates/node/migrations
-      - name: Check workflow and shell scripts
-        run: |
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          bash -n install.sh
-          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
-          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
-          bash install.sh --self-test
-      - name: Check JavaScript syntax
-        run: |
-          node --check crates/node/sdk/codex-manager.mjs
-          node --check crates/node/web/transport.js
-          node --check scripts/crypto-client.mjs
-          node --check npm/bin/vibeface.mjs
-          node --check scripts/package-npm.mjs
-          node scripts/package-npm.mjs --self-test
-      - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --locked
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Check declared minimum Rust version
+          shared-key: check
+      - name: Check affected crates with Clippy and the declared minimum Rust version
         env:
-          MSRV: ${{ steps.metadata.outputs.msrv }}
-        run: |
-          rustup toolchain install "$MSRV" --profile minimal
-          cargo +"$MSRV" check --workspace --locked
+          CI_PLAN: ${{ needs.plan.outputs.plan }}
+          MSRV: ${{ needs.plan.outputs.msrv }}
+        run: python3 scripts/ci.py check --plan-env CI_PLAN --msrv "$MSRV"
+
+  rust-fast:
+    needs: [plan, crypto-web, web]
+    if: needs.plan.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: crypto-web-${{ github.sha }}
+          path: crates/node/web/generated
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+      - name: Run affected Rust tests except the exact heavy scenarios
+        env:
+          CI_PLAN: ${{ needs.plan.outputs.plan }}
+        run: python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
+
+  rust-slow:
+    needs: [plan, crypto-web, web]
+    if: needs.plan.outputs.slow == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: crypto-web-${{ github.sha }}
+          path: crates/node/web/generated
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+      - name: Run the exact heavy Node scenarios
+        env:
+          CI_PLAN: ${{ needs.plan.outputs.plan }}
+        run: python3 scripts/ci.py test --tier slow --plan-env CI_PLAN
 
   package:
-    needs: [crypto-web, web]
+    needs: [plan, crypto-web, web]
+    if: needs.plan.outputs.package == 'true'
     name: package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - runner: macos-15
-            target: aarch64-apple-darwin
+      matrix: ${{ fromJSON(needs.plan.outputs.package_matrix) }}
     env:
       PACKAGE_TARGET: ${{ matrix.target }}
     steps:
@@ -228,12 +290,18 @@ jobs:
           PY
           "$package/vibeface" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
+      - name: Verify packaged Web assets and process
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
       - name: Verify unpacked Node processes without model calls
+        if: needs.plan.outputs.package_mode == 'node'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
       - name: Verify bot tools and startup event recovery
-        if: matrix.target == 'aarch64-apple-darwin'
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
@@ -259,6 +327,8 @@ jobs:
         with:
           name: node-process-failure-${{ matrix.target }}-${{ github.run_attempt }}
           path: |
+            .artifacts/ci-web/web-process-*/report.json
+            .artifacts/ci-web/web-process-*/WEB/process.log
             .artifacts/ci-node/node-acceptance-*/report.json
             .artifacts/ci-node/node-acceptance-*/A/process.log
             .artifacts/ci-node/node-acceptance-*/B/process.log
@@ -277,8 +347,8 @@ jobs:
           retention-days: 7
 
   npm-package:
-    needs: [check, package]
-    if: needs.check.outputs.channel == 'nightly'
+    needs: [plan, package]
+    if: needs.plan.outputs.npm == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -304,18 +374,12 @@ jobs:
           retention-days: 14
 
   npm-smoke:
-    needs: [check, npm-package]
+    needs: [plan, npm-package]
+    if: needs.plan.outputs.npm == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - runner: macos-15
-            target: aarch64-apple-darwin
+      matrix: ${{ fromJSON(needs.plan.outputs.package_matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -332,7 +396,7 @@ jobs:
           path: .artifacts/npm
       - name: Install npm artifact without lifecycle scripts
         env:
-          PACKAGE_VERSION: ${{ needs.check.outputs.version }}
+          PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
@@ -345,9 +409,23 @@ jobs:
           prefix="$PWD/.artifacts/npm-installed"
           python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --skip-codex
 
+  ci-gate:
+    name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'pr-metadata-only' || 'ci-gate' }}
+    if: always() && (github.event.action != 'edited' || github.event.changes.base != null)
+    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, package, npm-package, npm-smoke]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require every check selected for this commit and scenario
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS
+
   publish:
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.check.result == 'success' && needs.package.result == 'success' && (needs.check.outputs.channel != 'nightly' || needs.npm-smoke.result == 'success') }}
-    needs: [check, package, npm-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plan, ci-gate, package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -355,9 +433,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.ref_name }}
-      VERSION: ${{ needs.check.outputs.version }}
-      RELEASE_CHANNEL: ${{ needs.check.outputs.channel }}
-      PRERELEASE: ${{ needs.check.outputs.prerelease }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE_CHANNEL: ${{ needs.plan.outputs.channel }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
       - uses: actions/download-artifact@v4
         with:
