@@ -263,7 +263,6 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
           active.delete(attempt);
           if (finished) return;
           lastError = error;
-          if (candidate.url === entryUrl && candidate.relay) add({ url: entryUrl, relay: false });
           pump();
         });
       }

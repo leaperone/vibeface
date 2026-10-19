@@ -231,7 +231,6 @@ impl Runtime {
             return;
         };
         payload["source_node"] = json!(source);
-        payload["source"] = json!(source);
         let Some(scope) = payload["conversation_id"].as_str() else {
             return;
         };

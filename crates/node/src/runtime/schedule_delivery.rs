@@ -700,8 +700,6 @@ impl Runtime {
             if capabilities.is_some_and(|value| {
                 matches!(value["manager"].as_str(), Some("cursor_sdk" | "codex_sdk"))
                     && value["manager_capabilities"].is_object()
-                    && value["reliable_schedule"]["version"].as_u64()
-                        == Some(u64::from(SCHEDULING_VERSION))
             }) {
                 return Ok(candidate);
             }
@@ -989,18 +987,6 @@ impl Runtime {
         {
             return Ok(());
         }
-        let capability = self
-            .read_peer(
-                &entry.network_id,
-                &entry.target_node,
-                json!({"type":"capabilities"}),
-            )
-            .await?;
-        ensure!(
-            capability["reliable_schedule"]["version"].as_u64()
-                == Some(u64::from(SCHEDULING_VERSION)),
-            "target does not support reliable scheduling protocol 1; upgrade the original target"
-        );
         let reply = self.read_peer(&entry.network_id, &entry.target_node,
             json!({"type":"manager_status","conversation_id":entry.conversation_id,"trigger":entry.trigger})).await?;
         let presence = self

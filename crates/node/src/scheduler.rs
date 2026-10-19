@@ -193,7 +193,7 @@ pub async fn run(
             let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             progress_node.publish_progress(&progress_network, json!({
                 "type":"manager_progress", "conversation_id":progress_conversation,
-                "trigger":progress_trigger, "invocation_id":progress_attempt, "source":progress_node.identity.peer_id().ok(), "source_node":progress_node.identity.peer_id().ok(), "sequence":sequence, "progress":progress,
+                "trigger":progress_trigger, "invocation_id":progress_attempt, "source_node":progress_node.identity.peer_id().ok(), "sequence":sequence, "progress":progress,
             }));
             async { Ok(()) }
         }).await?;

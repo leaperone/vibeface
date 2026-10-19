@@ -433,12 +433,10 @@ mod tests {
         let sources = vec![
             HistorySource {
                 peer_id: a.clone(),
-                batch: None,
                 failed: false,
             },
             HistorySource {
                 peer_id: b.clone(),
-                batch: None,
                 failed: false,
             },
         ];
@@ -830,7 +828,7 @@ mod tests {
         event.sequence = 3;
         event.previous = Some(parent.hash.clone());
         let child = node.identity.sign_event(event.clone())?;
-        let batch = json!({"version":1,"hash":child.hash,"events":[root,parent,child]});
+        let batch = json!({"hash":child.hash,"events":[root,parent,child]});
         let store = node.store.lock().await;
         let verified = verify_history_batch(
             &store,
@@ -913,7 +911,7 @@ mod tests {
         event.previous = Some(parent.hash.clone());
         event.parents = vec![root.hash.clone(), branch.hash.clone()];
         let diamond = node.identity.sign_event(event.clone())?;
-        let batch = json!({"version":1,"hash":diamond.hash,"events":[root,parent,branch,diamond]});
+        let batch = json!({"hash":diamond.hash,"events":[root,parent,branch,diamond]});
         let store = node.store.lock().await;
         assert_eq!(
             verify_history_batch(
@@ -958,19 +956,10 @@ mod tests {
         assert_eq!(response["events"].as_array().unwrap().len(), 1);
         assert!(actual_bytes > large.canonical_body.len());
         message.payload["max_bytes"] = json!(512);
-        let response = node.handle_peer(&message).await?;
-        assert_eq!(
-            response,
-            json!({"version":1,"hash":large.hash,"single_event":true})
-        );
-        message.payload["max_bytes"] =
-            json!(serde_json::to_vec(&json!({"version":1,"hash":large.hash,"events":[]}))?.len());
         assert_eq!(
             node.handle_peer(&message).await.unwrap_err().to_string(),
             "history batch byte budget too small"
         );
-        message.payload = json!({"type":"event","hash":large.hash});
-        assert_eq!(node.handle_peer(&message).await?["event"], json!(large));
 
         let mut event: Event = serde_json::from_str(&root.canonical_body)?;
         event.scope_id = "wide".into();
@@ -996,7 +985,7 @@ mod tests {
             extract::{State, WebSocketUpgrade},
             routing::get,
         };
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         async fn upgrade(
             State(hub): State<Arc<PeerHub>>,
             ws: WebSocketUpgrade,
@@ -1077,10 +1066,8 @@ mod tests {
             let _ = hub.connect(scope, url).await;
         });
         let malformed = Arc::new(AtomicUsize::new(1));
-        let legacy = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
         let batch_requests = Arc::new(AtomicUsize::new(0));
-        let single_requests = Arc::new(AtomicUsize::new(0));
         let mut inbound = source
             .peer_rx
             .lock()
@@ -1089,13 +1076,7 @@ mod tests {
             .context("missing test receiver")?;
         let serving = source.clone();
         let extra = unrelated.clone();
-        let (bad, old, count, batches, singles) = (
-            malformed.clone(),
-            legacy.clone(),
-            requests.clone(),
-            batch_requests.clone(),
-            single_requests.clone(),
-        );
+        let (bad, count, batches) = (malformed.clone(), requests.clone(), batch_requests.clone());
         tasks.spawn(async move {
             while let Some(message) = inbound.recv().await {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -1103,12 +1084,6 @@ mod tests {
                     .handle_peer(&message)
                     .await
                     .unwrap_or_else(|error| json!({"error":error.to_string()}));
-                if message.payload["type"] == "capabilities" && old.load(Ordering::SeqCst) {
-                    value.as_object_mut().unwrap().remove("history_batch");
-                }
-                if message.payload["type"] == "event" {
-                    singles.fetch_add(1, Ordering::SeqCst);
-                }
                 if message.payload["type"] == "history_batch" {
                     batches.fetch_add(1, Ordering::SeqCst);
                     if bad.load(Ordering::SeqCst) == 1 {
@@ -1122,7 +1097,10 @@ mod tests {
                     } else if bad.load(Ordering::SeqCst) == 4 {
                         let mut small = message.clone();
                         small.payload["max_bytes"] = json!(120);
-                        value = serving.handle_peer(&small).await.unwrap();
+                        value = serving
+                            .handle_peer(&small)
+                            .await
+                            .unwrap_or_else(|error| json!({"error":error.to_string()}));
                     }
                 }
                 let _ = serving.hub.respond(&message, value).await;
@@ -1152,7 +1130,6 @@ mod tests {
                 .event(&network, &unrelated.hash)?
                 .is_none()
         );
-        assert_eq!(single_requests.load(Ordering::SeqCst), 0);
         malformed.store(2, Ordering::SeqCst);
         let mut sources = receiver
             .history_sources(&network, std::slice::from_ref(&source_id))
@@ -1192,26 +1169,6 @@ mod tests {
         );
         assert!(requests.load(Ordering::SeqCst) < 24);
         assert_eq!(batch_requests.load(Ordering::SeqCst), 11);
-        assert_eq!(single_requests.load(Ordering::SeqCst), 0);
-        legacy.store(true, Ordering::SeqCst);
-        let before = batch_requests.load(Ordering::SeqCst);
-        let mut sources = receiver
-            .history_sources(&network, std::slice::from_ref(&source_id))
-            .await?;
-        let mut budget = HistoryBudget {
-            events: 128,
-            bytes: 8 * MAX_EVENT_BYTES,
-        };
-        let old = receiver
-            .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
-            .await?;
-        assert_eq!(old.events, vec![envelopes.last().unwrap().clone()]);
-        drop(old);
-        assert_eq!(batch_requests.load(Ordering::SeqCst), before);
-        assert_eq!(single_requests.load(Ordering::SeqCst), 1);
-        assert!(requests.load(Ordering::SeqCst) < 24);
-
-        legacy.store(false, Ordering::SeqCst);
         malformed.store(4, Ordering::SeqCst);
         let mut sources = receiver
             .history_sources(&network, std::slice::from_ref(&source_id))
@@ -1220,12 +1177,12 @@ mod tests {
             events: 128,
             bytes: 8 * MAX_EVENT_BYTES,
         };
-        let single = receiver
-            .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
-            .await?;
-        assert_eq!(single.events, vec![envelopes.last().unwrap().clone()]);
-        drop(single);
-        assert_eq!(single_requests.load(Ordering::SeqCst), 2);
+        assert!(
+            receiver
+                .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
+                .await
+                .is_err()
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("ws://{}/peer", listener.local_addr()?);
@@ -1823,16 +1780,12 @@ mod tests {
             let receiver = nodes[0].clone();
             tasks.spawn(async move {
                 while let Some(message) = inbound.recv().await {
-                    if message.payload["type"] == "event" {
+                    if message.payload["type"] == "history_batch" {
                         let update = membership_during_fetch.lock().await.take();
                         if let Some(update) = update { receiver.install_membership(update).await.unwrap(); }
                     }
-                    let value = if message.payload["type"] == "capabilities" {
-                        let mut capabilities = source.capabilities();
-                        capabilities.as_object_mut().unwrap().remove("history_batch");
-                        capabilities
-                    } else if index == 1 && message.payload["type"] == "event" && message.payload["hash"] == root_hash {
-                        json!({"event":wrong})
+                    let value = if index == 1 && message.payload["type"] == "history_batch" && message.payload["hash"] == root_hash {
+                        json!({"hash":root_hash,"events":[wrong]})
                     } else if index == 1 && message.payload["type"] == "inventory" {
                         json!({"membership":source.store.lock().await.trust_bundle(&scope).unwrap(),"scopes":[
                             {"scope_id":"broken","heads":[crypto::digest(b"unavailable event")]},
@@ -2549,11 +2502,11 @@ mod tests {
         };
         let message = Inbound {
             origin: replica.peer_id()?,
-            payload: json!({"type":"event","hash":event.hash}),
+            payload: json!({"type":"history_batch","hash":event.hash}),
             ..message
         };
         assert_eq!(
-            node.handle_peer(&message).await?["event"]["hash"],
+            node.handle_peer(&message).await?["events"][0]["hash"],
             event.hash
         );
         let blob = BlobRef {
@@ -2811,7 +2764,6 @@ const HISTORY_BATCH_BYTES: usize = crate::peer::MAX_PACKET_BYTES - 1024;
 
 struct HistorySource {
     peer_id: String,
-    batch: Option<bool>,
     failed: bool,
 }
 
@@ -2829,10 +2781,6 @@ impl HistoryBudget {
     }
 }
 
-fn history_batch_capability() -> Value {
-    json!({"version":1,"max_events":HISTORY_BATCH_EVENTS,"max_bytes":HISTORY_BATCH_BYTES})
-}
-
 fn verify_history_batch(
     store: &Store,
     network: &str,
@@ -2841,10 +2789,7 @@ fn verify_history_batch(
     limit: usize,
     max_bytes: usize,
 ) -> Result<Vec<SignedEvent>> {
-    ensure!(
-        value["version"] == 1 && value["hash"] == hash,
-        "history batch root/version mismatch"
-    );
+    ensure!(value["hash"] == hash, "history batch root mismatch");
     ensure!(
         serde_json::to_vec(value)?.len() <= max_bytes,
         "history batch byte limit exceeded"
@@ -3536,7 +3481,6 @@ impl Runtime {
             .into_iter()
             .map(|peer_id| HistorySource {
                 peer_id,
-                batch: None,
                 failed: false,
             })
             .collect())
@@ -3562,45 +3506,15 @@ impl Runtime {
             let target = source.peer_id.clone();
             let before = budget.events;
             let result = async {
-                let batch = match source.batch {
-                    Some(batch) => batch,
-                    None => {
-                        let capabilities = self.history_response(network, &target, json!({"type":"capabilities"}), budget,class).await?;
-                        let batch = capabilities.value["history_batch"]["version"] == 1;
-                        source.batch = Some(batch);
-                        batch
-                    }
-                };
                 let limit = budget.events.min(HISTORY_BATCH_EVENTS);
                 let max_bytes = budget.bytes.min(HISTORY_BATCH_BYTES);
-                let value = if batch {
-                    self.history_response(network, &target, json!({"type":"history_batch","hash":hash,"limit":limit,"max_bytes":max_bytes}), budget,class).await?
-                } else {
-                    self.history_response(network,&target,json!({"type":"event","hash":hash}),budget,class).await?
-                };
-                let single = !batch || (value.value["version"] == 1 && value.value["hash"] == hash && value.value["single_event"] == true && value.value.get("events").is_none() && serde_json::to_vec(&value.value)?.len() <= max_bytes);
-                let value = if single && batch {
-                    drop(value);
-                    self.history_response(network,&target,json!({"type":"event","hash":hash}),budget,class).await?
-                } else { value };
-                budget.events = budget.events.saturating_sub(if single {1} else {value.value["events"].as_array().map_or(1,Vec::len).clamp(1,limit)});
+                let value = self.history_response(network, &target, json!({"type":"history_batch","hash":hash,"limit":limit,"max_bytes":max_bytes}), budget,class).await?;
+                budget.events = budget.events.saturating_sub(value.value["events"].as_array().map_or(1,Vec::len).clamp(1,limit));
                 let store = self.store.lock().await;
                 store.authorize_node(network, &target, Some(NodeRole::Replica))?;
-                let envelopes = if single {
-                    let envelope: SignedEvent = serde_json::from_value(value.value["event"].clone())?;
-                    ensure!(envelope.hash == hash, "event response hash mismatch");
-                    store.verify_event(network, &envelope)?;
-                    vec![envelope]
-                } else {
-                    verify_history_batch(&store, network, hash, &value.value, limit, max_bytes)?
-                };
-                if !single {
-                    tracing::trace!(network, target=%target, hash, count=envelopes.len(), "history batch fetched");
-                }
-                for envelope in &envelopes {
-                    tracing::trace!(network, target=%target, hash=%envelope.hash, mode=if single {"single"} else {"batch"}, "history event fetched");
-                }
-                Ok(HistoryPage { events:envelopes, _reply:Some(value) })
+                let envelopes = verify_history_batch(&store, network, hash, &value.value, limit, max_bytes)?;
+                tracing::trace!(network, target=%target, hash, count=envelopes.len(), "history batch fetched");
+                Ok::<_, anyhow::Error>(HistoryPage { events:envelopes, _reply:Some(value) })
             }
             .await;
             match result {
@@ -3965,8 +3879,7 @@ impl Runtime {
                 });
         json!({"roots":settings.roots,
             "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
-            "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1},
-            "history_batch":history_batch_capability()})
+            "manager_capabilities":manager.map(|kind|kind.capabilities())})
     }
 
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
@@ -4193,7 +4106,6 @@ impl Runtime {
             kind,
             "capabilities"
                 | "inventory"
-                | "event"
                 | "history_batch"
                 | "blob"
                 | "progress_read"
@@ -4216,18 +4128,7 @@ impl Runtime {
                     .into_iter()
                     .map(|(scope, heads)| json!({"scope_id":scope,"heads":heads}))
                     .collect::<Vec<_>>();
-                Ok(
-                    json!({"membership":store.trust_bundle(network)?,"scopes":scopes,"history_batch":history_batch_capability()}),
-                )
-            }
-            "event" => {
-                self.require_role(network, NodeRole::Replica).await?;
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Replica),
-                )?;
-                Ok(json!({"event":self.store.lock().await.event(network,field(input,"hash")?)?}))
+                Ok(json!({"membership":store.trust_bundle(network)?,"scopes":scopes}))
             }
             "history_batch" => {
                 self.require_role(network, NodeRole::Replica).await?;
@@ -4243,7 +4144,7 @@ impl Runtime {
                     .as_u64()
                     .unwrap_or(HISTORY_BATCH_BYTES as u64)
                     .min(HISTORY_BATCH_BYTES as u64) as usize;
-                let mut value = json!({"version":1,"hash":hash,"events":[]});
+                let mut value = json!({"hash":hash,"events":[]});
                 let mut bytes = serde_json::to_vec(&value)?.len();
                 ensure!(max_bytes >= bytes, "history batch byte budget too small");
                 let mut pending = VecDeque::from([hash.to_owned()]);
@@ -4261,14 +4162,7 @@ impl Runtime {
                     let added =
                         serde_json::to_vec(&encoded)?.len() + usize::from(!events.is_empty());
                     if bytes + added > max_bytes {
-                        if events.is_empty() {
-                            let marker = json!({"version":1,"hash":hash,"single_event":true});
-                            ensure!(
-                                serde_json::to_vec(&marker)?.len() <= max_bytes,
-                                "history batch byte budget too small"
-                            );
-                            return Ok(marker);
-                        }
+                        ensure!(!events.is_empty(), "history batch byte budget too small");
                         break;
                     }
                     bytes += added;
