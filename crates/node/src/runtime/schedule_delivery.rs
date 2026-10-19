@@ -373,7 +373,7 @@ impl Runtime {
         });
     }
 
-    async fn poll_watched_schedules(&self) -> Result<()> {
+    async fn poll_watched_schedules(self: &Arc<Self>) -> Result<()> {
         let local = self.identity.node_id()?;
         let mut watched = Vec::new();
         {
@@ -567,7 +567,7 @@ impl Runtime {
         Ok(())
     }
 
-    async fn flush_schedule_deliveries(&self) -> Result<()> {
+    async fn flush_schedule_deliveries(self: &Arc<Self>) -> Result<()> {
         let networks = self.store.lock().await.networks()?;
         for network in networks {
             let entries = self.store.lock().await.scheduler_outbox_all(&network)?;
@@ -1003,12 +1003,12 @@ impl Runtime {
         Ok(reply)
     }
 
-    async fn deliver_schedule(&self, entry: &OutboxEntry) -> Result<()> {
+    async fn deliver_schedule(self: &Arc<Self>, entry: &OutboxEntry) -> Result<()> {
         self.refresh_remote_schedule(entry, true, false).await
     }
 
     async fn refresh_remote_schedule(
-        &self,
+        self: &Arc<Self>,
         entry: &OutboxEntry,
         acknowledge: bool,
         force: bool,
@@ -1099,7 +1099,7 @@ impl Runtime {
     }
 
     async fn process_scheduler_reply(
-        &self,
+        self: &Arc<Self>,
         entry: &OutboxEntry,
         reply: Value,
         acknowledge: bool,

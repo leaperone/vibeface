@@ -16,6 +16,24 @@ use tokio::sync::OwnedMutexGuard;
 const MAX_STAGING_BYTES: u64 = 4 * MAX_BLOB_BYTES as u64;
 const MAX_STAGING_OBJECTS: usize = 64;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BlobStep {
+    Partial,
+    Complete { changed: bool },
+}
+pub(super) struct BlobQuantum {
+    pub remaining: usize,
+}
+impl BlobQuantum {
+    pub fn new(chunks: usize) -> Self {
+        Self { remaining: chunks }
+    }
+}
+struct BlobChunk {
+    bytes: Vec<u8>,
+    response: HistoryReply,
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct BlobKey {
     network: String,
@@ -333,7 +351,12 @@ impl BlobLease {
 }
 
 impl BlobWriter {
-    async fn write(mut self, offset: u64, bytes: Vec<u8>) -> Result<(Self, u64)> {
+    async fn write(
+        mut self,
+        offset: u64,
+        bytes: Vec<u8>,
+        response: Option<HistoryReply>,
+    ) -> Result<(Self, u64, Option<HistoryReply>)> {
         tokio::task::spawn_blocking(move || {
             ensure!(
                 self.part.metadata()?.len() == offset
@@ -347,7 +370,7 @@ impl BlobWriter {
             self.part.sync_all()?;
             test_boundary("chunk_fsynced");
             let actual_length = self.part.metadata()?.len();
-            Ok((self, actual_length))
+            Ok((self, actual_length, response))
         })
         .await?
     }
@@ -581,22 +604,25 @@ impl Runtime {
         blob: &BlobRef,
         offset: u64,
         limit: usize,
-    ) -> Result<Vec<u8>> {
+        class: ReadClass,
+    ) -> Result<BlobChunk> {
         self.authorize_blob_source(&*self.store.lock().await, network, source)?;
         tracing::trace!(network,hash=%blob.hash,source,offset,limit,"history blob request");
         let value = self
-            .read_peer(
+            .read_history(
                 network,
                 source,
                 json!({"type":"blob","hash":blob.hash,"offset":offset,"limit":limit}),
+                class,
+                limit * 2 + 1024,
             )
             .await?;
         self.authorize_blob_source(&*self.store.lock().await, network, source)?;
         ensure!(
-            value["size"].as_u64() == Some(blob.size),
+            value.value["size"].as_u64() == Some(blob.size),
             "blob response size mismatch"
         );
-        let encoded = value["data"].as_str().context("blob data required")?;
+        let encoded = value.value["data"].as_str().context("blob data required")?;
         ensure!(
             encoded.len() % 2 == 0 && encoded.len() <= limit * 2,
             "blob chunk too large"
@@ -616,7 +642,10 @@ impl Runtime {
                 "invalid empty blob"
             );
         }
-        Ok(bytes)
+        Ok(BlobChunk {
+            bytes,
+            response: value,
+        })
     }
     async fn commit_blob_progress(
         &self,
@@ -643,7 +672,12 @@ impl Runtime {
         network: &str,
         sources: &[HistorySource],
         blob: &BlobRef,
-    ) -> Result<bool> {
+        class: ReadClass,
+        quantum: &mut BlobQuantum,
+    ) -> Result<BlobStep> {
+        if quantum.remaining == 0 {
+            return Ok(BlobStep::Partial);
+        }
         let key = BlobKey::new(network, blob)?;
         let lease = self.blob_staging.lease(key).await;
         let (manifest, complete) = {
@@ -659,7 +693,7 @@ impl Runtime {
             {
                 tracing::warn!(network,hash=%blob.hash,%error,"staging cleanup pending");
             }
-            return Ok(false);
+            return Ok(BlobStep::Complete { changed: false });
         }
         let (lease, mut transfer) = match manifest {
             Some(transfer) => {
@@ -705,52 +739,73 @@ impl Runtime {
         tracing::debug!(network,hash=%blob.hash,size=blob.size,source=%bound_source,committed_offset=offset,part_length,"history blob opened");
         let mut ordered: Vec<_> = sources
             .iter()
+            .filter(|source| !source.failed)
             .map(|source| source.node_id.as_str())
             .collect();
-        ordered.sort_unstable();
         if let Some(index) = ordered.iter().position(|source| *source == bound_source) {
             ordered.rotate_left(index);
         }
         let first_source = ordered.first().copied().unwrap_or(&bound_source);
         let mut empty_received = blob.size != 0;
+        let mut busy = false;
         for source in ordered.iter().copied() {
             if blob.size == 0 {
-                match self.read_blob_chunk(network, source, blob, 0, 1).await {
-                    Ok(_) => {
+                match self
+                    .read_blob_chunk(network, source, blob, 0, 1, class)
+                    .await
+                {
+                    Ok(chunk) => {
                         transfer = self
                             .commit_blob_progress(network, &transfer, source, 0, part_length)
                             .await?;
                         empty_received = true;
+                        quantum.remaining -= 1;
+                        drop(chunk);
                         break;
                     }
                     Err(error) => {
+                        busy |=
+                            error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
                         tracing::debug!(network,source,%error,"empty blob source unavailable; trying another authorized replica");
                         continue;
                     }
                 }
             }
             while offset < blob.size {
+                if quantum.remaining == 0 {
+                    drop(writer);
+                    return Ok(BlobStep::Partial);
+                }
                 let chunk = match self
-                    .read_blob_chunk(network, source, blob, offset, 65536)
+                    .read_blob_chunk(network, source, blob, offset, 65536, class)
                     .await
                 {
                     Ok(chunk) => chunk,
                     Err(error) => {
+                        busy |=
+                            error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
                         tracing::debug!(network,source,%error,"blob source unavailable; prefix retained");
                         break;
                     }
                 };
-                let next = offset + chunk.len() as u64;
-                let (returned, part_length) = writer.write(offset, chunk).await?;
+                let next = offset + chunk.bytes.len() as u64;
+                let (returned, part_length, response) = writer
+                    .write(offset, chunk.bytes, Some(chunk.response))
+                    .await?;
                 writer = returned;
                 transfer = self
                     .commit_blob_progress(network, &transfer, source, next, part_length)
                     .await?;
                 offset = next;
+                quantum.remaining -= 1;
+                drop(response);
             }
             if offset == blob.size {
                 break;
             }
+        }
+        if busy && (offset != blob.size || !empty_received) {
+            return Err(RequestFailure::Busy.into());
         }
         ensure!(
             offset == blob.size && empty_received,
@@ -790,11 +845,32 @@ impl Runtime {
             let expected = &bytes[usize::try_from(last_offset)?..];
             let mut rebound = false;
             for candidate in ordered {
-                if let Ok(chunk) = self
-                    .read_blob_chunk(network, candidate, blob, last_offset, expected.len().max(1))
+                if quantum.remaining == 0 {
+                    drop(writer);
+                    return Ok(BlobStep::Partial);
+                }
+                let chunk = match self
+                    .read_blob_chunk(
+                        network,
+                        candidate,
+                        blob,
+                        last_offset,
+                        expected.len().max(1),
+                        class,
+                    )
                     .await
-                    && chunk == expected
                 {
+                    Ok(chunk) => {
+                        quantum.remaining -= 1;
+                        chunk
+                    }
+                    Err(error) => {
+                        busy |=
+                            error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
+                        continue;
+                    }
+                };
+                if chunk.bytes == expected {
                     self.commit_blob_progress(
                         network,
                         &transfer,
@@ -807,6 +883,9 @@ impl Runtime {
                     rebound = true;
                     break;
                 }
+            }
+            if !rebound && busy {
+                return Err(RequestFailure::Busy.into());
             }
             ensure!(
                 rebound,
@@ -829,7 +908,7 @@ impl Runtime {
         if let (_, Err(error)) = self.cleanup_blob_lease(writer.into_lease(), None).await {
             tracing::warn!(network,hash=%blob.hash,%error,"staging cleanup pending");
         }
-        Ok(changed)
+        Ok(BlobStep::Complete { changed })
     }
     fn authorize_blob_source_for_current(&self, network: &str, source: &str) -> Result<()> {
         let view = self.identities.public_state()?.project()?;
@@ -1219,7 +1298,7 @@ mod tests {
         let (writer, offset, actual) = lease.recover(0).await?;
         assert_eq!((offset, actual), (0, 0));
         let split = 8;
-        let (writer, length) = writer.write(0, BODY[..split].to_vec()).await?;
+        let (writer, length, _) = writer.write(0, BODY[..split].to_vec(), None).await?;
         let manifest = node
             .commit_blob_progress(
                 &network,
@@ -1229,7 +1308,9 @@ mod tests {
                 length,
             )
             .await?;
-        let (writer, _) = writer.write(split as u64, BODY[split..].to_vec()).await?;
+        let (writer, _, _) = writer
+            .write(split as u64, BODY[split..].to_vec(), None)
+            .await?;
         drop(writer);
         let key = BlobKey::new(&network, &blob)?;
         let lease = node.blob_staging.lease(key.clone()).await;
@@ -1274,6 +1355,227 @@ mod tests {
         );
         drop(node);
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m5_revoked_complete_prefix_rebound_consumes_the_chunk_quantum() -> Result<()> {
+        use axum::{
+            Router,
+            extract::{State, WebSocketUpgrade},
+            routing::get,
+        };
+        async fn upgrade(
+            State(hub): State<Arc<PeerHub>>,
+            ws: WebSocketUpgrade,
+        ) -> impl axum::response::IntoResponse {
+            ws.on_upgrade(|socket| async move {
+                let _ = hub.accept(socket).await;
+            })
+        }
+        let mut replicas = Vec::new();
+        for _ in 0..5 {
+            let dir = super::super::tests::fixture_under("network-reliability")?;
+            replicas.push(Arc::new(Runtime::open(&dir).await?));
+        }
+        replicas.sort_by_key(|node| node.identity.node_id().unwrap());
+        let receiver_dir = super::super::tests::fixture_under("network-reliability")?;
+        let receiver = Arc::new(Runtime::open(&receiver_dir).await?);
+        let owner = LocalIdentity::generate();
+        let retired = LocalIdentity::generate();
+        let mut certificates = replicas
+            .iter()
+            .map(|node| node.identity.certificate(node.config.roles.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        certificates.push(
+            receiver
+                .identity
+                .certificate(receiver.config.roles.clone())?,
+        );
+        certificates.push(retired.certificate(vec![NodeRole::Replica])?);
+        let membership = owner.sign_network_fixture(1, certificates.clone())?;
+        let network = membership.genesis.network_id.clone();
+        let blob = blob();
+        for replica in &replicas {
+            replica.install_membership(membership.clone()).await?;
+            replica.store.lock().await.put_blob(&network, &blob, BODY)?;
+        }
+        receiver.install_membership(membership).await?;
+        let lease = receiver
+            .blob_staging
+            .lease(BlobKey::new(&network, &blob)?)
+            .await;
+        let retired_id = retired.node_id()?;
+        let (lease, manifest) = receiver
+            .reserve_blob_transfer(lease, &blob, &retired_id)
+            .await?;
+        let (writer, _, _) = lease.recover(0).await?;
+        let (writer, length, _) = writer.write(0, BODY.to_vec(), None).await?;
+        receiver
+            .commit_blob_progress(&network, &manifest, &retired_id, blob.size, length)
+            .await?;
+        drop(writer);
+        let event = receiver.identity.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "rebound".into(),
+            author: receiver.identity.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 1,
+            body: EventBody::ConversationCreated {
+                title: "rebound fairness".into(),
+            },
+            blobs: vec![blob.clone()],
+        })?;
+        assert_eq!(
+            receiver
+                .store
+                .lock()
+                .await
+                .ingest_event(&network, &event)?
+                .status,
+            "pending"
+        );
+        certificates.last_mut().unwrap().revoked = true;
+        let membership = owner.sign_network_fixture(2, certificates)?;
+        for replica in &replicas {
+            replica.install_membership(membership.clone()).await?;
+        }
+        receiver.install_membership(membership).await?;
+        assert!(
+            receiver
+                .authorize_blob_source_for_current(&network, &retired_id)
+                .is_err()
+        );
+        let requests = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (entered, next_quantum) = oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered)));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, replica) in replicas.iter().enumerate() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("ws://{}/peer", listener.local_addr()?);
+            let app = Router::new()
+                .route("/peer", get(upgrade))
+                .with_state(replica.hub.clone());
+            tasks.spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let hub = receiver.hub.clone();
+            let scope = network.clone();
+            tasks.spawn(async move {
+                let _ = hub.connect(scope, url).await;
+            });
+            let observed = requests.clone();
+            let gate = gate.clone();
+            let entered = entered.clone();
+            let mut inbound = replica
+                .peer_rx
+                .lock()
+                .await
+                .take()
+                .context("source receiver")?;
+            let responder = replica.clone();
+            tasks.spawn(async move {
+                while let Some(message) = inbound.recv().await {
+                    if message.payload["type"] == "blob" {
+                        let count = {
+                            let mut requests = observed.lock().await;
+                            requests.push(index);
+                            requests.len()
+                        };
+                        if count == 5 {
+                            if let Some(entered) = entered.lock().await.take() {
+                                let _ = entered.send(());
+                            }
+                            gate.acquire().await.unwrap().forget();
+                        }
+                    }
+                    let mut reply = responder.handle_peer(&message).await.unwrap();
+                    if message.payload["type"] == "blob" && index < 4 {
+                        reply["data"] = json!(hex::encode(vec![0; BODY.len()]));
+                    }
+                    let _ = responder.hub.respond(&message, reply).await;
+                }
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while receiver.hub.online(&network).await.len() < 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let sources = receiver.history_sources(&network, &[]).await?;
+        let mut exhausted = BlobQuantum::new(0);
+        assert_eq!(
+            receiver
+                .history_blob(&network, &sources, &blob, ReadClass::Proof, &mut exhausted)
+                .await?,
+            BlobStep::Partial
+        );
+        assert!(requests.lock().await.is_empty());
+        let mut updates = receiver.events.subscribe();
+        let node = receiver.clone();
+        let scope = network.clone();
+        let source_id = replicas[0].identity.node_id()?;
+        let proof = tokio::spawn(async move {
+            node.fetch_closure(&scope, "rebound", &source_id, &[event.hash])
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), next_quantum)
+            .await
+            .context("rebound did not begin a second quantum")??;
+        assert_eq!(&requests.lock().await[..4], &[0, 1, 2, 3]);
+        {
+            let store = receiver.store.lock().await;
+            assert!(!store.has_blob(&network, &blob)?);
+            assert!(
+                matches!(store.blob_transfer(&network, &blob)?.unwrap().phase,
+                TransferPhase::Receiving { committed_offset, source_node_id }
+                if committed_offset == blob.size && source_node_id == retired_id)
+            );
+        }
+        assert!(updates.try_recv().is_err());
+        gate.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(3), proof).await;
+        if result.is_err() {
+            let requests = requests.lock().await;
+            println!(
+                "NET1_M5 rebound_completion_timeout=true requests={} first_sources={:?}",
+                requests.len(),
+                &requests[..requests.len().min(16)]
+            );
+        }
+        result
+            .context("healthy fifth rebound source did not complete")???
+            .require_complete()?;
+        assert_eq!(*requests.lock().await, vec![0, 1, 2, 3, 1, 2, 3, 4]);
+        assert_eq!(
+            receiver
+                .store
+                .lock()
+                .await
+                .get_blob(&network, &blob.hash)?
+                .unwrap(),
+            BODY
+        );
+        assert!(
+            receiver
+                .store
+                .lock()
+                .await
+                .blob_transfer(&network, &blob)?
+                .is_none()
+        );
+        assert_eq!(updates.try_recv()?.payload["type"], "changed");
+        assert!(updates.try_recv().is_err());
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        println!(
+            "NET1_M5 revoked_complete_prefix_retained=true exhausted_quantum_no_read_or_publish=true wrong_authorized_tail_sources=4 healthy_fifth_source=true actual_coordinator_steps=2 successful_ranges_per_step=4,4 range_requests=8 unverified_source_not_bound=true no_changed_during_partial=true final_hash_verified=true"
+        );
         Ok(())
     }
 
@@ -1341,7 +1643,7 @@ mod tests {
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         })?;
-        let error = match writer.write(0, BODY.to_vec()).await {
+        let error = match writer.write(0, BODY.to_vec(), None).await {
             Ok(_) => bail!("readonly writer unexpectedly succeeded"),
             Err(error) => error,
         };
@@ -1375,7 +1677,7 @@ mod tests {
         let blob = blob();
         let (lease, manifest) = reserve(&node, &network, &blob).await?;
         let (writer, _, _) = lease.recover(0).await?;
-        let (writer, length) = writer.write(0, BODY.to_vec()).await?;
+        let (writer, length, _) = writer.write(0, BODY.to_vec(), None).await?;
         let _ = node
             .commit_blob_progress(
                 &network,
@@ -1454,7 +1756,7 @@ mod tests {
         let blob = blob();
         let (lease, manifest) = reserve(&node, &network, &blob).await?;
         let (writer, _, _) = lease.recover(0).await?;
-        let (writer, length) = writer.write(0, BODY.to_vec()).await?;
+        let (writer, length, _) = writer.write(0, BODY.to_vec(), None).await?;
         let _ = node
             .commit_blob_progress(
                 &network,
@@ -1465,7 +1767,17 @@ mod tests {
             )
             .await?;
         drop(writer);
-        assert!(node.history_blob(&network, &[], &blob).await?);
+        assert_eq!(
+            node.history_blob(
+                &network,
+                &[],
+                &blob,
+                ReadClass::Proof,
+                &mut BlobQuantum::new(4)
+            )
+            .await?,
+            BlobStep::Complete { changed: true }
+        );
         bail!("requested crash boundary was not reached")
     }
 
@@ -1594,7 +1906,17 @@ mod tests {
                     );
                 }
                 "offset_committed" => {
-                    assert!(node.history_blob(network, &[], &blob).await?);
+                    assert_eq!(
+                        node.history_blob(
+                            network,
+                            &[],
+                            &blob,
+                            ReadClass::Proof,
+                            &mut BlobQuantum::new(4)
+                        )
+                        .await?,
+                        BlobStep::Complete { changed: true }
+                    );
                     assert!(!part.exists());
                 }
                 _ => {

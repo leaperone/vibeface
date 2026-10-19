@@ -32,8 +32,10 @@ mod manager_control;
 mod manager_control_tests;
 mod observation;
 mod schedule_delivery;
+mod sync;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::ObservationGuard;
+use sync::{HistoryPage, HistoryReply, ReadClass, SyncCoordinator};
 
 #[derive(Clone)]
 pub struct Access {
@@ -371,14 +373,22 @@ mod tests {
             HistorySource {
                 node_id: a.clone(),
                 batch: None,
+                failed: false,
             },
             HistorySource {
                 node_id: b.clone(),
                 batch: None,
+                failed: false,
             },
         ];
         let error = nodes[0]
-            .history_blob(&network, &sources, &blob)
+            .history_blob(
+                &network,
+                &sources,
+                &blob,
+                ReadClass::Proof,
+                &mut blob_transfer::BlobQuantum::new(4),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("hash mismatch"));
@@ -408,7 +418,18 @@ mod tests {
             vec![(1, 0), (1, 65536), (2, 65536)]
         );
         let boundary = first.len();
-        assert!(nodes[0].history_blob(&network, &sources, &blob).await?);
+        assert_eq!(
+            nodes[0]
+                .history_blob(
+                    &network,
+                    &sources,
+                    &blob,
+                    ReadClass::Proof,
+                    &mut blob_transfer::BlobQuantum::new(4)
+                )
+                .await?,
+            blob_transfer::BlobStep::Complete { changed: true }
+        );
         assert_eq!(observed.lock().await[boundary], (2, blob.hash.clone(), 0));
         assert_eq!(
             nodes[0]
@@ -445,7 +466,18 @@ mod tests {
             .await
             .unwrap_err();
         println!("NET1_EMPTY_SOURCE_FAILURE {unavailable:#}");
-        assert!(nodes[0].history_blob(&network, &sources, &empty).await?);
+        assert_eq!(
+            nodes[0]
+                .history_blob(
+                    &network,
+                    &sources,
+                    &empty,
+                    ReadClass::Proof,
+                    &mut blob_transfer::BlobQuantum::new(4)
+                )
+                .await?,
+            blob_transfer::BlobStep::Complete { changed: true }
+        );
         assert_eq!(
             nodes[0]
                 .store
@@ -1132,14 +1164,16 @@ mod tests {
         );
         assert_eq!(single_requests.load(Ordering::SeqCst), 0);
         malformed.store(2, Ordering::SeqCst);
-        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut sources = receiver
+            .history_sources(&network, std::slice::from_ref(&source_id))
+            .await?;
         let mut budget = HistoryBudget {
             events: 5,
             bytes: 8192,
         };
         assert!(
             receiver
-                .history_events(&network, &mut sources, head, &mut budget)
+                .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
                 .await
                 .is_err()
         );
@@ -1171,30 +1205,36 @@ mod tests {
         assert_eq!(single_requests.load(Ordering::SeqCst), 0);
         legacy.store(true, Ordering::SeqCst);
         let before = batch_requests.load(Ordering::SeqCst);
-        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut sources = receiver
+            .history_sources(&network, std::slice::from_ref(&source_id))
+            .await?;
         let mut budget = HistoryBudget {
             events: 128,
             bytes: 8 * MAX_EVENT_BYTES,
         };
         let old = receiver
-            .history_events(&network, &mut sources, head, &mut budget)
+            .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
             .await?;
-        assert_eq!(old, vec![envelopes.last().unwrap().clone()]);
+        assert_eq!(old.events, vec![envelopes.last().unwrap().clone()]);
+        drop(old);
         assert_eq!(batch_requests.load(Ordering::SeqCst), before);
         assert_eq!(single_requests.load(Ordering::SeqCst), 1);
         assert!(requests.load(Ordering::SeqCst) < 24);
 
         legacy.store(false, Ordering::SeqCst);
         malformed.store(4, Ordering::SeqCst);
-        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut sources = receiver
+            .history_sources(&network, std::slice::from_ref(&source_id))
+            .await?;
         let mut budget = HistoryBudget {
             events: 128,
             bytes: 8 * MAX_EVENT_BYTES,
         };
         let single = receiver
-            .history_events(&network, &mut sources, head, &mut budget)
+            .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
             .await?;
-        assert_eq!(single, vec![envelopes.last().unwrap().clone()]);
+        assert_eq!(single.events, vec![envelopes.last().unwrap().clone()]);
+        drop(single);
         assert_eq!(single_requests.load(Ordering::SeqCst), 2);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1234,13 +1274,15 @@ mod tests {
         })
         .await?;
         malformed.store(3, Ordering::SeqCst);
-        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut sources = receiver
+            .history_sources(&network, std::slice::from_ref(&source_id))
+            .await?;
         let mut budget = HistoryBudget {
             events: 1024,
             bytes: 8 * MAX_EVENT_BYTES,
         };
         let recovered = receiver
-            .history_events(&network, &mut sources, head, &mut budget)
+            .history_events(&network, &mut sources, head, &mut budget, ReadClass::Proof)
             .await?;
         assert_eq!(recovered.len(), 128);
         assert_eq!(recovered[0].hash, *head);
@@ -1252,7 +1294,7 @@ mod tests {
     #[tokio::test]
     async fn net1_continuation_survives_restart_and_frontier_rechecks_corruption() -> Result<()> {
         let dir = fixture_under("network-reliability")?;
-        let node = Runtime::open(&dir).await?;
+        let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
         let root = node.store.lock().await.heads(&network, "chat")?[0].clone();
         let content = b"verified network evidence";
@@ -1310,7 +1352,7 @@ mod tests {
         );
         node._process_lock.unlock()?;
         drop(node);
-        let node = Runtime::open(&dir).await?;
+        let node = Arc::new(Runtime::open(&dir).await?);
         let resumed = node
             .fetch_closure_batch(
                 &network,
@@ -1418,7 +1460,7 @@ mod tests {
     async fn net1_changing_heads_keep_one_scope_checkpoint_and_ignore_unverified_heads()
     -> Result<()> {
         let dir = fixture_under("network-reliability")?;
-        let node = Runtime::open(&dir).await?;
+        let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
         let local = node.identity.node_id()?;
         let content = b"one missing blob across advancing heads";
@@ -1571,7 +1613,7 @@ mod tests {
     #[tokio::test]
     async fn net1_checkpoints_require_matching_signed_scopes_and_allow_129_scopes() -> Result<()> {
         let dir = fixture_under("network-reliability")?;
-        let node = Runtime::open(&dir).await?;
+        let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
         let local = node.identity.node_id()?;
         let content = b"one object for many real scopes";
@@ -2185,6 +2227,103 @@ mod tests {
                 .state
                 .name(),
             "queued"
+        );
+        let local_scope = "local-replica-revocation";
+        let local_root = nodes[3].store.lock().await.append_event(
+            &nodes[3].identity,
+            &network,
+            local_scope,
+            EventBody::ConversationCreated {
+                title: "local import authorization".into(),
+            },
+            vec![],
+            4,
+        )?;
+        let local_request = OperationRequest {
+            operation_id: "local-replica-revoked-command".into(),
+            network_id: network.clone(),
+            conversation_id: local_scope.into(),
+            task_id: None,
+            target_node: nodes[0].identity.node_id()?,
+            session_id: None,
+            expected_revision: 0,
+            basis_heads: vec![local_root.hash.clone()],
+            action: json!({"type":"command","command":"printf forbidden > local-replica-effect","cwd":dirs[0],"timeout_secs":1}),
+            resources: vec![],
+            binding: None,
+            manager_authority: None,
+        };
+        let local_dispatch = nodes[3].store.lock().await.append_event(
+            &nodes[3].identity,
+            &network,
+            local_scope,
+            EventBody::DispatchRecorded {
+                operation_id: local_request.operation_id.clone(),
+                task_id: None,
+                target_node: local_request.target_node.clone(),
+                session_id: None,
+                action: json!(local_request),
+            },
+            vec![],
+            5,
+        )?;
+        let update = owner.sign_network_fixture(
+            4,
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    let roles = if index == 0 {
+                        vec![NodeRole::Relay]
+                    } else {
+                        node.config.roles.clone()
+                    };
+                    let mut certificate = node.identity.certificate(roles)?;
+                    certificate.revoked = index == 1 || index == 2;
+                    Ok(certificate)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        *membership_during_fetch.lock().await = Some(update);
+        let execute = Inbound {
+            network_id: network.clone(),
+            origin: nodes[3].identity.node_id()?,
+            request_id: "local-role-revoked-dispatch".into(),
+            broadcast: false,
+            payload: json!({"type":"execute","human":true,"request":local_request,"dispatch_head":local_dispatch.hash}),
+        };
+        let error = nodes[0].handle_peer(&execute).await.unwrap_err();
+        assert_eq!(error.to_string(), "Node lacks required role");
+        assert!(membership_during_fetch.lock().await.is_none());
+        let store = nodes[0].store.lock().await;
+        store.authorize_node(
+            &network,
+            &nodes[0].identity.node_id()?,
+            Some(NodeRole::Relay),
+        )?;
+        assert!(
+            store
+                .authorize_node(
+                    &network,
+                    &nodes[0].identity.node_id()?,
+                    Some(NodeRole::Replica)
+                )
+                .is_err()
+        );
+        assert!(
+            store.event(&network, &local_dispatch.hash)?.is_none(),
+            "revoked local Replica must not import the received page"
+        );
+        assert!(store.event(&network, &local_root.hash)?.is_none());
+        assert!(
+            store
+                .operation(&network, &local_request.operation_id)?
+                .is_none()
+        );
+        assert!(!dirs[0].join("local-replica-effect").exists());
+        drop(store);
+        println!(
+            "NET1_M5 local_replica_role_removed_during_real_noise_response=true local_relay_membership_retained=true received_page_imports=0 operation_admissions=0 command_effects=0"
         );
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
@@ -3743,6 +3882,7 @@ const HISTORY_BATCH_BYTES: usize = crate::peer::MAX_PACKET_BYTES - 1024;
 struct HistorySource {
     node_id: String,
     batch: Option<bool>,
+    failed: bool,
 }
 
 struct HistoryBudget {
@@ -3928,6 +4068,7 @@ pub struct Runtime {
     pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
     route_flights: Arc<Mutex<HashMap<(String, String), RouteFlight>>>,
+    sync: Arc<SyncCoordinator>,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
@@ -4123,6 +4264,7 @@ impl Runtime {
             blob_staging,
             schedule_workers: Mutex::new(BTreeSet::new()),
             route_flights: Arc::new(Mutex::new(HashMap::new())),
+            sync: Arc::new(SyncCoordinator::default()),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
@@ -4344,7 +4486,7 @@ impl Runtime {
                 node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
                 let networks = node.store.lock().await.networks().unwrap_or_default();
                 for network in networks {
-                    let _ = node.sync_all(&network).await;
+                    let _ = node.enqueue_sync_all(&network).await;
                     let _ = node.flush_completions(&network).await;
                 }
             }
@@ -4626,62 +4768,6 @@ impl Runtime {
         }
         Ok(reply)
     }
-    pub async fn sync_all(&self, network: &str) -> Result<SyncReport> {
-        let _work = self.maintenance.enter()?;
-        self.require_role(network, NodeRole::Replica).await?;
-        let local = self.identity.node_id()?;
-        let mut peers = self
-            .hub
-            .online(network)
-            .await
-            .into_iter()
-            .filter(|peer| peer != &local)
-            .collect::<Vec<_>>();
-        {
-            let store = self.store.lock().await;
-            peers.retain(|peer| {
-                store
-                    .authorize_node(network, peer, Some(NodeRole::Replica))
-                    .is_ok()
-            });
-        }
-        let source_count = peers.len();
-        let reports = futures_util::stream::iter(peers)
-            .map(|target| async move {
-                let result = self.sync_from(network, &target).await;
-                (target, result)
-            })
-            .buffer_unordered(4)
-            .collect::<Vec<_>>()
-            .await;
-        let mut scopes = Vec::new();
-        let mut unreachable_sources = Vec::new();
-        for (target, result) in reports {
-            match result {
-                Ok(report) => scopes.extend(report),
-                Err(error) => {
-                    tracing::debug!(network, target, error=%error, "history inventory unreachable");
-                    unreachable_sources.push(target);
-                }
-            }
-        }
-        let state = if source_count == 0 || unreachable_sources.len() == source_count {
-            SyncState::Unreachable
-        } else if !unreachable_sources.is_empty()
-            || scopes
-                .iter()
-                .any(|scope| scope.state != SyncState::Complete)
-        {
-            SyncState::Partial
-        } else {
-            SyncState::Complete
-        };
-        Ok(SyncReport {
-            state,
-            scopes,
-            unreachable_sources,
-        })
-    }
     async fn read_peer(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -4696,30 +4782,30 @@ impl Runtime {
         target: &str,
         payload: Value,
         budget: &mut HistoryBudget,
-    ) -> Result<Value> {
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, target, Some(NodeRole::Replica))?;
-        let value = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.raw_peer_request(network, target, payload),
-        )
-        .await
-        .map_err(|_| RequestFailure::Unknown)??;
-        budget.response(&value)?;
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, target, Some(NodeRole::Replica))?;
-        if let Some(error) = value["error"].as_str() {
+        class: ReadClass,
+    ) -> Result<HistoryReply> {
+        let reply = self
+            .read_history(
+                network,
+                target,
+                payload,
+                class,
+                crate::peer::MAX_PACKET_BYTES,
+            )
+            .await?;
+        budget.response(&reply.value)?;
+        if let Some(error) = reply.value["error"].as_str() {
             bail!("{error}");
         }
-        Ok(value)
+        Ok(reply)
     }
-    async fn history_sources(&self, network: &str, preferred: &str) -> Result<Vec<HistorySource>> {
+    async fn history_sources(
+        &self,
+        network: &str,
+        preferred: &[String],
+    ) -> Result<Vec<HistorySource>> {
         let local = self.identity.node_id()?;
-        let mut sources = vec![preferred.to_owned()];
+        let mut sources = preferred.to_vec();
         sources.extend(self.hub.online(network).await);
         let mut seen = BTreeSet::new();
         let store = self.store.lock().await;
@@ -4735,6 +4821,7 @@ impl Runtime {
             .map(|node_id| HistorySource {
                 node_id,
                 batch: None,
+                failed: false,
             })
             .collect())
     }
@@ -4744,20 +4831,26 @@ impl Runtime {
         sources: &mut [HistorySource],
         hash: &str,
         budget: &mut HistoryBudget,
-    ) -> Result<Vec<SignedEvent>> {
+        class: ReadClass,
+    ) -> Result<HistoryPage> {
         let initial_events = budget.events;
-        for source in sources {
+        let mut busy = false;
+        for index in 0..sources.len() {
+            let source = &mut sources[index];
+            if source.failed {
+                continue;
+            }
             if budget.events == 0 || budget.bytes == 0 {
                 break;
             }
-            let target = &source.node_id;
+            let target = source.node_id.clone();
             let before = budget.events;
             let result = async {
                 let batch = match source.batch {
                     Some(batch) => batch,
                     None => {
-                        let capabilities = self.history_response(network, target, json!({"type":"capabilities"}), budget).await?;
-                        let batch = capabilities["history_batch"]["version"] == 1;
+                        let capabilities = self.history_response(network, &target, json!({"type":"capabilities"}), budget,class).await?;
+                        let batch = capabilities.value["history_batch"]["version"] == 1;
                         source.batch = Some(batch);
                         batch
                     }
@@ -4765,150 +4858,77 @@ impl Runtime {
                 let limit = budget.events.min(HISTORY_BATCH_EVENTS);
                 let max_bytes = budget.bytes.min(HISTORY_BATCH_BYTES);
                 let value = if batch {
-                    self.history_response(network, target, json!({"type":"history_batch","hash":hash,"limit":limit,"max_bytes":max_bytes}), budget).await?
+                    self.history_response(network, &target, json!({"type":"history_batch","hash":hash,"limit":limit,"max_bytes":max_bytes}), budget,class).await?
                 } else {
-                    Value::Null
+                    self.history_response(network,&target,json!({"type":"event","hash":hash}),budget,class).await?
                 };
-                let single = !batch || (value["version"] == 1 && value["hash"] == hash && value["single_event"] == true && value.get("events").is_none() && serde_json::to_vec(&value)?.len() <= max_bytes);
-                let value = if single {
-                    let value = self.history_response(network, target, json!({"type":"event","hash":hash}), budget).await?;
-                    budget.events = budget.events.saturating_sub(1);
-                    value
-                } else {
-                    budget.events = budget.events.saturating_sub(value["events"].as_array().map_or(1, Vec::len).clamp(1, limit));
-                    value
-                };
+                let single = !batch || (value.value["version"] == 1 && value.value["hash"] == hash && value.value["single_event"] == true && value.value.get("events").is_none() && serde_json::to_vec(&value.value)?.len() <= max_bytes);
+                let value = if single && batch {
+                    drop(value);
+                    self.history_response(network,&target,json!({"type":"event","hash":hash}),budget,class).await?
+                } else { value };
+                budget.events = budget.events.saturating_sub(if single {1} else {value.value["events"].as_array().map_or(1,Vec::len).clamp(1,limit)});
                 let store = self.store.lock().await;
-                store.authorize_node(network, target, Some(NodeRole::Replica))?;
+                store.authorize_node(network, &target, Some(NodeRole::Replica))?;
                 let envelopes = if single {
-                    let envelope: SignedEvent = serde_json::from_value(value["event"].clone())?;
+                    let envelope: SignedEvent = serde_json::from_value(value.value["event"].clone())?;
                     ensure!(envelope.hash == hash, "event response hash mismatch");
                     store.verify_event(network, &envelope)?;
                     vec![envelope]
                 } else {
-                    verify_history_batch(&store, network, hash, &value, limit, max_bytes)?
+                    verify_history_batch(&store, network, hash, &value.value, limit, max_bytes)?
                 };
                 if !single {
-                    tracing::trace!(network, target, hash, count=envelopes.len(), "history batch fetched");
+                    tracing::trace!(network, target=%target, hash, count=envelopes.len(), "history batch fetched");
                 }
                 for envelope in &envelopes {
-                    tracing::trace!(network, target, hash=%envelope.hash, mode=if single {"single"} else {"batch"}, "history event fetched");
+                    tracing::trace!(network, target=%target, hash=%envelope.hash, mode=if single {"single"} else {"batch"}, "history event fetched");
                 }
-                Ok(envelopes)
+                Ok(HistoryPage { events:envelopes, _reply:Some(value) })
             }
             .await;
             match result {
-                Ok(envelopes) => return Ok(envelopes),
+                Ok(envelopes) => {
+                    let length = sources.len();
+                    sources.rotate_left((index + 1) % length);
+                    return Ok(envelopes);
+                }
                 Err(error) => {
-                    if budget.events == before {
-                        budget.events -= 1;
+                    if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy) {
+                        busy = true;
+                    } else {
+                        source.failed = true;
+                        if budget.events == before {
+                            budget.events -= 1;
+                        }
                     }
-                    tracing::debug!(network, target, error=%error, "history object source unavailable")
+                    tracing::debug!(network,target=%target, error=%error, "history object source unavailable")
                 }
             }
+        }
+        if busy {
+            return Err(RequestFailure::Busy.into());
         }
         if budget.events == initial_events && budget.events != 0 {
             budget.events -= 1;
         }
         bail!("event unavailable from authorized replicas")
     }
-    async fn sync_from(&self, network: &str, target: &str) -> Result<Vec<ClosureSync>> {
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, target, Some(NodeRole::Replica))?;
-        let inventory = self
-            .read_peer(network, target, json!({"type":"inventory"}))
-            .await?;
-        let state: NetworkState = serde_json::from_value(inventory["membership"].clone())?;
-        ensure!(
-            state.genesis.network_id == network,
-            "wrong membership network"
-        );
-        self.install_membership(state).await?;
-        let scopes = inventory["scopes"]
-            .as_array()
-            .context("invalid inventory")?;
-        let mut report = Vec::new();
-        for scope in scopes {
-            let scope_id = match field(scope, "scope_id") {
-                Ok(scope) => scope,
-                Err(error) => {
-                    report.push(ClosureSync {
-                        scope_id: "<invalid>".into(),
-                        target: target.into(),
-                        state: SyncState::Partial,
-                        missing: MissingDependencies::default(),
-                        processed: 0,
-                        changed: false,
-                        errors: vec![error.to_string()],
-                    });
-                    continue;
-                }
-            };
-            let wanted: Result<Vec<String>> =
-                serde_json::from_value(scope["heads"].clone()).map_err(Into::into);
-            let result = match wanted {
-                Ok(wanted) => self.fetch_scope(network, scope_id, target, &wanted).await,
-                Err(error) => Err(error),
-            };
-            let outcome = result.unwrap_or_else(|error| ClosureSync {
-                scope_id: scope_id.into(),
-                target: target.into(),
-                state: SyncState::Partial,
-                missing: MissingDependencies::default(),
-                processed: 0,
-                changed: false,
-                errors: vec![error.to_string()],
-            });
-            tracing::debug!(network, target, scope=scope_id, state=?outcome.state, processed=outcome.processed,
-                changed=outcome.changed, missing_events=outcome.missing.events.len(), missing_blobs=outcome.missing.blobs.len(),
-                conflicts=outcome.missing.conflicts.len(), "history scope sync finished");
-            report.push(outcome);
-        }
-        Ok(report)
-    }
-    async fn fetch_closure(
-        &self,
-        network: &str,
-        scope: &str,
-        target: &str,
-        wanted: &[String],
-    ) -> Result<ClosureSync> {
-        self.fetch_closure_batch_mode(network, scope, target, wanted, 1024, false)
-            .await
-    }
-    async fn fetch_scope(
-        &self,
-        network: &str,
-        scope: &str,
-        target: &str,
-        wanted: &[String],
-    ) -> Result<ClosureSync> {
-        self.fetch_closure_batch_mode(network, scope, target, wanted, 1024, true)
-            .await
-    }
-    #[cfg(test)]
-    async fn fetch_closure_batch(
-        &self,
-        network: &str,
-        scope: &str,
-        target: &str,
-        wanted: &[String],
-        budget: usize,
-    ) -> Result<ClosureSync> {
-        self.fetch_closure_batch_mode(network, scope, target, wanted, budget, true)
-            .await
-    }
-    async fn fetch_closure_batch_mode(
-        &self,
-        network: &str,
-        scope: &str,
-        target: &str,
-        wanted: &[String],
-        budget: usize,
-        persist: bool,
-    ) -> Result<ClosureSync> {
+    async fn sync_step_core(
+        self: &Arc<Self>,
+        spec: &sync::SyncSpec,
+        source_cursor: usize,
+    ) -> Result<(ClosureSync, bool)> {
+        let network = spec.network.as_str();
+        let scope = spec.scope.as_str();
+        let target = spec
+            .sources
+            .first()
+            .context("history unavailable from authorized replicas")?;
+        let wanted = &spec.roots;
+        let budget = spec.event_budget;
+        let class = spec.class;
+        let persist = class == ReadClass::Background;
         self.membership_state().await?;
         ensure!(
             !scope.is_empty() && scope.len() <= 512,
@@ -4921,7 +4941,11 @@ impl Runtime {
             ensure!(hex::decode(hash)?.len() == 32, "invalid history hash");
         }
         let key = format!("net1:v1:closure:{}", crypto::digest(scope.as_bytes()));
-        let mut sources = self.history_sources(network, target).await?;
+        let mut sources = self.history_sources(network, &spec.sources).await?;
+        if !sources.is_empty() {
+            let length = sources.len();
+            sources.rotate_left(source_cursor % length);
+        }
         let waiting = Instant::now();
         let (mut progress, generation) = {
             let store = self.store.lock().await;
@@ -4952,16 +4976,20 @@ impl Runtime {
             let previous = previous
                 .map(serde_json::from_value::<SyncProgress>)
                 .transpose()?;
-            let progress =
-                if let Some(progress) = previous.filter(|progress| progress.heads == roots) {
-                    progress
-                } else {
-                    SyncProgress::new(
-                        scope,
-                        roots.clone(),
-                        &store.missing_dependencies(network, &roots)?,
-                    )
-                };
+            let progress = if let Some(mut progress) = previous {
+                if progress.heads != roots {
+                    progress.heads = roots.clone();
+                    progress.frontier_generation = None;
+                    progress.advance(&store.missing_dependencies(network, &roots)?);
+                }
+                progress
+            } else {
+                SyncProgress::new(
+                    scope,
+                    roots.clone(),
+                    &store.missing_dependencies(network, &roots)?,
+                )
+            };
             ensure!(
                 progress.version == 1
                     && progress.scope == scope
@@ -5005,9 +5033,10 @@ impl Runtime {
         }
         let mut attempted = BTreeSet::new();
         let mut unavailable = BTreeSet::new();
-        let mut envelopes = Vec::new();
+        let mut inserted = 0;
         let mut blobs: BTreeSet<BlobRef> = progress.blobs.iter().cloned().collect();
         let mut errors = Vec::new();
+        let mut deferred = false;
         let mut work = HistoryBudget {
             events: budget,
             bytes: 8 * MAX_EVENT_BYTES,
@@ -5026,14 +5055,19 @@ impl Runtime {
                 Some(envelope) => {
                     work.events -= 1;
                     work.bytes = work.bytes.saturating_sub(envelope.canonical_body.len());
-                    vec![envelope]
+                    HistoryPage {
+                        events: vec![envelope],
+                        _reply: None,
+                    }
                 }
                 None => match self
-                    .history_events(network, &mut sources, &hash, &mut work)
+                    .history_events(network, &mut sources, &hash, &mut work, class)
                     .await
                 {
                     Ok(envelopes) => envelopes,
                     Err(error) => {
+                        deferred |=
+                            error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
                         errors.push(error.to_string());
                         unavailable.insert(hash);
                         continue;
@@ -5044,12 +5078,12 @@ impl Runtime {
                 page.first().is_some_and(|envelope| envelope.hash == hash),
                 "stored event hash mismatch"
             );
-            for envelope in page {
+            for envelope in &page.events {
                 let hash = &envelope.hash;
                 attempted.insert(hash.clone());
                 queued.remove(hash);
                 progress.event_cursor = Some(hash.clone());
-                let event = self.store.lock().await.verify_event(network, &envelope)?;
+                let event = self.store.lock().await.verify_event(network, envelope)?;
                 ensure!(
                     roots.binary_search(hash).is_err() || event.scope_id == scope,
                     "history head scope mismatch"
@@ -5070,8 +5104,17 @@ impl Runtime {
                         }
                     }
                 }
-                envelopes.push(envelope);
             }
+            {
+                let mut store = self.store.lock().await;
+                store.authorize_node(
+                    network,
+                    &self.identity.node_id()?,
+                    Some(NodeRole::Replica),
+                )?;
+                inserted += store.ingest_events(network, &page.events)?;
+            }
+            drop(page);
         }
         queued.extend(unavailable);
         let mut missing = MissingDependencies {
@@ -5079,32 +5122,42 @@ impl Runtime {
             blobs: blobs.iter().cloned().collect(),
             conflicts: Vec::new(),
         };
-        let inserted = {
+        {
             let mut store = self.store.lock().await;
             store.authorize_node(network, &self.identity.node_id()?, Some(NodeRole::Replica))?;
-            let inserted = store.ingest_events(network, &envelopes)?;
             progress.advance(&missing);
             save_sync_progress(&mut store, network, &key, &progress, persist)?;
-            inserted
-        };
+        }
         let blob_page = rotated_page(
             &blobs.into_iter().collect::<Vec<_>>(),
             progress.blob_cursor.as_ref(),
             4,
         );
         let mut blobs_completed = 0;
+        let mut blob_quantum = blob_transfer::BlobQuantum::new(4);
         for blob in blob_page {
             progress.blob_cursor = Some(blob.clone());
             if self.store.lock().await.has_blob(network, &blob)? {
                 missing.blobs.retain(|wanted| wanted != &blob);
                 continue;
             }
-            match self.history_blob(network, &sources, &blob).await {
-                Ok(changed) => {
+            match self
+                .history_blob(network, &sources, &blob, class, &mut blob_quantum)
+                .await
+            {
+                Ok(blob_transfer::BlobStep::Complete { changed }) => {
                     missing.blobs.retain(|wanted| wanted != &blob);
                     blobs_completed += usize::from(changed);
                 }
-                Err(error) => errors.push(error.to_string()),
+                Ok(blob_transfer::BlobStep::Partial) => {}
+                Err(error) => {
+                    deferred |=
+                        error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy);
+                    errors.push(error.to_string());
+                }
+            }
+            if blob_quantum.remaining == 0 {
+                break;
             }
         }
         let waiting = Instant::now();
@@ -5128,7 +5181,7 @@ impl Runtime {
                     return Err(error);
                 }
             }
-            if missing.is_complete() || (envelopes.is_empty() && blobs_completed == 0) {
+            if missing.is_complete() || (inserted == 0 && blobs_completed == 0) {
                 missing = match store.missing_dependencies(network, &roots) {
                     Ok(missing) => missing,
                     Err(error) => {
@@ -5157,11 +5210,9 @@ impl Runtime {
         let processed = budget - work.events;
         let state = if missing.is_complete() {
             SyncState::Complete
-        } else if !missing.conflicts.is_empty() {
+        } else if !missing.conflicts.is_empty() || deferred {
             SyncState::Partial
-        } else if sources.is_empty()
-            || (processed > 0 && !errors.is_empty() && envelopes.is_empty())
-        {
+        } else if sources.is_empty() || (processed > 0 && !errors.is_empty() && inserted == 0) {
             SyncState::Unreachable
         } else {
             SyncState::Partial
@@ -5172,15 +5223,18 @@ impl Runtime {
                 payload: json!({"type":"changed","conversation_id":scope}),
             });
         }
-        Ok(ClosureSync {
-            scope_id: scope.into(),
-            target: target.into(),
-            state,
-            missing,
-            processed,
-            changed,
-            errors,
-        })
+        Ok((
+            ClosureSync {
+                scope_id: scope.into(),
+                target: target.into(),
+                state,
+                missing,
+                processed,
+                changed,
+                errors,
+            },
+            inserted != 0 || blob_quantum.remaining != 4 || deferred,
+        ))
     }
     fn capabilities(&self) -> Value {
         let manager =
@@ -6602,10 +6656,10 @@ impl Runtime {
                 )?;
                 let store = self.store.lock().await;
                 let scopes = store
-                    .scopes(network)?
+                    .inventory_heads(network)?
                     .into_iter()
-                    .map(|s| Ok(json!({"scope_id":s,"heads":store.heads(network,&s)?})))
-                    .collect::<Result<Vec<_>>>()?;
+                    .map(|(scope, heads)| json!({"scope_id":scope,"heads":heads}))
+                    .collect::<Vec<_>>();
                 Ok(
                     json!({"membership":store.trust_bundle(network)?,"scopes":scopes,"history_batch":history_batch_capability()}),
                 )

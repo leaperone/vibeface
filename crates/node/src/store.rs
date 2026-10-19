@@ -1155,6 +1155,27 @@ impl Store {
     pub fn heads(&self, network_id: &str, scope_id: &str) -> Result<Vec<EventHash>> {
         Ok(heads_from_events(&self.load_events(network_id)?, scope_id))
     }
+    pub(crate) fn inventory_heads(&self, network: &str) -> Result<Vec<(ScopeId, Vec<EventHash>)>> {
+        let events = self.load_events(network)?;
+        let mut scopes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (hash, entry) in &events {
+            scopes
+                .entry(entry.event.scope_id.clone())
+                .or_default()
+                .insert(hash.clone());
+        }
+        for entry in events.values() {
+            if let Some(heads) = scopes.get_mut(&entry.event.scope_id) {
+                for parent in dependencies(&entry.event) {
+                    heads.remove(parent);
+                }
+            }
+        }
+        Ok(scopes
+            .into_iter()
+            .map(|(scope, heads)| (scope, heads.into_iter().collect()))
+            .collect())
+    }
     pub(crate) fn has_known_basis_gap(
         &self,
         network_id: &str,
@@ -5191,6 +5212,106 @@ mod tests {
             native_session_id: None,
         })
     }
+    #[test]
+    fn net1_grouped_inventory_preserves_pending_forks_and_cross_scope_heads() -> Result<()> {
+        fn equivalent(store: &Store, network: &str) -> Result<()> {
+            let legacy = store
+                .scopes(network)?
+                .into_iter()
+                .map(|scope| Ok((scope.clone(), store.heads(network, &scope)?)))
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(store.inventory_heads(network)?, legacy);
+            Ok(())
+        }
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?;
+        equivalent(&store, &network)?;
+        let root = conversation(&mut store, &owner)?;
+        let blob = BlobRef {
+            hash: digest(b"absent"),
+            size: 6,
+        };
+        let left = message(
+            &owner,
+            &network,
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash.clone()],
+            "left",
+            vec![blob],
+        )?;
+        assert_eq!(store.ingest_event(&network, &left)?.status, "pending");
+        equivalent(&store, &network)?;
+        assert_eq!(
+            store.heads(&network, "conversation")?,
+            vec![left.hash.clone()]
+        );
+        let right = message(
+            &owner,
+            &network,
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash],
+            "right",
+            vec![],
+        )?;
+        assert_eq!(store.ingest_event(&network, &right)?.status, "conflict");
+        let child = message(
+            &owner,
+            &network,
+            3,
+            Some(left.hash.clone()),
+            vec![left.hash],
+            "child",
+            vec![],
+        )?;
+        assert_eq!(store.ingest_event(&network, &child)?.status, "invalid");
+        equivalent(&store, &network)?;
+        let heads = store.heads(&network, "conversation")?;
+        assert_eq!(heads.len(), 2);
+        assert!(heads.contains(&right.hash) && heads.contains(&child.hash));
+        let a = store.append_event(
+            &owner,
+            &network,
+            "a",
+            EventBody::ConversationCreated {
+                title: "cross-scope parent".into(),
+            },
+            vec![],
+            3,
+        )?;
+        let b = owner.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "b".into(),
+            author: owner.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![a.hash.clone()],
+            created_at_ms: 4,
+            body: EventBody::ConversationCreated {
+                title: "cross-scope child".into(),
+            },
+            blobs: vec![],
+        })?;
+        store.ingest_event(&network, &b)?;
+        equivalent(&store, &network)?;
+        assert_eq!(store.heads(&network, "a")?, vec![a.hash]);
+        assert_eq!(store.heads(&network, "b")?, vec![b.hash.clone()]);
+        let mut corrupt = b;
+        corrupt.signature = "00".repeat(64);
+        store.connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            params![serde_json::to_string(&corrupt)?, network, corrupt.hash],
+        )?;
+        assert!(store.inventory_heads(&network).is_err());
+        println!(
+            "NET1_M5 grouped_inventory_legacy_equivalent=true pending_conflict_invalid_retained=true previous_fork_heads=true cross_scope_parent_retained=true corrupted_envelope_rejected=true"
+        );
+        Ok(())
+    }
+
     #[test]
     fn net1_duplicate_import_does_not_write_projections() -> Result<()> {
         let owner = LocalIdentity::generate();
