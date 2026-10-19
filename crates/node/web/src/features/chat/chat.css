@@ -4,14 +4,15 @@
 .conversation-screen [data-slot="bubble-content"] { white-space: pre-wrap; overflow-wrap: anywhere; }
 .conversation-screen > form { width: 100%; max-width: 48rem; flex-shrink: 0; align-self: center; padding: .5rem max(1rem, env(safe-area-inset-right)) max(.75rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left)); }
 .conversation-screen > form > p { margin: .5rem 0 0; color: var(--muted-foreground); font-size: .8125rem; line-height: 1.5; }
-.conversation-screen > .chat-trace { width: 100%; max-width: 48rem; flex-shrink: 0; align-self: center; min-width: 0; padding: 0 max(1rem, env(safe-area-inset-right)) 0 max(1rem, env(safe-area-inset-left)); }
+.conversation-screen > .chat-trace, .conversation-screen > .chat-approvals { width: 100%; max-width: 48rem; flex-shrink: 0; align-self: center; min-width: 0; max-height: 40dvh; overflow-y: auto; overscroll-behavior: contain; padding: 0 max(1rem, env(safe-area-inset-right)) 0 max(1rem, env(safe-area-inset-left)); }
+.conversation-screen > .chat-approvals { display: grid; gap: .75rem; padding-block: .5rem; }
 .conversation-screen > .autonomy-control { display: flex; width: 100%; max-width: 48rem; flex-shrink: 0; flex-wrap: wrap; align-self: center; align-items: center; gap: .5rem; padding: .5rem max(1rem, env(safe-area-inset-right)) 0 max(1rem, env(safe-area-inset-left)); color: var(--muted-foreground); font-size: .8125rem; }
 .conversation-screen .replying { display: flex; align-items: center; gap: .5rem; margin: 0; color: var(--muted-foreground); font-size: .875rem; }
 @media (min-width: 40rem) {
-  .conversation-screen > form, .conversation-screen > .chat-trace, .conversation-screen > .autonomy-control { padding-inline: max(1.5rem, env(safe-area-inset-left)) max(1.5rem, env(safe-area-inset-right)); }
+  .conversation-screen > form, .conversation-screen > .chat-trace, .conversation-screen > .chat-approvals, .conversation-screen > .autonomy-control { padding-inline: max(1.5rem, env(safe-area-inset-left)) max(1.5rem, env(safe-area-inset-right)); }
 }
 @media (min-width: 64rem) {
-  .conversation-screen > form, .conversation-screen > .chat-trace, .conversation-screen > .autonomy-control { padding-inline: max(2rem, env(safe-area-inset-left)) max(2rem, env(safe-area-inset-right)); }
+  .conversation-screen > form, .conversation-screen > .chat-trace, .conversation-screen > .chat-approvals, .conversation-screen > .autonomy-control { padding-inline: max(2rem, env(safe-area-inset-left)) max(2rem, env(safe-area-inset-right)); }
 }
 .conversation-screen [data-slot="message-header"] { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .conversation-screen > .pending-message { display: none; }

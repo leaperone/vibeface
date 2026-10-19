@@ -245,8 +245,9 @@ function useWorkspaceState(connection: ReadyConnection) {
     mutations.add(key)
     try { return await work() } finally { mutations.delete(key) }
   }
+  const clearMessages = () => { if (current()) { setError(""); setNoticeText("") } }
   const run = async (action: () => Promise<void>) => {
-    if (current()) setError("")
+    clearMessages()
     try { await action() } catch (caught) { showError(caught) }
   }
   const requireControlRefresh = () => {
@@ -321,7 +322,7 @@ function useWorkspaceState(connection: ReadyConnection) {
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView, nodes, conversationId, data, notifications, bots, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress,
     writable: booted && current() && readConnection.current === connection,
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",

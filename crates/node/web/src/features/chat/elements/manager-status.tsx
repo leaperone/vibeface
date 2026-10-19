@@ -14,9 +14,8 @@ export function managerTraceTitle(job: ManagerJob) {
   return `${label} · ${managerStates[job.state] ?? job.state}`
 }
 
-export function managerTraceStatus(state: string): 'running' | 'error' | 'pending' | undefined {
+export function managerTraceStatus(state: string): 'running' | 'error' | undefined {
   if (['failed', 'rejected'].includes(state)) return 'error'
-  if (state === 'pending_delivery') return 'pending'
   if (['queued', 'claimed', 'running', 'cancelling'].includes(state)) return 'running'
   return undefined
 }

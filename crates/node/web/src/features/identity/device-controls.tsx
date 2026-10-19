@@ -28,7 +28,7 @@ function entryKey(entry: ConnectionEntry) {
   return `${entry.address}|${entry.peer_id}|${entry.local === true}`
 }
 
-function MemberDetails({ member, compact = false }: { member: Member; compact?: boolean }) {
+function MemberDetails({ member, compact = false, current = false }: { member: Member; compact?: boolean; current?: boolean }) {
   const fingerprints = <dl className="grid gap-3 text-xs">
     <div className="space-y-1"><dt className="text-muted-foreground">完整设备编号</dt><dd className="break-all font-mono">{member.subject_id}</dd></div>
     <div className="space-y-1"><dt className="text-muted-foreground">公钥</dt><dd className="break-all font-mono">{member.public_key}</dd></div>
@@ -38,6 +38,7 @@ function MemberDetails({ member, compact = false }: { member: Member; compact?: 
       <h3 className="break-all text-sm font-medium">{member.name || '未命名设备'}</h3>
       <Badge variant="secondary">{member.kind === 'node' ? '节点' : '客户端'}</Badge>
       {member.manage && <Badge variant="outline">可管理设备</Badge>}
+      {current && <Badge variant="outline">当前入口</Badge>}
     </div>
     {member.kind === 'node' && <p className="text-xs text-muted-foreground">角色：{member.node_roles.map((role) => roleLabels[role]).join('、') || '无'}</p>}
     {compact ? <Collapsible>
@@ -47,7 +48,7 @@ function MemberDetails({ member, compact = false }: { member: Member; compact?: 
   </div>
 }
 
-export function DeviceControls() {
+export function DeviceControls({ active }: { active: boolean }) {
   const device = useDevice()
   const { ready, identity, entries, directory, pairs } = device
   const generation = device.connectionGeneration()
@@ -72,13 +73,18 @@ export function DeviceControls() {
     setRevokeSubject('')
     setError('')
     setStatus('')
+  }, [ready])
+
+  useEffect(() => {
     if (!ready) return
     let current = true
-    void device.refreshDirectory().catch((failure: unknown) => {
+    const refresh = () => device.refreshDirectory().catch((failure: unknown) => {
       if (current && ready.isCurrent()) setError(failure instanceof Error ? failure.message : '设备目录读取失败，请重试。')
     })
-    return () => { current = false }
-  }, [ready])
+    void refresh()
+    const timer = active && invitation ? setInterval(() => { void refresh() }, 5000) : undefined
+    return () => { current = false; if (timer !== undefined) clearInterval(timer) }
+  }, [ready, active, invitation])
 
   async function run(action: () => Promise<void>, success = '') {
     if (actionPending.current === generation) return
@@ -134,7 +140,7 @@ export function DeviceControls() {
             <dl className="grid gap-3 text-xs"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{pair.review.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{pair.review.inviter_subject_id}</dd></div></dl>
             <label className="flex min-h-11 items-start gap-2 text-sm"><input className="mt-1" type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} />我已通过可信渠道核对以上设备信息</label>
             <div className="flex flex-wrap gap-2">
-              <Button type="button" className={button} disabled={busy || !reviewConfirmed} onClick={() => void run(async () => { await device.approvePair(pair.request_id); if (ready?.isCurrent()) { setReview(null); setReviewConfirmed(false) } }, '设备已获授权。')}>确认授权</Button>
+              <Button type="button" className={button} disabled={busy || !reviewConfirmed} onClick={() => void run(async () => { await device.approvePair(pair.request_id); if (ready?.isCurrent()) { setReview(null); setReviewConfirmed(false); setInvitation(null) } }, '设备已获授权。')}>确认授权</Button>
               <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => { setReview(null); setReviewConfirmed(false) }}>取消</Button>
             </div>
           </div> : <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => { setReview(pair); setReviewConfirmed(false) }}>核对设备信息</Button>}
@@ -151,8 +157,8 @@ export function DeviceControls() {
         <ul className="divide-y divide-border">
           {directory.members.map((member) => <li key={member.subject_id} className="space-y-3 py-4 first:pt-0 last:pb-0">
             <div className="flex flex-wrap items-start justify-between gap-3">
-              <MemberDetails member={member} compact />
-              {canManage && !member.manage && revokeSubject !== member.subject_id && <Button type="button" variant="ghost" className={`${button} text-destructive`} disabled={busy} onClick={() => setRevokeSubject(member.subject_id)}>撤销授权</Button>}
+              <MemberDetails member={member} compact current={member.subject_id === ready?.entry.peer_id} />
+              {canManage && !member.manage && member.subject_id !== ready?.entry.peer_id && revokeSubject !== member.subject_id && <Button type="button" variant="ghost" className={`${button} text-destructive`} disabled={busy} onClick={() => setRevokeSubject(member.subject_id)}>撤销授权</Button>}
             </div>
             {canManage && !member.manage && revokeSubject === member.subject_id && <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
               <p className="break-all text-sm">撤销后，此设备将失去网络访问权限。确认撤销「{member.name || member.subject_id}」？</p>

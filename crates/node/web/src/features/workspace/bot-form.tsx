@@ -105,7 +105,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
                 {projects.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect>
             )}
-            <FieldDescription id="bot-project-help">{projects.length || pending?.project ? "选择已授权设备上的目录，方便机器人处理项目。" : "还没有可用的项目目录，也可以先创建机器人。"}</FieldDescription>
+            <FieldDescription id="bot-project-help">{projects.length || pending?.project ? "选择已授权设备上的目录，方便机器人处理项目。" : "还没有可用的项目目录。可在「设置」为节点启用 Agent 并添加项目目录，也可以先创建机器人。"}</FieldDescription>
           </Field>
           {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
           <div className="flex flex-wrap gap-3">

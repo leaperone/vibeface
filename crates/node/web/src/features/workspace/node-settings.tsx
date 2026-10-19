@@ -71,7 +71,7 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
     <CardContent className="space-y-4">
       <p className="break-all text-sm text-muted-foreground">这些设置只保存在当前节点。{ready.entry.address}</p>
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-      <p role="status" className="text-sm text-muted-foreground">{busy ? '正在读取或保存设置…' : status}</p>
+      <p role="status" className="text-sm text-muted-foreground empty:sr-only">{busy ? '正在读取或保存设置…' : status}</p>
       {response && <p className="text-sm text-muted-foreground">{response.readiness.manager === 'disabled' ? '选择 Provider 后保存，即可启用管理 Agent。默认工作目录会自动创建。'
         : response.readiness.manager === 'role_unavailable' ? '此节点没有调度角色授权，当前不能运行管理 Agent。保存配置不会授予新角色。'
         : response.readiness.manager === 'missing_prerequisites' ? `还缺少 ${response.readiness.missing.join('、')}。请先在此节点安装所需程序。`
@@ -103,7 +103,7 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
           <Button className="min-h-11" type="submit">保存节点设置</Button>
         </fieldset>
       </form>}
-      <Button className="min-h-11" type="button" variant="outline" disabled={busy} onClick={() => void run(false)}>重新读取设置</Button>
+      <Button className="min-h-11 justify-self-start" type="button" variant="outline" disabled={busy} onClick={() => void run(false)}>重新读取设置</Button>
     </CardContent>
   </Card>
 }
