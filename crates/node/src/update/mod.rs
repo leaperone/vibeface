@@ -325,7 +325,7 @@ pub async fn run(options: Update) -> Result<()> {
     }
 }
 
-fn update_lock(data: &Path) -> Result<File> {
+pub fn update_lock(data: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = OpenOptions::new()
         .read(true)

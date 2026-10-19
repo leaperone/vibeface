@@ -105,6 +105,14 @@ pub async fn run(options: Service) -> Result<()> {
         Some(root) => root.clone(),
         None => update::managed_install_root(&data)?,
     };
+    let _migration_lock = if npm_root.is_some() && matches!(options.action, Action::Install) {
+        Some(
+            update::update_lock(&data)
+                .context("wait for the updater before migrating its service")?,
+        )
+    } else {
+        None
+    };
     let mut operation = command(&root, &data, &executable, options.action)?;
     if npm_root.is_some() && matches!(options.action, Action::Install) {
         let status = command(&root, &data, &executable, Action::UninstallUpdater)?
