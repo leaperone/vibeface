@@ -1,13 +1,6 @@
 import type { MembershipView } from "@/lib/node"
 import type { NodeInfo } from "./types"
 
-export const roleNames: Record<string, string> = {
-  gateway: "接入",
-  relay: "中继",
-  replica: "同步",
-  scheduler: "调度",
-}
-
 export const stateNames: Record<string, string> = {
   accepted: "已接收",
   pending_delivery: "等待设备接收",
@@ -61,23 +54,12 @@ export function stateLabel(value: string | undefined, override?: string) {
   return stateNames[value] || value
 }
 
-export function textOf(value: unknown) {
-  return typeof value === "string" ? value : JSON.stringify(value, null, 2)
-}
-
-export function missingCount(value: unknown) {
-  if (Array.isArray(value)) return value.length
-  return typeof value === "number" ? value : 0
-}
-
 export function isIncomplete(missing: { events?: unknown; blobs?: unknown; conflicts?: unknown } | undefined) {
   return !missing || (["events", "blobs", "conflicts"] as const).some((key) => {
     const value = missing[key]
     return !Array.isArray(value) || value.length > 0
   })
 }
-
-export type FrontierHead = string
 
 export function mergeBasis(current: readonly string[], basisText: string | null) {
   if (!basisText || basisText.length >= 6000) return current
