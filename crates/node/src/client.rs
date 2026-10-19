@@ -70,6 +70,21 @@ struct Session {
     subscribed: bool,
     recovery: Option<Recovery>,
     observation: Option<crate::runtime::ObservationGuard>,
+    source: SessionSource,
+}
+
+enum SessionSource {
+    Membership,
+    LocalSession(String),
+}
+
+#[derive(Serialize)]
+struct BrowserPrincipal {
+    source: &'static str,
+    network_id: String,
+    subject_id: String,
+    epoch: u64,
+    can_manage: bool,
 }
 
 pub struct Client {
@@ -153,7 +168,20 @@ impl Client {
     }
 }
 
-pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> {
+pub async fn serve(node: Arc<Runtime>, socket: NetworkSocket) -> Result<()> {
+    serve_session(node, socket, None).await
+}
+
+pub async fn serve_local(node: Arc<Runtime>, socket: NetworkSocket, cookie: String) -> Result<()> {
+    serve_session(node, socket, Some(cookie)).await
+}
+
+async fn serve_session(
+    node: Arc<Runtime>,
+    mut socket: NetworkSocket,
+    cookie: Option<String>,
+) -> Result<()> {
+    let mut local_changes = node.local_access.subscribe();
     let (mut channel, subject_id, public_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut handshake = secure(Handshake::new(
             false,
@@ -178,12 +206,33 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
     })
     .await
     .context("client handshake timed out")??;
+    let source = if let Some(cookie) = cookie {
+        let view = node.membership_state().await?.project()?;
+        if view
+            .authorize_client(&subject_id)
+            .is_ok_and(|member| member.public_key == public_key)
+        {
+            SessionSource::Membership
+        } else {
+            let local =
+                node.local_access
+                    .session(&cookie, &node.identity.peer_id()?, &view.network_id)?;
+            ensure!(
+                local.subject_id == subject_id && local.public_key == public_key,
+                "local browser cookie is bound to another Noise identity"
+            );
+            SessionSource::LocalSession(cookie)
+        }
+    } else {
+        SessionSource::Membership
+    };
     let mut session = Session {
         subject_id,
         public_key,
         subscribed: false,
         recovery: None,
         observation: None,
+        source,
     };
     let mut events = node.events.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
@@ -200,7 +249,14 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            let result = dispatch(&node, &mut session, &request.method, request.params).await;
+                            let result = if matches!(session.source, SessionSource::LocalSession(_)) && request.method != "local_access" {
+                                tokio::select! {
+                                    result = dispatch(&node, &mut session, &request.method, request.params) => result,
+                                    _ = local_changes.changed() => bail!("local browser access was revoked"),
+                                }
+                            } else {
+                                dispatch(&node, &mut session, &request.method, request.params).await
+                            };
                             let response = match result { Ok(result) => Response { id: request.id, result, error: None }, Err(error) => Response { id: request.id, result: Value::Null, error: Some(error.to_string()) } };
                             send_value(&mut socket, &mut channel, &response).await?;
                         } else { partial_started.get_or_insert_with(Instant::now); }
@@ -210,7 +266,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                 }
             }
             event = events.recv(), if session.subscribed => {
-                let principal = current_view(&node, &session).await?.principal(&session.subject_id)?;
+                let principal = current_principal(&node, &session).await?;
                 match event {
                     Ok(event) if event.network_id == principal.network_id => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":event.payload})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
@@ -221,9 +277,13 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
             _ = heartbeat.tick() => {
                 ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed || session.observation.is_some() { current_view(&node, &session).await?.principal(&session.subject_id)?; }
+                if session.subscribed || session.observation.is_some() { current_principal(&node, &session).await?; }
                 if let Some(observation) = &session.observation { observation.refresh(); }
                 tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await.context("client heartbeat send timed out")??;
+            }
+            changed = local_changes.changed(), if matches!(session.source, SessionSource::LocalSession(_)) => {
+                changed.context("local access state closed")?;
+                bail!("local browser access was revoked");
             }
         }
     }
@@ -235,6 +295,16 @@ async fn dispatch(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    if matches!(session.source, SessionSource::LocalSession(_)) {
+        ensure!(
+            matches!(
+                method,
+                "info" | "authenticate" | "directory" | "subscribe" | "rpc" | "local_access"
+            ),
+            "local browser access cannot manage personal-network membership"
+        );
+        current_principal(node, session).await?;
+    }
     let _work = if matches!(
         method,
         "info"
@@ -252,7 +322,7 @@ async fn dispatch(
     };
     match method {
         "info" => Ok(
-            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION")}),
+            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node)?}),
         ),
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
@@ -268,21 +338,17 @@ async fn dispatch(
             Ok(authenticated)
         }
         "directory" => {
-            let view = current_view(node, session).await?;
-            view.authorize_client(&session.subject_id)?;
+            current_principal(node, session).await?;
+            let view = node.membership_state().await?.project()?;
             Ok(json!({"state":node.membership_state().await?,"view":view}))
         }
         "subscribe" => {
-            current_view(node, session)
-                .await?
-                .authorize_client(&session.subject_id)?;
+            current_principal(node, session).await?;
             session.subscribed = true;
             Ok(json!({"subscribed":true}))
         }
         "rpc" => {
-            let principal = current_view(node, session)
-                .await?
-                .principal(&session.subject_id)?;
+            let principal = current_principal(node, session).await?;
             let mut params = params;
             bind_client_identity(&mut params, &principal.subject_id)?;
             let watched_scope = (params["method"] == "conversation")
@@ -309,6 +375,18 @@ async fn dispatch(
                 }
             }
             Ok(result)
+        }
+        "local_access" => {
+            let principal = current_principal(node, session).await?;
+            if let Some(enabled) = params.get("enabled") {
+                let enabled = enabled.as_bool().context("enabled must be a boolean")?;
+                ensure!(
+                    principal.can_manage || (principal.source == "local_session" && !enabled),
+                    "only a management client can enable local browser access"
+                );
+                node.local_access.set_enabled(enabled)?;
+            }
+            Ok(json!({"enabled":node.local_access.enabled()}))
         }
         "prepare_genesis" => {
             ensure!(
@@ -363,7 +441,7 @@ async fn dispatch(
                     "bootstrap requires its original management identity"
                 );
             } else {
-                node.identities.bootstrap_network(
+                node.store.lock().await.bootstrap_network(
                     state.clone(),
                     text(&params, "capability")?,
                     &session.subject_id,
@@ -382,7 +460,7 @@ async fn dispatch(
                 .transpose()?
                 .unwrap_or_default();
             sort_roles(&mut roles)?;
-            let payload = node.identities.create_invite(InviteRequest {
+            let payload = node.store.lock().await.create_invite(InviteRequest {
                 request_id: request_id(&params)?,
                 network_id: view.network_id,
                 inviter_subject_id: session.subject_id.clone(),
@@ -410,7 +488,7 @@ async fn dispatch(
                 crypto::digest(capability.as_bytes()) == invite.payload.capability_hash,
                 "invitation capability mismatch"
             );
-            node.identities.commit_invite(invite.clone())?;
+            node.store.lock().await.commit_invite(invite.clone())?;
             Ok(json!({"invite":invite,"capability":capability}))
         }
         "prepare_pair_request" => {
@@ -472,14 +550,14 @@ async fn dispatch(
                 "pair request is for another channel identity"
             );
             let request_id = request.request_id.clone();
-            let review = node.identities.pair_request(request)?;
+            let review = node.store.lock().await.pair_request(request)?;
             let signing = signing("identity-pair-review", review.signing_bytes()?);
             Ok(json!({"request_id":request_id,"review":review,"signing":signing}))
         }
         "pair_accept" => {
             node.membership_state().await?;
             let request_id = text(&params, "request_id")?;
-            let review = node.identities.lookup_pair(request_id)?;
+            let review = node.store.lock().await.lookup_pair(request_id)?;
             ensure!(
                 review.new_member.subject_id == session.subject_id
                     && review.new_member.public_key == session.public_key,
@@ -494,7 +572,9 @@ async fn dispatch(
                 return Ok(json!({"status":"granted"}));
             }
             let receipt = node
-                .identities
+                .store
+                .lock()
+                .await
                 .accept_pair(review, text(&params, "signature")?.to_owned())?;
             let _ = node.events.send(crate::runtime::Update {
                 network_id: state.genesis.network_id,
@@ -505,13 +585,15 @@ async fn dispatch(
         "pair_requests" => {
             manager_view(node, session).await?;
             Ok(serde_json::to_value(
-                node.identities.pending_pairs(&session.subject_id)?,
+                node.store.lock().await.pending_pairs(&session.subject_id)?,
             )?)
         }
         "prepare_pair" => {
             let view = manager_view(node, session).await?;
             let pair = node
-                .identities
+                .store
+                .lock()
+                .await
                 .pending_pairs(&session.subject_id)?
                 .into_iter()
                 .find(|pair| pair.request_id == params["request_id"])
@@ -539,7 +621,9 @@ async fn dispatch(
                 return authentication(node, session).await;
             }
             let pair = node
-                .identities
+                .store
+                .lock()
+                .await
                 .pending_pairs(&session.subject_id)?
                 .into_iter()
                 .find(|pair| pair.request_id == params["request_id"])
@@ -550,12 +634,12 @@ async fn dispatch(
                 event == expected && event.issuer == session.subject_id,
                 "grant differs from approved pair review"
             );
-            node.identities.confirm_pair(PairConfirm {
+            node.store.lock().await.confirm_pair(PairConfirm {
                 review: pair.review,
                 inviter_signature: text(&params, "inviter_signature")?.to_owned(),
                 new_subject_signature: pair.new_subject_signature,
             })?;
-            let state = node.identities.store_signed_grant(event)?;
+            let state = node.store.lock().await.store_signed_grant(event)?;
             let network_id = state.genesis.network_id.clone();
             node.install_membership(state.clone()).await?;
             announce_membership(node, &network_id, &state).await;
@@ -564,7 +648,7 @@ async fn dispatch(
         "pair_status" => {
             node.membership_state().await?;
             let request_id = text(&params, "request_id")?;
-            let review = match node.identities.lookup_pair(request_id) {
+            let review = match node.store.lock().await.lookup_pair(request_id) {
                 Ok(review) => review,
                 Err(error)
                     if error
@@ -709,7 +793,7 @@ async fn dispatch(
             let fresh = !node.has_membership().await?;
             validate_local_node(node, &state, fresh)?;
             if fresh {
-                node.identities.bootstrap_recovered_network(
+                node.store.lock().await.bootstrap_recovered_network(
                     state.clone(),
                     text(&params, "capability")?,
                     &session.subject_id,
@@ -724,6 +808,10 @@ async fn dispatch(
 }
 
 async fn current_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
+    ensure!(
+        matches!(session.source, SessionSource::Membership),
+        "signed membership is required"
+    );
     let view = node.membership_state().await?.project()?;
     let member = view.authorize_client(&session.subject_id)?;
     ensure!(
@@ -731,6 +819,60 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
         "client identity key mismatch"
     );
     Ok(view)
+}
+fn connection_entry(node: &Runtime) -> Result<Value> {
+    let relay = node.config.network.bootstrap_urls.first();
+    let mut url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        scheme => scheme,
+    }
+    .to_owned();
+    url.set_scheme(&scheme)
+        .map_err(|_| anyhow::anyhow!("invalid public browser entry"))?;
+    Ok(
+        json!({"address":url.origin().ascii_serialization(),"peer_id":node.identity.peer_id()?,"relay":relay.is_some()}),
+    )
+}
+async fn current_principal(node: &Runtime, session: &Session) -> Result<BrowserPrincipal> {
+    match &session.source {
+        SessionSource::Membership => {
+            let principal = current_view(node, session)
+                .await?
+                .principal(&session.subject_id)?;
+            Ok(BrowserPrincipal {
+                source: "membership",
+                network_id: principal.network_id,
+                subject_id: principal.subject_id,
+                epoch: principal.epoch,
+                can_manage: principal.can_manage,
+            })
+        }
+        SessionSource::LocalSession(cookie) => {
+            let view = node.membership_state().await?.project()?;
+            let peer_id = node.identity.peer_id()?;
+            let member = view.authorize_node(&peer_id, None)?;
+            ensure!(
+                member.public_key == node.identity.public_key_hex()?,
+                "local node membership key changed"
+            );
+            let local = node
+                .local_access
+                .session(cookie, &peer_id, &view.network_id)?;
+            ensure!(
+                local.subject_id == session.subject_id && local.public_key == session.public_key,
+                "local browser session belongs to another Noise identity"
+            );
+            Ok(BrowserPrincipal {
+                source: "local_session",
+                network_id: local.network_id,
+                subject_id: local.subject_id,
+                epoch: view.epoch,
+                can_manage: false,
+            })
+        }
+    }
 }
 async fn manager_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
     let view = current_view(node, session).await?;
@@ -741,14 +883,16 @@ async fn manager_view(node: &Runtime, session: &Session) -> Result<Authorization
     Ok(view)
 }
 async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
+    let principal = current_principal(node, session).await?;
     let state = node.membership_state().await?;
     let view = state.project()?;
-    let member = view.authorize_client(&session.subject_id)?;
     ensure!(
-        member.public_key == session.public_key,
-        "client identity key mismatch"
+        principal.network_id == view.network_id && principal.epoch == view.epoch,
+        "personal-network membership changed during authentication"
     );
-    Ok(json!({"principal":view.principal(&session.subject_id)?,"state":state,"view":view}))
+    Ok(
+        json!({"principal":principal,"state":state,"view":view,"local_auto_access":node.local_access.enabled()}),
+    )
 }
 fn session_member(
     session: &Session,
@@ -890,7 +1034,9 @@ async fn recovery_context(node: &Runtime, session: &mut Session, params: &Value)
     let state = if node.has_membership().await? {
         node.membership_state().await?
     } else {
-        node.identities
+        node.store
+            .lock()
+            .await
             .verify_bootstrap_capability(text(params, "capability")?)?;
         from_field(params, "state")?
     };
@@ -1074,6 +1220,157 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()
+    -> Result<()> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        async fn connect_local(
+            origin: &str,
+            target: &str,
+            cookie: &str,
+            identity: &LocalIdentity,
+        ) -> Result<Client> {
+            let endpoint = origin.replace("http://", "ws://") + "/api/local/ws";
+            let mut request = endpoint.into_client_request()?;
+            request.headers_mut().insert("cookie", cookie.parse()?);
+            let (socket, _) = tokio_tungstenite::connect_async(request).await?;
+            Client::from_socket(NetworkSocket::Client(Box::new(socket)), identity, target).await
+        }
+
+        async fn browser_node(
+            dir: &std::path::Path,
+            manager: &LocalIdentity,
+        ) -> Result<Arc<Runtime>> {
+            crate::config::private_dir(dir)?;
+            let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let listen = reservation.local_addr()?;
+            drop(reservation);
+            crate::config::Config::local(listen, vec![], false).save(dir)?;
+            crate::config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&LocalIdentity::generate())?,
+            )?;
+            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+            let node = Arc::new(Runtime::open(dir).await?);
+            node.install_membership(NetworkState::new(Genesis::create(
+                &LocalIdentity::generate(),
+                vec![
+                    Member::node(&node.identity, "local device", node.config.roles.clone())?,
+                    Member::client(manager, "management browser", true)?,
+                ],
+            )?)?)
+            .await?;
+            Ok(node)
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-local-browser-{}", uuid::Uuid::new_v4()));
+        let manager = LocalIdentity::generate();
+        let browser = LocalIdentity::generate();
+        let node = browser_node(&dir, &manager).await?;
+        let listen = node.config.listen;
+        let serving = node.clone();
+        let server = tokio::spawn(async move { crate::api::serve(serving).await });
+        let mut second_server = None;
+        let result: Result<()> = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await?;
+            let launcher: crate::local_access::Launcher = serde_json::from_slice(&std::fs::read(dir.join("local-access.json"))?)?;
+            let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+            assert_eq!(http.get(format!("http://{listen}/api/local/info")).header("Forwarded", "for=127.0.0.1;host=localhost").send().await?.status(), 404);
+            let info: Value = http.get(format!("{}/api/local/info", launcher.origin)).send().await?.error_for_status()?.json().await?;
+            assert_eq!(info["has_session"], false);
+            let denied = http.post(format!("{}/api/local/launch", launcher.origin)).header("Origin", &launcher.origin).header("X-Forwarded-For", "127.0.0.1").json(&json!({})).send().await?;
+            assert_eq!(denied.status(), 401);
+            assert!(!denied.headers().contains_key("set-cookie"));
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+
+            let mut cookies = vec![];
+            for identity in [&browser, &manager] {
+                let launch: Value = http.post(format!("{}/api/local/launch", launcher.origin)).bearer_auth(&launcher.capability).json(&json!({})).send().await?.error_for_status()?.json().await?;
+                let input = json!({"token":launch["token"],"peer_id":launcher.peer_id,"subject_id":identity.peer_id()?,"public_key":identity.public_key_hex()?});
+                let exchanged = http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.error_for_status()?;
+                let cookie = exchanged.headers().get("set-cookie").context("session cookie missing")?.to_str()?;
+                assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict") && cookie.contains("Path=/api/local"));
+                cookies.push(cookie.split(';').next().context("session cookie missing")?.to_owned());
+                assert_eq!(http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.status(), 401);
+            }
+            let second_dir = dir.join("second");
+            let second = browser_node(&second_dir, &manager).await?;
+            second_server = Some(tokio::spawn(async move { crate::api::serve(second).await }));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !second_dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await?;
+            let second_launcher: crate::local_access::Launcher = serde_json::from_slice(&std::fs::read(second_dir.join("local-access.json"))?)?;
+            let first_origin = reqwest::Url::parse(&launcher.origin)?;
+            let second_origin = reqwest::Url::parse(&second_launcher.origin)?;
+            assert_eq!(first_origin.host_str(), Some("127.0.0.1"));
+            assert_eq!(second_origin.host_str(), first_origin.host_str());
+            assert_ne!(second_origin.port(), first_origin.port());
+            let launch: Value = http.post(format!("{}/api/local/launch", second_launcher.origin)).bearer_auth(&second_launcher.capability).json(&json!({})).send().await?.error_for_status()?.json().await?;
+            let input = json!({"token":launch["token"],"peer_id":second_launcher.peer_id,"subject_id":browser.peer_id()?,"public_key":browser.public_key_hex()?});
+            let exchanged = http.post(format!("{}/api/local/exchange", second_launcher.origin)).header("Origin", &second_launcher.origin).json(&input).send().await?.error_for_status()?;
+            let second_cookie = exchanged.headers().get("set-cookie").context("second session cookie missing")?.to_str()?;
+            assert!(second_cookie.contains("HttpOnly") && second_cookie.contains("SameSite=Strict") && second_cookie.contains("Path=/api/local"));
+            let second_cookie = second_cookie.split(';').next().context("second session cookie missing")?;
+            let mut jar = std::collections::BTreeMap::new();
+            for cookie in [cookies[0].as_str(), second_cookie] {
+                let (name, value) = cookie.split_once('=').context("invalid session cookie")?;
+                jar.insert(name, value);
+            }
+            assert_eq!(jar.len(), 2, "same-host Nodes must retain separate cookies");
+            let shared_cookies = jar.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; ");
+            for origin in [&launcher.origin, &second_launcher.origin] {
+                let info: Value = http.get(format!("{origin}/api/local/info")).header("Cookie", &shared_cookies).send().await?.error_for_status()?.json().await?;
+                assert_eq!(info["has_session"], true);
+                assert_eq!(info["subject_id"], browser.peer_id()?);
+            }
+            let (first_name, _) = cookies[0].split_once('=').context("invalid session cookie")?;
+            let (_, second_value) = second_cookie.split_once('=').context("invalid second session cookie")?;
+            let wrong_node_cookie = format!("{first_name}={second_value}");
+            let info: Value = http.get(format!("{}/api/local/info", launcher.origin)).header("Cookie", &wrong_node_cookie).send().await?.error_for_status()?.json().await?;
+            assert_eq!(info["has_session"], false);
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &wrong_node_cookie).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            let mut second_local = connect_local(&second_launcher.origin, &second_launcher.peer_id, &shared_cookies, &browser).await?;
+            assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
+            let mut local = connect_local(&launcher.origin, &launcher.peer_id, &shared_cookies, &browser).await?;
+            let auth = local.call("authenticate", json!({})).await?;
+            assert_eq!(auth["principal"]["source"], "local_session");
+            assert_eq!(auth["principal"]["can_manage"], false);
+            assert!(!auth["view"]["members"].as_array().context("members missing")?.iter().any(|member| member["subject_id"] == browser.peer_id().unwrap()));
+            assert!(local.call("prepare_invite", json!({"kind":"client"})).await.is_err());
+            let conversation = uuid::Uuid::new_v4().to_string();
+            local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser"})).await?;
+            let conversations = local.call("rpc", json!({"method":"conversations"})).await?;
+            assert!(conversations["conversations"].as_array().context("conversations missing")?.iter().any(|item| item["conversation_id"] == conversation && item["title"] == "Local browser"));
+            let mut wrong_key = connect_local(&launcher.origin, &launcher.peer_id, &cookies[0], &LocalIdentity::generate()).await?;
+            assert!(wrong_key.call("authenticate", json!({})).await.is_err());
+            let mut signed = connect_local(&launcher.origin, &launcher.peer_id, &cookies[1], &manager).await?;
+            let auth = signed.call("authenticate", json!({})).await?;
+            assert_eq!(auth["principal"]["source"], "membership");
+            assert_eq!(auth["principal"]["can_manage"], true);
+            local.call("local_access", json!({"enabled":false})).await?;
+            assert!(!crate::config::Config::load(&dir)?.local_auto_access);
+            assert!(local.call("rpc", json!({"method":"conversations"})).await.is_err());
+            assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
+            assert_eq!(signed.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            signed.call("local_access", json!({"enabled":true})).await?;
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            Ok(())
+        }.await;
+        server.abort();
+        let _ = server.await;
+        if let Some(server) = second_server {
+            server.abort();
+            let _ = server.await;
+        }
+        drop(node);
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
 
     #[tokio::test]
     async fn client_routes_by_target_and_pins_the_destination() -> Result<()> {

@@ -1,11 +1,11 @@
 import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
 
-export type ConnectionEntry = { address: string; peer_id: string }
+export type ConnectionEntry = { address: string; peer_id: string; local?: boolean }
 export type PublicIdentity = { peerId: string; publicKey: string }
-export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number; can_manage: boolean }
-export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler' | 'executor'
-export type EntryInfo = { peer_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean }
+export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
+export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
+export type EntryInfo = { peer_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
   readonly generation: number
   entry: ConnectionEntry
@@ -38,16 +38,21 @@ export function integer(value: unknown): number { if (typeof value !== 'number' 
 export function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
 export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
 export function roles(value: unknown): NodeRole[] {
-  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': case 'executor': return role; default: throw new Error('设备返回了不支持的角色。') } })
+  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': return role; default: throw new Error('设备返回了不支持的角色。') } })
 }
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '连接入口')
-  return { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id) }
+  const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id) }
+  if (v.local === true) {
+    if (v.relay === true || entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
+    return { ...entry, local: true }
+  }
+  return entry
 }
-export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}`
+export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.local === true}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
-  return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized) }
+  return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized), ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }) }
 }
 export function parseMember(value: unknown): Member {
   const v = record(value)
@@ -62,7 +67,13 @@ export function parseView(value: unknown): MembershipView {
 }
 export function parsePrincipal(value: unknown): ClientPrincipal {
   const v = record(value)
-  return { network_id: validTarget(v.network_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch), can_manage: boolean(v.can_manage) }
+  const principal = { network_id: validTarget(v.network_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch) }
+  if (v.source === 'local_session') {
+    if (v.can_manage !== false) throw new Error('本机会话不能取得设备管理权限。')
+    return { ...principal, source: 'local_session', can_manage: false }
+  }
+  if (v.source !== undefined && v.source !== 'membership') throw new Error('设备返回了未知授权来源。')
+  return { ...principal, source: 'membership', can_manage: boolean(v.can_manage) }
 }
 export function parseReview(value: unknown): PairReview {
   const v = record(value)

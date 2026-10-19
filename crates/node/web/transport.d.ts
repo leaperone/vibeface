@@ -5,7 +5,7 @@ export type DeviceChannel = {
   close(): void
 }
 export function initClient(options?: { replaceLostKey?: boolean }): Promise<{ peerId: string; publicKey: string }>
-export function connectDevice(entry: { address: string; peer_id: string }, options?: {
+export function connectDevice(entry: { address: string; peer_id: string; local?: boolean }, options?: {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void
   signal?: AbortSignal

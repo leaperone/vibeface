@@ -31,6 +31,8 @@ pub struct SdkAgentConfig {
     pub workspace: PathBuf,
     pub timeout_secs: u64,
     pub model: String,
+    pub read_only: bool,
+    pub tool_env: BTreeMap<String, String>,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_callback: Option<ToolCallbackConfig>,
 }
@@ -232,33 +234,16 @@ where
             .context("persist Cursor SDK session before sending management prompt")?;
         send_started = true;
         let bearer = rpc.bearer.clone();
+        let mut secrets = vec![api_key.as_str(), bearer.as_str()];
+        secrets.extend(config.tool_env.values().map(String::as_str));
+        if let Some(callback) = &config.tool_callback {
+            secrets.push(callback.auth_token.as_str());
+        }
         let mut pending_text = BTreeMap::new();
-        let mut emit_progress = |value| {
-            progress(redact_stream_progress(
-                value,
-                &[
-                    api_key.as_str(),
-                    bearer.as_str(),
-                    config
-                        .tool_callback
-                        .as_ref()
-                        .map(|callback| callback.auth_token.as_str())
-                        .unwrap_or(""),
-                ],
-                &mut pending_text,
-            ))
-        };
+        let mut emit_progress =
+            |value| progress(redact_stream_progress(value, &secrets, &mut pending_text));
         rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
         let mut result = state.finish(id)?;
-        let secrets = [
-            api_key.as_str(),
-            bearer.as_str(),
-            config
-                .tool_callback
-                .as_ref()
-                .map(|callback| callback.auth_token.as_str())
-                .unwrap_or(""),
-        ];
         result.output = match redact_progress(Value::String(result.output), &secrets) {
             Value::String(output) => output,
             _ => unreachable!("redacting an agent result must preserve its string type"),
@@ -341,6 +326,23 @@ where
         process.group = None;
     }
     outcome.map_err(|error| {
+        let mut message = error
+            .to_string()
+            .replace(&api_key, "[redacted]")
+            .replace(&rpc.bearer, "[redacted]");
+        for secret in config
+            .tool_env
+            .values()
+            .chain(
+                config
+                    .tool_callback
+                    .iter()
+                    .map(|callback| &callback.auth_token),
+            )
+            .filter(|value| !value.is_empty())
+        {
+            message = message.replace(secret, "[redacted]");
+        }
         AgentRunError {
             kind: if cancellation_requested {
                 provider_cancel_failure(native_terminal)
@@ -350,18 +352,7 @@ where
                 AgentFailure::Failed
             },
             session_id: agent_id,
-            message: error
-                .to_string()
-                .replace(&api_key, "[redacted]")
-                .replace(&rpc.bearer, "[redacted]")
-                .replace(
-                    config
-                        .tool_callback
-                        .as_ref()
-                        .map(|callback| callback.auth_token.as_str())
-                        .unwrap_or("\0"),
-                    "[redacted]",
-                ),
+            message,
         }
         .into()
     })
@@ -383,6 +374,34 @@ async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
 }
 
 fn validate_sdk_tools(config: &SdkAgentConfig) -> Result<()> {
+    ensure!(
+        config.tool_env.len() <= 64,
+        "too many tool environment entries"
+    );
+    for (key, value) in &config.tool_env {
+        ensure!(
+            !key.is_empty()
+                && key.len() <= 256
+                && key.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_alphabetic()
+                        || (index > 0 && byte.is_ascii_digit())
+                })
+                && !matches!(
+                    key.as_str(),
+                    "CODEX_HOME"
+                        | "CODEX_API_KEY"
+                        | "CURSOR_API_KEY"
+                        | "HOME"
+                        | "PATH"
+                        | "OPENAI_API_KEY"
+                        | "OPENAI_BASE_URL"
+                )
+                && value.len() <= 4096
+                && !value.contains('\0'),
+            "invalid or reserved tool environment entry"
+        );
+    }
     ensure!(config.custom_tools.len() <= 32, "too many custom tools");
     ensure!(
         config.custom_tools.is_empty() || config.tool_callback.is_some(),
@@ -439,10 +458,12 @@ fn sdk_options(config: &SdkAgentConfig, api_key: &str) -> Result<Value> {
         .workspace
         .to_str()
         .context("Cursor SDK workspace path must be UTF-8")?;
-    Ok(
-        json!({"apiKey":api_key,"model":{"id":config.model},"tools":{"names":["mcp"]},
-        "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":{}}),
-    )
+    let mut options = json!({"apiKey":api_key,"model":{"id":config.model},
+        "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":{}});
+    if config.read_only {
+        options["tools"] = json!({"names":["mcp"]});
+    }
+    Ok(options)
 }
 
 fn validate_sdk_id(id: &str) -> Result<()> {
@@ -546,6 +567,11 @@ impl SdkProcess {
             }
         }
         command
+            .envs(
+                config.tool_env.iter().filter(|(key, _)| {
+                    !config.read_only || key.as_str() != "VIBEFACE_CODEX_SOCKET"
+                }),
+            )
             .env("CURSOR_API_KEY", api_key)
             .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
         let mut child = command
@@ -1348,6 +1374,8 @@ mod tests {
             workspace: "/manager".into(),
             timeout_secs: 5,
             model: "fixture-model".into(),
+            read_only: false,
+            tool_env: BTreeMap::new(),
             custom_tools: BTreeMap::from([(
                 "context".into(),
                 CustomToolConfig {
@@ -1363,12 +1391,26 @@ mod tests {
         };
         let options = sdk_options(&config, "fixture-key").unwrap();
         assert_eq!(options["mcpServers"], json!({}));
-        assert_eq!(options["tools"], json!({"names":["mcp"]}));
+        assert!(options.get("tools").is_none());
         assert_eq!(
             options["local"]["customTools"]["context"]["inputSchema"],
             json!({"type":"object"})
         );
         assert!(options.to_string().find(&"x".repeat(32)).is_none());
+        config.read_only = true;
+        assert_eq!(
+            sdk_options(&config, "fixture-key").unwrap()["tools"],
+            json!({"names":["mcp"]})
+        );
+        config
+            .tool_env
+            .insert("VIBEFACE_CODEX_SOCKET".into(), "/node/codex.sock".into());
+        assert!(sdk_options(&config, "fixture-key").is_ok());
+        config
+            .tool_env
+            .insert("CURSOR_API_KEY".into(), "override".into());
+        assert!(sdk_options(&config, "fixture-key").is_err());
+        config.tool_env.remove("CURSOR_API_KEY");
         config.tool_callback.as_mut().unwrap().url = "http://192.0.2.1:1234".into();
         assert!(sdk_options(&config, "fixture-key").is_err());
         config.tool_callback = None;

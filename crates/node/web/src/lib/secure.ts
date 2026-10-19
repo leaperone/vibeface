@@ -12,7 +12,7 @@ export function verifiedView(state: unknown, networkId: string, owner: string) {
   const verified = verifyState(state, networkId, owner)
   try { return parseView(JSON.parse(verified.viewJson())) } finally { verified.free() }
 }
-export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint?: unknown }
+export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; peerId: string; nodePublicKey: string }
 export function verifyAuthentication(value: unknown, own: PublicIdentity, expected: AuthenticationTrust | null) {
   const auth = record(value)
   const principal = parsePrincipal(auth.principal)
@@ -21,6 +21,12 @@ export function verifyAuthentication(value: unknown, own: PublicIdentity, expect
   if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
   const owner = expected?.kind === 'root' ? expected.ownerPublicKey : text(record(state.genesis).owner_public_key)
   const view = verifiedView(state, expected?.networkId ?? principal.network_id, owner)
+  if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('认证目录与已签名的成员记录不一致。')
+  if (principal.source === 'local_session') {
+    const node = expected?.kind === 'local' ? view.members.find(member => member.subject_id === expected.peerId) : undefined
+    if (expected?.kind !== 'local' || !node || node.kind !== 'node' || node.public_key !== expected.nodePublicKey || view.revoked.includes(node.subject_id) || principal.can_manage) throw new Error('本机会话未绑定当前已验证的 Node。')
+    return { auth, principal, view }
+  }
   const member = view.members.find(item => item.subject_id === own.peerId)
   if (!member || view.revoked.includes(own.peerId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
   return { auth, principal, view }

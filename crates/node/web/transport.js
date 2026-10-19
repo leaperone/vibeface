@@ -159,7 +159,18 @@ function openSocket(url, signal, onClose) {
     if (!message || typeof message !== "object" || Array.isArray(message) || message.type !== expected) throw new Error("入口未能建立指定设备的通道。");
     return message;
   }
-  return { socket, receive, control, close, ready() { clearTimeout(timer); } };
+  return {
+    socket, receive, control, close, ready() { clearTimeout(timer); },
+    opened() {
+      if (failure) return Promise.reject(failure);
+      if (socket.readyState === WebSocket.OPEN) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        socket.addEventListener("open", resolve, { once: true });
+        socket.addEventListener("close", () => reject(failure || new Error("本机连接已断开。")), { once: true });
+        socket.addEventListener("error", () => reject(failure || new Error("无法连接本机入口。")), { once: true });
+      });
+    },
+  };
 }
 
 async function lookupPaths(url, target, signal) {
@@ -195,7 +206,14 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
   if (!identity) await initClient();
   const target = validTarget(entry.peer_id);
-  const initial = new URL("/api/network/ws", validEndpoint(entry.address));
+  const endpoint = validEndpoint(entry.address);
+  if (entry.local === true) {
+    if (entry.relay === true || endpoint !== location.origin) throw new Error("本机会话只能连接当前本机入口。");
+    const local = new URL("/api/local/ws", endpoint);
+    local.protocol = local.protocol === "https:" ? "wss:" : "ws:";
+    return connectPath(local.href, target, null, { onEvent, onClose, signal });
+  }
+  const initial = new URL("/api/network/ws", endpoint);
   initial.protocol = initial.protocol === "https:" ? "wss:" : "ws:";
   const entryUrl = initial.href;
   return new Promise((resolve, reject) => {
@@ -284,9 +302,12 @@ async function connectPath(url, target, relay, { onEvent, onClose, signal }) {
   const fail = error => wire.close(error);
   let handshake;
   try {
-    await wire.control("welcome");
-    socket.send(JSON.stringify(relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
-    await wire.control("ready");
+    if (relay === null) await wire.opened();
+    else {
+      await wire.control("welcome");
+      socket.send(JSON.stringify(relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
+      await wire.control("ready");
+    }
     handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
     socket.send(handshake.write(new Uint8Array()));
     const response = await receive();

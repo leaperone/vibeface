@@ -2,7 +2,7 @@ use super::*;
 use crate::scheduling::{
     AdmissionReceipt, JobOutcome, JobState, OutboxEntry, SCHEDULING_VERSION, SchedulerJob,
 };
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 
 const MAX_WATCH_SCOPES: usize = 32;
 const MAX_WATCH_JOBS: usize = 128;
@@ -71,26 +71,8 @@ fn observation_entries(
                 scheduler_node: Some(target),
                 ..
             } if role == "user" => target.clone(),
-            EventBody::ExecutionObserved {
-                task_id,
-                target_node,
-                status,
-                ..
-            } if event.author == *target_node
-                && matches!(status.as_str(), "succeeded" | "failed" | "rejected") =>
-            {
-                let target = if let Some(task) = task_id {
-                    store
-                        .historical_followup_policy(network, scope, task)
-                        .map(|policy| policy.target_node)
-                } else {
-                    let trigger = crypto::digest(&serde_json::to_vec(&event)?);
-                    store
-                        .execution_result_policy(network, scope, &trigger)
-                        .map(|policy| policy.target_node)
-                };
-                let Ok(target) = target else { continue };
-                target
+            EventBody::AgentMessage { message } if message.kind != AgentMessageKind::Progress => {
+                message.target_node.clone()
             }
             _ => continue,
         };
@@ -259,41 +241,31 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
             role,
             scheduler_node: Some(target),
             ..
-        } if role == "user" && target == &entry.target_node => {
+        } if role == "user" && target.as_str() == entry.target_node => {
             ensure!(
                 job.kind == crate::scheduling::TriggerKind::Human,
                 "observed job trigger kind mismatch"
             );
         }
-        EventBody::ExecutionObserved {
-            task_id,
-            target_node,
-            status,
-            ..
-        } if event.author == *target_node
-            && matches!(status.as_str(), "succeeded" | "failed" | "rejected") =>
-        {
+        EventBody::AgentMessage { message } => {
             ensure!(
-                job.kind == crate::scheduling::TriggerKind::Autonomous,
-                "observed job trigger kind mismatch"
+                message.target_node == entry.target_node,
+                "observed Agent job target mismatch"
             );
-            let target = if let Some(task) = task_id {
-                store
-                    .historical_followup_policy(&entry.network_id, &entry.conversation_id, task)?
-                    .target_node
+            let expected = if message.kind == AgentMessageKind::Task {
+                crate::scheduling::TriggerKind::AgentTask
             } else {
-                store
-                    .validate_followup_result(
-                        &entry.network_id,
-                        &entry.conversation_id,
-                        &job.trigger,
-                        &entry.target_node,
-                    )?
-                    .target_node
+                store.validate_followup_result(
+                    &entry.network_id,
+                    &entry.conversation_id,
+                    &job.trigger,
+                    &entry.target_node,
+                )?;
+                crate::scheduling::TriggerKind::AgentResult
             };
             ensure!(
-                target == entry.target_node,
-                "observed job belongs to another scheduler"
+                job.kind == expected,
+                "observed Agent job trigger kind mismatch"
             );
         }
         _ => bail!("observed job has no verified scheduling identity"),
@@ -562,7 +534,6 @@ impl Runtime {
                     }
                 }
             }
-            self.flush_followup_markers(&network).await?;
         }
         Ok(())
     }
@@ -811,9 +782,14 @@ impl Runtime {
                 .iter()
                 .any(|message| message.message_id == message_id && message.role == "user")
             {
+                let basis = heads(input)?;
+                ensure!(
+                    !store.has_known_basis_gap(network, &basis)?,
+                    "context is incomplete; wait for synchronization"
+                );
                 ensure!(
                     store
-                        .context(network, &scope, &heads(input)?)?
+                        .context(network, &scope, &basis)?
                         .missing
                         .is_complete(),
                     "context is incomplete; wait for synchronization"
@@ -872,10 +848,10 @@ impl Runtime {
             .await
             .authorize_node(network, &message.origin, None)?;
         ensure!(
-            sender.roles.iter().any(|role| matches!(
-                role,
-                NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
-            )),
+            sender
+                .roles
+                .iter()
+                .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler)),
             "origin cannot schedule"
         );
         let scope = id(input, "conversation_id")?;
@@ -888,10 +864,10 @@ impl Runtime {
             let mut store = self.store.lock().await;
             let sender = store.authorize_node(network, &message.origin, None)?;
             ensure!(
-                sender.roles.iter().any(|role| matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
-                )),
+                sender
+                    .roles
+                    .iter()
+                    .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler)),
                 "origin cannot schedule"
             );
             let envelope = store
@@ -912,20 +888,18 @@ impl Runtime {
                         "scheduling intent proof is missing"
                     );
                 }
-                EventBody::ExecutionObserved { .. } => {
-                    if !sender.roles.contains(&NodeRole::Gateway)
-                        && !sender.roles.contains(&NodeRole::Scheduler)
-                    {
-                        ensure!(
-                            event.author == message.origin,
-                            "executor may only schedule its own result in this conversation"
-                        );
+                EventBody::AgentMessage { message } => {
+                    ensure!(
+                        message.kind != AgentMessageKind::Progress,
+                        "progress cannot schedule an Agent"
+                    );
+                    if message.kind != AgentMessageKind::Task {
+                        store.validate_followup_result(network, &scope, trigger, &local)?;
                     }
-                    store.validate_followup_result(network, &scope, trigger, &local)?;
                 }
                 _ => bail!("invalid scheduling trigger"),
             }
-            store.enqueue_trigger(network, &scope, trigger, &local)?;
+            store.admit_received_trigger(&self.identity, network, &scope, trigger, now_ms())?;
         }
         self.spawn_scheduler(network.clone(), scope.clone(), trigger.into())?;
         self.manager_status(network, &scope, trigger).await
@@ -1330,107 +1304,6 @@ impl Runtime {
         }
         Ok(jobs)
     }
-
-    pub(super) async fn maybe_followup(
-        self: &Arc<Self>,
-        request: &OperationRequest,
-        result_hash: &str,
-    ) -> Result<bool> {
-        let _work = self.maintenance.enter()?;
-        if request.target_node != self.identity.peer_id()?
-            || (request.task_id.is_none() && request.manager_authority.is_none())
-            || (request.task_id.is_none()
-                && request.action["type"] == "open"
-                && self
-                    .store
-                    .lock()
-                    .await
-                    .operation(&request.network_id, &request.operation_id)?
-                    .is_some_and(|operation| operation.state == OperationState::Succeeded))
-        {
-            return Ok(true);
-        }
-        let key = format!("followup-wait:v1:{}", request.operation_id);
-        {
-            let mut store = self.store.lock().await;
-            if let Some(previous) = store.local_value(&request.network_id, &key)? {
-                ensure!(
-                    previous["trigger"] == result_hash,
-                    "follow-up result identity changed"
-                );
-            } else {
-                store.local_set(&request.network_id, &key, &json!({"trigger":result_hash}))?;
-            }
-        }
-        if let Err(error) = self.admit_followup_marker(request, result_hash).await {
-            self.store.lock().await.local_set(
-                &request.network_id,
-                &key,
-                &json!({"trigger":result_hash,"error":format!("{error:#}")}),
-            )?;
-        }
-        // Publishing is complete even while consent is absent. The separate local marker survives.
-        Ok(true)
-    }
-
-    async fn flush_followup_markers(self: &Arc<Self>, network: &str) -> Result<()> {
-        let local = self.identity.peer_id()?;
-        let operations = self.store.lock().await.operations(network)?;
-        for operation in operations.into_iter().filter(|operation| {
-            operation.state.terminal() && operation.request.target_node == local
-        }) {
-            let marker = self.store.lock().await.local_value(
-                network,
-                &format!("followup-wait:v1:{}", operation.request.operation_id),
-            )?;
-            if let Some(marker) = marker {
-                let trigger = field(&marker, "trigger")?;
-                if let Err(error) = self
-                    .admit_followup_marker(&operation.request, trigger)
-                    .await
-                {
-                    tracing::debug!(%error, operation_id=%operation.request.operation_id, "result follow-up remains pending");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn admit_followup_marker(
-        self: &Arc<Self>,
-        request: &OperationRequest,
-        result_hash: &str,
-    ) -> Result<()> {
-        let local = self.identity.peer_id()?;
-        {
-            let mut store = self.store.lock().await;
-            let policy = store.execution_result_policy(
-                &request.network_id,
-                &request.conversation_id,
-                result_hash,
-            )?;
-            store.validate_followup_result(
-                &request.network_id,
-                &request.conversation_id,
-                result_hash,
-                &policy.target_node,
-            )?;
-            store.admit_trigger(
-                &request.network_id,
-                &request.conversation_id,
-                result_hash,
-                &local,
-                &policy.target_node,
-            )?;
-            // Admission is durable first; a crash before deletion only repeats the same identity.
-            store.local_delete(
-                &request.network_id,
-                &format!("followup-wait:v1:{}", request.operation_id),
-            )?;
-        }
-        self.schedule_wakeup.notify_one();
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1807,11 +1680,8 @@ mod tests {
     #[tokio::test]
     async fn m4_lost_schedule_response_reconciles_original_job_without_replaying_real_command()
     -> Result<()> {
-        let mut fixture = DeliveryFixture::open(|workspace, target| {
-            json!({"phase1":true,"label":"net1-lost-ack","tools":[{
-            "name":"command","call_ref":"net1-effect","wait_terminal":true,
-            "arguments":{"command":"printf once >> marker","cwd":workspace,
-                "target_node":target,"timeout_secs":10}}]})
+        let mut fixture = DeliveryFixture::open(|workspace, _target| {
+            json!({"phase1":true,"label":"net1-lost-ack","host_command":"printf once >> marker","host_cwd":workspace})
             .to_string()
         })
         .await?;
@@ -1907,20 +1777,8 @@ mod tests {
             std::fs::read_to_string(fixture.target_dir.join("manager-invocations.jsonl"))?;
         assert_eq!(records.lines().count(), 1);
         assert_eq!(std::fs::read(workspace.join("marker"))?, b"once");
-        let operations = fixture
-            .target
-            .store
-            .lock()
-            .await
-            .operations(&fixture.entry.network_id)?;
-        let commands: Vec<_> = operations
-            .iter()
-            .filter(|record| record.request.action["type"] == "command")
-            .collect();
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].state, OperationState::Succeeded);
         println!(
-            "NET1_M4 real_noise_lost_schedule_response=true original_durable_job_reconciled=true schedule_packets=1 sdk_invocations=1 actual_node_command_marker=once command_operation=succeeded outbox_delivered=true"
+            "NET1_M4 original_durable_job_reconciled=true schedule_packets=1 sdk_invocations=1 sdk_host_marker=once outbox_delivered=true"
         );
         Ok(())
     }

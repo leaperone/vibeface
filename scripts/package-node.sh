@@ -65,7 +65,7 @@ name="vibeface-$version-$target"
 package="$staging/$name"
 mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface"
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":4}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":5}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
@@ -80,10 +80,9 @@ cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 
 The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the corresponding node roles.
 
-- Codex execution needs the `codex` CLI and its authenticated account.
+- Codex SDK work and native App Server access need the `codex` CLI and its authenticated account.
 - The Codex SDK sidecar needs Node.js 18 or newer. Run `npm ci --omit=dev` in `sidecars/` before using it.
 - Cursor scheduling needs the official Cursor SDK bridge executable and CURSOR_API_KEY in the service environment.
-- Claude and Cursor CLI execution need their respective authenticated executables.
 
 Use absolute provider and sidecar paths in `config.json` when running a background service. No credentials, provider runtimes, or npm dependencies are included.
 REQUIREMENTS
