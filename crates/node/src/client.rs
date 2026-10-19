@@ -560,8 +560,27 @@ async fn dispatch(
                 .await
         }
         "subscribe" => {
+            // The browser sends the vector it has already shown; a lagging entry asks its peers now.
+            let principal = principal(node, session).await?;
             session.subscribed = true;
-            Ok(json!({"subscribed":true}))
+            let vector: std::collections::BTreeMap<String, u64> = node
+                .store
+                .lock()
+                .await
+                .heads(&principal.network_id)?
+                .into_iter()
+                .map(|(author, (seq, _))| (author, seq))
+                .collect();
+            let behind = params["vector"].as_object().is_some_and(|seen| {
+                seen.iter().any(|(author, seq)| {
+                    seq.as_u64()
+                        .is_some_and(|seq| vector.get(author).is_none_or(|have| *have < seq))
+                })
+            });
+            if behind {
+                node.wake_sync_all();
+            }
+            Ok(json!({"subscribed":true,"vector":vector,"behind":behind}))
         }
         "rpc" => {
             let principal = principal(node, session).await?;
