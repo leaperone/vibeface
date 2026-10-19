@@ -232,21 +232,21 @@ vibeface serve --data-dir "$HOME/.vibeface-relay"
 
 发送后先看状态。`pending_delivery` 表示入口已保存消息，正在投递给原调度设备；只有目标持久入队后才是 `queued`。排队不表示模型已开始，`running` 才表示已跨过 SDK 启动边界。目标离线、能力不满足或回执丢失时，保留原目标与消息身份核对，不自动改派另一台设备。
 
-管理 Agent 忙时，追加消息进入持久队列。尚未开始的本人消息优先于自主后续，同一调度 Node 上的同一会话一次只运行一个管理轮。本轮已登记的原生工作和子任务结束后，Agent 以只读权限收尾，再消费后续消息。关闭网页不会停止 Node 上的工作，但执行设备关机、休眠或断网会影响推进。
+管理 Agent 忙时，追加消息进入持久队列。尚未开始的本人消息优先于自主后续，同一调度 Node 上的同一会话一次只运行一个管理轮。管理轮派发工作后即结束，不等待工作；工作结束时它的结果作为新的一轮入队，Agent 默认以只读权限汇报。关闭网页不会停止 Node 上的工作，但执行设备关机、休眠或断网会影响推进。
 
 需要停止时，区分以下动作：
 
-- **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。取消待确认时不能当作已经停止，也不停止已派发的后台任务。
-- **停止后台工作**作用于选中的 Agent 任务或已登记的原生 turn，按原任务、设备和会话关联发出取消或中断。请求发出后仍需核对实际终态。
+- **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
+- **停止工作**作用于选中的工作，中断它的原生 turn，并一并停止它委派出的工作。请求发出后仍需核对实际终态。
 - **停止后续**在聊天输入框上方把“收到结果后”设为停止后续，作用于整个机器人聊天。撤销权限阻止新的自主派发，不证明当前外部进程已停止。
 
-Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 在停止时记录 CLI 进程树中的全部子进程及其进程组，逐组终止并确认这些进程都已退出后才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已发起的原生 turn，停止原生 turn 是单独操作。
+Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 在停止时记录 CLI 进程树中的全部子进程及其进程组，逐组终止并确认这些进程都已退出后才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
 
-Agent 通过 Node 的 `codex` 工具发送原生请求，例如 `vibeface tool codex --json '{"method":"turn/start","params":{...}}' --call-ref REF`。可用方法只有 `thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`、`thread/read`、`thread/turns/list` 和 `thread/loaded/list`，每个方法只接受固定字段。`approvalPolicy`、`approvalsReviewer`、`sandbox`、`sandboxPolicy` 和 `config` 由 Node 设置，Agent 传入即被拒绝。`thread/start`、`thread/resume` 和 `turn/start` 必须提供授权 `roots` 内的 `cwd`，Node 固定为 `approvalPolicy=on-request`、`approvalsReviewer=user`，并把沙箱限定为该目录的 workspace-write、关闭网络。Agent 没有回复原生请求的入口，审批只能由本人在网页通过 `native_respond` 回答。写请求不自动重发，结果未知时先读取原线程核对。
+Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"prompt":"...","cwd":"..."}' --call-ref REF`。`cwd` 必须位于授权 `roots` 内，Node 固定 `approvalPolicy=on-request`、`approvalsReviewer=user`，并把沙箱限定为该目录的 workspace-write、关闭网络。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。Agent 没有回答审批的入口，审批只能由本人在网页回答。第一期只能派发到本机。
 
-启用 Agent 的 Node 可以启动与本机身份关联的私有 `codex app-server`，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。要连接已有实例，在 `config.json` 设置 `codex_socket`，`codex_bin` 指向 Codex 程序。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中后台工作的实际状态。
+Node 托管本机的 `codex app-server`：未设置 `codex_socket` 时，Node 用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要连接自己管理的实例，在 `config.json` 设置 `codex_socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
-Agent 启动原生工作后，使用 `observe_session` 登记准确的 thread 与 turn。Node 观察进度、审批及终态，断线后只读补查，不要求修改用户全局 Codex hooks，也不重发旧指令或自动批准审批。配置的 Socket 未加载的线程不视为可控制；另一个 stdio 进程的历史记录不能证明其当前状态。
+App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令，也不自动批准审批。重启前未回答的审批作废。读不到原 turn 的工作标为“待核对”，由本人附证据结清。
 
 普通执行的终态结果自动送回原聊天，默认只汇报，模型总结使用只读权限，不能借结果回调创建或派发新工作。收到结果后继续工作须由本人在该聊天中选择继续工作，模型和聊天文字不能代授予。并发修改授权会要求刷新版本，已知撤销后旧权限不能继续写入；离线设备尚未收到撤销时不能宣称全网已经生效。
 
@@ -363,4 +363,4 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 5，数据库 `user_version` 为 5，直接初始化最终结构，不提供旧库迁移。部署此版本使用全新数据目录和同版本节点，不能把新程序直接接到旧库。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
+存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 6，数据库 `user_version` 为 6，直接初始化最终结构，不提供旧库迁移。部署此版本使用全新数据目录和同版本节点，不能把新程序直接接到旧库。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。

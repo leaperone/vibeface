@@ -283,7 +283,7 @@ jobs:
           import json, os, pathlib, subprocess, sys
           info = json.load(open(sys.argv[1]))
           assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
-          assert info["update_protocol"] == 2 and info["data_epoch"] == 5
+          assert info["update_protocol"] == 2 and info["data_epoch"] == 6
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
           binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
@@ -298,11 +298,11 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
-      - name: Verify unpacked Node processes without model calls
+      - name: Verify unpacked Node scheduling and signed log without model calls
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
       - name: Verify bot tools and startup event recovery
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
@@ -332,18 +332,12 @@ jobs:
           path: |
             .artifacts/ci-web/web-process-*/report.json
             .artifacts/ci-web/web-process-*/WEB/process.log
-            .artifacts/ci-node/node-acceptance-*/report.json
-            .artifacts/ci-node/node-acceptance-*/A/process.log
-            .artifacts/ci-node/node-acceptance-*/B/process.log
-            .artifacts/ci-node/node-acceptance-*/C/process.log
-            .artifacts/ci-node/node-acceptance-*/R/process.log
+            .artifacts/ci-node/phase1-process-*/report.json
+            .artifacts/ci-node/phase1-process-*/A/process.log
+            .artifacts/ci-node/phase1-process-*/fixture-manager-*.stderr.log
             .artifacts/ci-chat-agent/chat-agent-process-*/report.json
             .artifacts/ci-chat-agent/chat-agent-process-*/A/process.log
-            .artifacts/ci-chat-agent/chat-agent-process-*/B/process.log
-            .artifacts/ci-chat-agent/chat-agent-process-*/C/process.log
             .artifacts/ci-chat-agent/chat-agent-process-*/fixture-manager-*.stderr.log
-            .artifacts/ci-chat-agent/chat-agent-process-*/command-target-readiness.json
-            .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-starts.jsonl
             .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
           include-hidden-files: true
           if-no-files-found: ignore

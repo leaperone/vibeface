@@ -29,15 +29,7 @@ PATH_RULES = (
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
     ("node", ("crates/node/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
 )
-SLOW_TESTS = (
-    "runtime::tests::net1_changing_heads_keep_one_scope_checkpoint_and_ignore_unverified_heads",
-    "runtime::tests::net1_checkpoints_require_matching_signed_scopes_and_allow_129_scopes",
-    "runtime::tests::net1_closure_switches_authorized_replicas_and_isolates_bad_scopes",
-    "runtime::tests::net1_history_batch_advances_with_only_64_replay_slots",
-    "runtime::sync::tests::m5_real_noise_scope_join_cancelled_proof_quantum_and_inventory_window",
-    "store::agent_messages::tests::cancellation_before_delivery_survives_late_admission_without_starting",
-    "store::agent_messages::tests::parallel_agent_parents_interrupt_mutual_nested_deliveries_without_starting_them",
-)
+SLOW_TESTS = ("store::tests::append_100k_stays_flat",)
 PLATFORMS = (
     {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
@@ -246,7 +238,7 @@ def run_test(packages, tier):
     if tier == "slow":
         if "vibeface" not in packages:
             raise ValueError("Slow tier requires the Node crate")
-        command = ["cargo", "test", "--locked", "-p", "vibeface", "--lib", "--", "--exact", *SLOW_TESTS]
+        command = ["cargo", "test", "--locked", "-p", "vibeface", "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
         command = ["cargo", "test", "--locked", *selected, "--", *skips]

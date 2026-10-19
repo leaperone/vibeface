@@ -361,21 +361,22 @@ Attestation {
 | 类型 | 字段 | 作者 | 说明 |
 |---|---|---|---|
 | `ConversationCreated` | `title` | 入口 Node | |
+| `ConversationOwner` | `scheduler_node`、`epoch` | 入口 Node | 本人为会话选择的调度 Node。`epoch` 最大者生效，相同时取 hash 较小者。消息不再各自携带 `scheduler_node` |
 | `BotCreated` | `bot_id`、`name`、`instructions`、`project?: { target_node, cwd }` | 入口 Node | 带 `Attestation`，删除 `membership_role_proof` |
-| `MessagePosted`（user） | `message_id`、`role: user`、`text`、`scheduler_node`、`report_results`、`attestation` | 入口 Node | 本人发的内容 |
-| `MessagePosted`（assistant） | `message_id`、`role: assistant`、`text`、`in_reply_to: message_id` | 调度 Node | 协调层给本人的每条回复，包括“已开始：…”这类即时回复 |
-| `WorkDispatched` | `work_id`、`trigger: message_id`、`target_node`、`executor: codex \| agent`、`cwd`、`thread_id?`、`turn_id?`、`continues?: work_id`、`parent_work?: work_id` | 派发方 Node | 目标 Node 确认后才写入。`codex` 在 turn 启动后写入并带 `thread_id` 和 `turn_id`，`agent` 在目标协调层接纳任务后写入 |
-| `WorkProgress` | `work_id`、`phase`、`summary` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写。`agent` 路径的摘要由目标协调层给出 |
+| `MessagePosted`（user） | `message_id`、`role: user`、`text`、`report_results`、`attestation` | 入口 Node | 本人发的内容 |
+| `MessagePosted`（assistant） | `message_id`、`role: assistant`、`text`、`in_reply_to: message_id`、`status` | 调度 Node | 协调层每一轮的回复。`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字 |
+| `WorkDispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`executor: codex \| agent`、`cwd`、`prompt`、`continues?: work_id`、`parent?: work_id` | 目标 Node | 目标接纳时写入，此后才有进度。作者即目标，不另写 `target_node` |
+| `WorkProgress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写。`codex` 的 thread 和 turn 在 `running` 时随进度写入。`agent` 路径的摘要由目标协调层给出 |
 | `ApprovalRequested` | `work_id`、`request_id`、`kind`、`summary` | 目标 Node | |
 | `ApprovalAnswered` | `work_id`、`request_id`、`decision`、`attestation` | 入口 Node | 必须带本人设备签名 |
 | `WorkFinished` | `work_id`、`outcome`、`result_text`、`failure_reason?`，结果正文过长时放入 `blobs` | 目标 Node，`unverified` 的复核由入口 Node 写 | `outcome` 为 `completed`、`failed`、`interrupted` 或 `unverified` |
 | `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码 |
-| `NotificationAcked` | `notification_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
+| `NotificationAcked` | `notification_id`、`client_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
 | `ContextCheckpoint` | `summary`、`covers: VersionVector` | 调度 Node | 保留现有类型，用于长会话的上下文压缩，`covered_heads` 改为版本向量 |
 
 `executor=codex` 表示委派目标 Node 上的 Codex App Server，`executor=agent` 表示把任务交给目标 Node 的协调 Agent，由它用本机工具执行，第 6 节说明两者的边界。目标协调 Agent 在执行 `agent` 任务时自己启动的 Codex 工作，记为一条 `parent_work` 指向原任务的新 `WorkDispatched`。
 
-`WorkDispatched` 只在目标确认后写入，确认前的派发只存在本机 outbox 中。这样 DAG 中不会出现目标从未收到的派发。这是设计决定，记录在第 9 节。
+`WorkDispatched` 由目标在接纳时写入，接纳前的派发只存在派发方本机 outbox 中。这样 DAG 中不会出现目标从未收到的派发。目标先写 `WorkDispatched` 并在本机日志记下 thread，再启动 turn，崩溃后能按日志核对，不重启工作。这是设计决定，记录在第 9 节。
 
 `WorkProgress.phase` 取值为 `started`、`running`、`waiting_approval`、`interrupting` 和 `finishing`。`WorkFinished` 的 `unverified` 表示目标 Node 无法证明执行层的真实结果，证据保存在目标 Node 的本机待核对记录中。本人核对后，入口 Node 可以为同一 `work_id` 再写一条带 `Attestation` 的 `WorkFinished`。只有 `unverified` 可以被后续的 `WorkFinished` 取代。
 
@@ -392,10 +393,10 @@ Attestation {
 ```sql
 events(
 	author TEXT, seq INTEGER, hash TEXT UNIQUE, scope_id TEXT,
-	envelope TEXT,
+	lamport INTEGER,                              -- 1 + max(prev, deps 的 lamport)
+	created_at_ms INTEGER, envelope TEXT,
 	PRIMARY KEY (author, seq)
 )
-event_deps(hash TEXT, dep TEXT)                   -- 用于展示因果顺序
 event_blobs(hash TEXT, blob TEXT)                 -- 附件授权读取的依据
 log_heads(author TEXT PRIMARY KEY, max_seq INTEGER, head_hash TEXT)
 pending_events(hash TEXT PRIMARY KEY, envelope TEXT, missing TEXT)
@@ -403,6 +404,8 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 ```
 
 `log_heads` 就是本机的版本向量。本机存储保持一个不变量，`events` 中每个事件的 `prev` 和 `deps` 也都在 `events` 中。因此 `{author: max_seq}` 精确描述本机拥有的事件集合。
+
+读取顺序为 `(lamport, created_at_ms, hash)`。`lamport` 只由事件内容决定，与到达顺序无关，并且总大于它的每个因果前项，所以按它排序满足因果顺序。投影保存同样的 `rank` 字符串，增量合并时比较 rank 即可，不需要 `event_deps` 表。
 
 ### 5.4 版本向量同步流程
 
@@ -433,11 +436,12 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 
 | 投影 | 合并规则 |
 |---|---|
-| 会话与消息 | 按 `(因果顺序, created_at_ms, hash)` 在读取时排序，不在入库时分配 `ordinal`。同一 `message_id` 的多条 `MessagePosted(user)` 若 `Attestation` 覆盖的内容相同，视为同一条消息，保留因果最早者，并发时取 hash 较小者，浏览器不会为同一 `message_id` 签两份内容，万一出现，投影只采用最早者并在界面标出另一条。这对应 4.5 节切换入口后的重复提交 |
+| 会话与消息 | 按 `(lamport, created_at_ms, hash)` 在读取时排序，不在入库时分配 `ordinal`。同一 `message_id` 的多条 `MessagePosted(user)` 若 `Attestation` 覆盖的内容相同，视为同一条消息，保留因果最早者，并发时取 hash 较小者，浏览器不会为同一 `message_id` 签两份内容，万一出现，投影只采用最早者并在界面标出另一条。这对应 4.5 节切换入口后的重复提交 |
 | Bot | 同一 `bot_id` 取因果最早的 `BotCreated`，并发时取 hash 较小者 |
 | 工作 | 每个 `work_id` 的状态只前进，`WorkFinished` 为终态，只有 `unverified` 可被取代 |
 | 审批 | 同一 `request_id` 首个有效 `ApprovalAnswered` 生效，执行层拒绝过期回答 |
-| 自主授权 | `version` 最大者生效，相同版本取 hash 较小者 |
+| 自主授权 | `version` 最大者生效。相同版本取更严格的模式（`off` 严于 `report`，`report` 严于 `continue`），仍相同时取 hash 较小者 |
+| 会话负责人 | `epoch` 最大的 `ConversationOwner` 生效，相同时取 hash 较小者 |
 | 通知确认 | 集合并集 |
 
 只有数据格式本身变化时才需要全量重建。项目不保留兼容，格式变化时直接使用新数据目录。
@@ -518,7 +522,11 @@ Node 启动后进入 `aligning` 状态，满足以下任一条件才进入 `writ
 
 SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` 保存，并记录它已覆盖的版本向量。新 `basis` 包含该向量且缓存来自本机时，只发送增量。否则开启新的原生会话并发送完整上下文。所以换入口、换调度节点或换浏览器后，协调层得到的上下文相同，差别只在缓存能否复用。
 
-协调工具改为 `nodes`、`context`、`dispatch_work`、`work_status`、`continue_work`、`interrupt_work` 和 `call_lookup`。`dispatch_work(target_node, executor, cwd, prompt)` 取代现在的 `send_task`、`codex` 中启动工作的 `thread/start` 与 `turn/start`，以及 `observe_session`。`work_status` 取代 `task_status` 和 `codex` 的 `thread/read`，`interrupt_work` 取代 `cancel_task` 和 `codex` 的 `turn/interrupt`。写工具仍要求稳定的 `call_ref`，结果不明时用 `call_lookup` 查询原调用。
+协调工具改为 `nodes`、`context`、`dispatch_work`、`work_status`、`interrupt_work` 和 `call_lookup`。`dispatch_work(target_node, executor, cwd, prompt, call_ref, continues?, parent?)` 取代现在的 `send_task`、`codex` 中启动工作的 `thread/start` 与 `turn/start`，以及 `observe_session`。`work_status` 取代 `task_status` 和 `codex` 的 `thread/read`，`interrupt_work` 取代 `cancel_task` 和 `codex` 的 `turn/interrupt`，并沿 `parent` 一并停止它委派出的工作。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询原调用。
+
+协调层一轮在派发后即结束，不等待工作。工作结束时目标写入 `WorkFinished`，调度 Node 把它作为新的 trigger（`work:<work_id>`）入队，下一轮向本人汇报结果；`report` 模式下这一轮只读。调度 job 以 `(会话, message_id | work_id)` 为键，重试和同步都不会产生第二个 job。
+
+目标 Node 上的工作由本机状态机驱动，状态为 `accepted`、`starting`、`running`、`waiting_approval`、`interrupting`、`finished` 和 `unverified`。状态转换函数是 Work 事件的唯一来源，同一事务内更新本机日志、追加事件并为结果入队。审批的 `request_id` 为 `hash(work_id, executor_epoch, rpc_id)`；App Server 重启后 epoch 加一，旧请求不能再回答。回答先标记为发送中，确认送达后才清除。
 
 ### 6.1 两条跨设备工作路径
 
@@ -545,7 +553,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 `executor=agent` 沿用现在 `post_agent_task` 的接纳规则（`crates/node/src/store/agent_messages.rs:444` 起）。只有任务可以由 Agent 派发，环形委派被拒绝，目标在同一会话中已有未结束任务时回传 `interrupted`。目标协调层收到的上下文同样只来自 DAG，外加该任务的 `WorkDispatched` 正文。
 
-“继续上次的任务”由 `continue_work(work_id)` 处理。调度器从 `WorkDispatched` 取得原 `target_node`、`executor` 和 `thread_id`。`codex` 在同一 thread 上启动新 turn，`agent` 向同一目标协调层发送新任务，两者都写入一条 `continues=work_id` 的新 `WorkDispatched`。原目标不可达时返回错误，不改派到其他 Node。
+“继续上次的任务”由 `dispatch_work` 的 `continues=work_id` 表达。目标从原工作取得 `executor` 和 thread。`codex` 在同一 thread 上启动新 turn，`agent` 向同一目标协调层发送新任务，两者都写入一条 `continues=work_id` 的新 `WorkDispatched`。原目标不可达时返回错误，不改派到其他 Node。第一期只记录 `continues`，仍新开 thread，复用原 thread 在第四期实现。
 
 只在本机保存的内容：
 
@@ -554,7 +562,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 | 调度 job 队列和投递 outbox | 调度 Node 与入口 Node 的 SQLite 本机表 |
 | 待核对记录及其证据 | 产生不确定结果的 Node |
 | SDK 原生会话 ID 和已覆盖向量 | 调度 Node |
-| 执行层 thread 的实时状态、待回答请求的 RPC ID | 目标 Node 的 Codex 观察记录 |
+| 工作状态机日志（thread、turn、待回答请求的 RPC ID、executor epoch） | 目标 Node 的 `local_values` |
 | 流式文字、工具调用进度 | 内存，经 `vibeface/rpc/1` 推送 |
 | 附件暂存进度、每日预算 | 本机 |
 | 设备私钥、模型凭证 | 本机，不进入任何同步数据 |
@@ -604,6 +612,18 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 在 10 万事件的数据目录上追加一条事件不触发全表读取，用 SQLite 查询计数核对。
 - 本人停止回复时，协调层已经输出的部分回复作为一条 `MessagePosted(assistant)` 写入并标记为已停止，不删除。
 
+第一期实施记录（PR #63）。与上文的差异和推迟项如下，后续各期按此为起点：
+
+- 不写 `Attestation`。设备签名依赖第二期的浏览器 CryptoKey，第一期不引入临时签名格式。`ConversationOwner` 也暂不要求本人签名。
+- 新增 `ConversationOwner { scheduler_node, epoch }`，`MessagePosted` 删除 `scheduler_node`。建会话时写入本机为负责人。消息的负责人不是本机时，消息留在本机 outbox，调度列表显示为待投递；第一期没有投递循环。
+- `WorkDispatched` 由目标在接纳时写入，thread 和 turn 改由 `WorkProgress` 携带，原因见 5.2 节。第一期 `dispatch_work` 只接受本机为目标、`executor=codex`；跨设备派发和 `executor=agent` 在第四期实现。
+- 读取顺序使用 `lamport` 列，不建 `event_deps` 表，见 5.3 节。
+- 删除历史同步、附件传输和 `send_task` 远端任务，多 Node 同步在第三期按版本向量重建。节点之间的实时进度观察（`progress_read`）保留不变。
+- 调度依据已改为版本向量，提前落地第四期的这一部分。原生会话缓存仍按会话保存，不记录已覆盖向量。
+- 本机 Codex App Server 由 Node 托管：Node 未配置 `codex_socket` 时自行启动 `codex app-server`，放入独立进程组并写 pidfile；启动时先结束上次遗留的进程组，退出时先 SIGTERM、3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启，每次重连 executor epoch 加一。重连后对未结束的工作只读复查，读不到原 turn 时进入 `unverified`，由本人附证据结清。
+- 未实现 5.7 节的 `forked` 状态与通知和 5.8 节的 `aligning`，按计划在第五期实现。离线复核命令 `vibeface store verify` 也未实现，入库已验签，需要时再加。
+- `verify-node.py` 的 `--phase1` 与 `--chat-agent` 改为单 Node 场景；默认的多 Node 全量验收在第三期恢复前不可用。
+
 **第二期：身份与浏览器接入。** `DeviceId` 改为公钥本身，成员目录删除角色并放开管理授权。实现 6 个身份 RPC、承诺加短码流程、浏览器 CryptoKey、`/api/client` 网关和固定端口本机会话。网页应用改为固定客户端 origin，注册 service worker 缓存应用外壳，`/api/client` 接受跨源连接（4.5 节）。浏览器 Noise 握手中的设备签名改由 CryptoKey 产生。删除 `pairing.rs`、`lookupPaths`、候选竞速和旧身份表。验收标准如下：
 
 - 浏览器端到端测试完成建网、浏览器加入、授予管理权、撤销和根恢复。
@@ -632,7 +652,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 按 `docs/ci.md` 补跑同步与恢复专项并记录结果。
 - 入口列表区分可公网访问的入口与仅本机或局域网可达的入口，第二期的邀请入口选择据此判断。
 
-**第四期：协调层与跨入口上下文。** 调度依据改为版本向量，原生会话缓存记录已覆盖向量。实现 `dispatch_work`、`continue_work` 和 `interrupt_work` 的 `codex` 与 `agent` 两种执行器，审批回答经网关转发并验证设备签名。验收标准如下：
+**第四期：协调层与跨入口上下文。** 调度依据改为版本向量，原生会话缓存记录已覆盖向量。实现 `dispatch_work`（含 `continues`）和 `interrupt_work` 的 `codex` 与 `agent` 两种执行器，审批回答经网关转发并验证设备签名。验收标准如下：
 
 - 受控 SDK 和 App Server 夹具下，从入口 A 发起的工作在入口 B 上能看到同一上下文并继续同一 thread。
 - 协调 Agent 调用审批回答被拒绝。

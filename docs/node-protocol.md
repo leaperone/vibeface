@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`。产品入口为 `vibeface`，共享协议以 `crates/node/src/model.rs` 为准。本文描述 Node HTTP、对等传输、事件、Agent 任务和原生工作观察。
+协议版本为 `1`。产品入口为 `vibeface`，共享协议以 `crates/node/src/model.rs` 为准。本文描述 Node HTTP、对等传输、事件、调度和工作。
 
 ## 身份与数据范围
 
@@ -148,61 +148,54 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | `bots` | 无 | 当前个人网络的持久机器人定义 |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project` | 本人显式创建机器人并绑定独立聊天历史；完整请求精确去重 |
 | `conversations` | 无 | 本地已知业务会话 |
-| `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
-| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、`autonomy`、`agent_tasks`、`native_sessions`、`pending_checks`、观察目标、heads、missing、调度队列及事实新鲜度 |
-| `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node`、`report_results` | 原子保存用户消息、汇报意图和本机 inbox 或 outbox，返回调度回执 |
-| `set_autonomy` | `conversation_id`、`mode`、`expected_version`、可选 `scheduler_node` | 本人设置该机器人聊天的后续权限，模式为 `off`、`report` 或 `continue` |
-| `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示后台任务已停止 |
-| `reconcile` | `conversation_id`、`target_node`、`check_id` | 向原目标复查一条待核对记录，只读，不重发 |
-| `resolve` | `conversation_id`、`target_node`、`check_id`、`evidence`，原生项另需 `outcome` | 本人附证据结清待核对记录，不重做原触发 |
-| `cancel_agent_task` | `conversation_id`、`task_ref` | 沿原任务向目标 Agent 请求取消，核对实际停止后回传终态 |
-| `native_interrupt` | `conversation_id`、`work_id`、`target_node` | 请求中断已登记的准确原生 turn |
-| `native_respond` | `conversation_id`、`work_id`、`target_node`、`request_id`、`response` | 本人回答该原生 turn 当前仍有效的请求 |
+| `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话并把本机记为负责人，同 ID 同内容可去重 |
+| `conversation` | `conversation_id` | 会话（含负责人）、机器人定义、消息、`works`、`autonomy`、`pending_checks`、`local_node` 和调度队列 |
+| `message` | `conversation_id`、`message_id`、`text`、可选 `report_results` | 同一事务保存用户消息和调度 job，返回调度回执 |
+| `set_autonomy` | `conversation_id`、`mode`、`expected_version` | 本人设置该聊天的后续权限，模式为 `off`、`report` 或 `continue` |
+| `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示工作已停止 |
+| `interrupt_work` | `conversation_id`、`work_id` | 中断该工作的原生 turn，并一并中断它委派出的工作；返回请求状态，终态由执行层确认 |
+| `answer_approval` | `conversation_id`、`work_id`、`request_id`、`response` | 本人回答该工作当前仍有效的审批或输入请求 |
+| `reconcile` | `conversation_id`、`check_id` | 只读复查一条待核对记录，不重发 |
+| `resolve` | `conversation_id`、`check_id`、`evidence` | 本人附证据结清待核对记录，不重做原触发 |
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit` | 分页读取本网络、该会话实际引用的 UTF-8 文本附件 |
 | `notifications` | `client_id` | 该客户端尚未确认的通知 |
-| `ack` | `notification_id`、`client_id` | 记录该客户端已读 |
-| `export` | `conversation_id` | 导出包含签名事件的快照 |
+| `ack` | `notification_id`、`client_id` | 写入 `NotificationAcked`，记录该客户端已读 |
 
-`bot_id`、`message_id`、`conversation_id`、`task_ref` 和 `call_ref` 标识业务写入及原调用。重试保留原身份、内容和目标；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`send_task`、`task_status`、`call_lookup`、`cancel_task`、`observe_session` 和 `codex`。只读结果回调只得到查询工具。宿主 SDK 工具只读取本机，本机修改通过 `codex` 工具启动的原生工作完成。
+`bot_id`、`message_id`、`conversation_id` 和 `call_ref` 标识业务写入及原调用。重试保留原身份和内容；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`dispatch_work`、`work_status`、`interrupt_work` 和 `call_lookup`，只读的结果汇报轮只得到查询工具。宿主 SDK 工具只读取本机，本机修改通过 `dispatch_work` 派发的原生工作完成。
 
-Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入或重建同版本定义不启动模型。
+Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名日志，Store 增量投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入同版本定义不启动模型。
 
-Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模型凭证。Provider 凭证由本机运行环境或 Provider 自身保存。Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存仍按网络、scope 和本机节点保存。缓存不是共享聊天的事实来源。
+Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模型凭证。Provider 凭证由本机运行环境或 Provider 自身保存。Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存按网络和会话保存，不是共享聊天的事实来源。
 
-`send_task` 在同一事务保存带稳定调用引用的签名任务及调度记录，固定原目标。恢复先用 `call_lookup` 或 `task_status` 查询原任务，不能根据同一文本猜测是否重复，也不能换目标重派。宿主 SDK 的 Shell 和原生写请求没有旧 Operation 账本，结果不明时必须核对真实副作用。
+`conversation.scheduler` 包含 `jobs`、`provider`、`model` 和 `capabilities`。每个 job 保留 `trigger`、`kind`、`sequence`、`basis`、`state`、`attempt`、`pending_check`、`read_only`、`reply_message_id` 及可用的 `message_id`。`kind` 为 `human` 或 `work_result`。负责人不是本机的消息显示为 `state=pending_delivery`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
 
-`conversation.scheduler` 包含 `jobs`、`provider`、`model` 和 `capabilities`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state`、`pending_check` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human`、`autonomous`、`agent_task` 或 `agent_result`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
+`autonomy` 包含 `mode` 和 `version`。`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`executor`、`cwd`、`prompt`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`open_approvals` 和本机状态 `state`。目标为本机时，`open_approvals` 每项附 `form`（可选的 `choices` 与 `questions`）和 `answering`。
 
-`autonomy` 包含 `mode`、`version` 和 `scheduler_node`；授权链无法验证时 `mode` 为 `off`、`version` 为 `null` 并附带 `error`。`agent_tasks` 包含 `task_ref`、来源与目标 Node、`origin_trigger`、`state`、任务文本和结果说明。`native_sessions` 包含 `work_id`、可选 `task_ref`、目标 Node、准确 thread 与 turn、状态、说明和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
+审批只能由本人回答。Node 按 `work_id` 找到原 thread 和 turn，校验回答属于请求提供的选项，App Server 重启后旧请求作废。中断请求发出或 SDK 进程退出都不直接证明工作已经停止。
 
-原生控制按已登记的 `work_id` 找到原 thread 和 turn，再核对目标、会话及当前有效请求。审批仅本人可回答，过期请求被拒绝。中断请求发出或 SDK 进程退出都不直接证明后台工作已经停止。
-
-`read_artifact` 返回 `{ blob_hash, text, offset, next_offset, size }`。偏移与长度按 UTF-8 字节计算，`limit` 范围为 4 至 65536，默认 65536。偏移必须位于字符边界；下一页使用返回的 `next_offset`，为 `null` 时结束。Node 核对签名附件引用、长度和哈希，正文未同步、非 UTF-8 或仅凭其他会话的哈希猜读都会拒绝。
+`read_artifact` 返回 `{ blob_hash, text, offset, next_offset, size }`。偏移与长度按 UTF-8 字节计算，`limit` 范围为 4 至 65536，默认 65536。偏移必须位于字符边界；下一页使用返回的 `next_offset`，为 `null` 时结束。Node 核对签名附件引用、长度和哈希，非 UTF-8 或仅凭其他会话的哈希猜读都会拒绝。
 
 ## 可靠调度回执
 
-可靠调度版本为 `1`。入口在同一事务保存消息、不可改写的汇报意图以及 inbox 或 outbox。个人网络中的节点使用同一版本，远端投递不探测目标协议版本。
+可靠调度版本为 `2`。`message` 在同一事务保存用户消息和调度 job，job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>` 或 `work:<work_id>`，重试不会产生第二个 job。
 
-`message` 返回 `accepted`、`queued`、`state`、`trigger`、`message_id`、`scheduler_node` 和 `receipt`。目标调度节点持久入队后，回执结构为：
+`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
 
 ```json
 {
-	"version": 1,
+	"version": 2,
 	"network_id": "NETWORK_FINGERPRINT",
 	"conversation_id": "conversation-id",
-	"trigger": "SIGNED_EVENT_HASH",
-	"target_node": "SCHEDULER_PEER_ID",
+	"trigger": "message:message-id",
 	"state": "queued"
 }
 ```
 
-入口仅写入 outbox 时，`accepted=true`、`queued=false`、`state=pending_delivery`。只有目标提交 inbox 后的匹配回执才能确认已入队，HTTP 成功或本机已保存不替代这个确认。`queued=true` 表示已经可靠接收，查询时 `state` 可能已推进至运行或终态。
+会话负责人由 `ConversationOwner` 决定。负责人不是本机时，消息保存在本机 outbox，`state=pending_delivery`；第一期没有跨设备投递。
 
-投递以网络、会话、trigger、原目标和版本核对回执。未确认的 outbox 先向原目标查询同一 trigger 的 `manager_status`，只有经过完整身份、版本、历史和状态校验的新鲜 `not_found` 才允许投递原 trigger。已有匹配持久 job 和回执时直接确认接单，job 为 `interrupted` 也不能重派。查询失败、过期或矛盾结果不能作为不存在。发送前再次读取持久 outbox，已经确认的条目不再投递。已投递项继续向原目标查询进展和结果，不因离线或超时改派另一台。
+每个会话的本机管理队列有界，最多保留 256 个待处理触发。单消费者按持久状态领取，本人消息优先于工作结果。提示通知只负责唤醒，周期扫描补上丢失的唤醒。每轮按领取时固定的版本向量 `basis` 准备上下文，后发消息不会隐式算作已处理。
 
-每个会话的本机管理队列有界，最多保留 256 个待处理触发；本机每个网络的未投递 outbox 也上限为 256。单消费者按持久状态领取，本人待处理消息优先于自主后续。提示通知只负责唤醒，周期扫描补上丢失的唤醒。每轮按持久固定的依据准备上下文，后发消息不会隐式算作已处理。
-
-job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `interrupted`，后四种是终态。`queued` 和确认尚未跨启动边界的 `claimed` 可恢复首次执行。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。最终回答和 job 终态一次提交。导入 DAG 或重建视图不创建 job，也不重放模型、工具或执行操作。
+job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `interrupted`，后四种是终态。`queued` 和确认尚未跨启动边界的 `claimed` 可恢复首次执行。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。助手回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。在开始前取消的 job 没有回答。导入事件或投影不创建 job，也不重放模型、工具或执行操作。
 
 ```text
 queued → claimed → running ─→ completed | failed
@@ -211,47 +204,27 @@ queued → claimed → running ─→ completed | failed
              └ 重启时 running / cancelling ─→ interrupted（登记待核对）
 ```
 
-停止回复只停止管理轮。Node 封存旧 attempt 的工具权限并排空已接纳工具，SDK 确认受管进程已退出后 job 进入 `cancelled`；已发起的原生 turn 和 Agent 任务继续独立观察和汇报，停止原生 turn 用 `native_interrupt`。`cancelling` 不是停止成功。SDK 进程退出无法确认时 job 进入 `interrupted`，并在原目标登记一条 `manager:<attempt>` 待核对记录。`interrupted` 是终态，不冻结会话，后续消息照常处理。
+停止回复只停止管理轮。Node 封存旧 attempt 的工具权限并排空已接纳工具，SDK 确认受管进程已退出后 job 进入 `cancelled`；已派发的工作继续运行，停止工作用 `interrupt_work`。`cancelling` 不是停止成功。SDK 进程退出无法确认时 job 进入 `interrupted`，并登记一条 `manager:<attempt>` 待核对记录。`interrupted` 是终态，不冻结会话，后续消息照常处理。
 
-待核对记录统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `native_turn`，`freshness` 表示本机观察或缓存。管理进程记录关联该 attempt 的 SDK 进程组、它登记的原生 turn 和它发起的 Agent 任务 job；它签发的工具 token 已封存，不需再核对。`reconcile` 在原目标只读复查：管理进程项探测记录的进程组是否已退出，并列出关联原生 turn 和 Agent 任务的当前状态；原生项只读补查原 turn。管理 SDK 的文件系统只读、网络仅限本机回环；进程存活期间经回环产生的副作用无法查询，只能由本人附证据 `resolve`。管理进程项要求记录的进程组均已退出、关联原生 turn 均有终态；原生项由本人给出 `completed`、`failed` 或 `interrupted`。模型不能结清待核对，结论不重跑旧 trigger。
+待核对记录统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `work`。管理进程项（`manager:<attempt>`）记录该 attempt 的 SDK 进程组，`reconcile` 探测这些进程组是否已退出；`resolve` 要求它们均已退出。工作项（`work:<work_id>`）是读不到真实结果的工作，`reconcile` 只读复查原 turn，读到终态即结清；`resolve` 由本人附证据结清。模型不能结清待核对，结论不重跑旧 trigger。
 
-`interrupted` 的 Agent 任务在待核对结清、关联工作结束前不回传结果，来源端 `agent_tasks` 显示 `pending_check`，不显示运行中。结清后目标端汇报实际结果或中断结果，不重发原任务。
+本机调度 job、outbox、工作状态日志和原生 SDK 会话不进入事件日志。维护空闲检查包含排队、活动和待核对项，新进程通过更新健康门后才消费。
 
-本机版本化队列、outbox、原生 SDK 会话及观察记录不通过 DAG 迁移。维护空闲检查包含待投递、排队、活动和待核对项，新进程通过更新健康门后才消费。存在新调度记录时不承诺任意降级旧程序。
+## 工作
 
-## Agent 任务与原生会话
+协调 Agent 用宿主 SDK 的 Shell 和文件工具只读访问本机，不持有 App Server Socket。修改本机通过 `dispatch_work { prompt, cwd, call_ref, parent?, continues? }`。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；同 `call_ref` 换内容被拒绝。`cwd` 必须位于授权 `roots` 内。第一期目标只能是本机，执行器为 Codex App Server。
 
-跨设备任务是签名 `agent_message` 事件，目标设备的协调 Agent 使用自己的宿主工具执行。没有通用远程 Shell RPC，也没有独立 Engine、Binding 或 Operation 协议。
+目标 Node 接纳时写入 `WorkDispatched`，在本机日志记下 thread 后再启动 turn。`thread/start` 使用 `approvalPolicy=on-request`、`approvalsReviewer=user`、`sandbox=workspace-write`，`turn/start` 另加 `sandboxPolicy={type:workspaceWrite, writableRoots:[cwd], networkAccess:false}`。Agent 不能回答审批。不自动批准、不自动重试写请求。
 
-```json
-{
-	"type": "agent_message",
-	"message": {
-		"message_id": "stable-agent-message-id",
-		"target_node": "TARGET_PEER_ID",
-		"origin_trigger": "ORIGINAL_TRIGGER_HASH",
-		"in_reply_to": null,
-		"kind": "task",
-		"text": "要在目标设备完成的工作"
-	}
-}
-```
+工作状态为 `accepted`、`starting`、`running`、`waiting_approval`、`interrupting`、`finished` 和 `unverified`。状态转换只来自执行层的结果或事件，每次转换在同一事务更新本机日志并追加 `WorkProgress`、`ApprovalRequested`、`ApprovalAnswered` 或 `WorkFinished`。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`。
 
-来源取事件签名作者，不能由消息正文冒充。`task_ref` 是原任务事件 hash。回信使用 `in_reply_to=task_ref` 和同一 `origin_trigger`，回到原来源设备。`kind` 为 `task`、`progress`、`completed`、`failed` 或 `interrupted`。普通进度不启动模型，终态必须来自原目标并通过原任务关联校验。
+管理轮派发后即结束。工作结束时，若原消息的 `report_results` 不为 `false`，Node 在同一事务把 `work:<work_id>` 入队，下一轮向本人汇报；`report` 模式下这一轮只读。
 
-`send_task` 在同一管理 attempt 内固定 `call_ref`、目标和内容。相同引用返回原任务，同引用改目标或内容拒绝。接纳、inbox、outbox 和回执复用可靠调度事务。导入签名历史只重建视图，不能产生新的执行；丢回执、重连或重启先查原 trigger，不重复启动 SDK。
+审批的 `request_id` 为 `hash(work_id, executor_epoch, rpc_id)`。回答先标记为发送中，送达 App Server 后才写 `ApprovalAnswered`。App Server 每次重连 executor epoch 加一，旧请求不能再回答。
 
-任务内继续委派时，若目标在同一聊天中已有未结束的 Agent 任务，目标在接纳事务中回传未启动的 `interrupted` 结果，避免两个 Agent 互相等待。本人发起的任务仍可正常排队。
+Node 未配置 `codex_socket` 时托管 App Server：独立进程组，进程组号写入数据目录的 `codex-app-server.pid`，启动时先结束上次遗留的进程组，退出时 SIGTERM，3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启。重连后 Node 对未结束的工作调用 `thread/read` 只读复查；读到终态则结束，读不到原 turn 则进入 `unverified` 并列入待核对。都不换 ID 重跑。
 
-协调 Agent 用宿主 SDK 的 Shell 和文件工具只读访问本机，不持有 App Server Socket。原生请求经 `codex` 工具 `{"method":...,"params":{...}}` 由 Node 转发，参数不翻译成 Operation。方法白名单为 `thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`、`thread/read`、`thread/turns/list`、`thread/loaded/list`，各方法只接受固定字段，其余方法和字段拒绝。审批、审阅者、沙箱及 `config` 字段只能由 Node 设置。启动类方法要求 `cwd` 位于授权 `roots` 内，Node 写入 `approvalPolicy=on-request`、`approvalsReviewer=user`，`thread/start` 与 `thread/resume` 使用 `sandbox=workspace-write`，`turn/start` 使用 `sandboxPolicy={type:workspaceWrite, writableRoots:[cwd], networkAccess:false}`。工具不能回复原生请求，审批只经本人的 `native_respond`。不自动批准、不自动重试写请求。
-
-原生工作启动后，用 `observe_session` 登记准确的 `thread_id` 和 `turn_id`。Node 保存所属会话、来源 trigger、管理 attempt 和可选任务引用，观察进度、审批和终态。它只订阅当前 Socket 已加载的线程；历史补查不能把其他 stdio 进程的线程视为已接管。无有效控制端点的会话保持不可确认。
-
-原生状态为 `running`、`waiting`、`interrupting`、`completed`、`failed`、`interrupted` 或 `unknown`。只有对应 thread 和 turn 的精确事件或只读补查可确认终态。协调 SDK 一轮返回、原生 turn 结束和用户任务完成分别表达，不能互相替代。SDK 已返回而子任务或原生工作仍运行时，调度任务继续等待；工作结束后恢复同一 SDK 会话做只读收尾。
-
-取消沿原任务和原目标发送。排队任务可在启动前原子取消；运行中的任务封存旧工具权限并请求中断真实工作。`cancelling` 或 `interrupting` 仅表示请求中，不能直接回报已停止。无法证明原生 turn 停止时保留 `unknown` 并列入待核对；无法证明管理进程停止时登记管理进程待核对。都不换 ID 或设备重跑。一个原生 turn 结束不能结清管理进程待核对。
-
-本地自动访问与授权记录都使用当前数据格式。单一 `node.sqlite3` 使用 `user_version=5`，制品声明 `data_epoch=5`。Atlas HCL 为 `crates/node/schema.hcl`，`migrations/` 只保留 `202610180001_initial.sql` 和 `atlas.sum`。此版本不迁移或清理旧数据目录。
+本地自动访问与授权记录都使用当前数据格式。单一 `node.sqlite3` 使用 `user_version=6`，制品声明 `data_epoch=6`。Atlas HCL 为 `crates/node/schema.hcl`，`migrations/` 只保留 `202610180001_initial.sql` 和 `atlas.sum`。此版本不迁移或清理旧数据目录。
 
 ## 事件 DAG
 
@@ -265,52 +238,22 @@ queued → claimed → running ─→ completed | failed
 
 ```text
 Event {
-  version, network_id, scope_id, author,
-  sequence, previous, parents, created_at_ms,
-  body, blobs
+  version, network_id, author, seq, prev, deps,
+  scope_id, created_at_ms, body, blobs
 }
 ```
 
-`previous` 和 `sequence` 校验同一作者的来源链，`parents` 引用当前事件依据的因果前项。父引用和附件列表按序去重。`created_at_ms` 不决定唯一全局顺序，也不能覆盖并发分支。
+每台 Node 在网络中只有一条日志：`seq` 从 1 连续递增，`prev` 为同一作者 `seq - 1` 的 hash。`deps` 引用写入时依据的其他作者事件，按 hash 排序去重。`created_at_ms` 只用于展示。
 
-正文类型包括 `conversation_created`、`bot_created`、`message_posted`、`agent_message`、`decision_recorded`、`notification_raised`、`notification_acknowledged` 和 `context_checkpoint`。
+正文类型为 `conversation_created`、`conversation_owner`、`bot_created`、`message_posted`、`work_dispatched`、`work_progress`、`approval_requested`、`approval_answered`、`work_finished`、`autonomy_set`、`notification_acked` 和 `context_checkpoint`。通知由 `approval_requested` 和 `work_finished` 派生，通知 ID 即该事件 hash。
 
-投影前检查网络、作者证书、签名、hash、来源链、因果依赖及附件。缺口和来源分叉分别保留在 `missing.events`、`missing.blobs` 与 `missing.conflicts`。必要历史未齐或冲突未处理时，禁止继续调度和执行。
+入库逐个检查 hash、网络、作者证书与签名、`seq` 与 `prev` 的连续性，以及 `deps` 是否已入库。签名只在入库时验证一次。重复事件忽略；序号跳过的事件拒绝；同序号不同内容写入 `log_conflicts`，不锁住会话；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。`log_heads` 保存每个作者的 `max_seq` 和 `head_hash`，即本机版本向量。
 
-事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限为 64 MiB，传输分块并校验总长度及 SHA256。附件内容按个人网络保存，不能跨网络凭 hash 读取。
+入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`，与到达顺序无关且满足因果顺序。投影由 reducer 对每个事件增量执行一次，合并规则满足交换律：同一 `message_id` 取 rank 最小者；`ConversationOwner` 取 `epoch` 最大者；`AutonomySet` 取 `version` 最大者，同版本取更严格的模式。
 
-节点交换 scope 的 heads，按需拉取事件、前驱和附件，再重建 SQLite 视图。并发历史保留为不同 heads。快照和摘要不替代原始依据，历史导入和视图重建不触发 Agent 或外部写操作。
+事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限为 64 MiB，正文保存为数据目录下 `blobs/sha256/<前两位>/<hash>` 文件，按个人网络和会话引用授权读取。
 
-同步先保存已验签的事件，缺少父事件或附件时保留为 `pending`。后台按个人网络和 scope 保存未完成项，分批继续拉取，也可向其他已授权副本请求同一 hash。单个 scope 失败不阻止其他 scope 推进。内部同步结果区分 `complete`、`partial` 和 `unreachable`，并保留缺口及错误；取得事件不代表其依赖已经完整。
-
-相同 envelope 的重复导入不重建投影。新事件每批最多 1024 项、正文合计最多 8 MiB，同批只重建一次。快照导入使用相同批处理。附件补齐、成员状态改变和实际新增历史仍触发必要重建。完整前沿绑定投影代次，新增历史或恢复后重新核验，已有事件不能代替完整性证明。
-
-历史事件只通过批读拉取，不做能力探测。每批最多 128 项、2096128 字节：
-
-```json
-{
-	"type": "history_batch",
-	"hash": "REQUESTED_EVENT_HASH",
-	"limit": 128,
-	"max_bytes": 2096128
-}
-```
-
-批读返回 `{ hash, events }`，包含请求事件及其部分祖先。事件数和实际 JSON 字节量同时受请求与服务端上限约束。接收方核对请求 hash、逐项验签，并验证每项都能从请求事件沿该批的 `parents` 或 `previous` 到达。它不接受不相关事件、重复事件或越界响应。
-
-请求事件本身装不进批预算时，来源返回错误，接收方改向其他已授权副本请求或保留缺口，不报告完整。没有单事件读取请求。单批仍受 2 MiB Packet 上限约束，部分极端转义的最大正文可能超限，此时同样保留缺口。
-
-附件请求仍使用 `{ type: "blob", hash, offset, limit }`，响应为 `{ data, size }`，`data` 为 hex。`offset` 按正文的字节计，`limit` 为 1 至 65536。来源核对当前个人网络、本机及请求方的 Replica 授权，再读取指定范围。来源使用独立只读 SQLite 连接保留读取位置，分页不重复物化或 hash 全文。新建读取者并从非零偏移开始时，SQLite 仍可能扫描一次前缀。现有 `get_blob` 的全文校验保留，接收端仍必须验证最终大小和 hash。
-
-来源最多保留 4 个范围读取者，每个请求方身份最多 2 个，所引用对象合计不超过 128 MiB。该额度不表示进程内存或 WAL 大小。读取者空闲 30 秒或存活 300 秒后退出，额度不足返回 busy。同对象正文修复及成员变更使相关读取者失效，缓存不能代替逐页授权。底层磁盘 I/O 不受这些期限强制中断，超时读取者在真正退出前仍占额度。
-
-接收端按 `(network_id, hash, expected_size)` 保存连续前缀，正文位于数据目录的私有 `.part` 文件，进度使用 `local_values` 的 `net1:v1:blob:` 保留前缀。每块先同步文件，再提交偏移。断线或重启后重新核验授权，截去未提交尾部，从已提交位置继续。文件短于进度时重置已有进度，不能通过补零伪造前缀。单对象上限仍为 64 MiB，全网暂存合计最多 256 MiB、64 个对象，未清理和异常占用也计入额度。
-
-收齐只代表传输完成。接收端核对最终大小和 hash，并在同一事务发布完整 blob、重建必要投影和记录 `Cleanup`，之后删除所属暂存文件。启动及周期维护重试清理，完整对象缺失或损坏时保留暂存并报告异常。纯本机清理不要求旧来源仍获授权，继续下载和发布则必须通过当前授权。未完成内容始终不进入正常附件读取或执行上下文。
-
-Agent 附件分页先核对当前会话的签名引用，再完整校验正文并保存私有不可变快照。后续页继续检查当前授权和引用，只从已验证快照取片。快照最多 4 个、正文合计 128 MiB，终页或所属管理调用排空后回收。该路径保留完整性校验，人工 `read_artifact` 仍使用原 UTF-8 和字符边界规则。
-
-DAG 能验证已知历史位置及依赖完整，不能证明全网最新。原始副本全部失联或丢失时，不承诺恢复缺失内容，也不迁移其他设备 SDK 的隐藏状态。
+第一期删除了节点间的历史同步和附件传输，多 Node 同步在后续阶段按版本向量重建。DAG 能验证已知历史位置及依赖完整，不能证明全网最新。
 
 ## 发现、对等连接与公共中继
 
@@ -362,24 +305,18 @@ Presence 的每个来源绑定邻居和 `Link.id`，有效期由原签名时间�
 
 加密通道保留外层 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress` 与失效提醒。客户端读取 `notifications`，使用稳定 `client_id` 确认 `notification_id`，同一客户端换路由后仍可去重。不同浏览器具有不同 client ID，各自确认。
 
-管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`。`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。文字按 `item_id` 关联，delta 追加，snapshot 替换全文。原生进度包含 `conversation_id`、`work_id`、`target_node`、`thread_id`、`turn_id`、可选 `task_ref`、`sequence` 和 `progress`，不能串入其他任务。临时进度不逐 token 写 DAG，持久回答和任务结果仍来自 Store 及签名事件。
+管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`。`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。文字按 `item_id` 关联，delta 追加，snapshot 替换全文。原生进度包含 `conversation_id`、`work_id`、`target_node`、`sequence` 和 `progress`，不能串入其他工作。临时进度不逐 token 写入事件日志，持久回答和工作结果仍来自签名事件。
 
 客户端读取 `conversation` 时，入口为该已授权会话建立有界的只读观察，从原管理节点和执行节点读取进度。节点间 `progress_read` 校验网络、来源和会话，响应包含 `version`、`cursor`、`reset` 和 `events`。游标缺口或源进程重启要求重新读取持久 snapshot，不生成重放写操作。连接关闭、权限撤销或观察租约过期后停止观察，代理进度不再次转发形成循环。
 
 普通进度、审批提醒和结果通知不调用管理模型。无人在线时保留通知，重新连接后读取。浏览器系统提醒是可选客户端功能，不等于网页关闭后的手机推送。
 
-后续权限使用 `DecisionRecorded.tool_configuration` 中带类型的签名记录，类型为 `followup_intent_v1` 和 `conversation_autonomy_v1`。自然语言或模型传入的参数不构成授权。
+`message.report_results` 默认 `true`，保存在签名的用户消息中，重试不能改变。为 `false` 时，该消息引出的工作结束后不再入队汇报。原始结果与通知始终保留，模型不能借汇报获得新的写权限。
 
-`message.report_results` 默认 `true`。汇报意图固定原消息 hash、网络、会话和目标 Scheduler，Agent 任务通过签名消息中的 `origin_trigger` 关联原消息，终态只触发只读总结，不创建隐藏 Task。`false` 保存明确的 `off` 意图，重试不能改变。原始结果与通知始终保留，模型不能借回调获得新的写权限。
+`set_autonomy` 仅本人可用，Agent token 不能调用，写入 `AutonomySet { mode, version }`。`off` 停止该聊天的自主后续，`report` 让结果汇报轮只读，`continue` 允许汇报轮继续派发工作。未设置时等同版本 `0` 的 `report`。`expected_version` 必须等于会话快照中的当前 `autonomy.version`，否则拒绝。同一版本出现并发记录时取更严格的模式。
 
-`set_autonomy` 仅本人可用，Agent token 不能调用，授权按机器人聊天生效。`off` 停止该聊天的自主后续，`report` 只允许读取结果并保存最终 assistant 回答，`continue` 允许固定的 Scheduler 收到结果后继续业务工作。未设置时等同版本 `0` 的 `report`。每条记录携带递增 `version` 和上一版本的 `previous_head`，`expected_version` 必须使用会话快照返回的当前 `autonomy.version`。并发或旧版本修改被拒绝；同一版本出现两条记录或版本链断开时，后续失效直到本人核对。省略 `scheduler_node` 时沿用当前目标，首次授权按新消息的规则选择 Scheduler。其他 Scheduler 收到的结果只做只读汇报。
+领取 job、签发工具权限及每次写工具调用前都复核本机最新的会话授权，写入还要求非只读。撤销封存旧权限。审批、验收与待核对始终由本人处理。
 
-领取后续、签发工具权限及每次工具调用前都复核本机已验证的最新会话授权和版本，写入还要求 `continue`。撤销封存旧权限；离线节点尚未获知撤销时，不保证全网立即停止。审批、验收与未知确认始终由本人处理。
+`daily_decision_limit` 只限制每个 Node 上、每个个人网络的 UTC 每日结果汇报轮。本人主动聊天不受这个额度限制。预算先预留，失败调用不保证退回；它不限制宿主 SDK 工具启动的其他模型调用，也不是 token 或账单上限。
 
-目标 Agent 的终态、关联结果事件及回投 outbox 在同一事务保存。来源验证原任务和汇报政策后调度一次只读收尾。原生 turn 结束与协调 SDK 结束分别记录，只有所有已登记工作均有真实终态才完成任务。结果未知时保留状态并查询原调用，不因超时再派给另一台。未授权模型后续不影响原始结果与通知保存。
-
-`daily_decision_limit` 只限制每个 Node 上、每个个人网络的 UTC 每日自主管理 SDK 调用。本人主动聊天不受这个额度限制。预算先预留，失败调用不保证退回；它不限制宿主 SDK 工具启动的其他模型调用，也不是 token 或账单上限。额度耗尽不把执行结果标为未知。
-
-每条用户消息在签名 `MessagePosted.scheduler_node` 中固定本次调度目标。客户端重试必须保留原 `message_id` 和 `scheduler_node`，网页将两者一同持久化。同一目标通过本地调用账本去重。已取得该消息的入口拒绝改写其目标；未同步节点之间没有全局消息唯一性共识，调用方不能用同一编号改换目标。切换入口后继续工作时提交一条新消息，可选择任意已授权调度节点。这个目标只属于该消息，不是会话或工单的负责人。
-
-消息请求中的 `entry_node` 固定为首次接收的 Gateway。未确认的同一消息只能回原入口核对或重试；换入口可只读查看历史，不能重签原请求。Node 在落盘前核对该字段。
+会话负责人由 `ConversationOwner { scheduler_node, epoch }` 决定，`epoch` 最大者生效，相同时取 hash 较小者。消息本身不携带调度目标。
