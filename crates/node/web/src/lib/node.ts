@@ -53,7 +53,7 @@ export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '连接入口')
   const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id) }
   if (v.local === true) {
-    if (v.relay === true || entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
+    if (entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
     return { ...entry, local: true }
   }
   return entry

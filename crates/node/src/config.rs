@@ -14,14 +14,11 @@ use std::{
 pub struct Config {
     pub listen: SocketAddr,
     pub public_url: String,
-    #[serde(default)]
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
-    #[serde(default = "default_local_auto_access")]
     pub local_auto_access: bool,
     pub roles: Vec<NodeRole>,
     pub roots: Vec<PathBuf>,
-    #[serde(default)]
     pub network: crate::network::NetworkConfig,
     pub manager: Option<ManagerSettings>,
     pub codex_socket: Option<PathBuf>,
@@ -151,10 +148,6 @@ impl Config {
         self.validate()?;
         private_write(&dir.join("config.json"), &serde_json::to_vec_pretty(self)?)
     }
-}
-
-fn default_local_auto_access() -> bool {
-    true
 }
 
 fn browser_origin(value: &str) -> Result<reqwest::Url> {
