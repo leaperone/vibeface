@@ -8,7 +8,7 @@ build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text())
 
 [[domain_check]]
 name = "Rust workspace"
-trigger_paths = ["crates/*/src/**", "crates/*/Cargo.toml", "crates/node/build.rs", "crates/node/migrations/**", "crates/node/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
+trigger_paths = ["crates/node/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/*/Cargo.toml", "crates/node/build.rs", "crates/node/migrations/**", "crates/node/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo fmt --all -- --check && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [[domain_check]]
