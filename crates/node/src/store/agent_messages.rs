@@ -290,10 +290,6 @@ impl Store {
         Ok(Some(job))
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "finalization binds the exact interrupted attempt and its terminal publication"
-    )]
     /// Reopens an interrupted attempt read-only so its report goes through `finish_job`.
     /// Returns false while another invocation holds the conversation; the caller retries later.
     pub(crate) fn reopen_interrupted_job(
