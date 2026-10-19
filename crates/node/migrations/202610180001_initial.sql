@@ -5,21 +5,49 @@ CREATE TABLE `node_certificates` (`network_id` text NOT NULL, `peer_id` text NOT
 -- Create "local_identities" table
 CREATE TABLE `local_identities` (`network_id` text NOT NULL, `peer_id` text NOT NULL, `identity` text NOT NULL, PRIMARY KEY (`network_id`, `peer_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create "events" table
-CREATE TABLE `events` (`network_id` text NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `author` text NOT NULL, `sequence` integer NOT NULL, `envelope` text NOT NULL, `status` text NOT NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
--- Create index "events_author_sequence" to table: "events"
-CREATE INDEX `events_author_sequence` ON `events` (`network_id`, `scope_id`, `author`, `sequence`);
--- Create index "events_scope" to table: "events"
-CREATE INDEX `events_scope` ON `events` (`network_id`, `scope_id`);
--- Create "blobs" table
-CREATE TABLE `blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `size` integer NOT NULL, `content` blob NOT NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, PRIMARY KEY (`network_id`, `author`, `seq`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+-- Create index "events_hash" to table: "events"
+CREATE UNIQUE INDEX `events_hash` ON `events` (`network_id`, `hash`);
+-- Create index "events_order" to table: "events"
+CREATE INDEX `events_order` ON `events` (`network_id`, `scope_id`, `lamport`, `created_at_ms`, `hash`);
+-- Create index "events_scope_author" to table: "events"
+CREATE INDEX `events_scope_author` ON `events` (`network_id`, `scope_id`, `author`, `seq`);
+-- Create "event_blobs" table
+CREATE TABLE `event_blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `blob` text NOT NULL, `size` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`, `blob`));
+-- Create index "event_blobs_blob" to table: "event_blobs"
+CREATE INDEX `event_blobs_blob` ON `event_blobs` (`network_id`, `blob`);
+-- Create "log_heads" table
+CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `max_seq` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`network_id`, `author`));
+-- Create "pending_events" table
+CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `envelope` text NOT NULL, `missing` text NOT NULL, `received_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`));
+-- Create index "pending_events_missing" to table: "pending_events"
+CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missing`);
+-- Create "log_conflicts" table
+CREATE TABLE `log_conflicts` (`network_id` text NOT NULL, `hash` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `envelope` text NOT NULL, `kept_hash` text NOT NULL, `detected_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`));
+-- Create index "log_conflicts_author" to table: "log_conflicts"
+CREATE INDEX `log_conflicts_author` ON `log_conflicts` (`network_id`, `author`, `seq`);
 -- Create "conversations" table
-CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
+CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_hash` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
-CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `message_id` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `ordinal` integer NOT NULL, PRIMARY KEY (`network_id`, `event_hash`));
--- Create "notification_outbox" table
-CREATE TABLE `notification_outbox` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `record` text NOT NULL, `derived` integer NOT NULL DEFAULT 0, PRIMARY KEY (`network_id`, `notification_id`));
+CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `blobs` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
+-- Create index "messages_order" to table: "messages"
+CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `rank`);
+-- Create "bots" table
+CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
+-- Create "works" table
+CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NULL, `dispatch` text NULL, `dispatch_rank` text NULL, `progress` text NULL, `progress_rank` text NULL, `thread_id` text NULL, `turn_id` text NULL, `finish` text NULL, `finish_rank` text NULL, PRIMARY KEY (`network_id`, `work_id`));
+-- Create index "works_conversation" to table: "works"
+CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
+-- Create "approvals" table
+CREATE TABLE `approvals` (`network_id` text NOT NULL, `request_id` text NOT NULL, `work_id` text NOT NULL, `kind` text NULL, `summary` text NULL, `request_rank` text NULL, `decision` text NULL, `answer_rank` text NULL, PRIMARY KEY (`network_id`, `request_id`));
+-- Create index "approvals_work" to table: "approvals"
+CREATE INDEX `approvals_work` ON `approvals` (`network_id`, `work_id`);
+-- Create "autonomy" table
+CREATE TABLE `autonomy` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `mode` text NOT NULL, `strictness` integer NOT NULL, `version` integer NOT NULL, `event_hash` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
+-- Create "notifications" table
+CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table
-CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, `event_hash` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
+CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
 -- Create "budget_days" table
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 -- Create "local_values" table
@@ -39,4 +67,4 @@ CREATE TABLE `identity_pair_requests` (`request_id` text NULL, `invite_id` text 
 -- Create index "identity_pair_requests_invite_id" to table: "identity_pair_requests"
 CREATE UNIQUE INDEX `identity_pair_requests_invite_id` ON `identity_pair_requests` (`invite_id`);
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

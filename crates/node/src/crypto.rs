@@ -52,8 +52,8 @@ impl LocalIdentity {
             event.author == self.peer_id()?,
             "event author does not match local identity"
         );
-        event.parents.sort();
-        event.parents.dedup();
+        event.deps.sort();
+        event.deps.dedup();
         event.blobs.sort();
         event.blobs.dedup();
         validate_event_shape(&event)?;
@@ -188,6 +188,16 @@ pub fn verify_signed_event(
     event: &SignedEvent,
     public_key: &str,
 ) -> Result<Event> {
+    let body = check_event(network_id, event)?;
+    ensure!(
+        body.author == fingerprint(public_key)?,
+        "author Peer ID mismatch"
+    );
+    verify_event_signature(event, public_key)?;
+    Ok(body)
+}
+/// Every check except the signature: size, hash, canonical encoding, network and shape.
+pub fn check_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
     ensure!(
         event.canonical_body.len() <= MAX_EVENT_BYTES,
         "event too large"
@@ -205,17 +215,15 @@ pub fn verify_signed_event(
         body.network_id == network_id,
         "event belongs to another network"
     );
-    ensure!(
-        body.author == fingerprint(public_key)?,
-        "author Peer ID mismatch"
-    );
     validate_event_shape(&body)?;
+    Ok(body)
+}
+pub fn verify_event_signature(event: &SignedEvent, public_key: &str) -> Result<()> {
     verify(
         public_key,
         &event.signature,
         &domain_message(EVENT_DOMAIN, &event.hash),
-    )?;
-    Ok(body)
+    )
 }
 pub fn verify_payload(
     public_key: &str,
@@ -245,64 +253,104 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
     decode32(&event.network_id)?;
     decode32(&event.author)?;
     ensure!(
-        event.sequence > 0 && event.sequence <= i64::MAX as u64,
+        event.seq > 0 && event.seq <= i64::MAX as u64,
         "invalid sequence"
     );
     ensure!(
-        (event.sequence == 1) == event.previous.is_none(),
+        (event.seq == 1) == event.prev.is_none(),
         "invalid predecessor"
     );
+    ensure!(event.created_at_ms >= 0, "invalid creation time");
     ensure!(
-        event.parents.len() <= 1024 && event.blobs.len() <= 128,
+        event.deps.len() <= 1024 && event.blobs.len() <= 128,
         "too many dependencies"
     );
     ensure!(
-        event.parents.windows(2).all(|w| w[0] < w[1]),
-        "parents must be sorted and unique"
+        event.deps.windows(2).all(|w| w[0] < w[1]),
+        "deps must be sorted and unique"
     );
     ensure!(
         event.blobs.windows(2).all(|w| w[0] < w[1]),
         "blobs must be sorted and unique"
     );
-    for hash in event.parents.iter().chain(event.previous.iter()) {
+    for hash in event.deps.iter().chain(event.prev.iter()) {
         decode32(hash)?;
     }
+    ensure!(
+        event
+            .prev
+            .as_ref()
+            .is_none_or(|prev| !event.deps.contains(prev)),
+        "prev is not a dependency on another author"
+    );
     for blob in &event.blobs {
         decode32(&blob.hash)?;
         ensure!(blob.size <= MAX_BLOB_BYTES as u64, "blob too large");
     }
-    if let EventBody::ContextCheckpoint { covered_heads, .. } = &event.body {
-        for hash in covered_heads {
-            ensure!(
-                event.parents.contains(hash),
-                "checkpoint head must be a parent"
-            );
+    let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
+    match &event.body {
+        EventBody::MessagePosted {
+            message_id,
+            role,
+            report_results,
+            in_reply_to,
+            status,
+            ..
+        } => {
+            id(message_id)?;
+            match role {
+                Role::User => ensure!(
+                    report_results.is_some() && in_reply_to.is_none() && status.is_none(),
+                    "a user message carries only its reporting choice"
+                ),
+                Role::Assistant => {
+                    ensure!(
+                        report_results.is_none() && status.is_some(),
+                        "an assistant reply carries its turn status"
+                    );
+                    in_reply_to.as_deref().map(id).transpose()?;
+                }
+            }
         }
-    }
-    if let EventBody::AgentMessage { message } = &event.body {
-        vibeface_protocol::validate_id(&message.message_id).map_err(anyhow::Error::msg)?;
-        decode32(&message.target_node)?;
-        decode32(&message.origin_trigger)?;
-        ensure!(
-            event.parents.contains(&message.origin_trigger),
-            "agent origin must be a parent"
-        );
-        if message.kind == AgentMessageKind::Task {
-            ensure!(
-                message.in_reply_to.is_none() && !message.text.trim().is_empty(),
-                "agent task requires text and cannot reply to another task"
-            );
-        } else {
-            let reference = message
-                .in_reply_to
-                .as_ref()
-                .context("agent reply has no task reference")?;
-            decode32(reference)?;
-            ensure!(
-                event.parents.contains(reference),
-                "agent task reference must be a parent"
-            );
+        EventBody::ConversationOwner {
+            scheduler_node,
+            epoch,
+        } => {
+            decode32(scheduler_node)?;
+            ensure!(*epoch > 0, "owner epoch starts at 1");
         }
+        EventBody::WorkDispatched {
+            work_id,
+            trigger,
+            dispatcher,
+            call_ref,
+            continues,
+            parent,
+            ..
+        } => {
+            id(work_id)?;
+            let (kind, trigger_id) = trigger.split_once(':').unwrap_or_default();
+            ensure!(matches!(kind, "message" | "work"), "invalid work trigger");
+            id(trigger_id)?;
+            id(call_ref)?;
+            decode32(dispatcher)?;
+            for work in continues.iter().chain(parent.iter()) {
+                id(work)?;
+            }
+        }
+        EventBody::WorkProgress { work_id, .. }
+        | EventBody::WorkFinished { work_id, .. }
+        | EventBody::ApprovalRequested { work_id, .. }
+        | EventBody::ApprovalAnswered { work_id, .. } => id(work_id)?,
+        EventBody::AutonomySet { version, .. } => {
+            ensure!(*version > 0, "autonomy version starts at 1")
+        }
+        EventBody::ContextCheckpoint { covers, .. } => {
+            for author in covers.keys() {
+                decode32(author)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -368,9 +416,9 @@ mod tests {
             network_id: owner.fixture_network_id()?,
             scope_id: "c".into(),
             author: owner.peer_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![],
+            seq: 1,
+            prev: None,
+            deps: vec![],
             created_at_ms: 0,
             body: EventBody::ConversationCreated {
                 title: "test".into(),
@@ -389,50 +437,48 @@ mod tests {
     }
 
     #[test]
-    fn agent_messages_bind_valid_ids_and_causal_references() -> Result<()> {
+    fn message_roles_and_log_links_are_part_of_the_signed_shape() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let origin = digest(b"origin");
-        let task = digest(b"task");
+        let message = |role, report_results, status| EventBody::MessagePosted {
+            message_id: "m-1".into(),
+            role,
+            text: "hi".into(),
+            report_results,
+            in_reply_to: None,
+            status,
+        };
         let mut event = Event {
             version: WIRE_VERSION,
             network_id: identity.fixture_network_id()?,
-            scope_id: "conversation".into(),
             author: identity.peer_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![origin.clone()],
+            seq: 1,
+            prev: None,
+            deps: vec![digest(b"b"), digest(b"a"), digest(b"b")],
+            scope_id: "conversation".into(),
             created_at_ms: 0,
-            body: EventBody::AgentMessage {
-                message: AgentMessage {
-                    message_id: "work-1".into(),
-                    target_node: identity.peer_id()?,
-                    origin_trigger: origin,
-                    in_reply_to: None,
-                    kind: AgentMessageKind::Task,
-                    text: "inspect the project".into(),
-                },
-            },
+            body: message(Role::User, Some(true), None),
             blobs: vec![],
         };
         let signed = identity.sign_event(event.clone())?;
-        verify_signed_event(&event.network_id, &signed, &identity.public_key_hex()?)?;
-        let EventBody::AgentMessage { message } = &mut event.body else {
-            unreachable!()
-        };
-        message.kind = AgentMessageKind::Completed;
+        let verified =
+            verify_signed_event(&event.network_id, &signed, &identity.public_key_hex()?)?;
+        assert_eq!(verified.deps.len(), 2);
+        assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
+        event.body = message(Role::User, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
-        let EventBody::AgentMessage { message } = &mut event.body else {
-            unreachable!()
-        };
-        message.in_reply_to = Some(task.clone());
+        event.body = message(Role::Assistant, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
-        event.parents.push(task);
+        event.body = message(Role::Assistant, None, Some(ReplyStatus::Stopped));
         assert!(identity.sign_event(event.clone()).is_ok());
-        let EventBody::AgentMessage { message } = &mut event.body else {
-            unreachable!()
-        };
-        message.target_node = "not-a-device-key".into();
-        assert!(identity.sign_event(event).is_err());
+        event.seq = 2;
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.prev = Some(digest(b"a"));
+        assert!(
+            identity.sign_event(event.clone()).is_err(),
+            "prev must not repeat a dep"
+        );
+        event.prev = Some(digest(b"c"));
+        assert!(identity.sign_event(event).is_ok());
         Ok(())
     }
 }

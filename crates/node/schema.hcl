@@ -70,6 +70,14 @@ table "events" {
     null = false
     type = text
   }
+  column "author" {
+    null = false
+    type = text
+  }
+  column "seq" {
+    null = false
+    type = integer
+  }
   column "hash" {
     null = false
     type = text
@@ -78,11 +86,11 @@ table "events" {
     null = false
     type = text
   }
-  column "author" {
+  column "lamport" {
     null = false
-    type = text
+    type = integer
   }
-  column "sequence" {
+  column "created_at_ms" {
     null = false
     type = integer
   }
@@ -90,12 +98,8 @@ table "events" {
     null = false
     type = text
   }
-  column "status" {
-    null = false
-    type = text
-  }
   primary_key {
-    columns = [column.network_id, column.hash]
+    columns = [column.network_id, column.author, column.seq]
   }
   foreign_key "0" {
     columns     = [column.network_id]
@@ -103,14 +107,18 @@ table "events" {
     on_update   = NO_ACTION
     on_delete   = NO_ACTION
   }
-  index "events_author_sequence" {
-    columns = [column.network_id, column.scope_id, column.author, column.sequence]
+  index "events_hash" {
+    unique  = true
+    columns = [column.network_id, column.hash]
   }
-  index "events_scope" {
-    columns = [column.network_id, column.scope_id]
+  index "events_order" {
+    columns = [column.network_id, column.scope_id, column.lamport, column.created_at_ms, column.hash]
+  }
+  index "events_scope_author" {
+    columns = [column.network_id, column.scope_id, column.author, column.seq]
   }
 }
-table "blobs" {
+table "event_blobs" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -120,22 +128,115 @@ table "blobs" {
     null = false
     type = text
   }
+  column "blob" {
+    null = false
+    type = text
+  }
   column "size" {
     null = false
     type = integer
   }
-  column "content" {
+  primary_key {
+    columns = [column.network_id, column.hash, column.blob]
+  }
+  index "event_blobs_blob" {
+    columns = [column.network_id, column.blob]
+  }
+}
+table "log_heads" {
+  schema = schema.main
+  column "network_id" {
     null = false
-    type = blob
+    type = text
+  }
+  column "author" {
+    null = false
+    type = text
+  }
+  column "max_seq" {
+    null = false
+    type = integer
+  }
+  column "head_hash" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.author]
+  }
+}
+table "pending_events" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "hash" {
+    null = false
+    type = text
+  }
+  column "author" {
+    null = false
+    type = text
+  }
+  column "seq" {
+    null = false
+    type = integer
+  }
+  column "envelope" {
+    null = false
+    type = text
+  }
+  column "missing" {
+    null = false
+    type = text
+  }
+  column "received_at_ms" {
+    null = false
+    type = integer
   }
   primary_key {
     columns = [column.network_id, column.hash]
   }
-  foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
-    on_update   = NO_ACTION
-    on_delete   = NO_ACTION
+  index "pending_events_missing" {
+    columns = [column.network_id, column.missing]
+  }
+}
+table "log_conflicts" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "hash" {
+    null = false
+    type = text
+  }
+  column "author" {
+    null = false
+    type = text
+  }
+  column "seq" {
+    null = false
+    type = integer
+  }
+  column "envelope" {
+    null = false
+    type = text
+  }
+  column "kept_hash" {
+    null = false
+    type = text
+  }
+  column "detected_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.hash]
+  }
+  index "log_conflicts_author" {
+    columns = [column.network_id, column.author, column.seq]
   }
 }
 table "conversations" {
@@ -149,8 +250,26 @@ table "conversations" {
     type = text
   }
   column "title" {
-    null = false
+    null = true
     type = text
+  }
+  column "title_rank" {
+    null = true
+    type = text
+  }
+  column "owner" {
+    null = true
+    type = text
+  }
+  column "owner_epoch" {
+    null    = false
+    type    = integer
+    default = 0
+  }
+  column "owner_hash" {
+    null    = false
+    type    = text
+    default = ""
   }
   primary_key {
     columns = [column.network_id, column.conversation_id]
@@ -166,11 +285,19 @@ table "messages" {
     null = false
     type = text
   }
+  column "message_id" {
+    null = false
+    type = text
+  }
   column "event_hash" {
     null = false
     type = text
   }
-  column "message_id" {
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "author" {
     null = false
     type = text
   }
@@ -186,15 +313,196 @@ table "messages" {
     null = false
     type = integer
   }
-  column "ordinal" {
+  column "in_reply_to" {
+    null = true
+    type = text
+  }
+  column "status" {
+    null = true
+    type = text
+  }
+  column "report_results" {
+    null = true
+    type = integer
+  }
+  column "blobs" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.message_id]
+  }
+  index "messages_order" {
+    columns = [column.network_id, column.conversation_id, column.rank]
+  }
+}
+table "bots" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "bot_id" {
+    null = false
+    type = text
+  }
+  column "name" {
+    null = false
+    type = text
+  }
+  column "instructions" {
+    null = false
+    type = text
+  }
+  column "project" {
+    null = true
+    type = text
+  }
+  column "event_hash" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id]
+  }
+}
+table "works" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "work_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "target_node" {
+    null = true
+    type = text
+  }
+  column "dispatch" {
+    null = true
+    type = text
+  }
+  column "dispatch_rank" {
+    null = true
+    type = text
+  }
+  column "progress" {
+    null = true
+    type = text
+  }
+  column "progress_rank" {
+    null = true
+    type = text
+  }
+  column "thread_id" {
+    null = true
+    type = text
+  }
+  column "turn_id" {
+    null = true
+    type = text
+  }
+  column "finish" {
+    null = true
+    type = text
+  }
+  column "finish_rank" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.work_id]
+  }
+  index "works_conversation" {
+    columns = [column.network_id, column.conversation_id]
+  }
+}
+table "approvals" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "request_id" {
+    null = false
+    type = text
+  }
+  column "work_id" {
+    null = false
+    type = text
+  }
+  column "kind" {
+    null = true
+    type = text
+  }
+  column "summary" {
+    null = true
+    type = text
+  }
+  column "request_rank" {
+    null = true
+    type = text
+  }
+  column "decision" {
+    null = true
+    type = text
+  }
+  column "answer_rank" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.request_id]
+  }
+  index "approvals_work" {
+    columns = [column.network_id, column.work_id]
+  }
+}
+table "autonomy" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "mode" {
+    null = false
+    type = text
+  }
+  column "strictness" {
     null = false
     type = integer
   }
+  column "version" {
+    null = false
+    type = integer
+  }
+  column "event_hash" {
+    null = false
+    type = text
+  }
   primary_key {
-    columns = [column.network_id, column.event_hash]
+    columns = [column.network_id, column.conversation_id]
   }
 }
-table "notification_outbox" {
+table "notifications" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -204,14 +512,21 @@ table "notification_outbox" {
     null = false
     type = text
   }
-  column "record" {
+  column "conversation_id" {
     null = false
     type = text
   }
-  column "derived" {
-    null    = false
-    type    = integer
-    default = 0
+  column "kind" {
+    null = false
+    type = text
+  }
+  column "text" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
   }
   primary_key {
     columns = [column.network_id, column.notification_id]
@@ -230,11 +545,6 @@ table "notification_acks" {
   column "client_id" {
     null = false
     type = text
-  }
-  column "event_hash" {
-    null    = false
-    type    = text
-    default = ""
   }
   primary_key {
     columns = [column.network_id, column.notification_id, column.client_id]
