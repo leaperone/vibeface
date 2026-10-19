@@ -7,7 +7,7 @@ use crate::{
         HistoricalNode, IdentityKind, Member, RootCheckpoint,
         local::{InviteEnvelope, InviteRequest, PairConfirm, PairRequest},
     },
-    network::{NetworkSocket, Service},
+    network::{AuthenticationFailure, NetworkConfig, NetworkHub, NetworkSocket, Service},
     runtime::{Access, Runtime},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -92,19 +92,29 @@ pub struct Client {
     channel: Channel,
 }
 impl Client {
-    pub async fn connect(
-        url: &str,
-        identity: &LocalIdentity,
-        target: &str,
-        relay: bool,
-    ) -> Result<Self> {
+    pub async fn connect(url: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
         let endpoint = client_endpoint(url)?;
-        let socket = if relay {
-            crate::network::connect_relay(&endpoint, target, Service::Client).await?
-        } else {
-            crate::network::connect_direct(&endpoint, Service::Client).await?
-        };
-        Self::from_socket(socket, identity, target).await
+        let (hub, _) = NetworkHub::new(
+            identity.clone(),
+            NetworkConfig {
+                bootstrap_urls: vec![endpoint.clone()],
+                ..Default::default()
+            },
+        );
+        let (socket, channel) = hub
+            .dial_authenticated(
+                target,
+                Service::Client,
+                Some(&endpoint),
+                |socket| async move {
+                    Self::from_socket(socket, identity, target)
+                        .await
+                        .map(|client| (client.socket, client.channel))
+                        .map_err(AuthenticationFailure::Path)
+                },
+            )
+            .await?;
+        Ok(Self { socket, channel })
     }
     async fn from_socket(
         mut socket: NetworkSocket,
@@ -1445,20 +1455,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_route_is_explicit_and_pins_the_destination() -> Result<()> {
+    async fn client_routes_by_target_and_pins_the_destination() -> Result<()> {
         use tokio_tungstenite::tungstenite::Message as NativeMessage;
-        for relay in [false, true] {
-            for correct_target in [false, true] {
-                let destination = LocalIdentity::generate();
-                let target = if correct_target {
-                    destination.peer_id()?
-                } else {
-                    LocalIdentity::generate().peer_id()?
-                };
-                let expected_target = target.clone();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                let url = format!("ws://{}/api/network/ws", listener.local_addr()?);
-                let server = tokio::spawn(async move {
+        assert_eq!(client_endpoint("ws://node.test")?, "ws://node.test/");
+        assert_eq!(
+            client_endpoint("wss://node.test/custom/network")?,
+            "wss://node.test/custom/network"
+        );
+        for (legacy, correct_target) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let destination = LocalIdentity::generate();
+            let target = if correct_target {
+                destination.peer_id()?
+            } else {
+                LocalIdentity::generate().peer_id()?
+            };
+            let expected_target = target.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("ws://{}/custom/network", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                loop {
                     let (stream, _) = listener.accept().await?;
                     let mut socket = tokio_tungstenite::accept_async(stream).await?;
                     socket
@@ -1471,12 +1487,26 @@ mod tests {
                     let control: Value = serde_json::from_str(
                         socket.next().await.context("missing route")??.to_text()?,
                     )?;
+                    if control["type"] == "lookup" {
+                        assert_eq!(control["target"], expected_target);
+                        socket
+                            .send(NativeMessage::Text(
+                                json!({"type":"record","record":null}).to_string().into(),
+                            ))
+                            .await?;
+                        continue;
+                    }
+                    if legacy && control["type"] == "dial" {
+                        assert_eq!(control["target"], expected_target);
+                        socket.close(None).await?;
+                        continue;
+                    }
                     assert_eq!(
                         control,
-                        if relay {
-                            json!({"type":"dial","target":expected_target,"service":"client"})
-                        } else {
+                        if legacy {
                             json!({"type":"direct","service":"client"})
+                        } else {
+                            json!({"type":"dial","target":expected_target,"service":"client"})
                         }
                     );
                     socket
@@ -1500,13 +1530,12 @@ mod tests {
                         assert!(secure(handshake.read(&third.into_data()))?.is_empty());
                         secure(handshake.finish())?;
                     }
-                    Ok::<_, anyhow::Error>(())
-                });
-                let client =
-                    Client::connect(&url, &LocalIdentity::generate(), &target, relay).await;
-                assert_eq!(client.is_ok(), correct_target);
-                server.await??;
-            }
+                    return Ok::<_, anyhow::Error>(());
+                }
+            });
+            let client = Client::connect(&url, &LocalIdentity::generate(), &target).await;
+            assert_eq!(client.is_ok(), correct_target);
+            server.await??;
         }
         Ok(())
     }

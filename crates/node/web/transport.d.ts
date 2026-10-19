@@ -5,16 +5,19 @@ export type DeviceChannel = {
   close(): void
 }
 export function initClient(options?: { replaceLostKey?: boolean }): Promise<{ peerId: string; publicKey: string }>
-export function connectDevice(entry: { address: string; peer_id: string; relay: boolean; local?: boolean }, options?: {
+type ChannelOptions = {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void
   signal?: AbortSignal
-}): Promise<DeviceChannel>
+}
+export function connectDevice(entry: { address: string; peer_id: string; local?: boolean }, options?: ChannelOptions): Promise<DeviceChannel>
+export type ClusterPath = { address: string; mode: 'direct' | 'relay' }
+export function connectClusterPath(path: ClusterPath & { peer_id: string }, options?: ChannelOptions): Promise<DeviceChannel>
 export type ClusterCandidate = {
   peerId: string
   publicKey: string
   expiresAt: number
-  entries: { address: string; peer_id: string; relay: boolean }[]
+  paths: ClusterPath[]
 }
 export function discoverCluster(target: { clusterId: string; directories: string[] }, options?: { signal?: AbortSignal; trustedPeers?: string[]; attempt?: number }): Promise<ClusterCandidate[]>
 export function validTarget(value: unknown): string

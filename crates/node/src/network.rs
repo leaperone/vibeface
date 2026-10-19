@@ -106,6 +106,7 @@ pub struct ClusterAdvertisement {
 pub struct Reachability {
     pub peer_id: String,
     pub public_key: String,
+    #[serde(deserialize_with = "Option::deserialize")]
     pub cluster: Option<ClusterAdvertisement>,
     pub direct_urls: Vec<String>,
     pub relay_urls: Vec<String>,
@@ -686,6 +687,7 @@ struct ActivePath {
 struct PathCandidate {
     url: String,
     relay: bool,
+    explicit: bool,
     mdns: bool,
     record_expires_at: Option<i64>,
 }
@@ -698,8 +700,10 @@ impl PathCandidate {
         )
     }
     fn live(&self, hub: &NetworkHub, target: &str) -> bool {
-        self.record_expires_at
-            .is_some_and(|expires| now_secs().is_ok_and(|now| expires > now))
+        self.explicit
+            || self
+                .record_expires_at
+                .is_some_and(|expires| now_secs().is_ok_and(|now| expires > now))
             || (self.mdns && mdns_lock(&hub.mdns).urls(target).contains(&self.url))
     }
 }
@@ -718,6 +722,7 @@ impl PathQueue {
             return;
         }
         if let Some(existing) = self.pending.iter_mut().find(|other| other.route() == route) {
+            existing.explicit |= candidate.explicit;
             existing.mdns |= candidate.mdns;
             existing.record_expires_at =
                 existing.record_expires_at.max(candidate.record_expires_at);
@@ -740,6 +745,7 @@ impl PathQueue {
                 self.insert(PathCandidate {
                     url,
                     relay,
+                    explicit: false,
                     mdns: false,
                     record_expires_at: Some(record.expires_at),
                 });
@@ -897,9 +903,16 @@ impl NetworkHub {
                 self.reservation(socket, peer_id, public_key).await
             }
             Control::Dial { target, service } => {
-                ensure!(self.config.relay_enabled, "public relay is disabled");
                 check_id(&target)?;
                 socket.promote(SocketClass::Data)?;
+                if service == Service::Client && target == self.identity.peer_id()? {
+                    send_control(&mut socket, &Control::Ready).await?;
+                    return self
+                        .incoming
+                        .try_send(IncomingSocket { service, socket })
+                        .map_err(|_| anyhow::anyhow!("network service queue full"));
+                }
+                ensure!(self.config.relay_enabled, "public relay is disabled");
                 self.relay(socket, source, target, service).await
             }
             Control::Attach { token, signature } => {
@@ -1192,21 +1205,26 @@ impl NetworkHub {
         &self,
         target: &str,
         service: Service,
+        entry: Option<&str>,
         authenticate: F,
     ) -> Result<(NetworkSocket, T)>
     where
         F: Fn(NetworkSocket) -> Fut,
         Fut: Future<Output = std::result::Result<(NetworkSocket, T), AuthenticationFailure>>,
     {
-        tokio::time::timeout(DIAL_TIMEOUT, self.race_paths(target, service, authenticate))
-            .await
-            .context("authenticated node dial deadline exceeded")?
+        tokio::time::timeout(
+            DIAL_TIMEOUT,
+            self.race_paths(target, service, entry, authenticate),
+        )
+        .await
+        .context("authenticated node dial deadline exceeded")?
     }
 
     async fn race_paths<T, F, Fut>(
         &self,
         target: &str,
         service: Service,
+        entry: Option<&str>,
         authenticate: F,
     ) -> Result<(NetworkSocket, T)>
     where
@@ -1215,15 +1233,27 @@ impl NetworkHub {
     {
         check_id(target)?;
         let mut queue = PathQueue::default();
+        if let Some(url) = entry {
+            validate_url(url)?;
+            queue.insert(PathCandidate {
+                url: url.to_owned(),
+                relay: true,
+                explicit: true,
+                mdns: false,
+                record_expires_at: None,
+            });
+        }
         for url in mdns_lock(&self.mdns).urls(target) {
             queue.insert(PathCandidate {
                 url,
                 relay: false,
+                explicit: false,
                 mdns: true,
                 record_expires_at: None,
             });
         }
-        for record in self.known_records(target).await? {
+        for mut record in self.known_records(target).await? {
+            record.direct_urls.retain(|url| Some(url.as_str()) != entry);
             queue.record(record);
         }
         let history = {
@@ -1354,11 +1384,20 @@ impl NetworkHub {
                         Err(AuthenticationFailure::Path(error)) => {
                             self.record_path(target, &candidate.route(), false).await;
                             tracing::debug!(target, route=%candidate.route(), %error, "authenticated path rejected");
+                            if candidate.explicit && candidate.relay {
+                                queue.insert(PathCandidate { relay: false, ..candidate });
+                            }
                         }
                     }
                 }
                 record = records.next(), if !records_done => {
-                    match record { Some(record) => queue.record(record), None => records_done = true }
+                    match record {
+                        Some(mut record) => {
+                            record.direct_urls.retain(|url| Some(url.as_str()) != entry);
+                            queue.record(record);
+                        }
+                        None => records_done = true
+                    }
                 }
                 _ = tokio::time::sleep_until(lead_until.unwrap_or_else(tokio::time::Instant::now)), if lead_until.is_some() => {
                     lead_until = None;
@@ -2587,6 +2626,35 @@ mod tests {
     enum DirectoryObservation {
         Request(Control),
         Closed,
+    }
+
+    #[tokio::test]
+    async fn client_target_connects_locally_without_enabling_public_relay() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let (target, mut incoming) = NetworkHub::new(identity.clone(), NetworkConfig::default());
+        let mut tasks = JoinSet::new();
+        let url = serve(target.clone(), &mut tasks).await?;
+        let socket = connect_relay(&url, &identity.peer_id()?, Service::Client).await?;
+        let accepted = incoming
+            .recv()
+            .await
+            .context("local client was not delivered")?;
+        assert_eq!(accepted.service, Service::Client);
+        assert!(relay_lock(&target.relay).reservations.is_empty());
+        assert!(relay_lock(&target.relay).attachments.is_empty());
+        assert!(
+            connect_relay(&url, &LocalIdentity::generate().peer_id()?, Service::Client)
+                .await
+                .is_err()
+        );
+        assert!(
+            connect_relay(&url, &identity.peer_id()?, Service::Peer)
+                .await
+                .is_err()
+        );
+        drop(socket);
+        drop(accepted);
+        Ok(())
     }
 
     struct DataConnections {
@@ -4729,7 +4797,7 @@ mod tests {
         vibeface_secure::Channel,
     )> {
         let target_id = target_identity.peer_id()?;
-        let dial = hub.dial_authenticated(&target_id, service, |mut socket| async move {
+        let dial = hub.dial_authenticated(&target_id, service, None, |mut socket| async move {
             let result = async {
                 let mut handshake = Handshake::new(
                     true,
@@ -5139,6 +5207,13 @@ mod tests {
         record.signature = identity.sign_payload("reachability-v2", unsigned.as_bytes())?;
         record.verify(1001)?;
         let wire = serde_json::to_string(&record)?;
+        assert!(
+            serde_json::from_str::<Reachability>(&wire.replace("\"cluster\":null,", "")).is_err()
+        );
+        let signature = record.signature.clone();
+        record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
+        assert!(record.verify(1001).is_err());
+        record.signature = signature;
         assert!(serde_json::from_str::<Reachability>(&wire.replace("peer_id", "node_id")).is_err());
         assert_eq!(
             serde_json::to_string(&ReservationProof {
@@ -5974,7 +6049,7 @@ mod tests {
             let authenticated = std::sync::atomic::AtomicUsize::new(0);
             assert!(
                 resolver
-                    .dial_authenticated::<(), _, _>(&target, Service::Peer, |_| {
+                    .dial_authenticated::<(), _, _>(&target, Service::Peer, None, |_| {
                         authenticated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         async {
                             Err(AuthenticationFailure::Path(anyhow::anyhow!(
@@ -6870,6 +6945,7 @@ mod tests {
         let mut dial = Box::pin(caller.dial_authenticated::<(), _, _>(
             &target_id,
             Service::Client,
+            None,
             |socket| {
                 let entered = entered.clone();
                 async move {
@@ -6911,6 +6987,7 @@ mod tests {
         let url = "ws://127.0.0.1:1/api/network/ws".to_owned();
         seed_mdns_urls(&hub, &target, vec![url.clone()]);
         let candidate = PathCandidate {
+            explicit: false,
             url,
             relay: false,
             mdns: true,

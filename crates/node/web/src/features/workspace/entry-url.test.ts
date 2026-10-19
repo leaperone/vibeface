@@ -187,7 +187,7 @@ test("workspace preserves bot and message requests while routing native decision
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
-    generation: 1, entry: { peer_id: "gateway", address: "https://node.example", relay: false },
+    generation: 1, entry: { peer_id: "gateway", address: "https://node.example" },
     principal: { cluster_id: "cluster", subject_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { peer_id: "gateway", public_key: "key", version: "test", roles: ["gateway"], initialized: true },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async () => { throw new Error("unexpected request") },
@@ -634,7 +634,7 @@ test("an old action completion cannot clear a new generation's busy state", asyn
 test("connection form keeps current errors and busy ownership when an earlier connection is cancelled", async () => {
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
-    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', peer_id: 'target', relay: true }], initialInvitation: '',
+    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', peer_id: 'target' }], initialInvitation: '',
     identity: { peerId: 'browser' }, phase: 'disconnected', error: '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
@@ -683,7 +683,7 @@ test("artifact reads retain their offset while old responses cannot append or un
 for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted fields before waiting and preserves replacement fields`, async () => {
   let generation = 1, work = pendingResult(), resets = 0
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
-  const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'peer_id', 'relay'].map(name => [name, new Input()]))
+  const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'peer_id'].map(name => [name, new Input()]))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, reset() { resets++; for (const field of fields.values()) field.value = '' } }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
     beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
@@ -716,7 +716,7 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
 test("an outstanding clipboard permission cannot keep new device controls busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
   const clipboard = pendingResult()
-  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, cluster_id: 'cluster' }, entry: { address: 'https://node.example', peer_id: 'target', relay: true } } }
+  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, cluster_id: 'cluster' }, entry: { address: 'https://node.example', peer_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), identity: null, entries: [], directory: null, pairs: [], refreshDirectory: async () => {}, createInvitation: () => creation.promise }
   const app = componentHarness('../identity/device-controls.tsx', { './context': { useDevice: () => device } }, { navigator: { clipboard: { writeText: () => clipboard.promise } } })
   const render = () => app.render('DeviceControls')
@@ -758,14 +758,16 @@ test("Cluster and Peer boundaries require the current fields and identity versio
   const invitation = { url: "https://node.example", peer_id: id, invite: { invite: { payload }, capability: "pairing" } }
   assert.equal(parsers.parseInvitation(invitation).payload.cluster_id, id)
   assert.throws(() => parsers.parseInvitation({ ...invitation, invite: { ...invitation.invite, invite: { payload: { ...payload, version: 1 } } } }), /邀请版本/)
-  assert.equal(parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: id }).peer_id, id)
+  assert.equal(parsers.parseEntry({ address: "https://node.example", peer_id: id }).peer_id, id)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", peer_id: id, relay: true }), /字段/)
+  assert.throws(() => parsers.parseInvitation({ ...invitation, relay: true }), /字段/)
   assert.equal(parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, peer_id: id }).peer_id, id)
   assert.equal(parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", peer_id: id }).entry.peer_id, id)
   assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], peer_id: id }] })[0].peer_id, id)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, node_id: id }), /64 位/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /64 位/)
   assert.throws(() => parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, node_id: id }), /64 位/)
   assert.throws(() => parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", node_id: id }), /64 位/)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: "invalid" }), /64 位/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", peer_id: "invalid" }), /64 位/)
   assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /文本字段/)
   const own = { peerId: id, publicKey: other }, actual = { peerId: other, publicKey: id }
   const effective = { cluster_id: id, epoch: 1, heads: [], revoked: [], members: [

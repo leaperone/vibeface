@@ -656,7 +656,7 @@ impl PeerHub {
             self.authorize(&cluster, &self.identity.peer_id()?).await?;
             self.authorize(&cluster, &target).await?;
             let winner = transport
-                .dial_authenticated(&target, Service::Peer, |mut socket| {
+                .dial_authenticated(&target, Service::Peer, None, |mut socket| {
                     let hub = self.clone();
                     let cluster = cluster.clone();
                     let target = target.clone();

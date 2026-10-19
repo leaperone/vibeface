@@ -198,7 +198,6 @@ struct Pair {
 struct Invitation {
     url: String,
     peer_id: String,
-    relay: bool,
     invite: InviteSecret,
 }
 
@@ -214,7 +213,6 @@ struct InviteSecret {
 struct PendingPair {
     url: String,
     peer_id: String,
-    relay: bool,
     invite_id: String,
     request_id: String,
     name: String,
@@ -736,7 +734,6 @@ async fn pair(options: Pair) -> Result<()> {
         ensure!(
             pending.url == url
                 && pending.peer_id == invitation.peer_id
-                && pending.relay == invitation.relay
                 && pending.invite_id == payload.invite_id
                 && pending.name == options.name,
             "finish the pending pairing with its original invitation and device name"
@@ -746,7 +743,6 @@ async fn pair(options: Pair) -> Result<()> {
         let pending = PendingPair {
             url: url.clone(),
             peer_id: invitation.peer_id.clone(),
-            relay: invitation.relay,
             invite_id: payload.invite_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
             name: options.name.clone(),
@@ -755,7 +751,7 @@ async fn pair(options: Pair) -> Result<()> {
         create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
         pending
     };
-    let mut client = Client::connect(&url, identity, &invitation.peer_id, invitation.relay).await?;
+    let mut client = Client::connect(&url, identity, &invitation.peer_id).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
     let mut accepted = false;
     loop {
@@ -988,11 +984,14 @@ mod tests {
 
     #[test]
     fn peer_id_pending_pair_uses_only_the_current_field() {
-        let wire = json!({"url":"http://localhost:4790", "peer_id":"device", "relay":false,
+        let wire = json!({"url":"http://localhost:4790", "peer_id":"device",
             "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
         let pending: PendingPair = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(pending.peer_id, "device");
         assert_eq!(serde_json::to_value(pending).unwrap(), wire);
+        let mut routed = wire.clone();
+        routed["relay"] = json!(true);
+        assert!(serde_json::from_value::<PendingPair>(routed).is_err());
         let mut old = wire;
         let fields = old.as_object_mut().unwrap();
         fields.remove("peer_id");
@@ -1464,32 +1463,34 @@ mod tests {
             nonce: "request nonce".into(),
             proof: String::new(),
         };
+        let envelope = json!({
+            "url":"ws://127.0.0.1:4790/api/network/ws",
+            "peer_id":device.peer_id().unwrap(),
+            "invite":{"invite":&invite,"capability":"fixture capability"}
+        });
+        let options = Pair {
+            data: DataDir {
+                data_dir: PathBuf::new(),
+            },
+            invite_file: None,
+            invite: Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())),
+            name: "Build Node".into(),
+        };
+        assert_eq!(
+            super::invitation(&options).unwrap().peer_id,
+            device.peer_id().unwrap()
+        );
+        let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
+        assert_eq!(parsed.peer_id, device.peer_id().unwrap());
+        let mut old = envelope.clone();
+        let fields = old.as_object_mut().unwrap();
+        let peer_id = fields.remove("peer_id").unwrap();
+        fields.insert("node_id".into(), peer_id);
+        assert!(serde_json::from_value::<Invitation>(old).is_err());
         for relay in [false, true] {
-            let mut envelope = json!({
-                "url":"ws://127.0.0.1:4790/api/network/ws",
-                "peer_id":device.peer_id().unwrap(),
-                "relay":relay,
-                "invite":{"invite":&invite,"capability":"fixture capability"}
-            });
-            let mut options = Pair {
-                data: DataDir {
-                    data_dir: PathBuf::new(),
-                },
-                invite_file: None,
-                invite: Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())),
-                name: "Build Node".into(),
-            };
-            assert_eq!(super::invitation(&options).unwrap().relay, relay);
-            let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
-            assert_eq!(parsed.peer_id, device.peer_id().unwrap());
-            let mut old = envelope.clone();
-            let fields = old.as_object_mut().unwrap();
-            let peer_id = fields.remove("peer_id").unwrap();
-            fields.insert("node_id".into(), peer_id);
-            assert!(serde_json::from_value::<Invitation>(old).is_err());
-            envelope.as_object_mut().unwrap().remove("relay");
-            options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
-            assert!(super::invitation(&options).is_err());
+            let mut routed = envelope.clone();
+            routed["relay"] = json!(relay);
+            assert!(serde_json::from_value::<Invitation>(routed).is_err());
         }
         let request_hash = digest(&request.signing_bytes().unwrap());
         let mut review = PairReview {

@@ -303,10 +303,21 @@ mDNS 按完整服务实例名保存来源，最多 256 个实例，每个实例�
 `Reachability` 包含 `peer_id`、`public_key`、可选 `cluster`、`direct_urls`、`relay_urls`、`issued_at`、`expires_at` 和 `signature`。`cluster` 为 `{ cluster_id, services }`，服务为规范排序的 `peer`、`client`。仅当本机当前成员授权和启用配置同时允许 Gateway 时声明 `client`。未加入集群或本机已撤销时不声明集群。成员变动由现有维护循环重新投影，并通过同一发布通知刷新公告。
 
 设备将空签名记录按 canonical JSON 编码，使用 Ed25519 的 `reachability-v2` domain 签名。公告最多 8 KiB，有效期最多 180 秒。签名证明设备声明该路径，不证明设备属于目标集群或路径此刻可达。
+普通客户端只保存入口地址和目标 `peer_id`，不选择直连或中继。浏览器将 HTTP 或 HTTPS 入口转换为 `/api/network/ws`，Rust Client 也接受保留完整路径的 WS 或 WSS 端点。客户端首先发送 `dial`，携带 `target` 和 `service: "client"`。目标等于入口本机时，入口接入本地 Client 服务，无需启用公共 `relay_enabled`；其他目标仍须启用公共中继并持有其活动预约。原 `direct` 控制继续用于已验明的直连候选。
+
+本机启动器授予的 `local_session` 保留独立的同源 `/api/local/ws` 通道，由 Cookie 和原目标 Noise 身份约束。该通道直接开始 Noise 握手，不发送网络控制消息，也不查询目录或回退到网络入口。内部 `local` 标记不是用户路由偏好。
+
+若显式入口的 `dial` 失败，客户端才将同一输入端点的 `direct` 路径加入既有队列。该路径仍核验原目标 Peer ID，不向其他身份发送业务请求，也不恢复用户的中继偏好。新版入口正常接入时不增加备用数据通道。完整 WS/WSS 端点保持原路径，包括根路径 `/`；HTTP/HTTPS origin 才补 `/api/network/ws`。
+
+客户端同时向入口发送 `lookup`，核验记录的目标、公钥指纹、签名和时间范围，再尝试记录中的直连或其他中继。普通 Peer 查询与 Cluster 查询共用八字段 canonical JSON 与 `reachability-v2` 验签，`signature` 为 `""`，`cluster` 为 `null` 或合法声明，拒绝旧七字段与旧签名域。有效期最多 180 秒，签发时间最多领先本机 30 秒，每份记录最多包含 8 个直连和 8 个中继 URL。浏览器先验证整份记录，再过滤 HTTPS 页面不能使用的非回环 `ws://` 候选，保留其中可用的 `wss://` 路径。
+
+每次连接最多尝试 16 个直连和 8 个中继候选，输入入口占用一个中继候选；最多同时拨号两条数据路径，整次拨号最多 15 秒。候选失效或失败时继续其他已知路径，首个完成固定目标 Noise 握手的路径胜出，其余尝试和目录查询关闭。页面不跳转到候选地址，浏览器密钥仍属于原客户端站点。入口没有预约或有效可达记录时，连接明确失败，不承诺仅凭 Peer ID 搜索全网。公共中继不替客户端主动拨号目录 URL。
+
+保存连接、邀请和待配对记录只使用地址与 `peer_id`，不写入路由偏好。断线后以相同目标重新选路、认证并订阅。身份不符或成员授权被撤销时拒绝访问。未确认写操作保留原编号并先对账，重连只恢复读取与订阅。
 
 `lookup { target }` 仍按 Peer ID 查询。`lookup_cluster { cluster_id, service }` 扫描同一公共公告目录，返回 `cluster_records { records, truncated }`。响应最多 8 条，并按实际序列化字节限制在 16 KiB 控制帧内。候选按查询轮换，不另存集群公告或授权索引。查询不返回成员姓名、会话或完整授权图。
 
-Web 的稳定目标为 Cluster ID 和最多 8 个明确配置的发现服务。HTTP/HTTPS origin 与完整 WS/WSS 端点分别解析，WS 路径原样保留；邀请分享链接使用对应 HTTP/HTTPS 网页 origin。浏览器最多同时查询两条目录连接，跨来源公平合并，最多尝试 16 个 Peer、每 Peer 两条路径，认证串行。同 Peer 的路径使用已合并公告中最早的过期时间，较新的公告不能为旧路径续期。未知 Peer 只能通过给出它的已配置目录建立中继 Noise 通道，不连接公告提供的任意地址。浏览器已经验证过的有效 Gateway 可以使用公告中的直连地址，包括私网地址。公告不能增加发现服务或获得 `local` 标志。这个策略不阻止已配置域名的 DNS 重绑定，也不保证恶意目录下的可用性。
+Web 的稳定目标为 Cluster ID 和最多 8 个明确配置的发现服务。HTTP/HTTPS origin 与完整 WS/WSS 端点分别解析，WS 路径原样保留；邀请分享链接使用对应 HTTP/HTTPS 网页 origin。浏览器最多同时查询两条目录连接，跨来源公平合并，最多尝试 16 个 Peer、每 Peer 两条路径，认证串行。Cluster 每次拨号只走一条选定的 direct 或 relay 路径，不触发普通 Peer 的 lookup、自动扩展或回退；最近成功路径也保存模式并计入同一预算。最近 relay 路径仍须属于当前明确目录，直连前重读最新已知 Gateway 授权。同 Peer 的路径使用已合并公告中最早的过期时间，较新的公告不能为旧路径续期。未知 Peer 只能通过给出它的已配置目录建立中继 Noise 通道，不连接公告提供的任意地址。浏览器已经验证过的有效 Gateway 可以使用公告中的直连地址，包括私网地址。公告不能增加发现服务或获得 `local` 标志。这个策略不阻止已配置域名的 DNS 重绑定，也不保证恶意目录下的可用性。
 
 进入 Ready 前，浏览器核对公告签名、Cluster、Peer 指纹和 TTL，Noise 实际身份及公钥，以及合并后的签名成员目录。`VerifiedMembership.mergeStateJson` 复用 Rust 合并规则，拒绝恢复 epoch 回滚或冲突 checkpoint，保留已知撤销，无需入口覆盖全部无关 heads。验证成功的签名状态先持久保存，即使这个候选随后被拒绝也保留。实际入口须是有效 Gateway，浏览器须是有效 Client，principal 不能扩大已知权限。服务端在认证和后续 membership 请求时持续核对本机 Gateway 授权与配置。成员展示与 nodes 选择同样受浏览器最新已验证投影限制。
 

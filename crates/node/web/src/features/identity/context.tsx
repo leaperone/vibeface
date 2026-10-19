@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { connectDevice, discoverCluster, initClient, readInvitation, signClient, validTarget } from '../../../transport.js'
-import type { DeviceChannel } from '../../../transport.js'
+import { connectClusterPath, connectDevice, discoverCluster, initClient, readInvitation, signClient, validEndpoint, validTarget } from '../../../transport.js'
+import type { ClusterPath, DeviceChannel } from '../../../transport.js'
 import {
   array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
   parseClusterTarget, parseMember, parsePairReceipt, parseReview, parseSigning, record, same, signingPayload, text,
@@ -17,9 +17,10 @@ import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, merg
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'ready'
 type Review = { kind: 'bootstrap'; clusterId: string } | { kind: 'recovery'; clusterId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
-type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; clusterId?: string; target?: ClusterTarget; principal?: ClientPrincipal; expiresAt?: number }
+type ConnectionSource = { kind: 'peer'; entry: ConnectionEntry } | { kind: 'cluster'; target: ClusterTarget; path: ClusterPath & { peer_id: string } }
+type Session = { channel: DeviceChannel; source: ConnectionSource; readonly entry: ConnectionEntry; info: EntryInfo; generation: number; clusterId?: string; principal?: ClientPrincipal; expiresAt?: number }
 type Reconnect = { target: ClusterTarget | { kind: 'peer'; entry: ConnectionEntry }; clusterId: string; attempt: number }
-type AuthenticatedEntry = { entry: ConnectionEntry; clusterId: string; target?: ClusterTarget }
+type AuthenticatedEntry = ConnectionSource & { clusterId: string }
 type DeviceContextValue = {
   connectionGeneration(): number
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
@@ -40,14 +41,28 @@ function store(key: string, value: unknown) { try { localStorage.setItem(`vibefa
 function savedEntries(): ConnectionEntry[] {
   const value = load('connections')
   if (!Array.isArray(value)) return []
-  return value.flatMap(item => { try { return [parseEntry(item)] } catch { return [] } })
+  const entries = new Map<string, ConnectionEntry>()
+  for (const item of value) { try { const entry = parseEntry(item); entries.set(entryKey(entry), entry) } catch {} }
+  return [...entries.values()]
+}
+function sourceEntry(source: ConnectionSource): ConnectionEntry {
+  return source.kind === 'peer' ? source.entry : { address: source.path.address, peer_id: source.path.peer_id }
+}
+function parseSource(value: unknown): ConnectionSource {
+  const v = record(value, '连接来源')
+  if (v.kind === 'peer') return { kind: 'peer', entry: parseEntry(v.entry) }
+  if (v.kind !== 'cluster') throw new Error('连接来源无效。')
+  const path = record(v.path, '集群路径')
+  const address = validEndpoint(text(path.address))
+  if (path.local === true || !['ws:', 'wss:'].includes(new URL(address).protocol) || path.mode !== 'direct' && path.mode !== 'relay') throw new Error('集群路径模式无效。')
+  return { kind: 'cluster', target: parseClusterTarget(v.target), path: { address, peer_id: validTarget(path.peer_id), mode: path.mode } }
 }
 function loadAuthenticated(): AuthenticatedEntry | null {
   try {
     const value = load('last-authenticated')
     if (!value) return null
     const v = record(value)
-    return { entry: parseEntry(v.entry), clusterId: validTarget(v.clusterId), ...(v.target ? { target: parseClusterTarget(v.target) } : {}) }
+    return { ...parseSource(v), clusterId: validTarget(v.clusterId) }
   } catch { return null }
 }
 function loadWaiting(): WaitingPair | null {
@@ -119,7 +134,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const next = savedEntries().filter(item => entryKey(item) !== entryKey(candidate))
     store('connections', next)
     const previous = loadAuthenticated()
-    if (previous && entryKey(previous.entry) === entryKey(candidate)) store('last-authenticated', null)
+    if (previous && entryKey(sourceEntry(previous)) === entryKey(candidate)) store('last-authenticated', null)
     setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接并核对自己的设备。'); return value }
@@ -183,19 +198,26 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (pinnedCluster && pinnedCluster !== verified.principal.cluster_id) throw new Error('此设备返回了不同的集群。请先核对原授权。')
     } catch (cause) { if (cause instanceof MembershipRevokedError) throw cause; throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
-    const { principal, view } = verified
+    const { principal } = verified
+    let { view } = verified
     await request('subscribe')
     if (session.current !== active || active.generation !== generation.current) throw changed()
     if (active.expiresAt !== undefined && active.expiresAt <= Date.now() / 1000) throw new AuthenticationError('集群公告已过期。')
-    if (principal.source === 'membership' && active.entry.local) active.entry = { ...active.entry, local: false }
+    const known = load(`cluster-state.${principal.cluster_id}`)
+    if (known && principal.source === 'membership') {
+      view = verifiedView(known, principal.cluster_id, ownerOf(known))
+      const member = authorizeMembership(view, own, { peerId: active.entry.peer_id, publicKey: active.channel.publicKey })
+      if (principal.epoch !== view.epoch || principal.can_manage && !member.manage) throw new AuthenticationError('集群授权已变化，需要重新认证。')
+    }
+    if (principal.source === 'membership' && active.source.kind === 'peer' && active.entry.local) active.source = { kind: 'peer', entry: { ...active.entry, local: false } }
     setLocalAutoAccessState(typeof verified.auth.local_auto_access === 'boolean' ? verified.auth.local_auto_access : null)
     store(`cluster-for.${active.entry.peer_id}`, principal.cluster_id)
     saveEntry(active.entry)
-    store('last-authenticated', { entry: active.entry, clusterId: principal.cluster_id, ...(active.target ? { target: active.target } : {}) } satisfies AuthenticatedEntry)
+    store('last-authenticated', { ...active.source, clusterId: principal.cluster_id } satisfies AuthenticatedEntry)
     store('waiting-pair', null)
     active.clusterId = principal.cluster_id
     active.principal = principal
-    reconnect.current = { target: active.target ?? { kind: 'peer', entry: active.entry }, clusterId: principal.cluster_id, attempt: 0 }
+    reconnect.current = { target: active.source.kind === 'cluster' ? active.source.target : active.source, clusterId: principal.cluster_id, attempt: 0 }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, principal, info: active.info,
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
@@ -239,7 +261,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             return
           }
         }
-        active = await open(entry, true)
+        active = await open({ kind: 'peer', entry }, true)
         const auth = await callSession(active, 'authenticate', { cluster_id: target.clusterId })
         await authenticate(auth, active, { kind: 'cluster', clusterId: target.clusterId })
       } catch (cause) {
@@ -250,16 +272,17 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       }
     }, immediate ? 0 : Math.min(1000 * 2 ** target.attempt++, 10000))
   }
-  async function open(entryValue: ConnectionEntry, resuming = false, target?: ClusterTarget) {
-    const parsed = parseEntry(entryValue)
+  async function open(sourceValue: ConnectionSource, resuming = false) {
+    const source = parseSource(sourceValue)
+    const parsed = sourceEntry(source)
     if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
-    else if (target) setEntry(parsed)
+    else if (source.kind === 'cluster') setEntry(parsed)
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     try {
-      const channel = await connectDevice(parsed, {
+      const options = {
         signal: controller.signal,
-        onEvent(value) {
+        onEvent(value: unknown) {
           if (version !== generation.current || session.current?.generation !== version || !session.current.clusterId) return
           if (!value || typeof value !== 'object' || Array.isArray(value)) return
           const event = record(value)
@@ -267,7 +290,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           const payload = parseChanged(event.payload)
           for (const listener of listeners.current) listener(payload)
         },
-        onClose(reason) {
+        onClose(reason: unknown) {
           if (version !== generation.current) return
           generation.current += 1; session.current = null; releaseSensitive(); listeners.current.clear()
           if (reconnect.current) {
@@ -277,7 +300,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
           }
         },
-      })
+      }
+      const channel = await (source.kind === 'cluster' ? connectClusterPath(source.path, options) : connectDevice(parsed, options))
       if (version !== generation.current) { channel.close(); throw changed() }
       const infoValue = await channel.request('info')
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -286,7 +310,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         details = parseInfo(infoValue)
         if (details.peer_id !== parsed.peer_id || details.public_key !== channel.publicKey) throw new Error('入口报告的设备与已核验设备编号不一致。')
       } catch (cause) { channel.close(); throw new AuthenticationError(messageOf(cause)) }
-      const active = { channel, entry: parsed, info: details, generation: version, ...(target ? { target } : {}) }
+      const active: Session = { channel, source, get entry() { return sourceEntry(this.source) }, info: details, generation: version }
       session.current = active; setInfo(details); if (!resuming) setPhase('unpaired'); return active
     } catch (cause) {
       if (version === generation.current) {
@@ -301,7 +325,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   async function connect(candidate: ConnectionEntry) {
     store('cluster-target', null)
-    const active = await open(candidate)
+    const active = await open({ kind: 'peer', entry: candidate })
     const request = scoped(active)
     let auth: unknown
     try { auth = await request('authenticate', { cluster_id: load(`cluster-for.${active.entry.peer_id}`) ?? '' }) }
@@ -325,27 +349,42 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function attemptCluster(attempt: Reconnect) {
     if (attempt.target.kind !== 'cluster') throw changed()
     const target = attempt.target
-    const known = load(`cluster-state.${target.clusterId}`)
-    const view = known ? verifiedView(known, target.clusterId, ownerOf(known)) : null
     const own = identityRef.current
-    if (view && own && view.revoked.includes(own.peerId)) throw new MembershipRevokedError('此浏览器的集群授权已被签名撤销。请重新配对。')
-    const gateways = view?.members.filter(member => member.kind === 'node' && member.node_roles.includes('gateway') && !view.revoked.includes(member.subject_id)) ?? []
+    function latestView() {
+      const known = load(`cluster-state.${target.clusterId}`)
+      const view = known ? verifiedView(known, target.clusterId, ownerOf(known)) : null
+      if (view && own && view.revoked.includes(own.peerId)) throw new MembershipRevokedError('此浏览器的集群授权已被签名撤销。请重新配对。')
+      return view
+    }
+    function gateways(view: MembershipView | null) {
+      return view?.members.filter(member => member.kind === 'node' && member.node_roles.includes('gateway') && !view.revoked.includes(member.subject_id)) ?? []
+    }
+    const directories = target.directories.map(address => {
+      const url = new URL(address)
+      if (['http:', 'https:'].includes(url.protocol)) { url.pathname = '/api/network/ws'; url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:' }
+      return url.href
+    })
+    latestView()
     const controller = new AbortController(); connecting.current = controller
     const tried = new Map<string, Set<string>>()
     const probe = { attempt, controller }; probing.current = probe
-    async function candidate(entry: ConnectionEntry, publicKey: string, expiresAt?: number) {
+    async function candidate(peerId: string, path: ClusterPath, publicKey: string, expiresAt?: number) {
       if (reconnect.current !== attempt) throw changed()
       if (expiresAt !== undefined && expiresAt <= Date.now() / 1000) return false
-      let paths = tried.get(entry.peer_id)
+      const latest = latestView()
+      const gateway = gateways(latest).find(member => member.subject_id === peerId && member.public_key === publicKey)
+      if (latest?.revoked.includes(peerId) || path.mode === 'direct' && !gateway || path.mode === 'relay' && !directories.includes(path.address)) return false
+      let paths = tried.get(peerId)
       if (!paths) {
         if (tried.size === 16) return false
-        paths = new Set(); tried.set(entry.peer_id, paths)
+        paths = new Set(); tried.set(peerId, paths)
       }
-      if (paths.size === 2 || paths.has(entryKey(entry))) return false
-      paths.add(entryKey(entry))
+      const key = `${path.mode}:${path.address}`
+      if (paths.size === 2 || paths.has(key)) return false
+      paths.add(key)
       let active: Session | null = null
       try {
-        active = await open({ address: entry.address, peer_id: entry.peer_id, relay: entry.relay }, true, target)
+        active = await open({ kind: 'cluster', target, path: { ...path, peer_id: peerId } }, true)
         if (active.channel.publicKey !== publicKey || expiresAt !== undefined && expiresAt <= Date.now() / 1000) throw new AuthenticationError('公告与实际 Noise 入口身份或有效期不符。')
         active.expiresAt = expiresAt
         const auth = await callSession(active, 'authenticate', { cluster_id: target.clusterId })
@@ -362,13 +401,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
     try {
       const recent = loadAuthenticated()
-      const gateway = recent?.clusterId === target.clusterId && !recent.entry.local ? gateways.find(member => member.subject_id === recent.entry.peer_id) : undefined
-      if (recent && gateway && await candidate(recent.entry, gateway.public_key)) return
+      const gateway = recent?.kind === 'cluster' && recent.clusterId === target.clusterId && recent.target.clusterId === target.clusterId ? gateways(latestView()).find(member => member.subject_id === recent.path.peer_id) : undefined
+      if (recent?.kind === 'cluster' && gateway && await candidate(recent.path.peer_id, recent.path, gateway.public_key)) return
       if (reconnect.current !== attempt) throw changed()
       connecting.current = controller
-      const records = await discoverCluster(target, { signal: controller.signal, trustedPeers: gateways.map(member => member.subject_id), attempt: attempt.attempt })
-      for (const record of records) for (const entry of record.entries) {
-        if (await candidate(entry, record.publicKey, record.expiresAt)) return
+      const records = await discoverCluster(target, { signal: controller.signal, trustedPeers: gateways(latestView()).map(member => member.subject_id), attempt: attempt.attempt })
+      for (const record of records) for (const path of record.paths) {
+        if (await candidate(record.peerId, path, record.publicKey, record.expiresAt)) return
       }
       throw new Error('当前已知发现服务没有可用的已授权入口。')
     } finally { controller.abort(); if (probing.current === probe) probing.current = null }
@@ -409,7 +448,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const result = record(await request('commit_invite', { invite, capability: prepared.capability }))
     if (!same(result.invite, invite) || result.capability !== prepared.capability) throw new Error('保存后的邀请与已签名内容不一致。')
     const route = ready.info.connection_entry ?? ready.entry
-    return JSON.stringify({ url: route.address, peer_id: ready.entry.peer_id, relay: route.relay, invite: result })
+    return JSON.stringify({ url: route.address, peer_id: ready.entry.peer_id, invite: result })
   }
   async function approvePair(requestId: string) {
     if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
@@ -439,7 +478,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function pair(invitationText: string, nameValue: string, password?: string) {
     const invitation = parseInvitation(readInvitation(invitationText))
     const name = deviceName(nameValue)
-    const active = await open(invitation.entry)
+    const active = await open({ kind: 'peer', entry: invitation.entry })
     const request = scoped(active)
     const own = identityRef.current
     if (!own) throw new Error('浏览器密钥尚未初始化。')
@@ -522,7 +561,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const cancelPair = disconnect
   async function beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }) {
     const name = deviceName(input.name)
-    const active = await open(input.entry)
+    const active = await open({ kind: 'peer', entry: input.entry })
     const request = scoped(active)
     let password = input.password
     input.password = ''
@@ -619,13 +658,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (local) { const opening = connect(local); version = generation.current; await opening; return }
       }
       const pending = invitation ? null : loadWaiting()
+      const clusterTarget = load('cluster-target')
+      const recent = loadAuthenticated()
       if (pending && pending.review.new_member.subject_id === own.peerId) {
-        const opening = open(pending.entry); version = generation.current
+        const opening = open({ kind: 'peer', entry: pending.entry }); version = generation.current
         const active = await opening
         if (!mounted || session.current !== active) return
         waitingRef.current = pending; setWaiting(pending)
-      } else if (!invitation && (loadAuthenticated()?.target || load('cluster-target'))) {
-        const saved = loadAuthenticated()?.target ?? parseClusterTarget(load('cluster-target'))
+      } else if (!invitation && (clusterTarget || recent?.kind === 'cluster')) {
+        const saved = parseClusterTarget(clusterTarget || (recent?.kind === 'cluster' ? recent.target : null))
         const opening = connectCluster(saved); version = generation.current
         void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
       } else if (shouldAutoConnect({ hasInvitation: Boolean(invitation), savedCount: savedEntries().length })) {
