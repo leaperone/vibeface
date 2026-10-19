@@ -209,10 +209,15 @@ async fn main() -> Result<()> {
         Action::Serve(options) => {
             let runtime = Arc::new(Runtime::open(&options.data_dir).await?);
             runtime.start().await?;
-            eprintln!(
-                "Web: {}\nRun vibeface access with the same --data-dir for the trusted browser entry.",
-                runtime.config.public_url
-            );
+            eprintln!("Web: {}", runtime.config.public_url);
+            if runtime.config.listen.ip().is_loopback()
+                || runtime.config.listen.ip().is_unspecified()
+            {
+                eprintln!(
+                    "Local setup: http://localhost:{}",
+                    runtime.config.listen.port()
+                );
+            }
             tokio::select! {
                 result = api::serve(runtime.clone()) => result,
                 result = maintenance::serve(runtime, options.data_dir) => result,

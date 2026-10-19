@@ -230,6 +230,7 @@ async fn dispatch(
         "info"
             | "authenticate"
             | "directory"
+            | "node_settings"
             | "subscribe"
             | "pair_status"
             | "pair_requests"
@@ -261,6 +262,15 @@ async fn dispatch(
             let view = current_view(node, session).await?;
             view.authorize_client(&session.subject_id)?;
             Ok(json!({"state":node.membership_state().await?,"view":view}))
+        }
+        "node_settings" => {
+            manager_view(node, session).await?;
+            node.node_settings()
+        }
+        "configure_node" => {
+            manager_view(node, session).await?;
+            let settings = serde_json::from_value(params).context("invalid Node settings")?;
+            node.configure_node(settings, &session.subject_id).await
         }
         "subscribe" => {
             current_view(node, session)
@@ -1061,6 +1071,201 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
+    -> Result<()> {
+        use crate::{
+            config::{self, Config, ManagerSettings},
+            model::NodeRole,
+        };
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        config.roles = vec![NodeRole::Relay, NodeRole::Replica, NodeRole::Scheduler];
+        config.save(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let client = LocalIdentity::generate();
+        let state = NetworkState::new(Genesis::create(
+            &root,
+            vec![
+                Member::client(&admin, "admin", true)?,
+                Member::client(&client, "browser", false)?,
+                Member::node(&node.identity, "node", node.config.roles.clone())?,
+            ],
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                subject_id: identity.peer_id()?,
+                public_key: identity.public_key_hex()?,
+                subscribed: false,
+                recovery: None,
+                observation: None,
+            })
+        };
+        for identity in [&client, &LocalIdentity::generate()] {
+            let mut unauthorized = session(identity)?;
+            assert!(
+                dispatch(&node, &mut unauthorized, "node_settings", json!({}))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut unauthorized,
+                    "configure_node",
+                    json!({"roots":[],"manager":null})
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut manager_session = session(&admin)?;
+        let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
+        assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
+        let before = std::fs::read(dir.join("config.json"))?;
+        for invalid in [
+            json!({"roots":["relative-project"],"manager":null}),
+            json!({"roots":[],"manager":null,"codex_bin":"arbitrary"}),
+        ] {
+            assert!(
+                dispatch(&node, &mut manager_session, "configure_node", invalid)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
+            assert!(node.settings_snapshot().roots.is_empty());
+        }
+        let project = dir.join("project");
+        let workspace = std::path::PathBuf::from(
+            initial["defaults"]["workspace"]
+                .as_str()
+                .context("default workspace missing")?,
+        );
+        config::private_dir(&project)?;
+        assert!(!workspace.exists());
+        let mut latest = Config::load(&dir)?;
+        latest
+            .network
+            .bootstrap_urls
+            .push("wss://relay.example/api/network/ws".into());
+        latest.daily_decision_limit = 11;
+        latest.save(&dir)?;
+        let settings = crate::runtime::NodeSettings {
+            roots: vec![project.clone(), project.join(".")],
+            manager: Some(ManagerSettings {
+                provider: "cursor_sdk".into(),
+                workspace: workspace.clone(),
+                model: "auto".into(),
+                cursor_sdk_bin: dir.join("missing-cursor-sdk"),
+                node_bin: "node".into(),
+                codex_sdk_script: dir.join("sidecars/codex-manager.mjs"),
+            }),
+        };
+        let mut missing_workspace = settings.clone();
+        missing_workspace.manager.as_mut().unwrap().workspace =
+            dir.join("custom-workspace-not-created");
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(missing_workspace)?
+            )
+            .await
+            .is_err()
+        );
+        assert!(!dir.join("custom-workspace-not-created").exists());
+        std::os::unix::fs::symlink(&project, &workspace)?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&settings)?
+            )
+            .await
+            .is_err()
+        );
+        std::fs::remove_file(&workspace)?;
+        let saved = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await?;
+        assert!(workspace.is_dir());
+        assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
+        assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
+        assert_eq!(saved["readiness"]["scheduler_available"], true);
+        assert_eq!(saved["readiness"]["executor_available"], false);
+        assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
+        assert_eq!(node.info()["manager_available"], true);
+        let nodes = node
+            .rpc(
+                Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"nodes"}),
+            )
+            .await?;
+        assert_eq!(
+            nodes["nodes"][0]["capabilities"]["roots"],
+            json!([project.canonicalize()?])
+        );
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
+        let persisted = Config::load(&dir)?;
+        assert_eq!(
+            persisted.network.bootstrap_urls,
+            latest.network.bootstrap_urls
+        );
+        assert_eq!(persisted.daily_decision_limit, 11);
+        assert_eq!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&settings)?
+            )
+            .await?["settings"],
+            saved["settings"]
+        );
+        drop(node);
+        let reopened = Runtime::open(&dir).await?;
+        assert_eq!(
+            serde_json::to_value(reopened.settings_snapshot())?,
+            saved["settings"]
+        );
+        drop(reopened);
+        let mut restricted = Config::load(&dir)?;
+        restricted.roles = vec![NodeRole::Relay, NodeRole::Replica];
+        restricted.save(&dir)?;
+        let restricted = Runtime::open(&dir).await?;
+        assert_eq!(
+            restricted.node_settings()?["readiness"]["manager"],
+            "role_unavailable"
+        );
+        assert_eq!(restricted.info()["manager_available"], false);
+        drop(restricted);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn client_route_is_explicit_and_pins_the_destination() -> Result<()> {

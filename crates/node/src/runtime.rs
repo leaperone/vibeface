@@ -32,9 +32,11 @@ mod manager_control;
 mod manager_control_tests;
 mod observation;
 mod schedule_delivery;
+mod settings;
 mod sync;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::ObservationGuard;
+pub use settings::NodeSettings;
 use sync::{HistoryPage, HistoryReply, ReadClass, SyncCoordinator};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
@@ -4124,6 +4126,8 @@ struct RouteFlight {
 
 pub struct Runtime {
     pub config: Config,
+    settings: std::sync::Mutex<NodeSettings>,
+    pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
     pub identities: Arc<IdentityStore>,
@@ -4313,6 +4317,11 @@ impl Runtime {
             tx,
         );
         let node = Self {
+            settings: std::sync::Mutex::new(NodeSettings {
+                roots: config.roots.clone(),
+                manager: config.manager.clone(),
+            }),
+            config_save: Mutex::new(()),
             config,
             identity,
             store,
@@ -4420,7 +4429,19 @@ impl Runtime {
         Ok(merged)
     }
     pub fn info(&self) -> Value {
-        json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
+        let manager_available = self.settings_snapshot().manager.is_some()
+            && self.config.roles.contains(&NodeRole::Scheduler)
+            && self
+                .identities
+                .public_state()
+                .and_then(|state| {
+                    state
+                        .project()?
+                        .authorize_node(&self.identity.peer_id()?, Some(NodeRole::Scheduler))
+                        .map(|_| ())
+                })
+                .is_ok();
+        json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         self.start_schedule_delivery();
@@ -5299,8 +5320,9 @@ impl Runtime {
         ))
     }
     fn capabilities(&self) -> Value {
+        let settings = self.settings_snapshot();
         let manager =
-            self.config
+            settings
                 .manager
                 .as_ref()
                 .and_then(|settings| match settings.provider.as_str() {
@@ -5308,12 +5330,12 @@ impl Runtime {
                     "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk),
                     _ => None,
                 });
-        json!({"roots":self.config.roots,"executors":["codex","claude_code","cursor_agent"],
+        json!({"roots":settings.roots,"executors":["codex","claude_code","cursor_agent"],
             "executor_capabilities":{
                 "codex":{"actions":ExecutorKind::Codex.capabilities(),"verified":false},
                 "claude_code":{"actions":ExecutorKind::ClaudeCode.capabilities(),"verified":false},
                 "cursor_agent":{"actions":ExecutorKind::CursorAgent.capabilities(),"verified":false}},
-            "manager":self.config.manager.as_ref().map(|m|m.provider.clone()),
+            "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
             "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1},
             "history_batch":history_batch_capability()})
     }
@@ -6227,7 +6249,7 @@ impl Runtime {
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
         let path = std::fs::canonicalize(path).context("execution path does not exist")?;
         ensure!(
-            self.config
+            self.settings_snapshot()
                 .roots
                 .iter()
                 .filter_map(|r| std::fs::canonicalize(r).ok())

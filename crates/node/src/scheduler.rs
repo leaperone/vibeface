@@ -92,10 +92,9 @@ pub async fn run(
             .is_none_or(|id| id == &conversation),
         "conversation access denied"
     );
-    let settings = node
-        .config
+    let local_settings = node.settings_snapshot();
+    let settings = local_settings
         .manager
-        .clone()
         .context("this Node has no configured management SDK")?;
     let kind = match settings.provider.as_str() {
         "cursor_sdk" => ManagerKind::CursorSdk,
@@ -146,7 +145,7 @@ pub async fn run(
             (context,tasks,facts,targets)
         };
         ensure!(context.missing.is_complete(), "conversation has missing or conflicting history; synchronize it before scheduling");
-        let mut prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
+        let mut prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &local_settings.roots)?;
         if attempt.read_only { prompt.push_str("\nThis management call is read-only. Read status and summarize existing results for the human; no write tool is authorized.\n"); }
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         let custom_tools = if attempt.read_only { tools().into_iter().filter(|(name,_)| matches!(name.as_str(),"context"|"nodes"|"execution_status"|"call_lookup")).collect() } else { tools() };

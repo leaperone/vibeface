@@ -64,13 +64,11 @@ cargo build --release -p vibeface --locked
 
 `init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 4），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。`serve` 和 `pair` 用目录锁独占该目录。
 
-```sh
-./target/release/vibeface access --data-dir "$HOME/.vibeface"
-```
+在本机可信浏览器打开 `http://localhost:4790`，填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络。初始化材料由本机页面自动取得，无需运行 `access` 或复制邀请。已有网络的节点不会因浏览器未授权而另建网络，新浏览器需要成员邀请或恢复包。`vibeface access --data-dir "$HOME/.vibeface"` 保留为备用入口。
 
-在自己信任的浏览器打开 `access` 打印的链接，填写此浏览器的设备名称，核对你的网络编号，并保存加密恢复包。保存密钥的页面需要安全上下文，推荐 `http://localhost:4790`。之后自动核验设备编号和成员授权，不使用账号密码。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
+保存密钥的页面需要安全上下文，推荐固定使用 `http://localhost:4790`。之后自动核验设备编号和成员授权，不使用账号密码。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
 
-另一台 Node 使用独立的空数据目录先 `init`。管理客户端复制的 base64url 配对信息传给 `pair --invite`。`pair --invite-file` 读取解码后的 JSON 邀请，不是这段原文。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
+另一台 Node 启动后，在它的 localhost 网页选择**使用节点邀请加入**，粘贴原网络管理客户端生成的 Node 邀请。核对并确认本机节点身份与权限，再由原管理客户端批准。Node 入网不授予浏览器管理权限，浏览器使用客户端邀请或恢复包授权。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
 ## 接续工作与通知
 

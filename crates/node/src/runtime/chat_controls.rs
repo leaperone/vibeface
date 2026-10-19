@@ -936,7 +936,8 @@ impl Runtime {
                         .is_some_and(|unresolved| !unresolved.is_empty())
                 })
         }) || jobs.iter().any(|job| job["write_frozen"] == true);
-        let manager = self.config.manager.as_ref();
+        let settings = self.settings_snapshot();
+        let manager = settings.manager.as_ref();
         let capabilities = manager.and_then(|manager| match manager.provider.as_str() {
             "cursor_sdk" => Some(crate::manager::ManagerKind::CursorSdk.capabilities()),
             "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk.capabilities()),
