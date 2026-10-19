@@ -1,5 +1,5 @@
 {
-  "name": "vibeface",
+  "name": "@leaperone/vibeface",
   "version": "0.0.0",
   "private": true,
   "description": "Run a personal Vibeface node on macOS or Linux",

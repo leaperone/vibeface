@@ -56,7 +56,7 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
         );
         ensure!(
             !matches!(action, Action::InstallUpdater),
-            "npm installations are updated with npm install -g vibeface@nightly"
+            "npm installations are updated with npm install -g @leaperone/vibeface@nightly"
         );
         if matches!(action, Action::Install) {
             drop(
@@ -193,7 +193,7 @@ mod tests {
         std::fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
         std::fs::write(
             root.join("package.json"),
-            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
         )
         .unwrap();
         std::fs::write(package.join("vibeface"), b"binary").unwrap();

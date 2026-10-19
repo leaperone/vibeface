@@ -70,7 +70,7 @@ function verifyReceipt(archive, version, sourceCommit) {
 function verify(archive, version, sourceCommit, scratch) {
   const directory = unpack(archive, scratch, 'package');
   const metadata = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8'));
-  assert.equal(metadata.name, 'vibeface');
+  assert.equal(metadata.name, '@leaperone/vibeface');
   assert.equal(metadata.version, version);
   assert.equal(metadata.private, false);
   assert.deepEqual(metadata.bin, { vibeface: 'bin/vibeface.mjs' });
@@ -89,7 +89,7 @@ function pack(input, output, version, sourceCommit) {
   const names = targets.map(target => `vibeface-${version}-${target}.tar.gz`);
   assert.deepEqual(fs.readdirSync(input).sort(), names.flatMap(name => [name, `${name}.sha256`]).sort(), 'expected exactly three native archives and three checksums');
   fs.mkdirSync(output, { recursive: true });
-  assert(!fs.existsSync(path.join(output, `vibeface-${version}.tgz`)), 'npm artifact already exists; use a fresh output directory');
+  assert(!fs.existsSync(path.join(output, `leaperone-vibeface-${version}.tgz`)), 'npm artifact already exists; use a fresh output directory');
   const scratch = fs.mkdtempSync(path.join(output, '.npm-stage-'));
   try {
     const directory = path.join(scratch, 'npm');
@@ -153,12 +153,14 @@ async function selfTest() {
       repack(target);
     }
     const artifact = pack(input, path.join(scratch, 'output'), version, commit);
+    assert.equal(path.basename(artifact), `leaperone-vibeface-${version}.tgz`);
     const artifactBytes = fs.readFileSync(artifact);
     fs.appendFileSync(artifact, 'changed');
     assert.throws(() => verifyReceipt(artifact, version, commit), /SHA256 mismatch/);
     fs.writeFileSync(artifact, artifactBytes);
     const prefix = path.join(scratch, 'prefix');
     run('npm', ['install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', artifact]);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(prefix, 'lib/node_modules/@leaperone/vibeface/package.json'), 'utf8')).name, '@leaperone/vibeface');
     const binary = path.join(prefix, 'bin/vibeface');
     assert.equal(run(binary, ['one two', '--flag']), '["one two","--flag"]\n');
     assert.equal(spawnSync(binary, ['exit']).status, 23);

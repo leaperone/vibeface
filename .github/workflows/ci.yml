@@ -300,7 +300,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package-${{ github.sha }}
-          path: .artifacts/npm/vibeface-*.tgz*
+          path: .artifacts/npm/leaperone-vibeface-*.tgz*
           if-no-files-found: error
           retention-days: 14
 
@@ -336,7 +336,7 @@ jobs:
           PACKAGE_VERSION: ${{ needs.check.outputs.version }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
-          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/vibeface-$PACKAGE_VERSION.tgz"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
           [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
           "$prefix/bin/vibeface" --help
       - name: Verify npm native processes and bundled web
@@ -344,7 +344,7 @@ jobs:
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
-          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --skip-codex
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --skip-codex
 
   publish:
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.check.result == 'success' && needs.package.result == 'success' && (needs.check.outputs.channel != 'nightly' || needs.npm-smoke.result == 'success') }}

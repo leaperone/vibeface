@@ -32,7 +32,7 @@ Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和�
 npm Nightly 分发已配置，包尚未公开发布。首次发布后使用：
 
 ```sh
-npm install -g vibeface@nightly
+npm install -g @leaperone/vibeface@nightly
 vibeface --version
 ```
 

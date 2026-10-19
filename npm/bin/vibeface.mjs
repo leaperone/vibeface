@@ -15,7 +15,7 @@ if (!target || (process.platform === 'linux' && !process.report.getReport().head
 }
 const binary = fileURLToPath(new URL(`../vendor/${target}/vibeface`, import.meta.url));
 if (!existsSync(binary)) {
-  console.error('The Vibeface native package is incomplete. Reinstall with npm install -g vibeface@nightly.');
+  console.error('The Vibeface native package is incomplete. Reinstall with npm install -g @leaperone/vibeface@nightly.');
   process.exit(1);
 }
 

@@ -7,12 +7,12 @@ Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌�
 Node.js 22+ 可通过 npm 安装 Nightly。npm 包尚未公开发布，首次发布后使用：
 
 ```sh
-npm install -g vibeface@nightly
+npm install -g @leaperone/vibeface@nightly
 vibeface --version
 vibeface
 ```
 
-一个 npm 包包含三个平台的完整程序及随包资源，按本机平台启动 Rust 程序。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。发布前从 PR 的 `npm-package-<SHA>` CI artifact 下载 `.tgz`，可用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/vibeface-<version>.tgz` 隔离安装。
+一个 npm 包包含三个平台的完整程序及随包资源，按本机平台启动 Rust 程序。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。发布前从 PR 的 `npm-package-<SHA>` CI artifact 下载 `.tgz`，可用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
 
 初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝仍被运行中节点锁定的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。
 
@@ -20,7 +20,7 @@ npm 安装由 npm 更新，内建 `update apply`、`update check`、`update conf
 
 ```sh
 vibeface service stop
-npm install -g vibeface@nightly
+npm install -g @leaperone/vibeface@nightly
 vibeface service start
 vibeface status
 ```

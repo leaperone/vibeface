@@ -118,12 +118,12 @@ PR、main 和 Nightly tag 的 CI 都生成 `npm-package-<SHA>` artifact，包含
 ```sh
 node scripts/package-npm.mjs --self-test
 node scripts/package-npm.mjs --input /absolute/path/to/verified-packages --source-commit <full-commit-sha>
-node scripts/package-npm.mjs --verify /absolute/path/to/vibeface-<version>.tgz --source-commit <full-commit-sha>
+node scripts/package-npm.mjs --verify /absolute/path/to/leaperone-vibeface-<version>.tgz --source-commit <full-commit-sha>
 ```
 
 `npm-publish.yml` 只接受手动触发，不在 PR、merge 或 tag 时自动向 npm 发布。默认 `publish=false`，从成功的对应 tag CI 下载已验收制品，重新核对身份并执行 `npm publish --dry-run`。发布阶段不重新构建另一份包。
 
-未来首次公开发布前，先确认 npm 包名权限，在 npm 自己的登录流程中完成认证，并对审核过的 tag 制品执行一次人工 bootstrap。不要把 npm token 发到聊天或写入仓库。首次发布命令是 `npm publish /absolute/path/to/vibeface-<version>.tgz --tag nightly --access public --ignore-scripts`。
+未来首次公开发布前，先确认 `@leaperone/vibeface` 的 npm scope 权限，在 npm 自己的登录流程中完成认证，并对审核过的 tag 制品执行一次人工 bootstrap。不要把 npm token 发到聊天或写入仓库。首次发布命令是 `npm publish /absolute/path/to/leaperone-vibeface-<version>.tgz --tag nightly --access public --ignore-scripts`。
 
 包存在后，在 npm 配置 GitHub trusted publisher，仓库为 `leaperone/vibeface`，workflow 文件为 `npm-publish.yml`，环境为 `npm-release`。GitHub 的同名 environment 应配置 required reviewers；该远端设置不由工作流文件自动保证。CI 使用 Node.js 24 内置的新版 npm 与 OIDC，不存长期 npm token。
 

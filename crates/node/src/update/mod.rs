@@ -140,7 +140,7 @@ pub fn npm_install_root(executable: &Path) -> Result<Option<PathBuf>> {
     let npm: NpmPackage = serde_json::from_slice(&fs::read(root.join("package.json"))?)
         .context("invalid npm package metadata")?;
     ensure!(
-        npm.name == "vibeface"
+        npm.name == "@leaperone/vibeface"
             && npm.version == manifest(package)?.version
             && root.join("bin/vibeface.mjs").is_file()
             && executable
@@ -177,7 +177,7 @@ pub async fn run(options: Update) -> Result<()> {
                 automatic: true, ..
             } => return Ok(()),
             _ => bail!(
-                "npm owns this installation; wait for idle, stop any node service, then run npm install -g vibeface@nightly and restart the service"
+                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@nightly and restart the service"
             ),
         }
     }
@@ -961,7 +961,7 @@ mod tests {
         fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
         fs::write(
             root.join("package.json"),
-            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -970,8 +970,9 @@ mod tests {
         );
         for metadata in [
             r#"{"name":"another-package","version":"1.2.3-nightly.20261019.1"}"#,
-            r#"{"name":"vibeface","version":"2.0.0"}"#,
-            r#"{"name":"vibeface"}"#,
+            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"2.0.0"}"#,
+            r#"{"name":"@leaperone/vibeface"}"#,
         ] {
             fs::write(root.join("package.json"), metadata).unwrap();
             assert!(npm_install_root(&native.join("vibeface")).is_err());

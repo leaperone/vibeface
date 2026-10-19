@@ -3,7 +3,7 @@
 Install Node.js 22 or newer, then install the Nightly CLI:
 
 ```sh
-npm install -g vibeface@nightly
+npm install -g @leaperone/vibeface@nightly
 vibeface --version
 vibeface
 ```
@@ -16,7 +16,7 @@ npm owns updates for this installation. The Rust self-updater is disabled. Befor
 
 ```sh
 vibeface service stop
-npm install -g vibeface@nightly
+npm install -g @leaperone/vibeface@nightly
 vibeface service start
 vibeface status
 ```
