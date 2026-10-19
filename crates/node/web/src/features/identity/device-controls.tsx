@@ -20,7 +20,7 @@ const roleLabels: Record<NodeRole, string> = {
 const nodeRoles: NodeRole[] = ['relay', 'replica', 'gateway', 'scheduler', 'executor']
 
 function entryKey(entry: ConnectionEntry) {
-  return `${entry.address}|${entry.peer_id}|${entry.relay}`
+  return `${entry.address}|${entry.peer_id}`
 }
 
 function MemberDetails({ member, compact = false }: { member: Member; compact?: boolean }) {
@@ -53,7 +53,6 @@ export function DeviceControls() {
   const [status, setStatus] = useState('')
   const [address, setAddress] = useState('')
   const [peerId, setPeerId] = useState('')
-  const [relay, setRelay] = useState(false)
   const [inviteKind, setInviteKind] = useState<'client' | 'node'>('client')
   const [roles, setRoles] = useState<NodeRole[]>(['relay'])
   const [invitation, setInvitation] = useState('')
@@ -200,7 +199,7 @@ export function DeviceControls() {
           <p className="text-xs text-muted-foreground">切换入口会结束当前连接。</p>
           {entries.length > 0 && <ul className="space-y-3">
             {entries.map((entry) => <li key={entryKey(entry)} className="space-y-3 rounded-lg bg-muted/50 p-3">
-              <p className="break-all text-sm">{entry.address}<span className="ml-2 text-xs text-muted-foreground">{entry.relay ? '中继' : '直连'}</span></p>
+              <p className="break-all text-sm">{entry.address}</p>
               <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" className={button} disabled={busy || (ready !== null && entryKey(entry) === entryKey(ready.entry))} onClick={() => void run(() => device.connect(entry))}>
@@ -217,14 +216,13 @@ export function DeviceControls() {
             event.preventDefault()
             setError('')
             try {
-              device.saveEntry({ address: address.trim(), peer_id: peerId.trim(), relay })
-              setAddress(''); setPeerId(''); setRelay(false); setStatus('入口已保存。')
+              device.saveEntry({ address: address.trim(), peer_id: peerId.trim() })
+              setAddress(''); setPeerId(''); setStatus('入口已保存。')
             } catch (failure: unknown) { setError(failure instanceof Error ? failure.message : '无法保存入口，请检查地址和设备编号。') }
           }}>
             <h3 className="text-sm font-medium">添加入口</h3>
             <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="entry-address" autoComplete="url" required placeholder="http://192.168.0.99:4790" value={address} onChange={(event) => setAddress(event.target.value)} /></label>
             <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="entry-peer-id" autoComplete="off" autoCapitalize="none" spellCheck={false} pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备编号" required value={peerId} onChange={(event) => setPeerId(event.target.value)} /></label>
-            <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={relay} onChange={(event) => setRelay(event.target.checked)} />通过入口中继到目标节点</label>
             <Button type="submit" className={button} disabled={busy}>保存入口</Button>
           </form>
         </CollapsibleContent>
@@ -241,7 +239,7 @@ export function DeviceControls() {
             <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的设备编号</dt><dd className="break-all font-mono">{identity?.peerId || '正在读取'}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的公钥</dt><dd className="break-all font-mono">{identity?.publicKey || '正在读取'}</dd></div>
             {ready && <>
-              <div className="space-y-1"><dt className="text-muted-foreground">入口地址</dt><dd className="break-all">{ready.entry.address}{ready.entry.relay ? ' · 经中继连接' : ' · 直接连接'}</dd></div>
+              <div className="space-y-1"><dt className="text-muted-foreground">入口地址</dt><dd className="break-all">{ready.entry.address}</dd></div>
               <div className="space-y-1"><dt className="text-muted-foreground">Peer ID</dt><dd className="break-all font-mono">{ready.entry.peer_id}</dd></div>
             </>}
           </dl>

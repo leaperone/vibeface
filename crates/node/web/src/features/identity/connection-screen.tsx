@@ -66,8 +66,7 @@ export function ConnectionScreen() {
   function connect(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    const relay = form.elements.namedItem('relay')
-    void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id'), relay: relay instanceof HTMLInputElement && relay.checked })))
+    void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id') })))
   }
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -116,8 +115,8 @@ export function ConnectionScreen() {
       </Card>}
       {!focused && active === 'saved' && <Card className={panel} aria-labelledby="saved-entries-title">
         <h2 id="saved-entries-title" className="font-semibold">{device.entries.length === 1 ? '已保存的入口' : '选择已保存的入口'}</h2>
-        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.peer_id}:${entry.relay}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
-          <div className="flex flex-wrap items-center justify-between gap-3"><p className="min-w-0 break-all text-sm">{entry.address}<span className="ml-2 text-xs text-muted-foreground">{entry.relay ? '中继' : '直连'}</span></p><Button className={button} type="button" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>{device.entries.length === 1 && device.phase === 'connecting' ? '正在连接' : '连接'}</Button></div>
+        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.peer_id}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-3"><p className="min-w-0 break-all text-sm">{entry.address}</p><Button className={button} type="button" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>{device.entries.length === 1 && device.phase === 'connecting' ? '正在连接' : '连接'}</Button></div>
           <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
         </li>)}</ul>
         {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
@@ -145,7 +144,6 @@ export function ConnectionScreen() {
           <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
             <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} placeholder="http://192.168.0.99:4790" /></label>
             <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="peer_id" required pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
-            <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" name="relay" />通过入口中继到目标节点</label>
             <Button className={button} type="submit">连接</Button>
           </fieldset>
         </form>

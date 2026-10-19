@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { createContext, Script } from 'node:vm'
 import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import { createHash } from 'node:crypto'
+import initCrypto, { Identity, Handshake, verify } from '../../../generated/vibeface_secure.js'
 import type { ConnectionEntry } from '../../lib/node.ts'
 import { primaryLane, shouldAutoConnect } from './connection-lane.ts'
 
@@ -21,7 +22,7 @@ test('one saved entry connects itself, and several entries stay listed', () => {
 })
 
 const target = 'a'.repeat(64), network = 'b'.repeat(64), subject = 'c'.repeat(64), publicKey = 'd'.repeat(64)
-const entry: ConnectionEntry = { address: 'https://node.example', peer_id: target, relay: true }
+const entry: ConnectionEntry = { address: 'https://node.example', peer_id: target }
 const genesis = { version: 1, network_id: network, owner_public_key: publicKey }
 const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1 }
 const canonical = (value: unknown): string => value && typeof value === 'object'
@@ -331,5 +332,133 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
     assert.equal(app.timers.size, 0)
     assert.equal(app.calls.filter(call => call === `open:${target}`).length, 2)
     assert.equal(app.calls.filter(call => ['bootstrap', 'pair_request', 'rpc'].includes(call)).length, 0)
+  } finally { app.close() }
+})
+
+
+async function routeHarness({ invalid = '', hold = false, secure = false } = {}) {
+  await initCrypto({ module_or_path: readFileSync(new URL('../../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
+  const client = Identity.generate(), targetKey = Identity.generate()
+  const targetUrl = `${secure ? 'wss' : 'ws'}://target.example/custom/network`
+  const now = Math.floor(Date.now() / 1000)
+  const record = { peer_id: targetKey.peerId(), public_key: targetKey.publicKeyHex(), direct_urls: ['ws://offline.example/path'], relay_urls: [targetUrl], issued_at: now, expires_at: now + 120, signature: '' }
+  record.signature = targetKey.sign('reachability', new TextEncoder().encode(JSON.stringify(record)))
+  if (invalid === 'signature') record.relay_urls = ['ws://attacker.example/path']
+  if (invalid === 'expired') record.expires_at = now - 1
+  if (invalid === 'target') record.peer_id = 'f'.repeat(64)
+  const sockets = new Set<RecordSocket>(), routes: string[] = [], controls: Record<string, unknown>[] = []
+  let maximum = 0, data = 0, closedEvents = 0
+  class RecordSocket extends EventTarget {
+    binaryType = 'arraybuffer'
+    dead = false
+    handshake: Handshake | undefined
+    channel: ReturnType<Handshake['finish']> | undefined
+    isData = false
+    readonly url: string
+    constructor(url: string) {
+      super(); this.url = url; sockets.add(this)
+      queueMicrotask(() => this.emit(JSON.stringify({ type: 'welcome', nonce: 'a'.repeat(64) })))
+    }
+    emit(value: unknown) { if (!this.dead) this.dispatchEvent(new MessageEvent('message', { data: value })) }
+    encrypted(value: Uint8Array) { const copy = new Uint8Array(value); queueMicrotask(() => this.emit(copy.buffer)) }
+    send(value: string | Uint8Array) {
+      if (typeof value === 'string') {
+        const message = JSON.parse(value); controls.push(message)
+        if (message.type === 'lookup') { if (!hold) queueMicrotask(() => this.emit(JSON.stringify({ type: 'record', record }))); return }
+        routes.push(this.url); this.isData = true; data++; maximum = Math.max(maximum, data)
+        if (hold) return
+        if (this.url !== targetUrl) { queueMicrotask(() => this.close()); return }
+        this.handshake = new Handshake(false, targetKey.secretHex(), undefined, new TextEncoder().encode('vibeface:client:v1'))
+        queueMicrotask(() => this.emit(JSON.stringify({ type: 'ready' })))
+        return
+      }
+      if (this.handshake) {
+        this.handshake.read(value)
+        if (this.handshake.isFinished()) { this.channel = this.handshake.finish(); this.handshake.free(); this.handshake = undefined }
+        else this.encrypted(this.handshake.write(new Uint8Array()))
+      } else if (this.channel) {
+        const request = this.channel.openRecord(value)
+        if (request) for (const frame of this.channel.sealMessage(new TextEncoder().encode(JSON.stringify({ id: JSON.parse(new TextDecoder().decode(request)).id, result: { peer_id: targetKey.peerId() } })))) this.encrypted(frame)
+      }
+    }
+    close() {
+      if (this.dead) return
+      this.dead = true; sockets.delete(this); if (this.isData) data--
+      this.handshake?.free(); this.channel?.free(); this.dispatchEvent(new Event('close'))
+    }
+  }
+  const source = readFileSync(new URL('../../../transport.js', import.meta.url), 'utf8').replace(/^import .*\n/, '').replace(/^export /gm, '')
+  const runtime = new Script(`${source}\nidentity = testIdentity; ({ connectDevice });`).runInNewContext({
+    init: initCrypto, Identity, Handshake, verify, testIdentity: client, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
+    WebSocket: RecordSocket, URL, crypto: globalThis.crypto, location: { protocol: secure ? 'https:' : 'http:' }, AbortController, setTimeout, clearTimeout,
+  })
+  return {
+    entry: { address: `${secure ? 'https' : 'http'}://entry.example`, peer_id: targetKey.peerId() }, controls, routes,
+    connect(signal?: AbortSignal) { return runtime.connectDevice(this.entry, { signal, onClose() { closedEvents++ } }) },
+    maximum: () => maximum, closedEvents: () => closedEvents, open: () => sockets.size,
+    close() { for (const socket of [...sockets]) socket.close(); client.free(); targetKey.free() },
+  }
+}
+
+test('automatic transport verifies a signed other-entry path, authenticates the target, and closes only the selected session', async () => {
+  const app = await routeHarness()
+  try {
+    const channel = await app.connect()
+    assert.equal(channel.peerId, app.entry.peer_id)
+    assert.equal((await channel.request('info')).peer_id, app.entry.peer_id)
+    assert.equal(app.controls.find(message => message.type === 'dial')?.target, app.entry.peer_id)
+    assert.equal(app.routes.includes('ws://target.example/custom/network'), true)
+    assert.equal(app.routes.includes('ws://offline.example/path'), true)
+    assert.ok(app.maximum() <= 2)
+    assert.equal(app.closedEvents(), 0)
+    channel.close(); await settle()
+    assert.equal(app.closedEvents(), 1)
+    assert.equal(app.open(), 0)
+  } finally { app.close() }
+})
+
+for (const invalid of ['signature', 'expired', 'target']) test(`automatic transport rejects a ${invalid} directory record without opening its candidates`, async () => {
+  const app = await routeHarness({ invalid })
+  try {
+    await assert.rejects(app.connect())
+    assert.deepEqual(app.routes, ['ws://entry.example/api/network/ws'])
+    assert.equal(app.closedEvents(), 0)
+    assert.equal(app.open(), 0)
+  } finally { app.close() }
+})
+
+test('cancelling automatic transport releases the active route and directory query', async () => {
+  const app = await routeHarness({ hold: true }), controller = new AbortController()
+  try {
+    const connecting = app.connect(controller.signal)
+    const rejected = assert.rejects(connecting, /取消/)
+    await settle(); controller.abort(); await rejected; await settle()
+    assert.equal(app.open(), 0)
+    assert.equal(app.closedEvents(), 0)
+  } finally { app.close() }
+})
+
+test('saved current-format route preferences collapse into one target without losing its identity', async () => {
+  const app = deviceHarness()
+  try {
+    app.stored.set('vibeface.connections', JSON.stringify([{ ...entry, relay: false }, { ...entry, relay: true }]))
+    app.render(); await settle()
+    const entries = app.render().entries
+    assert.equal(entries.length, 1)
+    assert.equal(entries[0].peer_id, entry.peer_id)
+    assert.equal(Object.hasOwn(entries[0], 'relay'), false)
+  } finally { app.close() }
+})
+
+
+test('a secure page skips an unusable insecure candidate while retaining its signed secure relay', async () => {
+  const app = await routeHarness({ secure: true })
+  try {
+    const channel = await app.connect()
+    assert.equal((await channel.request('info')).peer_id, app.entry.peer_id)
+    assert.equal(app.routes.includes('ws://offline.example/path'), false)
+    assert.equal(app.routes.includes('wss://target.example/custom/network'), true)
+    channel.close(); await settle()
+    assert.equal(app.open(), 0)
   } finally { app.close() }
 })
