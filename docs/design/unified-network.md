@@ -1,14 +1,15 @@
 # 统一网络、同步与身份设计
 
-状态为草案，供审阅。本文以 `origin/main` 的 `62f52f0` 为现状，并假定四项改动已经合入。它们是 #54 删除向后兼容，#55 删除 Task 并新增会话级 `set_autonomy`，#56 修复审批旁路，以及统一待核对（调度 job 不再有 `unknown` 和写冻结，只保留本机待核对记录）。文中的行数用 `wc -l` 在该提交上统计，标为“约”的数字是按函数范围估算的生产代码行数。
+状态为已批准的设计。本文以 `origin/main` 的 `1bdf6fd` 为现状，该提交已包含 #55（删除 Task，新增会话级 `set_autonomy`）和 #56（Node 的 `codex` 工具取代 `vibeface codex` 命令，并强制原生审批策略）。本文另外假定两项改动会先合入，即 #54 删除向后兼容，以及统一待核对（调度 job 不再有 `unknown` 和写冻结，只保留本机待核对记录）。文中的行数用 `wc -l` 在 `1bdf6fd` 上统计，标为“约”的数字是按函数范围估算的生产代码行数。第 9 节记录已经决定的事项。
 
 ## 1. 目标与非目标
 
-Vibeface 现在用自研的 WebSocket 会合目录、relay 预约、Presence 多跳转发和 Noise 通道连接设备，用按会话 heads 的闭包拉取同步 DAG，每次写入都全量验签并重建投影，加入一台设备要两端核对多个 64 位编号。本设计把传输换成 iroh，把同步改成每设备一条签名日志加版本向量，把 DAG 收窄为本人能看到的对话和工作记录，并把所有设备的加入统一成一种 ticket 加 6 位短码。项目尚未发布正式版，协议、数据格式、API 和数据目录直接改成最终形态。
+Vibeface 现在用自研的 WebSocket 会合目录、relay 预约、Presence 多跳转发和 Noise 通道连接所有设备，用按会话 heads 的闭包拉取同步 DAG，每次写入都全量验签并重建投影，加入一台设备要两端核对多个 64 位编号。本设计把 Node 之间的传输换成 iroh，浏览器保留到 Node 的 Noise 端到端加密，把同步改成每设备一条签名日志加版本向量，把 DAG 收窄为本人能看到的对话和工作记录，并把所有设备的加入统一成一种 ticket 加 6 位短码。项目尚未发布正式版，协议、数据格式、API 和数据目录直接改成最终形态。
 
 目标：
 
-- 节点身份、打洞、relay 和加密传输全部由 iroh 提供，删除 `network.rs`、`peer.rs` 和 Noise 通道。
+- Node 之间的身份、打洞、relay 和加密传输全部由 iroh 提供，删除 `network.rs`、`peer.rs` 和 Node 之间的 Noise 链路。
+- 浏览器经 Node 的 WebSocket 网关接入，网关之上仍运行浏览器与 Node 的 Noise 握手，这是唯一保留的 Noise 链路。
 - 设备编号就是设备的 Ed25519 公钥，Node 的设备编号等于 iroh `EndpointId`。
 - 同步只交换 `{设备: 最大序号}`，按 `(作者, 起始序号)` 批量拉取，事件入库时验签一次，投影增量更新。
 - 任何 Web 入口和任何调度节点看到同一份会话上下文，协调层每轮上下文只从 DAG 构造。
@@ -29,7 +30,7 @@ flowchart LR
 		W[网页 SPA<br>不可导出的设备 CryptoKey]
 	end
 	subgraph GW[公网 Gateway Node]
-		GH[HTTPS 网页与 /api/client]
+		GH[HTTPS 网页与 /api/client<br>WebSocket 网关]
 		GR[iroh relay]
 		GE[iroh Endpoint<br>Replica]
 	end
@@ -42,7 +43,7 @@ flowchart LR
 		LE[iroh Endpoint<br>Replica]
 		LX[Codex App Server]
 	end
-	W -->|WSS，设备签名认证| GH
+	W -->|WSS 内的 Noise，端到端到目标 Node| GH
 	GH --- GE
 	GE <-->|QUIC，直连或经 relay| ME
 	GE <-->|QUIC，直连或经 relay| LE
@@ -56,9 +57,9 @@ flowchart LR
 
 每台 Node 运行一个 iroh `Endpoint`，用自己的设备密钥作为 `SecretKey`。Node 之间只走 iroh QUIC，连接优先打洞直连，失败时经 relay 转发密文。启用 `relay` 的 Node 同时运行 iroh relay 服务，个人网络的其他 Node 把它作为 home relay。
 
-浏览器不运行 iroh。它通过 HTTPS 页面所在的 Gateway Node 的 `/api/client` WebSocket 接入，用设备 CryptoKey 签名认证。Gateway 用本机副本回答读请求，把需要其他节点处理的控制请求经 iroh 转给目标 Node。第 4 节说明这个选择。
+浏览器不运行 iroh。它连接 HTTPS 页面所在 Gateway Node 的 `/api/client` WebSocket，在其上与目标 Node 完成 Noise 握手。目标就是 Gateway 时，Noise 在 Gateway 终止。目标是另一台 Node 时，Gateway 经 iroh 的 `vibeface/client/1` 原样转发 Noise 密文，Gateway 和它前面的 TLS 终止方都看不到明文。第 4.3 节说明这条链路。
 
-执行层是各 Node 本机的 Codex App Server。执行层的内部事件只在本机观察和实时展示，DAG 只记录派发、阶段变化、审批和结果。
+跨设备工作有两条路径。一条是委派目标 Node 上的 Codex App Server，另一条是把任务发给目标 Node 的协调 Agent，由它用本机工具执行。两条路径的内部事件都只在本机观察和实时展示，DAG 只记录派发、阶段变化、审批和结果。第 6 节说明两条路径的授权和审批边界。
 
 ## 3. 身份与加入
 
@@ -72,7 +73,7 @@ flowchart LR
 
 现在的 `peer_id` 是公钥的 SHA256（`crates/node/src/crypto.rs:159`，`crates/secure/src/lib.rs:57`），`network_id` 是根公钥的 SHA256（`membership.rs:20`）。改造后不再取哈希，编号本身就是公钥，验签时不需要另查 `node_certificates` 表把编号换成公钥。Node 的 `DeviceId` 等于它的 iroh `EndpointId`，因此 iroh 连接的 `Connection::remote_id()` 直接给出已经由 TLS 证明的设备编号。
 
-浏览器的设备密钥是不可导出的 WebCrypto Ed25519 `CryptoKey`，它只用于签名，不参与传输加密。内部类型统一为 `DeviceId`，JSON 字段统一为 `device_id`，`peer_id`、`subject_id` 和 `PeerId` 全部删除。`target_node`、`scheduler_node` 这类表示角色用途的字段名保留，类型改为 `DeviceId`。
+浏览器的设备密钥是不可导出的 WebCrypto Ed25519 `CryptoKey`。它只用于签名，包括对每次会话的 Noise 临时静态密钥签名，自身不参与加密运算。内部类型统一为 `DeviceId`，JSON 字段统一为 `device_id`，`peer_id`、`subject_id` 和 `PeerId` 全部删除。`target_node`、`scheduler_node` 这类表示角色用途的字段名保留，类型改为 `DeviceId`。
 
 ### 3.2 成员目录
 
@@ -137,7 +138,7 @@ Ticket {
 
 ### 3.4 加入流程
 
-所有设备走同一个流程。新设备 J 可以是浏览器、手机或 Node，入口 E 是 ticket 中的 Node，A 是批准加入的管理设备。浏览器 J 经 E 的 `/api/client` 连接，Node J 经 iroh `vibeface/join/1` 连接。两种连接都先核对 E 的设备编号等于 ticket 中的 `entry.id`。
+所有设备走同一个流程。新设备 J 可以是浏览器、手机或 Node，入口 E 是 ticket 中的 Node，A 是批准加入的管理设备。浏览器 J 经 E 的 `/api/client` 与 E 完成 Noise 握手，Node J 经 iroh `vibeface/join/1` 连接。两种连接都先核对 E 的设备编号等于 ticket 中的 `entry.id`，浏览器依据 E 的 Noise `Proof`，Node 依据 iroh 的 `remote_id()`。
 
 ```mermaid
 sequenceDiagram
@@ -191,9 +192,9 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 
 ### 3.6 本机会话与浏览器密钥
 
-本机会话改用固定端口。`config.json` 新增 `local_listen`，默认 `127.0.0.1:4791`。现在的本机会话每次启动绑定 `127.0.0.1:0` 随机端口（`crates/node/src/api.rs:115-124`），origin 每次不同，浏览器按 origin 隔离的存储随之丢失。固定端口后 origin 稳定，cookie 和本机的 CryptoKey 可以长期保留。本机会话的其他约束不变，仍只接受实际 loopback 来源、字面 Host 和精确 Origin，仍不授予成员资格和管理权。本机会话不再执行 Noise 握手，loopback 连接不需要传输加密。
+本机会话改用固定端口。`config.json` 新增 `local_listen`，默认 `127.0.0.1:4791`。现在的本机会话每次启动绑定 `127.0.0.1:0` 随机端口（`crates/node/src/api.rs:115-124`），origin 每次不同，浏览器按 origin 隔离的存储随之丢失。固定端口后 origin 稳定，cookie 和本机的 CryptoKey 可以长期保留。本机会话的其他约束不变，仍只接受实际 loopback 来源、字面 Host 和精确 Origin，仍不授予成员资格和管理权。本机会话仍在 `/api/local/ws` 上执行与 4.3 节相同的 Noise 握手，cookie 绑定浏览器的设备编号。
 
-浏览器设备密钥改为 `crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign"])` 生成的不可导出 `CryptoKey`，存入 IndexedDB。现在的实现把十六进制明文种子存在 IndexedDB `vibeface-device` 库（`crates/node/web/transport.js:45-101`），页面脚本可以读出。改造后脚本只能请求签名，不能读出私钥。WASM 只负责构造规范签名字节，签名调用 WebCrypto。恢复包解锁出的根私钥只在 WASM 内存中使用一次，签完 `RootCheckpoint` 后清零。
+浏览器设备密钥改为 `crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign"])` 生成的不可导出 `CryptoKey`，存入 IndexedDB。现在的实现把十六进制明文种子存在 IndexedDB `vibeface-device` 库（`crates/node/web/transport.js:45-101`），页面脚本可以读出。改造后脚本只能请求签名，不能读出私钥。WASM 只负责构造规范签名字节和 Noise 握手，签名调用 WebCrypto。恢复包解锁出的根私钥只在 WASM 内存中使用一次，签完 `RootCheckpoint` 后清零。
 
 ### 3.7 步骤与核对次数对比
 
@@ -219,7 +220,7 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 依赖固定 `iroh` 1.x（调研时最新为 1.3.0）。每台 Node 启动一个 `Endpoint`：
 
 - `secret_key` 为本机设备密钥，与事件签名共用同一把 Ed25519 密钥。事件签名带 `vibeface:event:v1:` 域前缀，与 TLS 用途隔离。
-- `relay_mode` 为 `RelayMode::Custom`，内容来自 `config.json` 的 `network.relays`，默认是个人网络中启用 `relay` 的 Node。
+- `relay_mode` 为 `RelayMode::Custom`，内容来自 `config.json` 的 `network.relays`，默认只包含个人网络中启用 `relay` 的 Node。n0 公共 relay 只有在配置中手动打开 `network.n0_relays` 后才加入。
 - 地址查找使用 `MemoryLookup`。地址来源是 ticket 中的 `entry`、成员 Node 之间交换的签名地址簿和可选的 mDNS（`iroh-mdns-address-lookup`）。默认不向 n0 的 DNS 或 pkarr 发布地址，公共目录不会出现个人设备。
 - `Router` 按 ALPN 分发连接，每个 ALPN 一个 `ProtocolHandler`。
 
@@ -230,7 +231,7 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 | 会合目录、`Reachability` 签名记录、`lookup`/`publish` | `EndpointAddr`、`MemoryLookup`、成员间地址簿 |
 | relay 预约、attach 通道、电路额度 | `iroh-relay` 及其 `AccessControl` |
 | 拨号竞速、`PathQueue`、250 毫秒直连领先 | QUIC multipath，打洞与 relay 是同一连接的不同 path |
-| Noise XX、`Channel` 分片 | QUIC TLS 1.3，`remote_id()` 即对端 `DeviceId` |
+| Node 之间的 Noise XX 与 `PeerHub` 握手 | QUIC TLS 1.3，`remote_id()` 即对端 `DeviceId`。浏览器与 Node 之间的 Noise 保留，见 4.3 节 |
 | Presence 多跳转发、探索邻居 | 删除。任意两台 Node 直接连接，连不上时经 relay |
 | 按 IP 的 socket 准入 `network/admission.rs` | relay 与 QUIC 自带限流，客户端网关只保留连接数上限 |
 
@@ -241,30 +242,34 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 | `vibeface/sync/1` | 交换版本向量，按 `(作者, 起始序号)` 拉取事件，推送新事件通知，同步成员目录 | 未撤销的成员 Node |
 | `vibeface/blob/1` | 按内容哈希和偏移读取附件 | 未撤销的成员 Node |
 | `vibeface/rpc/1` | 调度投递、工作派发、中断、审批回答转发、状态查询、实时进度订阅、地址簿交换 | 未撤销的成员 Node |
+| `vibeface/client/1` | Gateway 转发浏览器与目标 Node 之间的 Noise 密文 | 未撤销的成员 Node |
 | `vibeface/join/1` | `join` 和 `join_status` | 任意对端，每个连接只能调用这两个方法，按 ticket 限流 |
 
 每个 ALPN 内部使用 QUIC 双向流，一次请求一条流，帧为长度前缀的 JSON。请求 ID 只用于匹配响应，写操作的去重仍依靠业务 ID。
 
 ### 4.3 浏览器接入
 
-可选方案有三种。浏览器可以经 iroh relay 的 WebSocket 直接连目标 Node，可以连 Node 提供的 WebSocket 网关，也可以在浏览器中运行 iroh 的 wasm 构建。第一种和第三种实际是同一条路径，iroh 的浏览器构建只能经 relay 的 WebSocket 通信，不能打洞。
+浏览器经 Node 的 WebSocket 网关接入，网关之上运行浏览器与目标 Node 的 Noise 握手。这是设计决定，记录在第 9 节。Noise 只保留在浏览器与 Node 之间，Node 与 Node 之间只用 iroh。
 
-推荐 Node 提供 WebSocket 网关。浏览器打开 Gateway Node 的 HTTPS 页面，连接同源的 `/api/client`，流程如下：
+连接过程如下：
 
-1. 网关发送随机 `challenge` 和自己的 `DeviceId`，并用设备密钥签名 `challenge ‖ origin`。
-2. 浏览器核对网关编号等于已保存的入口编号，再用 CryptoKey 签名 `challenge ‖ 网关 DeviceId ‖ origin`，发送自己的 `device_id`。
-3. 网关核对成员目录，建立会话。之后的 RPC 和 `changed` 推送都在这个 WebSocket 上传输。
+1. 浏览器打开 Gateway Node 的 HTTPS 页面，连接同源的 `/api/client` WebSocket，首帧为 `{ "type": "connect", "target": "DEVICE_ID" }`。
+2. `target` 等于 Gateway 自己时，Noise 在 Gateway 终止。`target` 是另一台成员 Node 时，Gateway 经 iroh 的 `vibeface/client/1` 打开一条流，双向原样转发二进制帧，不解析内容。
+3. 浏览器与目标 Node 执行 Noise XX 握手，协议仍为 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。
+4. 握手完成后，RPC 和 `changed` 推送都是 Noise 加密记录，大消息仍按现有 `Channel` 分片重组。
 
-选择网关的理由有四条：
+设备签名密钥与 Noise 静态密钥的关系如下：
 
-- 浏览器上的 iroh 只能走 relay，相比网关没有穿透优势，Gateway 本身就是 iroh 节点。
-- 不可导出的 CryptoKey 不能作为 iroh 的 TLS 密钥，浏览器的设备认证无论如何都要在应用层再做一次。
-- 网页必须来自安全上下文的 origin，这个 origin 就是 Gateway Node，所以用户本来就依赖它。
-- Gateway 是本人的 Replica，已经保存全部明文副本。浏览器到它之间再加一层端到端加密，不会给已同步的数据增加保密性。审批回答、用户消息等写操作带浏览器设备签名，网关不能伪造。
+- 双方每次会话都新生成一对 X25519 Noise 静态密钥，会话结束即丢弃。浏览器的这对密钥只存在 WASM 内存中。
+- 双方在握手 payload 中携带 `Proof { device_id, signature }`。`signature` 是设备 Ed25519 签名密钥对 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次 Noise 静态公钥` 的签名。
+- 浏览器的签名由不可导出的 `CryptoKey` 经 `crypto.subtle.sign("Ed25519", ...)` 产生，WASM 只提供待签字节。Node 的签名使用它的设备密钥，也就是 iroh 的 `SecretKey`。
+- 浏览器用钉住的目标 `DeviceId` 验证 Node 的 `Proof`，不一致时关闭连接。目标 Node 验证浏览器的 `Proof`，再按成员目录授权。未加入的设备只能调用 `join` 和 `join_status`。
 
-网关方案的代价是 Gateway 之前的 TLS 终止方能看到明文。例如把 Gateway 放在第三方 CDN 或隧道之后，该第三方能读取浏览器流量。现在的 Noise 通道能防住这种情况。第 9 节把这一点列为待决定项。
+这样设备私钥从不参与加密运算，也从不离开 `CryptoKey`，泄露一次会话的 Noise 密钥不影响其他会话。`crates/secure/src/lib.rs` 的 `Handshake` 和 `Channel` 保留给这条链路。`Handshake` 改为先输出本次静态公钥，再接收外部签名的 `Proof`，不再持有设备私钥（现在由 `Identity` 在 crate 内签名，`lib.rs:109-284`）。
 
-需要其他 Node 处理的请求，例如回答某台 Node 上的审批或中断某个工作，由网关经 `vibeface/rpc/1` 转给目标 Node。目标 Node 自行验证请求中的设备签名。
+这条链路保持现在的安全性质。Gateway 不是目标时只转发密文，Gateway 前面的第三方 TLS 终止方也只能看到 Noise 密文。与现状相比，删除的是会合目录 `lookup`、签名 `Reachability` 记录、`direct` 与 `dial` 控制消息、候选路径竞速和 relay 预约。浏览器总是连接自己页面所在的 Gateway，由 Gateway 经 iroh 到达任意成员 Node。
+
+浏览器只在需要读写某台 Node 本机设置时直接把它作为 `target`。业务操作默认以 Gateway 为目标。需要其他 Node 处理的控制请求，例如回答某台 Node 上的审批或中断某个工作，由会话所在 Node 经 `vibeface/rpc/1` 转给目标 Node，请求带浏览器的设备签名，目标 Node 自行验证。
 
 ### 4.4 个人网络隔离
 
@@ -276,7 +281,7 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 2. 每条 `vibeface/sync/1` 流的首帧携带 `network_id`，与本机不一致时关闭连接。
 3. 事件入库时核对 `network_id`、作者成员资格和撤销 `cutoff_seq`。
 
-SQLite 表不再需要 `network_id` 列，跨网络读取在结构上不可能发生。本节以第 9 节第 2 项采纳为前提，不采纳时所有表恢复 `network_id` 分区。
+SQLite 表不再需要 `network_id` 列，跨网络读取在结构上不可能发生。一个数据目录只属于一个个人网络是已决定事项，见第 9 节。
 
 ## 5. 同步与 DAG
 
@@ -308,9 +313,9 @@ Attestation {
 }
 ```
 
-每台 Node 在整个网络中只有一条日志，不再按会话分链。现在的 `sequence` 和 `previous` 按 `(network, scope, author)` 分别递增（`crates/node/src/store.rs:2301-2306`），版本向量会随会话数增长。改为每设备一条后，版本向量的大小等于 Node 数。`deps` 只引用作者写入时已知的其他作者事件，通常是同一会话中最新的几条，不再取整个会话的全部 heads。
+每台 Node 在整个网络中只有一条日志，不再按会话分链。现在的 `sequence` 和 `previous` 按 `(network, scope, author)` 分别递增（`crates/node/src/store.rs:2271-2276`），版本向量会随会话数增长。改为每设备一条后，版本向量的大小等于 Node 数。`deps` 只引用作者写入时已知的其他作者事件，通常是同一会话中最新的几条，不再取整个会话的全部 heads。
 
-浏览器不写日志，它发起的写操作由所连 Node 作为作者写入，并在 `body` 中携带 `Attestation`。需要本人授权的事件必须带有效的客户端设备签名，Node 和协调 Agent 不能代写。
+浏览器不写日志，它发起的写操作由所连 Node 作为作者写入，并在 `body` 中携带 `Attestation`。需要本人授权的事件必须带有效的客户端设备签名，Node 和协调 Agent 不能代写。这是设计决定，记录在第 9 节。
 
 ### 5.2 事件类型
 
@@ -322,14 +327,18 @@ Attestation {
 | `BotCreated` | `bot_id`、`name`、`instructions`、`project?: { target_node, cwd }` | 入口 Node | 带 `Attestation`，删除 `membership_role_proof` |
 | `MessagePosted`（user） | `message_id`、`role: user`、`text`、`scheduler_node`、`report_results`、`attestation` | 入口 Node | 本人发的内容 |
 | `MessagePosted`（assistant） | `message_id`、`role: assistant`、`text`、`in_reply_to: message_id` | 调度 Node | 协调层给本人的每条回复，包括“已开始：…”这类即时回复 |
-| `WorkDispatched` | `work_id`、`trigger: message_id`、`target_node`、`executor: codex`、`cwd`、`thread_id`、`turn_id`、`continues?: work_id` | 调度 Node | 目标 Node 确认已启动后写入 |
-| `WorkProgress` | `work_id`、`phase`、`summary` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写 |
+| `WorkDispatched` | `work_id`、`trigger: message_id`、`target_node`、`executor: codex \| agent`、`cwd`、`thread_id?`、`turn_id?`、`continues?: work_id`、`parent_work?: work_id` | 派发方 Node | 目标 Node 确认后才写入。`codex` 在 turn 启动后写入并带 `thread_id` 和 `turn_id`，`agent` 在目标协调层接纳任务后写入 |
+| `WorkProgress` | `work_id`、`phase`、`summary` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写。`agent` 路径的摘要由目标协调层给出 |
 | `ApprovalRequested` | `work_id`、`request_id`、`kind`、`summary` | 目标 Node | |
 | `ApprovalAnswered` | `work_id`、`request_id`、`decision`、`attestation` | 入口 Node | 必须带本人设备签名 |
 | `WorkFinished` | `work_id`、`outcome`、`result_text`、`failure_reason?`，结果正文过长时放入 `blobs` | 目标 Node，`unverified` 的复核由入口 Node 写 | `outcome` 为 `completed`、`failed`、`interrupted` 或 `unverified` |
 | `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码 |
 | `NotificationAcked` | `notification_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
 | `ContextCheckpoint` | `summary`、`covers: VersionVector` | 调度 Node | 保留现有类型，用于长会话的上下文压缩，`covered_heads` 改为版本向量 |
+
+`executor=codex` 表示委派目标 Node 上的 Codex App Server，`executor=agent` 表示把任务交给目标 Node 的协调 Agent，由它用本机工具执行，第 6 节说明两者的边界。目标协调 Agent 在执行 `agent` 任务时自己启动的 Codex 工作，记为一条 `parent_work` 指向原任务的新 `WorkDispatched`。
+
+`WorkDispatched` 只在目标确认后写入，确认前的派发只存在本机 outbox 中。这样 DAG 中不会出现目标从未收到的派发。这是设计决定，记录在第 9 节。
 
 `WorkProgress.phase` 取值为 `started`、`running`、`waiting_approval`、`interrupting` 和 `finishing`。`WorkFinished` 的 `unverified` 表示目标 Node 无法证明执行层的真实结果，证据保存在目标 Node 的本机待核对记录中。本人核对后，入口 Node 可以为同一 `work_id` 再写一条带 `Attestation` 的 `WorkFinished`。只有 `unverified` 可以被后续的 `WorkFinished` 取代。
 
@@ -339,7 +348,7 @@ Attestation {
 - 协调层流式中间文字和逐个工具调用，只经 `vibeface/rpc/1` 实时展示。
 - 本机调度 job 队列、outbox、待核对记录、SDK 原生会话缓存、附件暂存进度、模型密钥和设备私钥。
 
-删除的事件类型为 `AgentMessage`、`TaskCreated`、`TaskChanged`、`DecisionRecorded` 和 `NotificationRaised`。`AgentMessage` 的派发、进度和终态分别由 `WorkDispatched`、`WorkProgress` 和 `WorkFinished` 表达。`DecisionRecorded` 中的 `followup_intent_v1` 改为 `MessagePosted.report_results`，`conversation_autonomy_v1` 改为 `AutonomySet`。通知由 `WorkFinished` 和 `ApprovalRequested` 等事件派生，不再单独写 `NotificationRaised`。
+删除的事件类型为 `AgentMessage`、`DecisionRecorded` 和 `NotificationRaised`，`TaskCreated` 和 `TaskChanged` 已由 #55 删除。`AgentMessage` 的远端协调任务改为 `executor=agent` 的 Work 事件，其 `task`、`progress` 和终态三类 `kind` 分别由 `WorkDispatched`、`WorkProgress` 和 `WorkFinished` 表达。`DecisionRecorded` 中的 `followup_intent_v1` 改为 `MessagePosted.report_results`，`conversation_autonomy_v1` 改为 `AutonomySet`。通知由 `WorkFinished` 和 `ApprovalRequested` 等事件派生，不再单独写 `NotificationRaised`。
 
 ### 5.3 存储
 
@@ -368,7 +377,7 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 4. 接收方按 5.5 节入库。缺少其他作者的 `deps` 时，事件进入 `pending_events`，并对缺失作者追加 `Pull`。
 5. 本机追加事件后，向已连接的成员 Node 发送 `Have { author, seq, hash }`，对方据此拉取。连接空闲时每 60 秒重新交换一次 `Hello`，补上丢失的通知。
 
-现在的同步每 3 秒向最多 4 个副本请求所有会话的 heads（`crates/node/src/runtime.rs:3330-3338`），再沿 `parents` 和 `previous` 逐个或分批取闭包。改造后一次往返就知道缺什么，拉取按序号区间进行，不需要沿 hash 回溯。
+现在的同步每 3 秒向最多 4 个副本请求所有会话的 heads（`crates/node/src/runtime.rs:3268-3278`），再沿 `parents` 和 `previous` 逐个或分批取闭包。改造后一次往返就知道缺什么，拉取按序号区间进行，不需要沿 hash 回溯。
 
 ### 5.5 入库与投影
 
@@ -381,9 +390,9 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 5. `deps` 全部已入库，否则放入 `pending_events`。
 6. 写入 `events`，更新 `log_heads`，调用投影 reducer，再检查 `pending_events` 中是否有事件因此满足条件。
 
-入库后的事件不再验签。现在的 `load_events_from`（`crates/node/src/store.rs:2515`）在每次追加、每次重建以及 bots 和 followup 的读取中，都对全网每个事件查证书并完整验签。该函数删除，读取直接查表。数据目录的完整性属于本机信任边界，需要时用维护命令 `vibeface store verify` 离线重新验签。
+入库后的事件不再验签。现在的 `load_events_from`（`crates/node/src/store.rs:2469`）在每次追加、每次重建以及 bots 和 followup 的读取中，都对全网每个事件查证书并完整验签。该函数删除，读取直接查表。数据目录的完整性属于本机信任边界，需要时用维护命令 `vibeface store verify` 离线重新验签。
 
-投影 reducer 对每个事件只执行一次，不再全量重建。现在的 `rebuild_projections_from`（`crates/node/src/store.rs:2330-2478`）在每次入库或追加时删除并重写全部投影表。为了让增量结果与到达顺序无关，每个投影都满足交换律：
+投影 reducer 对每个事件只执行一次，不再全量重建。现在的 `rebuild_projections_from`（`crates/node/src/store.rs:2300-2432`）在每次入库或追加时删除并重写全部投影表。为了让增量结果与到达顺序无关，每个投影都满足交换律：
 
 | 投影 | 合并规则 |
 |---|---|
@@ -405,7 +414,7 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 3. 接收方写入 `<data-dir>/blobs/partial/<hash>.part`，每块 `fsync` 后在 SQLite 中提交已确认偏移。断线或重启后截去未提交的尾部，从已提交偏移继续。
 4. 收齐后核对大小和 SHA256，一致时原子重命名到正式路径，不一致时删除暂存并换来源重试。
 
-单件上限仍为 64 MiB，暂存额度保持 256 MiB、64 个对象。来源直接读文件，`store/blob_reader.rs` 的只读 SQLite 读取者池删除。本期不使用 `iroh-blobs`，原因是它仍为 0.x，2026-10-08 还发布过任意对端可写入 store 的安全公告。
+单件上限仍为 64 MiB，暂存额度保持 256 MiB、64 个对象。来源直接读文件，`store/blob_reader.rs` 的只读 SQLite 读取者池删除。不使用 `iroh-blobs`，原因是它仍为 0.x，2026-10-08 还发布过任意对端可写入 store 的安全公告。这是设计决定，记录在第 9 节。
 
 ### 5.7 冲突处理
 
@@ -416,9 +425,9 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 - 其他作者的事件若在 `deps` 中引用了被拒绝的事件，仍然入库。被拒绝的 hash 视为“已知但处于冲突中”，满足依赖检查，界面在该事件旁标出它依据了冲突内容。
 - 冲突不锁住会话，也不阻止其他作者和其他会话继续写入。
 - 发生分叉的作者 Node 在得知冲突后停止写入，进入 `forked` 状态，并向本人发出通知。
-- 本人在网页上查看两条分叉内容，然后撤销该设备编号，并让该 Node 用新密钥重新加入。需要保留的分叉内容由本人重新发送。
+- 本人在网页上查看两条分叉内容，然后撤销该设备编号，并让该 Node 用新密钥重新加入。需要保留的分叉内容由本人重新发送。这是设计决定，记录在第 9 节。
 
-现在的实现把重复序号标为 `conflict`，并让整个会话拒绝追加（`crates/node/src/store.rs:2292`、`2346-2376`），本设计删除这个锁定。
+现在的实现把重复序号标为 `conflict`，并让整个会话拒绝追加（`crates/node/src/store.rs:2262`、`2316-2346`），本设计删除这个锁定。
 
 ### 5.8 备份恢复后的写入保护
 
@@ -427,7 +436,9 @@ Node 启动后进入 `aligning` 状态，满足以下任一条件才进入 `writ
 - 至少一台其他成员 Node 完成 `Hello`，对方记录的本机作者 `max_seq` 不大于本机。如果对方更大，先拉回本机自己的日志再进入 `writable`。
 - 成员目录中没有其他 Node。
 
-`aligning` 期间可以读取和同步，不能追加事件。调度 job 保持排队，入口收到的用户消息保存在本机 outbox，写入后再投递。是否允许本人在所有其他 Node 都不可达时手动解除保护，见第 9 节。
+`aligning` 期间可以读取和同步，不能追加事件。调度 job 保持排队，入口收到的用户消息保存在本机 outbox，写入后再投递。
+
+所有其他 Node 都不可达时，Node 默认保持只读。本人可以在网页上确认“此数据目录没有从备份恢复”，Node 随即进入 `writable`。这一确认要求本机会话或带 `Attestation` 的管理设备，只记录在本机，不进入 DAG。这是已决定事项，记录在第 9 节。
 
 ### 5.9 三设备示例
 
@@ -438,7 +449,7 @@ Node 启动后进入 `aligning` 状态，满足以下任一条件才进入 `writ
 | t0 | P:10 G:4 L:7 | P:10 G:4 L:7 | P:10 G:4 L:7 |
 
 1. 手机发送“在笔记本上跑测试”。`G` 写入 `G#5 MessagePosted(user, scheduler_node=P, attestation=手机)`，`deps` 为该会话最新的 `P#10`。`G` 向 `P` 和 `L` 发送 `Have(G, 5)`，两者各拉取 `G 5..5`。
-2. `P` 的调度器领取 job，写入 `P#11 MessagePosted(assistant, "已开始：…")`。它经 `vibeface/rpc/1` 请求 `L` 在指定 `cwd` 启动 Codex turn，`L` 返回 `thread_id=t1`、`turn_id=u1` 后，`P` 写入 `P#12 WorkDispatched(work_id=w1, target_node=L, thread_id=t1, turn_id=u1)`。
+2. `P` 的调度器领取 job，写入 `P#11 MessagePosted(assistant, "已开始：…")`。它经 `vibeface/rpc/1` 请求 `L` 在指定 `cwd` 启动 Codex turn，`L` 返回 `thread_id=t1`、`turn_id=u1` 后，`P` 写入 `P#12 WorkDispatched(work_id=w1, target_node=L, executor=codex, thread_id=t1, turn_id=u1)`。
 3. `L` 写入 `L#8 WorkProgress(w1, running, "正在运行 cargo test")`，随后 Codex 请求执行网络命令，`L` 写入 `L#9 ApprovalRequested(w1, r1)`。这时 `L` 的网络中断。
 
 | 时刻 | P 的向量 | G 的向量 | L 的向量 |
@@ -461,7 +472,7 @@ Node 启动后进入 `aligning` 状态，满足以下任一条件才进入 `writ
 
 ## 6. 协调层与上下文
 
-协调层每轮的上下文只从 DAG 构造。调度器领取 job 时固定一个 `basis: VersionVector`，取代现在的 `basis_heads`。`materialize` 读取该依据下的会话视图（现在的实现见 `crates/node/src/scheduler.rs:452-519`），按以下顺序填入：
+协调层每轮的上下文只从 DAG 构造。调度器领取 job 时固定一个 `basis: VersionVector`，取代现在的 `basis_heads`。`materialize` 读取该依据下的会话视图（现在的实现见 `crates/node/src/scheduler.rs:450-516`），按以下顺序填入：
 
 1. Bot 定义和当前 `AutonomySet`。
 2. 最新 `ContextCheckpoint` 的摘要及其 `covers` 之后的消息，包括本人消息和协调层回复。
@@ -470,9 +481,34 @@ Node 启动后进入 `aligning` 状态，满足以下任一条件才进入 `writ
 
 SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` 保存，并记录它已覆盖的版本向量。新 `basis` 包含该向量且缓存来自本机时，只发送增量。否则开启新的原生会话并发送完整上下文。所以换入口、换调度节点或换浏览器后，协调层得到的上下文相同，差别只在缓存能否复用。
 
-协调工具改为 `nodes`、`context`、`dispatch_work`、`work_status`、`continue_work` 和 `interrupt_work`。`dispatch_work(target_node, cwd, prompt)` 在目标 Node 启动执行层 turn，同时覆盖 #56 中本机 `codex` 工具的 `thread/start` 和 `turn/start`，以及 `observe_session` 的登记。目标 Node 继续强制 #56 规定的审批策略和沙箱，协调层不能覆盖，也不能回答审批。跨节点工作只派发给目标 Node 的执行层，不再调用目标 Node 的协调 Agent。
+协调工具改为 `nodes`、`context`、`dispatch_work`、`work_status`、`continue_work`、`interrupt_work` 和 `call_lookup`。`dispatch_work(target_node, executor, cwd, prompt)` 取代现在的 `send_task`、`codex` 中启动工作的 `thread/start` 与 `turn/start`，以及 `observe_session`。`work_status` 取代 `task_status` 和 `codex` 的 `thread/read`，`interrupt_work` 取代 `cancel_task` 和 `codex` 的 `turn/interrupt`。写工具仍要求稳定的 `call_ref`，结果不明时用 `call_lookup` 查询原调用。
 
-“继续上次的任务”由 `continue_work(work_id)` 处理。调度器从 `WorkDispatched` 取得原 `target_node` 和 `thread_id`，在同一 thread 上启动新 turn，并写入一条 `continues=work_id` 的新 `WorkDispatched`。原目标不可达时返回错误，不改派到其他 Node。
+### 6.1 两条跨设备工作路径
+
+跨设备工作保留两条路径，并且并存。`executor=codex` 委派目标 Node 上的 Codex App Server。`executor=agent` 把任务发给目标 Node 的协调 Agent，由它用本机工具执行，也就是现在 `send_task` 提供的远端 shell 能力。这是已决定事项，记录在第 9 节。
+
+两条路径共用以下授权规则：
+
+- 派发方必须处于一次正在运行、非只读的调度 attempt 中。该 attempt 由带 `Attestation` 的本人消息触发，或由当前会话 `AutonomySet` 为 `continue` 的自主后续触发。
+- 目标 Node 核对派发方是未撤销的成员 Node，核对触发链上的本人签名或自主授权，核对 `cwd` 位于目标 Node 自己 `config.json` 的 `roots` 中。
+- 重试保留原 `work_id` 和 `call_ref`。结果不明时向原目标查询，不改派到其他 Node。
+- 两边的协调 Agent 都不能回答审批、加入或撤销设备，也不能修改 `AutonomySet`。
+
+两条路径的差别在审批边界：
+
+| | `executor=codex` | `executor=agent` |
+|---|---|---|
+| 在目标 Node 上执行的是 | 一个 Codex App Server turn | 目标 Node 的协调 SDK，作为一个 `AgentTask` 调度 job |
+| 目标 Node 需要 | Codex CLI 和允许的 `roots` | 已启用 `manager` 配置，并有剩余的 `daily_decision_limit` 额度 |
+| 每个操作是否审批 | 是。目标 Node 固定 `approvalPolicy=on-request`、`approvalsReviewer=user`、限于 `cwd` 的 workspace-write 沙箱且无网络，拒绝协调层覆盖这些字段（#56 的规则） | 授权在任务一级给出。目标协调 Agent 按目标 Node 的 Provider 使用本机工具，不逐条审批 |
+| 本机工具能力 | 只有 Codex turn 内的工具，受沙箱限制 | Codex SDK 协调层的 shell 对本机只读，改文件必须经本机 `codex` 执行器，因此仍逐条审批。Cursor SDK 协调层使用 Cursor 默认的本机工具集，可以直接执行 shell |
+| 审批由谁回答 | 只有本人，经带 `Attestation` 的 `ApprovalAnswered` | 目标协调层启动的 Codex 工作同左。Cursor 的本机工具没有审批，本人通过选择目标 Node 的 Provider 决定是否允许 |
+| DAG 中记录 | `WorkDispatched` 带 `thread_id` 和 `turn_id`，以及进度、审批和结果 | `WorkDispatched` 不带 thread，目标协调层给出阶段摘要和结果。它启动的 Codex 工作另记一条 `parent_work` 指向原任务的 `WorkDispatched` |
+| 不进入 DAG | Codex 的命令、diff 和工具输出 | 目标协调层的推理、shell 命令和输出 |
+
+`executor=agent` 沿用现在 `post_agent_task` 的接纳规则（`crates/node/src/store/agent_messages.rs:444` 起）。只有任务可以由 Agent 派发，环形委派被拒绝，目标在同一会话中已有未结束任务时回传 `interrupted`。目标协调层收到的上下文同样只来自 DAG，外加该任务的 `WorkDispatched` 正文。
+
+“继续上次的任务”由 `continue_work(work_id)` 处理。调度器从 `WorkDispatched` 取得原 `target_node`、`executor` 和 `thread_id`。`codex` 在同一 thread 上启动新 turn，`agent` 向同一目标协调层发送新任务，两者都写入一条 `continues=work_id` 的新 `WorkDispatched`。原目标不可达时返回错误，不改派到其他 Node。
 
 只在本机保存的内容：
 
@@ -488,35 +524,35 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 ## 7. 删除清单
 
-行数取自 `62f52f0`。“生产”指 `#[cfg(test)]` 之前的代码，测试随对应代码一起删除或重写。#54、#55、#56 合入后部分数字会小幅变化。
+行数取自 `1bdf6fd`。“生产”指 `#[cfg(test)]` 之前的代码，测试随对应代码一起删除或重写。#54 合入后部分数字会小幅变化。
 
 | 模块 | 删除内容 | 规模 |
 |---|---|---|
 | `crates/node/src/network.rs` | 整个文件，`Control`、`Reachability`、`NetworkHub`、mDNS 来源表、`Reservation`、`Attachment`、`PathQueue`、`dial_authenticated`、`race_paths`、relay 预约与电路转发 | 7375 行，生产约 2556 |
 | `crates/node/src/network/admission.rs` | 整个文件，`SocketClass`、按 IP 准入与电路额度 | 1096 行 |
-| `crates/node/src/peer.rs` | 整个文件，`PeerHub`、`Hello`、`Packet`、`Kind`、Presence、多跳转发、Noise 握手 | 2291 行，生产约 1262 |
-| `crates/secure/src/lib.rs` | `Handshake`、`Channel`、`NOISE` 常量，依赖 `snow` | 约 280 行 |
+| `crates/node/src/peer.rs` | 整个文件，`PeerHub`、`Hello`、`Packet`、`Kind`、Presence、多跳转发、Node 之间的 Noise 握手 | 2291 行，生产约 1262 |
+| `crates/secure/src/lib.rs` | `Handshake` 内用 `Identity` 签 Noise 静态密钥的代码，改为接收外部 `Proof`。`Handshake`、`Channel` 和 `snow` 保留给浏览器链路 | 约 40 行改动 |
 | `crates/node/src/crypto.rs` | `fingerprint` 作为身份编号的用法、证书查找式验签 | 约 60 行 |
 | `crates/node/src/runtime.rs` | `capabilities`、`inventory`、`event`、`history_batch` 处理，`sync_step_core`、`history_events`、`verify_history_batch`、闭包进度保存、`route_flight` | 约 800 行 |
 | `crates/node/src/runtime/sync.rs` | 按会话 heads 的作业协调和预算，重写为版本向量会话 | 1735 行，生产约 1150 |
 | `crates/node/src/store.rs` | `rebuild_projections_from`、`load_events_from`、`heads_from_events`、`missing_dependencies`、`inventory_heads`，按会话的 `sequence` 分配 | 约 450 行 |
 | `crates/node/src/store/blob_reader.rs` | 整个文件，只读 SQLite 读取者池 | 524 行 |
 | `crates/node/src/store/blob_transfer.rs`、`runtime/blob_transfer.rs` | SQLite 正文发布、hex 分块协议，重写为文件加 `vibeface/blob/1` | 2344 行，保留续传逻辑约 400 |
-| `crates/node/src/store/agent_messages.rs` | `AgentMessage` 任务的校验、投递、取消和结果发布，改为 Work 投影 | 1940 行，生产约 576 |
-| `crates/node/src/store/followup.rs` | #55 后剩余的 `followup_intent_v1` 与自主授权编码，改为 `report_results` 和 `AutonomySet` | 1626 行，生产约 793 |
+| `crates/node/src/store/agent_messages.rs` | `AgentMessage` 编码、按事件 hash 关联任务与结果的逻辑，改为 `executor=agent` 的 Work 投影。来源校验、环检测和忙时回传 `interrupted` 保留 | 1940 行，生产约 576，删除约 300 |
+| `crates/node/src/store/followup.rs` | `followup_intent_v1` 与 `conversation_autonomy_v1` 的 `DecisionRecorded` 编码，改为 `report_results` 和 `AutonomySet` | 1332 行，生产约 580 |
 | `crates/node/src/model.rs` | `AgentMessage`、`AgentMessageKind`、`DecisionRecorded`、`NotificationRaised`、`BotCreated.membership_role_proof`，`MissingDependencies` | 约 80 行 |
 | `crates/node/src/pairing.rs` | 整个文件，邀请、配对申请、review、本机加入状态机 | 1155 行，生产约 685 |
 | `crates/node/src/identity/local.rs` | `InvitePayload`、`InviteEnvelope`、`PairReview`、配对存储操作，改为 `join_requests` | 689 行，保留约 200 |
-| `crates/node/src/client.rs` | 17 个身份 RPC 合并为 6 个，删除 Noise 客户端通道 | 1868 行，删除约 700 |
+| `crates/node/src/client.rs` | 17 个身份 RPC 合并为 6 个。Noise 客户端通道保留 | 1868 行，删除约 600 |
 | `crates/secure/src/membership.rs` | `node_roles`、`NodeCertificate.roles`、“管理权只能由根 checkpoint 授予”规则（约 468 行处） | 约 150 行 |
 | `crates/node/src/local_access.rs`、`api.rs` | 随机端口发布，`/api/network/ws`、`/peer`、`/api/local/join/*` 三个路由 | 约 200 行 |
-| `crates/node/web/transport.js` | lookup、候选竞速、Noise 握手、明文种子存储，重写为 WebSocket 加 CryptoKey | 361 行，重写后约 120 |
+| `crates/node/web/transport.js` | `lookupPaths` 签名记录查询、`connectDevice` 中的候选竞速与 `direct`/`dial` 控制（176-289 行）、明文种子存储。Noise 握手和记录分片保留，设备签名改用 CryptoKey | 361 行，删除约 130 |
 | `crates/node/web/src/features/identity/` | 邀请类型和角色选择、三方编号核对、review 勾选、恢复建立管理客户端 | 生产 1330 行，重写 |
-| SQLite 表 | `identity_invites`、`identity_pair_reviews`、`identity_pair_requests`、`identity_requests`、`node_certificates`、`blobs`、`tasks`（#55）、`notification_outbox` 的 `derived` 列 | 8 处 |
-| RPC | `prepare_genesis`、`bootstrap`、`prepare_invite`、`commit_invite`、`prepare_pair_request`、`pair_request`、`pair_accept`、`pair_requests`、`prepare_pair`、`pair_confirm`、`pair_status`、`prepare_revoke`、`recovery_challenge`、`recovery_context`、`prepare_recovery`，协调工具 `send_task`、`task_status`、`call_lookup`、`cancel_task`、`observe_session` | 20 个 |
-| 依赖 | `snow`、`mdns-sd`。`tokio-tungstenite` 仍用于 Codex App Server 连接，只删除对等连接中的用法 | 2 个 |
+| SQLite 表 | `identity_invites`、`identity_pair_reviews`、`identity_pair_requests`、`identity_requests`、`node_certificates`、`blobs`、`notification_outbox` 的 `derived` 列 | 7 处 |
+| RPC | `prepare_genesis`、`bootstrap`、`prepare_invite`、`commit_invite`、`prepare_pair_request`、`pair_request`、`pair_accept`、`pair_requests`、`prepare_pair`、`pair_confirm`、`pair_status`、`prepare_revoke`、`recovery_challenge`、`recovery_context`、`prepare_recovery`，协调工具 `send_task`、`task_status`、`cancel_task`、`observe_session`、`codex`，后五个合并进 `dispatch_work`、`work_status` 和 `interrupt_work` | 20 个 |
+| 依赖 | `mdns-sd`，局域网发现改用可选的 `iroh-mdns-address-lookup`。`snow` 保留给浏览器链路，`tokio-tungstenite` 仍用于 Codex App Server 连接 | 1 个 |
 
-删除或重写的生产代码合计约 1.4 万行，测试约 1 万行。新增代码集中在 iroh 接入、版本向量同步、join 流程和 Work 投影，规模在第一期实现后再统计。
+删除或重写的生产代码合计约 1.3 万行，测试约 1 万行。新增代码集中在 iroh 接入、版本向量同步、join 流程和 Work 投影，规模在第一期实现后再统计。
 
 ## 8. 实施分期
 
@@ -530,47 +566,61 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 单 Node 真实进程能完成本人消息、本机 Codex 派发、审批和结果，DAG 中出现对应事件且不含执行层内部内容。
 - 在 10 万事件的数据目录上追加一条事件不触发全表读取，用 SQLite 查询计数核对。
 
-**第二期：身份与浏览器接入。** `DeviceId` 改为公钥本身，成员目录删除角色并放开管理授权。实现 6 个身份 RPC、承诺加短码流程、浏览器 CryptoKey、`/api/client` 网关和固定端口本机会话。删除 `pairing.rs`、Noise 客户端通道和旧身份表。验收标准如下：
+**第二期：身份与浏览器接入。** `DeviceId` 改为公钥本身，成员目录删除角色并放开管理授权。实现 6 个身份 RPC、承诺加短码流程、浏览器 CryptoKey、`/api/client` 网关和固定端口本机会话。浏览器 Noise 握手中的设备签名改由 CryptoKey 产生。删除 `pairing.rs`、`lookupPaths`、候选竞速和旧身份表。验收标准如下：
 
 - 浏览器端到端测试完成建网、浏览器加入、授予管理权、撤销和根恢复。
 - 承诺不匹配或短码被拒绝时请求作废。
-- 页面脚本无法导出设备私钥。
+- 页面脚本无法导出设备私钥，Noise 握手仍验证双方设备编号，编号不符时关闭连接。
 - 本机会话重启后 origin 不变。
 
-**第三期：iroh 传输与版本向量同步。** 接入 `iroh` Endpoint、`Router`、4 个 ALPN 和 relay 访问控制，实现 `Hello`、`Pull`、`Have` 和附件续传。Node 经 `vibeface/join/1` 加入。删除 `network.rs`、`network/admission.rs`、`peer.rs` 和 `snow`。验收标准如下：
+**第三期：iroh 传输与版本向量同步。** 接入 `iroh` Endpoint、`Router`、5 个 ALPN 和 relay 访问控制，实现 `Hello`、`Pull`、`Have`、附件续传和 `vibeface/client/1` 密文转发。Node 经 `vibeface/join/1` 加入。删除 `network.rs`、`network/admission.rs`、`peer.rs` 和 `mdns-sd`。验收标准如下：
 
 - `scripts/verify-node.py` 用三个真实 Node 进程，覆盖 NAT 后两台经自建 relay 互通。
 - 非成员 `EndpointId` 连接被拒绝。
+- 浏览器经 Gateway 连到 NAT 后的 Node，在 Gateway 上抓取的转发内容只有 Noise 密文。
 - 中断后按区间续拉。
 - 64 MiB 附件在传输中途重启后续传并通过哈希校验。
 - 按 `docs/ci.md` 补跑同步与恢复专项并记录结果。
 
-**第四期：协调层与跨入口上下文。** 调度依据改为版本向量，原生会话缓存记录已覆盖向量。实现 `dispatch_work`、`continue_work` 和 `interrupt_work`，审批回答经网关转发并验证设备签名。验收标准如下：
+**第四期：协调层与跨入口上下文。** 调度依据改为版本向量，原生会话缓存记录已覆盖向量。实现 `dispatch_work`、`continue_work` 和 `interrupt_work` 的 `codex` 与 `agent` 两种执行器，审批回答经网关转发并验证设备签名。验收标准如下：
 
 - 受控 SDK 和 App Server 夹具下，从入口 A 发起的工作在入口 B 上能看到同一上下文并继续同一 thread。
 - 协调 Agent 调用审批回答被拒绝。
+- `executor=agent` 的任务由目标 Node 的协调 Agent 执行，DAG 只出现 Work 事件。目标是 Codex SDK 协调层时，它的文件修改经原生审批。
+- `cwd` 不在目标 `roots` 内、触发链缺少本人签名或自主授权时，两种执行器都拒绝派发。
 - 换调度节点后协调层收到完整 DAG 上下文。
 
-**第五期：写入保护、文档与扩展验收。** 实现 `aligning`、`writable` 和 `forked` 三个状态及冲突处理界面，重写 `docs/node.md`、`docs/node-protocol.md` 和 README 中的相关章节。删除 `docs/peer-id-migration.md`，`data_epoch` 加一。验收标准如下：
+**第五期：写入保护、文档与扩展验收。** 实现 `aligning`、`writable` 和 `forked` 三个状态、本人手动解除只读的确认和冲突处理界面，重写 `docs/node.md`、`docs/node-protocol.md` 和 README 中的相关章节。删除 `docs/peer-id-migration.md`，`data_epoch` 加一。验收标准如下：
 
 - 从备份恢复的 Node 在对齐前拒绝写入，对齐后无分叉。
+- 其他 Node 全部离线时保持只读，本人确认后可以写入。
 - 人为复制数据目录造成分叉后，其他会话照常写入，分叉设备停止写入并通知本人。
 - 手动触发扩展 CI，三平台制品通过多进程验收。
 
-## 9. 风险与待用户决定的问题
+## 9. 风险与已决定事项
 
 ### 风险
 
 - iroh relay 服务能否挂在 Gateway 现有的 axum 监听器上尚未验证，可能需要单独端口。第三期第一步先做这个实验。
-- WebCrypto 的 Ed25519 需要较新的浏览器，旧版 Safari 不支持。不支持的浏览器无法成为设备，页面会明确提示。
+- WebCrypto 的 Ed25519 需要较新的浏览器，旧版 Safari 不支持。设备签名和 Noise 握手的 `Proof` 都依赖它，不支持的浏览器无法成为设备，页面会明确提示。
 - 用户可能不看短码直接批准。批准按钮在短码显示后才可用，但不能强制用户比对。
-- 恢复备份后若绕过写入保护，仍会产生分叉。5.7 节的处理保证不锁死会话，但分叉设备需要重新加入。
+- 恢复备份后若本人误确认解除只读，仍会产生分叉。5.7 节的处理保证不锁死会话，但分叉设备需要重新加入。
+- `executor=agent` 发往 Cursor SDK 协调层时没有逐条审批，本机 shell 的权限取决于目标 Node 的 Provider 配置。
 - iroh 1.x 承诺协议稳定，`iroh-blobs` 等上层库仍为 0.x，本设计只依赖 `iroh` 和 `iroh-relay`。
 
-### 待用户决定
+### 已决定事项
 
-1. **浏览器接入方式。** 推荐 Node 提供 WebSocket 网关（4.3 节）。代价是 Gateway 前的第三方 TLS 终止方能看到浏览器流量。若要求浏览器到目标 Node 端到端加密，改用浏览器内 iroh wasm 经 relay 连接。这需要额外设计浏览器临时 `EndpointId` 的 relay 准入，网页包体积也会增大。
-2. **一个数据目录只属于一个个人网络。** 推荐是。这样能删除所有表的 `network_id` 分区，隔离在连接层完成。代价是同一主机服务多个网络时要运行多个进程。
-3. **其他 Node 都不可达时的写入保护。** 推荐保持只读，并允许本人在网页上明确确认“此数据目录没有从备份恢复”后解除，确认记录只保存在本机。不允许解除则离线笔记本无法接收新消息。
-4. **默认 relay。** 推荐只使用个人网络中启用 `relay` 的 Node，n0 公共 relay 需要在配置中显式开启。默认开启 n0 能免去自建 Gateway，但设备会连接第三方服务，而 n0 的 relay 现在要求按 endpoint 签发的令牌。
-5. **跨节点工作只交给目标 Node 的执行层。** 推荐是。目标 Node 不再运行自己的协调 Agent 处理远端任务，派发、审批和结果都落在 `Work*` 事件上。代价是不能再让另一台 Node 的 Cursor 协调 Agent 用宿主 Shell 工具执行远端任务。
+用户确认的决定：
+
+1. **浏览器接入。** 保留浏览器到 Node 的端到端加密。浏览器经 Node 的 WebSocket 网关接入，网关之上继续运行浏览器与 Node 的 Noise 握手，这是唯一保留的 Noise 链路。设备 CryptoKey 对每次会话的 Noise 临时静态密钥签名，见 4.3 节。
+2. **跨设备工作两条路径并存。** 保留把任务发给另一台 Node 的协调 Agent、由它在本机执行的远端 shell 能力，与委派目标 Node 上的 Codex 并存。两条路径的授权和审批边界见 6.1 节。
+3. **一个数据目录只属于一个个人网络。** SQLite 表不再按 `network_id` 分区，同一主机服务多个网络时运行多个进程，见 4.4 节。
+4. **其他 Node 都不可达时默认只读。** 本人在网页上确认“此数据目录没有从备份恢复”后解除，确认只记录在本机，见 5.8 节。
+5. **默认 relay。** 只使用个人网络中启用 `relay` 的 Node，n0 公共 relay 需要在配置中手动打开，见 4.1 节。
+
+设计决定：
+
+6. **浏览器不写日志。** 浏览器发起的写操作由所连 Node 作为作者写入，事件附带浏览器设备签名的 `Attestation`，见 5.1 节。
+7. **`WorkDispatched` 在目标确认后才写入。** 确认前的派发只在本机 outbox 中，见 5.2 节。
+8. **分叉设备撤销后重新加入。** 分叉的作者 Node 停止写入，本人撤销其设备编号后用新密钥重新加入，见 5.7 节。
+9. **附件不用 `iroh-blobs`。** 附件使用按 SHA256 命名的文件和自有的 `vibeface/blob/1`，见 5.6 节。
