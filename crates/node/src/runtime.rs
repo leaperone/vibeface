@@ -736,6 +736,36 @@ mod tests {
         );
         assert!(!dir.join("pending-effect").exists());
         node.store.lock().await.put_blob(&network, &blob, content)?;
+        connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            rusqlite::params![serde_json::to_string(&corrupt)?, network, sentinel.hash],
+        )?;
+        assert!(
+            !node
+                .store
+                .lock()
+                .await
+                .has_known_basis_gap(&network, std::slice::from_ref(&pending.hash))?
+        );
+        assert_eq!(
+            node.rpc(human.clone(), input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "invalid signature"
+        );
+        assert!(
+            node.store
+                .lock()
+                .await
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
+                .is_empty()
+        );
+        assert!(!dir.join("pending-effect").exists());
+        connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            rusqlite::params![serde_json::to_string(&sentinel)?, network, sentinel.hash],
+        )?;
         let accepted = node.rpc(human, input).await?;
         let api_node = node.clone();
         let api = tokio::spawn(async move { crate::api::serve(api_node).await });
@@ -4148,7 +4178,21 @@ impl Runtime {
                 )
             }
             "conversation" => self.conversation_snapshot(&access, &input).await,
-            "message" => self.accept_chat_message(&access, &input).await,
+            "message" => {
+                {
+                    let store = self.store.lock().await;
+                    let scope = scope.as_deref().context("conversation_id is required")?;
+                    let existing = store.messages(network, scope)?.iter().any(|message| {
+                        input["message_id"].as_str() == Some(message.message_id.as_str())
+                            && message.role == "user"
+                    });
+                    ensure!(
+                        existing || !store.has_known_basis_gap(network, &heads(&input)?)?,
+                        "context is incomplete; wait for synchronization"
+                    );
+                }
+                self.accept_chat_message(&access, &input).await
+            }
             "set_followup" => {
                 let scope = scope.context("conversation_id is required")?;
                 let result = self.set_followup(&access, &scope, &input).await?;

@@ -2738,7 +2738,9 @@ def phase1_acceptance(options):
             node.configure(timeout_secs=600)
             nodes.append(node)
         a, b, c = nodes
-        a.configure(manager=manager, codex_bin=sys.executable, daily_decision_limit=100)
+        a.configure(manager=manager, codex_bin=sys.executable, daily_decision_limit=100,
+                    network={"bootstrap_urls": [], "advertise_urls": [a.url.replace("http:", "ws:") + "/api/network/ws"],
+                             "mdns": False, "relay_enabled": True})
         a.start()
         network = a.bootstrap()
         for node in (b, c):

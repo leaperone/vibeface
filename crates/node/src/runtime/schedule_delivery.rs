@@ -899,7 +899,7 @@ impl Runtime {
                 }
                 _ => bail!("invalid scheduling trigger"),
             }
-            store.enqueue_trigger(network, &scope, trigger, &local)?;
+            store.admit_received_trigger(&self.identity, network, &scope, trigger, now_ms())?;
         }
         self.spawn_scheduler(network.clone(), scope.clone(), trigger.into())?;
         self.manager_status(network, &scope, trigger).await

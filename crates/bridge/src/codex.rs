@@ -245,8 +245,9 @@ impl Cache {
         let Some(method) = event["method"].as_str() else {
             return;
         };
-        if let Some(id) = request_id(event) {
-            self.requests.insert(id, event.clone());
+        let request = request_id(event);
+        if let Some(id) = &request {
+            self.requests.insert(id.clone(), event.clone());
         }
         let params = &event["params"];
         if method == "serverRequest/resolved"
@@ -277,6 +278,33 @@ impl Cache {
                 }});
             }
             "item/completed" => observe_assistant(state, &params["item"]),
+            method
+                if request.is_some()
+                    && (method.ends_with("requestApproval")
+                        || method == "item/tool/requestUserInput") =>
+            {
+                if let Some(turn) = params["turnId"].as_str() {
+                    let terminal = state.last_turn.as_ref().is_some_and(|known| {
+                        known["id"] == turn
+                            && matches!(
+                                known["status"].as_str(),
+                                Some("completed" | "failed" | "interrupted")
+                            )
+                    });
+                    if !terminal {
+                        if state
+                            .last_turn
+                            .as_ref()
+                            .is_none_or(|known| known["id"] != turn)
+                        {
+                            state.last_assistant = None;
+                        }
+                        state.status = json!({"type":"active","activeFlags":[]});
+                        state.last_turn =
+                            Some(json!({"id":turn,"status":"inProgress","error":null}));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -852,6 +880,36 @@ mod tests {
             cache.snapshot()["threads"]["t"]["status"]["type"],
             "unknown"
         );
+    }
+
+    #[test]
+    fn live_input_request_recovers_exact_turn_without_reversing_a_terminal() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/tool/requestUserInput",
+        ] {
+            let mut cache = Cache::default();
+            let request = json!({"id":0,"method":method,"params":{"threadId":"t","turnId":"r"}});
+            cache.observe_event(&request);
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot["threads"]["t"]["status"]["type"], "active");
+            assert_eq!(
+                snapshot["threads"]["t"]["last_turn"],
+                json!({"id":"r","status":"inProgress","error":null})
+            );
+            assert_eq!(snapshot["pending_requests"], json!([request.clone()]));
+            cache.observe_event(&json!({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"r","status":"interrupted","items":[]}}}));
+            cache.observe_event(&request);
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot["threads"]["t"]["status"]["type"], "idle");
+            assert_eq!(
+                snapshot["threads"]["t"]["last_turn"]["status"],
+                "interrupted"
+            );
+        }
+        let mut cache = Cache::default();
+        cache.observe_event(&json!({"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"r"}}));
+        assert!(cache.snapshot()["threads"]["t"]["last_turn"].is_null());
     }
 
     #[test]

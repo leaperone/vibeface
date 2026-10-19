@@ -81,7 +81,7 @@ impl Runtime {
                     .agent_task_for_message(
                         &access.network_id,
                         scope,
-                        &task_message_id(scope, &manager.attempt_id, &reference)?,
+                        &task_message_id(scope, &manager.attempt_id, reference)?,
                     )?
                     .context("task call reference was not found in this invocation")?;
                 store.agent_task_status(&access.network_id, scope, &task.hash)

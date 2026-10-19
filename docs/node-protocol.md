@@ -221,6 +221,8 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 
 `send_task` 在同一管理 attempt 内固定 `call_ref`、目标和内容。相同引用返回原任务，同引用改目标或内容拒绝。接纳、inbox、outbox 和回执复用可靠调度事务。导入签名历史只重建视图，不能产生新的执行；丢回执、重连或重启先查原 trigger，不重复启动 SDK。
 
+任务内继续委派时，若目标在同一聊天中已有未结束的 Agent 任务，目标在接纳事务中回传未启动的 `interrupted` 结果，避免两个 Agent 互相等待。本人发起的任务仍可正常排队。
+
 协调 Agent 直接使用宿主 SDK 的 Shell 和文件工具，也可用 `vibeface codex METHOD --json 'JSON_OBJECT' --socket /absolute/codex.sock` 调用 App Server 原生方法。参数不翻译成 Operation。`--watch` 持续输出通知，stdin 可接收本人明确提供的 `{ "id": ..., "result": ... }` 响应。不自动批准、不自动重试写请求。
 
 原生工作启动后，用 `observe_session` 登记准确的 `thread_id` 和 `turn_id`。Node 保存所属会话、来源 trigger、管理 attempt 和可选任务引用，观察进度、审批和终态。它只订阅当前 Socket 已加载的线程；历史补查不能把其他 stdio 进程的线程视为已接管。无有效控制端点的会话保持不可确认。

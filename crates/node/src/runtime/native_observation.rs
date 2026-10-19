@@ -74,6 +74,25 @@ fn event_identity(event: &Value) -> (Option<&str>, Option<&str>) {
     )
 }
 
+fn native_input_request(event: &Value) -> bool {
+    serde_json::from_value::<vibeface_protocol::RpcId>(event["id"].clone()).is_ok()
+        && event["method"].as_str().is_some_and(|method| {
+            method.ends_with("requestApproval") || method == "item/tool/requestUserInput"
+        })
+}
+
+fn pending_native_request<'a>(snapshot: &'a Value, work: &NativeWork) -> Option<&'a Value> {
+    snapshot["pending_requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|request| {
+            native_input_request(request)
+                && event_identity(request)
+                    == (Some(work.thread_id.as_str()), work.turn_id.as_deref())
+        })
+}
+
 fn terminal_state(status: &str) -> Option<NativeState> {
     match status {
         "completed" => Some(NativeState::Completed),
@@ -354,38 +373,78 @@ impl Runtime {
         self.publish_changed(&access.network_id, scope, &work.origin_trigger);
         let observation = tokio::time::timeout(Duration::from_secs(10), async {
             let client = self.native_client()?;
-            let mut snapshot = client.snapshot().await;
-            let thread = &snapshot["threads"][&work.thread_id];
-            let observed_here = snapshot["connection"]["state"] == "connected"
-                && loaded_thread(thread)
-                && thread["last_turn"]["id"].as_str() == work.turn_id.as_deref();
-            if !observed_here {
-                let read = client
-                    .request(
-                        "thread/read",
-                        json!({"threadId":work.thread_id,"includeTurns":false}),
-                    )
-                    .await?;
-                ensure!(
-                    read["thread"]["id"] == work.thread_id && loaded_thread(&read["thread"]),
-                    "the original native thread is not loaded on this Socket"
-                );
-                snapshot = client.snapshot().await;
+            client.set_observed_threads(
+                self.native_observed_work()
+                    .await?
+                    .into_iter()
+                    .map(|(_, work)| work.thread_id)
+                    .collect(),
+            )?;
+            let lookup = async {
+                let mut snapshot = client.snapshot().await;
+                let thread = &snapshot["threads"][&work.thread_id];
+                let observed_here = snapshot["connection"]["state"] == "connected"
+                    && loaded_thread(thread)
+                    && thread["last_turn"]["id"].as_str() == work.turn_id.as_deref();
+                if !observed_here {
+                    let read = client
+                        .request(
+                            "thread/read",
+                            json!({"threadId":work.thread_id,"includeTurns":false}),
+                        )
+                        .await?;
+                    ensure!(
+                        read["thread"]["id"] == work.thread_id && loaded_thread(&read["thread"]),
+                        "the original native thread is not loaded on this Socket"
+                    );
+                    snapshot = client.snapshot().await;
+                }
+                let cached = &snapshot["threads"][&work.thread_id]["last_turn"];
+                let turn = if cached["id"].as_str() == work.turn_id.as_deref() {
+                    cached.clone()
+                } else {
+                    read_original_turn(client, &work).await?
+                };
+                Ok::<_, anyhow::Error>((Some(turn), snapshot))
             }
-            let cached = &snapshot["threads"][&work.thread_id]["last_turn"];
-            let turn = if cached["id"].as_str() == work.turn_id.as_deref() {
-                cached.clone()
-            } else {
-                read_original_turn(client, &work).await?
-            };
-            Ok::<_, anyhow::Error>((turn, snapshot))
+            .await;
+            if lookup.is_ok() {
+                return lookup;
+            }
+            loop {
+                let snapshot = client.snapshot().await;
+                let thread = &snapshot["threads"][&work.thread_id];
+                if snapshot["connection"]["state"] == "connected" {
+                    if loaded_thread(thread)
+                        && thread["last_turn"]["id"].as_str() == work.turn_id.as_deref()
+                    {
+                        return Ok((Some(thread["last_turn"].clone()), snapshot));
+                    }
+                    if pending_native_request(&snapshot, &work).is_some() {
+                        return Ok((None, snapshot));
+                    }
+                }
+                let current: NativeWork = serde_json::from_value(
+                    self.store
+                        .lock()
+                        .await
+                        .local_value(&access.network_id, &key(&work.work_id))?
+                        .context("native work is missing")?,
+                )?;
+                if current.state.terminal()
+                    || (current.sequence > work.sequence && current.state != NativeState::Unknown)
+                {
+                    return Ok((None, snapshot));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         })
         .await
         .map_err(|_| anyhow::anyhow!("native observation lookup timed out"))
         .and_then(|result| result);
         let (turn, snapshot) = match observation {
-            Ok((turn, snapshot)) => (Ok(turn), Some(snapshot)),
-            Err(error) => (Err(error), None),
+            Ok((turn, snapshot)) => (turn.map(Ok), Some(snapshot)),
+            Err(error) => (Some(Err(error)), None),
         };
         {
             let mut store = self.store.lock().await;
@@ -400,12 +459,14 @@ impl Runtime {
                     .then(|| thread["last_assistant"].as_str())
                     .flatten()
             });
-            if reconcile_work(&mut current, turn, assistant) {
+            if let Some(turn) = turn
+                && (turn.is_ok() || current.sequence == work.sequence)
+                && reconcile_work(&mut current, turn, assistant)
+            {
                 save_work(&mut store, &access.network_id, &current)?;
             }
         }
         if let Some(snapshot) = snapshot {
-            self.refresh_native_subscriptions().await?;
             for request in snapshot["pending_requests"]
                 .as_array()
                 .into_iter()
@@ -445,8 +506,7 @@ impl Runtime {
         });
     }
 
-    async fn refresh_native_subscriptions(&self) -> Result<()> {
-        let client = self.native_client()?;
+    async fn native_observed_work(&self) -> Result<Vec<(String, NativeWork)>> {
         let networks = self.store.lock().await.networks()?;
         let mut all = Vec::new();
         for network in networks {
@@ -467,6 +527,12 @@ impl Runtime {
                 );
             }
         }
+        Ok(all)
+    }
+
+    async fn refresh_native_subscriptions(&self) -> Result<()> {
+        let client = self.native_client()?;
+        let all = self.native_observed_work().await?;
         client
             .set_observed_threads(all.iter().map(|(_, work)| work.thread_id.clone()).collect())?;
         let snapshot = client.snapshot().await;
@@ -474,6 +540,12 @@ impl Runtime {
             return Ok(());
         }
         for (network, work) in all {
+            if let Some(request) = pending_native_request(&snapshot, &work) {
+                if !matches!(work.state, NativeState::Waiting | NativeState::Interrupting) {
+                    self.observe_native(request.clone()).await?;
+                }
+                continue;
+            }
             let thread = &snapshot["threads"][&work.thread_id];
             let (turn, assistant) = if !loaded_thread(thread) {
                 (
@@ -505,7 +577,8 @@ impl Runtime {
                     .local_value(&network, &key(&work.work_id))?
                     .context("native work is missing")?,
             )?;
-            let changed = reconcile_work(&mut current, turn, assistant);
+            let changed = (turn.is_ok() || current.sequence == work.sequence)
+                && reconcile_work(&mut current, turn, assistant);
             if changed {
                 save_work(&mut store, &network, &current)?;
             }
@@ -545,15 +618,8 @@ impl Runtime {
                         .context("native progress sequence overflow")?;
                     save_work(&mut store, &network, &work)?;
                     let sequence = work.sequence;
-                    if event.get("id").is_some()
-                        && serde_json::from_value::<vibeface_protocol::RpcId>(event["id"].clone())
-                            .is_ok()
-                        && event["method"].as_str().is_some_and(|method| {
-                            method.ends_with("requestApproval")
-                                || method == "item/tool/requestUserInput"
-                        })
-                    {
-                        if let Some(notification) = store.raise_notification_once(
+                    if native_input_request(&event)
+                        && let Some(notification) = store.raise_notification_once(
                             &self.identity,
                             &network,
                             Notification {
@@ -570,9 +636,9 @@ impl Runtime {
                                 event_hash: String::new(),
                             },
                             now_ms(),
-                        )? {
-                            changed_hash = notification.hash;
-                        }
+                        )?
+                    {
+                        changed_hash = notification.hash;
                     }
                     self.publish_progress(&network, json!({"type":"native_progress","conversation_id":work.conversation_id,
                         "work_id":work.work_id,"target_node":work.target_node,"source_node":work.target_node,
@@ -1080,9 +1146,14 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&socket_path)?;
             let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
             let captured = requests.clone();
+            let delayed_lookup = Arc::new(tokio::sync::Notify::new());
+            let delayed_approval = Arc::new(tokio::sync::Notify::new());
+            let lookup_rejected = delayed_lookup.clone();
+            let release_approval = delayed_approval.clone();
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await?;
                 let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                let mut delayed_sent = false;
                 while let Some(message) = socket.next().await {
                     let message = message?;
                     if !message.is_text() {
@@ -1123,6 +1194,23 @@ mod tests {
                         }
                     };
                     socket.send(Message::Text(reply.to_string().into())).await?;
+                    if !delayed_sent
+                        && request["method"] == "thread/read"
+                        && request["params"]["threadId"] == "delayed-thread"
+                    {
+                        delayed_sent = true;
+                        lookup_rejected.notify_one();
+                        release_approval.notified().await;
+                        socket
+                            .send(Message::Text(
+                                json!({"id":7,"method":"item/commandExecution/requestApproval",
+                                    "params":{"threadId":"delayed-thread","turnId":"delayed-turn",
+                                    "availableDecisions":["decline"]}})
+                                .to_string()
+                                .into(),
+                            ))
+                            .await?;
+                    }
                 }
                 Ok::<_, anyhow::Error>(())
             });
@@ -1198,6 +1286,65 @@ mod tests {
                 .await?;
             assert_eq!(attached["state"], "completed");
             assert_eq!(attached["turn_id"], "later-turn");
+            let delayed_node = node.clone();
+            let delayed_access = access.clone();
+            let mut delayed = tokio::spawn(async move {
+                delayed_node
+                    .observe_session(
+                        &delayed_access,
+                        &json!({"thread_id":"delayed-thread","turn_id":"delayed-turn"}),
+                        "delayed-call",
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), delayed_lookup.notified()).await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut delayed)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                sessions_from(&*node.store.lock().await, &network)?
+                    .iter()
+                    .find(|work| work.turn_id.as_deref() == Some("delayed-turn"))
+                    .unwrap()
+                    .state,
+                NativeState::Unknown
+            );
+            delayed_approval.notify_one();
+            let resumed = tokio::time::timeout(Duration::from_secs(3), delayed).await???;
+            assert_eq!(resumed["state"], "waiting");
+            node.refresh_native_subscriptions().await?;
+            let manager = access.manager.as_ref().unwrap();
+            assert!(matches!(
+                node.store
+                    .lock()
+                    .await
+                    .scheduler_job(&network, "chat", &manager.trigger, &manager.target_node)?
+                    .unwrap()
+                    .state,
+                JobState::Running { .. }
+            ));
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    node.wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id),
+                )
+                .await
+                .is_err()
+            );
+            node.observe_native(json!({"method":"turn/completed","params":{
+                "threadId":"delayed-thread","turn":{"id":"delayed-turn","status":"completed"}
+            }}))
+            .await?;
+            assert!(matches!(
+                outcome(
+                    &node
+                        .wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id)
+                        .await?
+                ),
+                Some(JobOutcome::Completed)
+            ));
             let unverified = node
                 .observe_session(
                     &access,
@@ -1207,7 +1354,6 @@ mod tests {
                 .await?;
             assert_eq!(unverified["state"], "unknown");
             assert_eq!(unverified["turn_id"], "unverified-turn");
-            let manager = access.manager.as_ref().unwrap();
             let error = node
                 .wait_native_work(&network, "chat", &manager.trigger, &manager.attempt_id)
                 .await
