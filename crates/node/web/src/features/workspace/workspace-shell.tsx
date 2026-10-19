@@ -2,10 +2,10 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useRouterState } from "@tanstack/react-router"
-import { Inbox, MonitorSmartphone, Plus, RefreshCw, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { toast } from "@/components/app/kit"
+import { Skeleton, toast } from "@/components/app/kit"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Button } from "@/components/ui/button"
@@ -158,4 +158,28 @@ function ConnectionCapsule() {
       </Popover.Content>
     </Popover.Portal>
   </Popover.Root>
+}
+
+/** Same layout as the workspace, shown while the browser loads its keys and connects. */
+export function ShellSkeleton() {
+  return <div className="flex h-dvh" aria-busy="true">
+    <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
+      <span className="text-heading font-semibold">vibeface</span>
+      <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
+      <div className="mt-auto flex items-center gap-2 px-2 text-meta text-info" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</div>
+    </div>
+    <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex h-14 items-center gap-3 border-b px-4"><Skeleton className="h-5 w-32" /><span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</span></div>
+      <ChatSkeleton />
+    </div>
+  </div>
+}
+
+export function ChatSkeleton() {
+  return <div className="mx-auto grid w-full max-w-3xl gap-6 px-4 py-6 sm:px-6" aria-hidden="true">
+    <Skeleton className="ml-auto h-10 w-2/5 rounded-2xl" />
+    <div className="grid gap-2"><Skeleton className="h-4 w-4/5" /><Skeleton className="h-4 w-3/5" /><Skeleton className="h-4 w-2/3" /></div>
+    <Skeleton className="ml-auto h-10 w-1/3 rounded-2xl" />
+    <div className="grid gap-2"><Skeleton className="h-4 w-3/4" /><Skeleton className="h-4 w-1/2" /></div>
+  </div>
 }

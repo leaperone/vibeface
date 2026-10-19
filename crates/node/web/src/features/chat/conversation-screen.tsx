@@ -14,6 +14,7 @@ import { canSend, composerHint } from './protocol'
 import { AgentTaskActivity, NativeSessionActivity, PendingCheckItem } from '@/features/workspace/task-activity'
 import { stateLabel } from '@/features/workspace/labels'
 import type { AutonomyMode } from '@/features/workspace/types'
+import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ManagerStatus, managerTraceStatus, managerTraceTitle } from './elements/manager-status'
 import './chat.css'
 
@@ -78,7 +79,7 @@ export function ConversationScreen() {
 
   return (
     <section className="conversation-screen" aria-label="对话">
-      <Chat
+      {workspace.selectedBot && !data ? <ChatSkeleton /> : <Chat
         key={conversationId}
         messages={shown}
         emptyTitle={workspace.selectedBot ? workspace.selectedBot.name : workspace.bots.length ? '选择一个机器人' : '还没有机器人'}
@@ -87,7 +88,7 @@ export function ConversationScreen() {
       >
         {reasoning ? <Reasoning text={reasoning} running={assistantBusy} /> : null}
         {(messageBusy || assistantBusy) && liveMessages.length === 0 ? <p role="status" className="replying" aria-label={waitLabel}><StatusOrb place={assistantBusy ? 'reply' : 'wait'} size={20} /><span>{waitLabel}</span></p> : null}
-      </Chat>
+      </Chat>}
       {awaitingDecision || hasDetails ? <div className="chat-activity">
       {awaitingDecision ? <div className="chat-approvals">
         {data?.native_sessions.map((session) => <NativeSessionActivity key={`approval-${session.target_node}:${session.work_id}`} session={session} compact />)}
