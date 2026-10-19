@@ -10,6 +10,7 @@ using a controlled sidecar. It does not verify real provider model behavior.
 --chat-agent checks Agent tasks, host commands and native event recovery
 with real Node processes and controlled provider protocol fixtures.
 --network-reliability records the NET-1 process baseline without Codex or models.
+--web-only checks packaged Web resources through one isolated Node process.
 Add --net1-lane 1 to check completed no-op syncs against the saved M0 baseline.
 Add --net1-lane 2 to check interrupted and crashed 32 MiB and 64 MiB relay downloads.
 Add --net1-lane 3 to verify a 100001-event closure across three authorized replicas.
@@ -3078,6 +3079,40 @@ def verify_real_codex_transport(run, workspace, executable):
         socket_dir.rmdir()
 
 
+def web_acceptance(options):
+    binary = options.binary.resolve(strict=True)
+    module = options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "packaged browser WASM is available")
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("web-process-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    report = {"status": "running", "binary_sha256": file_sha256(binary), "provider_calls": 0,
+              "coverage": "real packaged Node HTTP resources, CSP, SPA routes and browser WASM",
+              "not_checked": ["Node business tests", "provider behavior", "rendered browser UI"]}
+    node = None
+    try:
+        node = Node(run, "WEB", binary, workspace, None, None, module, relay_only=True)
+        node.configure(codex_socket=str(run / "unavailable.sock"))
+        node.start()
+        verify_web_assets(node, module)
+        require(node.process.poll() is None, "packaged Node remains running after Web checks")
+        require(file_sha256(binary) == report["binary_sha256"], "Web acceptance preserves the binary")
+        report["status"] = "passed"
+        print("PASS packaged Web resources, CSP, SPA routes and browser WASM", flush=True)
+    except Exception as error:
+        report.update(status="failed", failure=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
+        raise
+    finally:
+        if node:
+            node.stop()
+            node.client.close()
+        private_json(run / "report.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+
+
 def acceptance(options):
     binary = options.binary.resolve(strict=True)
     module = options.crypto_module.resolve(strict=True)
@@ -5738,6 +5773,7 @@ if __name__ == "__main__":
         parser.add_argument("--evidence-dir", type=Path, help="save compact NET-1 reports in the task evidence directory")
         parser.add_argument("--net1-lane", type=int, choices=[1, 2, 3, 4, 5, 6, 7], help="run one focused NET-1 process lane")
         modes = parser.add_mutually_exclusive_group()
+        modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run Agent delegation, host effects, cancellation and native observation process checks")
         modes.add_argument("--network-reliability", action="store_true", help="record NET-1 isolated process baselines without provider calls")
@@ -5745,7 +5781,9 @@ if __name__ == "__main__":
         if arguments.net1_lane and not arguments.network_reliability:
             parser.error("--net1-lane requires --network-reliability")
         try:
-            if arguments.network_reliability:
+            if arguments.web_only:
+                web_acceptance(arguments)
+            elif arguments.network_reliability:
                 network_reliability_acceptance(arguments)
             elif arguments.chat_agent:
                 chat_agent_acceptance(arguments)
