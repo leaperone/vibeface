@@ -660,6 +660,12 @@ async fn announce_membership(node: &Runtime, state: &NetworkState) {
 }
 
 fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
+    if let Some(signer) = input.pointer("/attestation/device_id") {
+        ensure!(
+            signer.as_str() == Some(subject),
+            "the write is signed by another device"
+        );
+    }
     if let Some(client) = input.get("client_id") {
         ensure!(
             client.as_str() == Some(subject),
@@ -1535,6 +1541,13 @@ mod tests {
                 "actual-client"
             )
             .is_ok()
+        );
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"message","attestation":{"device_id":"another-client","signature":""}}),
+                "actual-client"
+            )
+            .is_err()
         );
     }
 

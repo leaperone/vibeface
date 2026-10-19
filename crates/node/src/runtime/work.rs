@@ -256,6 +256,7 @@ impl Runtime {
         work_id: &str,
         request_id: &str,
         response: &Value,
+        attestation: Attestation,
     ) -> Result<Value> {
         let record = self
             .store
@@ -280,6 +281,18 @@ impl Runtime {
         );
         ensure!(!approval.answering, "an answer is already being sent");
         let decision = validate_response(&approval.method, &approval.params, response)?;
+        // Checked before Codex hears the answer: a refused signature must not leave an unrecorded answer.
+        let recorded = EventBody::ApprovalAnswered {
+            work_id: work_id.into(),
+            request_id: request_id.into(),
+            decision,
+            attestation: Some(attestation.clone()),
+        };
+        crate::crypto::verify_attestation(network, scope, &recorded)?;
+        self.store
+            .lock()
+            .await
+            .authorize_attestation(network, &recorded)?;
         let rpc_id = approval.rpc_id.clone();
         self.signal_work(
             network,
@@ -300,6 +313,7 @@ impl Runtime {
                     Signal::ApprovalAnswered {
                         request_id: request_id.into(),
                         decision,
+                        attestation,
                     },
                 )
                 .await?;

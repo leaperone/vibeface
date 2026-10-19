@@ -261,6 +261,7 @@ fn end_job_from(
                 report_results: None,
                 in_reply_to: Some(job.reply_to.clone()),
                 status: Some(status),
+                attestation: None,
             },
             vec![],
             at,
@@ -357,6 +358,7 @@ impl Store {
         text: &str,
         blobs: Vec<BlobRef>,
         report_results: bool,
+        attestation: Attestation,
         created_at_ms: i64,
     ) -> Result<(Message, AdmissionReceipt)> {
         let local = identity.device_id()?;
@@ -393,6 +395,7 @@ impl Store {
                     report_results: Some(report_results),
                     in_reply_to: None,
                     status: None,
+                    attestation: Some(attestation),
                 },
                 blobs,
                 created_at_ms,

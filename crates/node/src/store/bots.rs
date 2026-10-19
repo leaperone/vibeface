@@ -141,6 +141,7 @@ impl Store {
                 name: spec.name.clone(),
                 instructions: spec.instructions.clone(),
                 project: spec.project.clone(),
+                attestation: Some(spec.attestation.clone()),
             },
             vec![],
             created_at_ms,

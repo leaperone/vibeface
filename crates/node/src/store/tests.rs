@@ -29,15 +29,31 @@ fn store(net: &Net) -> Result<Store> {
     Ok(store)
 }
 
-fn user(id: &str, text: &str) -> EventBody {
-    EventBody::MessagePosted {
-        message_id: id.into(),
-        role: Role::User,
-        text: text.into(),
-        report_results: Some(true),
-        in_reply_to: None,
-        status: None,
-    }
+/// A user message in conversation `c`, signed by the network's client device.
+fn user(net: &Net, id: &str, text: &str) -> EventBody {
+    net.a
+        .fixture_admin()
+        .attest(
+            &net.network,
+            "c",
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: text.into(),
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                attestation: None,
+            },
+        )
+        .expect("fixture client signs")
+}
+
+fn signature(net: &Net, id: &str, text: &str) -> Result<Attestation> {
+    user(net, id, text)
+        .attestation()
+        .cloned()
+        .context("signed message")
 }
 
 type Projection = (Vec<(String, String)>, Vec<String>, Option<Conversation>);
@@ -78,7 +94,7 @@ fn out_of_order_delivery_converges() -> Result<()> {
             author,
             &net.network,
             "c",
-            user(&format!("m{i}"), &format!("text {i}")),
+            user(&net, &format!("m{i}"), &format!("text {i}")),
             vec![],
             10 + i,
         )?;
@@ -93,7 +109,7 @@ fn out_of_order_delivery_converges() -> Result<()> {
         &net.a,
         &net.network,
         "c",
-        user("same", "from a"),
+        user(&net, "same", "from a"),
         vec![],
         50,
     )?);
@@ -101,7 +117,7 @@ fn out_of_order_delivery_converges() -> Result<()> {
         &net.b,
         &net.network,
         "c",
-        user("same", "from b"),
+        user(&net, "same", "from b"),
         vec![],
         50,
     )?);
@@ -147,8 +163,9 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         vec![],
         1,
     )?;
-    let _second = origin.append_event(&net.a, &net.network, "c", user("m1", "x"), vec![], 2)?;
-    let third = origin.append_event(&net.a, &net.network, "c", user("m2", "y"), vec![], 3)?;
+    let _second =
+        origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+    let third = origin.append_event(&net.a, &net.network, "c", user(&net, "m2", "y"), vec![], 3)?;
     let mut target = store(&net)?;
     assert_eq!(
         target.ingest_events(&net.network, std::slice::from_ref(&first))?,
@@ -177,7 +194,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         deps: vec![],
         scope_id: "c".into(),
         created_at_ms: 1,
-        body: user("x", "y"),
+        body: user(&net, "x", "y"),
         blobs: vec![],
     })?;
     assert!(
@@ -192,7 +209,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         deps: vec![],
         scope_id: "c".into(),
         created_at_ms: 1,
-        body: user("x", "y"),
+        body: user(&net, "x", "y"),
         blobs: vec![],
     })?;
     tampered.signature = net
@@ -219,7 +236,14 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         vec![],
         1,
     )?;
-    let kept = origin.append_event(&net.a, &net.network, "c", user("m1", "kept"), vec![], 2)?;
+    let kept = origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m1", "kept"),
+        vec![],
+        2,
+    )?;
     let fork = net.a.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
@@ -229,7 +253,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         deps: vec![],
         scope_id: "c".into(),
         created_at_ms: 2,
-        body: user("m1", "forked"),
+        body: user(&net, "m1", "forked"),
         blobs: vec![],
     })?;
     let after_fork = net.a.sign_event(Event {
@@ -241,7 +265,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         deps: vec![],
         scope_id: "c".into(),
         created_at_ms: 3,
-        body: user("m9", "after fork"),
+        body: user(&net, "m9", "after fork"),
         blobs: vec![],
     })?;
     let mut target = store(&net)?;
@@ -258,7 +282,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         &net.b,
         &net.network,
         "c",
-        user("m2", "still works"),
+        user(&net, "m2", "still works"),
         vec![],
         4,
     )?;
@@ -266,7 +290,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         &net.a,
         &net.network,
         "c",
-        user("m3", "a continues"),
+        user(&net, "m3", "a continues"),
         vec![],
         5,
     )?;
@@ -293,14 +317,42 @@ fn the_same_message_id_queues_one_job() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
-    let (_, first) =
-        store.accept_message(&net.a, &net.network, "c", "m1", "hi", vec![], true, 2)?;
-    let (_, second) =
-        store.accept_message(&net.a, &net.network, "c", "m1", "hi", vec![], true, 3)?;
+    let (_, first) = store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "hi",
+        vec![],
+        true,
+        signature(&net, "m1", "hi")?,
+        2,
+    )?;
+    let (_, second) = store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "hi",
+        vec![],
+        true,
+        signature(&net, "m1", "hi")?,
+        3,
+    )?;
     assert_eq!(first, second);
     assert!(
         store
-            .accept_message(&net.a, &net.network, "c", "m1", "other", vec![], true, 4)
+            .accept_message(
+                &net.a,
+                &net.network,
+                "c",
+                "m1",
+                "other",
+                vec![],
+                true,
+                signature(&net, "m1", "other")?,
+                4
+            )
             .is_err()
     );
     assert_eq!(store.scheduler_jobs(&net.network, "c")?.len(), 1);
@@ -313,8 +365,28 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
-    store.accept_message(&net.a, &net.network, "c", "m1", "first", vec![], true, 2)?;
-    store.accept_message(&net.a, &net.network, "c", "m2", "second", vec![], true, 3)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "first",
+        vec![],
+        true,
+        signature(&net, "m1", "first")?,
+        2,
+    )?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m2",
+        "second",
+        vec![],
+        true,
+        signature(&net, "m2", "second")?,
+        3,
+    )?;
     let claimed = store
         .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
@@ -370,7 +442,17 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
-    store.accept_message(&net.a, &net.network, "c", "m1", "do it", vec![], true, 2)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "do it",
+        vec![],
+        true,
+        signature(&net, "m1", "do it")?,
+        2,
+    )?;
     let trigger = message_trigger("m1");
     let spec = WorkSpec {
         work_id: WorkSpec::id("c", &trigger, "call-1"),
@@ -484,7 +566,7 @@ fn append_100k_stays_flat() -> Result<()> {
                 author,
                 &net.network,
                 "c",
-                user(&format!("m{i}"), "x"),
+                user(&net, &format!("m{i}"), "x"),
                 vec![],
                 i,
             )?;

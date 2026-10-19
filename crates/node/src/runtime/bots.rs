@@ -45,6 +45,7 @@ impl Runtime {
                 name: name.to_owned(),
                 instructions: instructions.to_owned(),
                 project,
+                attestation: attestation(input)?,
             },
             now_ms(),
         )?;

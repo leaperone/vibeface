@@ -22,6 +22,7 @@ impl Runtime {
             scope,
             mode,
             expected,
+            attestation(args)?,
             now_ms(),
         )?;
         self.publish_changed(&access.network_id, scope, &envelope.hash);

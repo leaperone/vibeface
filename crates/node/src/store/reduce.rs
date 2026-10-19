@@ -68,6 +68,7 @@ pub(crate) fn apply(
             name,
             instructions,
             project,
+            ..
         } => {
             connection.execute(
                 "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,project,event_hash,rank) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET bot_id=excluded.bot_id,name=excluded.name,instructions=excluded.instructions,project=excluded.project,event_hash=excluded.event_hash,rank=excluded.rank WHERE excluded.rank<rank",
@@ -81,6 +82,7 @@ pub(crate) fn apply(
             report_results,
             in_reply_to,
             status,
+            ..
         } => {
             connection.execute(
                 "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,blobs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,blobs=excluded.blobs WHERE excluded.rank<rank",
@@ -150,6 +152,7 @@ pub(crate) fn apply(
             work_id,
             request_id,
             decision,
+            ..
         } => {
             connection.execute(
                 "INSERT INTO approvals(network_id,request_id,work_id,decision,answer_rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET decision=excluded.decision,answer_rank=excluded.answer_rank WHERE answer_rank IS NULL OR excluded.answer_rank<answer_rank",
@@ -178,7 +181,7 @@ pub(crate) fn apply(
                 rank,
             )?;
         }
-        EventBody::AutonomySet { mode, version } => {
+        EventBody::AutonomySet { mode, version, .. } => {
             connection.execute(
                 "INSERT INTO autonomy(network_id,conversation_id,mode,strictness,version,event_hash) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET mode=excluded.mode,strictness=excluded.strictness,version=excluded.version,event_hash=excluded.event_hash WHERE excluded.version>version OR (excluded.version=version AND (excluded.strictness>strictness OR (excluded.strictness=strictness AND excluded.event_hash<event_hash)))",
                 params![network, scope, text(mode)?, strictness(*mode), version, hash],
@@ -187,6 +190,7 @@ pub(crate) fn apply(
         EventBody::NotificationAcked {
             notification_id,
             client_id,
+            ..
         } => {
             connection.execute(
                 "INSERT OR IGNORE INTO notification_acks(network_id,notification_id,client_id) VALUES(?,?,?)",

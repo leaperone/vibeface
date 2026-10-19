@@ -2,6 +2,8 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import type { ReadyConnection } from "@/lib/node"
+import { attestationPayload } from "../../../generated/vibeface_secure.js"
+import { signClient } from "../../../transport.js"
 import { messageOf } from "@/lib/node"
 import { mergeProgress, type LiveProgress } from "@/lib/progress"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol"
@@ -21,6 +23,9 @@ export type InterruptedReply = { trigger: string; conversation_id: string; after
 function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}) {
   const networkId = connection.principal.network_id
   const clientId = connection.principal.device_id
+  /** This device's signature over the exact event body the Node will write for it. */
+  const attest = async (scope: string, body: Record<string, unknown>) =>
+    ({ device_id: clientId, signature: await signClient("attestation", attestationPayload(networkId, scope, JSON.stringify(body))) })
   const [booted, setBooted] = useState(false)
   const [error, setError] = useState("")
   const [noticeText, setNoticeText] = useState("")
@@ -119,7 +124,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
-          await connection.rpc("ack", { notification_id: notification.notification_id })
+          await connection.rpc("ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
           requireCurrent()
           notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
           setNotifications(notificationsRef.current)
@@ -271,7 +276,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {
-      const receipt = await connection.rpc("message", prepared.body)
+      const { body } = prepared
+      const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, report_results: body.report_results })
+      const receipt = await connection.rpc("message", { ...body, attestation })
       requireCurrent()
       if (!isQueuedReceipt(receipt, prepared.pending)) {
         if (activeId.current === id) await refreshRef.current().catch(showError)
@@ -346,7 +353,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       writeStorage(scoped("pending-bot"), pending, true)
       botCreationRef.current = pending; setPendingBot(pending)
       let response: unknown
-      try { response = await connection.rpc("create_bot", request) }
+      const attestation = await attest(request.conversation_id, { type: "bot_created", bot_id: request.bot_id, name: request.name, instructions: request.instructions, ...(request.project ? { project: request.project } : {}) })
+      try { response = await connection.rpc("create_bot", { ...request, attestation }) }
       catch (caught) {
         if (!prior && current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
           const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.device_id } }
@@ -382,7 +390,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const id = activeId.current, context = requireBotContext(id)
       const version = context.autonomy.version
       if (version === null) throw new Error("后面的记录读不到，请再查一次。")
-      try { await connection.rpc("set_autonomy", { conversation_id: id, mode, expected_version: version }) }
+      const attestation = await attest(id, { type: "autonomy_set", mode, version: version + 1 })
+      try { await connection.rpc("set_autonomy", { conversation_id: id, mode, expected_version: version, attestation }) }
       catch (caught) {
         if (messageOf(caught).includes("refresh")) {
           if (activeId.current === id) await refreshRef.current()
@@ -411,7 +420,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const request = work?.open_approvals.find((item) => item.request_id === requestId)
       if (!work || work.state !== "waiting_approval" || !request?.form) throw new Error("找不到这个请求，请再查一次。")
       if (request.form.questions?.some((question) => question.is_secret)) throw new Error("这项内容请到执行设备上填写。")
-      try { await connection.rpc("answer_approval", { conversation_id: id, work_id: workId, request_id: requestId, response }) }
+      const chosen = (response as { decision?: unknown } | null)?.decision
+      const attestation = await attest(id, { type: "approval_answered", work_id: workId, request_id: requestId, decision: typeof chosen === "string" ? chosen : "answered" })
+      try { await connection.rpc("answer_approval", { conversation_id: id, work_id: workId, request_id: requestId, response, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       setNoticeText("已提交。")

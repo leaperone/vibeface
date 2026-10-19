@@ -163,6 +163,7 @@ pub enum Signal {
     ApprovalAnswered {
         request_id: String,
         decision: ApprovalDecision,
+        attestation: Attestation,
     },
     /// The executor reports a request resolved; unless this Node was answering it, someone bypassed it.
     ApprovalResolved(Value),
@@ -363,6 +364,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             Signal::ApprovalAnswered {
                 request_id,
                 decision,
+                attestation,
             },
         ) => {
             let before = approvals.len();
@@ -379,6 +381,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 work_id: record.spec.work_id.clone(),
                 request_id,
                 decision,
+                attestation: Some(attestation),
             })
         }
         (WaitingApproval { handle, approvals }, Signal::ApprovalResolved(rpc_id)) => {
@@ -610,6 +613,10 @@ mod tests {
         let answered = Signal::ApprovalAnswered {
             request_id: request_id.clone(),
             decision: ApprovalDecision::Decline,
+            attestation: Attestation {
+                device_id: "c".repeat(64),
+                signature: "s".into(),
+            },
         };
         assert!(transition(&mut work, answered.clone()).is_some());
         assert!(transition(&mut work, answered).is_none());

@@ -183,6 +183,7 @@ impl Runtime {
             field(input, "text")?,
             vec![],
             report_results,
+            attestation(input)?,
             now_ms(),
         )?;
         self.publish_changed(network, &scope, &message.event_hash);

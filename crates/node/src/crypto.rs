@@ -80,6 +80,36 @@ impl LocalIdentity {
     pub fn fixture_network_id(&self) -> Result<String> {
         self.fixture_root().device_id()
     }
+    /// The client device in `sign_network_fixture`'s network.
+    #[cfg(test)]
+    pub fn fixture_admin(&self) -> Self {
+        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
+        admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
+        Self {
+            secret_key_hex: hex::encode(Sha256::digest(admin_seed)),
+        }
+    }
+    /// `body` with this client's signature, as a browser would send it.
+    #[cfg(test)]
+    pub fn attest(&self, network: &str, scope: &str, mut body: EventBody) -> Result<EventBody> {
+        let signature = self.sign_payload(
+            vibeface_secure::join::ATTESTATION_DOMAIN,
+            &attestation_payload(network, scope, &body)?,
+        )?;
+        let value = Some(Attestation {
+            device_id: self.device_id()?,
+            signature,
+        });
+        match &mut body {
+            EventBody::BotCreated { attestation, .. }
+            | EventBody::MessagePosted { attestation, .. }
+            | EventBody::ApprovalAnswered { attestation, .. }
+            | EventBody::AutonomySet { attestation, .. }
+            | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
+            _ => anyhow::bail!("this event carries no device signature"),
+        }
+        Ok(body)
+    }
     /// A recovered network whose members are a fixture admin client and `nodes`.
     #[cfg(test)]
     pub fn sign_network_fixture(
@@ -89,11 +119,7 @@ impl LocalIdentity {
     ) -> Result<crate::identity::NetworkState> {
         use crate::identity::{Genesis, IdentityKind, Member, NetworkState, RootCheckpoint};
 
-        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
-        admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
-        let admin = LocalIdentity {
-            secret_key_hex: hex::encode(Sha256::digest(admin_seed)),
-        };
+        let admin = self.fixture_admin();
         let admin_member = Member::client(&admin, "fixture-admin", true)?;
         let root = self.fixture_root();
         let genesis = Genesis::create(
@@ -196,6 +222,48 @@ fn payload_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     );
     Ok(format!("vibeface:message:v1:{domain}:{}", digest(payload)).into_bytes())
 }
+/// What a client signs for `body` (its `attestation` left out) in one conversation.
+pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(body)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("attestation");
+    }
+    vibeface_secure::join::attestation_payload(network_id, scope_id, &value.to_string())
+        .map_err(anyhow::Error::msg)
+}
+
+/// The user's own writes must carry their device signature; nothing else may carry one.
+fn validate_attestation(event: &Event) -> Result<()> {
+    let required = match &event.body {
+        EventBody::MessagePosted { role, .. } => *role == Role::User,
+        EventBody::BotCreated { .. }
+        | EventBody::ApprovalAnswered { .. }
+        | EventBody::AutonomySet { .. }
+        | EventBody::NotificationAcked { .. } => true,
+        _ => false,
+    };
+    if event.body.attestation().is_none() {
+        ensure!(!required, "this write needs the user's device signature");
+        return Ok(());
+    }
+    ensure!(
+        required,
+        "only the user's own writes carry a device signature"
+    );
+    verify_attestation(&event.network_id, &event.scope_id, &event.body)
+}
+
+pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) -> Result<()> {
+    let attestation = body.attestation().context("missing device signature")?;
+    verify_payload(
+        &attestation.device_id,
+        vibeface_secure::join::ATTESTATION_DOMAIN,
+        &attestation_payload(network_id, scope_id, body)?,
+        &attestation.signature,
+    )
+    .context("the device signature does not match this write")
+}
+
 pub fn validate_event_shape(event: &Event) -> Result<()> {
     ensure!(event.version == WIRE_VERSION, "unsupported event version");
     ensure!(
@@ -304,7 +372,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         }
         _ => {}
     }
-    Ok(())
+    validate_attestation(event)
 }
 
 #[cfg(test)]
@@ -364,23 +432,58 @@ mod tests {
             report_results,
             in_reply_to: None,
             status,
+            attestation: None,
         };
+        let network = identity.fixture_network_id()?;
+        let client = identity.fixture_admin();
+        let signed_user = client.attest(
+            &network,
+            "conversation",
+            message(Role::User, Some(true), None),
+        )?;
         let mut event = Event {
             version: WIRE_VERSION,
-            network_id: identity.fixture_network_id()?,
+            network_id: network.clone(),
             author: identity.device_id()?,
             seq: 1,
             prev: None,
             deps: vec![digest(b"b"), digest(b"a"), digest(b"b")],
             scope_id: "conversation".into(),
             created_at_ms: 0,
-            body: message(Role::User, Some(true), None),
+            body: signed_user.clone(),
             blobs: vec![],
         };
         let signed = identity.sign_event(event.clone())?;
         let verified = verify_signed_event(&event.network_id, &signed)?;
         assert_eq!(verified.deps.len(), 2);
         assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
+        // The Node cannot write the user's message alone, change it, or move it to another conversation.
+        event.body = message(Role::User, Some(true), None);
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = signed_user.clone();
+        if let EventBody::MessagePosted { text, .. } = &mut event.body {
+            *text = "rm -rf".into();
+        }
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = signed_user;
+        event.scope_id = "other".into();
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.scope_id = "conversation".into();
+        assert!(
+            client
+                .attest(
+                    &network,
+                    "conversation",
+                    message(Role::Assistant, None, Some(ReplyStatus::Stopped))
+                )
+                .is_ok_and(|body| identity
+                    .sign_event(Event {
+                        body,
+                        ..event.clone()
+                    })
+                    .is_err()),
+            "assistant replies carry no device signature"
+        );
         event.body = message(Role::User, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = message(Role::Assistant, None, None);

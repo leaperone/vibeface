@@ -89,6 +89,14 @@ pub struct OpenWork {
     pub summary: String,
 }
 
+/// The user's device signature over an event body the connected Node writes on its behalf.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Attestation {
+    pub device_id: DeviceId,
+    pub signature: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventBody {
@@ -106,6 +114,8 @@ pub enum EventBody {
         instructions: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<BotProject>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     /// `report_results` belongs to user messages; `in_reply_to` and `status` to assistant replies.
     MessagePosted {
@@ -118,6 +128,8 @@ pub enum EventBody {
         in_reply_to: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ReplyStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     /// Written by the target Node when it accepts the work, so no progress precedes it.
     WorkDispatched {
@@ -152,6 +164,8 @@ pub enum EventBody {
         work_id: String,
         request_id: String,
         decision: ApprovalDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     WorkFinished {
         work_id: String,
@@ -163,10 +177,14 @@ pub enum EventBody {
     AutonomySet {
         mode: AutonomyMode,
         version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     NotificationAcked {
         notification_id: String,
         client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     /// Written only by the owner in a read-only closing turn; covered events stay stored.
     ContextCheckpoint {
@@ -179,6 +197,17 @@ pub enum EventBody {
 }
 
 impl EventBody {
+    /// Present on writes that need the user's own device signature; see `crypto::validate_event_shape`.
+    pub fn attestation(&self) -> Option<&Attestation> {
+        match self {
+            Self::BotCreated { attestation, .. }
+            | Self::MessagePosted { attestation, .. }
+            | Self::ApprovalAnswered { attestation, .. }
+            | Self::AutonomySet { attestation, .. }
+            | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
+            _ => None,
+        }
+    }
     pub fn work_id(&self) -> Option<&str> {
         match self {
             Self::WorkDispatched { work_id, .. }
@@ -266,6 +295,7 @@ pub struct BotCreateSpec {
     pub name: String,
     pub instructions: String,
     pub project: Option<BotProject>,
+    pub attestation: Attestation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

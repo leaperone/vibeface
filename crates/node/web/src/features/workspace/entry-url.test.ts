@@ -126,6 +126,7 @@ test("workspace preserves bot and message requests while routing native decision
     navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
+  const signed: string[] = [], attestation = { device_id: "client", signature: "signature" }
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL("../../", import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
@@ -139,6 +140,8 @@ test("workspace preserves bot and message requests while routing native decision
       if (specifier === "react") return react
       if (specifier === "@/lib/node") return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
       if (specifier === "react/jsx-runtime") return { jsx: () => null }
+      if (specifier.endsWith("/generated/vibeface_secure.js")) return { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` }
+      if (specifier.endsWith("/transport.js")) return { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } }
       const path = specifier.startsWith("@/") ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
       return load(extname(path) ? path : `${path}.ts`)
     }
@@ -180,7 +183,7 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: transcript, works: [work] }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
-        assert.deepEqual(JSON.parse(JSON.stringify(parseCreateBot(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")))), creations.at(-1))
+        assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")))), attestation }, creations.at(-1))
         if (createMode === "unknown") throw new Error("connection lost")
         if (createMode === "rejected") throw Object.assign(new Error("project unavailable"), { responded: true })
         const created = parseBot({ ...body, event_hash: "new-bot-event" })
@@ -226,7 +229,8 @@ test("workspace preserves bot and message requests while routing native decision
     state = render()
     assert.ok(state.messagePending)
     const pending = JSON.parse(JSON.stringify(state.messagePending))
-    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", report_results: true })
+    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", report_results: true, attestation })
+    assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "message_posted", message_id: pending.message_id, role: "user", text: "work", report_results: true })}`)
     await assert.rejects(render().sendMessage("different work"), /上一条消息/)
     connection.entry.device_id = "other-gateway"
     await assert.rejects(render().sendMessage("work"), /原来的设备/)
@@ -239,8 +243,9 @@ test("workspace preserves bot and message requests while routing native decision
     await render().answerApproval("work", "req", { decision: "decline" })
     assert.deepEqual(controls, [
       { method: "interrupt_work", conversation_id: "chat", work_id: "work" },
-      { method: "answer_approval", conversation_id: "chat", work_id: "work", request_id: "req", response: { decision: "decline" } },
+      { method: "answer_approval", conversation_id: "chat", work_id: "work", request_id: "req", response: { decision: "decline" }, attestation },
     ])
+    assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"approval_answered","work_id":"work","request_id":"req","decision":"decline"}')
     await assert.rejects(render().interruptWork("other-work"), /停不了/)
     await assert.rejects(render().answerApproval("work", "other", { decision: "accept" }), /找不到这个请求/)
     const beforeUnknown = controls.length
@@ -272,13 +277,13 @@ test("workspace preserves bot and message requests while routing native decision
     const originalCreation = creations[0]
     assert.equal(typeof originalCreation.bot_id, "string")
     assert.notEqual(originalCreation.bot_id, originalCreation.conversation_id)
-    assert.deepEqual(JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), originalCreation)
+    assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), attestation }, originalCreation)
     await reload()
-    assert.deepEqual(JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), originalCreation)
+    assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), attestation }, originalCreation)
     await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /内容已保留/)
     createMode = "rejected"
     await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
-    assert.deepEqual(JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), originalCreation)
+    assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), attestation }, originalCreation)
     assert.equal(render().pendingBot?.submission?.state, "unconfirmed")
     createMode = "success"
     await render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })

@@ -180,6 +180,11 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     ensure!(!s.trim().is_empty() && s.len() <= 65536, "invalid {key}");
     Ok(s)
 }
+/// The client's signature over the event body this write produces; checked when the event is signed.
+fn attestation(v: &Value) -> Result<Attestation> {
+    serde_json::from_value(v["attestation"].clone())
+        .context("this write needs the signature of your device; reload the page and retry")
+}
 fn id(v: &Value, key: &str) -> Result<String> {
     let s = field(v, key)?;
     ensure!(
@@ -738,6 +743,7 @@ impl Runtime {
                         &work_id,
                         &id(&input, "request_id")?,
                         input.get("response").context("response is required")?,
+                        attestation(&input)?,
                     )
                     .await
                 }
@@ -768,6 +774,7 @@ impl Runtime {
                         EventBody::NotificationAcked {
                             notification_id: notification,
                             client_id: client,
+                            attestation: Some(attestation(&input)?),
                         },
                     )
                     .await?;

@@ -272,6 +272,9 @@ pub(crate) fn append_from(
 ) -> Result<SignedEvent> {
     let author = identity.device_id()?;
     super::authorize_node_from(connection, network, &author)?;
+    if let Some(attestation) = body.attestation() {
+        super::membership_from(connection, network)?.client(&attestation.device_id)?;
+    }
     for blob in &blobs {
         ensure!(
             blob_file_matches(&blob_path(blob_dir, &blob.hash), blob),

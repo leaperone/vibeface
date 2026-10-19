@@ -210,6 +210,13 @@ impl Store {
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
     }
+    /// A write signed by a device this network has admitted and not revoked.
+    pub fn authorize_attestation(&self, network_id: &str, body: &EventBody) -> Result<()> {
+        if let Some(attestation) = body.attestation() {
+            membership_from(&self.connection, network_id)?.client(&attestation.device_id)?;
+        }
+        Ok(())
+    }
     pub fn save_local_identity(
         &mut self,
         network_id: &str,
@@ -475,6 +482,7 @@ impl Store {
         autonomy_from(&self.connection, network, scope)
     }
     /// Optimistic: a stale `expected_version` is refused, so two clients never silently override.
+    #[expect(clippy::too_many_arguments, reason = "the decision and its signature")]
     pub fn set_autonomy(
         &mut self,
         identity: &LocalIdentity,
@@ -482,6 +490,7 @@ impl Store {
         scope: &str,
         mode: AutonomyMode,
         expected_version: u64,
+        attestation: Attestation,
         at: i64,
     ) -> Result<SignedEvent> {
         let tx = self
@@ -504,6 +513,7 @@ impl Store {
             EventBody::AutonomySet {
                 mode,
                 version: expected_version + 1,
+                attestation: Some(attestation),
             },
             vec![],
             at,
