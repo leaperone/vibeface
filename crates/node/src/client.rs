@@ -961,7 +961,7 @@ fn client_endpoint(value: &str) -> Result<String> {
             && url.fragment().is_none(),
         "client URL must not contain credentials, query, or fragment"
     );
-    if !network_endpoint {
+    if !network_endpoint || url.path() == "/" {
         ensure!(
             matches!(url.path(), "/" | "/api/network/ws"),
             "client URL must be a node base URL or network endpoint"
@@ -1078,6 +1078,14 @@ mod tests {
     #[tokio::test]
     async fn client_routes_by_target_and_pins_the_destination() -> Result<()> {
         use tokio_tungstenite::tungstenite::Message as NativeMessage;
+        assert_eq!(
+            client_endpoint("ws://node.test")?,
+            "ws://node.test/api/network/ws"
+        );
+        assert_eq!(
+            client_endpoint("wss://node.test/custom/network")?,
+            "wss://node.test/custom/network"
+        );
         for correct_target in [false, true] {
             let destination = LocalIdentity::generate();
             let target = if correct_target {

@@ -459,7 +459,7 @@ fn network_url(value: &str) -> Result<String> {
     };
     url.set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
-    if !network_endpoint {
+    if !network_endpoint || url.path() == "/" {
         url.set_path("/api/network/ws");
     }
     Ok(url.to_string())
@@ -1053,6 +1053,14 @@ mod tests {
 
     #[test]
     fn network_urls_normalize_without_accepting_credentials() {
+        assert_eq!(
+            network_url("ws://node.test").unwrap(),
+            "ws://node.test/api/network/ws"
+        );
+        assert_eq!(
+            network_url("wss://node.test/custom/network").unwrap(),
+            "wss://node.test/custom/network"
+        );
         assert_eq!(
             network_url("https://node.test").unwrap(),
             "wss://node.test/api/network/ws"
