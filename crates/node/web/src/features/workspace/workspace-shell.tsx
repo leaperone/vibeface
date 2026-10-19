@@ -6,7 +6,7 @@ import { Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, Settings, Shie
 import { Popover } from "radix-ui"
 import { cn } from "cn"
 import { Skeleton, toast } from "@/components/app/kit"
-import { useOpenJoins } from "@/features/devices/join"
+import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Button } from "@/components/ui/button"
@@ -64,6 +64,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     for (const join of joins) {
       if (announced.current.has(join.join_id)) continue
       announced.current.add(join.join_id)
+      if (joinsOnScreen()) continue
       toast(`${join.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } })
     }
   }, [joins.map((join) => join.join_id).join()])

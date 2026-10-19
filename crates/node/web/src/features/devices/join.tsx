@@ -11,11 +11,16 @@ export function useOpenJoins(): JoinRequest[] {
   return device.ready?.principal.can_manage ? device.joins.filter((request) => request.status === "pending" || request.status === "confirming") : []
 }
 
+let cardsOnScreen = 0
+/** While join cards are visible the shell skips its "X 想加入" toast; the card already says it. */
+export const joinsOnScreen = () => cardsOnScreen > 0
+
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
 /** `issuing`: this page just handed out a link, so it starts the comparison without a click. */
 export function JoinRequests({ issuing = false }: { issuing?: boolean }) {
   const device = useDevice()
   const joins = useOpenJoins()
+  useEffect(() => { cardsOnScreen++; return () => { cardsOnScreen-- } }, [])
   // The code appears once the new device reveals its nonce; poll until every open request shows one.
   const waiting = joins.some((request) => !request.code)
   useEffect(() => {
