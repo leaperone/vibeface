@@ -7,7 +7,7 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import { conversationHref } from "./entry-url.ts"
-import { isIncomplete, mergeBasis } from "./labels.ts"
+import { isIncomplete, mergeBasis, nodeName } from "./labels.ts"
 import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parsePending, parseCreateBot, parseBot } from "./model.ts"
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
@@ -32,8 +32,16 @@ test("missing integrity fields fail closed instead of authorizing writes", () =>
   assert.throws(() => parseConversation(context, "other"))
   assert.equal(isIncomplete(parseConversation({ ...context, missing: { events: [], blobs: [{ hash: "blob" }], conflicts: [] } }).missing), true)
 })
+test("nodeName prefers rpc and directory names over truncated peer ids", () => {
+  const id = "a".repeat(64)
+  assert.equal(nodeName(id, { nodes: [{ node_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
+  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ subject_id: id, public_key: id, kind: "node", name: "工作机", node_roles: [], manage: false }], revoked: [] } }), "工作机")
+  assert.equal(nodeName(id), `${id.slice(0, 10)}…`)
+})
+
 test("capabilities parse the actual provider name and reject malformed node lists", () => {
-  const nodes = parseNodes({ nodes: [{ node_id: "n", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", executors: ["codex"], roots: ["/project"] } }] })
+  const nodes = parseNodes({ nodes: [{ node_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", executors: ["codex"], roots: ["/project"] } }] })
+  assert.equal(nodes[0]?.name, "本机")
   assert.equal(nodes[0]?.capabilities?.manager, "cursor_agent")
   assert.throws(() => parseNodes({ nodes: [{ node_id: "n" }] }))
 })

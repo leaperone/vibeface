@@ -11,7 +11,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Artifact } from "../chat/elements/artifact"
 import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
-import { stateLabel } from "./labels"
+import { nodeName, stateLabel } from "./labels"
 import { ActionButton, DetailList, StatusBadge, SubmitButton } from "./present"
 import { reconcileDecision } from "./reconcile"
 import type { ExecutionActivityRecord, HumanRequest, OperationRecord, PendingOperation } from "./types"
@@ -20,7 +20,7 @@ export function ExecutionActivity({ execution, conversationId, compact = false }
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
-  const deviceName = directory?.members.find((member) => member.subject_id === execution.target_node)?.name || (workspace.nodes.some((node) => node.node_id === execution.target_node && node.local) ? "本机" : "执行设备")
+  const deviceName = nodeName(execution.target_node, { nodes: workspace.nodes, directory }, "执行设备")
   const [steerGeneration, setSteerGeneration] = useState<number | null>(null)
   const steerBusy = steerGeneration === workspace.generation
   const targetOnline = workspace.nodes.some((node) => node.node_id === execution.target_node && node.online && !node.revoked)
@@ -108,8 +108,9 @@ export function PendingExecutionControl({ operation }: { operation: PendingOpera
 }
 
 export function UnknownOperationActivity({ operation }: { operation: OperationRecord }) {
+  const workspace = useWorkspace()
   const { directory } = useDevice()
-  const deviceName = directory?.members.find((member) => member.subject_id === operation.request.target_node)?.name || "执行设备"
+  const deviceName = nodeName(operation.request.target_node, { nodes: workspace.nodes, directory }, "执行设备")
   return <Card><CardHeader><CardTitle>结果待核查 · {deviceName}</CardTitle></CardHeader><CardContent className="space-y-3"><p className="text-sm">先确认原进程和外部结果，避免重复执行。</p><ResolveForm targetNode={operation.request.target_node} operationId={operation.request.operation_id} /></CardContent></Card>
 }
 

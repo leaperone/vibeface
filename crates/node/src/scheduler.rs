@@ -24,6 +24,7 @@ const CONSTRAINTS: &[&str] = &[
     "Use the Node tools for execution; do not edit projects or launch executors from the scheduler workspace.",
     "Use command for simple authorized queries or commands and delegate for coding work. The Node owns operation, session, target and revision bookkeeping.",
     "Unknown execution results require reconciliation, never an automatic resend.",
+    "When talking about devices, use each Node's name from the nodes tool first; mention Peer ID only in details or when names are missing.",
     "Never approve execution, grant autonomous authority, or accept a task for the human.",
     "A completed executor turn is evidence to assess against the user request; only the human can grant authority or accept a deliverable.",
 ];
@@ -537,7 +538,7 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
     let specs = [
         (
             "nodes",
-            "List reachable execution Nodes, supported executors and allowed directories.",
+            "List reachable execution Nodes with device names (name), supported executors and allowed directories. Prefer name when replying; Peer ID is for details.",
             json!({}),
             vec![],
         ),

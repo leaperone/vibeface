@@ -1,3 +1,6 @@
+import type { MembershipView } from "@/lib/node"
+import type { NodeInfo } from "./types"
+
 export const roleNames: Record<string, string> = {
   gateway: "接入",
   relay: "中继",
@@ -26,8 +29,23 @@ export const stateNames: Record<string, string> = {
   ready: "就绪",
 }
 
-export function nodeName(id: string | undefined) {
+export type NodeNameLookup = {
+  nodes?: readonly NodeInfo[]
+  directory?: MembershipView | null
+}
+
+export function nodeName(
+  id: string | undefined,
+  lookup?: NodeNameLookup,
+  fallback?: string,
+) {
   if (!id) return "未知设备"
+  const node = lookup?.nodes?.find((item) => item.node_id === id)
+  if (node?.name) return node.name
+  const member = lookup?.directory?.members.find((item) => item.subject_id === id)
+  if (member?.name) return member.name
+  if (node?.local) return "本机"
+  if (fallback) return fallback
   return `${id.slice(0, 10)}${id.length > 10 ? "…" : ""}`
 }
 

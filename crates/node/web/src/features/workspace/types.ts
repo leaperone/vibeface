@@ -2,6 +2,7 @@ import type { PendingMessage, TranscriptMessage } from "../chat/types"
 
 export type NodeInfo = {
   node_id: string
+  name: string
   local: boolean
   online: boolean
   revoked: boolean

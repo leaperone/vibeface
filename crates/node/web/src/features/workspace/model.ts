@@ -42,7 +42,9 @@ export function parseNodes(value: unknown): NodeInfo[] {
     const data = record(item)
     const capabilities = data.capabilities == null ? null : record(data.capabilities)
     return {
-      node_id: text(data.node_id), local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked), roles: texts(data.roles),
+      node_id: text(data.node_id),
+      name: typeof data.name === "string" ? data.name : "",
+      local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked), roles: texts(data.roles),
       capabilities: capabilities ? { manager: capabilities.manager === null ? null : text(capabilities.manager), executors: texts(capabilities.executors), roots: texts(capabilities.roots) } : undefined,
     }
   })
