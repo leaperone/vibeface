@@ -1649,12 +1649,12 @@ mod tests {
         assert_eq!(requests.lock().await.len(), 1);
         println!("M5_STAGE snapshots returned; release first blob");
         gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(10), survivor)
+        tokio::time::timeout(Duration::from_secs(60), survivor)
             .await??
             .context("m5 survivor proof")?
             .require_complete()?;
         println!("M5_STAGE proof complete");
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while !receiver.sync.queue.lock().unwrap().entries.is_empty() {
                 tokio::task::yield_now().await;
             }

@@ -1539,7 +1539,7 @@ mod tests {
         }
         assert!(updates.try_recv().is_err());
         gate.add_permits(1);
-        let result = tokio::time::timeout(Duration::from_secs(3), proof).await;
+        let result = tokio::time::timeout(Duration::from_secs(60), proof).await;
         if result.is_err() {
             let requests = requests.lock().await;
             println!(

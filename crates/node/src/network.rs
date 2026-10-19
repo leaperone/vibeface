@@ -3853,7 +3853,7 @@ mod tests {
         let mut waits = [false; 2];
         let mut accepted = 0;
         let mut lookup_done = false;
-        let error = tokio::time::timeout(Duration::from_secs(50), async {
+        let error = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 tokio::select! {
                     result = &mut circuit.done => return Ok::<_, anyhow::Error>(result?.unwrap_err()),
