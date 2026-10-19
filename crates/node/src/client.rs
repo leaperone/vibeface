@@ -808,7 +808,7 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
     Ok(view)
 }
 fn connection_entry(node: &Runtime) -> Result<Value> {
-    let relay = node.config.cluster.bootstrap_urls.first();
+    let relay = node.config.network.bootstrap_urls.first();
     let mut url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
     let scheme = match url.scheme() {
         "ws" => "http",
