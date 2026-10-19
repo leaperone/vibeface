@@ -43,13 +43,13 @@ export function prepareSend(input: {
   const pending = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,
     scheduler_node: input.schedulerNodeId, entry_node: input.entryNode, basis_heads: [...input.heads],
-    report_results: input.reportResults ?? false,
+    report_results: input.reportResults ?? true,
   }
   return { ok: true, pending, body: {
     conversation_id: pending.conversation_id, message_id: pending.message_id, text: pending.text,
     basis_heads: pending.basis_heads, scheduler_node: pending.scheduler_node,
     entry_node: pending.entry_node,
-    report_results: pending.report_results ?? false,
+    report_results: pending.report_results ?? true,
   } }
 }
 export function isQueuedReceipt(value: unknown, pending: PendingMessage): boolean {
