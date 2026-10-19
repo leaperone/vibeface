@@ -2238,7 +2238,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
- "ed25519-dalek",
  "flate2",
  "futures-util",
  "hex",

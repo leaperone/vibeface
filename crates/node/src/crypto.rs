@@ -1,9 +1,10 @@
 use crate::model::*;
-use anyhow::{Context as _, Result, ensure};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+#[cfg(test)]
+use anyhow::Context as _;
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use vibeface_secure::Identity;
+pub use vibeface_secure::digest;
 
 const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
 
@@ -20,17 +21,19 @@ impl std::fmt::Debug for LocalIdentity {
 impl LocalIdentity {
     pub fn generate() -> Self {
         Self {
-            secret_key_hex: hex::encode(SigningKey::generate(&mut OsRng).to_bytes()),
+            secret_key_hex: Identity::generate()
+                .expect("secure randomness unavailable")
+                .secret_hex(),
         }
     }
-    fn key(&self) -> Result<SigningKey> {
-        Ok(SigningKey::from_bytes(&decode32(&self.secret_key_hex)?))
+    fn key(&self) -> Result<Identity> {
+        Identity::from_secret_hex(&self.secret_key_hex).map_err(anyhow::Error::msg)
     }
     pub fn public_key_hex(&self) -> Result<String> {
-        Ok(hex::encode(self.key()?.verifying_key().as_bytes()))
+        Ok(self.key()?.public_key_hex())
     }
     pub fn peer_id(&self) -> Result<PeerId> {
-        fingerprint(&self.public_key_hex()?)
+        Ok(self.key()?.peer_id())
     }
     pub fn network_id(&self) -> Result<NetworkId> {
         self.peer_id()
@@ -44,8 +47,9 @@ impl LocalIdentity {
         })
     }
     pub fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        let message = payload_message(domain, payload)?;
-        Ok(hex::encode(self.key()?.sign(&message).to_bytes()))
+        self.key()?
+            .sign(domain, payload)
+            .map_err(anyhow::Error::msg)
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
@@ -60,11 +64,7 @@ impl LocalIdentity {
         let canonical_body = serde_json::to_string(&event)?;
         ensure!(canonical_body.len() <= MAX_EVENT_BYTES, "event too large");
         let hash = digest(canonical_body.as_bytes());
-        let signature = hex::encode(
-            self.key()?
-                .sign(&domain_message(EVENT_DOMAIN, &hash))
-                .to_bytes(),
-        );
+        let signature = self.key()?.sign_bytes(&domain_message(EVENT_DOMAIN, &hash));
         Ok(SignedEvent {
             hash,
             canonical_body,
@@ -95,9 +95,9 @@ impl LocalIdentity {
 
         let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
         admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
-        let admin_secret = Sha256::digest(admin_seed);
+        let admin_secret = digest(&admin_seed);
         let admin = LocalIdentity {
-            secret_key_hex: hex::encode(admin_secret),
+            secret_key_hex: admin_secret,
         };
         let admin_member = Member::client(&admin, "fixture-admin", true)?;
         let root = self.fixture_root();
@@ -153,26 +153,14 @@ impl vibeface_secure::membership::MembershipSigner for LocalIdentity {
     }
 }
 
-pub fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
 pub fn fingerprint(public_key: &str) -> Result<String> {
-    Ok(digest(&decode32(public_key)?))
+    vibeface_secure::fingerprint(public_key).map_err(anyhow::Error::msg)
 }
 fn decode32(value: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(value).context("invalid hexadecimal key/hash")?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected 32 bytes"))
+    vibeface_secure::decode32(value).map_err(anyhow::Error::msg)
 }
 fn domain_message(domain: &[u8], hash: &str) -> Vec<u8> {
     [domain, hash.as_bytes()].concat()
-}
-fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
-    let key = VerifyingKey::from_bytes(&decode32(public_key)?)?;
-    let signature = Signature::from_slice(&hex::decode(signature)?)?;
-    key.verify_strict(message, &signature)
-        .context("invalid signature")
 }
 #[cfg(test)]
 fn node_role_key(role: &NodeRole) -> &'static str {
@@ -210,11 +198,12 @@ pub fn verify_signed_event(
         "author Peer ID mismatch"
     );
     validate_event_shape(&body)?;
-    verify(
+    vibeface_secure::verify_bytes(
         public_key,
-        &event.signature,
         &domain_message(EVENT_DOMAIN, &event.hash),
-    )?;
+        &event.signature,
+    )
+    .map_err(anyhow::Error::msg)?;
     Ok(body)
 }
 pub fn verify_payload(
@@ -223,18 +212,7 @@ pub fn verify_payload(
     payload: &[u8],
     signature: &str,
 ) -> Result<()> {
-    verify(public_key, signature, &payload_message(domain, payload)?)
-}
-fn payload_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
-    ensure!(
-        !domain.is_empty()
-            && domain.len() <= 64
-            && domain
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-        "invalid signing domain"
-    );
-    Ok(format!("vibeface:message:v1:{domain}:{}", digest(payload)).into_bytes())
+    vibeface_secure::verify(public_key, domain, payload, signature).map_err(anyhow::Error::msg)
 }
 pub fn validate_event_shape(event: &Event) -> Result<()> {
     ensure!(event.version == WIRE_VERSION, "unsupported event version");

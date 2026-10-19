@@ -55,27 +55,43 @@ impl Identity {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = peerId))]
     pub fn peer_id(&self) -> String {
-        hex::encode(Sha256::digest(self.key.verifying_key().as_bytes()))
+        digest(self.key.verifying_key().as_bytes())
     }
 
     pub fn sign(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        Ok(hex::encode(
-            self.key.sign(&signing_message(domain, payload)?).to_bytes(),
-        ))
+        Ok(self.sign_bytes(&signing_message(domain, payload)?))
+    }
+}
+
+impl Identity {
+    pub fn sign_bytes(&self, message: &[u8]) -> String {
+        hex::encode(self.key.sign(message).to_bytes())
     }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn verify(public_key: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
+    verify_bytes(public_key, &signing_message(domain, payload)?, signature)
+}
+
+pub fn verify_bytes(public_key: &str, message: &[u8], signature: &str) -> Result<()> {
     let key = VerifyingKey::from_bytes(&decode32(public_key)?)
         .map_err(|_| "invalid identity public key")?;
     let bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
     let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature size")?;
-    key.verify_strict(&signing_message(domain, payload)?, &signature)
+    key.verify_strict(message, &signature)
         .map_err(|_| "invalid identity signature".to_owned())
 }
 
-fn decode32(value: &str) -> Result<[u8; 32]> {
+pub fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub fn fingerprint(public_key: &str) -> Result<String> {
+    Ok(digest(&decode32(public_key)?))
+}
+
+pub fn decode32(value: &str) -> Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(value, &mut bytes).map_err(|_| "expected a 32-byte hexadecimal key")?;
     Ok(bytes)
@@ -90,11 +106,7 @@ fn signing_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     {
         return Err("invalid signing domain".into());
     }
-    Ok(format!(
-        "vibeface:message:v1:{domain}:{}",
-        hex::encode(Sha256::digest(payload))
-    )
-    .into_bytes())
+    Ok(format!("vibeface:message:v1:{domain}:{}", digest(payload)).into_bytes())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -185,11 +197,9 @@ impl Handshake {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = remoteId))]
     pub fn remote_id(&self) -> Option<String> {
-        self.remote_public_key.as_ref().map(|key| {
-            hex::encode(Sha256::digest(
-                hex::decode(key).expect("validated identity"),
-            ))
-        })
+        self.remote_public_key
+            .as_ref()
+            .map(|key| fingerprint(key).expect("validated identity"))
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = isFinished))]
@@ -269,7 +279,7 @@ impl Handshake {
             remote_static,
             &proof.signature,
         )?;
-        let id = hex::encode(Sha256::digest(decode32(&proof.public_key)?));
+        let id = fingerprint(&proof.public_key)?;
         if self
             .expected_peer_id
             .as_ref()

@@ -1,10 +1,9 @@
 //! Independent device identities and signed, recoverable personal-network membership.
 
-use crate::{Identity, decode32};
+use crate::{Identity, digest};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -32,12 +31,8 @@ impl MembershipSigner for Identity {
     }
 }
 
-fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 fn fingerprint(public_key: &str) -> Result<String> {
-    Ok(digest(&decode32(public_key).map_err(anyhow::Error::msg)?))
+    crate::fingerprint(public_key).map_err(anyhow::Error::msg)
 }
 
 fn verify_payload(public_key: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
