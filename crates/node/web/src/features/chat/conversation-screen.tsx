@@ -88,10 +88,11 @@ export function ConversationScreen() {
         {reasoning ? <Reasoning text={reasoning} running={assistantBusy} /> : null}
         {(messageBusy || assistantBusy) && liveMessages.length === 0 ? <p role="status" className="replying" aria-label={waitLabel}><StatusOrb place={assistantBusy ? 'reply' : 'wait'} size={20} /><span>{waitLabel}</span></p> : null}
       </Chat>
+      {awaitingDecision || hasDetails ? <div className="chat-activity">
       {awaitingDecision ? <div className="chat-approvals">
         {data?.native_sessions.map((session) => <NativeSessionActivity key={`approval-${session.target_node}:${session.work_id}`} session={session} compact />)}
       </div> : null}
-      {hasDetails ? <div className="chat-trace">
+      {hasDetails ? <div>
         <Trace>
           <TraceCollapsible defaultOpen={false}>
             <TraceCollapsibleTrigger>
@@ -123,6 +124,7 @@ export function ConversationScreen() {
             </TraceCollapsibleContent>
           </TraceCollapsible>
         </Trace>
+      </div> : null}
       </div> : null}
       {data && workspace.selectedBot ? <div className="autonomy-control">
         <label htmlFor="autonomy-mode">收到结果后</label>
