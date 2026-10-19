@@ -91,7 +91,7 @@ def maintenance(node, command):
     stream.settimeout(5)
     try:
         wait_for("private maintenance listener",
-                 lambda: stream.connect(f"/tmp/vibeface-{node.peer_id[:32]}/maintenance.sock") is None,
+                 lambda: stream.connect(f"/tmp/vibeface-{node.device_id[:32]}/maintenance.sock") is None,
                  timeout=5)
         stream.sendall(json.dumps({"protocol": 1, "command": command}).encode() + b"\n")
         response = b""
@@ -114,7 +114,7 @@ def verify_cli_status(node, running):
     status = json.loads(result.stdout)
     require(set(status) == {"status", "peer_id", "data_dir", "listen", "roles", "version", "cli_version", "error"},
             "CLI status returns only public node health and local paths")
-    require(status["status"] == ("running" if running else "stopped") and status["peer_id"] == node.peer_id,
+    require(status["status"] == ("running" if running else "stopped") and status["peer_id"] == node.device_id,
             "CLI status pins the initialized local node in both running and stopped states")
     require(node.access["capability"] not in result.stdout, "CLI status never exposes bootstrap capability")
 
@@ -123,12 +123,12 @@ def verify_maintenance(node):
     stream, value = maintenance(node, "acquire")
     try:
         require(value["status"] == "ready", "idle node enters maintenance")
-        require(value["health"]["peer_id"] == node.peer_id, "lease pins the running node")
+        require(value["health"]["peer_id"] == node.device_id, "lease pins the running node")
         node.client.rpc("nodes", status=503)
         probe, health = maintenance(node, "probe")
         probe.close()
         require(health["status"] == "healthy", "health is readable while writes are closed")
-        require(node.client.request("/api/info")["peer_id"] == node.peer_id, "HTTP reads survive maintenance")
+        require(node.client.request("/api/info")["peer_id"] == node.device_id, "HTTP reads survive maintenance")
     finally:
         stream.close()
     wait_for("lease disconnect reopens node", lambda: node.client.rpc("nodes"))
@@ -136,7 +136,7 @@ def verify_maintenance(node):
     marker = node.directory / "update-pending.json"
     private_json(marker, {"protocol": 1})
     node.start()
-    opened = node.client.command("connect", url=node.url, peer_id=node.peer_id, check=False)
+    opened = node.client.command("connect", url=node.url, peer_id=node.device_id, check=False)
     if opened["ok"]:
         denied = node.client.command("request", method="rpc",
                                      params={"method": "nodes"}, check=False)
@@ -416,166 +416,80 @@ class RelayCapture:
 
 
 CLIENT_SOURCE = r"""
-import init, { Identity, Handshake, recoverySeal, recoveryOpen, verifyMembership, verify } from "MODULE_URL";
+import init, { Identity, Handshake, signingMessage, recoverySeal, recoveryOpen, verifyMembership, createGenesis, governancePayload, inviteSigningPayload, joinCommit, shortCode, ticketEncode, ticketDecode, attestationPayload } from "MODULE_URL";
 import { lstat, readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
-import { createHash } from 'node:crypto';
+import { createHash, createPrivateKey, randomBytes, sign as edSign } from 'node:crypto';
 await init({ module_or_path: await readFile(new URL('./vibeface_secure_bg.wasm', "MODULE_URL")) });
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
-let clientIdentity;
-if (process.argv[2]) {
+const hex = value => Buffer.from(value).toString('hex');
+const prologue = encoder.encode('vibeface:client:v1');
+// The browser's device: page scripts only ask the key to sign, like a non-extractable CryptoKey.
+function device(secret) {
+  const identity = Identity.fromSecretHex(secret);
+  const deviceId = identity.deviceId();
+  identity.free();
+  const key = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(secret, 'hex')]), format: 'der', type: 'pkcs8' });
+  const raw = bytes => edSign(null, Buffer.from(bytes), key).toString('hex');
+  return { deviceId, raw, sign: (domain, payload) => raw(signingMessage(domain, typeof payload === 'string' ? encoder.encode(payload) : payload)) };
+}
+async function loadSecret(file) {
+  if (!file) return hex(randomBytes(32));
   try {
-    const stat = await lstat(process.argv[2]);
+    const stat = await lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077)) throw new Error('client identity file must be private');
-    clientIdentity = Identity.fromSecretHex(JSON.parse(await readFile(process.argv[2], 'utf8')).secret_key_hex);
+    return JSON.parse(await readFile(file, 'utf8')).secret_key_hex;
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    clientIdentity = Identity.generate();
-    await writeFile(process.argv[2], JSON.stringify({secret_key_hex:clientIdentity.secretHex()})+'\n', {mode:0o600,flag:'wx'});
-  }
-} else clientIdentity = Identity.generate();
-const keys = new Map([['client', clientIdentity], ['root', Identity.generate()]]);
-const connections = new Map();
-const routeStats = new Map();
-const identity = name => { const key = keys.get(name); if (!key) throw new Error('unknown local identity'); return key; };
-const exposed = key => ({ public_key: key.publicKeyHex(), subject_id: key.peerId() });
-async function networkProbe(input) {
-  const sockets = [], identities = [];
-  async function control() {
-    const socket = new WebSocket(new URL('/api/network/ws', input.url.replace(/^http/, 'ws')));
-    const queue = [], waiting = [];
-    let closed = false;
-    socket.addEventListener('message', event => {
-      const waiter = waiting.shift();
-      if (waiter) waiter(JSON.parse(event.data)); else queue.push(JSON.parse(event.data));
-    });
-    const close = () => { closed = true; for (const waiter of waiting.splice(0)) waiter(null); };
-    socket.addEventListener('close', close); socket.addEventListener('error', close);
-    const next = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.resolve(null) : new Promise(resolve => {
-      const done = value => { clearTimeout(timer); resolve(value); };
-      const timer = setTimeout(() => { const index = waiting.indexOf(done); if (index >= 0) waiting.splice(index, 1); resolve(null); }, 1500);
-      waiting.push(done);
-    });
-    const value = { socket, next, get closed() { return closed; } };
-    sockets.push(value);
-    const welcome = await next();
-    if (welcome?.type !== 'welcome') throw new Error('probe did not receive relay welcome');
-    value.nonce = welcome.nonce;
-    return value;
-  }
-  function key() { const value = Identity.generate(); identities.push(value); return value; }
-  async function reserve(owner) {
-    const connection = await control();
-    const proof = JSON.stringify({nonce:connection.nonce,peer_id:owner.peerId()});
-    connection.socket.send(JSON.stringify({type:'reserve',peer_id:owner.peerId(),public_key:owner.publicKeyHex(),signature:owner.sign('relay-reserve',encoder.encode(proof))}));
-    const response = await connection.next();
-    return { connection, accepted:response?.type === 'reserved',outcome:response?.type || (connection.closed ? 'closed' : 'timeout') };
-  }
-  async function exchange(message) {
-    const connection = await control(); connection.socket.send(JSON.stringify(message));
-    return await connection.next();
-  }
-  try {
-    if (input.kind === 'peer_id_contract') {
-      const owner = key(), legacy = await control();
-      const proof = JSON.stringify({nonce:legacy.nonce,node_id:owner.peerId()});
-      legacy.socket.send(JSON.stringify({type:'reserve',node_id:owner.peerId(),public_key:owner.publicKeyHex(),signature:owner.sign('relay-reserve',encoder.encode(proof))}));
-      const rejected = await legacy.next();
-      if (rejected !== null || !legacy.closed) throw new Error('removed node_id field was not rejected');
-      const valid = await reserve(owner);
-      if (!valid.accepted) throw new Error('current peer_id reservation was rejected');
-      return {old_node_id_rejected:true,peer_id_accepted:true};
-    }
-    if (input.kind === 'record') {
-      const reply = await exchange({type:'lookup',target:input.target});
-      const record = reply?.record;
-      if (reply?.type !== 'record' || !record || record.peer_id !== input.target) throw new Error('requested signed directory record is unavailable');
-      if (createHash('sha256').update(Buffer.from(record.public_key,'hex')).digest('hex') !== record.peer_id) throw new Error('directory identity mismatch');
-      const now = Math.floor(Date.now()/1000);
-      if (!Number.isSafeInteger(record.issued_at) || !Number.isSafeInteger(record.expires_at) || record.issued_at > now+30 || record.expires_at <= now || record.expires_at <= record.issued_at || record.expires_at > record.issued_at+180) throw new Error('directory lifetime invalid');
-      if (![record.direct_urls,record.relay_urls].every(urls => Array.isArray(urls) && urls.length <= 8 && urls.every(url => typeof url === 'string'))) throw new Error('directory URLs invalid');
-      verify(record.public_key,'reachability',encoder.encode(JSON.stringify({...record,signature:''})),record.signature);
-      return record;
-    }
-    if (input.kind === 'directory') {
-      const now = Math.floor(Date.now() / 1000), short = key(), healthy = key();
-      async function publish(owner, expires) {
-        const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:expires,signature:''};
-        record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
-        if ((await exchange({type:'publish',record}))?.type !== 'published') throw new Error('signed fixture record was rejected');
-      }
-      await publish(short, now + 2); await publish(healthy, now + 120);
-      const before = await exchange({type:'lookup',target:short.peerId()});
-      await new Promise(resolve => setTimeout(resolve, Math.max(0, (now + 2) * 1000 - Date.now()) + 100));
-      const expired = await exchange({type:'lookup',target:short.peerId()});
-      const good = await exchange({type:'lookup',target:healthy.peerId()});
-      return {short_record_present_before_expiry:before?.record?.peer_id === short.peerId(),expired_record_removed:expired?.type === 'record' && expired.record === null,healthy_record_retained:good?.record?.peer_id === healthy.peerId()};
-    }
-    if (input.kind === 'reservations') {
-      const owner = key(), first = await reserve(owner), duplicate = await reserve(owner);
-      if (!first.accepted) throw new Error(`first isolated reservation failed ${first.outcome}`);
-      let accepted = 1, rejected = 0, timeouts = Number(duplicate.outcome === 'timeout');
-      for (let index = 1; index < 65; index++) {
-        const result = await reserve(key());
-        if (result.accepted) accepted++;
-        else if (result.outcome === 'closed') rejected++;
-        else if (result.outcome === 'timeout') timeouts++;
-        else throw new Error(`unexpected reservation reply ${result.outcome}`);
-      }
-      const now = Math.floor(Date.now() / 1000);
-      const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:now+120,signature:''};
-      record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
-      first.connection.socket.send(JSON.stringify({type:'publish',record}));
-      await new Promise(resolve => setTimeout(resolve, 100));
-      const lookup = await exchange({type:'lookup',target:owner.peerId()});
-      return {unique_identities:65,reserve_requests:66,accepted,rejected,timeouts,duplicate_identity_outcome:duplicate.outcome,duplicate_identity_accepted:duplicate.accepted,first_reservation_still_open:!first.connection.closed,first_reservation_published_after_capacity:lookup?.record?.peer_id === owner.peerId(),directory_query_after_capacity:lookup?.type === 'record'};
-    }
-    throw new Error('unknown network probe');
-  } finally {
-    for (const connection of sockets) connection.socket.close();
-    for (const value of identities) value.free();
+    const secret = hex(randomBytes(32));
+    await writeFile(file, JSON.stringify({ secret_key_hex: secret }) + '\n', { mode: 0o600, flag: 'wx' });
+    return secret;
   }
 }
+const client = device(await loadSecret(process.argv[2]));
+const roots = new Map();
+const connections = new Map();
+const root = name => { const value = roots.get(name); if (!value) throw new Error('unknown root key'); return value; };
 async function connect(input) {
-  const key = identity(input.identity || 'client');
-  const socket = new WebSocket(new URL('/api/network/ws', input.url.replace(/^http/, 'ws')));
+  const url = new URL('/api/client', input.url.replace(/^http/, 'ws'));
+  // Node's WebSocket can send the Origin a page on another client origin would send.
+  const socket = new WebSocket(url, input.origin ? { headers: { Origin: input.origin } } : undefined);
   socket.binaryType = 'arraybuffer';
-  const queue = [], waiting = [], pending = new Map(), events = [], frames = [];
-  let channel, closed = false, sequence = 0;
+  const queue = [], waiting = [], pending = new Map(), events = [];
+  let channel, closed = false, failure, sequence = 0;
   function close(error = new Error('channel closed')) {
     if (closed) return;
-    closed = true;
+    closed = true; failure = error;
     for (const waiter of waiting.splice(0)) waiter.reject(error);
     for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error); }
     pending.clear(); socket.close();
   }
-  const receive = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.reject(new Error('channel closed')) : new Promise((resolve, reject) => waiting.push({resolve, reject}));
-  socket.addEventListener('message', event => { const waiter = waiting.shift(); if (waiter) waiter.resolve(event.data); else if (queue.length < 512) queue.push(event.data); else close(new Error('bounded receive queue')); });
+  const receive = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.reject(failure) : new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+  socket.addEventListener('message', event => {
+    if (typeof event.data === 'string') { let reason = 'gateway refused'; try { reason = JSON.parse(event.data).error || reason; } catch {} close(new Error(reason)); return; }
+    const waiter = waiting.shift(); if (waiter) waiter.resolve(event.data); else if (queue.length < 512) queue.push(event.data); else close(new Error('bounded receive queue'));
+  });
   socket.addEventListener('close', () => close());
   socket.addEventListener('error', () => close(new Error('WebSocket transport failed')));
-  async function control(type) { const frame = await receive(); if (typeof frame !== 'string') throw new Error('control frame is not text'); const value = JSON.parse(frame); if (value.type !== type) throw new Error(`expected ${type}`); }
   const timer = setTimeout(() => close(new Error('handshake timeout')), 15000);
+  let handshake;
   try {
-    await control('welcome');
-    socket.send(JSON.stringify(input.relay ? {type:'dial', target:input.peer_id, service:'client'} : {type:'direct', service:'client'}));
-    await control('ready');
-    const handshake = new Handshake(true, key.secretHex(), input.peer_id, encoder.encode('vibeface:client:v1'));
+    await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('close', () => reject(failure), { once: true }); });
+    socket.send(JSON.stringify({ type: 'connect', target: input.device_id }));
+    handshake = new Handshake(true, input.device_id, prologue);
+    handshake.setProof(client.deviceId, client.raw(handshake.signingBytes()));
     socket.send(handshake.write(new Uint8Array()));
-    const response = await receive();
-    if (!(response instanceof ArrayBuffer)) throw new Error('Noise response must be binary');
-    handshake.read(new Uint8Array(response));
+    handshake.read(new Uint8Array(await receive()));
     socket.send(handshake.write(new Uint8Array()));
-    if (!handshake.isFinished() || handshake.remoteId() !== input.peer_id) throw new Error('target identity mismatch');
-    channel = handshake.finish(); handshake.free();
+    if (!handshake.isFinished() || handshake.remoteId() !== input.device_id) throw new Error('target identity mismatch');
+    channel = handshake.finish();
   } catch (error) { close(error); throw error; }
-  finally { clearTimeout(timer); }
+  finally { clearTimeout(timer); handshake?.free(); }
   (async () => {
     try {
       while (!closed) {
-        const frame = await receive();
-        if (!(frame instanceof ArrayBuffer)) throw new Error('plaintext application frame rejected');
-        const plaintext = channel.openRecord(new Uint8Array(frame));
+        const plaintext = channel.openRecord(new Uint8Array(await receive()));
         if (plaintext === null) continue;
         const value = JSON.parse(decoder.decode(plaintext));
         const request = pending.get(value.id);
@@ -585,115 +499,98 @@ async function connect(input) {
     } catch (error) { close(error); }
     finally { channel.free(); }
   })();
+  const send = (id, method, params) => { for (const record of channel.sealMessage(encoder.encode(JSON.stringify({ id, method, params })))) socket.send(record); };
   return {
-    events, frames,
+    events, close,
     request(method, params) {
-      if (closed) throw new Error('channel closed');
+      if (closed) return Promise.resolve({ error: String(failure) });
       const id = String(++sequence);
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { pending.delete(id); reject(new Error('request timeout')); }, 20000);
-        pending.set(id, {resolve, reject, timer});
-        for (const record of channel.sealMessage(encoder.encode(JSON.stringify({id,method,params})))) { frames.push(Buffer.from(record)); socket.send(record); }
+      return new Promise(resolve => {
+        const timer = setTimeout(() => { pending.delete(id); resolve({ error: 'request timeout' }); }, 20000);
+        pending.set(id, { resolve, reject: error => resolve({ error: String(error) }), timer });
+        send(id, method, params);
       });
     },
-    async attack(kind) {
-      if (!frames.length) throw new Error('no protected request to attack');
-      const record = Buffer.from(frames[frames.length - 1]);
-      if (kind === 'tamper') record[record.length - 1] ^= 1;
-      socket.send(record);
-      for (let attempt = 0; attempt < 50 && !closed; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
-      if (!closed) throw new Error('invalid protected frame did not close the channel');
-      return {rejected:true};
-    },
-    close,
+    // The request leaves, then the connection drops before any answer: an unknown write.
+    drop(method, params) { send(String(++sequence), method, params); close(new Error('dropped after send')); return { sent: true }; },
   };
 }
-async function automaticConnect(input) {
-  const stats = {controls:[],opened:0,closed:0,active_data:0,max_active_data:0,authenticated_sessions:0,calls:[]};
-  routeStats.set(input.connection || 'main',stats);
-  class ObservedSocket extends WebSocket {
-    constructor(url) {
-      super(url);
-      stats.opened++;
-      this.dataPath = false;
-      this.addEventListener('close',() => { stats.closed++; if (this.dataPath) stats.active_data--; });
-    }
-    send(value) {
-      if (typeof value === 'string') {
-        const control = JSON.parse(value);
-        stats.controls.push({url:this.url,type:control.type,target:control.target});
-        if (['dial','direct'].includes(control.type) && !this.dataPath) {
-          this.dataPath = true;
-          stats.active_data++; stats.max_active_data = Math.max(stats.max_active_data,stats.active_data);
-        }
-      }
-      super.send(value);
-    }
-  }
-  const source = (await readFile(input.transport,'utf8')).replace(/^import .*;\n/,'').replace(/^export /gm,'');
-  const transport = new Function('init','Identity','Handshake','verify','WebSocket','location',
-    source + '\nreturn {connectDevice, setIdentity(value) {identity=value;}};')(
-      init,Identity,Handshake,verify,ObservedSocket,{protocol:'http:'});
-  transport.setIdentity(identity(input.identity || 'client'));
-  const events = [], controller = new AbortController();
-  const timer = input.cancel_after_ms === undefined ? undefined : setTimeout(() => controller.abort(),input.cancel_after_ms);
-  let selected;
-  try {
-    selected = await transport.connectDevice({address:input.url,peer_id:input.peer_id},
-      {signal:controller.signal,onEvent:event => events.push(event)});
-    stats.authenticated_sessions++;
-  } finally { clearTimeout(timer); }
-  return {events,frames:[],close:() => selected.close(),async request(method,params) {
-    stats.calls.push({method,rpc_method:params?.method,operation_id:params?.request?.operation_id});
-    try { return {result:await selected.request(method,params)}; }
-    catch (error) { return {error:String(error)}; }
-  }};
-}
-for await (const line of createInterface({input:process.stdin})) {
+for await (const line of createInterface({ input: process.stdin })) {
   try {
     const input = JSON.parse(line);
     let result;
-    if (input.op === 'network_probe') result = await networkProbe(input);
-    else if (input.op === 'identity') result = exposed(identity(input.identity || 'client'));
-    else if (input.op === 'sign') result = identity(input.identity || 'client').sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
-    else if (input.op === 'backup') {
-      const root = identity(input.identity || 'root');
-      const epoch = input.recovery_epoch || 1;
-      const payload = encoder.encode(JSON.stringify({version:1,network_id:root.peerId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:epoch,decryption_keys:[]}));
-      try { result = {version:1,network_id:root.peerId(),recovery_epoch:epoch,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
-      finally { payload.fill(0); }
+    switch (input.op) {
+      case 'identity': result = { device_id: client.deviceId }; break;
+      case 'connect': { connections.get(input.connection || 'main')?.close(); connections.set(input.connection || 'main', await connect(input)); result = { connected: true }; break; }
+      case 'genesis': {
+        roots.get('root')?.free();
+        const key = Identity.generate(); roots.set('root', key);
+        const genesis = JSON.parse(createGenesis(key, JSON.stringify({ device_id: client.deviceId, kind: 'client', name: input.client_name, manage: true }), JSON.stringify({ device_id: input.node_id, kind: 'node', name: input.node_name, manage: false })));
+        result = { genesis, network_id: key.deviceId() }; break;
+      }
+      case 'backup': {
+        const key = root('root');
+        const payload = encoder.encode(JSON.stringify({ version: 1, network_id: key.deviceId(), root_secret_key: key.secretHex(), genesis: input.genesis, recovery_epoch: input.recovery_epoch || 1, decryption_keys: [] }));
+        try { result = { version: 1, network_id: key.deviceId(), recovery_epoch: input.recovery_epoch || 1, envelope: JSON.parse(decoder.decode(recoverySeal(payload, input.password))) }; }
+        finally { payload.fill(0); }
+        break;
+      }
+      case 'forget_root': root('root').free(); roots.delete('root'); result = { forgotten: true }; break;
+      case 'recover_material': {
+        const plaintext = recoveryOpen(encoder.encode(JSON.stringify(input.backup.envelope)), input.password);
+        try {
+          const payload = JSON.parse(decoder.decode(plaintext));
+          roots.get('recovered')?.free(); roots.set('recovered', Identity.fromSecretHex(payload.root_secret_key));
+          result = { network_id: root('recovered').deviceId(), recovery_epoch: payload.recovery_epoch, genesis: payload.genesis };
+        } finally { plaintext.fill(0); }
+        break;
+      }
+      case 'recovery_read_proof': {
+        const expires = Date.now() + 60000;
+        const proof = `{"device_id":"${client.deviceId}","expires_at_ms":${expires},"network_id":"${input.network_id}"}`;
+        result = { expires_at_ms: expires, signature: root('recovered').sign('identity-recovery-read', encoder.encode(proof)) };
+        break;
+      }
+      case 'recovery_checkpoint': {
+        const verified = verifyMembership(JSON.stringify(input.state), input.network_id);
+        try { result = JSON.parse(verified.createRecoveryCheckpoint(root('recovered'), JSON.stringify(input.members), input.epoch)); }
+        finally { verified.free(); }
+        break;
+      }
+      case 'invite': {
+        const secret = randomBytes(32);
+        const record = { network_id: input.network_id, invite_hash: createHash('sha256').update(secret).digest('hex'), issuer: client.deviceId, expires_at_ms: Date.now() + 600000, signature: '' };
+        record.signature = client.sign('identity-invite', inviteSigningPayload(JSON.stringify(record)));
+        result = { record, ticket: ticketEncode(input.entry_id, hex(secret)) };
+        secret.fill(0);
+        break;
+      }
+      case 'ticket': result = JSON.parse(ticketDecode(input.ticket)); break;
+      case 'commit': result = joinCommit(client.deviceId, input.nonce); break;
+      case 'short_code': { const r = input.request; result = shortCode(r.network_id, r.invite_id, r.device_id, r.admin_id, r.admin_nonce, input.joiner_nonce ?? r.joiner_nonce); break; }
+      case 'governance': {
+        const verified = verifyMembership(JSON.stringify(input.state), input.network_id);
+        try { result = JSON.parse(verified.governanceTemplate(client.deviceId, JSON.stringify(input.action))); }
+        finally { verified.free(); }
+        result.signature = client.sign('identity-governance', governancePayload(JSON.stringify(result)));
+        break;
+      }
+      case 'attest': result = { device_id: client.deviceId, signature: client.sign('attestation', attestationPayload(input.network_id, input.scope_id, JSON.stringify(input.body))) }; break;
+      default: {
+        const connection = connections.get(input.connection || 'main');
+        if (!connection) throw new Error('no connection');
+        if (input.op === 'request') result = await connection.request(input.method, input.params || {});
+        else if (input.op === 'drop') result = connection.drop(input.method, input.params || {});
+        else if (input.op === 'events') result = connection.events;
+        else if (input.op === 'close') { connection.close(); result = { closed: true }; }
+        else throw new Error('unknown client command');
+      }
     }
-    else if (input.op === 'recover_material') {
-      const plaintext = recoveryOpen(encoder.encode(JSON.stringify(input.backup.envelope)),input.password);
-      try {
-        const payload = JSON.parse(decoder.decode(plaintext));
-        const root = Identity.fromSecretHex(payload.root_secret_key);
-        keys.get('recovered')?.free(); keys.set('recovered',root);
-        result = {network_id:root.peerId(),recovery_epoch:payload.recovery_epoch,genesis:payload.genesis};
-      } finally { plaintext.fill(0); }
-    }
-    else if (input.op === 'recovery_checkpoint') {
-      const root = identity('recovered');
-      const verified = verifyMembership(JSON.stringify(input.state), root.peerId(), root.publicKeyHex());
-      try { result = JSON.parse(verified.createRecoveryCheckpoint(root, JSON.stringify(input.members), input.backup_epoch, JSON.stringify(input.prepared))); }
-      finally { verified.free(); }
-    }
-    else if (input.op === 'forget_root') { identity('root').free(); keys.delete('root'); result = {forgotten:true}; }
-    else if (input.op === 'connect' || input.op === 'connect_auto') { const old = connections.get(input.connection || 'main'); old?.close(); const value = await (input.op === 'connect_auto' ? automaticConnect(input) : connect(input)); connections.set(input.connection || 'main', value); result = {connected:true}; }
-    else if (input.op === 'route_stats') result = routeStats.get(input.connection || 'main');
-    else { const connection = connections.get(input.connection || 'main'); if (!connection) throw new Error('no connection');
-      if (input.op === 'request') result = await connection.request(input.method,input.params || {});
-      else if (input.op === 'events') result = connection.events;
-      else if (input.op === 'wire') result = connection.frames.map(frame => frame.toString('hex'));
-      else if (input.op === 'attack') result = await connection.attack(input.kind);
-      else if (input.op === 'close') { connection.close(); result = {closed:true}; }
-      else throw new Error('unknown client command');
-    }
-    process.stdout.write(`${JSON.stringify({ok:true,result})}\n`);
-  } catch (error) { process.stdout.write(`${JSON.stringify({ok:false,error:String(error)})}\n`); }
+    process.stdout.write(`${JSON.stringify({ ok: true, result })}\n`);
+  } catch (error) { process.stdout.write(`${JSON.stringify({ ok: false, error: String(error) })}\n`); }
 }
 for (const connection of connections.values()) connection.close();
-for (const key of keys.values()) key.free();
+for (const key of roots.values()) key.free();
 """
 
 
@@ -706,7 +603,7 @@ class Client:
         self.network_id = None
         self.principal = None
         self.process = None
-        self.peer_id = None
+        self.device_id = None
 
     def command(self, op, *, check=True, _wait_timeout=30, **arguments):
         require(0 < _wait_timeout <= 30, "client command wait stays within its original deadline")
@@ -725,10 +622,10 @@ class Client:
         require(value.get("ok"), f"client {op} failed: {value.get('error', 'unknown error')}")
         return value.get("result")
 
-    def connect(self, peer_id=None, *, relay=False, connection="main"):
-        self.peer_id = peer_id or self.peer_id
-        return self.command("connect", url=self.url, peer_id=self.peer_id,
-                            relay=relay, connection=connection)
+    def connect(self, device_id=None, *, connection="main", check=True, origin=None):
+        self.device_id = device_id or self.device_id
+        return self.command("connect", url=self.url, device_id=self.device_id, connection=connection, check=check,
+                            **({"origin": origin} if origin else {}))
 
     def call(self, method, params=None, *, status=200, connection="main"):
         response = self.command("request", method=method, params=params or {}, connection=connection)
@@ -737,18 +634,43 @@ class Client:
             require(not error, f"encrypted {method} rejected: {error}")
             return response.get("result")
         require(bool(error), f"encrypted {method} expected rejection")
-        if isinstance(error, dict) and error.get("status"):
-            require(error["status"] == status, f"encrypted {method} rejection status")
         return response
 
     def authenticate(self, network=None):
         self.network_id = network or self.network_id
         result = self.call("authenticate", {"network_id": self.network_id})
         self.principal = result["principal"]
-        require(self.principal["network_id"] == self.network_id, "client authenticates the pinned personal network")
+        require(self.principal and self.principal["network_id"] == self.network_id, "client authenticates the pinned personal network")
         return result
 
-    def rpc(self, method, *, status=200, **arguments):
+    def own_id(self):
+        return self.command("identity")["device_id"]
+
+    def attestation(self, method, arguments):
+        """The device signature over the exact event body the Node writes for this request."""
+        if method == "message":
+            arguments.setdefault("report_results", True)
+            body = {"type": "message_posted", "message_id": arguments["message_id"], "role": "user",
+                    "text": arguments["text"], "report_results": arguments["report_results"]}
+        elif method == "create_bot":
+            body = {"type": "bot_created", "bot_id": arguments["bot_id"], "name": arguments["name"],
+                    "instructions": arguments.get("instructions", "")}
+            if arguments.get("project") is not None:
+                body["project"] = arguments["project"]
+        elif method == "set_autonomy":
+            body = {"type": "autonomy_set", "mode": arguments["mode"], "version": arguments["expected_version"] + 1}
+        elif method == "answer_approval":
+            decision = (arguments.get("response") or {}).get("decision")
+            body = {"type": "approval_answered", "work_id": arguments["work_id"], "request_id": arguments["request_id"],
+                    "decision": decision if isinstance(decision, str) else "answered"}
+        else:
+            return None
+        return self.command("attest", network_id=self.network_id, scope_id=arguments["conversation_id"], body=body)
+
+    def rpc(self, method, *, status=200, unsigned=False, **arguments):
+        attestation = None if unsigned else self.attestation(method, arguments)
+        if attestation:
+            arguments["attestation"] = attestation
         return self.call("rpc", {"method": method, **arguments}, status=status)
 
     def request(self, path, payload=None, *, status=200, origin=True, headers=None, timeout=20, **unused):
@@ -771,40 +693,66 @@ class Client:
             require(observed == status, f"{path}: expected HTTP {status}, received {observed}")
             return json.loads(encoded) if encoded and "application/json" in response.headers.get("Content-Type", "") else encoded or None
 
-    def invite(self, kind, roles=None):
-        prepared = self.call("prepare_invite", {"kind": kind, "node_roles": sorted(roles or []),
-                                                 "request_id": uuid.uuid4().hex})
-        prepared["invite"]["inviter_signature"] = self.command("sign", **prepared["signing"])
-        tampered = copy.deepcopy(prepared["invite"])
-        tampered["payload"]["network_id"] = "ab" * 32
-        self.call("commit_invite", {"invite": tampered, "capability": prepared["capability"]}, status=400)
-        return self.call("commit_invite", {"invite": prepared["invite"], "capability": prepared["capability"]})
+    def invite(self):
+        """A one-time ticket link to the entry this manager is connected to."""
+        made = self.command("invite", network_id=self.network_id, entry_id=self.device_id)
+        tampered = copy.deepcopy(made["record"])
+        tampered["expires_at_ms"] += 1
+        self.call("invite", {"record": tampered}, status=400)
+        self.call("invite", {"record": made["record"]})
+        return f"{self.url}/join#{made['ticket']}"
 
-    def approve(self, request_id):
-        prepared = self.call("prepare_pair", {"request_id": request_id})
-        prepared["event"]["signature"] = self.command("sign", **prepared["signing"])
-        review_signature = self.command("sign", **prepared["review_signing"])
-        return self.call("pair_confirm", {"request_id": request_id, "event": prepared["event"],
-                                           "inviter_signature": review_signature})
+    def directory_state(self):
+        return self.call("directory")["state"]
 
-    def pair_client(self, owner, network, name):
-        self.url = owner.url
-        self.connect(owner.peer_id)
-        invitation = owner.invite("client")
-        prepared = self.call("prepare_pair_request", {**invitation, "name": name,
-                                                       "request_id": uuid.uuid4().hex})
-        prepared["request"]["proof"] = self.command("sign", **prepared["signing"])
-        invalid = copy.deepcopy(prepared["request"])
-        invalid["proof"] = "00" * 64
-        self.call("pair_request", {"request": invalid}, status=400)
-        receipt = self.call("pair_request", {"request": prepared["request"]})
-        review_signature = self.command("sign", **receipt["signing"])
-        self.call("pair_accept", {"request_id": receipt["request_id"], "signature": review_signature})
-        owner.approve(receipt["request_id"])
-        result = self.call("pair_status", {"request_id": receipt["request_id"]})
-        require(result["status"] == "granted", "new client pairing completes after both signatures")
-        self.authenticate(network)
-        self.call("prepare_revoke", {"subject_id": owner.peer_id}, status=403)
+    def pending_join(self, device_id):
+        requests = self.call("join_status")["requests"]
+        return next((item for item in requests if item["device_id"] == device_id), None)
+
+    def start_approval(self, join_id):
+        request = self.call("approve", {"join_id": join_id, "admin_nonce": uuid.uuid4().hex + uuid.uuid4().hex})
+        require(request["status"] == "confirming", "the manager's nonce moves the request to confirming")
+        return request
+
+    def grant(self, request, *, manage=False):
+        member = {"device_id": request["device_id"], "kind": request["kind"], "name": request["name"],
+                  "manage": manage and request["kind"] == "client"}
+        event = self.command("governance", state=self.directory_state(), network_id=self.network_id,
+                             action={"type": "grant", "member": member})
+        result = self.call("approve", {"join_id": request["join_id"], "event": event})
+        require(result["status"] == "joined", "the signed grant admits the device")
+        return result
+
+    def revoke(self, device_id, cutoff_seq=0):
+        event = self.command("governance", state=self.directory_state(), network_id=self.network_id,
+                             action={"type": "revoke", "device_id": device_id, "cutoff_seq": cutoff_seq})
+        return self.call("revoke", {"event": event})
+
+    def join(self, owner, name, *, manage=False, reveal=None):
+        """Joins through a ticket from `owner` (a Node or a managing Client); approval follows matching short codes."""
+        owner = getattr(owner, "client", owner)
+        link = owner.invite()
+        ticket = self.command("ticket", ticket=link.split("#", 1)[1])
+        self.url = link.split("/join#", 1)[0]
+        self.connect(ticket["entry_id"])
+        me = self.own_id()
+        nonce = uuid.uuid4().hex + uuid.uuid4().hex
+        request = self.call("join", {"secret": ticket["secret"], "public_key": me, "kind": "client", "name": name,
+                                     "commit": self.command("commit", nonce=nonce)})
+        require(request["status"] == "pending" and request["invite_id"] == ticket["invite_id"], "the entry records the committed join")
+        owner.start_approval(request["join_id"])
+        status = self.call("join_status", {"join_id": request["join_id"], "reveal": reveal or nonce})
+        if reveal:
+            return status
+        code = self.command("short_code", request=status, joiner_nonce=nonce)
+        reviewed = wait_for("the manager sees the revealed nonce", lambda: (lambda item: item if item and item.get("joiner_nonce") else None)(owner.pending_join(me)))
+        require(owner.command("short_code", request=reviewed) == code, "both sides show the same short code")
+        owner.grant(reviewed, manage=manage)
+        joined = self.call("join_status", {"join_id": request["join_id"]})
+        require(joined["status"] == "joined" and joined["state"]["genesis"]["network_id"] == owner.network_id,
+                "the joiner receives the signed directory")
+        self.authenticate(owner.network_id)
+        return joined
 
     def close(self):
         if self.process is not None:
@@ -823,6 +771,7 @@ class Node:
         self.binary = binary
         self.directory = run / name
         self.port = available_port()
+        self.local_port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.client = Client(self.url, helper, module, identity_file=self.directory / "client-identity.json")
         self.process = None
@@ -830,7 +779,7 @@ class Node:
         try:
             result = subprocess.run(
                 [str(binary), "init", "--data-dir", str(self.directory),
-                 "--listen", f"127.0.0.1:{self.port}",
+                 "--listen", f"127.0.0.1:{self.port}", "--local-listen", f"127.0.0.1:{self.local_port}",
                  *(["--relay-only"] if relay_only else ["--root", str(workspace)])],
                 capture_output=True, timeout=45)
         except subprocess.TimeoutExpired:
@@ -843,22 +792,14 @@ class Node:
                                 capture_output=True, timeout=15)
         require(result.returncode == 0, f"{name}: local access material is available")
         self.access = json.loads(result.stdout)
-        require(self.access["peer_id"], "local access pins the Node identity")
-        self.peer_id = self.access["peer_id"]
+        require(self.access["device_id"], "local access pins the Node identity")
+        self.device_id = self.client.device_id = self.access["device_id"]
 
     def configure(self, **values):
         path = self.directory / "config.json"
         configuration = json.loads(path.read_text())
         configuration.update(values)
         private_json(path, configuration)
-
-    def set_url(self, host, *, listen=None):
-        require(self.process is None, f"{self.name}: listener changes require a stopped process")
-        address = ipaddress.ip_address(host)
-        authority = f"[{address}]" if address.version == 6 else str(address)
-        self.url = self.client.url = f"http://{authority}:{self.port}"
-        self.configure(listen=listen or f"{authority}:{self.port}", public_url=self.url,
-                       allow_insecure_lan=not address.is_loopback)
 
     def start(self, *, env=None):
         require(self.process is None, f"{self.name}: process is stopped before start")
@@ -868,7 +809,7 @@ class Node:
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True, env=env)
         info = wait_for(f"{self.name} HTTP listener", lambda: self.client.request("/api/info"))
-        self.peer_id = info["peer_id"]
+        require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self, *, crash=False):
@@ -889,66 +830,58 @@ class Node:
             self.log = None
             return returncode
 
-    def pair(self, owner, network, *, entry_url=None):
-        original_config = json.loads((self.directory / "config.json").read_text())
-        network_config = original_config["network"]
-        invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler"])
-        path = self.directory / "pair-invitation.json"
-        private_json(path, {"url": entry_url or owner.url, "peer_id": owner.peer_id,
-                            "invite": invitation})
-        log_path = self.directory / f"pair-cli-{uuid.uuid4().hex[:8]}.log"
+    def pair(self, owner):
+        """`vibeface join <link>` on this stopped Node; the owner approves once the short codes match."""
+        require(self.process is None, f"{self.name}: joins while stopped")
+        link = owner.client.invite()
+        log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None
         try:
-            process = subprocess.Popen([str(self.binary), "pair", "--data-dir", str(self.directory),
-                                        "--invite-file", str(path), "--name", f"Node {self.name}"],
+            process = subprocess.Popen([str(self.binary), "join", "--data-dir", str(self.directory),
+                                        "--name", f"Node {self.name}", link],
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-            def pending():
+
+            def revealed():
                 if process.poll() is not None:
-                    raise RuntimeError(f"{self.name}: CLI pairing exited {process.returncode} before signed review; see {log_path}")
-                requests = owner.client.call("pair_requests")
-                return next((item for item in requests if item["review"]["new_member"]["subject_id"] == self.peer_id
-                             and item.get("new_subject_signature")), None)
-            review = wait_for(f"{self.name} signed CLI pairing review", pending)
-            owner.client.approve(review["request_id"])
+                    raise RuntimeError(f"{self.name}: CLI join exited {process.returncode}; see {log_path}")
+                request = owner.client.pending_join(self.device_id)
+                if request and request["status"] == "pending":
+                    owner.client.start_approval(request["join_id"])
+                    return None
+                return request if request and request.get("joiner_nonce") else None
+            request = wait_for(f"{self.name} reveals its join nonce", revealed)
+            code = owner.client.command("short_code", request=request)
+            shown = wait_for("the CLI shows its short code", lambda: code.encode() in log_path.read_bytes())
+            require(shown, "the CLI and the manager show the same short code")
+            require(request["kind"] == "node", "a CLI join asks for a Node membership")
+            owner.client.grant(request)
             process.wait(timeout=40)
-            require(process.returncode == 0, f"{self.name}: pinned CLI pairing completes after management approval")
+            require(process.returncode == 0, f"{self.name}: CLI join completes after the signed grant")
         finally:
-            try:
-                if process is not None and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-            finally:
-                log.close()
-        self.client.pair_client(owner.client, network, f"{self.name} independent client")
-        self.client.url = self.url
-        self.client.peer_id = self.peer_id
-        paired_config = json.loads((self.directory / "config.json").read_text())
-        require(paired_config["codex_socket"] == original_config["codex_socket"],
-                "pairing preserves managed or explicit Codex socket configuration")
-        self.configure(network=network_config)
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            log.close()
+        return code
 
     def bootstrap(self):
-        self.client.connect(self.peer_id)
-        root = self.client.command("identity", identity="root")
-        prepared = self.client.call("prepare_genesis", {"owner_public_key": root["public_key"],
-                                                        "client_name": f"{self.name} management client"})
-        state = prepared["state"]
-        signing = prepared["signing"]
-        state["genesis"]["signature"] = self.client.command("sign", identity="root", **signing)
+        """Creates the personal network on this fresh Node through its one-time local capability."""
+        self.client.connect(self.device_id)
+        info = self.client.call("info")
+        require(not info["initialized"] and info["device_id"] == self.device_id, "a fresh Node reports no network")
+        created = self.client.command("genesis", node_id=self.device_id, node_name=info["name"],
+                                      client_name=f"{self.name} management client")
+        genesis = created["genesis"]
         self.backup_password = "acceptance-only-encrypted-recovery-passphrase"
-        self.backup = self.client.command("backup", state=state, password=self.backup_password)
+        self.backup = self.client.command("backup", genesis=genesis, password=self.backup_password)
         private_json(self.directory / "recovery-package.json", self.backup)
         self.client.command("forget_root")
-        self.client.call("bootstrap", {"capability": "invalid-capability", "state": state}, status=400)
-        result = self.client.call("bootstrap", {"capability": self.access["capability"], "state": state})
-        self.client.network_id = state["genesis"]["network_id"]
+        self.client.call("recover", {"genesis": genesis, "capability": "00" * 32}, status=400)
+        result = self.client.call("recover", {"genesis": genesis, "capability": self.access["capability"]})
+        self.client.network_id = created["network_id"]
         self.client.principal = result["principal"]
-        require(self.client.principal["can_manage"], "bootstrap grants the local management client")
+        require(self.client.principal["can_manage"], "creating the network makes this browser a manager")
         return self.client.network_id
 
 
@@ -960,7 +893,7 @@ def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
             controls = list(capture.controls)
         attempts = {item["connection"] for item in controls
                     if item["connection"] > after_connection and item["direction"] == "to_relay"
-                    and item["type"] == "reserve" and item["peer_id"] == node.peer_id}
+                    and item["type"] == "reserve" and item["peer_id"] == node.device_id}
         return next((item for item in reversed(controls)
                      if item["connection"] in attempts and item["direction"] == "from_relay"
                      and item["type"] == "reserved"), None)
@@ -969,13 +902,13 @@ def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
     probe = Client(capture.url, node.client.helper, node.client.module)
     started = time.monotonic()
     try:
-        probe.command("connect", url=capture.url, peer_id=node.peer_id, relay=True,
+        probe.command("connect", url=capture.url, peer_id=node.device_id, relay=True,
                       _wait_timeout=min(30, deadline - time.monotonic()))
         response = probe.command("request", method="info", params={},
                                  _wait_timeout=min(30, deadline - time.monotonic()))
-        require(not response.get("error") and response.get("result", {}).get("peer_id") == node.peer_id,
+        require(not response.get("error") and response.get("result", {}).get("peer_id") == node.device_id,
                 "current relay reaches the original target through pinned Noise and an encrypted read")
-        return {"target": node.peer_id, "relay_url": capture.url,
+        return {"target": node.device_id, "relay_url": capture.url,
                 "after_connection": after_connection, "reservation_connection": candidate["connection"],
                 "capture_generation": candidate["generation"], "read_peer_id": response["result"]["peer_id"],
                 "probe_seconds": time.monotonic() - started, "kind": "pinned Noise and encrypted read-only info"}
@@ -1543,8 +1476,8 @@ class NetworkControlSocket:
         raise AssertionError("bounded raw binary frames before response")
 
     def reserve(self, owner):
-        proof = json.dumps({"nonce": self.nonce, "peer_id": owner.peer_id}, separators=(",", ":"))
-        self.send_control({"type": "reserve", "peer_id": owner.peer_id, "public_key": owner.public_key,
+        proof = json.dumps({"nonce": self.nonce, "peer_id": owner.device_id}, separators=(",", ":"))
+        self.send_control({"type": "reserve", "peer_id": owner.device_id, "public_key": owner.public_key,
                            "signature": owner.sign("relay-reserve", proof.encode())})
         return self.control()
 
@@ -1578,7 +1511,7 @@ class NetworkCryptoFixture:
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         try:
             identity = self.command("fixture_identity", identity_file=str(self.identity_file), expected_peer_id=expected_peer_id)
-            self.peer_id, self.public_key = identity["peer_id"], identity["public_key"]
+            self.device_id, self.public_key = identity["peer_id"], identity["public_key"]
         except BaseException:
             self.close()
             raise
@@ -1631,19 +1564,19 @@ class NetworkCryptoFixture:
 
 def network_fixture_noise(caller, target, caller_identity, target_identity):
     context = "vibeface:net1:fixture:v1"
-    caller_identity.command("handshake", initiator=True, expected_peer_id=target_identity.peer_id, context=context)
-    target_identity.command("handshake", initiator=False, expected_peer_id=caller_identity.peer_id, context=context)
+    caller_identity.command("handshake", initiator=True, expected_peer_id=target_identity.device_id, context=context)
+    target_identity.command("handshake", initiator=False, expected_peer_id=caller_identity.device_id, context=context)
     caller.send_binary(bytes.fromhex(caller_identity.command("write", data="")))
     target_identity.command("read", data=target.binary().hex())
     target.send_binary(bytes.fromhex(target_identity.command("write", data="")))
     caller_identity.command("read", data=caller.binary().hex())
     caller.send_binary(bytes.fromhex(caller_identity.command("write", data="")))
     target_identity.command("read", data=target.binary().hex())
-    require(caller_identity.command("remote") == target_identity.peer_id
-            and target_identity.command("remote") == caller_identity.peer_id, "fixture Noise authenticates both fixed original identities")
+    require(caller_identity.command("remote") == target_identity.device_id
+            and target_identity.command("remote") == caller_identity.device_id, "fixture Noise authenticates both fixed original identities")
     caller_identity.command("finish")
     target_identity.command("finish")
-    return {"caller_peer_id": caller_identity.peer_id, "target_peer_id": target_identity.peer_id,
+    return {"caller_peer_id": caller_identity.device_id, "target_peer_id": target_identity.device_id,
             "context": context, "scope": "fixture Noise over the original public relay; not personal-network member authorization"}
 
 
@@ -1661,7 +1594,7 @@ def network_fixture_canary(sender, receiver, sender_identity, receiver_identity,
             break
     require(opened is not None and bytes.fromhex(opened) == payload, "the fixed receiving identity decrypts the exact end-to-end canary")
     return {"label": label, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
-            "sender_peer_id": sender_identity.peer_id, "receiver_peer_id": receiver_identity.peer_id, "decrypted_exactly": True}
+            "sender_peer_id": sender_identity.device_id, "receiver_peer_id": receiver_identity.device_id, "decrypted_exactly": True}
 
 
 class CodexSocket:
@@ -2053,6 +1986,9 @@ def verify_web_assets(node, module):
                 require(address.startswith("/") and not address.startswith("//"), "shell resources come from the trusted Web origin")
                 self.paths.add(address)
 
+    worker, worker_headers = fetch("/sw.js")
+    require(worker_headers.get_content_type() == "text/javascript" and worker_headers["Cache-Control"] == "no-cache"
+            and b"/api/" in worker, "the offline service worker is served as revalidated JavaScript and skips the API")
     references = References()
     references.feed(shell.decode())
     pending, checked, content_types = list(references.paths), set(), set()
@@ -2068,8 +2004,11 @@ def verify_web_assets(node, module):
         content, asset_headers = fetch(path)
         mime = asset_headers.get_content_type()
         content_types.add(mime)
-        require(path.startswith("/assets/") and asset_headers["Cache-Control"] == "public, max-age=31536000, immutable",
-                f"{path}: hashed client assets are immutable")
+        if path in ("/manifest.webmanifest", "/icon.svg"):
+            require(asset_headers["Cache-Control"] == "no-cache", f"{path}: unhashed app-shell files revalidate")
+        else:
+            require(path.startswith("/assets/") and asset_headers["Cache-Control"] == "public, max-age=31536000, immutable",
+                    f"{path}: hashed client assets are immutable")
         body, head_headers = fetch(path, method="HEAD")
         require(not body and int(head_headers["Content-Length"]) == len(content)
                 and head_headers.get_content_type() == mime and head_headers["Cache-Control"] == asset_headers["Cache-Control"],
@@ -2136,117 +2075,59 @@ def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
 
 
 def recover_fresh_node(node, backup, password):
+    """A fresh Node joins the recovered network through its local capability and a root checkpoint."""
     node.start()
-    node.client.connect(node.peer_id)
+    node.client.connect(node.device_id)
     material = node.client.command("recover_material", backup=backup, password=password)
-    state = {"genesis": material["genesis"], "checkpoint": None, "events": []}
-    challenge = node.client.call("recovery_challenge", {"network_id": material["network_id"],
-                                 "owner_public_key": material["genesis"]["owner_public_key"],
-                                 "genesis": material["genesis"]})
-    signature = node.client.command("sign", identity="recovered", **challenge["signing"])
-    params = {"challenge_id": challenge["challenge_id"], "signature": signature,
-              "recovery_epoch": material["recovery_epoch"], "state": state}
-    node.client.call("recovery_context", params, status=400)
-    context = node.client.call("recovery_context", {**params, "capability": node.access["capability"]})
-    require(context["view"]["network_id"] == backup["network_id"], "fresh recovery proves the original root network")
-    identity = node.client.command("identity")
     info = node.client.call("info")
-    members = [
-        {**identity, "kind": "client", "name": "Fresh recovery manager", "node_roles": [], "manage": True},
-        {"subject_id": info["peer_id"], "public_key": info["public_key"], "kind": "node", "name": node.name,
-         "node_roles": sorted(info["roles"]), "manage": False},
-    ]
-    members.sort(key=lambda member: member["subject_id"])
-    prepared = node.client.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": members})
-    require(prepared["checkpoint"]["epoch"] == backup["recovery_epoch"] + 1,
-            "fresh recovery advances beyond the backed-up recovery epoch")
-    prepared["checkpoint"] = node.client.command("recovery_checkpoint", state=context["state"], members=members,
-                                                   backup_epoch=backup["recovery_epoch"], prepared=prepared)
-    result = node.client.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"],
+    members = [{"device_id": node.client.own_id(), "kind": "client", "name": "Fresh recovery manager", "manage": True},
+               {"device_id": node.device_id, "kind": "node", "name": info["name"], "manage": False}]
+    state = {"genesis": material["genesis"], "checkpoint": None, "events": []}
+    checkpoint = node.client.command("recovery_checkpoint", state=state, network_id=material["network_id"],
+                                     members=members, epoch=material["recovery_epoch"])
+    node.client.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint}, status=400)
+    result = node.client.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint,
                                           "capability": node.access["capability"]})
     node.client.network_id = backup["network_id"]
-    require(result["principal"]["can_manage"] and result["view"]["epoch"] == backup["recovery_epoch"] + 1,
+    require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"],
             "fresh node restores independent management at the next recovery epoch")
     node.client.authenticate()
     require(node.client.rpc("conversations")["conversations"] == [],
             "root-only recovery does not invent unavailable business history")
-    updated = node.client.command("backup", identity="recovered", state=result["state"],
-                                  recovery_epoch=result["view"]["epoch"], password=password)
-    private_json(node.directory / "recovery-package.json", updated)
-    return updated
+    return checkpoint
 
 
-def verify_recovery(node, other, nodes, network, *, entry_url=None):
-    wrong = other.command("recover_material", backup=node.backup,
-                          password="wrong-acceptance-passphrase", check=False)
+def verify_recovery(node, other, network):
+    """A browser that lost every manager regains control with the root key; existing managers stay."""
+    wrong = other.command("recover_material", backup=node.backup, password="wrong-acceptance-passphrase", check=False)
     require(wrong["ok"] is False, "encrypted recovery package rejects a wrong password")
-    missing = copy.deepcopy(node.backup)
-    missing["envelope"] = {}
-    rejected = other.command("recover_material", backup=missing,
-                             password=node.backup_password, check=False)
-    require(rejected["ok"] is False, "recovery rejects missing encrypted key material")
     material = other.command("recover_material", backup=node.backup, password=node.backup_password)
     require(material["network_id"] == network, "recovered root retains the original personal fingerprint")
-    other.url = entry_url or node.url
-    if entry_url:
-        other.command("connect_auto", url=entry_url, peer_id=node.peer_id,
-                      transport=str(Path(__file__).resolve().parents[1] / "crates/node/web/transport.js"))
-    else:
-        other.connect(node.peer_id)
-    wrong_challenge = other.call("recovery_challenge", {"network_id": network,
-                                 "owner_public_key": material["genesis"]["owner_public_key"],
-                                 "genesis": material["genesis"]})
-    wrong_signature = other.command("sign", **wrong_challenge["signing"])
-    response = other.call("recovery_context", {"challenge_id": wrong_challenge["challenge_id"],
-                                              "signature": wrong_signature}, status=403)
-    require(not response.get("result") and "state" not in response and "view" not in response,
-            "wrong root proof reveals no private membership")
-    challenge = other.call("recovery_challenge", {"network_id": network,
-                           "owner_public_key": material["genesis"]["owner_public_key"],
-                           "genesis": material["genesis"]})
-    signature = other.command("sign", identity="recovered", **challenge["signing"])
-    context = other.call("recovery_context", {"challenge_id": challenge["challenge_id"], "signature": signature})
-    view = context["view"]
-    keep = [member for member in view["members"] if member["subject_id"] not in view["revoked"] and not member["manage"]]
-    identity = other.command("identity")
-    keep.append({**identity, "kind": "client", "name": "Recovered management client", "node_roles": [], "manage": True})
-    keep.sort(key=lambda member: member["subject_id"])
-    prepared = other.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": keep})
-    for field in ("history", "signing"):
-        tampered = copy.deepcopy(prepared)
-        if field == "history":
-            tampered["checkpoint"]["historical_nodes"] = []
-        else:
-            tampered["signing"]["domain"] = "identity-genesis"
-        rejected = other.command("recovery_checkpoint", state=context["state"], members=keep,
-                                 backup_epoch=node.backup["recovery_epoch"], prepared=tampered, check=False)
-        require(rejected["ok"] is False, "trusted WASM rejects altered recovery history or signing payload")
-    prepared["checkpoint"] = other.command("recovery_checkpoint", state=context["state"], members=keep,
-                                            backup_epoch=node.backup["recovery_epoch"], prepared=prepared)
-    result = other.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"]})
+    other.url = node.url
+    other.connect(node.device_id)
+    me = other.own_id()
+    stale = other.command("recovery_read_proof", network_id=network)
+    stale["signature"] = node.client.command("attest", network_id=network, scope_id="x",
+                                             body={"type": "probe"})["signature"]
+    response = other.call("recovery_state", stale, status=400)
+    require("state" not in response, "a proof not signed by the root reveals no membership")
+    state = other.call("recovery_state", other.command("recovery_read_proof", network_id=network))["state"]
+    view = node.client.call("directory")["view"]
+    revoked = {item["device_id"] for item in view["revoked"]}
+    keep = [member for member in view["members"] if member["device_id"] not in revoked]
+    managers = [member["device_id"] for member in keep if member["manage"]]
+    keep.append({"device_id": me, "kind": "client", "name": "Recovered management client", "manage": True})
+    checkpoint = other.command("recovery_checkpoint", state=state, network_id=network, members=keep,
+                               epoch=material["recovery_epoch"])
+    result = other.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint})
     other.network_id = network
-    require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
-            "root recovery establishes an independent manager in a higher epoch")
-    history = other.rpc("conversation", conversation_id="acceptance-conversation")
-    require(any(message["message_id"] == "message-original"
-                and message["text"] == "Keep this context after A disconnects."
-                for message in history["messages"]),
-            "root recovery retains the exact existing private conversation")
-    rejected = node.client.command("request", method="directory", check=False)
-    if rejected["ok"]:
-        require(rejected["result"].get("error") and not rejected["result"].get("result"),
-                "recovered epoch rejects the old client's already-open channel")
-    else:
-        require("closed" in rejected.get("error", "").lower(),
-                "old authorization is explicitly rejected or disconnected")
+    require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"] > view["epoch"],
+            "root recovery establishes a manager in a higher epoch")
     node.client.connect()
-    node.client.call("authenticate", {"network_id": network}, status=403)
-    for peer in nodes:
-        if peer is node or peer.name == "C":
-            continue
-        wait_for("authorized peer installs recovered management epoch", lambda: peer.client.call("directory")["view"]["epoch"] == result["view"]["epoch"])
-    return other.command("backup", identity="recovered", state=result["state"],
-                         recovery_epoch=result["view"]["epoch"], password=node.backup_password)
+    node.client.authenticate(network)
+    require(node.client.principal["can_manage"] and node.client.own_id() in managers,
+            "existing managers keep management after root recovery by default")
+    return checkpoint
 
 
 def verify_channel_security(node):
@@ -2301,7 +2182,7 @@ def local_events(node, network, conversation):
 def bot_checks(run, workspace, a, network, passed, outsider):
     definitions = [{"bot_id": "bot-" + label, "conversation_id": "bot-history-" + label,
                     "name": label.capitalize(), "instructions": "bot-" + label + "-instructions-sentinel",
-                    "project": {"target_node": a.peer_id, "cwd": str(workspace)}} for label in ("alpha", "beta")]
+                    "project": {"target_node": a.device_id, "cwd": str(workspace)}} for label in ("alpha", "beta")]
     stored = []
     before_calls = len(fixture_records(run))
     for definition in definitions:
@@ -2405,7 +2286,7 @@ def work_checks(run, workspace, a, network, passed):
                                         changed="work ID reused with a different request")
     finished = wait_for("the native turn finishes and records its outcome", lambda: in_state(name, work_id, "finished"))
     require(finished["outcome"] == "completed" and finished["trigger"] == receipt["trigger"]
-            and finished["target_node"] == a.peer_id, "the work keeps its dispatching trigger and target")
+            and finished["target_node"] == a.device_id, "the work keeps its dispatching trigger and target")
     job = wait_for("the finished work becomes its own result trigger", lambda: result_job(work_id))
     require(job["kind"] == "work_result" and job["attempt"]["read_only"], "a report-mode result turn is read-only")
     results = [row for row in fixture_records(run, "manager-results.jsonl") if row["work_id"] == work_id]
@@ -2718,7 +2599,7 @@ def phase1_acceptance(options):
         progress = wait_for("the client observes actual management text", lambda:
             [event["payload"] for event in a.client.command("events") if event.get("payload", {}).get("type") == "manager_progress"
              and event["payload"].get("conversation_id") == name and event["payload"].get("trigger") == first["trigger"]])
-        require(all(row["source_node"] == a.peer_id and row["invocation_id"] and row["sequence"] > 0
+        require(all(row["source_node"] == a.device_id and row["invocation_id"] and row["sequence"] > 0
                     and row["progress"]["type"] == "text_snapshot" for row in progress),
                 "progress carries the invocation identity and normalized text snapshots")
         active_before = state(first, "running")
@@ -2871,10 +2752,10 @@ def verify_local_access(node):
         parsed = urllib.parse.urlparse(entry["url"])
         fragment = urllib.parse.parse_qs(parsed.fragment)
         require(entry["local"] and parsed._replace(fragment="").geturl().rstrip("/") == launcher["origin"]
-                and fragment["node"] == [node.peer_id] and "token" not in parsed.query,
+                and fragment["node"] == [node.device_id] and "token" not in parsed.query,
                 "one-time local credential appears only in the pinned URL fragment")
         identity = browser.command("identity")
-        exchange = {"token": fragment["local"][0], "peer_id": node.peer_id, **identity}
+        exchange = {"token": fragment["local"][0], "peer_id": node.device_id, **identity}
         request = urllib.request.Request(launcher["origin"] + "/api/local/exchange", json.dumps(exchange).encode(),
                                          {"Origin": launcher["origin"], "Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -3013,7 +2894,7 @@ def acceptance(options):
         a.stop()
         verify_cli_status(a, False)
         a.start()
-        a.client.connect(a.peer_id)
+        a.client.connect(a.device_id)
         a.client.call("rpc", {"method": "nodes"}, status=401)
         a.client.call("directory", status=401)
         for path in ("/api/register", "/api/login", "/api/rpc"):
@@ -3043,27 +2924,27 @@ def acceptance(options):
             node.client.connect()
             wait_for(node.name + " client authorization", lambda node=node: node.client.authenticate())
         wait_for("three personal Nodes are reachable through the pure relay", lambda: all(
-            any(row["peer_id"] == node.peer_id and row["online"] for row in a.client.rpc("nodes")["nodes"]) for node in (b, c)))
+            any(row["peer_id"] == node.device_id and row["online"] for row in a.client.rpc("nodes")["nodes"]) for node in (b, c)))
         phone_client = Client(capture.url, helper, module)
         phone_client.pair_client(a.client, network, "phone through pure relay")
         phone_client.url = capture.url
-        phone_client.connect(a.peer_id, relay=True)
+        phone_client.connect(a.device_id, relay=True)
         phone_client.authenticate(network)
-        require(phone_client.call("info")["peer_id"] == a.peer_id, "relay client authenticates the pinned personal Node")
+        require(phone_client.call("info")["peer_id"] == a.device_id, "relay client authenticates the pinned personal Node")
         with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
             require(connection.execute("SELECT COUNT(*) FROM networks").fetchone()[0] == 0,
                     "public relay remains outside every personal network")
         outsider.start()
         other_network = outsider.bootstrap()
         other = outsider.client
-        require(len({a.peer_id, b.peer_id, c.peer_id}) == 3, "Nodes have distinct stable Peer IDs")
+        require(len({a.device_id, b.device_id, c.device_id}) == 3, "Nodes have distinct stable Peer IDs")
         require(len({node.client.command("identity")["subject_id"] for node in (a, b, c)}) == 3,
                 "each browser installation owns an independent identity")
         require(c.client.network_id == b.client.network_id == network and other_network != network,
                 "paired clients share one network and the outsider retains its independent network")
-        report["topology"] = {"network_id": network, "peers": [node.peer_id for node in (a, b, c)],
-                              "relay_peer_id": relay.peer_id, "relay_network_id": None}
-        other.command("connect", url=a.url, peer_id=a.peer_id, connection="foreign")
+        report["topology"] = {"network_id": network, "peers": [node.device_id for node in (a, b, c)],
+                              "relay_peer_id": relay.device_id, "relay_network_id": None}
+        other.command("connect", url=a.url, peer_id=a.device_id, connection="foreign")
         other.call("authenticate", {"network_id": network}, connection="foreign", status=401)
         other.call("rpc", {"method": "nodes"}, connection="foreign", status=401)
         conversation = "acceptance-conversation"
@@ -3090,7 +2971,7 @@ def acceptance(options):
         gate = directory / "release"
         receipt = a.client.rpc("message", conversation_id=conversation, message_id="delegate-delayed",
             text=json.dumps({"chat_agent": True, "label": "source-delayed", "dispatch": {
-                "label": "delayed", "target_node": b.peer_id, "host_cwd": str(directory),
+                "label": "delayed", "target_node": b.device_id, "host_cwd": str(directory),
                 "host_command": "printf once >> count.txt", "gate": str(gate), "result_size": 50000}}))
         task = wait_for("Agent delegation is durable", lambda: agent_tool_result(run, conversation, "task-delayed"))
         wait_for("B performs the real host effect", lambda: (directory / "count.txt").exists())
@@ -3144,11 +3025,11 @@ def acceptance(options):
             verify_real_codex_transport(run, workspace, options.codex_bin)
             passed("installed App Server opens and reads an exact native thread without a model turn", "real_codex_transport")
         before = len(invocations(run))
-        proposal = a.client.call("prepare_revoke", {"subject_id": c.peer_id})
+        proposal = a.client.call("prepare_revoke", {"subject_id": c.device_id})
         proposal["event"]["signature"] = a.client.command("sign", **proposal["signing"])
         a.client.call("revoke", {"event": proposal["event"]})
-        wait_for("B installs C's revocation", lambda: any(row["peer_id"] == c.peer_id and row["revoked"] for row in b.client.rpc("nodes")["nodes"]))
-        require(not any(row["peer_id"] == c.peer_id and row["online"] for row in a.client.rpc("nodes")["nodes"]),
+        wait_for("B installs C's revocation", lambda: any(row["peer_id"] == c.device_id and row["revoked"] for row in b.client.rpc("nodes")["nodes"]))
+        require(not any(row["peer_id"] == c.device_id and row["online"] for row in a.client.rpc("nodes")["nodes"]),
                 "known revoked Nodes lose usable remote routing")
         recovery_client = Client(a.url, helper, module)
         backup = verify_recovery(a, recovery_client, [a, b, c], network)
@@ -3213,7 +3094,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                            codex_bin=sys.executable)
             node.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=trace", "NO_COLOR": "1"}
                        if node is receiver else None)
-            node.client.connect(node.peer_id)
+            node.client.connect(node.device_id)
             wait_for(f"{node.name} client authorization", lambda node=node: node.client.authenticate())
         expected_membership = head_source.client.call("directory")["state"]
         wait_for("all source and receiver memberships converge before maintenance", lambda: all(
@@ -3230,7 +3111,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
         scope = "net1-continuation-history"
         payload = b"NET-1 closure attachment supplied by replica C\n"
         blob = {"hash": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
-        event = {"version": 1, "network_id": network, "scope_id": scope, "author": head_source.peer_id,
+        event = {"version": 1, "network_id": network, "scope_id": scope, "author": head_source.device_id,
                  "sequence": 1, "previous": None, "parents": [], "created_at_ms": 1,
                  "body": {}, "blobs": []}
         chain_path = run / "signed-history.ndjson"
@@ -3247,7 +3128,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                 "private streamed history has the exact requested count and digest")
         case.update({"network_id": network, "scope_id": scope, "head": chain["head"], "blob": blob,
                      "expected_envelopes_sha256": chain["envelopes_sha256"], "fixture_artifact": str(chain_path),
-                     "sources": {node.name: node.peer_id for node in nodes[1:-1]},
+                     "sources": {node.name: node.device_id for node in nodes[1:-1]},
                      "receiver_log": str(receiver.directory / "process.log")})
         sequences = {}
         with sqlite3.connect(head_source.directory / "node.sqlite3", timeout=10) as heads, \
@@ -3260,13 +3141,13 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                     sequences[envelope["hash"]] = sequence
                     connection = heads if sequence == event_count else parents
                     connection.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
-                                       (network, envelope["hash"], scope, head_source.peer_id, sequence,
+                                       (network, envelope["hash"], scope, head_source.device_id, sequence,
                                         json.dumps(envelope, separators=(",", ":")), "pending" if sequence == event_count else "ready"))
         require(len(sequences) == event_count and sequences[chain["head"]] == event_count,
                 "seeded history contains every unique signed event exactly once")
         database = receiver.directory / "node.sqlite3"
-        source_events = {head_source.peer_id: set(), parent_source.peer_id: set(), blob_source.peer_id: set()}
-        source_blobs = {node.peer_id: set() for node in nodes[1:-1]}
+        source_events = {head_source.device_id: set(), parent_source.device_id: set(), blob_source.device_id: set()}
+        source_blobs = {node.device_id: set() for node in nodes[1:-1]}
         log_path = receiver.directory / "process.log"
         log_offset = log_path.stat().st_size
         log_tail = b""
@@ -3296,12 +3177,12 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                 if "history event fetched" in line:
                     target, digest = fields["target"], fields["hash"]
                     require(target in source_events and digest in sequences, "events come from a known authorized fixture source")
-                    require((target == head_source.peer_id and digest == chain["head"])
-                            or (target == parent_source.peer_id and digest != chain["head"]),
+                    require((target == head_source.device_id and digest == chain["head"])
+                            or (target == parent_source.device_id and digest != chain["head"]),
                             "each event is fetched from its actual fixed source distribution")
                     source_events[target].add(digest)
                 elif "history blob committed" in line and int(fields.get("committed_offset", "0")) == blob["size"]:
-                    require(fields["source"] == blob_source.peer_id and fields["hash"] == blob["hash"],
+                    require(fields["source"] == blob_source.device_id and fields["hash"] == blob["hash"],
                             "the complete attachment is fetched from replica C")
                     source_blobs[fields["source"]].add(fields["hash"])
             with sqlite3.connect(database, timeout=10) as connection:
@@ -3341,7 +3222,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
             if blocked_message is None and observation["has_head"] and observation["has_conversation"] and observation["pending_events"]:
                 message_id = "net1-incomplete-history-must-not-run"
                 rejection = receiver.client.rpc("message", conversation_id=scope, message_id=message_id,
-                    scheduler_node=receiver.peer_id, basis_heads=[chain["head"]], report_results=False,
+                    scheduler_node=receiver.device_id, basis_heads=[chain["head"]], report_results=False,
                     text=json.dumps({"phase1": True, "label": "net1-incomplete",
                                      "host_command": "printf forbidden >> incomplete-effect", "host_cwd": str(workspace)}), status=400)
                 require("context is incomplete; wait for synchronization" in str(rejection.get("error")),
@@ -3349,7 +3230,7 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                 accepted = len(scheduler_records(receiver, network))
                 require(accepted == 0 and not invocations(run) and not (workspace / "incomplete-effect").exists(),
                         "incomplete history never admits a Scheduler job or starts the host fixture")
-                blocked_message = {"message_id": message_id, "target_node": receiver.peer_id,
+                blocked_message = {"message_id": message_id, "target_node": receiver.device_id,
                                    "basis_heads": [chain["head"]], "rejection": rejection["error"],
                                    "accepted_jobs": accepted, "fixture_invocations": 0}
                 case["pending_message"] = blocked_message
@@ -3388,15 +3269,15 @@ def network_reliability_closure_progress(run, binary, workspace, fixture, helper
                 count = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=? AND scope_id=?", (network, scope)).fetchone()[0]
                 blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE network_id=?", (network,)).fetchone()[0]
             require(count == expected_count and blobs == int(node is blob_source), "source distribution remains fixed throughout transfer")
-        require(source_events[head_source.peer_id] == {chain["head"]}
-                and len(source_events[parent_source.peer_id]) == event_count - 1
-                and source_blobs[blob_source.peer_id] == {blob["hash"]}, "real object-source logs cover every supplied event and attachment")
+        require(source_events[head_source.device_id] == {chain["head"]}
+                and len(source_events[parent_source.device_id]) == event_count - 1
+                and source_blobs[blob_source.device_id] == {blob["hash"]}, "real object-source logs cover every supplied event and attachment")
         require(not invocations(run), "closure continuation and rejected incomplete message never start host work")
         verify_no_model_budget(nodes)
         require(file_sha256(binary) == report["binary_sha256"], "Lane 3 binary remains unchanged")
         case.update({"status": "passed", "actual_envelopes_sha256": digest.hexdigest(), "attachment_hash_verified": True,
-                     "source_events_fetched": {node.name: len(source_events[node.peer_id]) for node in nodes[1:-1]},
-                     "source_blobs_fetched": {node.name: len(source_blobs[node.peer_id]) for node in nodes[1:-1]},
+                     "source_events_fetched": {node.name: len(source_events[node.device_id]) for node in nodes[1:-1]},
+                     "source_blobs_fetched": {node.name: len(source_blobs[node.device_id]) for node in nodes[1:-1]},
                      "source_distribution_preserved": True})
         report["fixture_invocations"] = 0
         report["status"] = "passed"
@@ -3415,8 +3296,8 @@ def seed_net1_attachment(source, network, conversation, size, module):
     with sqlite3.connect(source.directory / "node.sqlite3", timeout=10) as connection:
         previous, sequence = connection.execute(
             "SELECT hash,sequence FROM events WHERE network_id=? AND scope_id=? AND author=? ORDER BY sequence DESC LIMIT 1",
-            (network, conversation, source.peer_id)).fetchone()
-        event = {"version": 1, "network_id": network, "scope_id": conversation, "author": source.peer_id,
+            (network, conversation, source.device_id)).fetchone()
+        event = {"version": 1, "network_id": network, "scope_id": conversation, "author": source.device_id,
                  "sequence": sequence + 1, "previous": previous, "parents": [previous],
                  "created_at_ms": int(time.time() * 1000),
                  "body": {"type": "message_posted", "message_id": f"net1-attachment-{size}",
@@ -3431,7 +3312,7 @@ def seed_net1_attachment(source, network, conversation, size, module):
         connection.execute("INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?)",
                            (network, blob["hash"], blob["size"], payload))
         connection.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",
-                           (network, envelope["hash"], conversation, source.peer_id, sequence + 1,
+                           (network, envelope["hash"], conversation, source.device_id, sequence + 1,
                             json.dumps(envelope, separators=(",", ":"))))
     del payload
     return blob, envelope
@@ -3494,7 +3375,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
         for node in (source, receiver):
             node.configure(roles=["gateway", "replica"])
         receiver.start(env=trace_env)
-        receiver.client.connect(receiver.peer_id)
+        receiver.client.connect(receiver.device_id)
         wait_for("Lane 2 receiver authorization", lambda: receiver.client.authenticate())
         expected_membership = source.client.call("directory")["state"]
         wait_for("Lane 2 memberships converge", lambda: receiver.client.call("directory")["state"] == expected_membership)
@@ -3509,7 +3390,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
         require(health["status"] == "healthy", "source PendingActivation preserves its read listener")
         receiver.stop()
         case.update({"network_id": network, "scope_id": scope, "relay_url": relay_url,
-                     "nodes": {node.name: node.peer_id for node in nodes},
+                     "nodes": {node.name: node.device_id for node in nodes},
                      "process_logs": {node.name: str(node.directory / "process.log") for node in nodes},
                      "temporary_configurations": {node.name: {key: json.loads((node.directory / "config.json").read_text())[key] for key in ("roles", "network", "manager", "codex_socket")} for node in nodes}})
         for node in (source, receiver):
@@ -3545,7 +3426,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                     require(manifest["version"] == 1 and manifest["blob"] == blob, "durable manifest binds the exact signed object")
                 offset = manifest["phase"].get("committed_offset") if manifest and manifest["phase"]["state"] == "receiving" else None
                 if offset is not None:
-                    require(0 <= offset <= size and manifest["phase"]["source_peer_id"] == source.peer_id, "progress stays within this authorized source object")
+                    require(0 <= offset <= size and manifest["phase"]["source_peer_id"] == source.device_id, "progress stays within this authorized source object")
                 files = list(staging.iterdir()) if staging.exists() else []
                 reserved = sum(json.loads(value)["blob"]["size"] for value, in manifests)
                 actual_bytes = sum(path.lstat().st_size for path in files)
@@ -3584,9 +3465,9 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                     return None
                 request_entry = queued[served["fields"]["request_id"]]
                 fields = request_entry["fields"]
-                require(fields.get("network") == network and fields.get("target") == source.peer_id,
+                require(fields.get("network") == network and fields.get("target") == source.device_id,
                         "queued request keeps the original network and source target")
-                require(served["fields"].get("network") == network and served["fields"].get("origin") == receiver.peer_id,
+                require(served["fields"].get("network") == network and served["fields"].get("origin") == receiver.device_id,
                         "actual source range read authenticates the original receiver")
                 preceding = [entry for entry in b_logs if entry["log_offset"] < request_entry["log_offset"]
                              and ("history blob committed" in entry["message"] or "history blob opened" in entry["message"])]
@@ -3650,7 +3531,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             receiver.start(env=trace_env)
             crash["new_pid"] = receiver.process.pid
             require(crash["new_pid"] != crash["old_pid"], "restart creates a distinct receiver process")
-            require(receiver.peer_id == case["nodes"]["B"], "restart keeps the original receiver identity")
+            require(receiver.device_id == case["nodes"]["B"], "restart keeps the original receiver identity")
             crash["known_request_ids"] = [entry["fields"]["request_id"] for entry in records(receiver, start_b, digest=digest) if "peer blob request queued" in entry["message"]]
             crash["relay_log_cursor_before_resume"] = boundary(relay)
             crash["resume"] = capture.resume()
@@ -3665,7 +3546,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             require(published, "receiver logs actual publication of this exact attachment")
             complete_scope = wait_for("completed attachment scope reports Complete", lambda: [entry for entry in records(receiver, start_b)
                 if entry["log_offset"] >= published[-1]["log_end"] and "history scope sync finished" in entry["message"] and entry["fields"].get("network") == network
-                and entry["fields"].get("target") == source.peer_id
+                and entry["fields"].get("target") == source.device_id
                 and entry["fields"].get("scope") == scope and entry["fields"].get("state") == "Complete"
                 and all(entry["fields"].get(field) == "0" for field in ("missing_events", "missing_blobs", "conflicts"))], timeout=35)
             with read_only(receiver) as connection:
@@ -3693,7 +3574,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                 served_fields = served_entry["fields"]
                 queued_entry = queued_by_id.get(served_fields.get("request_id"))
                 require(queued_entry is not None and served_fields.get("network") == network
-                        and served_fields.get("origin") == receiver.peer_id
+                        and served_fields.get("origin") == receiver.device_id
                         and served_fields["offset"] == queued_entry["fields"]["offset"]
                         and int(served_fields["size"]) == size
                         and 0 < int(served_fields["returned_bytes"]) <= int(queued_entry["fields"]["limit"]),
@@ -3702,7 +3583,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             controls = [dict(control) for control in capture.controls]
             circuits = []
             for control in controls:
-                if control.get("type") != "dial" or control.get("direction") != "to_relay" or control.get("service") != "peer" or control.get("target") not in (source.peer_id, receiver.peer_id):
+                if control.get("type") != "dial" or control.get("direction") != "to_relay" or control.get("service") != "peer" or control.get("target") not in (source.device_id, receiver.device_id):
                     continue
                 ready = next((entry for entry in controls if entry["connection"] == control["connection"] and entry.get("type") == "ready" and entry["direction"] == "from_relay"), None)
                 traffic = capture.traffic[control["connection"]]
@@ -3740,9 +3621,9 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
                 relay_events = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=?", (network,)).fetchone()[0]
                 relay_blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE network_id=?", (network,)).fetchone()[0]
             require(relay_events == relay_blobs == 0, "the sole relay never stores this personal network's private history or blobs")
-            receiver.client.connect(receiver.peer_id)
+            receiver.client.connect(receiver.device_id)
             wait_for("completed receiver client authorization", lambda: receiver.client.authenticate())
-            signed_records = {node.name: wait_for(f"{node.name} signed relay-only directory record", lambda node=node: relay.client.command("network_probe", kind="record", url=relay.url, target=node.peer_id)) for node in (source, receiver)}
+            signed_records = {node.name: wait_for(f"{node.name} signed relay-only directory record", lambda node=node: relay.client.command("network_probe", kind="record", url=relay.url, target=node.device_id)) for node in (source, receiver)}
             require(all(value["direct_urls"] == [] and value["relay_urls"] == [relay_url] for value in signed_records.values()), "signed A/B directory records offer only this sole relay")
             logical_bytes = sum(int(entry["fields"]["returned_bytes"]) for entry in records(source, start_a, digest=digest) if "peer blob range served" in entry["message"])
             item.update({"status": "passed", "final": snapshot(), "actual_hash": digest, "actual_size": actual_size,
@@ -3819,8 +3700,8 @@ def network_peer_query(caller, target, label):
         envelopes, previous = [], None
         for sequence, body in enumerate(({"type": "conversation_created", "title": "Read-only native status"},
                 {"type": "message_posted", "message_id": label, "role": "user", "text": "Observe existing native work only",
-                 "scheduler_node": target.peer_id}), 1):
-            event = {"version": 1, "network_id": network, "scope_id": scope, "author": caller.peer_id,
+                 "scheduler_node": target.device_id}), 1):
+            event = {"version": 1, "network_id": network, "scope_id": scope, "author": caller.device_id,
                      "sequence": sequence, "previous": previous, "parents": [previous] if previous else [],
                      "created_at_ms": sequence, "body": body, "blobs": []}
             signed = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(caller.client.module)],
@@ -3835,7 +3716,7 @@ def network_peer_query(caller, target, label):
         with sqlite3.connect(database) as connection:
             for event, envelope in envelopes:
                 connection.execute("INSERT OR IGNORE INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
-                    (network, envelope["hash"], scope, caller.peer_id, event["sequence"], json.dumps(envelope, separators=(",", ":")), "ready"))
+                    (network, envelope["hash"], scope, caller.device_id, event["sequence"], json.dumps(envelope, separators=(",", ":")), "ready"))
             connection.execute("INSERT OR IGNORE INTO conversations(network_id,conversation_id,title) VALUES(?,?,?)", (network, scope, "Read-only native status"))
             connection.execute("INSERT OR IGNORE INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",
                 (network, scope, envelopes[-1][1]["hash"], label, "user", "Observe existing native work only", 2, 2))
@@ -3844,7 +3725,7 @@ def network_peer_query(caller, target, label):
     require(result["native_sessions"] == [], "read-only target has no native work to invent")
     handled = wait_for("the fixed original target handles an authenticated native status read", lambda: [entry
         for entry in network_trace_records(target, target_offset, messages=["peer business request handled"])
-        if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.peer_id
+        if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.device_id
         and entry["fields"].get("request_type") == "native_status" and entry["fields"].get("outcome") == "ok"])
     require(len(handled) == 1, "the read reaches its original authenticated target once")
     return {"native_sessions": result["native_sessions"]}
@@ -3854,7 +3735,7 @@ def network_peer_read_evidence(caller, target, network, label, caller_offset, ta
                                *, next_hop, link_id, route_kind):
     def handled_reads():
         return [entry for entry in network_trace_records(target, target_offset, messages=["peer business request handled"])
-                if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.peer_id
+                if entry["fields"].get("network") == network and entry["fields"].get("origin") == caller.device_id
                 and entry["fields"].get("request_type") == "native_status"]
 
     handled = wait_for("the original target handles this exact native status read", handled_reads)
@@ -3865,14 +3746,14 @@ def network_peer_read_evidence(caller, target, network, label, caller_offset, ta
         entry for entry in network_trace_records(caller, caller_offset, messages=["peer packet queued"])
         if entry["fields"].get("network") == network and entry["fields"].get("request_id") == request_id
         and entry["fields"].get("kind") == "Request"])
-    require(len(queued) == 1 and queued[0]["fields"].get("target") == target.peer_id
+    require(len(queued) == 1 and queued[0]["fields"].get("target") == target.device_id
             and queued[0]["fields"].get("next_hop") == next_hop and queued[0]["fields"].get("link_id") == link_id
             and queued[0]["fields"].get("route_kind") == route_kind,
             "the exact read uses only its expected next-hop link generation")
     response = wait_for("the caller accepts the matching original-target signed response", lambda: next(
         (entry for entry in network_trace_records(caller, caller_offset, messages=["peer response matched"])
          if entry["fields"].get("network") == network and entry["fields"].get("request_id") == request_id
-         and entry["fields"].get("origin") == target.peer_id and entry["fields"].get("delivered") == "true"), None))
+         and entry["fields"].get("origin") == target.device_id and entry["fields"].get("delivered") == "true"), None))
     require(len(handled_reads()) == 1, "the exact native status read is handled once")
     return {"observation": label, "request_id": request_id, "target_handled": handled[0],
             "caller_queued": queued[0], "caller_response": response}
@@ -3992,7 +3873,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
 
     def dial(reservation, owner):
         caller = socket_at()
-        caller.send_control({"type": "dial", "target": owner.peer_id, "service": "peer"})
+        caller.send_control({"type": "dial", "target": owner.device_id, "service": "peer"})
         incoming = reservation.control()
         require(incoming.get("type") == "incoming" and incoming.get("service") == "peer", "current reservation receives the exact peer Dial")
         return caller, incoming["token"]
@@ -4008,7 +3889,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         caller_owner = identity("caller")
         old = socket_at()
         require(old.reserve(owner) == {"type": "reserved"}, "old fixed identity completes a real reservation challenge")
-        old_ready = wait_for("old generation ready trace", lambda: trace("relay reservation ready", target=owner.peer_id), timeout=remaining())
+        old_ready = wait_for("old generation ready trace", lambda: trace("relay reservation ready", target=owner.device_id), timeout=remaining())
         old_generation = old_ready["fields"]["generation"]
         first, token = dial(old, owner)
         established_target = socket_at()
@@ -4022,12 +3903,12 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         fresh = socket_at()
         require(fresh.reserve(owner) == {"type": "reserved"}, "same fixed identity authenticates a fresh challenge without client-closing the old socket")
         installed = wait_for("new generation installation", lambda: next((entry for entry in network_trace_records(relay, messages=["relay reservation installed"])
-            if entry["fields"].get("target") == owner.peer_id and entry["fields"].get("generation") != old_generation), None), timeout=remaining())
+            if entry["fields"].get("target") == owner.device_id and entry["fields"].get("generation") != old_generation), None), timeout=remaining())
         generation = installed["fields"]["generation"]
         require(old_generation in installed["fields"].get("previous", ""), "new generation explicitly replaces the original reservation")
-        previous_closed = wait_for("server actively reclaims the previous physical socket", lambda: trace("relay reservation previous socket closed", target=owner.peer_id, generation=generation), timeout=remaining())
-        removed = wait_for("old cleanup is scoped to its previous generation", lambda: trace("relay reservation removed", target=owner.peer_id, generation=old_generation, current="false"), timeout=remaining())
-        new_ready = wait_for("new reservation remains ready after old cleanup", lambda: trace("relay reservation ready", target=owner.peer_id, generation=generation), timeout=remaining())
+        previous_closed = wait_for("server actively reclaims the previous physical socket", lambda: trace("relay reservation previous socket closed", target=owner.device_id, generation=generation), timeout=remaining())
+        removed = wait_for("old cleanup is scoped to its previous generation", lambda: trace("relay reservation removed", target=owner.device_id, generation=old_generation, current="false"), timeout=remaining())
+        new_ready = wait_for("new reservation remains ready after old cleanup", lambda: trace("relay reservation ready", target=owner.device_id, generation=generation), timeout=remaining())
         old.close()
         after = network_fixture_canary(established_target, first, owner, caller_owner, "old-ready-circuit-after-handoff")
         stale_cursor = (relay.directory / "process.log").stat().st_size
@@ -4044,7 +3925,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         pending_caller.close()
         new_caller_owner = identity("new-caller")
         new_target_owner = identity("target")
-        require(new_target_owner.peer_id == owner.peer_id, "new circuit keeps the exact original target key")
+        require(new_target_owner.device_id == owner.device_id, "new circuit keeps the exact original target key")
         new_caller, token = dial(fresh, owner)
         new_target = socket_at()
         require(new_target.attach(new_target_owner, token) == {"type": "ready"} and new_caller.control() == {"type": "ready"}, "new generation accepts a fresh attachment after old cleanup")
@@ -4060,7 +3941,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         current_generation = generation
         recovered_caller_identity = identity("new-caller")
         recovered_target_identity = identity("target")
-        require(recovered_caller_identity.peer_id == new_caller_owner.peer_id and recovered_target_identity.peer_id == owner.peer_id,
+        require(recovered_caller_identity.device_id == new_caller_owner.device_id and recovered_target_identity.device_id == owner.device_id,
                 "capacity recovery keeps both original fixture identities")
         held, held_tokens = [], []
         held_started = time.monotonic()
@@ -4070,7 +3951,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
             held_tokens.append(held_token)
         denied_cursor = (relay.directory / "process.log").stat().st_size
         extra = socket_at()
-        extra.send_control({"type": "dial", "target": owner.peer_id, "service": "peer"})
+        extra.send_control({"type": "dial", "target": owner.device_id, "service": "peer"})
         try:
             extra.control()
             raise AssertionError("fifth same-source circuit must be refused")
@@ -4092,11 +3973,11 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         recovered_noise = network_fixture_noise(recovered, recovered_target, recovered_caller_identity, recovered_target_identity)
         recovered_canary = network_fixture_canary(recovered, recovered_target, recovered_caller_identity, recovered_target_identity, "after-quota-release")
         require(time.monotonic() < held_started + 10, "recovered Noise and canary complete while the other pending requests remain unexpired")
-        require(not trace("relay reservation removed", target=owner.peer_id, generation=current_generation), "current reservation was not torn down by rejected Dial")
+        require(not trace("relay reservation removed", target=owner.device_id, generation=current_generation), "current reservation was not torn down by rejected Dial")
         core = network_core_evidence(evidence_dir, "a1", ["full_data_capacity_refuses_only_the_incoming_and_recovers_on_the_same_reservation"])
         generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_preserves_ready_circuit_during_blocked_directory_publication",
             "a2_outer_abort_drops_an_attached_socket_waiting_in_the_receiver", "a2_real_full_source_and_global_handoff_uses_a_full_logical_table_fixture"])
-        case.update({"status": "passed", "target_peer_id": owner.peer_id, "old_generation": old_generation, "new_generation": generation,
+        case.update({"status": "passed", "target_peer_id": owner.device_id, "old_generation": old_generation, "new_generation": generation,
                      "old_ready": old_ready, "new_installed": installed, "previous_socket_closed": previous_closed,
                      "old_cleanup": removed, "new_ready": new_ready, "old_token_sha256": token_tag, "stale_failure": stale_failure,
                      "stale_trace": stale_trace, "old_noise": noise, "canary_before": before, "old_circuit_canary_after": after,
@@ -4147,7 +4028,7 @@ def network_reliability_duplex(run, binary, workspace, fixture, helper, module, 
 
     def establish(reservation, caller_owner, target_owner, *, receive_buffer=None):
         caller = connection()
-        caller.send_control({"type": "dial", "target": target_owner.peer_id, "service": "peer"})
+        caller.send_control({"type": "dial", "target": target_owner.device_id, "service": "peer"})
         incoming = reservation.control()
         require(incoming.get("type") == "incoming" and incoming.get("service") == "peer", "fixed target receives the original relay request")
         target = connection(receive_buffer=receive_buffer)
@@ -4199,7 +4080,7 @@ def network_reliability_duplex(run, binary, workspace, fixture, helper, module, 
             candidates = {}
             for entry in network_trace_records(relay, before_flood, messages=["relay flow"]):
                 fields = entry["fields"]
-                if fields.get("target") != target_owner.peer_id or fields.get("direction") != "caller_to_target":
+                if fields.get("target") != target_owner.device_id or fields.get("direction") != "caller_to_target":
                     continue
                 circuit = fields.get("circuit")
                 require(circuit and re.fullmatch(r"[0-9a-f]{12}", circuit), "slow direction is associated with an actual local circuit tag")
@@ -4225,14 +4106,14 @@ def network_reliability_duplex(run, binary, workspace, fixture, helper, module, 
         circuit = blocked["circuit"]
         reverse = network_fixture_canary(stopped_target, caller, target_owner, caller_owner, "reverse-during-continuous-backpressure")
         lookup_socket = connection()
-        lookup_socket.send_control({"type": "lookup", "target": other_target_owner.peer_id})
+        lookup_socket.send_control({"type": "lookup", "target": other_target_owner.device_id})
         lookup_reply = lookup_socket.control()
         require(lookup_reply.get("type") == "record", "directory control progresses while the matched slow circuit remains blocked")
         other_caller, other_target, other_noise = establish(other_reservation, other_caller_owner, other_target_owner)
         other_canary = network_fixture_canary(other_caller, other_target, other_caller_owner, other_target_owner, "other-target-during-backpressure")
         progress_done = {"wall_time": time.time(), "monotonic": time.monotonic()}
         require(progress_done["monotonic"] < paused["monotonic"] + 10, "reverse and other-target progress precede the conservative pending-write deadline")
-        same_flow = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("target") == target_owner.peer_id]
+        same_flow = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("target") == target_owner.device_id]
         require(not any(entry["log_offset"] > blocked["write_pending"]["log_offset"] and entry["fields"].get("direction") == "caller_to_target"
                         and entry["fields"].get("event") in ("write_resumed", "closed") for entry in same_flow),
                 "the same pending write stays unresolved through reverse, lookup and other-target completion")
@@ -4251,7 +4132,7 @@ def network_reliability_duplex(run, binary, workspace, fixture, helper, module, 
             decrypted.append(hashlib.sha256(payload).hexdigest())
         flood_thread.join(timeout=min(5, remaining()))
         require(not flood_thread.is_alive() and flood["error_type"] is None and flood["records_sent"] == len(records), "bounded sender finishes and is joined after the actual reader resumes")
-        same_flow = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("target") == target_owner.peer_id]
+        same_flow = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("target") == target_owner.device_id]
         interruptions = [entry for entry in same_flow if entry["log_offset"] > blocked["write_pending"]["log_offset"]
                          and entry["fields"].get("direction") == "caller_to_target" and entry["fields"].get("event") in ("write_resumed", "closed")]
         require(interruptions and interruptions[0]["fields"]["event"] == "write_resumed"
@@ -4286,9 +4167,9 @@ def network_reliability_duplex(run, binary, workspace, fixture, helper, module, 
             "x1_each_silent_endpoint_expires_despite_continuous_opposite_traffic", "x1_stopped_tcp_reader_keeps_reverse_noise_and_other_target_progress",
             "x1_two_real_writers_share_the_production_rate_and_total_byte_limit",
             "x1_abort_and_timeout_during_rate_or_slow_write_release_io_and_allow_reuse"])
-        case.update({"status": "passed", "relay_peer_id": relay.peer_id, "target_peer_id": target_owner.peer_id, "circuit": circuit,
+        case.update({"status": "passed", "relay_peer_id": relay.device_id, "target_peer_id": target_owner.device_id, "circuit": circuit,
             "noise": noise, "reader_paused": paused, "continuous_backpressure": blocked, "reverse_canary": reverse,
-            "directory_control": {"type": lookup_reply["type"], "target_peer_id": other_target_owner.peer_id,
+            "directory_control": {"type": lookup_reply["type"], "target_peer_id": other_target_owner.device_id,
                                   "has_record": lookup_reply.get("record") is not None, "scope": "Control query progress; fixture target has no published directory record"},
             "other_target_noise": other_noise, "other_target_canary": other_canary, "progress_done": progress_done, "reader_resumed": resumed,
             "first_write_resumed_after_progress": interruptions[0], "decrypted_message_sha256": decrypted, "flood": flood,
@@ -4336,7 +4217,7 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         try:
             connection.request("GET", "/api/info")
             response = connection.getresponse()
-            require(response.status == 200 and json.loads(response.read(65536))["peer_id"] == node.peer_id,
+            require(response.status == 200 and json.loads(response.read(65536))["peer_id"] == node.device_id,
                     "both real loopback address families reach the same packaged Node identity")
         finally:
             connection.close()
@@ -4360,13 +4241,13 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
 
     def lookup(node, source):
         value = open_at(node, source)
-        value.send_control({"type": "lookup", "target": node.peer_id})
+        value.send_control({"type": "lookup", "target": node.device_id})
         reply = value.control()
-        require(reply.get("type") == "record" and reply.get("record", {}).get("peer_id") == node.peer_id,
+        require(reply.get("type") == "record" and reply.get("record", {}).get("peer_id") == node.device_id,
                 "other legal source completes a real target lookup")
         summary = dict(value.summary)
         value.close()
-        return {"source_socket": summary, "target_peer_id": node.peer_id, "record_received": True}
+        return {"source_socket": summary, "target_peer_id": node.device_id, "record_received": True}
 
     def closed_after_control(value):
         try:
@@ -4379,7 +4260,7 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         deadline = time.monotonic() + 45
         relay = start_relay("R-budget")
         case["listener"] = {"listen": f"[::]:{relay.port}", "public_url": relay.url, "allow_insecure_lan": True,
-                            "scope": "temporary wildcard test listener; no production config changed", "peer_id": relay.peer_id}
+                            "scope": "temporary wildcard test listener; no production config changed", "peer_id": relay.device_id}
         initial_group_deadline = deadline
         first_initial_started = time.monotonic()
         deadline = min(deadline, first_initial_started + 10)
@@ -4414,8 +4295,8 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         extra_owner = identity("long-source-extra")
         cursor = (relay.directory / "process.log").stat().st_size
         extra = open_at(relay, "v4", forwarded_for="198.51.100.62")
-        proof = json.dumps({"nonce": extra.nonce, "peer_id": extra_owner.peer_id}, separators=(",", ":"))
-        extra.send_control({"type": "reserve", "peer_id": extra_owner.peer_id, "public_key": extra_owner.public_key,
+        proof = json.dumps({"nonce": extra.nonce, "peer_id": extra_owner.device_id}, separators=(",", ":"))
+        extra.send_control({"type": "reserve", "peer_id": extra_owner.device_id, "public_key": extra_owner.public_key,
                             "signature": extra_owner.sign("relay-reserve", proof.encode())})
         long_closed = closed_after_control(extra)
         long_reason = reason(relay, cursor, "source_established_socket")
@@ -4425,9 +4306,9 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         for value in long_reservations:
             value.close()
         wait_for("all sixteen exact source reservations actually clean up", lambda: len({entry["fields"].get("target") for entry in network_trace_records(relay, release_cursor, messages=["relay reservation removed"])
-                 if entry["fields"].get("target") in {owner.peer_id for owner in long_owners}}) == 16, timeout=remaining())
+                 if entry["fields"].get("target") in {owner.device_id for owner in long_owners}}) == 16, timeout=remaining())
         case["groups"]["source_long_identity_isolation"] = {"status": "passed", "limit": 16,
-            "fixed_distinct_identities": [owner.peer_id for owner in long_owners], "refused_new_identity": extra_owner.peer_id,
+            "fixed_distinct_identities": [owner.device_id for owner in long_owners], "refused_new_identity": extra_owner.device_id,
             "ws_close": long_closed, "server_rejection": long_reason, "other_real_source_lookup": other_long,
             "removed_reservations": 16, "forwarded_header_ignored": True}
         for owner in long_owners + [extra_owner]:
@@ -4442,25 +4323,25 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         first_pending = time.monotonic()
         for _ in range(4):
             value = open_at(relay, "v4")
-            value.send_control({"type": "dial", "target": t1.peer_id, "service": "peer"})
+            value.send_control({"type": "dial", "target": t1.device_id, "service": "peer"})
             incoming = r1.control()
             require(incoming.get("type") == "incoming", "every pending Dial reaches the actual target reservation")
             pending.append(value)
             tokens.append(incoming["token"])
         cursor = (relay.directory / "process.log").stat().st_size
         source_excess = open_at(relay, "v4")
-        source_excess.send_control({"type": "dial", "target": t2.peer_id, "service": "peer"})
+        source_excess.send_control({"type": "dial", "target": t2.device_id, "service": "peer"})
         source_closed = closed_after_control(source_excess)
         source_reason = reason(relay, cursor, "source_circuit")
         network_assert_source(source_reason, source_excess.summary)
         cursor = (relay.directory / "process.log").stat().st_size
         target_excess = open_at(relay, "v6")
-        target_excess.send_control({"type": "dial", "target": t1.peer_id, "service": "peer"})
+        target_excess.send_control({"type": "dial", "target": t1.device_id, "service": "peer"})
         target_closed = closed_after_control(target_excess)
         target_reason = reason(relay, cursor, "target_circuit")
         network_assert_source(target_reason, target_excess.summary)
         other_caller = open_at(relay, "v6")
-        other_caller.send_control({"type": "dial", "target": t2.peer_id, "service": "peer"})
+        other_caller.send_control({"type": "dial", "target": t2.device_id, "service": "peer"})
         token = r2.control()["token"]
         other_target = open_at(relay, "v4")
         require(other_target.attach(t2, token) == {"type": "ready"} and other_caller.control() == {"type": "ready"}, "another real source and legal target get a complete circuit under overload")
@@ -4475,8 +4356,8 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         other_caller.close()
         other_target.close()
         case["groups"]["source_and_target_circuits"] = {"status": "passed", "source_limit": 4, "target_limit": 4,
-            "source_refused_on_other_empty_target": {"close": source_closed, "trace": source_reason, "target": t2.peer_id},
-            "other_source_refused_on_full_target": {"close": target_closed, "trace": target_reason, "target": t1.peer_id},
+            "source_refused_on_other_empty_target": {"close": source_closed, "trace": source_reason, "target": t2.device_id},
+            "other_source_refused_on_full_target": {"close": target_closed, "trace": target_reason, "target": t1.device_id},
             "other_source_other_target_noise": noise, "canary": canary, "lookups": lookups,
             "pending_tokens_sha256": [hashlib.sha256(token.encode()).hexdigest() for token in tokens], "preceded_pending_expiry": True}
         relay.stop()
@@ -4496,7 +4377,7 @@ def network_reliability_budgets(run, binary, workspace, fixture, helper, module,
         network_assert_source(rate_reason, rate_rejected)
         rate_other = lookup(rate_relay, "v6")
         require(time.monotonic() < window_start + 60, "all 120 requests and denial fit the unchanged source rate window")
-        case["groups"]["source_request_rate"] = {"status": "passed", "fresh_relay_peer_id": rate_relay.peer_id,
+        case["groups"]["source_request_rate"] = {"status": "passed", "fresh_relay_peer_id": rate_relay.device_id,
             "accepted": len(rate_results), "source_limit": 120, "rejected": rate_rejected,
             "server_rejection": rate_reason, "other_real_source_lookup": rate_other,
             "window_seconds_observed": time.monotonic() - window_start, "forwarded_header_ignored": True,
@@ -4578,7 +4459,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
     def signed_short_record():
         result = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
                                 input=json.dumps({"op": "fixture_reachability", "identity_file": str(b.directory / "identity.json"),
-                                                  "expected_peer_id": b.peer_id, "relay_urls": [unavailable.url], "ttl_secs": 2}) + "\n",
+                                                  "expected_peer_id": b.device_id, "relay_urls": [unavailable.url], "ttl_secs": 2}) + "\n",
                                 capture_output=True, text=True, timeout=15)
         require(result.returncode == 0, "temporary original target signs a short-lived reachability fixture")
         response = json.loads(result.stdout)
@@ -4604,7 +4485,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         directory_url = directory_capture.url.replace("http:", "ws:") + "/api/network/ws"
         healthy = NetworkDirectoryFixture("healthy")
         directories.append(healthy)
-        healthy.record_factory = lambda target: copy.deepcopy(healthy.record) if target == b.peer_id else None
+        healthy.record_factory = lambda target: copy.deepcopy(healthy.record) if target == b.device_id else None
         a.configure(network={"bootstrap_urls": [healthy.url], "advertise_urls": [], "mdns": False, "relay_enabled": False})
         case["first_start_a_network"] = json.loads((a.directory / "config.json").read_text())["network"]
         b.configure(network={"bootstrap_urls": [relay_url, directory_url], "advertise_urls": [], "mdns": False, "relay_enabled": False})
@@ -4615,33 +4496,33 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         b.start(env=trace_env)
 
         def target_record():
-            record = directory.client.command("network_probe", kind="record", url=directory.url, target=b.peer_id)
+            record = directory.client.command("network_probe", kind="record", url=directory.url, target=b.device_id)
             require(record["direct_urls"] == [] and record["relay_urls"] == [relay_url], "healthy source provides the original B with only the actual relay path")
             return record
 
         healthy.record = wait_for("B reserves and signs its sole relay path", target_record)
-        b.client.connect(b.peer_id)
+        b.client.connect(b.device_id)
         wait_for("Lane 4 B independent client authorization", lambda: b.client.authenticate())
         membership = a.client.call("directory")["state"]
         wait_for("Lane 4 source and target memberships converge", lambda: b.client.call("directory")["state"] == membership)
 
         def authenticated_target():
             return next((node for node in a.client.rpc("nodes")["nodes"]
-                         if node["peer_id"] == b.peer_id and node["online"] and node.get("capabilities")), None)
+                         if node["peer_id"] == b.device_id and node["online"] and node.get("capabilities")), None)
 
         wait_for("setup discovers B using only the healthy directory", authenticated_target)
         a.stop()
         a.configure(roles=["gateway", "replica"])
         healthy.record = target_record()
-        wrong_record = relay.client.command("network_probe", kind="record", url=relay.url, target=relay.peer_id)
+        wrong_record = relay.client.command("network_probe", kind="record", url=relay.url, target=relay.device_id)
         invalid_signature = copy.deepcopy(healthy.record)
         invalid_signature["signature"] = ("0" if invalid_signature["signature"][0] != "0" else "1") + invalid_signature["signature"][1:]
-        slow = NetworkDirectoryFixture("slow", record_factory=lambda target: copy.deepcopy(healthy.record) if target == b.peer_id else None)
-        wrong = NetworkDirectoryFixture("wrong-identity", record_factory=lambda target: copy.deepcopy(wrong_record) if target == b.peer_id else None)
-        bad_signature = NetworkDirectoryFixture("bad-signature", record_factory=lambda target: copy.deepcopy(invalid_signature) if target == b.peer_id else None)
+        slow = NetworkDirectoryFixture("slow", record_factory=lambda target: copy.deepcopy(healthy.record) if target == b.device_id else None)
+        wrong = NetworkDirectoryFixture("wrong-identity", record_factory=lambda target: copy.deepcopy(wrong_record) if target == b.device_id else None)
+        bad_signature = NetworkDirectoryFixture("bad-signature", record_factory=lambda target: copy.deepcopy(invalid_signature) if target == b.device_id else None)
         unavailable = NetworkDirectoryFixture("unavailable-short-path")
         short = NetworkDirectoryFixture("short-expiry")
-        short.record_factory = lambda target: copy.deepcopy(short.record) if target == b.peer_id else None
+        short.record_factory = lambda target: copy.deepcopy(short.record) if target == b.device_id else None
         directories.extend([slow, wrong, bad_signature, unavailable, short])
         for source in (healthy, slow, short):
             source.reply_gate.clear()
@@ -4652,26 +4533,26 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         controls_offset = len(capture.controls)
         cold_start = {"wall_time": time.time(), "monotonic": time.monotonic(), "a_log_offset": log_offset,
                       "query_deadline_seconds": 10, "deadline_basis": "lower bound before spawning cold A; actual production queries start later"}
-        case.update({"network_id": network, "target_peer_id": b.peer_id, "source_peer_id": a.peer_id,
+        case.update({"network_id": network, "target_peer_id": b.device_id, "source_peer_id": a.device_id,
                      "healthy_record": healthy.record, "wrong_identity_record_peer_id": wrong_record["peer_id"],
                      "cold_start": cold_start, "a_process_log": str(a.directory / "process.log"),
                      "configurations": {node.name: json.loads((node.directory / "config.json").read_text())["network"] for node in nodes}})
         a.start(env=trace_env)
-        a.client.connect(a.peer_id)
+        a.client.connect(a.device_id)
         wait_for("cold A original management client authorization", lambda: a.client.authenticate())
-        wait_for("slow directory really receives Lookup(B)", lambda: any(event["kind"] == "control_received" and event.get("control") == "lookup" and event.get("target") == b.peer_id for event in slow.snapshot()["events"]))
-        wait_for("short directory really receives Lookup(B) before signing", lambda: any(event["kind"] == "control_received" and event.get("control") == "lookup" and event.get("target") == b.peer_id for event in short.snapshot()["events"]))
+        wait_for("slow directory really receives Lookup(B)", lambda: any(event["kind"] == "control_received" and event.get("control") == "lookup" and event.get("target") == b.device_id for event in slow.snapshot()["events"]))
+        wait_for("short directory really receives Lookup(B) before signing", lambda: any(event["kind"] == "control_received" and event.get("control") == "lookup" and event.get("target") == b.device_id for event in short.snapshot()["events"]))
         short.record = signed_short_record()
         short.release()
         accepted_short = wait_for("production resolver accepts the still-valid short record", lambda: next((entry for entry in completed_queries(a, log_offset)
-            if entry["fields"].get("directory") == short.url and entry["fields"].get("target") == b.peer_id and entry["fields"].get("outcome") == "record"), None))
-        short_sent = next(event for event in short.snapshot()["events"] if event["kind"] == "record_send_started" and event.get("target") == b.peer_id)
+            if entry["fields"].get("directory") == short.url and entry["fields"].get("target") == b.device_id and entry["fields"].get("outcome") == "record"), None))
+        short_sent = next(event for event in short.snapshot()["events"] if event["kind"] == "record_send_started" and event.get("target") == b.device_id)
         require(accepted_short["wall_time"] is not None and accepted_short["wall_time"] < short_sent["expires_at"], "short candidate is actually received while valid, not merely generated before expiry")
         wait_for("accepted short candidate really expires before healthy release", lambda: time.time() >= short_sent["expires_at"], timeout=5)
         rejected = {}
         for source, reason in ((wrong, "another node"), (bad_signature, "signature")):
             rejected[source.name] = wait_for(f"production rejects {source.name} independently", lambda source=source, reason=reason: next((entry for entry in completed_queries(a, log_offset)
-                if entry["fields"].get("directory") == source.url and entry["fields"].get("target") == b.peer_id
+                if entry["fields"].get("directory") == source.url and entry["fields"].get("target") == b.device_id
                 and entry["fields"].get("outcome") == "rejected" and reason in entry["fields"].get("reason", "").lower()), None))
         release = healthy.release()
         require(time.monotonic() < cold_start["monotonic"] + 10, "healthy response is released before the conservative production query deadline")
@@ -4683,11 +4564,11 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
         require(finished["monotonic"] < cold_start["monotonic"] + 10 and not slow.reply_gate.is_set(), "target Noise and query complete before the slow production query can time out or be released")
         require(not any(event["kind"] == "record_sent" for event in slow.snapshot()["events"]), "the slow directory has not supplied a candidate before target authentication")
         healthy_result = next(entry for entry in completed_queries(a, log_offset) if entry["fields"].get("directory") == healthy.url
-                              and entry["fields"].get("target") == b.peer_id and entry["fields"].get("outcome") == "record")
+                              and entry["fields"].get("target") == b.device_id and entry["fields"].get("outcome") == "record")
         controls = list(capture.controls[controls_offset:])
         circuits = []
         for event in controls:
-            if event.get("type") == "dial" and event.get("direction") == "to_relay" and event.get("target") == b.peer_id and event.get("service") == "peer":
+            if event.get("type") == "dial" and event.get("direction") == "to_relay" and event.get("target") == b.device_id and event.get("service") == "peer":
                 ready = next((value for value in controls if value["connection"] == event["connection"] and value.get("type") == "ready" and value["direction"] == "from_relay"), None)
                 if ready and capture.traffic[event["connection"]]["binary_payload_bytes"]:
                     circuits.append({"dial": event, "ready": ready, **capture.traffic[event["connection"]]})
@@ -4711,7 +4592,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
                    "relay_control_offset": len(capture.controls), "directory_control_offset": len(directory_capture.controls)}
         b.start(env=trace_env)
         held_publish = wait_for("B's independent slow publication actually enters the unreleased fixture", lambda: next((event for event in slow_publication.snapshot()["events"]
-            if event["kind"] == "control_received" and event.get("control") == "publish" and event.get("peer_id") == b.peer_id), None), timeout=5)
+            if event["kind"] == "control_received" and event.get("control") == "publish" and event.get("peer_id") == b.device_id), None), timeout=5)
         d_publication = wait_for("B's fresh publication to actual directory D is acknowledged despite slow publication elsewhere",
             lambda: next((entry for entry in directory_logs(b, restart["b_log_offset"], "directory publication completed")
                           if entry["fields"].get("directory") == directory_url and entry["fields"].get("outcome") == "published"), None), timeout=5)
@@ -4728,13 +4609,13 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
                 and not any(event["kind"] == "publish_acknowledged_locally" for event in slow_publication.snapshot()["events"]),
                 "the slow publication has not replied while other relay work completes")
         b_reservations = [event for event in capture.controls[restart["relay_control_offset"]:]
-                          if event.get("type") == "reserve" and event.get("peer_id") == b.peer_id]
+                          if event.get("type") == "reserve" and event.get("peer_id") == b.device_id]
         require(len(b_reservations) == 1, "one actual B reservation establishes the healthy relay during the held publication")
         reservation_connection = b_reservations[0]["connection"]
-        wait_for("actual directory D receives a signed B publication", lambda: any(event.get("type") == "publish" and event.get("peer_id") == b.peer_id
+        wait_for("actual directory D receives a signed B publication", lambda: any(event.get("type") == "publish" and event.get("peer_id") == b.device_id
                  for event in directory_capture.controls[restart["directory_control_offset"]:]), timeout=5)
         wait_for("startup relay-change publications settle across the first rejected directory retry", lambda: len([event for event in directory_capture.controls[restart["directory_control_offset"]:]
-                 if event.get("type") == "reserve" and event.get("peer_id") == b.peer_id]) >= 2, timeout=10)
+                 if event.get("type") == "reserve" and event.get("peer_id") == b.device_id]) >= 2, timeout=10)
         stable = {"wall_time": time.time(), "monotonic": time.monotonic(), "directory_control_offset": len(directory_capture.controls),
                   "relay_control_offset": len(capture.controls),
                   "directory_log_offset": (directory.directory / "process.log").stat().st_size,
@@ -4743,10 +4624,10 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
 
         def refused_without_republication():
             fresh = list(directory_capture.controls[stable["directory_control_offset"]:])
-            reserves = [event for event in fresh if event.get("type") == "reserve" and event.get("peer_id") == b.peer_id]
-            publications = [event for event in fresh if event.get("type") == "publish" and event.get("peer_id") == b.peer_id]
+            reserves = [event for event in fresh if event.get("type") == "reserve" and event.get("peer_id") == b.device_id]
+            publications = [event for event in fresh if event.get("type") == "publish" and event.get("peer_id") == b.device_id]
             require(not publications, "directory Reserve rejection does not drive a new B publication inside the stable pre-refresh window")
-            require(not any(event.get("type") == "reserve" and event.get("peer_id") == b.peer_id for event in capture.controls[stable["relay_control_offset"]:]),
+            require(not any(event.get("type") == "reserve" and event.get("peer_id") == b.device_id for event in capture.controls[stable["relay_control_offset"]:]),
                     "the healthy B reservation remains the same during refused directory retries")
             value = network_peer_query(a, b, "net1-lane4-d2-read-only")
             require(value == {"native_sessions": []}, "original B remains queryable during repeated directory Reserve rejection")
@@ -4856,7 +4737,7 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
     def source_state(value):
         sources, epoch = {}, None
         entries = [entry for entry in network_trace_records(value, messages=["mdns source changed", "mdns daemon reset"])
-                   if "mdns daemon reset" in entry["message"] or entry["fields"].get("target") == b.peer_id]
+                   if "mdns daemon reset" in entry["message"] or entry["fields"].get("target") == b.device_id]
         for entry in entries:
             fields = entry["fields"]
             actual_epoch = int(fields["epoch"])
@@ -4877,11 +4758,11 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         browse = observe("mdns-browse", ["-B", "_vibeface._tcp", "local"])
         for name, wildcard in (("mdns-fixed", False), ("mdns-wildcard", True)):
             target = node(name)
-            expected_id = target.peer_id
+            expected_id = target.device_id
             target.configure(roles=["relay"], network={"bootstrap_urls": [], "advertise_urls": [], "mdns": True, "relay_enabled": False})
             target.set_url(address, listen=f"0.0.0.0:{target.port}" if wildcard else None)
             target.start(env=trace_env)
-            require(target.peer_id == expected_id, "HTTP listener retains the initialized temporary Node identity")
+            require(target.device_id == expected_id, "HTTP listener retains the initialized temporary Node identity")
             advertisement = wait_for("actual Node DNS-SD service advertisement", lambda: next(
                 (item for item in browse.browse_records() if item["action"] == "Add" and item["instance"].startswith(expected_id[:32])), None))
             resolved = resolution(name + "-resolve", advertisement["instance"], target.port, expected_id)
@@ -4928,48 +4809,48 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         captures.append(proxy)
         b.configure(allowed_origins=[proxy.url])
         b.start(env=trace_env)
-        b.client.connect(b.peer_id)
-        instance = b.peer_id[:32]
+        b.client.connect(b.device_id)
+        instance = b.device_id[:32]
         registrations = {b.port: observe("mdns-register-first", ["-R", instance, "_vibeface._tcp", "local", b.port,
-                                                                 f"peer_id={b.peer_id}", "path=/api/network/ws"])}
+                                                                 f"peer_id={b.device_id}", "path=/api/network/ws"])}
         first = wait_for("first real DNS-SD registration", lambda: next(
             (item for item in browse.browse_records() if item["action"] == "Add" and item["instance"] == instance), None))
-        first_resolution = resolution("mdns-first-resolve", first["instance"], b.port, b.peer_id)
+        first_resolution = resolution("mdns-first-resolve", first["instance"], b.port, b.device_id)
         registrations[proxy.port] = observe("mdns-register-second", ["-R", instance, "_vibeface._tcp", "local", proxy.port,
-                                                                    f"peer_id={b.peer_id}", "path=/api/network/ws"])
+                                                                    f"peer_id={b.device_id}", "path=/api/network/ws"])
         conflict = wait_for("actual DNS-SD conflict rename", lambda: next(
             (item for item in browse.browse_records() if item["action"] == "Add" and item["instance"].startswith(instance)
              and item["instance"] != first["instance"]), None))
         conflict_lookup = observe("mdns-conflict-resolve", ["-L", conflict["instance"], "_vibeface._tcp", "local"])
         renamed = wait_for("actual renamed instance resolves to one of the two owned listener ports", lambda: next(
-            (item for item in conflict_lookup.resolutions() if item["port"] in registrations and any(f"peer_id={b.peer_id}" in line for line in item["txt_lines"])), None))
+            (item for item in conflict_lookup.resolutions() if item["port"] in registrations and any(f"peer_id={b.device_id}" in line for line in item["txt_lines"])), None))
         require(renamed["canonical_fullname"] != first_resolution["canonical_fullname"], "actual conflict fullname differs from the original registration")
         remaining_port = next(port for port in registrations if port != renamed["port"])
-        current_original = resolution("mdns-original-after-conflict", first["instance"], remaining_port, b.peer_id)
+        current_original = resolution("mdns-original-after-conflict", first["instance"], remaining_port, b.device_id)
         observed_sources = wait_for("both actual fullnames contribute to the original target", lambda: (
-            state if len([entry for entry in state["sources"].values() if entry["fields"].get("target") == b.peer_id]) == 2 else None)
+            state if len([entry for entry in state["sources"].values() if entry["fields"].get("target") == b.device_id]) == 2 else None)
             if (state := source_state(a)) else None)
-        target_sources = {key: entry for key, entry in observed_sources["sources"].items() if entry["fields"]["target"] == b.peer_id}
+        target_sources = {key: entry for key, entry in observed_sources["sources"].items() if entry["fields"]["target"] == b.device_id}
         require(renamed["canonical_fullname"] in target_sources and first_resolution["canonical_fullname"] in target_sources,
                 "Node source keys match the independently observed actual DNS-SD fullnames")
         wait_for("mDNS target's previously paired client grant", lambda: b.client.authenticate(network))
         verify_offset = (a.directory / "process.log").stat().st_size
         verified = wait_for("new real DNS cache verify of the renamed instance", lambda: next(
             (entry for entry in network_trace_records(a, verify_offset, messages=["mdns source verify"])
-             if entry["fields"].get("target") == b.peer_id
+             if entry["fields"].get("target") == b.device_id
              and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
              and network_dns_name(entry["fields"]["fullname"]) == renamed["canonical_fullname"]), None))
         time.sleep(min(int(verified["fields"]["timeout_ms"]) / 1000 + .2, 5))
         healthy = source_state(a)
         verify_changes = network_trace_records(a, verify_offset, messages=["mdns source changed", "mdns daemon reset"])
         require(not any("mdns daemon reset" in entry["message"] or (
-            entry["fields"].get("target") == b.peer_id and entry["fields"].get("event") == "removed"
+            entry["fields"].get("target") == b.device_id and entry["fields"].get("event") == "removed"
             and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
             and network_dns_name(entry["fields"]["fullname"]) in target_sources) for entry in verify_changes),
                 "neither actual target source is removed or reset during the new verify window")
         require(healthy["epoch"] == observed_sources["epoch"] and all(key in healthy["sources"] for key in target_sources),
                 "both healthy sources survive the real verify timeout in the same daemon epoch")
-        resolved_in_window = [entry for entry in verify_changes if entry["fields"].get("target") == b.peer_id
+        resolved_in_window = [entry for entry in verify_changes if entry["fields"].get("target") == b.device_id
                               and entry["fields"].get("event") == "resolved"]
         before = network_peer_query(a, b, "net1-lane7-mdns-read-only")
         require(before == {"native_sessions": []}, "original target answers a real read before source removal")
@@ -4981,22 +4862,22 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
              and item["action"] == "Rmv" and item["canonical_fullname"] == renamed["canonical_fullname"]), None))
         survivor = wait_for("Node removes exactly the actual conflict fullname while retaining its other source", lambda: (
             state if state["epoch"] == observed_sources["epoch"] and renamed["canonical_fullname"] not in state["sources"]
-            and len([entry for entry in state["sources"].values() if entry["fields"].get("target") == b.peer_id]) == 1 else None)
+            and len([entry for entry in state["sources"].values() if entry["fields"].get("target") == b.device_id]) == 1 else None)
             if (state := source_state(a)) else None)
-        surviving = next(entry for entry in survivor["sources"].values() if entry["fields"].get("target") == b.peer_id)
-        require(any(entry["fields"].get("event") == "removed" and entry["fields"].get("target") == b.peer_id
+        surviving = next(entry for entry in survivor["sources"].values() if entry["fields"].get("target") == b.device_id)
+        require(any(entry["fields"].get("event") == "removed" and entry["fields"].get("target") == b.device_id
                     and entry["log_offset"] >= removal_offset
                     and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
                     and network_dns_name(entry["fields"]["fullname"]) == renamed["canonical_fullname"] for entry in survivor["entries"]),
                 "actual Node removal log identifies the same target, fullname and daemon epoch")
         old_link = wait_for("original target has an installed peer link before its restart", lambda: next(
             (entry for entry in reversed(network_trace_records(a, messages=["peer link ready"]))
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.peer_id), None))
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.device_id), None))
         restart_offset = (a.directory / "process.log").stat().st_size
         b.stop()
         old_removed = wait_for("the current original peer link is actually removed", lambda: next(
             (entry for entry in network_trace_records(a, restart_offset, messages=["peer link removed"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.peer_id
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.device_id
              and entry["fields"].get("link_id") == old_link["fields"]["link_id"]
              and entry["fields"].get("current") == "true"), None))
         b.start(env=trace_env)
@@ -5008,17 +4889,17 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         surviving_urls = json.loads(surviving["fields"]["urls"])
         selected = wait_for("a new authenticated path uses an actual surviving mDNS endpoint", lambda: next(
             (entry for entry in network_trace_records(a, restart_offset, messages=["authenticated path selected"])
-             if entry["fields"].get("target") == b.peer_id
+             if entry["fields"].get("target") == b.device_id
              and entry["log_end"] <= read_end
              and entry["fields"].get("route") in ["direct:" + url for url in surviving_urls]), None))
         new_link = wait_for("the restarted original target installs a distinct peer link", lambda: next(
             (entry for entry in network_trace_records(a, restart_offset, messages=["peer link ready"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.peer_id
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == b.device_id
              and entry["fields"].get("link_id") != old_link["fields"]["link_id"]
              and entry["fields"].get("outbound") == "true" and entry["log_end"] <= read_end
              and entry["log_offset"] > selected["log_offset"]), None))
         read_evidence = network_peer_read_evidence(a, b, network, "net1-lane7-mdns-read-only", read_offset, target_read_offset,
-                                                   next_hop=b.peer_id, link_id=new_link["fields"]["link_id"], route_kind="direct")
+                                                   next_hop=b.device_id, link_id=new_link["fields"]["link_id"], route_kind="direct")
         require(source_state(a)["epoch"] == observed_sources["epoch"], "reconnecting the target does not reset the observer's mDNS epoch")
         last_removal_offset = (a.directory / "process.log").stat().st_size
         last_removal_browse_line = len(browse.text().splitlines())
@@ -5029,7 +4910,7 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
              and item["canonical_fullname"] == remaining_fullname), None))
         empty = wait_for("last actual source is removed from the target", lambda: (
             state if state["epoch"] == observed_sources["epoch"] and not state["sources"]
-            and any(entry["fields"].get("event") == "removed" and entry["fields"].get("target") == b.peer_id
+            and any(entry["fields"].get("event") == "removed" and entry["fields"].get("target") == b.device_id
                     and entry["log_offset"] >= last_removal_offset
                     and int(entry["fields"]["epoch"]) == observed_sources["epoch"]
                     and network_dns_name(entry["fields"]["fullname"]) == remaining_fullname for entry in state["entries"]) else None)
@@ -5037,7 +4918,7 @@ def network_reliability_mdns(run, binary, workspace, fixture, helper, module, re
         registration_mapping = [{"port": port, "registration": registration.snapshot(),
                                  "resolved_fullname": renamed["canonical_fullname"] if port == renamed["port"] else remaining_fullname}
                                 for port, registration in registrations.items()]
-        case["source_lifecycle"] = {"target": b.peer_id, "network": network, "first_resolution": first_resolution,
+        case["source_lifecycle"] = {"target": b.device_id, "network": network, "first_resolution": first_resolution,
                                     "original_resolution_after_conflict": current_original,
                                     "actual_conflict": {"browse": conflict, "resolve": renamed}, "initial_sources": target_sources,
                                     "owned_registration_mapping": registration_mapping,
@@ -5124,7 +5005,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
     def online_snapshot():
         snapshot = a.client.rpc("nodes")
         by_id = {item["peer_id"]: item for item in snapshot["nodes"]}
-        return snapshot if t.peer_id in by_id and not by_id[t.peer_id]["online"] and by_id.get(u.peer_id, {}).get("online") else None
+        return snapshot if t.device_id in by_id and not by_id[t.device_id]["online"] and by_id.get(u.device_id, {}).get("online") else None
 
     try:
         for name in ("route-A", "route-M", "route-T", "route-U"):
@@ -5132,13 +5013,13 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
             nodes.append(value)
             owned_nodes.append(value)
             directory = NetworkDirectoryFixture(name + "-directory", retain_publications=True,
-                                                record_factory=lambda target, owner=value.peer_id: record_for(owner, target))
+                                                record_factory=lambda target, owner=value.device_id: record_for(owner, target))
             directories.append(directory)
-            by_target[value.peer_id] = directory
+            by_target[value.device_id] = directory
             advertise_urls = []
             if name != "route-A":
                 capture = RelayCapture(value.port, retain_payloads=False)
-                captures[value.peer_id] = capture
+                captures[value.device_id] = capture
                 advertise_urls = [capture.url.replace("http:", "ws:") + "/api/network/ws"]
                 value.configure(allowed_origins=[capture.url])
             value.configure(manager=None, codex_socket=str(run / "unused-codex.sock"),
@@ -5146,7 +5027,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
                                      "mdns": False, "relay_enabled": False})
         a, middle, t, u = owned_nodes
         with adjacency_lock:
-            allowed.update({a.peer_id: {middle.peer_id, u.peer_id}, middle.peer_id: {t.peer_id}, t.peer_id: set(), u.peer_id: set()})
+            allowed.update({a.device_id: {middle.device_id, u.device_id}, middle.device_id: {t.device_id}, t.device_id: set(), u.device_id: set()})
         a.configure(roles=["gateway", "replica"])
         a.start(env=trace_env)
         network = a.bootstrap()
@@ -5159,55 +5040,55 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
         publications = {}
         for value in (middle, t, u):
             publication = wait_for("real signed target publication at its own isolated directory",
-                                   lambda value=value: by_target[value.peer_id].published(value.peer_id))
-            require(publication["peer_id"] == value.peer_id
-                    and publication["direct_urls"] == [captures[value.peer_id].url.replace("http:", "ws:") + "/api/network/ws"]
+                                   lambda value=value: by_target[value.device_id].published(value.device_id))
+            require(publication["peer_id"] == value.device_id
+                    and publication["direct_urls"] == [captures[value.device_id].url.replace("http:", "ws:") + "/api/network/ws"]
                     and not publication["relay_urls"] and publication["expires_at"] > time.time(),
                     "directory returns the unmodified original target's live direct-only publication")
-            publications[value.peer_id] = publication
+            publications[value.device_id] = publication
         initial_a_links = wait_for("A installs only its two allowed neighbor links", lambda: (
-            state if middle.peer_id in state and u.peer_id in state and t.peer_id not in state else None)
+            state if middle.device_id in state and u.device_id in state and t.device_id not in state else None)
             if (state := links(a)) else None)
         initial_m_links = wait_for("M installs its independent target link", lambda: (
-            state if t.peer_id in state else None) if (state := links(middle)) else None)
+            state if t.device_id in state else None) if (state := links(middle)) else None)
         presence = wait_for("the original target is reached through the authenticated M link generation", lambda: next(
             (entry for entry in network_trace_records(a, messages=["peer presence route observed"])
-             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.peer_id
-             and entry["fields"].get("neighbor") == middle.peer_id
-             and entry["fields"].get("link_id") == initial_a_links[middle.peer_id]["fields"]["link_id"]), None))
+             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.device_id
+             and entry["fields"].get("neighbor") == middle.device_id
+             and entry["fields"].get("link_id") == initial_a_links[middle.device_id]["fields"]["link_id"]), None))
         initial_request_offset = (a.directory / "process.log").stat().st_size
         initial_target_offset = (t.directory / "process.log").stat().st_size
         initial_query = network_peer_query(a, t, "net1-lane7-via-middle-read-only")
         require(initial_query == {"native_sessions": []}, "the fixed target answers the initial read across its live intermediate neighbor")
         initial_read = network_peer_read_evidence(a, t, network, "net1-lane7-via-middle-read-only", initial_request_offset, initial_target_offset,
-                                                  next_hop=middle.peer_id, link_id=initial_a_links[middle.peer_id]["fields"]["link_id"], route_kind="presence")
-        require(t.peer_id not in links(a), "the initial target read has no direct A-T peer link")
+                                                  next_hop=middle.device_id, link_id=initial_a_links[middle.device_id]["fields"]["link_id"], route_kind="presence")
+        require(t.device_id not in links(a), "the initial target read has no direct A-T peer link")
         cut_offset = (a.directory / "process.log").stat().st_size
         middle_cut_offset = (middle.directory / "process.log").stat().st_size
-        cut = captures[middle.peer_id].pause()
+        cut = captures[middle.device_id].pause()
         removed = wait_for("A revokes the exact current M link and its learned routes", lambda: next(
             (entry for entry in network_trace_records(a, cut_offset, messages=["peer link removed"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == middle.peer_id
-             and entry["fields"].get("link_id") == initial_a_links[middle.peer_id]["fields"]["link_id"]
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == middle.device_id
+             and entry["fields"].get("link_id") == initial_a_links[middle.device_id]["fields"]["link_id"]
              and entry["fields"].get("current") == "true" and int(entry["fields"]["removed_routes"]) > 0), None))
         offline = wait_for("the target loses indirect online status while unrelated U stays online", online_snapshot)
-        require(links(a)[u.peer_id]["fields"]["link_id"] == initial_a_links[u.peer_id]["fields"]["link_id"]
-                and links(middle)[t.peer_id]["fields"]["link_id"] == initial_m_links[t.peer_id]["fields"]["link_id"],
+        require(links(a)[u.device_id]["fields"]["link_id"] == initial_a_links[u.device_id]["fields"]["link_id"]
+                and links(middle)[t.device_id]["fields"]["link_id"] == initial_m_links[t.device_id]["fields"]["link_id"],
                 "cutting only the M listener preserves the existing A-U and M-T link generations")
-        recovery_directory = by_target[a.peer_id]
+        recovery_directory = by_target[a.device_id]
         recovery_directory.reply_gate.clear()
         gate_started = time.monotonic()
         request_offset = (a.directory / "process.log").stat().st_size
         target_offset = (t.directory / "process.log").stat().st_size
         with adjacency_lock:
-            allowed[a.peer_id].add(t.peer_id)
+            allowed[a.device_id].add(t.device_id)
         query_label = "net1-lane7-original-target-query"
         with ThreadPoolExecutor(max_workers=1) as pool:
             request = pool.submit(network_peer_query, a, t, query_label)
             try:
                 on_demand = wait_for("the single read starts or joins the target's shared connection flight", lambda: next(
                     (entry for entry in network_trace_records(a, request_offset, messages=["peer route flight started", "peer route flight joined"])
-                     if entry["fields"].get("network") == network and entry["fields"].get("target") == t.peer_id
+                     if entry["fields"].get("network") == network and entry["fields"].get("target") == t.device_id
                      and entry["fields"].get("trigger") == "on_demand"
                      and entry["fields"].get("request_type") == "native_status"), None), timeout=8)
             finally:
@@ -5217,25 +5098,25 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
         require(recovered == {"native_sessions": []}, "the single new read returns the original target's native status result")
         restored = wait_for("the original target installs a new direct link within the single read", lambda: next(
             (entry for entry in network_trace_records(a, request_offset, messages=["peer link ready"])
-             if entry["fields"].get("network") == network and entry["fields"].get("peer") == t.peer_id
+             if entry["fields"].get("network") == network and entry["fields"].get("peer") == t.device_id
              and entry["fields"].get("outbound") == "true" and entry["log_end"] <= request_end), None))
         ready = wait_for("the same shared flight reports the installed target link ready", lambda: next(
             (entry for entry in network_trace_records(a, request_offset, messages=["peer route flight ready"])
-             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.peer_id
+             if entry["fields"].get("network") == network and entry["fields"].get("target") == t.device_id
              and entry["fields"].get("flight_id") == on_demand["fields"]["flight_id"]
              and entry["fields"].get("link_id") == restored["fields"]["link_id"] and entry["fields"].get("state") == "ready"), None))
         selected = wait_for("the alternate path authenticates the actual original target endpoint", lambda: next(
             (entry for entry in network_trace_records(a, request_offset, messages=["authenticated path selected"])
-             if entry["fields"].get("target") == t.peer_id
-             and entry["fields"].get("route") == "direct:" + captures[t.peer_id].url.replace("http:", "ws:") + "/api/network/ws"
+             if entry["fields"].get("target") == t.device_id
+             and entry["fields"].get("route") == "direct:" + captures[t.device_id].url.replace("http:", "ws:") + "/api/network/ws"
              and entry["log_end"] <= restored["log_offset"]), None))
         recovered_read = network_peer_read_evidence(a, t, network, query_label, request_offset, target_offset,
-                                                    next_hop=t.peer_id, link_id=restored["fields"]["link_id"], route_kind="direct")
-        require(middle.peer_id not in links(a), "the disabled original next hop is not silently restored")
-        require(links(a)[u.peer_id]["fields"]["link_id"] == initial_a_links[u.peer_id]["fields"]["link_id"]
-                and links(middle)[t.peer_id]["fields"]["link_id"] == initial_m_links[t.peer_id]["fields"]["link_id"],
+                                                    next_hop=t.device_id, link_id=restored["fields"]["link_id"], route_kind="direct")
+        require(middle.device_id not in links(a), "the disabled original next hop is not silently restored")
+        require(links(a)[u.device_id]["fields"]["link_id"] == initial_a_links[u.device_id]["fields"]["link_id"]
+                and links(middle)[t.device_id]["fields"]["link_id"] == initial_m_links[t.device_id]["fields"]["link_id"],
                 "alternate recovery leaves both unaffected link generations intact")
-        case.update(network=network, targets={value.name: value.peer_id for value in owned_nodes}, publications=publications,
+        case.update(network=network, targets={value.name: value.device_id for value in owned_nodes}, publications=publications,
                     initial_a_links=initial_a_links, initial_m_links=initial_m_links, presence=presence,
                     initial_query=initial_query, initial_read_evidence=initial_read,
                     cut=cut, cut_log_offset=cut_offset, middle_cut_log_offset=middle_cut_offset,
@@ -5244,7 +5125,7 @@ def network_reliability_routes(run, binary, workspace, fixture, helper, module, 
                     restored_link=restored, recovered_read_evidence=recovered_read,
                     recovery_flight={"on_demand": on_demand, "ready": ready, "selected_path": selected,
                                      "directory_gate_started_monotonic": gate_started, "directory_gate_released": gate_released},
-                    unaffected_links_after_recovery={"A_to_U": links(a)[u.peer_id], "M_to_T": links(middle)[t.peer_id]})
+                    unaffected_links_after_recovery={"A_to_U": links(a)[u.device_id], "M_to_T": links(middle)[t.device_id]})
         require(not invocations(run.parent), "route recovery invokes no host work or paid model")
         case["status"] = "passed"
     except BaseException as error:
@@ -5421,7 +5302,7 @@ def network_reliability_acceptance(options):
         report["relay_readiness"] = wait_for_relay_target(source, capture, source_relay_start_connection)
         receiver.pair(source, network, entry_url=capture.url)
         receiver.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=debug", "NO_COLOR": "1"} if lane == 1 else None)
-        receiver.client.connect(receiver.peer_id)
+        receiver.client.connect(receiver.device_id)
         wait_for("receiver client authorization", lambda: receiver.client.authenticate())
         conversation = "net1-baseline-history"
         source.client.rpc("create_conversation", conversation_id=conversation, title="NET-1 baseline")
@@ -5439,7 +5320,7 @@ def network_reliability_acceptance(options):
         baseline = wait_for("audit positive control imports a real new event",
                             lambda: (value if len(value["events"]) == 2 else None)
                             if (value := receiver.client.rpc("export", conversation_id=conversation)) else None)
-        require(any(item["peer_id"] == source.peer_id and item["online"]
+        require(any(item["peer_id"] == source.device_id and item["online"]
                     for item in receiver.client.rpc("nodes")["nodes"]), "receiver has a real authenticated source peer")
         if lane == 1:
             log_path = receiver.directory / "process.log"
@@ -5531,10 +5412,10 @@ def network_reliability_acceptance(options):
         blob, envelope = seed_net1_attachment(source, network, conversation, 32 * 1024 * 1024, module)
         source.start()
         receiver.start()
-        receiver.client.connect(receiver.peer_id)
+        receiver.client.connect(receiver.device_id)
         wait_for("restarted receiver client authorization", lambda: receiver.client.authenticate())
         wait_for("restarted attachment peer is authenticated online", lambda: any(
-            item["peer_id"] == source.peer_id and item["online"]
+            item["peer_id"] == source.device_id and item["online"]
             for item in receiver.client.rpc("nodes")["nodes"]))
         started = time.monotonic()
         starting_bytes, starting_frames = capture.payload_bytes, capture.frame_count
@@ -5598,20 +5479,30 @@ def network_reliability_acceptance(options):
             private_json(evidence_path, report)
 
 
-def shared_history(client, conversation):
-    result = client.rpc("conversation", conversation_id=conversation)
-    return result if (any(message["message_id"] == "message-original" for message in result["messages"])
-                      and result["autonomy"]["version"] == 1
-                      and not any(result["missing"].values())) else None
+def upgrade_status(node, path, origin):
+    """The status of a WebSocket upgrade to `path` sent as a page on `origin` would send it."""
+    connection = http.client.HTTPConnection("127.0.0.1", node.port, timeout=5)
+    headers = {"Host": f"127.0.0.1:{node.port}", "Upgrade": "websocket", "Connection": "Upgrade",
+               "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(), "Sec-WebSocket-Version": "13"}
+    if origin:
+        headers["Origin"] = origin
+    try:
+        connection.request("GET", path, headers=headers)
+        return connection.getresponse().status
+    finally:
+        connection.close()
 
 
 def auto_route_acceptance(options):
+    """Phase-2 entry acceptance: one Gateway, ticket joins, revocation, origins, unknown writes and recovery.
+
+    Cross-entry routing through other Gateways returns with iroh in phase 3; the browser no longer races
+    relay candidates, so those cases are gone rather than skipped.
+    """
     repository = Path(__file__).resolve().parents[1]
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
     artifacts = options.artifacts.resolve()
-    require(artifacts.is_relative_to(repository / ".artifacts"), "routing fixtures stay in the task worktree")
-    require(subprocess.run(["git", "check-ignore", "--quiet", str(artifacts / "probe")],
-                           cwd=repository).returncode == 0, "routing artifacts are ignored")
+    require(artifacts.is_relative_to(repository / ".artifacts"), "entry fixtures stay in the task worktree")
     artifacts.mkdir(parents=True, exist_ok=True)
     run = artifacts / ("auto-route-" + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
@@ -5620,247 +5511,160 @@ def auto_route_acceptance(options):
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     fixture = fixture_wrapper(run, "fixture-manager", "--fixture-manager")
-    transport = repository / "crates/node/web/transport.js"
-    nodes, clients, captures, directories = [], [], [], []
+    nodes, clients = [], []
+    allowed = "https://client.vibeface.example"
     report = {"status": "running", "source_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip(),
-        "binary_sha256": file_sha256(binary), "transport_sha256": file_sha256(transport),
-        "provider_calls": 0, "cases": {}, "artifacts": str(run),
-        "not_checked": ["rendered browser UI", "production ingress", "provider models"],
-        "measurement": "one functional run per case; includes helper startup, Noise, authorization and read, not UI latency or a speed comparison"}
+        "binary_sha256": file_sha256(binary), "provider_calls": 0, "cases": {}, "artifacts": str(run),
+        "not_checked": ["rendered browser UI", "production ingress", "provider models",
+                        "routing through another Gateway (phase 3)"]}
 
-    def ws(url):
-        return url.replace("http:", "ws:") + "/api/network/ws"
-
-    def fresh(url, *, identity_file=None):
-        client = Client(url, helper, module, identity_file=identity_file)
+    def fresh(url):
+        client = Client(url, helper, module)
         clients.append(client)
         return client
-
-    def connect(client, target, *, network=None):
-        client.peer_id = target
-        started = time.monotonic()
-        client.command("connect_auto", url=client.url, peer_id=target, transport=str(transport))
-        require(client.call("info")["peer_id"] == target, "production transport reads the fixed authenticated target")
-        if network:
-            client.authenticate(network)
-            client.call("subscribe")
-            client.rpc("nodes")
-        stats = wait_for("only the winning data channel survives", lambda:
-                         (lambda value: value if value["active_data"] == 1 else None)(client.command("route_stats")))
-        require(stats["max_active_data"] <= 2 and stats["authenticated_sessions"] == 1,
-                "routing respects concurrency and selects one authenticated session")
-        stats["ready_seconds"] = time.monotonic() - started
-        return stats
 
     def passed(name, **evidence):
         report["cases"][name] = evidence
         print("PASS auto-route " + name, flush=True)
 
-    def publish(url, record):
-        stream = NetworkControlSocket(ws(url))
-        try:
-            stream.send_control({"type": "publish", "record": record})
-            require(stream.control()["type"] == "published", "real entry accepts target-signed reachability")
-        finally:
-            stream.close()
-
-    def signed_record(node, *, direct=None, relay=None, ttl=180):
-        result = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
-            input=json.dumps({"op": "fixture_reachability", "identity_file": str(node.directory / "identity.json"),
-                              "expected_peer_id": node.peer_id, "direct_urls": direct or [],
-                              "relay_urls": relay or [], "ttl_secs": ttl}) + "\n",
-            text=True, capture_output=True, timeout=10)
-        reply = json.loads(result.stdout)
-        require(result.returncode == 0 and reply["ok"], "actual target key signs the fixture record")
-        return reply["result"]
-
     try:
-        for name in ("R1", "R2", "TARGET"):
-            node = Node(run, name, binary, workspace, fixture, helper, module, relay_only=name != "TARGET")
-            nodes.append(node)
-            node.configure(roles=["relay"] if name != "TARGET" else ["gateway", "replica", "relay", "scheduler"],
-                           network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False,
-                                    "relay_enabled": name != "TARGET"})
-            capture = RelayCapture(node.port)
-            captures.append(capture)
-            node.configure(allowed_origins=[capture.url])
-        r1, r2, target = nodes
-        c1, c2, local = captures
-        target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable, daily_decision_limit=100)
-        r1.start()
-        r2.start()
-        target.configure(network={"bootstrap_urls": [ws(c2.url)], "advertise_urls": [],
-                                  "mdns": False, "relay_enabled": False})
+        target = Node(run, "TARGET", binary, workspace, fixture, helper, module)
+        nodes.append(target)
+        target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable,
+                         daily_decision_limit=100, allowed_origins=[allowed],
+                         network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": False})
         target.start()
         network = target.bootstrap()
-        wait_for_relay_target(target, c2, 0)
-        record = target.client.command("network_probe", kind="record", url=r2.url, target=target.peer_id)
-        require(record["direct_urls"] == [] and record["relay_urls"] == [ws(c2.url)],
-                "target is advertised only through R2")
-        browser = fresh(local.url, identity_file=target.client.identity_file)
-        stats = connect(browser, target.peer_id, network=network)
-        require(sum(item["type"] in {"dial", "direct"} for item in stats["controls"]) == 1,
-                "self target uses exactly one data channel with public relay disabled")
-        passed("local-with-relay-disabled", target=target.peer_id, stats=stats)
-        browser.url = c2.url
-        passed("same-entry-reservation", target=target.peer_id, stats=connect(browser, target.peer_id, network=network))
-        publish(r1.url, record)
-        browser.url = c1.url
-        stats = connect(browser, target.peer_id, network=network)
-        require(any(item["type"] == "dial" and item["url"] == ws(c2.url) for item in stats["controls"]),
-                "client follows R1's signed record to R2 without changing its entry")
-        passed("other-entry", entry=c1.url, target=target.peer_id, stats=stats)
-        fallback = signed_record(target, direct=[f"ws://127.0.0.1:{available_port()}/api/network/ws"], relay=[ws(c2.url)])
-        directory = NetworkDirectoryFixture("fallback", record=fallback)
-        directories.append(directory)
-        browser.url = directory.url.replace("ws:", "http:").removesuffix("/api/network/ws")
-        stats = connect(browser, target.peer_id, network=network)
-        require(any(item["type"] == "dial" and item["url"] == ws(c2.url) for item in stats["controls"]),
-                "failed direct candidate retains the healthy signed relay")
-        passed("failed-direct-fallback", stats=stats)
-        for kind in ("signature", "expired", "other-target"):
-            invalid = copy.deepcopy(record)
-            if kind == "signature":
-                invalid["signature"] = "00" * 64
-            elif kind == "expired":
-                invalid["expires_at"] = int(time.time()) - 1
-            else:
-                invalid = signed_record(r1, relay=[ws(c2.url)])
-            directory = NetworkDirectoryFixture(kind, record=invalid)
-            directories.append(directory)
-            rejected = fresh(directory.url.replace("ws:", "http:").removesuffix("/api/network/ws"))
-            result = rejected.command("connect_auto", url=rejected.url, peer_id=target.peer_id,
-                                      transport=str(transport), check=False)
-            stats = rejected.command("route_stats")
-            require(not result["ok"] and not stats["authenticated_sessions"]
-                    and all(item["url"] != ws(c2.url) for item in stats["controls"]),
-                    "unverified candidates never receive a connection")
-            passed("reject-" + kind, stats=stats)
-        cancelled_directory = NetworkDirectoryFixture("cancelled")
-        directories.append(cancelled_directory)
-        cancelled_directory.reply_gate.clear()
-        cancelled = fresh(cancelled_directory.url.replace("ws:", "http:").removesuffix("/api/network/ws"))
-        result = cancelled.command("connect_auto", url=cancelled.url, peer_id=target.peer_id,
-                                   transport=str(transport), cancel_after_ms=50, check=False)
-        cancelled_directory.reply_gate.set()
-        stats = wait_for("cancel releases every transport socket", lambda:
-                         (lambda value: value if value["opened"] == value["closed"] else None)(cancelled.command("route_stats")))
-        require(not result["ok"] and stats["active_data"] == 0, "cancelled routing cannot select a session")
-        passed("cancel", stats=stats)
-        outsider = fresh(c1.url)
-        connect(outsider, target.peer_id)
+        passed("genesis", network=network, target=target.device_id)
+
+        impostor = fresh(target.url)
+        other_id = impostor.own_id()
+        refused = impostor.connect(other_id, check=False)
+        require(not refused["ok"], "a Gateway refuses a target that is not itself")
+        passed("wrong-target-refused", error=refused["error"])
+
+        require(upgrade_status(target, "/api/client", allowed) == 101, "allowed_origins may open /api/client")
+        require(upgrade_status(target, "/api/client", "https://elsewhere.example") == 403,
+                "other origins cannot open /api/client")
+        require(upgrade_status(target, "/api/local/ws", allowed) == 403, "other paths stay same-origin")
+        target.client.request("/api/info", headers={"Origin": allowed}, origin=False, status=403)
+        cross = fresh(target.url)
+        cross.connect(target.device_id, origin=allowed)
+        require(cross.call("info")["device_id"] == target.device_id, "a cross-origin page completes Noise to the target")
+        passed("client-origins", allowed=allowed)
+
+        outsider = fresh(target.url)
+        outsider.connect(target.device_id)
+        require(outsider.call("authenticate")["principal"] is None, "an unknown device has no principal")
         outsider.call("rpc", {"method": "nodes"}, status=401)
-        wrong = outsider.command("connect_auto", url=c1.url, peer_id="ab" * 32,
-                                 transport=str(transport), check=False)
-        require(not wrong["ok"], "wrong target cannot authenticate an available entry")
-        browser.url = c1.url
-        connect(browser, target.peer_id, network=network)
-        invitation = target.client.invite("client")
-        guest = fresh(c1.url)
-        connect(guest, target.peer_id)
-        prepared = guest.call("prepare_pair_request", {**invitation, "name": "Auto-route guest", "request_id": uuid.uuid4().hex})
-        prepared["request"]["proof"] = guest.command("sign", **prepared["signing"])
-        receipt = guest.call("pair_request", {"request": prepared["request"]})
-        guest.call("pair_accept", {"request_id": receipt["request_id"],
-                                   "signature": guest.command("sign", **receipt["signing"])})
-        target.client.approve(receipt["request_id"])
-        require(guest.call("pair_status", {"request_id": receipt["request_id"]})["status"] == "granted",
-                "cross-entry invitation retains its original dual-signed request")
-        guest.authenticate(network)
-        revocation = target.client.call("prepare_revoke", {"subject_id": guest.command("identity")["subject_id"]})
-        revocation["event"]["signature"] = target.client.command("sign", **revocation["signing"])
-        target.client.call("revoke", {"event": revocation["event"]})
-        guest.call("rpc", {"method": "nodes"}, status=403)
-        connect(guest, target.peer_id)
-        guest.call("authenticate", {"network_id": network}, status=403)
-        passed("invitation-and-revocation", request_id=receipt["request_id"], network=network, target=target.peer_id)
-        joining = Node(run, "CLI", binary, workspace, fixture, helper, module)
-        nodes.append(joining)
-        joining.pair(target, network, entry_url=c1.url)
-        passed("cli-other-entry-invitation", subject=joining.peer_id, target=target.peer_id)
-        conversation = "acceptance-conversation"
-        browser.rpc("create_conversation", conversation_id=conversation, title="Automatic routing")
-        browser.rpc("message", conversation_id=conversation, message_id="message-original", text="Keep this context after A disconnects.")
+        passed("outsider-unauthorized")
+
+        manager = fresh(target.url)
+        manager.join(target, "Second manager", manage=True)
+        require(manager.principal["can_manage"], "a manager can grant management at approval")
+        member = fresh(target.url)
+        member.join(manager, "Plain member")
+        require(not member.principal["can_manage"], "a plain grant does not manage")
+        member.call("invite", {"record": member.command("invite", network_id=network, entry_id=target.device_id)["record"]},
+                    status=403)
+        passed("join-and-grant-manage", manager=manager.own_id(), member=member.own_id())
+
+        mismatch = fresh(target.url)
+        voided = mismatch.join(target, "Mismatched", reveal="ab" * 32)
+        require(voided["status"] == "rejected" and voided["reason"] == "commitment_mismatch",
+                "a reveal that differs from the commitment voids the request")
+        again = mismatch.call("join_status", {"join_id": voided["join_id"]})
+        require(again["status"] == "rejected", "a voided request stays void")
+        passed("commitment-mismatch-voids", join_id=voided["join_id"])
+
+        rejected = fresh(target.url)
+        link = target.client.invite()
+        ticket = rejected.command("ticket", ticket=link.split("#", 1)[1])
+        rejected.connect(ticket["entry_id"])
+        nonce = uuid.uuid4().hex * 2
+        request = rejected.call("join", {"secret": ticket["secret"], "public_key": rejected.own_id(), "kind": "client",
+                                         "name": "Rejected", "commit": rejected.command("commit", nonce=nonce)})
+        target.client.start_approval(request["join_id"])
+        rejected.call("join_status", {"join_id": request["join_id"], "reveal": nonce})
+        reviewed = target.client.pending_join(rejected.own_id())
+        target.client.call("approve", {"join_id": request["join_id"], "reject": True})
+        require(rejected.call("join_status", {"join_id": request["join_id"]})["status"] == "rejected",
+                "rejecting the short code voids the request")
+        member_value = {"device_id": reviewed["device_id"], "kind": "client", "name": "Rejected", "manage": False}
+        late = target.client.command("governance", state=target.client.directory_state(), network_id=network,
+                                     action={"type": "grant", "member": member_value})
+        target.client.call("approve", {"join_id": request["join_id"], "event": late}, status=400)
+        passed("rejection-voids", join_id=request["join_id"])
+
+        target.client.revoke(member.own_id())
+        member.call("rpc", {"method": "nodes"}, status=401)
+        member.connect()
+        auth = member.call("authenticate")
+        require(auth["principal"] is None and auth["revoked"], "a revoked browser is told it was removed")
+        passed("revocation", revoked=member.own_id())
+
+        conversation = "entry-conversation"
+        target.client.rpc("create_conversation", conversation_id=conversation, title="Entry acceptance")
+        unsigned = {"conversation_id": conversation, "message_id": "unsigned", "text": "no signature"}
+        target.client.rpc("message", unsigned=True, status=400, **unsigned)
+        forged = {**unsigned, "attestation": manager.attestation("message", dict(unsigned))}
+        target.client.call("rpc", {"method": "message", **forged}, status=400)
+        changed = {**unsigned, "attestation": target.client.attestation("message", dict(unsigned)), "text": "changed"}
+        target.client.call("rpc", {"method": "message", **changed}, status=400)
+        passed("attestation-required", refused=["unsigned", "other-device", "changed-text"])
+
         directive = json.dumps({"label": "auto-route", "host_command": "printf once >> auto-route-count.txt",
                                 "host_cwd": str(workspace), "gate": str(run / "never-release")})
         original = {"conversation_id": conversation, "message_id": "auto-route-unknown", "text": directive,
                     "report_results": False}
-        connect(browser, target.peer_id, network=network)
-        with c2.lock:
-            circuit = next(item for item in reversed(c2.controls) if item["direction"] == "to_relay"
-                           and item["type"] == "dial" and item.get("target") == target.peer_id)
-        c2.reply_connections = {circuit["connection"]}
-        c2.reply_gate.clear()
+        signed = {**original, "attestation": target.client.attestation("message", dict(original))}
+        target.client.command("drop", method="rpc", params={"method": "message", **signed})
         marker = workspace / "auto-route-count.txt"
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(browser.rpc, "message", **original)
-            wait_for("exactly one real Agent write starts before its response is delivered", lambda:
-                     marker.exists() and marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
-            trigger = invocations(run, "auto-route")[0]["trigger"]
-            running = scheduler_record(target, network, trigger)
-            require(running and running["state"] == "running", "write is bound to one running Agent attempt")
-            attempt_id = running["attempt"]["id"]
-            c2.pause()
-            try:
-                pending.result(timeout=10)
-                raise AssertionError("withheld write response must remain unconfirmed")
-            except AssertionError as error:
-                require("加密连接已断开" in str(error), "lost reply is reported as an unconfirmed write")
-        target.stop()
-        target.configure(network={"bootstrap_urls": [ws(c1.url)], "advertise_urls": [], "mdns": False, "relay_enabled": False})
-        target.start()
+        wait_for("exactly one Agent write starts after the dropped send", lambda:
+                 marker.exists() and marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         target.client.connect()
         target.client.authenticate()
-        wait_for_relay_target(target, c1, 0)
-        stats = connect(browser, target.peer_id, network=network)
-        snapshot = browser.rpc("conversation", conversation_id=conversation)
-        message = next(row for row in snapshot["messages"] if row["message_id"] == original["message_id"])
-        job = next(row for row in snapshot["scheduler"]["jobs"] if row["trigger"] == trigger)
-        require(trigger == "message:" + message["message_id"] and job["state"] == "interrupted"
-                and job["attempt"]["id"] == attempt_id and job["pending_check"]
-                and any(check["check_id"] == "manager:" + attempt_id for check in snapshot["pending_checks"]),
-                "reconnected reads retain the original interrupted write and its pending check")
-        require(marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1
-                and not any(item.get("rpc_method") == "message" for item in browser.command("route_stats")["calls"]),
-                "changed path restores reads without replaying the original write")
-        duplicate = browser.rpc("message", **original)
-        require(duplicate["trigger"] == trigger and duplicate["state"] == "interrupted",
-                "an explicit same-ID retry returns the original interrupted job")
-        require_quiet("a same-ID retry never repeats the original host write", lambda:
+        snapshot = target.client.rpc("conversation", conversation_id=conversation)
+        require(any(row["message_id"] == original["message_id"] for row in snapshot["messages"]),
+                "after reconnecting, the business ID shows the write was recorded")
+        trigger = invocations(run, "auto-route")[0]["trigger"]
+        duplicate = target.client.call("rpc", {"method": "message", **signed})
+        require(duplicate["trigger"] == trigger, "resubmitting the unchanged signed request returns the original job")
+        require_quiet("a same-ID resubmission never repeats the host write", lambda:
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
-        passed("uncertain-write-and-path-change", message_id=original["message_id"], trigger=trigger,
-               attempt_id=attempt_id, invocations=1, stats=stats)
-        recovered = fresh(c1.url)
-        backup = verify_recovery(target, recovered, [target], network, entry_url=c1.url)
-        require(backup["network_id"] == network, "automatic-route recovery retains the original network")
-        passed("recovery", network=network, target=target.peer_id)
-        for relay in (r1, r2):
-            with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
-                require(database.execute("SELECT COUNT(*) FROM events WHERE network_id=?", (network,)).fetchone()[0] == 0,
-                        "public entries never acquire private network history")
-        require(all(b"Keep this context after A disconnects." not in b"".join(capture.payloads) for capture in (c1, c2)),
-                "relays cannot see encrypted business text")
-        passed("blind-public-entries", private_event_count=0, plaintext_canary_found=False)
+        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1)
+
+        joining = Node(run, "CLI", binary, workspace, fixture, helper, module)
+        nodes.append(joining)
+        code = joining.pair(target)
+        listed = target.client.call("directory")["view"]["members"]
+        require(any(row["device_id"] == joining.device_id and row["kind"] == "node" for row in listed),
+                "the CLI Node is a member after the grant")
+        passed("cli-join", device=joining.device_id, short_code_digits=len(code))
+
+        recovered = fresh(target.url)
+        checkpoint = verify_recovery(target, recovered, network)
+        passed("root-recovery-keeps-managers", epoch=checkpoint["epoch"])
+        blank = Node(run, "FRESH", binary, workspace, fixture, helper, module)
+        nodes.append(blank)
+        fresh_checkpoint = recover_fresh_node(blank, target.backup, target.backup_password)
+        passed("fresh-node-recovery", network=network, epoch=fresh_checkpoint["epoch"])
         report["status"] = "passed"
     except BaseException as error:
         report["status"] = "failed"
         report["failure"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
+        (run / "never-release").touch()
         for client in reversed(clients):
             client.close()
         for node in reversed(nodes):
             node.client.close()
             node.stop()
-        for directory in reversed(directories):
-            directory.close()
-        for capture in reversed(captures):
-            capture.close()
-        require(not any(capture.errors for capture in captures), "routing captures remain valid")
+        stop_fixture_processes(run)
         report["cleanup"] = {"remaining_nodes": sum(node.process is not None for node in nodes),
-                             "remaining_clients": sum(client.process is not None for client in clients),
-                             "remaining_directory_sockets": sum(directory.snapshot()["active_sockets"] for directory in directories)}
+                             "remaining_clients": sum(client.process is not None for client in clients)}
         private_json(run / "report.json", report)
         if options.evidence_dir:
             options.evidence_dir.mkdir(parents=True, exist_ok=True)

@@ -745,12 +745,14 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     }
     if let Some(file) = web_assets::get(path) {
         let mut response = ([(header::CONTENT_TYPE, file.content_type)], file.body).into_response();
-        if path.starts_with("/assets/") {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
-        }
+        let cache = if path.starts_with("/assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
         return response;
     }
     if path == "/assets"
