@@ -54,7 +54,7 @@ vibeface --help
 vibeface
 ```
 
-直接运行默认使用 `~/.vibeface`。首次仅在不存在或为空的真实目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent 或发现服务。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
+直接运行默认使用 `~/.vibeface`。首次仅在不存在或为空的真实目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，默认不配置发现入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
 
 保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器仍需原有成员邀请或恢复包授权。使用恢复包时，本机入口和初始化授权自动选取。
 
@@ -72,6 +72,16 @@ vibeface
 ```
 
 `init` 拒绝覆盖非空数据目录。显式 `vibeface serve` 只启动已初始化节点。已有节点先停止进程，再修改原 `config.json`，不要重新初始化身份。
+
+要使用自己的发现或中继入口，在初始化或启动时传入 URL：
+
+```sh
+vibeface --bootstrap-url https://relay.example
+vibeface serve --bootstrap-url wss://relay.example/api/network/ws
+vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
+```
+
+这三种命令分别使用，可重复 `--bootstrap-url` 指定多个入口，最多 8 个。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点，URL 不接受凭证、查询参数、片段或其他路径。程序不内置公共入口。首次直接启动和显式 `init` 将传入的 URL 保存到配置；已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写配置或身份。省略该参数时使用原配置。更多说明见[发现与公共中继](node.md#发现与公共中继)。
 
 ## 用 CLI 管理后台服务
 

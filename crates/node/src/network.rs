@@ -355,6 +355,18 @@ struct State {
     paths: HashMap<(String, String), PathHistory>,
 }
 
+impl State {
+    fn check_bootstrap(&self, url: &str) -> Result<bool> {
+        validate_url(url)?;
+        let missing = !self.bootstrap_urls.iter().any(|known| known == url);
+        ensure!(
+            !missing || self.bootstrap_urls.len() < MAX_URLS,
+            "too many network URLs"
+        );
+        Ok(missing)
+    }
+}
+
 #[derive(Clone)]
 struct MdnsSource {
     fullname: String,
@@ -1623,16 +1635,15 @@ impl NetworkHub {
         }
     }
 
+    pub(crate) async fn validate_bootstrap(&self, url: &str) -> Result<()> {
+        self.state.lock().await.check_bootstrap(url).map(|_| ())
+    }
+
     pub async fn add_bootstrap(&self, url: &str) -> Result<()> {
-        validate_url(url)?;
         let mut state = self.state.lock().await;
-        if state.bootstrap_urls.iter().any(|known| known == url) {
+        if !state.check_bootstrap(url)? {
             return Ok(());
         }
-        ensure!(
-            state.bootstrap_urls.len() < MAX_URLS,
-            "too many network URLs"
-        );
         state.bootstrap_urls.push(url.to_owned());
         self.bootstrap_changes
             .send_modify(|version| *version = version.wrapping_add(1));

@@ -642,6 +642,7 @@ impl NodePairing {
             configuration.validate()?;
         }
         configuration.network.validate()?;
+        self.node.network.validate_bootstrap(&pending.url).await?;
         let installed = self.node.install_membership(state).await?;
         ensure!(
             installed.authorize_node(&self.node.identity.peer_id()?, None)? == member,
@@ -1007,16 +1008,28 @@ mod tests {
             ],
         )?)?;
         inviter.install_membership(state.clone()).await?;
-        for count in [7, 8] {
-            let node_dir = dir.join(format!("joiner-{count}"));
+        for (count, startup_override) in [(7, false), (8, false), (7, true), (8, true)] {
+            let node_dir = dir.join(format!("joiner-{count}-{startup_override}"));
             let node = open_node(&node_dir, "127.0.0.1:4790".parse()?).await?;
-            let mut configuration = Config::load(&node_dir)?;
-            configuration.network.bootstrap_urls = (0..count)
+            let urls: Vec<String> = (0..count)
                 .map(|index| format!("ws://127.0.0.1:{}/api/network/ws", 5900 + index))
                 .collect();
-            configuration.save(&node_dir)?;
+            if !startup_override {
+                let mut configuration = Config::load(&node_dir)?;
+                configuration.network.bootstrap_urls = urls.clone();
+                configuration.save(&node_dir)?;
+            }
             drop(node);
-            let node = Arc::new(Runtime::open(&node_dir).await?);
+            let node = Arc::new(if startup_override {
+                Runtime::open_with_bootstrap_urls(&node_dir, &urls).await?
+            } else {
+                Runtime::open(&node_dir).await?
+            });
+            assert_eq!(node.config.network.bootstrap_urls.len(), count);
+            assert_eq!(
+                Config::load(&node_dir)?.network.bootstrap_urls.len(),
+                if startup_override { 0 } else { count }
+            );
             let capability = node.identities.bootstrap_capability()?;
             let pairing = NodePairing::new(node.clone());
             let invitation = invitation(&inviter, &admin, "ws://127.0.0.1:9/api/network/ws")?;
@@ -1046,6 +1059,7 @@ mod tests {
             let config_before = fs::read(node_dir.join("config.json"))?;
             let receipt_before = fs::read(&pairing.pending_path)?;
             let result = pairing.finish(&pending, granted).await;
+            let saved_count;
             if count == 8 {
                 assert_eq!(result.unwrap_err().to_string(), "too many network URLs");
                 assert!(!node.has_membership().await?);
@@ -1053,19 +1067,31 @@ mod tests {
                     .verify_bootstrap_capability(&capability.capability)?;
                 assert_eq!(fs::read(node_dir.join("config.json"))?, config_before);
                 assert_eq!(fs::read(&pairing.pending_path)?, receipt_before);
+                saved_count = if startup_override { 0 } else { 8 };
             } else {
                 assert!(matches!(result?, JoinState::Joined { .. }));
                 assert!(node.has_membership().await?);
                 assert!(!pairing.pending_path.exists());
                 let saved = Config::load(&node_dir)?;
-                assert_eq!(saved.network.bootstrap_urls.len(), 8);
+                saved_count = if startup_override { 1 } else { 8 };
+                assert_eq!(saved.network.bootstrap_urls.len(), saved_count);
                 assert_eq!(saved.network.bootstrap_urls.last(), Some(&pending.url));
+                node.network.validate_bootstrap(&pending.url).await?;
             }
+            assert!(
+                node.network
+                    .add_bootstrap("ws://127.0.0.1:10/api/network/ws")
+                    .await
+                    .is_err()
+            );
             drop(pairing);
             drop(node);
             let reopened = Runtime::open(&node_dir).await?;
             assert_eq!(reopened.has_membership().await?, count == 7);
-            assert_eq!(Config::load(&node_dir)?.network.bootstrap_urls.len(), 8);
+            assert_eq!(
+                Config::load(&node_dir)?.network.bootstrap_urls.len(),
+                saved_count
+            );
             drop(reopened);
         }
         drop(inviter);
