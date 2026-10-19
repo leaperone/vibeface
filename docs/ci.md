@@ -1,45 +1,51 @@
 # 按改动选择 CI
 
-`.github/workflows/ci.yml` 使用 `scripts/ci.py` 统一选择检查范围、Rust 测试分组和必需任务。工作流没有顶层 `paths` 筛选；每次触发都生成计划并执行 `ci-gate`。
+`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-| 改动 | PR 中执行的检查 |
+## 每个 PR 的核心检查
+
+Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查；merge queue 无路径筛选，执行整个工作区的核心检查。
+
+| 改动 | 核心检查 |
 | --- | --- |
 | README、项目指引、`docs/`、SDK README | 静态快检，不构建或运行 Rust 测试 |
-| `crates/node/web/`、Web 构建脚本 | 浏览器密码学、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
-| Node Rust、迁移、SDK、安装、打包或进程验收脚本 | Node 检查、测试和制品验收 |
-| Bridge | Bridge 和 Node |
-| Protocol | Protocol、Bridge 和 Node |
-| Secure、密码学验收脚本 | Secure、Node 和浏览器密码学互通验收 |
-| Cargo manifest、锁文件、工具链、CI 规则、未知输入 | 全工作区 |
+| `crates/node/web/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
+| Node Rust、迁移、SDK、安装、打包或进程验收脚本 | Node 快速测试、Clippy、Web 和 Linux x64 制品启动验收 |
+| Bridge | Bridge 和 Node 的核心检查 |
+| Protocol | Protocol、Bridge 和 Node 的核心检查 |
+| Secure、密码学验收脚本 | Secure、Node 和浏览器密码学互通 |
+| Cargo manifest、锁文件、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
-Web 路径先于 Node 路径分类。Web-only PR 不运行 Node 库的同步、存储、调度测试，但仍构建真正的 Node 制品，用 `verify-node.py --web-only` 启动独立进程检查资源、SPA 路由、CSP、缓存与 404。Node 依赖 Protocol、Bridge、Secure，因此这些库变更会沿反向依赖选中 Node。
+静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的七条重型用例。
 
-PR 使用 `merge-base(base, head)..head` 的完整差异。删除与重命名同时考虑旧路径和新路径，不只判断最后一个提交。无法识别的输入按全量处理。
+Web 路径优先于 Node 路径。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
-| 场景 | 测试与制品范围 |
+Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行完整多节点业务验收，也不验证浏览器渲染。
+
+## 定期、手动和发布检查
+
+每日 UTC 03:23 定时、Actions 中手动运行 `ci`、`v*` tag 强制执行扩展检查，不受路径影响。手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+
+| 扩展检查 | 执行范围 |
 | --- | --- |
-| Draft PR | 受影响 crate 的快速测试；需要制品时仅构建 Linux x64 |
-| Ready PR | 受影响 crate 的快、慢测试；Node 改动构建三个平台；Web-only 保留 Linux x64 |
-| `main` 代码 push | 全工作区、慢测试和三平台制品；纯文档提交只做快检 |
-| 定时、手动、merge queue、版本 tag | 强制全量 |
+| Rust 快、慢测试及 Clippy | 整个工作区；慢组为七条精确名称的 `SLOW_TESTS` |
+| 最低 Rust 版本 | 安装 Cargo 声明的 MSRV，检查整个工作区 |
+| 原生 release 制品 | Linux x64、Linux ARM64、macOS ARM64，分别校验身份并启动网页进程 |
+| 完整 Node 多进程验收 | Linux x64 一次，使用 `--skip-codex` |
+| 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
+| Nightly npm 包 | 组装三个原生包，三个平台分别安装、检查版本并执行 `--web-only` 冒烟 |
 
-`ready_for_review`、`converted_to_draft`、`synchronize` 和 PR base 调整会重新触发。Draft 的绿色 gate 仅表示草稿阶段应运行的检查通过；Draft PR 本身不能合并。正式 PR 后续提交会重新执行其完整受影响检查。
+慢组使用 `opt-level=1`，保留调试断言和整数溢出检查，使用独立缓存。快、慢组运行前校验每个慢测试名恰好匹配一个已有测试。扩展检查覆盖所有默认 Rust 测试，原本 `ignored` 的用例仍默认忽略。NET-1 七个进程专项不自动加入每日检查。
 
-只改 PR 标题或描述时跳过任务，并使用独立的并发组与检查名称，保留正在运行的代码检查和必需的 `ci-gate` 结果。
+CI 不使用真实 AI Provider 或模型密钥。`--chat-agent` 使用受控 SDK 和 App Server 夹具；`--skip-codex` 跳过本机真实 Codex 协议检查。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-`rust-fast`、`rust-slow` 与 `rust-check` 独立运行。慢测试名单集中在 `scripts/ci.py` 的 `SLOW_TESTS`，包含七条重型用例，覆盖 NET-1、真实 Noise 同步和队列饱和场景。快测试跳过这些用例，慢测试按完整名称精确选择。运行前用 `cargo test -- --list` 验证每个慢测试恰好存在一次，并拒绝会多匹配的过滤器，避免重命名后出现零测试成功。正式全量覆盖所有默认测试；原本 `ignored` 的用例仍由 Rust 默认忽略。
+只有版本 tag 可以发布。tag 必须与 Cargo 版本一致且提交已进入 `main`；扩展 gate、三平台制品及适用的 npm 检查必须通过。发布前继续校验资产清单并下载逐字节比对，详见 [构建与发布](releasing.md)。
 
-`ci-gate` 始终执行，要求计划中的每个任务成功。必需任务失败、取消、缺失或意外跳过都会使 gate 失败。GitHub 仓库还需将 `ci-gate` 设为必需检查，并要求更新到最新 base 或使用 merge queue，才能强制阻止检查未通过的合并；`main` 或定时全量结果不能替代本次 PR 的合并前检查。
+## 本地按改动补充验收
 
-本地 Rust preflight 执行快测试和 Clippy。慢测试由正式 PR 的必需 `ci-gate` 检查，避免合并前在本机重复执行同一组重型场景。
+开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发 `ci`，确认目标平台制品。
 
-远端慢组使用 `opt-level=1` 的测试构建，并保留调试断言与整数溢出检查；它使用独立缓存，不改变用例或夹具规模。
-
-推送版本 tag 才触发发布，手动全量检查只生成制品。版本 tag 必须与 Cargo 版本完全一致且已经进入 `main`。只有全量 gate 与三平台制品成功后才运行发布；SHA256、源提交、存储 epoch、资产清单和下载比对规则保留。
-
-Nightly 版本的 Ready Node PR 和全量场景还会将三个已验收的原生包组装成 npm 包，在三个平台安装并运行进程烟测。Web-only 和 Draft PR 不组装全平台 npm 包。`npm-package` 和 `npm-smoke` 属于相应计划的必需检查，Nightly tag 必须等这些检查通过才能发布。
-
-本地检查选择规则，无需编译：
+无需编译即可验证 CI 规则：
 
 ```sh
 python3 scripts/ci.py --self-test
@@ -47,11 +53,32 @@ python3 scripts/ci.py plan --base origin/main --head HEAD --event pull_request
 actionlint .github/workflows/ci.yml
 ```
 
-需要运行选定 crate 的测试时：
+Rust 快、慢组可独立运行。Clippy 默认不安装 MSRV，需要时显式提供：
 
 ```sh
 python3 scripts/ci.py test --tier fast --packages vibeface-bridge vibeface
 python3 scripts/ci.py test --tier slow --packages vibeface
+python3 scripts/ci.py check --packages vibeface
+python3 scripts/ci.py check --packages vibeface --msrv 1.89
 ```
 
-这种拆分减少无关覆盖和草稿阶段的重复重型测试，不改变慢测试内部的计算量。Node 正式 PR 仍需等待相应慢测试完成。模型调用、实体手机和真实公网拓扑不在这些检查的覆盖内。
+MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 Node 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#ci-验证范围) 生成资源和制品，然后设置以下路径：
+
+```sh
+binary=/absolute/path/to/package/vibeface
+crypto=/absolute/path/to/package/web/vibeface_secure.js
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-node --skip-codex
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-queue --phase1
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-net --network-reliability --net1-lane 7
+```
+
+队列、follow-up 和调度持久化改动跑 `--phase1`；工具调用、取消和启动恢复改动跑 `--chat-agent`；网络改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
+
+默认模式省略 `--skip-codex` 时还需要本机安装的 Codex，`--codex-bin` 可指定路径；它检查真实会话协议，不发起模型生成。真正模型调用、浏览器渲染、实体设备授权、实际公网与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
+
+## 合并门禁
+
+`ci-gate` 要求选中的任务成功，失败、取消、缺失或意外跳过均拒绝通过，并重新计算计划以防弱化覆盖。只编辑 PR 标题或描述时使用独立检查名和并发组，不取消代码检查。PR base 调整与后续代码提交重新选择范围。
+
+GitHub 仓库须将 `ci-gate` 设置为必需检查，并要求更新到最新 base 或使用 merge queue，才能强制阻止未通过的合并。扩展检查已移出普通 PR；每日绿色不能替代本次 PR 核心检查，核心绿色也不能当作跨平台或完整进程验收通过。
