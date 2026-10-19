@@ -1,4 +1,8 @@
-//! Authenticated Noise channels shared by native nodes and browser clients.
+//! Device signatures, membership and the browser-to-Node Noise channel.
+//!
+//! A `DeviceId` is the device's Ed25519 public key. Browsers keep that key in a
+//! non-extractable WebCrypto `CryptoKey`, so this crate builds the exact bytes to
+//! sign and verifies signatures, but never needs a browser's private key.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -7,6 +11,7 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+pub mod join;
 pub mod membership;
 
 mod recovery;
@@ -18,8 +23,9 @@ const MAX_MESSAGE: usize = 65_535;
 const MAX_CONTEXT: usize = 4_096;
 pub const MAX_APPLICATION_MESSAGE: usize = 16 * 1024 * 1024;
 const RECORD_PLAINTEXT: usize = 60 * 1024;
-const STATIC_DOMAIN: &str = "noise-static";
+const NOISE_STATIC_DOMAIN: &[u8] = b"vibeface:noise-static:v1";
 
+/// A locally held Ed25519 key: a Node's device key or an unlocked recovery root.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Identity {
     key: SigningKey,
@@ -48,40 +54,25 @@ impl Identity {
         hex::encode(Zeroizing::new(self.key.to_bytes()).as_ref())
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = publicKeyHex))]
-    pub fn public_key_hex(&self) -> String {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = deviceId))]
+    pub fn device_id(&self) -> String {
         hex::encode(self.key.verifying_key().as_bytes())
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = peerId))]
-    pub fn peer_id(&self) -> String {
-        hex::encode(Sha256::digest(self.key.verifying_key().as_bytes()))
-    }
-
     pub fn sign(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        Ok(hex::encode(
-            self.key.sign(&signing_message(domain, payload)?).to_bytes(),
-        ))
+        Ok(self.sign_message(&signing_message(domain, payload)?))
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
-pub fn verify(public_key: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
-    let key = VerifyingKey::from_bytes(&decode32(public_key)?)
-        .map_err(|_| "invalid identity public key")?;
-    let bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
-    let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature size")?;
-    key.verify_strict(&signing_message(domain, payload)?, &signature)
-        .map_err(|_| "invalid identity signature".to_owned())
+impl Identity {
+    pub fn sign_message(&self, message: &[u8]) -> String {
+        hex::encode(self.key.sign(message).to_bytes())
+    }
 }
 
-fn decode32(value: &str) -> Result<[u8; 32]> {
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(value, &mut bytes).map_err(|_| "expected a 32-byte hexadecimal key")?;
-    Ok(bytes)
-}
-
-fn signing_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
+/// The exact bytes a device signs for `domain` over `payload`; browsers pass them to WebCrypto.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = signingMessage))]
+pub fn signing_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     if domain.is_empty()
         || domain.len() > 64
         || !domain
@@ -97,21 +88,66 @@ fn signing_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     .into_bytes())
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn verify(device_id: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
+    verify_message(device_id, &signing_message(domain, payload)?, signature)
+}
+
+pub fn verify_message(device_id: &str, message: &[u8], signature: &str) -> Result<()> {
+    let key =
+        VerifyingKey::from_bytes(&decode32(device_id)?).map_err(|_| "invalid device public key")?;
+    let bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
+    let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature size")?;
+    key.verify_strict(message, &signature)
+        .map_err(|_| "invalid device signature".to_owned())
+}
+
+/// A `DeviceId` is 64 lowercase hexadecimal characters of a valid, non-small-order Ed25519 public key.
+pub fn validate_device_id(value: &str) -> Result<()> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("invalid device ID".into());
+    }
+    let key =
+        VerifyingKey::from_bytes(&decode32(value)?).map_err(|_| "invalid device public key")?;
+    if key.is_weak() {
+        return Err("weak device public key".into());
+    }
+    Ok(())
+}
+
+fn decode32(value: &str) -> Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(value, &mut bytes).map_err(|_| "expected a 32-byte hexadecimal key")?;
+    Ok(bytes)
+}
+
+/// Binds a device key to one session's Noise static key; the device key never encrypts.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proof {
-    public_key: String,
+    device_id: String,
     signature: String,
     payload: Vec<u8>,
 }
 
+fn static_message(context: &[u8], static_key: &[u8]) -> Vec<u8> {
+    [NOISE_STATIC_DOMAIN, context, static_key].concat()
+}
+
+/// Noise XX with a fresh static key per session. The local device signs that key
+/// (`signingBytes`, then `setProof`) before its identity can be sent.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Handshake {
     inner: Option<snow::HandshakeState>,
-    public_key: String,
-    signature: String,
-    expected_peer_id: Option<String>,
-    remote_public_key: Option<String>,
+    context: Vec<u8>,
+    static_public: Vec<u8>,
+    proof: Option<(String, String)>,
+    expected_device_id: Option<String>,
+    remote_id: Option<String>,
     first_write: bool,
 }
 
@@ -121,23 +157,20 @@ impl Handshake {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
     pub fn new(
         initiator: bool,
-        secret_hex: &str,
-        expected_peer_id: Option<String>,
+        expected_device_id: Option<String>,
         context: &[u8],
     ) -> Result<Handshake> {
         if context.len() > MAX_CONTEXT {
             return Err("Noise context too large".into());
         }
-        if let Some(expected) = &expected_peer_id {
-            decode32(expected)?;
+        if let Some(expected) = &expected_device_id {
+            validate_device_id(expected)?;
         }
-        let identity = Identity::from_secret_hex(secret_hex)?;
         let builder = snow::Builder::new(NOISE.parse().map_err(|_| "invalid Noise protocol")?);
         let keys = builder
             .generate_keypair()
             .map_err(|_| "Noise key generation failed")?;
         let private = Zeroizing::new(keys.private);
-        let signature = identity.sign(STATIC_DOMAIN, &keys.public)?;
         let builder = builder
             .local_private_key(&private)
             .map_err(|_| "invalid Noise static key")?
@@ -151,12 +184,28 @@ impl Handshake {
         .map_err(|_| "Noise initialization failed")?;
         Ok(Self {
             inner: Some(inner),
-            public_key: identity.public_key_hex(),
-            signature,
-            expected_peer_id,
-            remote_public_key: None,
+            context: context.to_vec(),
+            static_public: keys.public,
+            proof: None,
+            expected_device_id,
+            remote_id: None,
             first_write: initiator,
         })
+    }
+
+    /// `"vibeface:noise-static:v1" ‖ prologue ‖ this session's static public key`.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = signingBytes))]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        static_message(&self.context, &self.static_public)
+    }
+
+    /// Accepts the device's signature over `signingBytes` and checks it before use.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = setProof))]
+    pub fn set_proof(&mut self, device_id: &str, signature: &str) -> Result<()> {
+        validate_device_id(device_id)?;
+        verify_message(device_id, &self.signing_bytes(), signature)?;
+        self.proof = Some((device_id.to_owned(), signature.to_owned()));
+        Ok(())
     }
 
     /// Application data is accepted only after the remote identity is authenticated.
@@ -164,7 +213,7 @@ impl Handshake {
         let result = self.write_inner(payload);
         if result.is_err() {
             self.inner = None;
-            self.remote_public_key = None;
+            self.remote_id = None;
         }
         result
     }
@@ -173,28 +222,19 @@ impl Handshake {
         let result = self.read_inner(message);
         if result.is_err() {
             self.inner = None;
-            self.remote_public_key = None;
+            self.remote_id = None;
         }
         result
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = remotePublicKey))]
-    pub fn remote_public_key(&self) -> Option<String> {
-        self.remote_public_key.clone()
-    }
-
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = remoteId))]
     pub fn remote_id(&self) -> Option<String> {
-        self.remote_public_key.as_ref().map(|key| {
-            hex::encode(Sha256::digest(
-                hex::decode(key).expect("validated identity"),
-            ))
-        })
+        self.remote_id.clone()
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = isFinished))]
     pub fn is_finished(&self) -> bool {
-        self.remote_public_key.is_some()
+        self.remote_id.is_some()
             && self
                 .inner
                 .as_ref()
@@ -220,8 +260,21 @@ impl Handshake {
 }
 
 impl Handshake {
+    /// A Node signs its own static key with its device key.
+    pub fn signed(
+        initiator: bool,
+        identity: &Identity,
+        expected_device_id: Option<String>,
+        context: &[u8],
+    ) -> Result<Handshake> {
+        let mut handshake = Self::new(initiator, expected_device_id, context)?;
+        let signature = identity.sign_message(&handshake.signing_bytes());
+        handshake.set_proof(&identity.device_id(), &signature)?;
+        Ok(handshake)
+    }
+
     fn write_inner(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        if self.remote_public_key.is_none() && !payload.is_empty() {
+        if self.remote_id.is_none() && !payload.is_empty() {
             return Err(
                 "Noise identity must be authenticated before sending application data".into(),
             );
@@ -230,9 +283,11 @@ impl Handshake {
         let payload = if self.first_write {
             Vec::new()
         } else {
+            let (device_id, signature) =
+                self.proof.clone().ok_or("device proof missing for Noise")?;
             serde_json::to_vec(&Proof {
-                public_key: self.public_key.clone(),
-                signature: self.signature.clone(),
+                device_id,
+                signature,
                 payload: payload.to_vec(),
             })
             .map_err(|_| "Noise identity payload encoding failed")?
@@ -263,21 +318,20 @@ impl Handshake {
         let remote_static = inner
             .get_remote_static()
             .ok_or("Noise static key missing")?;
-        verify(
-            &proof.public_key,
-            STATIC_DOMAIN,
-            remote_static,
+        validate_device_id(&proof.device_id)?;
+        verify_message(
+            &proof.device_id,
+            &static_message(&self.context, remote_static),
             &proof.signature,
         )?;
-        let id = hex::encode(Sha256::digest(decode32(&proof.public_key)?));
         if self
-            .expected_peer_id
+            .expected_device_id
             .as_ref()
-            .is_some_and(|expected| expected != &id)
+            .is_some_and(|expected| expected != &proof.device_id)
         {
-            return Err("unexpected Noise peer identity".into());
+            return Err("unexpected Noise device identity".into());
         }
-        self.remote_public_key = Some(proof.public_key);
+        self.remote_id = Some(proof.device_id);
         Ok(proof.payload)
     }
 }
@@ -416,20 +470,8 @@ mod tests {
     fn endpoints() -> (Identity, Identity, Handshake, Handshake) {
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let ah = Handshake::new(
-            true,
-            &a.secret_hex(),
-            Some(b.peer_id()),
-            b"vibeface:channel:v1",
-        )
-        .unwrap();
-        let bh = Handshake::new(
-            false,
-            &b.secret_hex(),
-            Some(a.peer_id()),
-            b"vibeface:channel:v1",
-        )
-        .unwrap();
+        let ah = Handshake::signed(true, &a, Some(b.device_id()), b"vibeface:channel:v1").unwrap();
+        let bh = Handshake::signed(false, &b, Some(a.device_id()), b"vibeface:channel:v1").unwrap();
         (a, b, ah, bh)
     }
 
@@ -458,7 +500,7 @@ mod tests {
     #[test]
     fn wrong_expected_identity_fails_closed() {
         let (_, _, mut a, mut b) = endpoints();
-        a.expected_peer_id = Some("ab".repeat(32));
+        a.expected_device_id = Some(Identity::generate().unwrap().device_id());
         b.read(&a.write(&[]).unwrap()).unwrap();
         assert!(a.read(&b.write(&[]).unwrap()).is_err());
         assert!(a.remote_id().is_none());
@@ -469,7 +511,8 @@ mod tests {
     #[test]
     fn substituted_identity_signature_fails_closed() {
         let (_, _, mut a, mut b) = endpoints();
-        b.signature = "00".repeat(64);
+        let device = b.proof.clone().unwrap().0;
+        b.proof = Some((device, "00".repeat(64)));
         b.read(&a.write(&[]).unwrap()).unwrap();
         assert!(a.read(&b.write(&[]).unwrap()).is_err());
         assert!(a.finish().is_err());
@@ -497,16 +540,10 @@ mod tests {
     fn identity_signatures_are_domain_bound_and_restorable() {
         let a = Identity::generate().unwrap();
         let restored = Identity::from_secret_hex(&a.secret_hex()).unwrap();
-        assert_eq!(a.peer_id(), restored.peer_id());
+        assert_eq!(a.device_id(), restored.device_id());
         let signature = a.sign("client-challenge", b"challenge").unwrap();
-        verify(
-            &a.public_key_hex(),
-            "client-challenge",
-            b"challenge",
-            &signature,
-        )
-        .unwrap();
-        assert!(verify(&a.public_key_hex(), "pair", b"challenge", &signature).is_err());
+        verify(&a.device_id(), "client-challenge", b"challenge", &signature).unwrap();
+        assert!(verify(&a.device_id(), "pair", b"challenge", &signature).is_err());
         assert!(a.sign("invalid:domain", b"data").is_err());
     }
     #[test]
@@ -542,11 +579,52 @@ mod tests {
         let (mut a, mut b) = connected();
         assert!(b.open_record(&a.seal(&[0, 0, 0, 0, 1]).unwrap()).is_err());
         let (_, remote, mut initiator, _) = endpoints();
-        let mut responder =
-            Handshake::new(false, &remote.secret_hex(), None, b"another-service").unwrap();
+        let mut responder = Handshake::signed(false, &remote, None, b"another-service").unwrap();
         responder.read(&initiator.write(&[]).unwrap()).unwrap();
         assert!(initiator.read(&responder.write(&[]).unwrap()).is_err());
     }
+    #[test]
+    fn an_externally_signed_proof_authenticates_without_the_private_key() {
+        let browser = Identity::generate().unwrap();
+        let node = Identity::generate().unwrap();
+        let mut client =
+            Handshake::new(true, Some(node.device_id()), b"vibeface:client:v1").unwrap();
+        let other = Identity::generate().unwrap();
+        assert!(
+            client
+                .set_proof(
+                    &browser.device_id(),
+                    &other.sign_message(&client.signing_bytes())
+                )
+                .is_err()
+        );
+        let signature = browser.sign_message(&client.signing_bytes());
+        client.set_proof(&browser.device_id(), &signature).unwrap();
+        let mut server = Handshake::signed(false, &node, None, b"vibeface:client:v1").unwrap();
+        server.read(&client.write(&[]).unwrap()).unwrap();
+        client.read(&server.write(&[]).unwrap()).unwrap();
+        server.read(&client.write(&[]).unwrap()).unwrap();
+        assert_eq!(server.remote_id(), Some(browser.device_id()));
+        assert_eq!(client.remote_id(), Some(node.device_id()));
+        assert!(client.finish().is_ok() && server.finish().is_ok());
+    }
+
+    #[test]
+    fn a_proof_for_another_session_key_is_rejected() {
+        let browser = Identity::generate().unwrap();
+        let node = Identity::generate().unwrap();
+        let earlier = Handshake::new(true, None, b"vibeface:client:v1").unwrap();
+        let replayed = browser.sign_message(&earlier.signing_bytes());
+        let mut client = Handshake::new(true, None, b"vibeface:client:v1").unwrap();
+        assert!(client.set_proof(&browser.device_id(), &replayed).is_err());
+        client.proof = Some((browser.device_id(), replayed));
+        let mut server = Handshake::signed(false, &node, None, b"vibeface:client:v1").unwrap();
+        server.read(&client.write(&[]).unwrap()).unwrap();
+        client.read(&server.write(&[]).unwrap()).unwrap();
+        assert!(server.read(&client.write(&[]).unwrap()).is_err());
+        assert!(server.remote_id().is_none());
+    }
+
     #[test]
     fn responder_cannot_send_application_data_before_authentication() {
         let (_, _, mut a, mut b) = endpoints();
