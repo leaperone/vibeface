@@ -343,23 +343,12 @@ impl Runtime {
             projected["blobs"] = json!(event.blobs);
             messages.push(projected);
         }
-        let mut tasks = Vec::new();
-        for task in store.tasks(network, scope)? {
-            let mut projected = json!(task);
-            match store.followup_policy(network, scope, &task.task_id) {
-                Ok(policy) => {
-                    projected["followup_mode"] = json!(policy.mode);
-                    projected["followup_version"] = json!(policy.version);
-                    projected["followup_scheduler_node"] = json!(policy.target_node);
-                }
-                Err(error) => {
-                    projected["followup_mode"] = json!("off");
-                    projected["followup_version"] = json!(0);
-                    projected["followup_error"] = json!(error.to_string());
-                }
+        let autonomy = match store.conversation_autonomy(network, scope) {
+            Ok(policy) => {
+                json!({"mode":policy.mode,"version":policy.version,"scheduler_node":policy.target_node})
             }
-            tasks.push(projected);
-        }
+            Err(error) => json!({"mode":"off","version":null,"error":error.to_string()}),
+        };
         targets.retain(|target| store.authorize_node(network, target, None).is_ok());
         let frozen = jobs.iter().any(|job| job["write_frozen"] == true);
         let settings = self.settings_snapshot();
@@ -378,7 +367,7 @@ impl Runtime {
             .missing_dependencies(network, &current_heads)?
             .is_complete();
         let snapshot = json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),
-            "messages":messages,"tasks":tasks,"agent_tasks":agent_tasks,"native_sessions":native_sessions,"heads":context.heads,"missing":context.missing,
+            "messages":messages,"autonomy":autonomy,"agent_tasks":agent_tasks,"native_sessions":native_sessions,"heads":context.heads,"missing":context.missing,
             "facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets});
         drop(store);
         if needs_sync {

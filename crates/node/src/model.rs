@@ -61,17 +61,6 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scheduler_node: Option<PeerId>,
     },
-    TaskCreated {
-        task_id: String,
-        title: String,
-        goal: String,
-        acceptance: String,
-    },
-    TaskChanged {
-        task_id: String,
-        status: String,
-        detail: String,
-    },
     DecisionRecorded {
         decision_id: String,
         text: String,
@@ -191,32 +180,12 @@ pub struct Message {
     pub created_at_ms: i64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Task {
-    pub task_id: String,
-    pub conversation_id: ScopeId,
-    pub title: String,
-    pub goal: String,
-    pub acceptance: String,
-    pub status: String,
-    pub detail: String,
-    pub event_hash: EventHash,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Notification {
     pub notification_id: String,
     pub conversation_id: ScopeId,
     pub kind: String,
     pub text: String,
     pub event_hash: EventHash,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ContinuationClaim {
-    pub result_event_hash: EventHash,
-    pub policy_version: String,
-    pub scheduler_node: PeerId,
-    pub state: String,
-    pub result: Value,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetUsage {

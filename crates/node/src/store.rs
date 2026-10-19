@@ -705,7 +705,9 @@ impl Store {
                     conversation,
                     &candidate.trigger,
                     target,
-                ) {
+                )
+                .and_then(followup::ResultFollowupPolicy::authorized)
+                {
                     Ok(policy) => Some(policy),
                     Err(error) => {
                         candidate.state = JobState::Failed {
@@ -1605,23 +1607,6 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
-    pub fn tasks(&self, network_id: &str, scope_id: &str) -> Result<Vec<Task>> {
-        let mut statement=self.connection.prepare("SELECT task_id,conversation_id,title,goal,acceptance,status,detail,event_hash FROM tasks WHERE network_id=? AND conversation_id=? ORDER BY task_id")?;
-        Ok(statement
-            .query_map(params![network_id, scope_id], |r| {
-                Ok(Task {
-                    task_id: r.get(0)?,
-                    conversation_id: r.get(1)?,
-                    title: r.get(2)?,
-                    goal: r.get(3)?,
-                    acceptance: r.get(4)?,
-                    status: r.get(5)?,
-                    detail: r.get(6)?,
-                    event_hash: r.get(7)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
-    }
     pub fn local_value(&self, network_id: &str, key: &str) -> Result<Option<Value>> {
         optional_json(
             self.connection
@@ -1644,21 +1629,6 @@ impl Store {
         )?;
         Ok(())
     }
-    pub fn task_creation(&self, network: &str, scope: &str, task_id: &str) -> Result<SignedEvent> {
-        let context = self.context(network, scope, &[])?;
-        ensure!(
-            context.missing.is_complete(),
-            "task history is incomplete or conflicting"
-        );
-        let matches = context.events.iter().filter(|event| {
-            event.scope_id == scope && matches!(&event.body, EventBody::TaskCreated { task_id: id, .. } if id == task_id)
-        }).collect::<Vec<_>>();
-        ensure!(matches.len() == 1, "task creation is missing or ambiguous");
-        let hash = digest(&serde_json::to_vec(matches[0])?);
-        self.event(network, &hash)?
-            .context("task creation envelope is missing")
-    }
-
     pub fn queue_notification(
         &mut self,
         network_id: &str,
@@ -2401,7 +2371,6 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
     }
     connection.execute("DELETE FROM conversations WHERE network_id=?", [network_id])?;
     connection.execute("DELETE FROM messages WHERE network_id=?", [network_id])?;
-    connection.execute("DELETE FROM tasks WHERE network_id=?", [network_id])?;
     connection.execute(
         "DELETE FROM notification_outbox WHERE network_id=? AND derived=1",
         [network_id],
@@ -2427,21 +2396,6 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
                 ..
             } => {
                 connection.execute("INSERT INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",params![network_id,event.scope_id,hash,message_id,role,text,event.created_at_ms,ordinal])?;
-            }
-            EventBody::TaskCreated {
-                task_id,
-                title,
-                goal,
-                acceptance,
-            } => {
-                connection.execute("INSERT OR IGNORE INTO tasks(network_id,conversation_id,task_id,title,goal,acceptance,status,detail,event_hash) VALUES(?,?,?,?,?,?,'open','',?)",params![network_id,event.scope_id,task_id,title,goal,acceptance,hash])?;
-            }
-            EventBody::TaskChanged {
-                task_id,
-                status,
-                detail,
-            } => {
-                connection.execute("UPDATE tasks SET status=?,detail=?,event_hash=? WHERE network_id=? AND conversation_id=? AND task_id=?",params![status,detail,hash,network_id,event.scope_id,task_id])?;
             }
             EventBody::NotificationRaised {
                 notification_id,

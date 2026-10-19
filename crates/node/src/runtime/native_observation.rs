@@ -396,7 +396,7 @@ impl Runtime {
         let turn_id = id(args, "turn_id")?;
         let work = {
             let mut store = self.store.lock().await;
-            Self::check_manager_permission(&store, access, true, None)?;
+            Self::check_manager_permission(&store, access, true)?;
             let job = store
                 .scheduler_job(
                     &access.network_id,

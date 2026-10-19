@@ -895,7 +895,9 @@ impl Runtime {
                         "progress cannot schedule an Agent"
                     );
                     if message.kind != AgentMessageKind::Task {
-                        store.validate_followup_result(network, &scope, trigger, &local)?;
+                        store
+                            .validate_followup_result(network, &scope, trigger, &local)?
+                            .authorized()?;
                     }
                 }
                 _ => bail!("invalid scheduling trigger"),

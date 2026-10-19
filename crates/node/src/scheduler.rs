@@ -135,17 +135,16 @@ pub async fn run(
     let mut tools_fenced = false;
     let mut registered = false;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
-        let (context, tasks, facts, targets) = {
+        let (context, facts, targets) = {
             let store = node.store.lock().await;
             let context = store.context(&network, &conversation, &job.basis_heads)?;
-            let tasks = serde_json::to_value(store.tasks(&network, &conversation)?)?;
             let facts = known_facts(&store, &context)?;
             let view = store.trust_bundle(&network)?.context("missing network trust")?.project()?;
             let targets = view.members.into_iter().filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Scheduler)).map(|n| n.subject_id).collect::<Vec<_>>();
-            (context,tasks,facts,targets)
+            (context,facts,targets)
         };
         ensure!(context.missing.is_complete(), "conversation has missing or conflicting history; synchronize it before scheduling");
-        let mut prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &local_settings.roots)?;
+        let mut prompt = materialize(&context, &trigger, &facts, &targets, &local_settings.roots)?;
         if attempt.read_only { prompt.push_str("\nThis management call is read-only. Read status and summarize existing results for the human; no write tool is authorized.\n"); }
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         let custom_tools = if attempt.read_only { tools().into_iter().filter(|(name,_)| matches!(name.as_str(),"context"|"nodes"|"task_status"|"call_lookup")).collect() } else { tools() };
@@ -452,7 +451,6 @@ fn bounded(value: &Value, bytes: usize) -> Value {
 fn materialize(
     context: &Context,
     trigger: &str,
-    tasks: &Value,
     facts: &Value,
     targets: &[String],
     roots: &[std::path::PathBuf],
@@ -501,7 +499,7 @@ fn materialize(
         "network_id":context.network_id,"conversation_id":context.scope_id,
         "trigger_event_hash":trigger,"trigger_event":trigger_event,"event_count":events.len(),"history":history,
         "configured_bot":bot.as_ref().map(|bot| json!({"name":bot.name,"instructions":bot.instructions,"project":bot.project})),
-        "saved_goals":bounded(tasks,6_000),"current_work_facts":bounded(facts,6_000),
+        "current_work_facts":bounded(facts,6_000),
         "summary":bounded(&checkpoint.unwrap_or(Value::Null),2_000),
         "omitted_constraint_review":{"offsets":omitted_constraints.iter().take(128).collect::<Vec<_>>(),"count":omitted_constraints.len(),"scan_before_offset":history_start},
         "authorized_agent_nodes":targets,"local_work_roots":roots,
@@ -897,14 +895,7 @@ mod tests {
             events,
             missing: MissingDependencies::default(),
         };
-        let prompt = materialize(
-            &context,
-            "trigger",
-            &json!([]),
-            &json!({"state":"unknown"}),
-            &[],
-            &[],
-        )?;
+        let prompt = materialize(&context, "trigger", &json!({"state":"unknown"}), &[], &[])?;
         assert!(prompt.len() <= PROMPT_LIMIT);
         assert!(!prompt.contains("unrelated-private-content"));
         assert!(prompt.contains("event-99"));
@@ -977,7 +968,6 @@ mod tests {
         let prompt = materialize(
             &context,
             &trigger,
-            &json!({"goal":"\"".repeat(10000)}),
             &json!({"stdout":"\"".repeat(10000)}),
             &[],
             &[],
@@ -1023,7 +1013,7 @@ mod tests {
             ],
             missing: MissingDependencies::default(),
         };
-        let prompt = materialize(&context, "trigger", &json!([]), &json!({}), &[], &[])?;
+        let prompt = materialize(&context, "trigger", &json!({}), &[], &[])?;
         assert!(prompt.contains("Review Rust changes"));
         assert!(prompt.contains("/project"));
         assert!(!prompt.contains("Private bot B instructions"));
@@ -1038,7 +1028,7 @@ mod tests {
         context
             .events
             .push(make("bot-a-chat", "C", "Conflicting role"));
-        assert!(materialize(&context, "trigger", &json!([]), &json!({}), &[], &[]).is_err());
+        assert!(materialize(&context, "trigger", &json!({}), &[], &[]).is_err());
         context.events.pop();
         context
             .missing

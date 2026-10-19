@@ -2338,36 +2338,6 @@ mod tests {
         });
         config.save(dir)
     }
-    async fn task(node: &Arc<Runtime>, network: &str, task_id: &str, report: bool) -> Result<()> {
-        let access = Access {
-            network_id: network.into(),
-            human: true,
-            conversation_id: None,
-            manager: None,
-        };
-        node.rpc(
-            access.clone(),
-            json!({"method":"create_task","conversation_id":"chat","task_id":task_id,
-                "title":"test","goal":"test","acceptance":"user verifies"}),
-        )
-        .await?;
-        if report {
-            let version = node
-                .store
-                .lock()
-                .await
-                .followup_policy(network, "chat", task_id)?
-                .version;
-            node.rpc(
-                access,
-                json!({"method":"set_followup","conversation_id":"chat",
-                "task_id":task_id,"mode":"report","expected_version":version,
-                "scheduler_node":node.identity.peer_id()?}),
-            )
-            .await?;
-        }
-        Ok(())
-    }
     #[tokio::test]
     async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
         let dir = fixture()?;
@@ -2456,34 +2426,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_cannot_reopen_or_start_new_work_for_a_user_finalized_task() -> Result<()> {
+    async fn agent_tokens_cannot_change_conversation_autonomy() -> Result<()> {
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        task(&node, &network, "task", false).await?;
         let human = Access {
             network_id: network.clone(),
             human: true,
             conversation_id: Some("chat".into()),
-
             manager: None,
         };
         let agent = Access {
             human: false,
             ..human.clone()
         };
-        for status in ["accepted", "cancelled"] {
-            node.rpc(human.clone(), json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":status})).await?;
-            let update = json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":"working"});
+        let grant = json!({"method":"set_autonomy","conversation_id":"chat","mode":"continue",
+            "expected_version":0,"scheduler_node":node.identity.peer_id()?});
+        assert!(
+            node.rpc(agent.clone(), grant.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable to Agent tokens")
+        );
+        for removed in ["create_task", "update_task", "set_followup"] {
             assert!(
-                node.rpc(agent.clone(), update.clone())
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("only the user may reopen")
+                node.rpc(
+                    human.clone(),
+                    json!({"method":removed,"conversation_id":"chat"})
+                )
+                .await
+                .is_err()
             );
-            node.rpc(human.clone(), update).await?;
         }
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .conversation_autonomy(&network, "chat")?
+                .version,
+            0
+        );
+        node.rpc(human, grant).await?;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -2693,91 +2677,60 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn task_retry_requires_explicit_versioned_grant_without_reopening() -> Result<()> {
+    async fn conversation_autonomy_requires_the_current_version_and_survives_restart() -> Result<()>
+    {
         use crate::store::followup::FollowupMode;
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        for (task_id, status) in [
-            ("active", "open"),
-            ("accepted", "accepted"),
-            ("cancelled", "cancelled"),
-        ] {
-            task(&node, &network, task_id, false).await?;
-            if status != "open" {
-                node.append(
-                    &network,
-                    "chat",
-                    EventBody::TaskChanged {
-                        task_id: task_id.into(),
-                        status: status.into(),
-                        detail: "user ended this task".into(),
-                    },
-                )
-                .await?;
-            }
-        }
-        drop(node);
-        let node = Arc::new(Runtime::open(&dir).await?);
         let access = Access {
             network_id: network.clone(),
             human: true,
             conversation_id: None,
             manager: None,
         };
-        for _ in 0..2 {
-            for task_id in ["active", "accepted", "cancelled"] {
-                let rejected = node.rpc(access.clone(), json!({"method":"create_task","conversation_id":"chat",
-                    "task_id":task_id,"title":"test","goal":"test","acceptance":"user verifies","auto_followup":true})).await.unwrap_err();
-                assert!(rejected.to_string().contains("task follow-up control"));
-                task(&node, &network, task_id, false).await?;
-                assert_eq!(
-                    node.store
-                        .lock()
-                        .await
-                        .followup_policy(&network, "chat", task_id)?
-                        .version,
-                    0
-                );
-            }
-        }
-        let grant = json!({"method":"set_followup","conversation_id":"chat","task_id":"active",
+        let grant = json!({"method":"set_autonomy","conversation_id":"chat",
             "mode":"report","expected_version":0,"scheduler_node":node.identity.peer_id()?});
         assert_eq!(
-            node.rpc(access.clone(), grant.clone()).await?["policy"]["version"],
+            node.rpc(access.clone(), grant.clone()).await?["autonomy"]["version"],
             1
         );
-        assert!(node.rpc(access, grant).await.is_err());
-        let store = node.store.lock().await;
-        assert_eq!(
-            store.followup_policy(&network, "chat", "active")?.mode,
-            FollowupMode::Report
+        assert!(
+            node.rpc(access.clone(), grant)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("refresh")
         );
-        for (task_id, status) in [("accepted", "accepted"), ("cancelled", "cancelled")] {
-            assert_eq!(
-                store.followup_policy(&network, "chat", task_id)?.mode,
-                FollowupMode::Off
-            );
-            assert_eq!(
-                store
-                    .tasks(&network, "chat")?
-                    .into_iter()
-                    .find(|task| task.task_id == task_id)
-                    .unwrap()
-                    .status,
-                status
-            );
-        }
-        let grants = store
+        drop(node);
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let snapshot = node
+            .rpc(
+                access.clone(),
+                json!({"method":"conversation","conversation_id":"chat"}),
+            )
+            .await?;
+        assert_eq!(snapshot["autonomy"]["mode"], "report");
+        assert_eq!(snapshot["autonomy"]["version"], 1);
+        node.rpc(
+            access,
+            json!({"method":"set_autonomy","conversation_id":"chat",
+            "mode":"off","expected_version":1}),
+        )
+        .await?;
+        let store = node.store.lock().await;
+        let policy = store.conversation_autonomy(&network, "chat")?;
+        assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 2));
+        let records = store
             .context(&network, "chat", &[])?
             .events
             .into_iter()
             .filter(|event| {
                 matches!(&event.body, EventBody::DecisionRecorded { tool_configuration, .. }
-                if tool_configuration["type"] == "task_followup_grant_v1")
+                if tool_configuration["type"] == "conversation_autonomy_v1")
             })
             .count();
-        assert_eq!(grants, 1);
+        assert_eq!(records, 2);
         drop(store);
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -3090,25 +3043,6 @@ fn heads(v: &Value) -> Result<Vec<String>> {
         v.get("basis_heads").cloned().unwrap_or(json!([])),
     )?)
 }
-fn require_task_write(
-    store: &Store,
-    network: &str,
-    scope: &str,
-    task_id: &str,
-    human: bool,
-) -> Result<()> {
-    let task = store
-        .tasks(network, scope)?
-        .into_iter()
-        .find(|t| t.task_id == task_id)
-        .context("task not found")?;
-    ensure!(
-        human || !matches!(task.status.as_str(), "accepted" | "cancelled"),
-        "only the user may reopen accepted or cancelled tasks"
-    );
-    Ok(())
-}
-
 impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
         Self::open_with_bootstrap_urls(dir, &[]).await
@@ -4035,10 +3969,7 @@ impl Runtime {
             input["method"].as_str(),
             Some("nodes" | "conversation" | "conversations" | "bots" | "notifications" | "export")
         );
-        let task = input["task_id"]
-            .as_str()
-            .or_else(|| input["request"]["task_id"].as_str());
-        let _lease = self.manager_tool_lease(&access, write, task).await?;
+        let _lease = self.manager_tool_lease(&access, write).await?;
         self.rpc_inner(access, input).await
     }
     async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
@@ -4055,10 +3986,7 @@ impl Runtime {
             .authorize_node(network, &self.identity.peer_id()?, None)?;
         let method = field(&input, "method")?;
         if !access.human {
-            ensure!(
-                matches!(method, "nodes" | "create_task" | "update_task"),
-                "method unavailable to Agent tokens"
-            );
+            ensure!(method == "nodes", "method unavailable to Agent tokens");
         }
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
@@ -4168,9 +4096,9 @@ impl Runtime {
                 }
                 self.accept_chat_message(&access, &input).await
             }
-            "set_followup" => {
+            "set_autonomy" => {
                 let scope = scope.context("conversation_id is required")?;
-                let result = self.set_followup(&access, &scope, &input).await?;
+                let result = self.set_autonomy(&access, &scope, &input).await?;
                 self.schedule_wakeup.notify_one();
                 Ok(result)
             }
@@ -4181,77 +4109,6 @@ impl Runtime {
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "resolve_manager_unknown" => self.resolve_manager_invocation(&access, &input).await,
-            "create_task" => {
-                ensure!(
-                    input["auto_followup"].as_bool() != Some(true),
-                    "use the task follow-up control to grant permission"
-                );
-                let scope = scope.context("conversation_id is required")?;
-                let body = EventBody::TaskCreated {
-                    task_id: id(&input, "task_id")?,
-                    title: field(&input, "title")?.into(),
-                    goal: field(&input, "goal")?.into(),
-                    acceptance: field(&input, "acceptance")?.into(),
-                };
-                let origin = access
-                    .manager
-                    .as_ref()
-                    .map(|m| (m.trigger.as_str(), m.attempt_id.as_str()));
-                let event = {
-                    let mut store = self.store.lock().await;
-                    Self::check_manager_permission(&store, &access, true, None)?;
-                    store.create_task_with_origin(
-                        &self.identity,
-                        network,
-                        &scope,
-                        body,
-                        origin,
-                        now_ms(),
-                    )?
-                };
-                self.publish_changed(network, &scope, &event.hash);
-                Ok(json!(event))
-            }
-            "update_task" => {
-                let scope = scope.context("conversation_id is required")?;
-                let task_id = id(&input, "task_id")?;
-                let status = field(&input, "status")?;
-                ensure!(
-                    matches!(
-                        status,
-                        "open" | "working" | "blocked" | "needs_review" | "accepted" | "cancelled"
-                    ),
-                    "invalid task status"
-                );
-                ensure!(
-                    access.human || !matches!(status, "accepted" | "cancelled"),
-                    "only the user accepts or cancels tasks"
-                );
-                let event = {
-                    let mut store = self.store.lock().await;
-                    Self::check_manager_permission(&store, &access, true, Some(&task_id))?;
-                    require_task_write(&store, network, &scope, &task_id, access.human)?;
-                    store.append_event(
-                        &self.identity,
-                        network,
-                        &scope,
-                        EventBody::TaskChanged {
-                            task_id,
-                            status: status.into(),
-                            detail: input["detail"]
-                                .as_str()
-                                .unwrap_or("")
-                                .chars()
-                                .take(65536)
-                                .collect(),
-                        },
-                        vec![],
-                        now_ms(),
-                    )?
-                };
-                self.publish_changed(network, &scope, &event.hash);
-                Ok(json!(event))
-            }
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
             ),

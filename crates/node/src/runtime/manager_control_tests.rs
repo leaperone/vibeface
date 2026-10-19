@@ -117,7 +117,7 @@ async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messag
     );
     assert!(!*cancel.borrow());
     let mut store = node.store.lock().await;
-    Runtime::check_manager_permission(&store, &access, true, None)?;
+    Runtime::check_manager_permission(&store, &access, true)?;
     assert_eq!(store.messages(&access.network_id, "chat")?.len(), 3);
     store.finish_job(
         &node.identity,
@@ -156,11 +156,11 @@ async fn manager_fence_revokes_persisted_permission_before_draining_admitted_too
     let (dir, node, access, mut cancel) = running_manager().await?;
     let attempt = access.manager.as_ref().unwrap().attempt_id.clone();
     let lease = node
-        .manager_tool_lease(&access, true, None)
+        .manager_tool_lease(&access, true)
         .await?
         .context("management tool lease missing")?;
     let store = node.store.lock().await;
-    Runtime::check_manager_permission(&store, &access, true, None)?;
+    Runtime::check_manager_permission(&store, &access, true)?;
     let fence_node = node.clone();
     let fence = tokio::spawn(async move { fence_node.fence_manager_attempt(&attempt).await });
     tokio::time::timeout(Duration::from_secs(5), cancel.changed()).await??;
@@ -168,7 +168,7 @@ async fn manager_fence_revokes_persisted_permission_before_draining_admitted_too
     drop(store);
 
     let store = node.store.lock().await;
-    assert!(Runtime::check_manager_permission(&store, &access, true, None).is_err());
+    assert!(Runtime::check_manager_permission(&store, &access, true).is_err());
     assert!(
         !fence.is_finished(),
         "fence must wait for the admitted tool"
