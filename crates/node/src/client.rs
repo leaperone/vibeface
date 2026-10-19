@@ -397,6 +397,7 @@ async fn dispatch(
             Ok(result)
         }
         "local_access" => {
+            let _save = node.config_save.lock().await;
             let principal = current_principal(node, session).await?;
             if let Some(enabled) = params.get("enabled") {
                 let enabled = enabled.as_bool().context("enabled must be a boolean")?;
@@ -404,7 +405,6 @@ async fn dispatch(
                     principal.can_manage || (principal.source == "local_session" && !enabled),
                     "only a management client can enable local browser access"
                 );
-                let _save = node.config_save.lock().await;
                 node.local_access.set_enabled(enabled)?;
             }
             Ok(json!({"enabled":node.local_access.enabled()}))
@@ -1480,7 +1480,7 @@ mod tests {
         async fn browser_node(
             dir: &std::path::Path,
             manager: &LocalIdentity,
-        ) -> Result<Arc<Runtime>> {
+        ) -> Result<(Arc<Runtime>, LocalIdentity)> {
             crate::config::private_dir(dir)?;
             let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let listen = reservation.local_addr()?;
@@ -1492,22 +1492,23 @@ mod tests {
             )?;
             crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
             let node = Arc::new(Runtime::open(dir).await?);
+            let root = LocalIdentity::generate();
             node.install_membership(NetworkState::new(Genesis::create(
-                &LocalIdentity::generate(),
+                &root,
                 vec![
                     Member::node(&node.identity, "local device", node.config.roles.clone())?,
                     Member::client(manager, "management browser", true)?,
                 ],
             )?)?)
             .await?;
-            Ok(node)
+            Ok((node, root))
         }
 
         let dir =
             std::env::temp_dir().join(format!("vibeface-local-browser-{}", uuid::Uuid::new_v4()));
         let manager = LocalIdentity::generate();
         let browser = LocalIdentity::generate();
-        let node = browser_node(&dir, &manager).await?;
+        let (node, root) = browser_node(&dir, &manager).await?;
         let listen = node.config.listen;
         let serving = node.clone();
         let server = tokio::spawn(async move { crate::api::serve(serving).await });
@@ -1537,7 +1538,7 @@ mod tests {
                 assert_eq!(http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.status(), 401);
             }
             let second_dir = dir.join("second");
-            let second = browser_node(&second_dir, &manager).await?;
+            let (second, _) = browser_node(&second_dir, &manager).await?;
             second_server = Some(tokio::spawn(async move { crate::api::serve(second).await }));
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !second_dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
@@ -1600,10 +1601,23 @@ mod tests {
             let auth = signed.call("authenticate", json!({})).await?;
             assert_eq!(auth["principal"]["source"], "membership");
             assert_eq!(auth["principal"]["can_manage"], true);
-            local.call("local_access", json!({"enabled":false})).await?;
+            let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
+            let browser_id = browser.peer_id()?;
+            let mut local_session = Session {
+                subject_id: browser_id.clone(), public_key: browser.public_key_hex()?,
+                subscribed: false, recovery: None, observation: None,
+                source: SessionSource::LocalSession(cookie.into()),
+            };
+            let save = node.config_save.lock().await;
+            let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
+            assert!(futures_util::poll!(queued_disable.as_mut()).is_pending());
+            node.local_access.set_enabled(false)?;
+            let after_close = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_disable.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_close);
             assert!(!crate::config::Config::load(&dir)?.local_auto_access);
             let before = std::fs::read(dir.join("config.json"))?;
-            let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
             assert!(node.configure_node(node.settings_snapshot(), &browser.peer_id()?, Some(cookie)).await.is_err());
             assert_eq!(std::fs::read(dir.join("config.json"))?, before);
             assert!(local.call("rpc", json!({"method":"conversations"})).await.is_err());
@@ -1611,6 +1625,45 @@ mod tests {
             assert_eq!(signed.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             signed.call("local_access", json!({"enabled":true})).await?;
             assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            node.local_access.set_enabled(false)?;
+            let mut manager_session = Session {
+                subject_id: manager.peer_id()?, public_key: manager.public_key_hex()?,
+                subscribed: false, recovery: None, observation: None, source: SessionSource::Membership,
+            };
+            let save = node.config_save.lock().await;
+            let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
+            assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
+            let replacement_manager = LocalIdentity::generate();
+            let mut state = node.membership_state().await?;
+            let checkpoint = RootCheckpoint::create_with_history(&root, state.epoch() + 1, vec![
+                Member::node(&node.identity, "local device", node.config.roles.clone())?,
+                Member::client(&replacement_manager, "replacement manager", true)?,
+            ], state.historical_nodes()?)?;
+            state.recover(checkpoint)?;
+            node.install_membership(state).await?;
+            let after_recovery = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_enable.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_recovery);
+            assert!(!node.local_access.enabled());
+            node.local_access.set_enabled(true)?;
+            let mut state = node.membership_state().await?;
+            let node_id = node.identity.peer_id()?;
+            let token = node.local_access.issue_from_local_setup(&node_id, &state.genesis.network_id)?;
+            let cookie = node.local_access.exchange(&token, &node_id, &state.genesis.network_id, &browser_id, &browser.public_key_hex()?)?;
+            let mut settings = node.settings_snapshot();
+            settings.roots.clear();
+            let save = node.config_save.lock().await;
+            let mut queued_settings = Box::pin(node.configure_node(settings, &browser_id, Some(&cookie)));
+            assert!(futures_util::poll!(queued_settings.as_mut()).is_pending());
+            state.append(GovernanceEvent::revoke(&replacement_manager, &state.project()?, &node_id)?)?;
+            node.install_membership(state.clone()).await?;
+            assert!(node.local_access.session(&cookie, &node_id, &state.genesis.network_id).is_ok());
+            let after_revoke = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_settings.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_revoke);
+            assert_eq!(node.settings_snapshot().roots, vec![local_project.canonicalize()?]);
             Ok(())
         }.await;
         server.abort();

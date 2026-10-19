@@ -99,9 +99,15 @@ impl Runtime {
         let _work = self.maintenance.enter()?;
         let view = self.membership_state().await?.project()?;
         if let Some(cookie) = local_cookie {
-            let session =
-                self.local_access
-                    .session(cookie, &self.identity.peer_id()?, &view.network_id)?;
+            let peer_id = self.identity.peer_id()?;
+            let member = view.authorize_node(&peer_id, None)?;
+            ensure!(
+                member.public_key == self.identity.public_key_hex()?,
+                "local node membership key changed"
+            );
+            let session = self
+                .local_access
+                .session(cookie, &peer_id, &view.network_id)?;
             ensure!(
                 session.subject_id == subject,
                 "local session identity changed"
