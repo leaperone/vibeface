@@ -1,8 +1,9 @@
 import { CircleQuestionMark, Hand, MonitorSmartphone, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "./context"
+import type { HumanRequest, NativeSessionRecord } from "./types"
 
-export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "approval" | "confirm" | "join" | "setup" | "attention" }
+export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "approval" | "confirm" | "join" | "setup" | "attention"; approval?: { session: NativeSessionRecord; request: HumanRequest } }
 
 /**
  * Everything waiting on the person, newest kinds first.
@@ -16,7 +17,7 @@ export function useInbox(): InboxItem[] {
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   for (const session of data?.native_sessions ?? []) {
-    for (const request of session.pending_requests) items.push({ key: `approval:${session.work_id}:${request.request_id}`, icon: Hand, title: "需要你同意", meta: bot?.name, to: chat, kind: "approval" })
+    for (const request of session.pending_requests) items.push({ key: `approval:${session.work_id}:${request.request_id}`, icon: Hand, title: "需要你同意", meta: bot?.name, to: chat, kind: "approval", approval: { session, request } })
   }
   const checks = (data?.pending_checks.length ?? 0) + (data?.agent_tasks.filter((task) => task.state === "pending_check").length ?? 0)
   if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })

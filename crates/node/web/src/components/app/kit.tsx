@@ -53,7 +53,7 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, ch
   return <section className={cn("grid gap-3 rounded-xl border p-4", toneSurface[tone], className)}>
     <header className="flex min-w-0 items-center gap-2">
       <Icon aria-hidden="true" className={cn("size-5 shrink-0", toneText[tone])} />
-      <h3 className="min-w-0 flex-1 truncate text-heading font-semibold">{title}</h3>
+      <h3 className="min-w-0 flex-1 text-heading font-semibold">{title}</h3>
       {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground">{meta}</span> : null}
       {menu}
     </header>

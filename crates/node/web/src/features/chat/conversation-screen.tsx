@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { Bot, ChevronDown, ChevronRight, ListChecks, LoaderCircle } from 'lucide-react'
-import { InlineError } from '@/components/app/kit'
+import { Bot, ChevronDown, ChevronRight, CircleCheck, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
 import { useWorkspace } from '@/features/workspace/context'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
-import { NativeSessionActivity, PendingCheckItem } from '@/features/workspace/task-activity'
-import { nodeName, taskActive, taskLabel } from '@/features/workspace/labels'
+import { ApprovalCard, ConfirmCard } from '@/features/workspace/task-activity'
+import { approvalKind, nodeName, taskActive, taskLabel } from '@/features/workspace/labels'
 import type { AutonomyMode, ManagerJob } from '@/features/workspace/types'
 import { Chat } from './elements/chat'
 import type { ChatMessage } from './elements/message'
@@ -30,6 +30,9 @@ export function ConversationScreen() {
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
   const [sendError, setSendError] = useState<unknown>(null)
   const [timelineOpen, setTimelineOpen] = useState(false)
+  const [allApprovals, setAllApprovals] = useState(false)
+  // ponytail: answered approvals stay for this page view only; persist like interrupted replies if people miss them.
+  const [answered, setAnswered] = useState<{ key: string; text: string; at: number }[]>([])
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const bot = workspace.selectedBot
@@ -59,16 +62,29 @@ export function ConversationScreen() {
     .concat((data?.native_sessions ?? []).filter((session) => !session.task_ref || !data?.agent_tasks.some((task) => task.task_ref === session.task_ref)).map((session) => ({ id: session.work_id, state: session.state, device: session.target_node, summary: session.detail })))
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'pending_check' || task.state === 'unknown')
   const doneTasks = tasks.length - openTasks.length
-  const awaitingDecision = data?.native_sessions.some((session) => session.pending_requests.length > 0)
+  const approvals = (data?.native_sessions ?? []).flatMap((session) => session.pending_requests.map((request) => ({ session, request, key: `${session.target_node}:${session.work_id}:${request.request_id}` })))
   const needsConfirm = pendingChecks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
-  const activity = needsConfirm ? '需要确认' : status && assistantBusy ? status : assistantBusy ? (live.length ? '正在回复' : '思考中') : openTasks.length ? '任务进行中' : ''
-  const hasTimeline = needsConfirm || assistantBusy || openTasks.length > 0 || doneTasks > 0 || jobs.some((job) => job.state === 'failed' || job.state === 'rejected')
+  const activity = status && assistantBusy ? status : assistantBusy ? (live.length ? '正在回复' : '思考中') : openTasks.length ? '任务进行中' : ''
+  const hasTimeline = assistantBusy || openTasks.length > 0 || doneTasks > 0 || jobs.some((job) => job.state === 'failed' || job.state === 'rejected')
+
+  // Everything waiting on the person, pinned above the composer; the first shows, the rest fold into "还有 N 条".
+  const cards = [
+    messagePending && !messageBusy ? <ActionCard key="undelivered" icon={MessageSquareWarning} title="消息可能没送达" actions={<>
+      <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
+      <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
+      <ActionButton variant="default" disabled={!workspace.writable || !originalEntry || workspace.incomplete} action={async () => {
+        if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
+      }}>重新发送</ActionButton>
+    </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
+    ...pendingChecks.map((check) => <ConfirmCard key={`${check.target_node}:${check.check_id}`} check={check} />),
+    ...approvals.map(({ session, request, key }) => <ApprovalCard key={key} session={session} request={request} onAnswered={(result) => setAnswered((list) => [...list, { key, text: `${result} · ${approvalKind(request)}${request.command ? ` ${request.command}` : ''}`, at: Date.now() }])} />),
+  ].filter(Boolean)
 
   const hint = !workspace.connectionOnline ? '离线，恢复后可发送'
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? (!originalEntry ? '这条消息要回到原来的设备上处理' : '上一条消息还没确认送达')
-    : needsConfirm ? '有一件事需要你确认'
+    : needsConfirm ? '先处理上面这件事'
     : bot && !agentReady ? '暂时没有能运行助手的设备'
     : bot ? composerHint(gate) : ''
   const needsSetup = Boolean(bot && !agentReady)
@@ -85,7 +101,7 @@ export function ConversationScreen() {
       return next
     })
   }, [conversationId, data, messagePending])
-  useEffect(() => { setSendError(null); setTimelineOpen(false) }, [conversationId])
+  useEffect(() => { setSendError(null); setTimelineOpen(false); setAllApprovals(false); setAnswered([]) }, [conversationId])
 
   function clearSentDraft(id: string, sent: string) {
     setDrafts((current) => {
@@ -112,6 +128,7 @@ export function ConversationScreen() {
           </div>
         </div> : null}
       >
+        {answered.map((item) => <p key={item.key} className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 flex-1 truncate">{item.text}</span><time className="shrink-0 tabular-nums">{new Date(item.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time></p>)}
         {assistantBusy && !live.length ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ?? '思考中'}</p> : null}
         {bot ? openTasks.map((task) => <Link key={task.id} to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
           <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
@@ -119,24 +136,17 @@ export function ConversationScreen() {
           <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
         </Link>) : null}
       </Chat>
-      {awaitingDecision ? <div className="chat-activity"><div className="chat-approvals">
-        {data?.native_sessions.map((session) => <NativeSessionActivity key={`approval-${session.target_node}:${session.work_id}`} session={session} compact />)}
+      {cards.length ? <div className="chat-activity"><div className="chat-approvals">
+        {allApprovals ? cards : cards.slice(0, 1)}
+        {cards.length > 1 && !allApprovals ? <button type="button" className="w-fit text-meta font-medium text-muted-foreground underline underline-offset-4 hover:text-foreground" onClick={() => setAllApprovals(true)}>还有 {cards.length - 1} 条</button> : null}
       </div></div> : null}
       {hasTimeline ? <div className="chat-activity">
         <button type="button" aria-expanded={timelineOpen} className="flex min-h-9 w-full items-center gap-2 text-meta text-muted-foreground hover:text-foreground" onClick={() => setTimelineOpen((open) => !open)}>
           {assistantBusy || openTasks.length ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : <ListChecks aria-hidden="true" className="size-4" />}
-          <span className={needsConfirm ? 'font-medium text-warning' : ''}>{activity || '进展'}</span>
+          <span>{activity || '进展'}</span>
           <ChevronDown aria-hidden="true" className={`size-4 transition-transform ${timelineOpen ? 'rotate-180' : ''}`} />
         </button>
         {timelineOpen ? <ol className="grid gap-1 pb-2 text-meta">
-          {messagePending ? <li className="flex flex-wrap items-center gap-2 py-1">
-            <ActionButton variant="default" disabled={messageBusy} action={() => workspace.refresh()}>再查一次</ActionButton>
-            <ActionButton disabled={!workspace.writable || !originalEntry || messageBusy || workspace.incomplete} action={async () => {
-              if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
-            }}>重新发送</ActionButton>
-            <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
-          </li> : null}
-          {pendingChecks.map((check) => <li key={`${check.target_node}:${check.check_id}`} className="py-1"><PendingCheckItem check={check} /></li>)}
           {jobs.slice(-8).map((job) => <JobLine key={job.trigger} job={job} />)}
           {doneTasks ? <li className="flex items-center gap-2 py-1 text-muted-foreground"><ListChecks aria-hidden="true" className="size-4" />{doneTasks} 个任务已结束
             {bot ? tasks.filter((task) => !openTasks.includes(task)).slice(-3).map((task) => <Link key={task.id} className="underline underline-offset-4" to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: task.id }}>{taskLabel(task.state)}</Link>) : null}

@@ -35,10 +35,10 @@ export function prepareSend(input: {
   try { text = inputText(input.text, '消息内容', 65536) }
   catch (caught) { return { ok: false, error: caught instanceof Error ? caught.message : '消息内容无效。' } }
   if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId)) {
-    return { ok: false, error: '此对话有一条消息尚未确认，请先核对原消息，再发送新内容。' }
+    return { ok: false, error: '上一条消息还没确认送达，先处理它再发新的。' }
   }
   if (input.pending && input.pending.entry_node !== input.entryNode) {
-    return { ok: false, error: '原消息尚未确认，请回原入口核对或重试；切换入口只能查看原消息，不能重新提交。' }
+    return { ok: false, error: '上一条消息还没确认，要回到原来的设备上处理。' }
   }
   const pending = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,

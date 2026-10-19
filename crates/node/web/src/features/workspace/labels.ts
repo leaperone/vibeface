@@ -1,5 +1,5 @@
 import type { MembershipView } from "@/lib/node"
-import type { NodeInfo } from "./types"
+import type { HumanRequest, NodeInfo } from "./types"
 
 export const roleNames: Record<string, string> = {
   gateway: "接入",
@@ -97,3 +97,27 @@ const taskStates: Record<string, string> = {
 }
 export const taskLabel = (state: string) => taskStates[state] ?? state
 export const taskActive = (state: string) => ["pending_delivery", "queued", "claimed", "accepted", "running", "waiting", "cancelling", "interrupting"].includes(state)
+
+const kinds: Record<string, string> = {
+  "item/commandExecution/requestApproval": "运行命令",
+  "item/fileChange/requestApproval": "修改文件",
+  "item/tool/requestUserInput": "补充信息",
+}
+export const approvalKind = (request: HumanRequest) => kinds[request.kind] ?? "处理请求"
+
+// ponytail: keyword heuristics; a command parser if these miss real cases.
+const risks: [RegExp, string][] = [
+  [/git\s+push\b.*(--force|\s-f\b)/, "会覆盖远端的提交记录"],
+  [/(^|[\s;&|])(rm|rmdir)\s|git\s+clean\b|git\s+reset\s+--hard/, "会删除文件"],
+  [/(^|[\s;&|])(sudo|chmod|chown)\s/, "会改动权限"],
+  [/(^|[\s;&|])(curl|wget)\s|\b(npm|pnpm|yarn|bun)\s+(i|install|add)\b|\bpip3?\s+install\b|\b(brew|cargo)\s+install\b/, "会从网络下载"],
+]
+
+/** One line describing the consequence of a risky request, or "" when nothing stands out. */
+export function approvalRisk(request: HumanRequest, roots: string[]): string {
+  const hit = risks.find(([pattern]) => pattern.test(request.command ?? ""))
+  if (hit) return hit[1]
+  const cwd = request.cwd
+  if (cwd && roots.length && !roots.some((root) => cwd === root || cwd.startsWith(root.endsWith("/") ? root : `${root}/`))) return "在可用文件夹之外"
+  return ""
+}

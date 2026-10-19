@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "./context"
 import { nodeName, taskActive, taskLabel } from "./labels"
-import { NativeSessionActivity } from "./task-activity"
+import { ApprovalCard } from "./task-activity"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["pending_check", "unknown", "waiting"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
@@ -36,7 +36,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {task?.text ? <p className="whitespace-pre-wrap break-words">{task.text}</p> : null}
       {progress?.status ? <p className="text-meta text-muted-foreground">{progress.status}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
-      {sessions.map((one) => <NativeSessionActivity key={`${one.target_node}:${one.work_id}`} session={one} compact />)}
+      {sessions.flatMap((one) => one.pending_requests.map((request) => <ApprovalCard key={`${one.target_node}:${one.work_id}:${request.request_id}`} session={one} request={request} />))}
       {stop ? <div className="grid gap-2">
         <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop, "已请求停止")}><Square aria-hidden="true" />停止任务</Button>
         <InlineError error={action.error} />
