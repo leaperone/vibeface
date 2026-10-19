@@ -1,6 +1,6 @@
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 在 PR、`main` push 和 `v*` tag 上运行同一流程。PR 与 `main` 只上传 Actions 制品，不创建公开版本，也不部署主机。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围和 Draft/Ready 场景选择 PR 检查；`main` 代码提交、定时、手动、merge queue 和 `v*` tag 执行全量回归。PR 与 `main` 只上传 Actions 制品，不创建公开版本，也不部署主机。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
 ## 可下载的包
 
@@ -28,9 +28,11 @@ cd vibeface-<version>-<target>
 
 ## CI 验证范围
 
-`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。检查和三个平台的打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
+`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。被选中的检查和打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
 
-质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。网页验收检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。纯文档不构建；Web-only PR 只构建 Linux x64 包并验收网页资源，不运行 Node 库业务测试。Node 正式 PR 与全量场景构建三个平台，Draft PR 仅保留 Linux x64 和快速测试。`ci-gate` 要求本次计划中的任务全部成功。
+
+打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。Node 范围启动解包后的程序运行无账号网络验收；Linux x64 额外独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
 
 源码打包前先生成密码学资源，再构建网页。安装 Node.js 22.12+、pnpm 11.9.0、Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
 
