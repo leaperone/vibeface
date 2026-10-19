@@ -203,7 +203,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         }
         active = await open(target.entry, true)
         const auth = await callSession(active, 'authenticate', { network_id: target.networkId })
-        if (record(auth).principal === null) throw new AuthenticationError(record(auth).revoked === true ? '这个浏览器已被移除。' : '这个浏览器已不在我的设备里。')
+        if (record(auth).principal === null) throw new AuthenticationError(record(auth).revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
       } catch (cause) {
         if (reconnect.current !== target) return
@@ -211,7 +211,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           resetConnection(); setPhase('unpaired')
           let detail = messageOf(cause)
           try { store('last-authenticated', null) } catch (storageError) { detail += ` ${messageOf(storageError)}` }
-          setError(`无法恢复原来的连接。请检查设备后重新连接，或用加入链接加入。${detail}`)
+          setError(cause instanceof AuthenticationError ? detail : `无法恢复原来的连接。请检查设备后重新连接，或用加入链接加入。${detail}`)
         } else if (active && session.current === active) active.channel.close()
         else scheduleReconnect()
       }
@@ -387,8 +387,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       return
     }
     if (status.status === 'rejected' || status.status === 'expired') {
-      setJoin(null)
-      throw new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '邀请已过期。请重新取得邀请。' : '管理设备拒绝了这次加入。')
+      // The join is gone, so the poller can no longer tell it apart from a stale one; say why here.
+      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。请重新生成。' : '管理设备拒绝了这次加入。')
+      setJoin(null); setError(failure.message)
+      throw failure
     }
     const code = status.joiner_nonce && status.admin_id && status.admin_nonce ? withCode(status).code : undefined
     const next = { ...pending, status: status.status, code }
@@ -438,6 +440,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const url = new URL(setup.local_launch.url)
     url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id }).toString()
     location.assign(url.href)
+    // Same page with only a new hash does not reload, and the launch token is read on mount.
+    if (url.origin === location.origin && url.pathname === location.pathname) location.reload()
   }
   /** Root recovery keeps every current member by default and adds this browser as a manager. */
   async function beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry }) {

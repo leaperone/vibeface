@@ -132,7 +132,7 @@ function openSocket(url, signal, onClose) {
     else close(new Error("入口发送的数据过多，已关闭连接。"));
   });
   socket.addEventListener("close", () => close());
-  socket.addEventListener("error", () => close(new Error("无法连接入口，请检查地址和设备在线状态。")));
+  socket.addEventListener("error", () => close(new Error("连不上这台设备。请确认它开着，并且和这里网络互通。")));
   if (signal?.aborted) abort();
   return {
     socket, close, ready() { clearTimeout(timer); },

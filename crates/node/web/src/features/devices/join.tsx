@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { ActionCard, Details, DetailRow, InlineError, SafetyCode, Skeleton, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
@@ -12,7 +12,8 @@ export function useOpenJoins(): JoinRequest[] {
 }
 
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
-export function JoinRequests() {
+/** `issuing`: this page just handed out a link, so it starts the comparison without a click. */
+export function JoinRequests({ issuing = false }: { issuing?: boolean }) {
   const device = useDevice()
   const joins = useOpenJoins()
   // The code appears once the new device reveals its nonce; poll until every open request shows one.
@@ -25,21 +26,27 @@ export function JoinRequests() {
   if (!joins.length) return null
   return <section className="grid gap-3" aria-label="等待加入">
     <h3 className="text-meta font-medium text-muted-foreground">等待加入（{joins.length}）</h3>
-    {joins.map((request) => <JoinCard key={request.join_id} request={request} />)}
+    {joins.map((request) => <JoinCard key={request.join_id} request={request} auto={issuing} />)}
   </section>
 }
 
-export function JoinCard({ request }: { request: JoinRequest }) {
+// The same request can show in the sheet, the page and the inbox at once; start it only once per page.
+const started = new Set<string>()
+
+/**
+ * Starting the comparison claims the request for this admin, so only the page that issued the link does it
+ * on its own; every other admin page asks first.
+ */
+export function JoinCard({ request, auto = false }: { request: JoinRequest; auto?: boolean }) {
   const device = useDevice()
   const action = useAction()
   const [manage, setManage] = useState(false)
-  const started = useRef(false)
   // Opening the card is the admin's commitment; the new device then reveals and both sides show the code.
   useEffect(() => {
-    if (request.status !== "pending" || started.current) return
-    started.current = true
+    if (!auto || request.status !== "pending" || started.has(request.join_id)) return
+    started.add(request.join_id)
     void action.run("start", () => device.startApproval(request.join_id))
-  }, [request.status, request.join_id])
+  }, [auto, request.status, request.join_id])
   const busy = action.busy !== null
   // Only the admin that started the comparison can allow it (the Node enforces this too).
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
@@ -50,10 +57,11 @@ export function JoinCard({ request }: { request: JoinRequest }) {
     meta={request.kind === "node" ? "电脑" : "浏览器"}
     actions={<>
       <Button type="button" variant="ghost" disabled={busy} onClick={() => void action.run("reject", () => device.rejectJoin(request.join_id), "已拒绝")}>拒绝</Button>
-      <Button type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", () => device.approveJoin(request.join_id, request.kind === "client" && manage), "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>
+      {request.status === "pending" && !auto ? <Button type="button" disabled={busy} onClick={() => void action.run("start", () => device.startApproval(request.join_id))}>{action.busy === "start" ? "处理中" : "显示安全码"}</Button>
+      : <Button type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", () => device.approveJoin(request.join_id, request.kind === "client" && manage), "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
     </>}
   >
-    <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.code ? "和新设备上显示的一致再允许" : "等新设备显示安全码"}</p>
+    <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上显示的一致再允许" : "等新设备显示安全码"}</p>
     {request.code ? <SafetyCode code={request.code} /> : <Skeleton className="h-8 w-40" />}
     {request.kind === "client" ? <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为管理员</label> : null}
     <InlineError error={action.error} />
