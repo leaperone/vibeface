@@ -14,6 +14,8 @@ await crypto.default({ module_or_path: await readFile(join(dirname(modulePath), 
 const hex = value => Buffer.from(value).toString('hex');
 const bytes = value => Uint8Array.from(Buffer.from(value, 'hex'));
 
+const canonical = value => JSON.stringify(value, function (_key, item) { return item && !Array.isArray(item) && typeof item === 'object' ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item; });
+
 function endpoint() {
   let identity = crypto.Identity.generate();
   let handshake;
@@ -52,9 +54,9 @@ function endpoint() {
             assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
             assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
             const issued = Math.floor(Date.now() / 1000);
-            const record = {peer_id:fixture.peerId(),public_key:fixture.publicKeyHex(),direct_urls:[],relay_urls:input.relay_urls,
+            const record = {peer_id:fixture.peerId(),public_key:fixture.publicKeyHex(),cluster:input.cluster ?? null,direct_urls:[],relay_urls:input.relay_urls,
               issued_at:issued,expires_at:issued+input.ttl_secs,signature:''};
-            record.signature = fixture.sign('reachability',new TextEncoder().encode(JSON.stringify(record)));
+            record.signature = fixture.sign('reachability-v2',new TextEncoder().encode(canonical(record)));
             result = record;
           } finally { fixture.free(); }
           break;

@@ -1052,6 +1052,25 @@ struct RecoverySigning {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl VerifiedMembership {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = mergeStateJson))]
+    pub fn merge_state_json(&self, incoming_json: &str) -> crate::Result<VerifiedMembership> {
+        let incoming = verify_membership(
+            incoming_json,
+            &self.state.genesis.cluster_id,
+            &self.state.genesis.owner_public_key,
+        )?;
+        let state = self
+            .state
+            .merge(&incoming.state)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(VerifiedMembership {
+            view: state.project().map_err(|error| format!("{error:#}"))?,
+            historical_nodes: state
+                .historical_nodes()
+                .map_err(|error| format!("{error:#}"))?,
+            state,
+        })
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = viewJson))]
     pub fn view_json(&self) -> crate::Result<String> {
         serde_json::to_string(&self.view).map_err(|error| error.to_string())
@@ -1192,6 +1211,44 @@ mod tests {
         previous.version = 1;
         previous.signature = root.sign_payload("identity-genesis", &previous.signing_bytes()?)?;
         assert!(previous.verify().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verified_merge_retains_known_revocations_from_an_older_gateway() -> Result<()> {
+        let (root, admin, _, mut state) = setup()?;
+        let node = identity();
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(&node, "gateway", vec![NodeRole::Gateway, NodeRole::Replica])?,
+        )?)?;
+        let older = serde_json::to_string(&state)?;
+        state.append(GovernanceEvent::revoke(
+            &admin,
+            &state.project()?,
+            &node.peer_id(),
+        )?)?;
+        let known = verify_membership(
+            &serde_json::to_string(&state)?,
+            &root.peer_id(),
+            &root.public_key_hex(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let merged = known.merge_state_json(&older).map_err(anyhow::Error::msg)?;
+        assert!(merged.view.revoked.contains(&node.peer_id()));
+        assert!(
+            merged
+                .view
+                .authorize_node(&node.peer_id(), Some(NodeRole::Gateway))
+                .is_err()
+        );
+        let (_, _, _, another) = setup()?;
+        assert!(
+            known
+                .merge_state_json(&serde_json::to_string(&another)?)
+                .is_err()
+        );
         Ok(())
     }
 

@@ -800,6 +800,15 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
         "signed membership is required"
     );
     let view = node.membership_state().await?.project()?;
+    let gateway = view.authorize_node(
+        &node.identity.peer_id()?,
+        Some(crate::model::NodeRole::Gateway),
+    )?;
+    ensure!(
+        node.config.roles.contains(&crate::model::NodeRole::Gateway)
+            && gateway.public_key == node.identity.public_key_hex()?,
+        "local Node is not an enabled Cluster Gateway"
+    );
     let member = view.authorize_client(&session.subject_id)?;
     ensure!(
         member.public_key == session.public_key,
@@ -809,18 +818,13 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
 }
 fn connection_entry(node: &Runtime) -> Result<Value> {
     let relay = node.config.network.bootstrap_urls.first();
-    let mut url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        scheme => scheme,
-    }
-    .to_owned();
-    url.set_scheme(&scheme)
-        .map_err(|_| anyhow::anyhow!("invalid public browser entry"))?;
-    Ok(
-        json!({"address":url.origin().ascii_serialization(),"peer_id":node.identity.peer_id()?,"relay":relay.is_some()}),
-    )
+    let url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
+    let address = if relay.is_some() {
+        url.to_string()
+    } else {
+        url.origin().ascii_serialization()
+    };
+    Ok(json!({"address":address,"peer_id":node.identity.peer_id()?,"relay":relay.is_some()}))
 }
 async fn current_principal(node: &Runtime, session: &Session) -> Result<BrowserPrincipal> {
     match &session.source {
@@ -1079,6 +1083,7 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
 
 fn client_endpoint(value: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(value)?;
+    let websocket = matches!(url.scheme(), "ws" | "wss");
     let scheme = match url.scheme() {
         "http" | "ws" => "ws",
         "https" | "wss" => "wss",
@@ -1094,10 +1099,12 @@ fn client_endpoint(value: &str) -> Result<String> {
         "client URL must not contain credentials, query, or fragment"
     );
     ensure!(
-        matches!(url.path(), "/" | "/api/network/ws"),
+        websocket || matches!(url.path(), "/" | "/api/network/ws"),
         "client URL must be a node base URL or cluster endpoint"
     );
-    url.set_path("/api/network/ws");
+    if !websocket || url.path() == "/" {
+        url.set_path("/api/network/ws");
+    }
     Ok(url.into())
 }
 
@@ -1204,6 +1211,72 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gateway_membership_and_configuration_are_required_for_browser_access() -> Result<()> {
+        use crate::model::NodeRole;
+        let dir = std::env::temp_dir().join(format!("vibeface-gateway-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let mut config = crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.roles = vec![NodeRole::Replica];
+        config.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        let mut node = Runtime::open(&dir).await?;
+        node.config.network.bootstrap_urls = vec!["wss://relay.example/custom/ws".into()];
+        assert_eq!(
+            connection_entry(&node)?["address"],
+            "wss://relay.example/custom/ws"
+        );
+        node.config.network.bootstrap_urls.clear();
+        assert_eq!(connection_entry(&node)?["address"], node.config.public_url);
+        let admin = LocalIdentity::generate();
+        let mut state = ClusterState::new(Genesis::create(
+            &LocalIdentity::generate(),
+            vec![
+                Member::node(&node.identity, "replica", vec![NodeRole::Replica])?,
+                Member::client(&admin, "browser", true)?,
+            ],
+        )?)?;
+        node.install_membership(state.clone()).await?;
+        let session = Session {
+            subject_id: admin.peer_id()?,
+            public_key: admin.public_key_hex()?,
+            subscribed: false,
+            recovery: None,
+            observation: None,
+            source: SessionSource::Membership,
+        };
+        assert!(current_principal(&node, &session).await.is_err());
+        node.config.roles = vec![NodeRole::Gateway, NodeRole::Replica];
+        assert!(current_principal(&node, &session).await.is_err());
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(&node.identity, "gateway", node.config.roles.clone())?,
+        )?)?;
+        node.install_membership(state.clone()).await?;
+        assert_eq!(
+            current_principal(&node, &session).await?.subject_id,
+            admin.peer_id()?
+        );
+        node.config.roles = vec![NodeRole::Replica];
+        assert!(current_principal(&node, &session).await.is_err());
+        node.config.roles = vec![NodeRole::Gateway, NodeRole::Replica];
+        state.append(GovernanceEvent::revoke(
+            &admin,
+            &state.project()?,
+            &node.identity.peer_id()?,
+        )?)?;
+        node.install_membership(state).await?;
+        assert!(current_principal(&node, &session).await.is_err());
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()

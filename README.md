@@ -71,6 +71,8 @@ cargo build --release -p vibeface --locked
 
 PVE 只提供网页和中继时，使用 `init --relay-only`，然后让 Mac mini 的 `network.bootstrap_urls` 指向它。在手机上打开可信网页，导入 Mac mini 的连接信息并完成设备配对，实际认证目标是 Mac mini。见 [纯 Web 与 Relay](docs/node.md#纯-web-与-relay)。
 
+已配对的浏览器也可在连接页选择“按集群连接”，填写 Cluster ID 和已知发现服务。集群编号保持不变，浏览器会重新发现并认证可用的 Gateway。入口切换只恢复读取与订阅，未确认写操作仍绑定原入口，不会自动重发。
+
 另一台 Node 使用独立的空数据目录先 `init`。管理客户端复制的 base64url 配对信息传给 `pair --invite`。`pair --invite-file` 读取解码后的 JSON 邀请，不是这段原文。不要用新建集群代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
 ## 接续工作与通知

@@ -2,6 +2,7 @@ import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
 
 export type ConnectionEntry = { address: string; peer_id: string; relay: boolean; local?: boolean }
+export type ClusterTarget = { kind: 'cluster'; clusterId: string; directories: string[] }
 export type PublicIdentity = { peerId: string; publicKey: string }
 export type ClientPrincipal = { cluster_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
@@ -48,6 +49,14 @@ export function parseEntry(value: unknown): ConnectionEntry {
     return { ...entry, local: true }
   }
   return entry
+}
+export function parseClusterTarget(value: unknown): ClusterTarget {
+  const v = record(value, '集群入口')
+  const input = strings(v.directories)
+  if (input.length > 8) throw new Error('最多配置 8 个发现服务。')
+  const directories = [...new Set(input.map(validEndpoint))]
+  if (v.kind !== 'cluster' || !directories.length || directories.length > 8) throw new Error('填写 1 至 8 个已知发现服务。')
+  return { kind: 'cluster', clusterId: validTarget(v.clusterId), directories }
 }
 export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.relay}:${entry.local === true}`
 export function parseInfo(value: unknown): EntryInfo {

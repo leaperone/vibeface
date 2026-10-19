@@ -516,13 +516,14 @@ fn is_loopback(url: &Url) -> bool {
 fn network_url(value: &str) -> Result<String> {
     ensure!(value.len() <= 2048, "network URL is too long");
     let mut url = Url::parse(value).context("invalid network URL")?;
+    let websocket = matches!(url.scheme(), "ws" | "wss");
     ensure!(
         url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && matches!(url.path(), "/" | "/api/network/ws"),
+            && (websocket || matches!(url.path(), "/" | "/api/network/ws")),
         "network URL must identify the Node WebSocket endpoint without credentials"
     );
     let scheme = match url.scheme() {
@@ -532,7 +533,9 @@ fn network_url(value: &str) -> Result<String> {
     };
     url.set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
-    url.set_path("/api/network/ws");
+    if !websocket || url.path() == "/" {
+        url.set_path("/api/network/ws");
+    }
     Ok(url.to_string())
 }
 
@@ -1404,6 +1407,10 @@ mod tests {
 
     #[test]
     fn network_urls_normalize_without_accepting_credentials() {
+        assert_eq!(
+            network_url("wss://relay.test/custom/ws").unwrap(),
+            "wss://relay.test/custom/ws"
+        );
         assert_eq!(
             network_url("https://node.test").unwrap(),
             "wss://node.test/api/network/ws"

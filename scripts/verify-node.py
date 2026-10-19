@@ -430,6 +430,8 @@ const keys = new Map([['client', clientIdentity], ['root', Identity.generate()]]
 const connections = new Map();
 const identity = name => { const key = keys.get(name); if (!key) throw new Error('unknown local identity'); return key; };
 const exposed = key => ({ public_key: key.publicKeyHex(), subject_id: key.peerId() });
+const canonical = value => JSON.stringify(value, function (_key, item) { return item && !Array.isArray(item) && typeof item === 'object' ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item; });
+
 async function networkProbe(input) {
   const sockets = [], identities = [];
   async function control() {
@@ -485,14 +487,14 @@ async function networkProbe(input) {
       const now = Math.floor(Date.now()/1000);
       if (!Number.isSafeInteger(record.issued_at) || !Number.isSafeInteger(record.expires_at) || record.issued_at > now+30 || record.expires_at <= now || record.expires_at <= record.issued_at || record.expires_at > record.issued_at+180) throw new Error('directory lifetime invalid');
       if (![record.direct_urls,record.relay_urls].every(urls => Array.isArray(urls) && urls.length <= 8 && urls.every(url => typeof url === 'string'))) throw new Error('directory URLs invalid');
-      verify(record.public_key,'reachability',encoder.encode(JSON.stringify({...record,signature:''})),record.signature);
+      verify(record.public_key,'reachability-v2',encoder.encode(canonical({...record,signature:''})),record.signature);
       return record;
     }
     if (input.kind === 'directory') {
       const now = Math.floor(Date.now() / 1000), short = key(), healthy = key();
       async function publish(owner, expires) {
-        const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:expires,signature:''};
-        record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
+        const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),cluster:null,direct_urls:[],relay_urls:[],issued_at:now,expires_at:expires,signature:''};
+        record.signature = owner.sign('reachability-v2',encoder.encode(canonical(record)));
         if ((await exchange({type:'publish',record}))?.type !== 'published') throw new Error('signed fixture record was rejected');
       }
       await publish(short, now + 2); await publish(healthy, now + 120);
@@ -514,8 +516,8 @@ async function networkProbe(input) {
         else throw new Error(`unexpected reservation reply ${result.outcome}`);
       }
       const now = Math.floor(Date.now() / 1000);
-      const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:now+120,signature:''};
-      record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
+      const record = {peer_id:owner.peerId(),public_key:owner.publicKeyHex(),cluster:null,direct_urls:[],relay_urls:[],issued_at:now,expires_at:now+120,signature:''};
+      record.signature = owner.sign('reachability-v2',encoder.encode(canonical(record)));
       first.connection.socket.send(JSON.stringify({type:'publish',record}));
       await new Promise(resolve => setTimeout(resolve, 100));
       const lookup = await exchange({type:'lookup',target:owner.peerId()});

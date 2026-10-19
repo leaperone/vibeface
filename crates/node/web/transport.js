@@ -1,4 +1,4 @@
-import init, { Identity, Handshake } from "/generated/vibeface_secure.js";
+import init, { Identity, Handshake, verify } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -14,10 +14,105 @@ export function validTarget(value) {
 
 export function validEndpoint(value) {
   const url = new URL(value);
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || !["", "/"].includes(url.pathname)) throw new Error("填写 HTTP 或 HTTPS 入口地址，不包含路径、账号或密钥。");
+  const web = ["http:", "https:"].includes(url.protocol);
+  if (value.length > 2048 || !["http:", "https:", "ws:", "wss:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || web && !["", "/"].includes(url.pathname)) throw new Error("填写 HTTP 或 HTTPS 入口，或完整 WS/WSS 端点，不包含账号、查询参数或密钥。");
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (location.protocol === "https:" && url.protocol === "http:" && !local) throw new Error("HTTPS 客户端需要 HTTPS 入口。请为目标或中继启用 HTTPS，再保留相同设备编号连接。");
-  return url.origin;
+  if (location.protocol === "https:" && ["http:", "ws:"].includes(url.protocol) && !local) throw new Error("HTTPS 客户端需要 HTTPS 或 WSS 入口。");
+  return web ? url.origin : url.href;
+}
+
+const canonical = value => JSON.stringify(value, function (_key, item) {
+  return item && !Array.isArray(item) && typeof item === "object"
+    ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item;
+});
+
+async function clusterRecord(value, clusterId) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || encoder.encode(JSON.stringify(value)).length > 8192) throw new Error("集群公告格式无效。");
+  const keys = ["peer_id", "public_key", "cluster", "direct_urls", "relay_urls", "issued_at", "expires_at", "signature"];
+  if (Object.keys(value).length !== keys.length || keys.some(key => !(key in value))) throw new Error("集群公告字段无效。");
+  const peerId = validTarget(value.peer_id), publicKey = validTarget(value.public_key);
+  const fingerprint = await crypto.subtle.digest("SHA-256", Uint8Array.from(publicKey.match(/../g), byte => parseInt(byte, 16)));
+  if ([...new Uint8Array(fingerprint)].map(byte => byte.toString(16).padStart(2, "0")).join("") !== peerId) throw new Error("公告 Peer ID 与公钥不符。");
+  const cluster = value.cluster;
+  if (!cluster || Object.keys(cluster).length !== 2 || cluster.cluster_id !== clusterId || !Array.isArray(cluster.services) || !cluster.services.includes("client") || cluster.services.some((service, index) => !["peer", "client"].includes(service) || index && ["peer", "client"].indexOf(cluster.services[index - 1]) >= ["peer", "client"].indexOf(service))) throw new Error("公告不属于目标集群 Gateway。");
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(value.issued_at) || !Number.isSafeInteger(value.expires_at) || value.issued_at > now + 30 || value.expires_at <= now || value.expires_at <= value.issued_at || value.expires_at > value.issued_at + 180) throw new Error("集群公告已过期或有效期无效。");
+  for (const urls of [value.direct_urls, value.relay_urls]) {
+    if (!Array.isArray(urls) || urls.length > 8 || urls.some(url => typeof url !== "string" || !["ws:", "wss:"].includes(new URL(validEndpoint(url)).protocol))) throw new Error("公告地址无效。");
+  }
+  if (typeof value.signature !== "string") throw new Error("公告签名无效。");
+  verify(publicKey, "reachability-v2", encoder.encode(canonical({ ...value, signature: "" })), value.signature);
+  return { peerId, publicKey, expiresAt: value.expires_at, direct: value.direct_urls };
+}
+
+function queryCluster(address, clusterId, signal) {
+  if (signal?.aborted) return Promise.reject(new Error("集群查询已取消。"));
+  const url = new URL(validEndpoint(address));
+  if (["http:", "https:"].includes(url.protocol)) { url.pathname = "/api/network/ws"; url.protocol = url.protocol === "https:" ? "wss:" : "ws:"; }
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    let done = false, welcomed = false;
+    const timer = setTimeout(() => finish(new Error("发现服务未响应。")), 8000);
+    const abort = () => finish(new Error("集群查询已取消。"));
+    function finish(error, records) {
+      if (done) return;
+      done = true; clearTimeout(timer); signal?.removeEventListener("abort", abort); socket.close();
+      if (error) reject(error); else resolve(records);
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    socket.addEventListener("error", () => finish(new Error("无法查询发现服务。")));
+    socket.addEventListener("close", () => finish(new Error("发现服务已断开。")));
+    socket.addEventListener("message", event => {
+      try {
+        if (typeof event.data !== "string" || encoder.encode(event.data).length > 16384) throw new Error("发现响应过大或格式无效。");
+        const response = JSON.parse(event.data);
+        if (!welcomed) {
+          if (response?.type !== "welcome") throw new Error("发现服务握手无效。");
+          welcomed = true; socket.send(JSON.stringify({ type: "lookup_cluster", cluster_id: clusterId, service: "client" }));
+        } else {
+          if (response?.type !== "cluster_records" || !Array.isArray(response.records) || response.records.length > 8 || typeof response.truncated !== "boolean") throw new Error("集群发现响应无效。");
+          finish(null, response.records);
+        }
+      } catch (error) { finish(error); }
+    });
+  });
+}
+
+export async function discoverCluster(target, { signal, trustedPeers = [] } = {}) {
+  const clusterId = validTarget(target.clusterId);
+  if (!Array.isArray(target.directories) || !target.directories.length || target.directories.length > 8) throw new Error("填写 1 至 8 个已知发现服务。");
+  const sources = [...new Set(target.directories.map(validEndpoint))];
+  const pages = sources.map(() => []);
+  let cursor = 0;
+  await Promise.all([0, 1].map(async () => {
+    while (cursor < sources.length && !signal?.aborted) {
+      const index = cursor++;
+      try {
+        const records = await queryCluster(sources[index], clusterId, signal);
+        for (const value of records) {
+          try { pages[index].push(await clusterRecord(value, clusterId)); } catch {}
+        }
+      } catch {}
+    }
+  }));
+  if (signal?.aborted) throw new Error("集群查询已取消。");
+  const peers = new Map();
+  for (let row = 0; row < 8; row++) for (let source = 0; source < pages.length; source++) {
+    const record = pages[source][row];
+    if (!record) continue;
+    let candidate = peers.get(record.peerId);
+    if (!candidate) {
+      if (peers.size === 16) continue;
+      candidate = { peerId: record.peerId, publicKey: record.publicKey, expiresAt: record.expiresAt, entries: [] };
+      peers.set(record.peerId, candidate);
+    }
+    candidate.expiresAt = Math.min(candidate.expiresAt, record.expiresAt);
+    const paths = [{ address: sources[source], peer_id: record.peerId, relay: true }];
+    if (trustedPeers.includes(record.peerId)) paths.push(...record.direct.map(address => ({ address, peer_id: record.peerId, relay: false })));
+    for (const entry of paths) if (candidate.entries.length < 2 && !candidate.entries.some(item => item.address === entry.address && item.relay === entry.relay)) candidate.entries.push(entry);
+  }
+  return [...peers.values()];
 }
 
 export function readInvitation(value) {
@@ -120,8 +215,8 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   const target = validTarget(entry.peer_id);
   const endpoint = validEndpoint(entry.address);
   if (entry.local === true && (entry.relay || endpoint !== location.origin)) throw new Error("本机会话只能连接当前本机入口。");
-  const url = new URL(entry.local === true ? "/api/local/ws" : "/api/network/ws", endpoint);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  const url = new URL(endpoint);
+  if (["http:", "https:"].includes(url.protocol)) { url.pathname = entry.local === true ? "/api/local/ws" : "/api/network/ws"; url.protocol = url.protocol === "https:" ? "wss:" : "ws:"; }
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
   const incoming = [];

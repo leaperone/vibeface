@@ -345,6 +345,11 @@ test("workspace preserves bot and message requests while routing native decision
       await render().refresh()
       assert.equal(render().messagePending, null)
       for (const outcome of ["success", "failure"]) {
+        if (activeConnection.entry.peer_id !== connection.entry.peer_id) {
+          const originalEntry: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === originalEntry }
+          activeConnection = originalEntry; render(); await new Promise(setImmediate)
+          await render().refresh()
+        }
         const write = deferred(); messageHold = write
         const before = messages.length
         const sending = render().sendMessage("reconnect payload")
@@ -355,7 +360,7 @@ test("workspace preserves bot and message requests while routing native decision
         const reading = deferred(); conversationHold = reading
         const ackBefore = acknowledgements.length
         unreadNotifications = [{ notification_id: `note-${activeConnection.generation}`, kind: "result", text: "unread", conversation_id: "chat" }]
-        const next: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === next }
+        const next: ReadyConnection = { ...connection, entry: { ...connection.entry, peer_id: 'replacement-gateway' }, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === next }
         activeConnection = next
         assert.equal(render().writable, false)
         await new Promise(setImmediate)
@@ -375,6 +380,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(render().writable, true)
         assert.equal(render().incomplete, false)
         assert.deepEqual(JSON.parse(JSON.stringify(render().messagePending)), original)
+        await assert.rejects(render().sendMessage("reconnect payload"), /原入口/)
         if (outcome === "success") write.resolve({ accepted: true, queued: true, message_id: original.message_id, scheduler_node: "chosen" })
         else write.reject(new Error("old response lost"))
         await rejected
@@ -761,4 +767,29 @@ test("Cluster and Peer boundaries require the current fields and identity versio
   assert.throws(() => parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", node_id: id }), /64 位/)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: "invalid" }), /64 位/)
   assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /文本字段/)
+  const own = { peerId: id, publicKey: other }, actual = { peerId: other, publicKey: id }
+  const effective = { cluster_id: id, epoch: 1, heads: [], revoked: [], members: [
+    { subject_id: id, public_key: other, kind: 'client', name: 'browser', node_roles: [], manage: false },
+    { subject_id: other, public_key: id, kind: 'node', name: 'gateway', node_roles: ['gateway', 'replica'], manage: false },
+  ] }
+  let freed = 0
+  const secureSource = readFileSync(new URL('../../lib/secure.ts', import.meta.url), 'utf8')
+  const secureCode = transpileModule(secureSource, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
+  const secure = new Script(`(function(require, exports) { ${secureCode}\nreturn exports })`).runInNewContext({ TextEncoder, TextDecoder })(
+    (name: string) => name.includes('generated') ? { verifyMembership: (input: string) => ({
+      viewJson: () => JSON.stringify(JSON.parse(input).projected), stateJson: () => input,
+      mergeStateJson() { throw new Error('checkpoint conflict') }, free() { freed++ },
+    }) } : parsers, {},
+  )
+  const state = { genesis: { owner_public_key: id }, projected: effective }
+  const auth = { state, view: effective, principal: { cluster_id: id, subject_id: id, source: 'membership', epoch: 1, can_manage: false } }
+  assert.equal(secure.verifyAuthentication(auth, own, { kind: 'cluster', clusterId: id }, { view: effective, actual }).principal.subject_id, id)
+  assert.throws(() => secure.authorizeMembership({ ...effective, revoked: [id] }, own, actual), secure.MembershipRevokedError)
+  assert.throws(() => secure.verifyAuthentication(auth, own, null, { view: { ...effective, revoked: [other] }, actual }), /Gateway/)
+  assert.throws(() => secure.verifyAuthentication(auth, own, null, { view: effective, actual: { ...actual, publicKey: other } }), /Gateway/)
+  const inflated = { ...effective, members: effective.members.map(member => member.kind === 'client' ? { ...member, manage: true } : member) }
+  assert.throws(() => secure.verifyAuthentication({ state: { ...state, projected: inflated }, view: inflated, principal: { ...auth.principal, can_manage: true } }, own, null, { view: effective, actual }), /授权/)
+  const before = freed
+  assert.throws(() => secure.mergeMembership(state, id, state), /checkpoint conflict/)
+  assert.equal(freed, before + 1)
 })

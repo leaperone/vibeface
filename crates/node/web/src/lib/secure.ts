@@ -1,6 +1,6 @@
 import { Identity, recoveryOpen, recoverySeal, verifyMembership } from '../../generated/vibeface_secure.js'
 import { integer, parsePrincipal, parseView, record, same, text } from './node'
-import type { Member, PublicIdentity } from './node'
+import type { Member, MembershipView, PublicIdentity } from './node'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -12,23 +12,45 @@ export function verifiedView(state: unknown, clusterId: string, owner: string) {
   const verified = verifyState(state, clusterId, owner)
   try { return parseView(JSON.parse(verified.viewJson())) } finally { verified.free() }
 }
+export function mergeMembership(state: unknown, clusterId: string, known: unknown) {
+  const owner = text(record(record(state).genesis).owner_public_key)
+  const previous = known ? verifyState(known, clusterId, owner) : null
+  let verified: ReturnType<typeof verifyState> | undefined
+  try {
+    verified = previous ? previous.mergeStateJson(JSON.stringify(state)) : verifyState(state, clusterId, owner)
+    return { state: JSON.parse(verified.stateJson()), view: parseView(JSON.parse(verified.viewJson())) }
+  } finally { verified?.free(); previous?.free() }
+}
+export class MembershipRevokedError extends Error {}
+export function authorizeMembership(view: MembershipView, own: PublicIdentity, actual?: PublicIdentity) {
+  if (view.revoked.includes(own.peerId)) throw new MembershipRevokedError('此浏览器的集群授权已被签名撤销。请重新配对。')
+  const member = view.members.find(item => item.subject_id === own.peerId)
+  if (!member || member.kind !== 'client' || member.public_key !== own.publicKey) throw new Error('此入口尚未确认浏览器的集群授权。')
+  if (actual) {
+    const gateway = view.members.find(item => item.subject_id === actual.peerId)
+    if (!gateway || gateway.kind !== 'node' || gateway.public_key !== actual.publicKey || view.revoked.includes(actual.peerId) || !gateway.node_roles.includes('gateway')) throw new Error('入口不是当前已授权的集群 Gateway。')
+  }
+  return member
+}
 export type AuthenticationTrust = { kind: 'cluster'; clusterId: string } | { kind: 'root'; clusterId: string; ownerPublicKey: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; clusterId: string; peerId: string; nodePublicKey: string }
-export function verifyAuthentication(value: unknown, own: PublicIdentity, expected: AuthenticationTrust | null) {
+export function verifyAuthentication(value: unknown, own: PublicIdentity, expected: AuthenticationTrust | null, effective?: { view: MembershipView; actual: PublicIdentity }) {
   const auth = record(value)
   const principal = parsePrincipal(auth.principal)
   const state = record(auth.state)
   if (principal.subject_id !== own.peerId || expected && principal.cluster_id !== expected.clusterId) throw new Error('认证返回的集群或浏览器身份不一致。')
   if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
   const owner = expected?.kind === 'root' ? expected.ownerPublicKey : text(record(state.genesis).owner_public_key)
-  const view = verifiedView(state, expected?.clusterId ?? principal.cluster_id, owner)
-  if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('认证目录与已签名的成员记录不一致。')
+  const reportedView = verifiedView(state, expected?.clusterId ?? principal.cluster_id, owner)
+  if (principal.epoch !== reportedView.epoch || !same(auth.view, reportedView)) throw new Error('认证目录与已签名的成员记录不一致。')
+  const view = effective?.view ?? reportedView
   if (principal.source === 'local_session') {
     const node = expected?.kind === 'local' ? view.members.find(member => member.subject_id === expected.peerId) : undefined
     if (expected?.kind !== 'local' || !node || node.kind !== 'node' || node.public_key !== expected.nodePublicKey || view.revoked.includes(node.subject_id) || principal.can_manage) throw new Error('本机会话未绑定当前已验证的 Node。')
     return { auth, principal, view }
   }
-  const member = view.members.find(item => item.subject_id === own.peerId)
-  if (!member || view.revoked.includes(own.peerId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
+  const reportedMember = reportedView.members.find(item => item.subject_id === own.peerId)
+  const member = authorizeMembership(view, own, effective?.actual)
+  if (!reportedMember || reportedView.revoked.includes(own.peerId) || reportedMember.public_key !== own.publicKey || reportedMember.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== reportedMember.manage || principal.can_manage && !member.manage) throw new Error('设备授权与已签名的成员记录不一致。')
   return { auth, principal, view }
 }
 export function verifyRecoveryResult(value: unknown, expected: { clusterId: string; ownerPublicKey: string; genesis: unknown; checkpoint: unknown; manager: Member }) {

@@ -5,8 +5,8 @@ import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createContext, Script } from 'node:vm'
 import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
-import { createHash } from 'node:crypto'
-import type { ConnectionEntry } from '../../lib/node.ts'
+import { createHash, generateKeyPairSync, createPublicKey, sign as signBytes, verify as verifyBytes } from 'node:crypto'
+import type { ConnectionEntry, MembershipView, Member } from '../../lib/node.ts'
 import { primaryLane, shouldAutoConnect } from './connection-lane.ts'
 import { invitationLink } from '../../lib/enrollment-reference.ts'
 import { readConnectionFile } from '../../lib/connection-file.ts'
@@ -23,6 +23,18 @@ test('connection links preserve the invitation in the fragment of the trusted we
   assert.equal(Buffer.from(encoded, 'base64url').toString('utf8'), '{"url":"https://relay.example","peer_id":"pinned-node","relay":true,"capability":"配对凭证"}')
   assert.equal(new URL(invitationLink('{}', 'http://localhost:4790')).origin, 'http://localhost:4790')
   for (const page of ['http://relay.example', 'https://user:password@web.example', 'file:///page']) assert.throws(() => invitationLink(content, page), /HTTPS|URL/)
+})
+
+test('invitation transport endpoints preserve custom WSS paths while links use the HTTPS page', () => {
+  const endpoint = 'wss://relay.example/custom/ws'
+  const content = JSON.stringify({ url: endpoint, peer_id: target, relay: true, capability: 'bootstrap' })
+  const link = new URL(invitationLink(content, endpoint))
+  assert.equal(link.origin, 'https://relay.example')
+  assert.equal(link.pathname, '/')
+  const encoded = new URLSearchParams(link.hash.slice(1)).get('invite') ?? ''
+  const restored = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
+  assert.equal(restored.url, endpoint)
+  assert.equal(restored.peer_id, target)
 })
 
 test('connection files keep the original content and reject empty or oversized files', async () => {
@@ -56,7 +68,7 @@ test('one saved entry connects itself, and several entries stay listed', () => {
 const target = 'a'.repeat(64), cluster = 'b'.repeat(64), subject = 'c'.repeat(64), publicKey = 'd'.repeat(64)
 const entry: ConnectionEntry = { address: 'https://node.example', peer_id: target, relay: true }
 const genesis = { version: 2, cluster_id: cluster, owner_public_key: publicKey }
-const membership = { cluster_id: cluster, members: [], revoked: [], heads: [], epoch: 1 }
+const membership: MembershipView = { cluster_id: cluster, members: [], revoked: [], heads: [], epoch: 1 }
 const canonical = (value: unknown): string => value && typeof value === 'object'
   ? Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`
   : JSON.stringify(value)
@@ -71,6 +83,8 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = new Map<string, string>(), calls: string[] = []
+  const discovery: { records: { peerId: string; publicKey: string; expiresAt: number; entries: ConnectionEntry[] }[]; signals: AbortSignal[]; rejected: Set<string> } = { records: [], signals: [], rejected: new Set() }
+  const signed = { view: membership }
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
   const localEntry = { address: 'https://node.example', peer_id: target, relay: false, local: true }
@@ -96,6 +110,11 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   if (pairing) stored.set('vibeface.waiting-pair', JSON.stringify({ request_id: 'pair', cluster_id: cluster, entry, review, signing: { domain: 'identity-pair-review', payload: canonical(review) }, accepted: true }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   const transport = {
+    async discoverCluster(_target: unknown, options: { signal: AbortSignal }) {
+      calls.push('discover'); discovery.signals.push(options.signal)
+      if (holds.has('discover')) await holds.get('discover')?.promise
+      return discovery.records
+    },
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
     initClient: async () => ({ peerId: subject, publicKey }), readInvitation: JSON.parse, signClient: () => 'signature',
     async connectDevice(candidate: ConnectionEntry, options: { onClose(cause: Error): void; signal: AbortSignal }) {
@@ -107,13 +126,14 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
       if (holds.has('open')) await holds.get('open')?.promise
       return { peerId: candidate.peer_id, publicKey, close, async request(method: string) {
         calls.push(method)
-        if (holds.has(method)) return holds.get(method)?.promise
-        if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['relay'], initialized: !bootstrap }
-        if (method === 'authenticate' && local) return { principal: { cluster_id: cluster } }
+        if (holds.has(method)) { const held = await holds.get(method)?.promise; if (method !== 'authenticate') return held }
+        if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['gateway', 'replica'], initialized: !bootstrap }
+        if (method === 'authenticate') { if (discovery.rejected.has(candidate.peer_id)) throw Object.assign(new Error('entry has not synchronized authorization'), { responded: true }); return { principal: { cluster_id: cluster }, state: { genesis } } }
+        if (method === 'directory') return { state: { genesis }, view: signed.view }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'pair_status') return { status: 'granted' }
         if (method === 'prepare_genesis') {
-          const genesis = { version: 2, cluster_id: cluster, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
+          const genesis = { version: 2, cluster_id: cluster, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['gateway', 'replica'], manage: false }, { ...review.new_member, manage: true }] }
           return { state: { genesis, checkpoint: null, events: [] }, signing: { domain: 'identity-genesis', payload: canonical(genesis) } }
         }
         return {}
@@ -122,8 +142,11 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   }
   let verifications = 0, released = 0
   const secure = {
-    verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: local ? 'local_session' : 'membership', cluster_id: cluster, subject_id: subject, epoch: 1, can_manage: false }, view: membership } },
-    verifiedView: () => membership,
+    mergeMembership: (state: unknown) => ({ state: state ?? { genesis }, view: signed.view }),
+    authorizeMembership: () => { if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); return { manage: false } },
+    MembershipRevokedError: class extends Error {},
+    verifyAuthentication: () => { verifications++; if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); return { auth: { local_auto_access: true }, principal: { source: local ? 'local_session' : 'membership', cluster_id: cluster, subject_id: subject, epoch: 1, can_manage: false }, view: signed.view } },
+    verifiedView: () => signed.view,
     openPackage: async () => ({ clusterId: cluster, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ peerId: () => cluster, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {}, verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership) }),
@@ -171,7 +194,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, calls, holds, sockets, stored, timers, location, localState, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, calls, holds, discovery, signed, sockets, stored, timers, location, localState, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 test('a local browser reuses its cookie-bound identity and can disable its own automatic access', async () => {
@@ -366,7 +389,7 @@ test('unexpected closure reconnects the same target with fresh authentication an
   } finally { app.close() }
 })
 
-test('revoked authorization stops reconnection and releases the rejected session', async () => {
+test('an unsigned authorization error retains the target and retries without clearing trust', async () => {
   const app = deviceHarness({ saved: true })
   try {
     app.render(); await settle(); app.render()
@@ -375,13 +398,164 @@ test('revoked authorization stops reconnection and releases the rejected session
     const [id, retry] = [...app.timers.entries()][0]
     app.timers.delete(id); retry(); await settle()
     hold.reject(Object.assign(new Error('authorization revoked'), { responded: true })); await settle()
+    assert.equal(app.render().ready?.isCurrent(), false)
+    assert.equal(app.render().phase, 'reconnecting')
+    assert.notEqual(app.stored.get('vibeface.last-authenticated'), 'null')
+    assert.ok(app.stored.get(`vibeface.cluster-state.${cluster}`))
+    assert.equal(app.timers.size, 1)
+    app.render().disconnect(); assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+test('Cluster candidates continue after a false Noise key and an unsynchronized entry', async () => {
+  const app = deviceHarness()
+  const peers = ['1', '2', '3'].map(value => value.repeat(64))
+  try {
+    app.render(); await settle()
+    app.discovery.records = peers.map((peerId, index) => ({ peerId, publicKey: index ? publicKey : 'f'.repeat(64), expiresAt: Date.now() / 1000 + 60, entries: [{ address: 'wss://directory.example/custom/socket', peer_id: peerId, relay: true }] }))
+    app.discovery.rejected.add(peers[1])
+    await app.render().connectCluster({ kind: 'cluster', clusterId: cluster, directories: ['wss://directory.example/custom/socket'] })
+    const connection = app.render().ready
+    assert.equal(connection?.entry.peer_id, peers[2])
+    assert.equal(connection?.entry.local, undefined)
+    assert.equal(connection?.principal.cluster_id, cluster)
+    assert.deepEqual(app.calls.filter(call => call.startsWith('open:')), peers.map(peer => `open:${peer}`))
+    assert.equal(app.calls.filter(call => call === 'subscribe').length, 1)
+    assert.ok(app.stored.get(`vibeface.cluster-state.${cluster}`))
+    assert.equal(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? '{}').target.kind, 'cluster')
+    app.sockets.at(-1)?.drop()
+    assert.equal(app.render().phase, 'reconnecting')
+    assert.equal(app.timers.size, 1)
+    app.render().disconnect()
+    assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+test('cancelled discovery and an old attempt cannot release the newer probe', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    const first = deferred(), second = deferred(), auth = deferred()
+    app.holds.set('discover', first)
+    const opening = app.render().connectCluster({ kind: 'cluster', clusterId: cluster, directories: ['https://one.example'] })
+    await settle()
+    app.holds.set('discover', second)
+    const replacing = app.render().connectCluster({ kind: 'cluster', clusterId: cluster, directories: ['https://two.example'] })
+    await settle()
+    assert.equal(app.discovery.signals[0].aborted, true)
+    first.resolve({}); await opening
+    app.discovery.records = [{ peerId: target, publicKey, expiresAt: Date.now() / 1000 + 60, entries: [entry] }]
+    app.holds.set('authenticate', auth)
+    second.resolve({}); await settle()
+    app.sockets.at(-1)?.drop()
+    assert.equal(app.timers.size, 0)
+    auth.resolve({}); await replacing
+    assert.equal(app.render().ready, null)
+    assert.equal(app.timers.size, 1)
+    app.render().disconnect()
+    assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+test('a verified client revocation retains signed state and stops Cluster retries', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    app.signed.view = { ...membership, revoked: [subject] }
+    app.discovery.records = [{ peerId: target, publicKey, expiresAt: Date.now() / 1000 + 60, entries: [entry] }]
+    await app.render().connectCluster({ kind: 'cluster', clusterId: cluster, directories: ['https://directory.example'] })
     assert.equal(app.render().ready, null)
     assert.equal(app.render().phase, 'unpaired')
-    assert.match(app.render().error, /无法恢复原集群授权/)
-    assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
     assert.equal(app.timers.size, 0)
-    app.sockets[1].drop(); assert.equal(app.timers.size, 0)
+    assert.ok(app.stored.get(`vibeface.cluster-state.${cluster}`))
+    assert.notEqual(app.stored.get('vibeface.cluster-target'), 'null')
   } finally { app.close() }
+})
+
+test('late nodes responses cannot reintroduce a member revoked by a newer signed directory', async () => {
+  const app = deviceHarness({ saved: true })
+  const other = 'e'.repeat(64)
+  try {
+    app.signed.view = { ...membership, members: [target, other].map(subject_id => ({ subject_id, public_key: publicKey, kind: 'node', name: subject_id, node_roles: ['gateway', 'replica'], manage: false } satisfies Member)) }
+    app.render(); await settle()
+    const connection = app.render().ready
+    assert.ok(connection)
+    const hold = deferred(); app.holds.set('rpc', hold)
+    const reading = connection.rpc('nodes'); await settle()
+    app.signed.view = { ...app.signed.view, revoked: [other] }
+    await app.render().refreshDirectory()
+    hold.resolve({ nodes: [target, other].map(peer_id => ({ peer_id, roles: ['gateway', 'replica'], online: true, revoked: false })) })
+    const response = JSON.parse(JSON.stringify(await reading))
+    assert.deepEqual(response.nodes.map((node: { peer_id: string }) => node.peer_id), [target])
+    app.signed.view = { ...app.signed.view, epoch: 2 }
+    await assert.rejects(app.render().refreshDirectory(), /授权已变化/)
+    assert.equal(connection.isCurrent(), false)
+    assert.equal(app.render().phase, 'reconnecting')
+  } finally { app.close() }
+})
+
+test('Cluster discovery verifies signed records and limits source and path budgets', async () => {
+  const sources = Array.from({ length: 8 }, (_, index) => `wss://directory${index}.example/custom/socket`)
+  const pages = sources.map(() => Array.from({ length: 8 }, () => {
+    const keys = generateKeyPairSync('ed25519')
+    const publicKey = keys.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex')
+    const peer = createHash('sha256').update(Buffer.from(publicKey, 'hex')).digest('hex')
+    const now = Math.floor(Date.now() / 1000)
+    const record = { peer_id: peer, public_key: publicKey, cluster: { cluster_id: cluster, services: ['peer', 'client'] }, direct_urls: ['ws://127.0.0.1/private/socket'], relay_urls: ['wss://unconfigured.example/socket'], issued_at: now, expires_at: now + 180, signature: '' }
+    const hash = createHash('sha256').update(canonical(record)).digest('hex')
+    record.signature = signBytes(null, Buffer.from(`vibeface:message:v1:reachability-v2:${hash}`), keys.privateKey).toString('hex')
+    return record
+  }))
+  let active = 0, peak = 0, hold = false
+  class Socket {
+    listeners = new Map<string, (event: unknown) => void>()
+    closed = false
+    address: string
+    constructor(address: URL) { this.address = address.href; active++; peak = Math.max(peak, active); if (!hold) queueMicrotask(() => this.listeners.get('message')?.({ data: JSON.stringify({ type: 'welcome' }) })) }
+    addEventListener(type: string, listener: (event: unknown) => void) { this.listeners.set(type, listener) }
+    send(value: string) { assert.equal(JSON.parse(value).type, 'lookup_cluster'); queueMicrotask(() => this.listeners.get('message')?.({ data: JSON.stringify({ type: 'cluster_records', records: pages[sources.indexOf(this.address)], truncated: false }) })) }
+    close() { if (this.closed) return; this.closed = true; active--; this.listeners.get('close')?.({}) }
+  }
+  const source = readFileSync(new URL('../../../transport.js', import.meta.url), 'utf8').replace(/^import[^\n]+\n/, '').replace(/\bexport /g, '')
+  const transport = new Script(`${source}\n({clusterRecord, discoverCluster, validEndpoint})`).runInNewContext({ TextEncoder, TextDecoder, URL, Uint8Array, crypto: globalThis.crypto, location: { protocol: 'https:' }, WebSocket: Socket, setTimeout, clearTimeout,
+    verify(key: string, domain: string, payload: Uint8Array, signature: string) {
+      const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(key, 'hex')]), format: 'der', type: 'spki' })
+      const hash = createHash('sha256').update(payload).digest('hex')
+      assert.equal(verifyBytes(null, Buffer.from(`vibeface:message:v1:${domain}:${hash}`), publicKey, Buffer.from(signature, 'hex')), true)
+    },
+  })
+  const target = { clusterId: cluster, directories: sources }
+  const records = await transport.discoverCluster(target)
+  assert.equal(records.length, 16)
+  assert.ok(peak <= 2)
+  assert.equal(active, 0)
+  for (const source of sources) assert.equal(records.filter((record: { entries: ConnectionEntry[] }) => record.entries.some(entry => entry.address === source)).length, 2)
+  assert.ok(records.every((record: { entries: ConnectionEntry[] }) => record.entries.length <= 2 && record.entries.every(entry => entry.relay && !entry.local && sources.includes(entry.address))))
+  const repeated = generateKeyPairSync('ed25519')
+  const repeatedKey = repeated.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex')
+  const repeatedPeer = createHash('sha256').update(Buffer.from(repeatedKey, 'hex')).digest('hex')
+  const issued = Math.floor(Date.now() / 1000)
+  for (const [index, ttl] of [30, 120].entries()) {
+    const record = { peer_id: repeatedPeer, public_key: repeatedKey, cluster: { cluster_id: cluster, services: ['peer', 'client'] }, direct_urls: [], relay_urls: [], issued_at: issued, expires_at: issued + ttl, signature: '' }
+    const hash = createHash('sha256').update(canonical(record)).digest('hex')
+    record.signature = signBytes(null, Buffer.from(`vibeface:message:v1:reachability-v2:${hash}`), repeated.privateKey).toString('hex')
+    pages[index][0] = record
+  }
+  const merged = await transport.discoverCluster({ ...target, directories: sources.slice(0, 2) })
+  assert.equal(merged.find((record: { peerId: string }) => record.peerId === repeatedPeer)?.expiresAt, issued + 30)
+  assert.equal(transport.validEndpoint(sources[0]), sources[0])
+  const record = pages[0][0]
+  await assert.rejects(transport.clusterRecord(record, 'e'.repeat(64)), /集群/)
+  await assert.rejects(transport.clusterRecord({ ...record, peer_id: 'f'.repeat(64) }, cluster), /Peer ID/)
+  await assert.rejects(transport.clusterRecord({ ...record, expires_at: 1 }, cluster), /过期/)
+  await assert.rejects(transport.clusterRecord({ ...record, signature: '00'.repeat(64) }, cluster))
+  await assert.rejects(transport.clusterRecord({ ...record, direct_urls: ['wss://large.example/' + 'x'.repeat(8192)] }, cluster), /公告格式/)
+  hold = true
+  const controller = new AbortController()
+  const pending = transport.discoverCluster(target, { signal: controller.signal })
+  await settle(); controller.abort()
+  await assert.rejects(pending, /取消/)
+  assert.equal(active, 0)
 })
 
 test('successful bootstrap releases local material without disconnecting the authenticated session', async () => {

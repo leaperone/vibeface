@@ -4,7 +4,7 @@ use crate::{
     identity::{AuthorizationView, ClusterState, GovernanceAction, IdentityKind},
     maintenance::{Busy, Gate},
     model::*,
-    network::{IncomingSocket, NetworkHub, Service},
+    network::{ClusterAdvertisement, IncomingSocket, NetworkHub, Service},
     peer::{AuthorizationDenied, Inbound, PeerHub, RequestFailure},
     store::Store,
 };
@@ -3249,6 +3249,8 @@ impl Runtime {
         if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
             store.save_local_identity(&view.cluster_id, &self.identity)?;
         }
+        drop(store);
+        self.refresh_local_cluster().await;
         Ok(view)
     }
 
@@ -3262,7 +3264,32 @@ impl Runtime {
     pub fn info(&self) -> Value {
         json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
     }
+    async fn refresh_local_cluster(&self) {
+        let state = self.store.lock().await.public_state();
+        let cluster = (|| -> Result<_> {
+            let state = state?;
+            let view = state.project()?;
+            let member = view.authorize_node(&self.identity.peer_id()?, None)?;
+            ensure!(
+                member.public_key == self.identity.public_key_hex()?,
+                "local Node key mismatch"
+            );
+            let mut services = vec![Service::Peer];
+            if member.node_roles.contains(&NodeRole::Gateway)
+                && self.config.roles.contains(&NodeRole::Gateway)
+            {
+                services.push(Service::Client);
+            }
+            Ok(ClusterAdvertisement {
+                cluster_id: view.cluster_id,
+                services,
+            })
+        })()
+        .ok();
+        self.network.set_local_cluster(cluster).await;
+    }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.refresh_local_cluster().await;
         self.start_schedule_delivery();
         self.start_observation_worker();
         self.start_native_observation();
@@ -3343,6 +3370,7 @@ impl Runtime {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tick.tick().await;
+                node.refresh_local_cluster().await;
                 let Ok(state) = node.store.lock().await.public_state() else {
                     continue;
                 };

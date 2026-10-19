@@ -20,7 +20,7 @@ const button = 'min-h-11'
 const panel = 'min-w-0 gap-4 p-4 sm:p-5'
 const check = 'size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50'
 const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
-type Lane = 'invite' | 'saved' | 'manual' | 'recovery' | 'passphrase'
+type Lane = 'invite' | 'saved' | 'manual' | 'cluster' | 'recovery' | 'passphrase'
 type Purpose = 'empty' | 'bootstrap' | 'pair' | 'node' | 'invalid'
 
 function purposeOf(invitation: string): Purpose {
@@ -76,6 +76,11 @@ export function ConnectionScreen() {
     const password = value(form, 'password')
     void run(() => device.pair(invitation, value(form, 'name'), purpose === 'bootstrap' ? passphrase(password, password) : undefined))
   }
+  function connectCluster(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = event.currentTarget
+    void run(() => device.connectCluster({ kind: 'cluster', clusterId: value(form, 'cluster_id').trim(), directories: value(form, 'directories').split(/\s+/).filter(Boolean) }))
+  }
   async function importConnectionFile(file: File) {
     const owner = device.connectionGeneration()
     const content = await readConnectionFile(file)
@@ -91,6 +96,7 @@ export function ConnectionScreen() {
     : active === 'saved' && device.entries.length === 1 && ['connecting', 'reconnecting'].includes(device.phase) ? '正在连接。'
     : active === 'saved' ? '选一个入口。'
     : active === 'manual' ? '填写地址和设备编号。'
+    : active === 'cluster' ? '用集群编号寻找可用入口。'
     : active === 'recovery' ? '用恢复包恢复。'
     : active === 'passphrase' ? '只更换口令，不连接。'
     : purpose === 'bootstrap' ? '设置口令后连接。'
@@ -167,6 +173,18 @@ export function ConnectionScreen() {
         </form>
         {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
       </Card>}
+      {!focused && active === 'cluster' && <Card className={panel} aria-labelledby="cluster-entry-title">
+        <h2 id="cluster-entry-title" className="font-semibold">按集群连接</h2>
+        <form className="space-y-4" onSubmit={connectCluster}>
+          <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
+            <label className="grid gap-2 text-sm">Cluster ID<Input className={`${input} font-mono`} name="cluster_id" required pattern="[a-f0-9]{64}" title="填写完整的 64 位集群编号" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
+            <label className="grid gap-2 text-sm">已知发现服务<Textarea className="min-h-24" name="directories" required maxLength={16384} placeholder="wss://relay.example/api/network/ws" aria-describedby="cluster-directories-hint" autoComplete="off" spellCheck={false} /></label>
+            <p id="cluster-directories-hint" className="text-xs text-muted-foreground">每行一个地址，最多 8 个。使用已知的 HTTP/HTTPS 入口或完整 WS/WSS 端点。浏览器仍须先获得集群授权。</p>
+            <Button className={button} type="submit">连接集群</Button>
+          </fieldset>
+        </form>
+        {linking && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
+      </Card>}
       {!focused && active === 'recovery' && usable && <RecoveryControls only="restore" />}
       {!focused && active === 'passphrase' && usable && <RecoveryControls only="passphrase" />}
       {!focused && device.phase !== 'blocked' && device.phase !== 'key_lost' && <div className="space-y-2">
@@ -175,6 +193,7 @@ export function ConnectionScreen() {
           {active !== 'saved' && device.entries.length > 0 && <Button variant="ghost" className={button} type="button" onClick={() => setLane('saved')}>已保存的入口</Button>}
           {active !== 'invite' && <Button variant="ghost" className={button} type="button" onClick={() => setLane('invite')}>使用邀请</Button>}
           {active !== 'manual' && <Button variant="ghost" className={button} type="button" onClick={() => setLane('manual')}>手填入口地址</Button>}
+          {active !== 'cluster' && <Button variant="ghost" className={button} type="button" onClick={() => setLane('cluster')}>按集群连接</Button>}
           {active !== 'recovery' && usable && <Button variant="ghost" className={button} type="button" onClick={() => setLane('recovery')}>恢复管理权限</Button>}
           {active !== 'passphrase' && usable && <Button variant="ghost" className={button} type="button" onClick={() => setLane('passphrase')}>更换恢复包口令</Button>}
         </div>

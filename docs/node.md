@@ -168,7 +168,11 @@ Node 可启用局域网发现，从候选地址找到已知 Peer ID。公网发�
 ./vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
 ```
 
-参数可重复，最多指定 8 个入口。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点。URL 不接受凭证、查询参数、片段或其他路径，程序没有内置的公共入口。
+参数可重复，最多指定 8 个入口。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点。URL 不接受凭证、查询参数或片段，程序没有内置的公共入口。
+
+完整 WS/WSS 地址保留自定义端点路径，例如 `wss://relay.example/custom/ws`。HTTP/HTTPS 地址继续使用 origin 和默认端点。邀请保留传输端点，分享链接则使用对应的 HTTP/HTTPS 网页入口。
+
+网页连接页的“按集群连接”接收 Cluster ID 和已知发现服务，每行一个、最多 8 个。浏览器须先通过普通邀请获得集群 Client 授权。进入后保存稳定的集群目标及最近可信入口，原入口离线时重新发现同集群 Gateway。目录只能提供连接线索，不能授予权限。本机自动访问仍绑定本机 Peer，可以按原方式关闭；它不能转移到其他设备。
 
 首次直接启动或显式 `init` 会保存传入的 URL。已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写原配置与身份；省略参数时沿用配置。`serve` 始终要求已初始化的数据目录。使用子命令时，将 `--bootstrap-url` 写在子命令后。入口提供路由和中继预约，设备仍须获得集群授权。
 

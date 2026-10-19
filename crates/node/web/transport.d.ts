@@ -10,6 +10,13 @@ export function connectDevice(entry: { address: string; peer_id: string; relay: 
   onClose?: (error: unknown) => void
   signal?: AbortSignal
 }): Promise<DeviceChannel>
+export type ClusterCandidate = {
+  peerId: string
+  publicKey: string
+  expiresAt: number
+  entries: { address: string; peer_id: string; relay: boolean }[]
+}
+export function discoverCluster(target: { clusterId: string; directories: string[] }, options?: { signal?: AbortSignal; trustedPeers?: string[] }): Promise<ClusterCandidate[]>
 export function validTarget(value: unknown): string
 export function validEndpoint(value: string): string
 export function readInvitation(value: string): unknown

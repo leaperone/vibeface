@@ -35,6 +35,8 @@ use tracing::Instrument;
 
 pub const MAX_FRAME_BYTES: usize = 65_535;
 const MAX_CONTROL_BYTES: usize = 16 * 1024;
+const MAX_ANNOUNCEMENT_BYTES: usize = 8 * 1024;
+const MAX_CLUSTER_RECORDS: usize = 8;
 const MAX_RECORDS: usize = 2048;
 const MAX_RESOLVED: usize = 256;
 const MAX_RESERVATIONS: usize = 64;
@@ -85,11 +87,18 @@ impl NetworkConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Service {
     Peer,
     Client,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAdvertisement {
+    pub cluster_id: String,
+    pub services: Vec<Service>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +106,7 @@ pub enum Service {
 pub struct Reachability {
     pub peer_id: String,
     pub public_key: String,
+    pub cluster: Option<ClusterAdvertisement>,
     pub direct_urls: Vec<String>,
     pub relay_urls: Vec<String>,
     pub issued_at: i64,
@@ -107,9 +117,13 @@ impl Reachability {
     fn unsigned(&self) -> Result<Vec<u8>> {
         let mut record = self.clone();
         record.signature.clear();
-        Ok(serde_json::to_vec(&record)?)
+        crate::identity::canonical_json(&record)
     }
     pub fn verify(&self, now: i64) -> Result<()> {
+        ensure!(
+            serde_json::to_vec(self)?.len() <= MAX_ANNOUNCEMENT_BYTES,
+            "reachability announcement too large"
+        );
         ensure!(
             self.peer_id == fingerprint(&self.public_key)?,
             "reachability identity mismatch"
@@ -128,9 +142,18 @@ impl Reachability {
         for url in self.direct_urls.iter().chain(&self.relay_urls) {
             validate_url(url)?;
         }
+        if let Some(cluster) = &self.cluster {
+            check_id(&cluster.cluster_id)?;
+            ensure!(
+                !cluster.services.is_empty()
+                    && cluster.services.len() <= 2
+                    && cluster.services.windows(2).all(|pair| pair[0] < pair[1]),
+                "invalid cluster services"
+            );
+        }
         verify_payload(
             &self.public_key,
-            "reachability",
+            "reachability-v2",
             &self.unsigned()?,
             &self.signature,
         )
@@ -154,6 +177,14 @@ enum Control {
     },
     Record {
         record: Option<Reachability>,
+    },
+    LookupCluster {
+        cluster_id: String,
+        service: Service,
+    },
+    ClusterRecords {
+        records: Vec<Reachability>,
+        truncated: bool,
     },
     Reserve {
         peer_id: String,
@@ -351,6 +382,8 @@ struct State {
     resolved: HashMap<String, Reachability>,
     active_relays: HashSet<String>,
     paths: HashMap<(String, String), PathHistory>,
+    local_cluster: Option<ClusterAdvertisement>,
+    cluster_cursor: usize,
 }
 
 #[derive(Clone)]
@@ -833,6 +866,15 @@ impl NetworkHub {
                 let record = self.lookup_local(&target).await?;
                 send_control(&mut socket, &Control::Record { record }).await
             }
+            Control::LookupCluster {
+                cluster_id,
+                service,
+            } => {
+                socket.promote(SocketClass::Control)?;
+                check_id(&cluster_id)?;
+                let response = self.lookup_cluster_local(&cluster_id, service).await?;
+                send_control(&mut socket, &response).await
+            }
             Control::Reserve {
                 peer_id,
                 public_key,
@@ -939,6 +981,62 @@ impl NetworkHub {
         state.records.retain(|_, r| r.expires_at > now);
         Ok(state.records.get(target).cloned())
     }
+    pub async fn set_local_cluster(&self, cluster: Option<ClusterAdvertisement>) {
+        let mut state = self.state.lock().await;
+        if state.local_cluster != cluster {
+            state.local_cluster = cluster;
+            self.relay_changes
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
+    async fn lookup_cluster_local(&self, cluster_id: &str, service: Service) -> Result<Control> {
+        let local = self.local_record().await?;
+        let now = now_secs()?;
+        let mut state = self.state.lock().await;
+        state.records.retain(|_, record| record.expires_at > now);
+        let matches = |record: &&Reachability| {
+            record.cluster.as_ref().is_some_and(|cluster| {
+                cluster.cluster_id == cluster_id && cluster.services.contains(&service)
+            })
+        };
+        let mut candidates: Vec<_> = state
+            .records
+            .values()
+            .filter(|record| record.peer_id != local.peer_id)
+            .chain(std::iter::once(&local))
+            .filter(matches)
+            .cloned()
+            .collect();
+        candidates.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        if !candidates.is_empty() {
+            let offset = state.cluster_cursor % candidates.len();
+            candidates.rotate_left(offset);
+            state.cluster_cursor = state.cluster_cursor.wrapping_add(1);
+        }
+        let mut response = Control::ClusterRecords {
+            records: vec![],
+            truncated: false,
+        };
+        for candidate in candidates {
+            let Control::ClusterRecords { records, truncated } = &mut response else {
+                unreachable!()
+            };
+            if records.len() == MAX_CLUSTER_RECORDS {
+                *truncated = true;
+                break;
+            }
+            records.push(candidate);
+            if serde_json::to_vec(&response)?.len() > MAX_CONTROL_BYTES {
+                let Control::ClusterRecords { records, truncated } = &mut response else {
+                    unreachable!()
+                };
+                records.pop();
+                *truncated = true;
+                break;
+            }
+        }
+        Ok(response)
+    }
     async fn publish(&self, record: Reachability) -> Result<PublishOutcome> {
         record.verify(now_secs()?)?;
         #[cfg(test)]
@@ -996,18 +1094,13 @@ impl NetworkHub {
     }
     async fn local_record(&self) -> Result<Reachability> {
         let now = now_secs()?;
-        let mut relay_urls: Vec<_> = self
-            .state
-            .lock()
-            .await
-            .active_relays
-            .iter()
-            .cloned()
-            .collect();
+        let state = self.state.lock().await;
+        let mut relay_urls: Vec<_> = state.active_relays.iter().cloned().collect();
         relay_urls.sort();
         let mut record = Reachability {
             peer_id: self.identity.peer_id()?,
             public_key: self.identity.public_key_hex()?,
+            cluster: state.local_cluster.clone(),
             direct_urls: self.config.advertise_urls.clone(),
             relay_urls,
             issued_at: now,
@@ -1016,7 +1109,8 @@ impl NetworkHub {
         };
         record.signature = self
             .identity
-            .sign_payload("reachability", &record.unsigned()?)?;
+            .sign_payload("reachability-v2", &record.unsigned()?)?;
+        record.verify(now)?;
         Ok(record)
     }
     pub async fn resolve(&self, target: &str) -> Result<BoxStream<'_, Reachability>> {
@@ -2763,14 +2857,84 @@ mod tests {
         let mut record = Reachability {
             peer_id: identity.peer_id()?,
             public_key: identity.public_key_hex()?,
+            cluster: None,
             direct_urls: Vec::new(),
             relay_urls: Vec::new(),
             issued_at,
             expires_at: issued_at + RECORD_TTL_SECS,
             signature: String::new(),
         };
-        record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         Ok(record)
+    }
+
+    #[tokio::test]
+    async fn cluster_directory_rotates_and_bounds_signed_candidates() -> Result<()> {
+        let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let cluster_id = "ab".repeat(32);
+        let advertisement = ClusterAdvertisement {
+            cluster_id: cluster_id.clone(),
+            services: vec![Service::Peer, Service::Client],
+        };
+        hub.set_local_cluster(Some(advertisement.clone())).await;
+        assert_eq!(
+            hub.local_record().await?.cluster,
+            Some(advertisement.clone())
+        );
+        hub.set_local_cluster(None).await;
+        for _ in 0..10 {
+            let identity = LocalIdentity::generate();
+            let mut record = signed_record(&identity, now_secs()?)?;
+            record.cluster = Some(advertisement.clone());
+            record.signature = identity.sign_payload("reachability-v2", &record.unsigned()?)?;
+            assert_eq!(hub.publish(record).await?, PublishOutcome::Accepted);
+        }
+        let Control::ClusterRecords {
+            records: first,
+            truncated,
+        } = hub
+            .lookup_cluster_local(&cluster_id, Service::Client)
+            .await?
+        else {
+            unreachable!()
+        };
+        assert!(truncated);
+        assert_eq!(first.len(), MAX_CLUSTER_RECORDS);
+        let Control::ClusterRecords { records: next, .. } = hub
+            .lookup_cluster_local(&cluster_id, Service::Client)
+            .await?
+        else {
+            unreachable!()
+        };
+        assert_ne!(first[0].peer_id, next[0].peer_id);
+        assert!(
+            matches!(hub.lookup_cluster_local(&"cd".repeat(32), Service::Client).await?, Control::ClusterRecords { records, truncated: false } if records.is_empty())
+        );
+        hub.state.lock().await.records.clear();
+        for _ in 0..3 {
+            let identity = LocalIdentity::generate();
+            let mut record = signed_record(&identity, now_secs()?)?;
+            record.cluster = Some(advertisement.clone());
+            record.direct_urls = vec![format!("wss://example.test/{}", "x".repeat(1750)); 4];
+            record.signature = identity.sign_payload("reachability-v2", &record.unsigned()?)?;
+            assert_eq!(hub.publish(record).await?, PublishOutcome::Accepted);
+        }
+        let response = hub
+            .lookup_cluster_local(&cluster_id, Service::Client)
+            .await?;
+        assert!(serde_json::to_vec(&response)?.len() <= MAX_CONTROL_BYTES);
+        assert!(
+            matches!(response, Control::ClusterRecords { records, truncated: true } if records.len() == 2)
+        );
+        let identity = LocalIdentity::generate();
+        let mut oversized = signed_record(&identity, now_secs()?)?;
+        oversized.direct_urls = vec![format!("wss://example.test/{}", "x".repeat(1750)); 8];
+        oversized.signature = identity.sign_payload("reachability-v2", &oversized.unsigned()?)?;
+        assert!(hub.publish(oversized).await.is_err());
+        let mut forged = first[0].clone();
+        forged.cluster.as_mut().unwrap().cluster_id = "ef".repeat(32);
+        assert!(forged.verify(now_secs()?).is_err());
+        Ok(())
     }
 
     async fn serve_publication_probe(
@@ -4968,11 +5132,11 @@ mod tests {
         let peer_id = identity.peer_id()?;
         let public_key = identity.public_key_hex()?;
         let unsigned = format!(
-            r#"{{"peer_id":"{peer_id}","public_key":"{public_key}","direct_urls":[],"relay_urls":[],"issued_at":1000,"expires_at":1180,"signature":""}}"#
+            r#"{{"cluster":null,"direct_urls":[],"expires_at":1180,"issued_at":1000,"peer_id":"{peer_id}","public_key":"{public_key}","relay_urls":[],"signature":""}}"#
         );
         let mut record: Reachability = serde_json::from_str(&unsigned)?;
         assert_eq!(record.unsigned()?, unsigned.as_bytes());
-        record.signature = identity.sign_payload("reachability", unsigned.as_bytes())?;
+        record.signature = identity.sign_payload("reachability-v2", unsigned.as_bytes())?;
         record.verify(1001)?;
         let wire = serde_json::to_string(&record)?;
         assert!(serde_json::from_str::<Reachability>(&wire.replace("peer_id", "node_id")).is_err());
@@ -5379,7 +5543,7 @@ mod tests {
             record.issued_at = now - age;
             record.expires_at = record.issued_at + RECORD_TTL_SECS;
             record.direct_urls = vec![format!("ws://127.0.0.1:{port}/api/network/ws")];
-            record.signature = target.sign_payload("reachability", &record.unsigned()?)?;
+            record.signature = target.sign_payload("reachability-v2", &record.unsigned()?)?;
             record.verify(now)?;
             Ok(record)
         };
@@ -5453,7 +5617,7 @@ mod tests {
         let healthy = owner.local_record().await?;
         let mut expiring = healthy.clone();
         expiring.expires_at = now_secs()? + 2;
-        expiring.signature = identity.sign_payload("reachability", &expiring.unsigned()?)?;
+        expiring.signature = identity.sign_payload("reachability-v2", &expiring.unsigned()?)?;
         let (fast, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         let (slow, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         fast.publish(expiring.clone()).await?;
@@ -5591,7 +5755,7 @@ mod tests {
         let target_url = serve(target, &mut tasks).await?;
         let mut record = signed_record(&target_identity, now_secs()?)?;
         record.direct_urls.push(target_url);
-        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = target_identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         let (directory_url, _) = serve_directory(Some(record.clone()), None, &mut tasks).await?;
         let (resolver, _) = NetworkHub::new(
             caller_identity.clone(),
@@ -5618,7 +5782,7 @@ mod tests {
         let (identity, mut updated) = first.context("missing full-table fixture")?;
         updated.issued_at += 1;
         updated.expires_at += 1;
-        updated.signature = identity.sign_payload("reachability", &updated.unsigned()?)?;
+        updated.signature = identity.sign_payload("reachability-v2", &updated.unsigned()?)?;
         assert_eq!(
             resolver.publish(updated.clone()).await?,
             PublishOutcome::Accepted
@@ -5718,7 +5882,7 @@ mod tests {
         let identity = LocalIdentity::generate();
         let mut record = signed_record(&identity, now_secs()?)?;
         record.expires_at = now_secs()? + 2;
-        record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         let held = hub.state.lock().await;
         let mut publish = Box::pin(hub.publish(record.clone()));
@@ -5747,7 +5911,7 @@ mod tests {
         let identity = LocalIdentity::generate();
         let mut record = signed_record(&identity, now_secs()?)?;
         record.expires_at = now_secs()? + 2;
-        record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         assert_eq!(hub.publish(record.clone()).await?, PublishOutcome::Accepted);
         assert!(hub.remember(record.clone()).await?);
@@ -5788,7 +5952,7 @@ mod tests {
                 } else {
                     record.direct_urls = urls;
                 }
-                record.signature = identity.sign_payload("reachability", &record.unsigned()?)?;
+                record.signature = identity.sign_payload("reachability-v2", &record.unsigned()?)?;
                 directories.push(serve_directory(Some(record), None, &mut tasks).await?.0);
             }
             let (resolver, _) = NetworkHub::new(
@@ -5867,10 +6031,11 @@ mod tests {
             .map(|index| format!("{reject_url}/public-{index}"))
             .collect();
         public.relay_urls.push(format!("{reject_url}/relay"));
-        public.signature = target_identity.sign_payload("reachability", &public.unsigned()?)?;
+        public.signature = target_identity.sign_payload("reachability-v2", &public.unsigned()?)?;
         let mut private = signed_record(&target_identity, now_secs()? - 1)?;
         private.direct_urls.push(target_url.clone());
-        private.signature = target_identity.sign_payload("reachability", &private.unsigned()?)?;
+        private.signature =
+            target_identity.sign_payload("reachability-v2", &private.unsigned()?)?;
         assert_eq!(caller.publish(public).await?, PublishOutcome::Accepted);
         assert!(caller.remember(private.clone()).await?);
         seed_mdns_urls(
@@ -6633,7 +6798,7 @@ mod tests {
         let (transport, _) = NetworkHub::new(owner.clone(), NetworkConfig::default());
         let mut record = signed_record(&target_identity, now_secs()?)?;
         record.direct_urls.push(url);
-        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = target_identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         assert!(transport.remember(record).await?);
         let (entered, observed) = oneshot::channel();
         let (resume, gate) = oneshot::channel();
@@ -6809,7 +6974,7 @@ mod tests {
         let stalled_url = serve(stalled, &mut tasks).await?;
         let mut record = signed_record(&target_identity, now_secs()?)?;
         record.direct_urls.push(url.clone());
-        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = target_identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         let fast_gate = Arc::new(Semaphore::new(0));
         let slow_gate = Arc::new(Semaphore::new(0));
         let (fast_url, mut fast_requests) =
@@ -7087,7 +7252,7 @@ mod tests {
         let target_id = target_identity.peer_id()?;
         let mut record = signed_record(&target_identity, now_secs()?)?;
         record.direct_urls = vec![bad_url.clone(), healthy_url.clone()];
-        record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
+        record.signature = target_identity.sign_payload("reachability-v2", &record.unsigned()?)?;
         assert!(transport.remember(record).await?);
         transport
             .record_path(&target_id, &format!("direct:{bad_url}"), true)
