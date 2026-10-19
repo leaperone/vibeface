@@ -165,7 +165,7 @@ impl Drop for MaintenanceGuard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
-    pub node_id: String,
+    pub peer_id: String,
     pub version: String,
 }
 #[derive(Debug)]
@@ -237,8 +237,8 @@ async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Resul
 }
 pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let node_id = crate::config::identity(data_dir)?.node_id()?;
-    let socket_dir = PathBuf::from("/tmp").join(format!("vibeface-{}", &node_id[..32]));
+    let peer_id = crate::config::identity(data_dir)?.peer_id()?;
+    let socket_dir = PathBuf::from("/tmp").join(format!("vibeface-{}", &peer_id[..32]));
     match std::fs::create_dir(&socket_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -353,7 +353,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
         "unsupported maintenance protocol"
     );
     let health = Health {
-        node_id: runtime.identity.node_id()?,
+        peer_id: runtime.identity.peer_id()?,
         version: env!("CARGO_PKG_VERSION").into(),
     };
     let mut response = Response {
@@ -457,7 +457,7 @@ mod tests {
             .join(format!("maintenance-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         config.codex_socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;
@@ -477,7 +477,7 @@ mod tests {
             }
             assert!(node.maintenance.enter().is_err());
             let health = probe(&dir).await?;
-            assert_eq!(health.node_id, node.identity.node_id()?);
+            assert_eq!(health.peer_id, node.identity.peer_id()?);
             assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
             assert!(commit(&dir).await.is_err());
             config::private_write(
@@ -496,7 +496,7 @@ mod tests {
             );
             drop(work);
             let lease = acquire(&dir).await?;
-            assert_eq!(lease.health.node_id, health.node_id);
+            assert_eq!(lease.health.peer_id, health.peer_id);
             assert!(node.maintenance.enter().is_err());
             assert!(
                 node.sync_all("test")
@@ -529,7 +529,7 @@ mod tests {
             })
             .await?;
             assert!(node.maintenance.enter().is_err());
-            assert_eq!(probe(&dir).await?.node_id, health.node_id);
+            assert_eq!(probe(&dir).await?.peer_id, health.peer_id);
             config::private_write(
                 &dir.join("update-pending.json"),
                 br#"{"phase":"confirmed"}"#,

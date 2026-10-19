@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { readInvitation } from '../../../transport.js'
 import { messageOf, parseEntry, parseInvitation } from '@/lib/node'
+import { readConnectionFile } from '@/lib/connection-file'
 import { passphrase } from '@/lib/secure'
 import { primaryLane } from './connection-lane'
 import { StatusOrb } from '@/components/status-orb'
@@ -67,13 +68,22 @@ export function ConnectionScreen() {
     event.preventDefault()
     const form = event.currentTarget
     const relay = form.elements.namedItem('relay')
-    void run(() => device.connect(parseEntry({ address: value(form, 'address'), node_id: value(form, 'node_id'), relay: relay instanceof HTMLInputElement && relay.checked })))
+    void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id'), relay: relay instanceof HTMLInputElement && relay.checked })))
   }
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
     const password = value(form, 'password')
     void run(() => device.pair(invitation, value(form, 'name'), purpose === 'bootstrap' ? passphrase(password, password) : undefined))
+  }
+  async function importConnectionFile(file: File) {
+    const owner = device.connectionGeneration()
+    const content = await readConnectionFile(file)
+    if (owner !== device.connectionGeneration()) return
+    const parsed = readInvitation(content)
+    parseInvitation(parsed)
+    setInvitation(JSON.stringify(parsed))
+    setLane('invite')
   }
   const subtitle = device.review?.kind === 'bootstrap' ? '先保存恢复包，再创建网络。'
     : device.review ? '选择要留下的设备。'
@@ -116,18 +126,24 @@ export function ConnectionScreen() {
       </Card>}
       {!focused && active === 'saved' && <Card className={panel} aria-labelledby="saved-entries-title">
         <h2 id="saved-entries-title" className="font-semibold">{device.entries.length === 1 ? '已保存的入口' : '选择已保存的入口'}</h2>
-        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.node_id}:${entry.relay}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
+        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.peer_id}:${entry.relay}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
           <div className="flex flex-wrap items-center justify-between gap-3"><p className="min-w-0 break-all text-sm">{entry.address}<span className="ml-2 text-xs text-muted-foreground">{entry.relay ? '中继' : '直连'}</span></p><Button className={button} type="button" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>{device.entries.length === 1 && device.phase === 'connecting' ? '正在连接' : '连接'}</Button></div>
-          <p className="break-all font-mono text-xs text-muted-foreground">{entry.node_id}</p>
+          <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
         </li>)}</ul>
         {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
       </Card>}
       {!focused && active === 'invite' && <Card className={panel} aria-labelledby="invite-title">
         <h2 id="invite-title" className="font-semibold">{purpose === 'bootstrap' ? '准备创建网络' : purpose === 'pair' ? '申请加入网络' : '使用邀请'}</h2>
-        <p className="text-sm text-muted-foreground">{purpose === 'bootstrap' ? '口令至少 12 个字符。' : '粘贴邀请。'}</p>
+        <p className="text-sm text-muted-foreground">{purpose === 'bootstrap' ? '口令至少 12 个字符。' : '粘贴连接链接或邀请，也可以导入连接文件。'}</p>
         <form className="space-y-4" onSubmit={submitInvitation}>
           <fieldset disabled={linking || !usable || !!device.review} className="space-y-4 disabled:opacity-70">
-            <label className="grid gap-2 text-sm">邀请内容<Textarea className="min-h-28 font-mono text-xs" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} onChange={event => setInvitation(event.target.value)} /></label>
+            <label className="grid gap-2 text-sm">导入连接文件<Input className={input} type="file" name="connection-file" accept=".json,application/json,text/plain" aria-describedby="connection-file-hint" onChange={event => {
+              const file = event.currentTarget.files?.item(0)
+              event.currentTarget.value = ''
+              if (file) void run(() => importConnectionFile(file))
+            }} /></label>
+            <p id="connection-file-hint" className="text-xs text-muted-foreground">文件不超过 64 KiB。请从管理设备通过可信渠道取得。</p>
+            <label className="grid gap-2 text-sm">连接链接或邀请内容<Textarea className="min-h-28 font-mono text-xs" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} onChange={event => setInvitation(event.target.value)} /></label>
             <label className="grid gap-2 text-sm">此浏览器名称<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
             {purpose === 'bootstrap' && <>
               <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
@@ -144,7 +160,7 @@ export function ConnectionScreen() {
         <form className="space-y-4" onSubmit={connect}>
           <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
             <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} placeholder="http://192.168.0.99:4790" /></label>
-            <label className="grid gap-2 text-sm">目标节点完整指纹<Input className={`${input} font-mono`} name="node_id" required pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备指纹" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
+            <label className="grid gap-2 text-sm">目标节点完整指纹<Input className={`${input} font-mono`} name="peer_id" required pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备指纹" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
             <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" name="relay" />通过入口中继到目标节点</label>
             <Button className={button} type="submit">连接</Button>
           </fieldset>
@@ -165,7 +181,7 @@ export function ConnectionScreen() {
       </div>}
       {device.identity && <Collapsible className="px-1">
         <CollapsibleTrigger asChild><Button variant="ghost" className="min-h-11 w-full justify-between text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">此浏览器的设备指纹<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
-        <CollapsibleContent forceMount className="px-3 pb-3 data-[state=closed]:hidden"><p className="break-all font-mono text-xs text-muted-foreground">{device.identity.nodeId}</p></CollapsibleContent>
+        <CollapsibleContent forceMount className="px-3 pb-3 data-[state=closed]:hidden"><p className="break-all font-mono text-xs text-muted-foreground">{device.identity.peerId}</p></CollapsibleContent>
       </Collapsible>}
     </div>
   </main>

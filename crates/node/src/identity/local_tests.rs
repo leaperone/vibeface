@@ -13,7 +13,7 @@ use std::{
 
 fn fixture() -> Result<(
     PathBuf,
-    IdentityStore,
+    Store,
     LocalIdentity,
     LocalIdentity,
     LocalIdentity,
@@ -22,7 +22,7 @@ fn fixture() -> Result<(
     let root_dir = std::env::temp_dir().join(format!("vibeface-identity-tests-{}", random_id()));
     fs::create_dir_all(&root_dir)?;
     fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700))?;
-    let store = IdentityStore::open(&root_dir.join("identity.sqlite3"))?;
+    let store = Store::open(&root_dir.join("node.sqlite3"))?;
     let root = LocalIdentity::generate();
     let node = LocalIdentity::generate();
     let admin = LocalIdentity::generate();
@@ -41,7 +41,7 @@ fn fixture() -> Result<(
 }
 
 fn invite_request(
-    store: &IdentityStore,
+    store: &Store,
     admin: &LocalIdentity,
     capability: &str,
     manage: bool,
@@ -50,7 +50,7 @@ fn invite_request(
     let payload = store.create_invite(InviteRequest {
         request_id: random_id(),
         network_id: view.network_id,
-        inviter_subject_id: admin.node_id()?,
+        inviter_subject_id: admin.peer_id()?,
         epoch: view.epoch,
         capability: capability.to_owned(),
         new_kind: IdentityKind::Client,
@@ -73,7 +73,7 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
     let root_dir = std::env::temp_dir().join(format!("vibeface-bootstrap-{}", random_id()));
     fs::create_dir_all(&root_dir)?;
     fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700))?;
-    let store = IdentityStore::open(&root_dir.join("identity.sqlite3"))?;
+    let store = Store::open(&root_dir.join("node.sqlite3"))?;
     let cap = store.bootstrap_capability()?;
     assert!(store.bootstrap_capability().is_err());
     let root = LocalIdentity::generate();
@@ -84,15 +84,15 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
     )?)?;
     assert!(
         store
-            .bootstrap_network(state.clone(), &cap.capability, &root.node_id()?)
+            .bootstrap_network(state.clone(), &cap.capability, &root.peer_id()?)
             .is_err()
     );
     assert!(
         store
-            .bootstrap_network(state.clone(), "00".repeat(32).as_str(), &admin.node_id()?)
+            .bootstrap_network(state.clone(), "00".repeat(32).as_str(), &admin.peer_id()?)
             .is_err()
     );
-    store.bootstrap_network(state, &cap.capability, &admin.node_id()?)?;
+    store.bootstrap_network(state, &cap.capability, &admin.peer_id()?)?;
     assert!(
         store
             .bootstrap_network(
@@ -101,7 +101,7 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
                     vec![Member::client(&admin, "admin", true)?]
                 )?)?,
                 &cap.capability,
-                &admin.node_id()?
+                &admin.peer_id()?
             )
             .is_err()
     );
@@ -110,7 +110,7 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
 
 #[test]
 fn invite_pair_review_and_grant_are_exact_and_capability_is_not_a_hash() -> Result<()> {
-    let (_dir, store, admin, _peer, _root, _state) = fixture()?;
+    let (_dir, mut store, admin, _peer, _root, _state) = fixture()?;
     let new_client = LocalIdentity::generate();
     let capability = random_hex(32);
     let (payload, envelope) = invite_request(&store, &admin, &capability, false)?;
@@ -142,7 +142,7 @@ fn invite_pair_review_and_grant_are_exact_and_capability_is_not_a_hash() -> Resu
             .accept_pair(review.clone(), new_signature.clone())
             .is_ok()
     );
-    assert!(!store.pending_pairs(&admin.node_id()?)?.is_empty());
+    assert!(!store.pending_pairs(&admin.peer_id()?)?.is_empty());
     let inviter_signature = admin.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
     let proposal = store.confirm_pair(PairConfirm {
         review: review.clone(),
@@ -187,10 +187,19 @@ fn management_grants_and_private_path_boundaries_are_rejected() -> Result<()> {
     let public_dir = std::env::temp_dir().join(format!("vibeface-public-{}", random_id()));
     fs::create_dir_all(&public_dir)?;
     fs::set_permissions(&public_dir, fs::Permissions::from_mode(0o755))?;
-    assert!(IdentityStore::open(&public_dir.join("identity.sqlite3")).is_err());
+    assert!(Store::open(&public_dir.join("node.sqlite3")).is_err());
     let link = dir.join("link.sqlite3");
-    symlink(store.path(), &link)?;
-    assert!(IdentityStore::open(&link).is_err());
+    symlink(dir.join("node.sqlite3"), &link)?;
+    assert!(Store::open(&link).is_err());
+    let directory = dir.join("directory.sqlite3");
+    fs::create_dir(&directory)?;
+    assert!(Store::open(&directory).is_err());
+    let parent_link = dir.join("linked-directory");
+    symlink(&dir, &parent_link)?;
+    assert!(Store::open(parent_link.join("node.sqlite3")).is_err());
+    let sidecar_link = dir.join("unsafe.sqlite3-wal");
+    symlink(dir.join("node.sqlite3"), sidecar_link)?;
+    assert!(Store::open(dir.join("unsafe.sqlite3")).is_err());
     Ok(())
 }
 
@@ -239,7 +248,7 @@ fn pair_review_tamper_expiry_and_request_identity_reuse_are_rejected() -> Result
 
 #[test]
 fn two_invites_have_independent_pair_and_grant_records() -> Result<()> {
-    let (_dir, store, admin, _peer, _root, _state) = fixture()?;
+    let (_dir, mut store, admin, _peer, _root, _state) = fixture()?;
     for label in ["one", "two"] {
         let client = LocalIdentity::generate();
         let capability = random_hex(32);

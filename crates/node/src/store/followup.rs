@@ -260,7 +260,7 @@ pub(super) fn append_report_intent_from(
     report_results: bool,
     at: i64,
 ) -> Result<Option<String>> {
-    let author = identity.node_id()?;
+    let author = identity.peer_id()?;
     authorize_node_from(connection, network, &author, Some(NodeRole::Gateway))?;
     authorize_node_from(connection, network, target, Some(NodeRole::Scheduler))?;
     let events = load_events_from(connection, network)?;
@@ -462,273 +462,8 @@ fn policy_from(
     Ok(policy)
 }
 
-fn validate_task_result_from(
-    connection: &Connection,
-    network: &str,
-    scope: &str,
-    trigger: &str,
-    scheduler: &str,
-) -> Result<FollowupPolicy> {
-    let events = scope_events(connection, network, scope)?;
-    let result = events.get(trigger).context("follow-up result is missing")?;
-    ensure!(
-        result.status == "ready" && result.event.scope_id == scope,
-        "follow-up result has the wrong conversation"
-    );
-    let EventBody::ExecutionObserved {
-        operation_id,
-        task_id: Some(task),
-        target_node,
-        session_id,
-        status,
-        ..
-    } = &result.event.body
-    else {
-        bail!("follow-up needs an execution task result")
-    };
-    ensure!(
-        result.event.author == *target_node
-            && matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
-        "follow-up requires the original executor's known terminal result"
-    );
-    authorize_node_from(connection, network, target_node, Some(NodeRole::Executor))?;
-    let policy = followup_policy_from(connection, network, scope, task)?;
-    ensure!(
-        policy.mode != FollowupMode::Off && policy.target_node == scheduler,
-        "follow-up is disabled or belongs to another scheduler"
-    );
-    let mut original = None;
-    for hash in closure_hashes(&events, &[trigger.into()]) {
-        let Some(dispatch) = events.get(&hash) else {
-            continue;
-        };
-        let EventBody::DispatchRecorded {
-            operation_id: id,
-            task_id: Some(dispatch_task),
-            target_node: target,
-            session_id: session,
-            action,
-        } = &dispatch.event.body
-        else {
-            continue;
-        };
-        if id != operation_id {
-            continue;
-        }
-        let request: OperationRequest = serde_json::from_value(action.clone())?;
-        ensure!(
-            dispatch.event.scope_id == scope
-                && dispatch_task == task
-                && target == target_node
-                && session == session_id
-                && request.network_id == network
-                && request.conversation_id == scope
-                && request.operation_id == *operation_id
-                && request.task_id.as_ref() == Some(task)
-                && request.target_node == *target_node
-                && request.session_id == *session_id
-                && request.action["type"] == "send"
-                && ancestor(&events, &hash, &policy.task_ref),
-            "execution result does not match its original dispatch"
-        );
-        let certificate = authorize_node_from(connection, network, &dispatch.event.author, None)?;
-        ensure!(
-            certificate.roles.contains(&NodeRole::Gateway)
-                || certificate.roles.contains(&NodeRole::Scheduler),
-            "dispatch author is not authorized"
-        );
-        let binding = request
-            .binding
-            .as_ref()
-            .context("follow-up dispatch has no signed task binding")?;
-        let creation = events
-            .get(&policy.task_ref)
-            .context("task creation is missing")?;
-        ensure!(
-            binding.binding.network_id == network
-                && binding.binding.conversation_id == scope
-                && binding.binding.task_id == *task
-                && binding.binding.task_ref == policy.task_ref
-                && binding.binding.authority_node == creation.event.author
-                && binding.binding.target_node == *target_node
-                && Some(binding.binding.session_id.as_str()) == session_id.as_deref(),
-            "follow-up dispatch task binding mismatch"
-        );
-        let key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
-            params![network, binding.binding.authority_node],
-            |row| row.get(0),
-        )?;
-        crate::binding::verify_binding(binding, &key)?;
-        if let Some(original) = &original {
-            ensure!(
-                original == &request,
-                "execution result has conflicting dispatch bodies"
-            );
-        } else {
-            original = Some(request);
-        }
-    }
-    ensure!(original.is_some(), "execution result dispatch is missing");
-    Ok(policy)
-}
 
-fn human_dispatch_source_from(
-    connection: &Connection,
-    network: &str,
-    scope: &str,
-    events: &BTreeMap<String, StoredEvent>,
-    request: &OperationRequest,
-) -> Result<()> {
-    let authority = request
-        .manager_authority
-        .as_ref()
-        .context("execution dispatch has no original manager invocation")?;
-    ensure!(
-        authority.followup_version == 0,
-        "ordinary execution must originate in a human invocation"
-    );
-    let source = events
-        .get(&authority.trigger)
-        .context("execution origin message is missing")?;
-    ensure!(
-        source.status == "ready"
-            && source.event.scope_id == scope
-            && matches!(&source.event.body,
-                EventBody::MessagePosted { role, scheduler_node: Some(target), .. }
-                if role == "user" && target == &authority.scheduler_node),
-        "execution origin is not its fixed scheduler's user message"
-    );
-    authorize_node_from(
-        connection,
-        network,
-        &source.event.author,
-        Some(NodeRole::Gateway),
-    )?;
-    authorize_node_from(
-        connection,
-        network,
-        &authority.scheduler_node,
-        Some(NodeRole::Scheduler),
-    )?;
-    ensure!(
-        request.basis_heads.iter().any(|head| {
-            head == &authority.trigger || ancestor(events, head, &authority.trigger)
-        }),
-        "execution dispatch did not consume its original human message"
-    );
-    let intent = intent_from(connection, network, scope, events, &authority.trigger, true)?;
-    if let Some((head, _)) = &intent {
-        ensure!(
-            request
-                .basis_heads
-                .iter()
-                .any(|basis| basis == head || ancestor(events, basis, head)),
-            "execution dispatch did not consume its result-report intent"
-        );
-    }
-    Ok(())
-}
 
-fn ordinary_result_policy_from(
-    connection: &Connection,
-    network: &str,
-    scope: &str,
-    events: &BTreeMap<String, StoredEvent>,
-    trigger: &str,
-) -> Result<ResultFollowupPolicy> {
-    let result = events.get(trigger).context("execution result is missing")?;
-    let EventBody::ExecutionObserved {
-        operation_id,
-        task_id: None,
-        target_node,
-        session_id,
-        status,
-        ..
-    } = &result.event.body
-    else {
-        bail!("ordinary result requires an execution without a task")
-    };
-    ensure!(
-        result.status == "ready"
-            && result.event.scope_id == scope
-            && result.event.author == *target_node
-            && matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
-        "ordinary result requires its executor's known terminal result"
-    );
-    authorize_node_from(connection, network, target_node, Some(NodeRole::Executor))?;
-    let mut original = None;
-    for hash in closure_hashes(events, &[trigger.into()]) {
-        let Some(dispatch) = events.get(&hash) else {
-            continue;
-        };
-        let EventBody::DispatchRecorded {
-            operation_id: id,
-            task_id,
-            target_node: target,
-            session_id: session,
-            action,
-        } = &dispatch.event.body
-        else {
-            continue;
-        };
-        if id != operation_id {
-            continue;
-        }
-        let request: OperationRequest = serde_json::from_value(action.clone())?;
-        let authority = request
-            .manager_authority
-            .as_ref()
-            .context("ordinary result has no original manager invocation")?;
-        ensure!(
-            dispatch.status == "ready"
-                && dispatch.event.scope_id == scope
-                && dispatch.event.author == authority.scheduler_node
-                && task_id.is_none()
-                && request.task_id.is_none()
-                && request.binding.is_none()
-                && target == target_node
-                && session == session_id
-                && request.network_id == network
-                && request.conversation_id == scope
-                && request.operation_id == *operation_id
-                && request.target_node == *target_node
-                && request.session_id == *session_id
-                && (matches!(
-                    request.action["type"].as_str(),
-                    Some("command" | "send" | "steer" | "interrupt" | "respond_request")
-                ) || (request.action["type"] == "open" && status != "succeeded")),
-            "ordinary result does not match its original signed dispatch"
-        );
-        human_dispatch_source_from(connection, network, scope, events, &request)?;
-        if let Some(original) = &original {
-            ensure!(
-                original == &request,
-                "execution result has conflicting dispatch bodies"
-            );
-        } else {
-            original = Some(request);
-        }
-    }
-    let request = original.context("ordinary result dispatch is missing")?;
-    let authority = request
-        .manager_authority
-        .as_ref()
-        .context("manager invocation missing")?;
-    let (head, intent) = intent_from(connection, network, scope, events, &authority.trigger, true)?
-        .context("ordinary result reporting intent is missing")?;
-    ensure!(
-        intent.mode == FollowupMode::Report,
-        "ordinary result reporting is disabled"
-    );
-    Ok(ResultFollowupPolicy {
-        task_id: None,
-        target_node: authority.scheduler_node.clone(),
-        mode: FollowupMode::Report,
-        version: intent.version,
-        proof_heads: vec![trigger.into(), authority.trigger.clone(), head.into()],
-    })
-}
 
 pub(super) fn validate_followup_result_from(
     connection: &Connection,
@@ -738,59 +473,40 @@ pub(super) fn validate_followup_result_from(
     scheduler: &str,
 ) -> Result<ResultFollowupPolicy> {
     let events = scope_events(connection, network, scope)?;
-    let result = events.get(trigger).context("follow-up result is missing")?;
-    let policy = match &result.event.body {
-        EventBody::ExecutionObserved {
-            task_id: Some(_), ..
-        } => validate_task_result_from(connection, network, scope, trigger, scheduler)?.into(),
-        EventBody::ExecutionObserved { task_id: None, .. } => {
-            ordinary_result_policy_from(connection, network, scope, &events, trigger)?
+    let result = events.get(trigger).context("agent result is missing")?;
+    let EventBody::AgentMessage { message } = &result.event.body else {
+        bail!("follow-up requires an agent result");
+    };
+    ensure!(
+        agent_messages::validate_agent_trigger_from(connection, network, &result.event, message, scheduler)?
+            == TriggerKind::AgentResult,
+        "follow-up requires a terminal agent result"
+    );
+    let mut source = message.origin_trigger.as_str();
+    let mut visited = BTreeSet::new();
+    loop {
+        ensure!(visited.insert(source), "cyclic agent origin");
+        let origin = events.get(source).context("agent result origin is missing")?;
+        match &origin.event.body {
+            EventBody::MessagePosted { role, .. } if role == "user" => break,
+            EventBody::AgentMessage { message } => source = &message.origin_trigger,
+            _ => bail!("agent result origin is not a user request or agent task"),
         }
-        _ => bail!("follow-up requires an execution result"),
-    };
-    ensure!(
-        policy.target_node == scheduler,
-        "execution result belongs to another scheduler"
-    );
-    Ok(policy)
-}
-
-pub(super) fn validate_manager_dispatch_from(
-    connection: &Connection,
-    network: &str,
-    request: &OperationRequest,
-) -> Result<()> {
-    let Some(authority) = &request.manager_authority else {
-        return Ok(());
-    };
-    let events = scope_events(connection, network, &request.conversation_id)?;
-    if matches!(events.get(&authority.trigger).map(|source| &source.event.body),
-        Some(EventBody::MessagePosted { role, .. }) if role == "user")
-    {
-        human_dispatch_source_from(
-            connection,
-            network,
-            &request.conversation_id,
-            &events,
-            request,
-        )?;
-        return Ok(());
     }
-    let policy = validate_followup_result_from(
-        connection,
-        network,
-        &request.conversation_id,
-        &authority.trigger,
-        &authority.scheduler_node,
-    )?;
+    let intent = intent_from(connection, network, scope, &events, source, true)?;
     ensure!(
-        policy.version == authority.followup_version
-            && policy.mode == FollowupMode::Continue
-            && request.task_id.is_some()
-            && request.task_id == policy.task_id,
-        "autonomous dispatch permission was revoked or changed"
+        intent.as_ref().is_none_or(|(_, intent)| intent.mode != FollowupMode::Off),
+        "result reporting is disabled"
     );
-    Ok(())
+    Ok(ResultFollowupPolicy {
+        task_id: None,
+        target_node: scheduler.into(),
+        mode: FollowupMode::Report,
+        version: intent.as_ref().map_or(1, |(_, intent)| intent.version),
+        proof_heads: std::iter::once(trigger.to_owned())
+            .chain(intent.map(|(hash, _)| hash.to_owned()))
+            .collect(),
+    })
 }
 
 impl Store {
@@ -831,27 +547,15 @@ impl Store {
         validate_followup_result_from(&self.connection, network, scope, trigger, scheduler)
     }
 
-    pub fn execution_result_policy(
-        &self,
-        network: &str,
-        scope: &str,
-        trigger: &str,
+    pub fn agent_result_policy(
+        &self, network: &str, scope: &str, trigger: &str,
     ) -> Result<ResultFollowupPolicy> {
         let events = scope_events(&self.connection, network, scope)?;
-        let result = events.get(trigger).context("execution result is missing")?;
-        match &result.event.body {
-            EventBody::ExecutionObserved {
-                task_id: Some(task),
-                ..
-            } => {
-                let policy = self.followup_policy(network, scope, task)?;
-                self.validate_followup_result(network, scope, trigger, &policy.target_node)
-            }
-            EventBody::ExecutionObserved { task_id: None, .. } => {
-                ordinary_result_policy_from(&self.connection, network, scope, &events, trigger)
-            }
-            _ => bail!("follow-up requires an execution result"),
-        }
+        let result = events.get(trigger).context("agent result is missing")?;
+        let EventBody::AgentMessage { message } = &result.event.body else {
+            bail!("follow-up requires an agent result");
+        };
+        validate_followup_result_from(&self.connection, network, scope, trigger, &message.target_node)
     }
 
     pub fn original_message_route(
@@ -889,25 +593,6 @@ impl Store {
         Ok(found)
     }
 
-    pub fn require_followup_version(
-        &self,
-        network: &str,
-        scope: &str,
-        task: &str,
-        mode: FollowupMode,
-        version: u64,
-        target: &str,
-    ) -> Result<()> {
-        let current = self.followup_policy(network, scope, task)?;
-        ensure!(
-            current.version == version
-                && current.mode == mode
-                && current.mode != FollowupMode::Off
-                && current.target_node == target,
-            "task follow-up permission was revoked or changed"
-        );
-        Ok(())
-    }
 
     pub fn validate_latest_manager_policy(
         &self,
@@ -950,7 +635,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &identity.node_id()?, Some(NodeRole::Gateway))?;
+        authorize_node_from(&tx, network, &identity.peer_id()?, Some(NodeRole::Gateway))?;
         let current = policy_from(&tx, network, scope, task, mode != FollowupMode::Off)?;
         ensure!(
             current.version == expected_version,
@@ -1016,7 +701,7 @@ impl Store {
             ensure!(previous.event.body == body, "task ID reused with different content");
             return Ok(previous.envelope.clone());
         }
-        let scheduler = identity.node_id()?;
+        let scheduler = identity.peer_id()?;
         let verified_origin = if let Some((trigger, attempt_id)) = origin {
             authorize_node_from(&tx, network, &scheduler, Some(NodeRole::Scheduler))?;
             let session = load_scheduler_session(&tx, network, scope, &scheduler)?;
@@ -1095,26 +780,20 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        binding::{TaskBinding, sign_binding},
-        scheduling::{ManagerAttempt, SchedulerSession},
-    };
-    use serde_json::json;
+    use crate::scheduling::JobOutcome;
+
+    fn roles() -> Vec<NodeRole> {
+        vec![NodeRole::Gateway, NodeRole::Replica, NodeRole::Scheduler]
+    }
 
     fn fixture() -> Result<(Store, LocalIdentity, String, String)> {
         let identity = LocalIdentity::generate();
         let network = identity.fixture_network_id()?;
-        let node = identity.node_id()?;
+        let node = identity.peer_id()?;
         let mut store = Store::open(":memory:")?;
-        let roles = vec![
-            NodeRole::Gateway,
-            NodeRole::Replica,
-            NodeRole::Scheduler,
-            NodeRole::Executor,
-        ];
         store.install_trust_bundle(
             &network,
-            &identity.sign_network_fixture(1, vec![identity.certificate(roles)?])?,
+            &identity.sign_network_fixture(1, vec![identity.certificate(roles())?])?,
         )?;
         store.append_event(
             &identity,
@@ -1164,36 +843,15 @@ mod tests {
         network: &str,
         node: &str,
         message: &SignedEvent,
-        attempt_id: &str,
-    ) -> Result<()> {
-        let mut session = SchedulerSession::new("chat", node);
-        session.active = Some(message.hash.clone());
-        let job = SchedulerJob {
-            version: 1,
-            conversation_id: "chat".into(),
-            trigger: message.hash.clone(),
-            target_node: node.into(),
-            kind: TriggerKind::Human,
-            sequence: 1,
-            basis_heads: store.heads(network, "chat")?,
-            message_id: "assistant".into(),
-            state: JobState::Running {
-                attempt: ManagerAttempt {
-                    id: attempt_id.into(),
-                    boot: "test".into(),
-                    read_only: false,
-                    permission_version: 1,
-                    followup_version: None,
-                },
-            },
-        };
-        scheduler_save(
-            &store.connection,
-            network,
-            &scheduler_key("job", "chat", node, &message.hash),
-            &job,
-        )?;
-        save_scheduler_session(&store.connection, network, &session)
+    ) -> Result<String> {
+        store.enqueue_trigger(network, "chat", &message.hash, node)?;
+        let claimed = store
+            .claim_next(network, "chat", node, "test", "sdk")?
+            .context("human invocation missing")?;
+        ensure!(claimed.job.trigger == message.hash, "another invocation was claimed");
+        let attempt = claimed.job.state.attempt().context("attempt missing")?.id.clone();
+        store.mark_started(network, "chat", node, &message.hash, &attempt)?;
+        Ok(attempt)
     }
 
     fn task_body(id: &str) -> EventBody {
@@ -1205,133 +863,56 @@ mod tests {
         }
     }
 
+    fn agent_task(
+        store: &mut Store,
+        identity: &LocalIdentity,
+        network: &str,
+        target: &str,
+        origin: &SignedEvent,
+    ) -> Result<SignedEvent> {
+        store.append_event(
+            identity,
+            network,
+            "chat",
+            EventBody::AgentMessage {
+                message: AgentMessage {
+                    message_id: format!("agent-task-{}", origin.hash),
+                    target_node: target.into(),
+                    origin_trigger: origin.hash.clone(),
+                    in_reply_to: None,
+                    kind: AgentMessageKind::Task,
+                    text: "work".into(),
+                },
+            },
+            vec![],
+            4,
+        )
+    }
+
     fn result(
         store: &mut Store,
         identity: &LocalIdentity,
         network: &str,
-        node: &str,
-        task: &str,
+        target: &str,
+        task: &SignedEvent,
+        kind: AgentMessageKind,
     ) -> Result<SignedEvent> {
-        let creation = store.task_creation(network, "chat", task)?;
-        let binding = sign_binding(
-            identity,
-            &TaskBinding {
-                network_id: network.into(),
-                conversation_id: "chat".into(),
-                task_ref: creation.hash,
-                task_id: task.into(),
-                authority_node: node.into(),
-                generation: 1,
-                target_node: node.into(),
-                session_id: "execution".into(),
-                open_spec: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
-                previous_binding_hash: None,
-                previous_seal: None,
-            },
-        )?;
-        let request = OperationRequest {
-            operation_id: "send".into(),
-            network_id: network.into(),
-            conversation_id: "chat".into(),
-            task_id: Some(task.into()),
-            target_node: node.into(),
-            session_id: Some("execution".into()),
-            expected_revision: 1,
-            basis_heads: store.heads(network, "chat")?,
-            action: json!({"type":"send","text":"work"}),
-            resources: vec![],
-            binding: Some(binding),
-            manager_authority: None,
+        let EventBody::AgentMessage { message } = store.verify_event(network, task)?.body else {
+            bail!("agent task fixture is missing");
         };
         store.append_event(
             identity,
             network,
             "chat",
-            EventBody::DispatchRecorded {
-                operation_id: "send".into(),
-                task_id: Some(task.into()),
-                target_node: node.into(),
-                session_id: Some("execution".into()),
-                action: serde_json::to_value(request)?,
-            },
-            vec![],
-            4,
-        )?;
-        store.append_event(
-            identity,
-            network,
-            "chat",
-            EventBody::ExecutionObserved {
-                operation_id: "send".into(),
-                task_id: Some(task.into()),
-                target_node: node.into(),
-                session_id: Some("execution".into()),
-                status: "succeeded".into(),
-                detail: json!({"text":"done"}),
-            },
-            vec![],
-            5,
-        )
-    }
-
-    fn ordinary_request(
-        store: &Store,
-        network: &str,
-        node: &str,
-        message: &SignedEvent,
-        operation: &str,
-    ) -> Result<OperationRequest> {
-        Ok(OperationRequest {
-            operation_id: operation.into(),
-            network_id: network.into(),
-            conversation_id: "chat".into(),
-            task_id: None,
-            target_node: node.into(),
-            session_id: None,
-            expected_revision: 0,
-            basis_heads: store.heads(network, "chat")?,
-            action: json!({"type":"command","argv":["pwd"],"cwd":"/tmp","timeout_secs":1}),
-            resources: vec![],
-            binding: None,
-            manager_authority: Some(ManagerDispatchAuthority {
-                scheduler_node: node.into(),
-                trigger: message.hash.clone(),
-                followup_version: 0,
-            }),
-        })
-    }
-
-    fn ordinary_result(
-        store: &mut Store,
-        identity: &LocalIdentity,
-        request: &OperationRequest,
-        result_session: Option<String>,
-    ) -> Result<SignedEvent> {
-        store.append_event(
-            identity,
-            &request.network_id,
-            &request.conversation_id,
-            EventBody::DispatchRecorded {
-                operation_id: request.operation_id.clone(),
-                task_id: None,
-                target_node: request.target_node.clone(),
-                session_id: request.session_id.clone(),
-                action: serde_json::to_value(request)?,
-            },
-            vec![],
-            4,
-        )?;
-        store.append_event(
-            identity,
-            &request.network_id,
-            &request.conversation_id,
-            EventBody::ExecutionObserved {
-                operation_id: request.operation_id.clone(),
-                task_id: None,
-                target_node: request.target_node.clone(),
-                session_id: result_session,
-                status: "succeeded".into(),
-                detail: json!({"exit_code":0,"stdout":"/tmp"}),
+            EventBody::AgentMessage {
+                message: AgentMessage {
+                    message_id: format!("agent-result-{kind:?}-{}", task.hash),
+                    target_node: target.into(),
+                    origin_trigger: message.origin_trigger,
+                    in_reply_to: Some(task.hash.clone()),
+                    kind,
+                    text: "done".into(),
+                },
             },
             vec![],
             5,
@@ -1339,175 +920,155 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_results_are_read_only_durable_jobs_without_task_creation() -> Result<()> {
+    fn terminal_results_are_read_only_durable_jobs_without_business_task_creation() -> Result<()> {
         let (mut store, identity, network, node) = fixture()?;
-        let (message, _) = store.accept_message(
+        let message = intent(&mut store, &identity, &network, &node, "ordinary", true)?;
+        let attempt = claim(&mut store, &network, &node, &message)?;
+        let task = agent_task(&mut store, &identity, &network, &node, &message)?;
+        let completion = result(
+            &mut store,
             &identity,
             &network,
-            "chat",
-            EventBody::MessagePosted {
-                message_id: "ordinary".into(),
-                role: "user".into(),
-                text: "where am I".into(),
-                scheduler_node: Some(node.clone()),
-            },
-            vec![],
-            2,
             &node,
-            &node,
-            true,
+            &task,
+            AgentMessageKind::Completed,
         )?;
-        let human = store
-            .claim_next(&network, "chat", &node, "test", "sdk")?
-            .context("human invocation missing")?;
-        let attempt = human.job.state.attempt().context("human attempt missing")?;
-        let request = ordinary_request(&store, &network, &node, &message, "ordinary-command")?;
-        validate_manager_dispatch_from(&store.connection, &network, &request)?;
-        let result = ordinary_result(&mut store, &identity, &request, None)?;
         store.finish_job(
             &identity,
             &network,
             "chat",
             &node,
             &message.hash,
-            &attempt.id,
-            crate::scheduling::JobOutcome::Failed("fixture manager has returned".into()),
+            &attempt,
+            JobOutcome::Failed("fixture source has returned".into()),
             vec![],
             6,
         )?;
-        let policy = store.validate_followup_result(&network, "chat", &result.hash, &node)?;
-        assert_eq!(policy.task_id, None);
-        assert_eq!(policy.mode, FollowupMode::Report);
-        let first = store.enqueue_trigger(&network, "chat", &result.hash, &node)?;
-        assert_eq!(
-            store.enqueue_trigger(&network, "chat", &result.hash, &node)?,
-            first
-        );
+        let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
+        assert_eq!((policy.task_id, policy.mode, policy.version), (None, FollowupMode::Report, 1));
+        assert_eq!(policy.target_node, node);
+        let first = store.enqueue_trigger(&network, "chat", &completion.hash, &node)?;
+        assert_eq!(store.enqueue_trigger(&network, "chat", &completion.hash, &node)?, first);
         let followup = store
             .claim_next(&network, "chat", &node, "test", "sdk")?
-            .context("read-only result report missing")?;
-        assert!(
-            followup
-                .job
-                .state
-                .attempt()
-                .context("report attempt missing")?
-                .read_only
-        );
+            .context("result report missing")?;
+        assert_eq!(followup.job.trigger, completion.hash);
+        assert_eq!(followup.job.kind, TriggerKind::AgentResult);
+        let report = followup.job.state.attempt().context("report attempt missing")?;
+        assert!(report.read_only);
+        assert_eq!(report.followup_version, Some(1));
         assert!(followup.previous_native_id.is_none());
-        assert!(
-            store
-                .claim_next(&network, "chat", &node, "test", "sdk")?
-                .is_none()
-        );
+        assert!(store.claim_next(&network, "chat", &node, "test", "sdk")?.is_none());
         assert!(store.tasks(&network, "chat")?.is_empty());
-        assert!(
-            store
-                .context(&network, "chat", &[])?
-                .events
-                .iter()
-                .all(|event| !matches!(event.body, EventBody::TaskCreated { .. }))
-        );
-        store.validate_latest_manager_policy(&network, "chat", &result.hash, &node, 1, None)?;
-        assert!(
-            store
-                .validate_latest_manager_policy(
-                    &network,
-                    "chat",
-                    &result.hash,
-                    &node,
-                    1,
-                    Some("anything")
-                )
-                .is_err()
-        );
-        let mut forged = request;
-        forged.operation_id = "report-cannot-continue".into();
-        forged.basis_heads = store.heads(&network, "chat")?;
-        forged.manager_authority = Some(ManagerDispatchAuthority {
-            scheduler_node: node,
-            trigger: result.hash,
-            followup_version: 1,
-        });
-        assert!(validate_manager_dispatch_from(&store.connection, &network, &forged).is_err());
+        store.validate_latest_manager_policy(&network, "chat", &completion.hash, &node, 1, None)?;
+        assert!(store.validate_latest_manager_policy(
+            &network, "chat", &completion.hash, &node, 1, Some("anything")
+        ).is_err());
+        let report_attempt = report.id.clone();
+        assert!(store.create_task_with_origin(
+            &identity, &network, "chat", task_body("forbidden"),
+            Some((&completion.hash, &report_attempt)), 7
+        ).is_err());
+        assert!(store.tasks(&network, "chat")?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn ordinary_results_require_the_original_human_dispatch_scope_and_report_intent() -> Result<()>
-    {
+    fn terminal_results_require_the_original_agent_source_target_and_request() -> Result<()> {
         let (mut store, identity, network, node) = fixture()?;
-        let message = intent(&mut store, &identity, &network, &node, "ordinary", true)?;
-        let request = ordinary_request(&store, &network, &node, &message, "mismatched-session")?;
-        let mismatch = ordinary_result(
-            &mut store,
-            &identity,
-            &request,
-            Some("injected-session".into()),
-        )?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &mismatch.hash, &node)
-                .is_err()
-        );
-        let mut wrong_source = ordinary_request(&store, &network, &node, &message, "wrong-origin")?;
-        wrong_source
-            .manager_authority
-            .as_mut()
-            .context("authority missing")?
-            .trigger = mismatch.hash;
-        let mismatch = ordinary_result(&mut store, &identity, &wrong_source, None)?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &mismatch.hash, &node)
-                .is_err()
-        );
-        let off = intent(&mut store, &identity, &network, &node, "off", false)?;
-        let request = ordinary_request(&store, &network, &node, &off, "report-disabled")?;
-        let disabled = ordinary_result(&mut store, &identity, &request, None)?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &disabled.hash, &node)
-                .is_err()
-        );
-        let mut request =
-            ordinary_request(&store, &network, &node, &message, "missing-origin-proof")?;
-        request.basis_heads.clear();
-        let missing = ordinary_result(&mut store, &identity, &request, None)?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &missing.hash, &node)
-                .is_err()
-        );
-        let other = LocalIdentity::generate();
+        let peer = LocalIdentity::generate();
+        let peer_node = peer.peer_id()?;
         store.install_trust_bundle(
             &network,
             &identity.sign_network_fixture(
                 2,
-                vec![
-                    identity.certificate(vec![
-                        NodeRole::Gateway,
-                        NodeRole::Replica,
-                        NodeRole::Scheduler,
-                        NodeRole::Executor,
-                    ])?,
-                    other.certificate(vec![
-                        NodeRole::Gateway,
-                        NodeRole::Replica,
-                        NodeRole::Executor,
-                    ])?,
-                ],
+                vec![identity.certificate(roles())?, peer.certificate(roles())?],
             )?,
         )?;
-        let mut borrowed = ordinary_request(&store, &network, &node, &message, "borrowed-manager")?;
-        borrowed.target_node = other.node_id()?;
-        let forged = ordinary_result(&mut store, &other, &borrowed, None)?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &forged.hash, &node)
-                .is_err()
-        );
+        let message = intent(&mut store, &identity, &network, &node, "request", true)?;
+        let another = intent(&mut store, &identity, &network, &node, "another", true)?;
+        let task = agent_task(&mut store, &identity, &network, &peer_node, &message)?;
+        for kind in [
+            AgentMessageKind::Completed,
+            AgentMessageKind::Failed,
+            AgentMessageKind::Interrupted,
+        ] {
+            let completion = result(&mut store, &peer, &network, &node, &task, kind)?;
+            let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
+            assert_eq!((policy.mode, policy.version, policy.task_id), (FollowupMode::Report, 1, None));
+            assert_eq!(policy.target_node, node);
+            assert_eq!(policy.proof_heads[0], completion.hash);
+        }
+        for (index, author, target, origin, reply, kind) in [
+            (0, &identity, &node, &message.hash, Some(task.hash.clone()), AgentMessageKind::Completed),
+            (1, &peer, &peer_node, &message.hash, Some(task.hash.clone()), AgentMessageKind::Completed),
+            (2, &peer, &node, &another.hash, Some(task.hash.clone()), AgentMessageKind::Completed),
+            (3, &peer, &node, &message.hash, Some(message.hash.clone()), AgentMessageKind::Completed),
+            (4, &peer, &node, &message.hash, None, AgentMessageKind::Completed),
+            (5, &peer, &node, &message.hash, Some(task.hash.clone()), AgentMessageKind::Progress),
+        ] {
+            let forged = store.append_event(
+                author,
+                &network,
+                "chat",
+                EventBody::AgentMessage {
+                    message: AgentMessage {
+                        message_id: format!("forged-{index}"),
+                        target_node: target.clone(),
+                        origin_trigger: origin.clone(),
+                        in_reply_to: reply,
+                        kind,
+                        text: "forged result".into(),
+                    },
+                },
+                vec![],
+                6,
+            )?;
+            assert!(
+                store.validate_followup_result(&network, "chat", &forged.hash, &node).is_err(),
+                "forged terminal case {index} was accepted"
+            );
+        }
+        assert!(store.validate_followup_result(&network, "other-chat", &task.hash, &node).is_err());
         assert!(store.tasks(&network, "chat")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn result_reporting_defaults_to_report_and_explicit_off_stays_off() -> Result<()> {
+        let (mut store, identity, network, node) = fixture()?;
+        let default = store.append_event(
+            &identity,
+            &network,
+            "chat",
+            EventBody::MessagePosted {
+                message_id: "default".into(),
+                role: "user".into(),
+                text: "work".into(),
+                scheduler_node: Some(node.clone()),
+            },
+            vec![],
+            2,
+        )?;
+        let task = agent_task(&mut store, &identity, &network, &node, &default)?;
+        let completion = result(
+            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+        )?;
+        let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
+        assert_eq!((policy.mode, policy.version), (FollowupMode::Report, 1));
+        let off = intent(&mut store, &identity, &network, &node, "off", false)?;
+        let task = agent_task(&mut store, &identity, &network, &node, &off)?;
+        for kind in [
+            AgentMessageKind::Completed,
+            AgentMessageKind::Failed,
+            AgentMessageKind::Interrupted,
+        ] {
+            let disabled = result(&mut store, &identity, &network, &node, &task, kind)?;
+            assert!(
+                store.agent_result_policy(&network, "chat", &disabled.hash)
+                    .unwrap_err().to_string().contains("result reporting is disabled")
+            );
+        }
         Ok(())
     }
 
@@ -1524,14 +1085,8 @@ mod tests {
             store.original_message_route(&network, "chat", "off")?,
             Some((node, false))
         );
-        assert_eq!(
-            store.original_message_route(&network, "chat", "missing")?,
-            None
-        );
-        assert_eq!(
-            store.original_message_route(&network, "another-chat", "report")?,
-            None
-        );
+        assert_eq!(store.original_message_route(&network, "chat", "missing")?, None);
+        assert_eq!(store.original_message_route(&network, "another-chat", "report")?, None);
         Ok(())
     }
 
@@ -1539,74 +1094,32 @@ mod tests {
     fn report_intent_is_immutable_and_cannot_grant_continue() -> Result<()> {
         let (mut store, identity, network, node) = fixture()?;
         let message = intent(&mut store, &identity, &network, &node, "request", true)?;
-        assert!(
-            append_report_intent_from(
-                &store.connection,
-                &identity,
-                &network,
-                "chat",
-                &message,
-                &node,
-                false,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            store
-                .create_task_with_origin(
-                    &identity,
-                    &network,
-                    "chat",
-                    task_body("task"),
-                    Some((&message.hash, "not-claimed")),
-                    3
-                )
-                .is_err()
-        );
-        claim(&mut store, &network, &node, &message, "attempt")?;
+        let before = store.heads(&network, "chat")?;
+        assert!(append_report_intent_from(
+            &store.connection, &identity, &network, "chat", &message, &node, false, 3
+        ).is_err());
+        assert_eq!(store.heads(&network, "chat")?, before);
+        assert!(store.create_task_with_origin(
+            &identity, &network, "chat", task_body("task"),
+            Some((&message.hash, "not-claimed")), 3
+        ).is_err());
+        let attempt = claim(&mut store, &network, &node, &message)?;
         store.create_task_with_origin(
-            &identity,
-            &network,
-            "chat",
-            task_body("task"),
-            Some((&message.hash, "attempt")),
-            3,
+            &identity, &network, "chat", task_body("task"), Some((&message.hash, &attempt)), 3
         )?;
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Report, 1));
-        let completion = result(&mut store, &identity, &network, &node, "task")?;
-        assert!(
-            store
-                .validate_latest_manager_policy(&network, "chat", &completion.hash, &node, 1, None)
-                .is_ok()
-        );
-        assert!(
-            store
-                .validate_latest_manager_policy(
-                    &network,
-                    "chat",
-                    &completion.hash,
-                    &node,
-                    1,
-                    Some("task")
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .set_task_followup(
-                    &identity,
-                    &network,
-                    "chat",
-                    "missing",
-                    FollowupMode::Continue,
-                    0,
-                    Some(&node),
-                    6
-                )
-                .is_err()
-        );
+        let task = agent_task(&mut store, &identity, &network, &node, &message)?;
+        let completion = result(
+            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+        )?;
+        store.validate_latest_manager_policy(&network, "chat", &completion.hash, &node, 1, None)?;
+        assert!(store.validate_latest_manager_policy(
+            &network, "chat", &completion.hash, &node, 1, Some("task")
+        ).is_err());
+        assert!(store.set_task_followup(
+            &identity, &network, "chat", "missing", FollowupMode::Continue, 0, Some(&node), 6
+        ).is_err());
         Ok(())
     }
 
@@ -1614,36 +1127,37 @@ mod tests {
     fn task_retry_never_rebinds_origin_and_forged_origin_is_rejected() -> Result<()> {
         let (mut store, identity, network, node) = fixture()?;
         let first = intent(&mut store, &identity, &network, &node, "first", false)?;
-        claim(&mut store, &network, &node, &first, "first-attempt")?;
+        let first_attempt = claim(&mut store, &network, &node, &first)?;
         let creation = store.create_task_with_origin(
-            &identity,
-            &network,
-            "chat",
-            task_body("task"),
-            Some((&first.hash, "first-attempt")),
-            3,
+            &identity, &network, "chat", task_body("task"),
+            Some((&first.hash, &first_attempt)), 3
+        )?;
+        store.finish_job(
+            &identity, &network, "chat", &node, &first.hash, &first_attempt,
+            JobOutcome::Failed("fixture source has returned".into()), vec![], 3
         )?;
         let second = intent(&mut store, &identity, &network, &node, "second", true)?;
-        claim(&mut store, &network, &node, &second, "second-attempt")?;
+        let second_attempt = claim(&mut store, &network, &node, &second)?;
         assert_eq!(
-            store
-                .create_task_with_origin(
-                    &identity,
-                    &network,
-                    "chat",
-                    task_body("task"),
-                    Some((&second.hash, "second-attempt")),
-                    4
-                )?
-                .hash,
+            store.create_task_with_origin(
+                &identity, &network, "chat", task_body("task"),
+                Some((&second.hash, &second_attempt)), 4
+            )?.hash,
             creation.hash
         );
-        assert_eq!(
-            store.followup_policy(&network, "chat", "task")?.mode,
-            FollowupMode::Off
-        );
-        let second_intent =
-            report_intent_head_from(&store.connection, &network, "chat", &second.hash)?;
+        assert!(store.create_task_with_origin(
+            &identity, &network, "chat",
+            EventBody::TaskCreated {
+                task_id: "task".into(),
+                title: "changed".into(),
+                goal: "goal".into(),
+                acceptance: "result".into(),
+            },
+            Some((&second.hash, &second_attempt)), 4
+        ).is_err());
+        let policy = store.followup_policy(&network, "chat", "task")?;
+        assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 1));
+        let second_intent = report_intent_head_from(&store.connection, &network, "chat", &second.hash)?;
         store.append_event(
             &identity,
             &network,
@@ -1654,235 +1168,87 @@ mod tests {
                 task_id: "task".into(),
                 task_ref: creation.hash,
                 trigger: second.hash,
-                attempt_id: "second-attempt".into(),
+                attempt_id: second_attempt,
                 target_node: node,
                 intent_ref: second_intent,
             }))?,
             vec![],
             5,
         )?;
-        assert!(store.followup_policy(&network, "chat", "task").is_err());
+        assert!(store.followup_policy(&network, "chat", "task")
+            .unwrap_err().to_string().contains("task origin is not its scheduler's user invocation"));
         Ok(())
     }
 
     #[test]
-    fn identical_dispatch_retries_preserve_followup_but_changed_bodies_are_rejected() -> Result<()>
-    {
+    fn task_grant_versions_preserve_target_and_never_authorize_result_writes() -> Result<()> {
         let (mut store, identity, network, node) = fixture()?;
         store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
+        let initial = store.followup_policy(&network, "chat", "task")?;
+        assert_eq!((initial.mode, initial.version), (FollowupMode::Off, 0));
         store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Report,
-            0,
-            Some(&node),
-            3,
+            &identity, &network, "chat", "task", FollowupMode::Report, 0, Some(&node), 3
         )?;
-        let completion = result(&mut store, &identity, &network, &node, "task")?;
-        let result_body = store.verify_event(&network, &completion)?.body;
-        let mut dispatch = store.context(&network, "chat", &[])?.events.into_iter()
-            .find_map(|event| matches!(&event.body, EventBody::DispatchRecorded { operation_id, .. } if operation_id == "send").then_some(event.body))
-            .context("dispatch missing")?;
-        store.append_event(&identity, &network, "chat", dispatch.clone(), vec![], 6)?;
-        let repeated =
-            store.append_event(&identity, &network, "chat", result_body.clone(), vec![], 7)?;
+        store.set_task_followup(
+            &identity, &network, "chat", "task", FollowupMode::Off, 1, None, 4
+        )?;
+        let revoked = store.followup_policy(&network, "chat", "task")?;
+        assert_eq!((revoked.mode, revoked.version), (FollowupMode::Off, 2));
+        let before = store.heads(&network, "chat")?;
+        assert!(store.set_task_followup(
+            &identity, &network, "chat", "task", FollowupMode::Continue, 1, None, 5
+        ).is_err());
+        assert_eq!(store.heads(&network, "chat")?, before);
+        store.set_task_followup(
+            &identity, &network, "chat", "task", FollowupMode::Continue, 2, None, 5
+        )?;
+        let granted = store.followup_policy(&network, "chat", "task")?;
+        assert_eq!((granted.mode, granted.version), (FollowupMode::Continue, 3));
+        assert_eq!(granted.target_node, node);
+        assert!(store.set_task_followup(
+            &identity, &network, "chat", "task", FollowupMode::Report, 3,
+            Some(&LocalIdentity::generate().peer_id()?), 6
+        ).is_err());
+        let message = intent(&mut store, &identity, &network, &node, "request", true)?;
+        let task = agent_task(&mut store, &identity, &network, &node, &message)?;
+        let completion = result(
+            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+        )?;
+        let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
+        assert_eq!((policy.mode, policy.version, policy.task_id), (FollowupMode::Report, 1, None));
+        assert!(store.validate_latest_manager_policy(
+            &network, "chat", &completion.hash, &node, 1, Some("task")
+        ).is_err());
+        assert!(store.validate_latest_manager_policy(
+            &network, "chat", &completion.hash, &node, 3, None
+        ).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn forged_signature_network_and_task_reference_are_rejected() -> Result<()> {
+        let (mut store, identity, network, node) = fixture()?;
+        let message = intent(&mut store, &identity, &network, &node, "request", true)?;
+        store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
+        let task = agent_task(&mut store, &identity, &network, &node, &message)?;
+        let completion = result(
+            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+        )?;
         assert_eq!(
-            store
-                .validate_followup_result(&network, "chat", &repeated.hash, &node)?
-                .mode,
+            store.agent_result_policy(&network, "chat", &completion.hash)?.mode,
             FollowupMode::Report
         );
-        if let EventBody::DispatchRecorded { action, .. } = &mut dispatch {
-            action["action"]["text"] = json!("changed request");
-        }
-        store.append_event(&identity, &network, "chat", dispatch, vec![], 8)?;
-        let conflicting =
-            store.append_event(&identity, &network, "chat", result_body, vec![], 9)?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &conflicting.hash, &node)
-                .unwrap_err()
-                .to_string()
-                .contains("conflicting dispatch bodies")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn late_grant_uses_original_result_and_revocation_fences_frozen_version() -> Result<()> {
-        let (mut store, identity, network, node) = fixture()?;
-        store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
-        let completion = result(&mut store, &identity, &network, &node, "task")?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &completion.hash, &node)
-                .is_err()
-        );
-        store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Continue,
-            0,
-            Some(&node),
-            6,
-        )?;
-        assert_eq!(
-            store
-                .validate_followup_result(&network, "chat", &completion.hash, &node)?
-                .version,
-            1
-        );
-        assert!(
-            store
-                .validate_latest_manager_policy(
-                    &network,
-                    "chat",
-                    &completion.hash,
-                    &node,
-                    1,
-                    Some("task")
-                )
-                .is_ok()
-        );
-        assert!(
-            store
-                .validate_latest_manager_policy(
-                    &network,
-                    "chat",
-                    &completion.hash,
-                    &node,
-                    1,
-                    Some("another-task")
-                )
-                .is_err()
-        );
-        let mut accepted: OperationRequest = store
-            .context(&network, "chat", &[])?
-            .events
-            .into_iter()
-            .find_map(|event| match event.body {
-                EventBody::DispatchRecorded { action, .. } => serde_json::from_value(action).ok(),
-                _ => None,
-            })
-            .context("original dispatch missing")?;
-        store.install_binding(accepted.binding.as_ref().unwrap())?;
-        accepted.operation_id = "accepted-before-revocation".into();
-        accepted.expected_revision = 0;
-        accepted.basis_heads = store.heads(&network, "chat")?;
-        accepted.manager_authority = Some(ManagerDispatchAuthority {
-            scheduler_node: node.clone(),
-            trigger: completion.hash.clone(),
-            followup_version: 1,
-        });
-        assert_eq!(
-            store.accept_operation(&network, &accepted)?.state,
-            OperationState::Accepted
-        );
-        store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Off,
-            1,
-            None,
-            7,
-        )?;
-        assert!(
-            store
-                .validate_latest_manager_policy(
-                    &network,
-                    "chat",
-                    &completion.hash,
-                    &node,
-                    1,
-                    Some("task")
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .set_task_followup(
-                    &identity,
-                    &network,
-                    "chat",
-                    "task",
-                    FollowupMode::Continue,
-                    1,
-                    None,
-                    8
-                )
-                .is_err()
-        );
-        assert_eq!(
-            store.accept_operation(&network, &accepted)?.state,
-            OperationState::Accepted
-        );
-        let mut delayed = accepted.clone();
-        delayed.operation_id = "new-arrival-after-revocation".into();
-        delayed.expected_revision = 1;
-        let rejected = store.accept_operation(&network, &delayed).unwrap_err();
-        assert!(rejected.to_string().contains("follow-up"), "{rejected:#}");
-        assert!(store.operation(&network, &delayed.operation_id)?.is_none());
-        assert_eq!(store.followup_policy(&network, "chat", "task")?.version, 2);
-        assert!(store.event(&network, &completion.hash)?.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn forged_signature_network_and_dispatch_are_rejected() -> Result<()> {
-        let (mut store, identity, network, node) = fixture()?;
-        store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
-        store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Report,
-            0,
-            Some(&node),
-            3,
-        )?;
-        let bad = store.append_event(
-            &identity,
-            &network,
-            "chat",
-            EventBody::ExecutionObserved {
-                operation_id: "forged".into(),
-                task_id: Some("task".into()),
-                target_node: node.clone(),
-                session_id: Some("wrong".into()),
-                status: "succeeded".into(),
-                detail: json!({}),
-            },
-            vec![],
-            4,
-        )?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &bad.hash, &node)
-                .is_err()
-        );
-        assert!(
-            store
-                .followup_policy(
-                    &LocalIdentity::generate().fixture_network_id()?,
-                    "chat",
-                    "task"
-                )
-                .is_err()
-        );
-        let mut corrupt = bad.clone();
+        let wrong_network = LocalIdentity::generate().fixture_network_id()?;
+        assert!(store.followup_policy(&wrong_network, "chat", "task").is_err());
+        assert!(store.agent_result_policy(&wrong_network, "chat", &completion.hash).is_err());
+        let mut corrupt = completion;
         corrupt.signature = "00".repeat(64);
         assert!(store.verify_event(&network, &corrupt).is_err());
         store.connection.execute(
             "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
-            params![serde_json::to_string(&corrupt)?, network, bad.hash],
+            params![serde_json::to_string(&corrupt)?, network, corrupt.hash],
         )?;
+        assert!(store.agent_result_policy(&network, "chat", &corrupt.hash).is_err());
         assert!(store.followup_policy(&network, "chat", "task").is_err());
         Ok(())
     }
@@ -1892,14 +1258,7 @@ mod tests {
         let (mut store, identity, network, node) = fixture()?;
         store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
         store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Off,
-            0,
-            Some(&node),
-            3,
+            &identity, &network, "chat", "task", FollowupMode::Off, 0, Some(&node), 3
         )?;
         let next_gateway = LocalIdentity::generate();
         store.install_trust_bundle(
@@ -1907,30 +1266,15 @@ mod tests {
             &identity.sign_network_fixture(
                 2,
                 vec![
-                    identity.certificate(vec![
-                        NodeRole::Scheduler,
-                        NodeRole::Replica,
-                        NodeRole::Executor,
-                    ])?,
+                    identity.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
                     next_gateway.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
                 ],
             )?,
         )?;
         let before = store.heads(&network, "chat")?;
-        assert!(
-            store
-                .set_task_followup(
-                    &next_gateway,
-                    &network,
-                    "chat",
-                    "task",
-                    FollowupMode::Continue,
-                    1,
-                    None,
-                    4
-                )
-                .is_err()
-        );
+        assert!(store.set_task_followup(
+            &next_gateway, &network, "chat", "task", FollowupMode::Continue, 1, None, 4
+        ).is_err());
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 1));
         assert_eq!(store.heads(&network, "chat")?, before);
@@ -1942,36 +1286,18 @@ mod tests {
         let (mut store, identity, network, node) = fixture()?;
         store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
         store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Report,
-            0,
-            Some(&node),
-            3,
+            &identity, &network, "chat", "task", FollowupMode::Report, 0, Some(&node), 3
         )?;
         store.install_trust_bundle(
             &network,
             &identity.sign_network_fixture(
                 2,
-                vec![identity.certificate(vec![
-                    NodeRole::Gateway,
-                    NodeRole::Replica,
-                    NodeRole::Executor,
-                ])?],
+                vec![identity.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?],
             )?,
         )?;
         assert!(store.followup_policy(&network, "chat", "task").is_err());
         store.set_task_followup(
-            &identity,
-            &network,
-            "chat",
-            "task",
-            FollowupMode::Off,
-            1,
-            None,
-            4,
+            &identity, &network, "chat", "task", FollowupMode::Off, 1, None, 4
         )?;
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 2));

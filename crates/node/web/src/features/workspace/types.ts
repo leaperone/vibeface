@@ -1,18 +1,38 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 
 export type NodeInfo = {
-  node_id: string
+  peer_id: string
   name: string
   local: boolean
   online: boolean
   revoked: boolean
   roles: string[]
-  capabilities?: { manager: string | null; executors: string[]; roots: string[] }
+  capabilities?: { manager: string | null; roots: string[] }
 }
 export type ConversationSummary = { conversation_id: string; title: string }
-export type FollowupMode = "off" | "report" | "continue"
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
 export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
+export type AgentTaskState = "pending_delivery" | "queued" | "claimed" | "accepted" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted" | "unknown"
+export type NativeSessionState = "running" | "waiting" | "interrupting" | "completed" | "failed" | "interrupted" | "unknown"
+export type AgentTaskRecord = {
+  task_ref: string
+  source_node: string
+  target_node: string
+  origin_trigger: string
+  state: AgentTaskState
+  text: string
+  detail: string
+}
+export type NativeSessionRecord = {
+  work_id: string
+  task_ref: string | null
+  target_node: string
+  thread_id: string
+  turn_id: string | null
+  state: NativeSessionState
+  detail: string
+  pending_requests: HumanRequest[]
+}
 export type ManagerJob = {
   trigger: string
   state: string
@@ -32,11 +52,6 @@ export type SchedulerSnapshot = {
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
   write_frozen?: boolean
 }
-export type OperationRecord = {
-  state: string
-  request: { operation_id: string; target_node: string; conversation_id: string; session_id: string | null }
-  raw: unknown
-}
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type MissingContext = { events: string[]; blobs: unknown[]; conflicts: string[] }
 export type ConversationPayload = {
@@ -44,46 +59,10 @@ export type ConversationPayload = {
   messages: TranscriptMessage[]
   heads: string[]
   missing: MissingContext
-  executions: ExecutionActivityRecord[]
-  operations: OperationRecord[]
+  agent_tasks: AgentTaskRecord[]
+  native_sessions: NativeSessionRecord[]
+  observation_targets: string[]
   scheduler: SchedulerSnapshot | null
-}
-export type ExecutionControlAction =
-  | { type: "interrupt" }
-  | { type: "steer"; text: string }
-  | { type: "respond_request"; request_id: string | number; response: unknown }
-export type ExecutionControlRequest = {
-  conversation_id: string
-  operation_id: string
-  expected_operation_id: string
-  expected_revision: number
-  action: ExecutionControlAction
-}
-export type ExecutionActivityRecord = {
-  operation_id: string
-  target_node: string
-  session_id: string | null
-  revision: number
-  title: string
-  state: string
-  session_state: string
-  capabilities: string[]
-  pending_requests: HumanRequest[]
-  freshness: "local_ledger" | "cached" | "unknown"
-  checked_at_ms?: number
-  latest_progress?: string
-  detail: string
-  blobs: { hash: string; size: number }[]
-  source_trigger?: string
-  source_message_id?: string
-  goal?: { task_id: string; title: string; acceptance: string; status: string; followup_mode: FollowupMode; followup_version: number; followup_scheduler_node?: string }
-}
-export type PendingOperation = {
-  operation_id: string
-  target_node: string
-  session_id: string | null
-  conversation_id: string
-  execution_control: ExecutionControlRequest
 }
 export type WorkspaceView = "chat" | "settings"
 export type { PendingMessage }

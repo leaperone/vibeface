@@ -48,7 +48,7 @@ export function ManagerStatus({ job, progress, hasLiveProgress }: { job: Manager
       <Collapsible>
         <CollapsibleTrigger asChild><Button type="button" variant="secondary" className="min-h-11">本人核对原调用</Button></CollapsibleTrigger>
         <CollapsibleContent className="pt-3">
-          <p className="mb-3 text-sm text-muted-foreground">先核对关联操作和外部结果。服务器确认旧权限已隔离后，才会解除写入冻结。</p>
+          <p className="mb-3 text-sm text-muted-foreground">先核对关联任务、原生工作和外部结果。服务器确认旧权限已隔离后，才会解除写入冻结。</p>
           <form className="space-y-3" onSubmit={(event) => {
             event.preventDefault()
             const form = event.currentTarget

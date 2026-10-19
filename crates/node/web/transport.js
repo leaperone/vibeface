@@ -106,7 +106,7 @@ async function initializeIdentity(replaceLostKey) {
       try { localStorage.setItem("vibeface.device-created", "true"); } catch {}
     }
   }
-  return { nodeId: identity.nodeId(), publicKey: identity.publicKeyHex() };
+  return { peerId: identity.peerId(), publicKey: identity.publicKeyHex() };
 }
 
 export function signClient(domain, payload) {
@@ -117,9 +117,10 @@ export function signClient(domain, payload) {
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
   if (!identity) await initClient();
-  const target = validTarget(entry.node_id);
+  const target = validTarget(entry.peer_id);
   const endpoint = validEndpoint(entry.address);
-  const url = new URL("/api/network/ws", endpoint);
+  if (entry.local === true && (entry.relay || endpoint !== location.origin)) throw new Error("本机会话只能连接当前本机入口。");
+  const url = new URL(entry.local === true ? "/api/local/ws" : "/api/network/ws", endpoint);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
@@ -169,9 +170,18 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   }
   let handshake;
   try {
-    await control("welcome");
-    socket.send(JSON.stringify(entry.relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
-    await control("ready");
+    if (entry.local === true) {
+      await new Promise((resolve, reject) => {
+        if (socket.readyState === WebSocket.OPEN) { resolve(); return; }
+        socket.addEventListener("open", resolve, { once: true });
+        socket.addEventListener("close", () => reject(disconnected()), { once: true });
+        socket.addEventListener("error", () => reject(disconnected()), { once: true });
+      });
+    } else {
+      await control("welcome");
+      socket.send(JSON.stringify(entry.relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
+      await control("ready");
+    }
     handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
     socket.send(handshake.write(new Uint8Array()));
     const response = await receive();
@@ -208,7 +218,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     finally { channel.free(); }
   })();
   return {
-    nodeId: target,
+    peerId: target,
     publicKey,
     request(method, params = {}) {
       if (closed) return Promise.reject(disconnected());

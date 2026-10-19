@@ -14,7 +14,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
-use vibeface_protocol::{Command, RpcId, now_ms};
+use vibeface_protocol::{RpcId, now_ms};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -65,18 +65,38 @@ impl CodexClient {
         }
     }
 
-    pub async fn execute(&self, command: &Command) -> Result<Value, CodexError> {
-        command.validate().map_err(rejected)?;
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexError> {
+        validate_request(method, &params)?;
+        self.send(NativeCall::Request {
+            method: method.into(),
+            params,
+        })
+        .await
+    }
+
+    pub async fn respond(&self, id: Value, result: Value) -> Result<(), CodexError> {
+        let id = serde_json::from_value(id).map_err(|_| rejected("invalid native request id"))?;
+        if serde_json::to_vec(&result)
+            .map_err(|error| rejected(error.to_string()))?
+            .len()
+            > 1_048_576
+        {
+            return Err(rejected("native response is too large"));
+        }
+        self.send(NativeCall::Respond { id, result })
+            .await
+            .map(|_| ())
+    }
+
+    async fn send(&self, call: NativeCall) -> Result<Value, CodexError> {
+        let uncertain = call.uncertain();
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Execute {
-                command: command.clone(),
-                reply,
-            })
+            .send(Execute { call, reply })
             .map_err(|_| rejected("Codex adapter is stopped"))?;
         response.await.unwrap_or_else(|_| {
             Err(CodexError {
-                uncertain: mutates(command),
+                uncertain,
                 message: "Codex adapter stopped before returning a result".into(),
             })
         })
@@ -96,8 +116,53 @@ impl CodexClient {
     }
 }
 
+enum NativeCall {
+    Request { method: String, params: Value },
+    Respond { id: RpcId, result: Value },
+}
+
+impl NativeCall {
+    fn uncertain(&self) -> bool {
+        match self {
+            Self::Request { method, .. } => !matches!(
+                method.as_str(),
+                "thread/read"
+                    | "thread/list"
+                    | "thread/loaded/list"
+                    | "thread/turns/list"
+                    | "thread/items/list"
+                    | "thread/items/read"
+                    | "thread/goal/get"
+                    | "thread/backgroundTerminals/list"
+                    | "thread/attachment/list"
+                    | "thread/attachmentOwner/list"
+                    | "thread/queue/list"
+                    | "model/list"
+                    | "account/read"
+                    | "config/read"
+                    | "configRequirements/read"
+            ),
+            Self::Respond { .. } => true,
+        }
+    }
+}
+
+pub(crate) fn validate_request(method: &str, params: &Value) -> Result<(), CodexError> {
+    if method.is_empty() || method.len() > 256 || method.chars().any(char::is_control) {
+        return Err(rejected("invalid native method"));
+    }
+    if serde_json::to_vec(params)
+        .map_err(|error| rejected(error.to_string()))?
+        .len()
+        > 1_048_576
+    {
+        return Err(rejected("native request is too large"));
+    }
+    Ok(())
+}
+
 struct Execute {
-    command: Command,
+    call: NativeCall,
     reply: oneshot::Sender<Result<Value, CodexError>>,
 }
 
@@ -243,47 +308,11 @@ fn request_id(message: &Value) -> Option<RpcId> {
     serde_json::from_value(message.get("id")?.clone()).ok()
 }
 
-fn mutates(command: &Command) -> bool {
-    !matches!(
-        command,
-        Command::ReadThread { .. } | Command::ListTurns { .. }
-    )
-}
-
-fn wire_command(command: &Command) -> Option<(&'static str, Value)> {
-    Some(match command {
-        Command::ReadThread { thread_id } => (
-            "thread/read",
-            json!({"threadId":thread_id,"includeTurns":false}),
-        ),
-        Command::ListTurns { thread_id, cursor } => (
-            "thread/turns/list",
-            json!({"threadId":thread_id,"cursor":cursor,"limit":20,"itemsView":"full"}),
-        ),
-        Command::StartThread { cwd } => ("thread/start", json!({"cwd":cwd})),
-        Command::StartTurn { thread_id, text } => (
-            "turn/start",
-            json!({"threadId":thread_id,"input":[{"type":"text","text":text,"text_elements":[]}]}),
-        ),
-        Command::SteerTurn {
-            thread_id,
-            turn_id,
-            text,
-        } => (
-            "turn/steer",
-            json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":text,"text_elements":[]}]}),
-        ),
-        Command::InterruptTurn { thread_id, turn_id } => (
-            "turn/interrupt",
-            json!({"threadId":thread_id,"turnId":turn_id}),
-        ),
-        Command::RespondRequest { .. } => return None,
-    })
-}
-
 enum PendingKind {
     Initialize,
-    Command(Execute),
+    Request(Execute),
+    ObserveThread(String),
+    ObserveTurns(String),
     SubscribeThread(String),
 }
 
@@ -299,7 +328,7 @@ struct Session {
     ready: bool,
     pending: HashMap<RpcId, Pending>,
     subscribed: HashSet<String>,
-    resuming: HashMap<String, Vec<Execute>>,
+    resuming: HashSet<String>,
     retry_observation_at: HashMap<String, Instant>,
 }
 
@@ -333,18 +362,20 @@ impl Session {
         writer: &mpsc::UnboundedSender<Write>,
         execute: Execute,
     ) -> Result<(), String> {
-        let Some((method, params)) = wire_command(&execute.command) else {
-            let _ = execute
-                .reply
-                .send(Err(rejected("command is not handled by the Codex adapter")));
+        let NativeCall::Request { method, params } = &execute.call else {
+            let _ = execute.reply.send(Err(rejected(
+                "native response must match a pending request",
+            )));
             return Ok(());
         };
-        let uncertain = mutates(&execute.command);
+        let method = method.clone();
+        let params = params.clone();
+        let uncertain = execute.call.uncertain();
         self.request(
             writer,
-            method,
+            &method,
             params,
-            PendingKind::Command(execute),
+            PendingKind::Request(execute),
             uncertain,
         )
     }
@@ -360,8 +391,7 @@ impl Session {
         self.retry_observation_at
             .retain(|id, _| threads.contains(id));
         for id in threads {
-            if self.subscribed.contains(id)
-                || self.resuming.contains_key(id)
+            if self.resuming.contains(id)
                 || self
                     .retry_observation_at
                     .get(id)
@@ -369,12 +399,12 @@ impl Session {
             {
                 continue;
             }
-            self.resuming.insert(id.clone(), Vec::new());
+            self.resuming.insert(id.clone());
             self.request(
                 writer,
-                "thread/resume",
-                json!({"threadId":id,"excludeTurns":true}),
-                PendingKind::SubscribeThread(id.clone()),
+                "thread/read",
+                json!({"threadId":id,"includeTurns":false}),
+                PendingKind::ObserveThread(id.clone()),
                 false,
             )?;
         }
@@ -383,22 +413,18 @@ impl Session {
 
     fn fail(&mut self, pending: Pending, reason: &str, uncertain: bool) {
         match pending.kind {
-            PendingKind::Command(execute) => {
+            PendingKind::Request(execute) => {
                 let _ = execute.reply.send(Err(CodexError {
                     uncertain: uncertain && pending.uncertain,
                     message: reason.into(),
                 }));
             }
-            PendingKind::SubscribeThread(thread) => {
+            PendingKind::SubscribeThread(thread)
+            | PendingKind::ObserveThread(thread)
+            | PendingKind::ObserveTurns(thread) => {
+                self.resuming.remove(&thread);
                 self.retry_observation_at
-                    .insert(thread.clone(), Instant::now() + Duration::from_secs(5));
-                if let Some(waiters) = self.resuming.remove(&thread) {
-                    for execute in waiters {
-                        let _ = execute.reply.send(Err(rejected(format!(
-                            "could not subscribe to thread before starting turn: {reason}"
-                        ))));
-                    }
-                }
+                    .insert(thread, Instant::now() + Duration::from_secs(5));
             }
             PendingKind::Initialize => {}
         }
@@ -506,7 +532,7 @@ async fn run_session(
     let mut state = Session::default();
     let _ = state.request(&writer, "initialize", json!({"clientInfo":{"name":"vibeface","title":"Vibeface Rust Bridge","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), PendingKind::Initialize, false);
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    let reason = 'session: loop {
+    let reason = loop {
         tokio::select! {
             writer_result = &mut writer_task => {
                 break match writer_result {
@@ -521,7 +547,7 @@ async fn run_session(
                     let _ = execute.reply.send(Err(rejected("Codex is initializing")));
                     continue;
                 }
-                if let Command::RespondRequest { request_id, response } = &execute.command {
+                if let NativeCall::Respond { id: request_id, result: response } = &execute.call {
                     let pending = cache.write().await.requests.remove(request_id);
                     if pending.is_none() {
                         let _ = execute.reply.send(Err(rejected("request is unknown or already resolved")));
@@ -536,17 +562,6 @@ async fn run_session(
                     }
                     continue;
                 }
-                if let Command::StartTurn { thread_id, .. } = &execute.command
-                    && !state.subscribed.contains(thread_id) {
-                        let thread_id = thread_id.clone();
-                        let subscribing = state.resuming.contains_key(&thread_id);
-                        state.resuming.entry(thread_id.clone()).or_default().push(execute);
-                        if !subscribing
-                            && let Err(reason) = state.request(&writer, "thread/resume", json!({"threadId":thread_id,"excludeTurns":true}), PendingKind::SubscribeThread(thread_id), false) {
-                                break reason;
-                            }
-                        continue;
-                    }
                 if let Err(reason) = state.command(&writer, execute) { break reason; }
             }
             message = reader.next() => {
@@ -590,17 +605,31 @@ async fn run_session(
                         cache.write().await.connection = json!({"state":"connected","user_agent":result["userAgent"],"at_ms":now_ms()});
                         let _ = events.send(json!({"method":"bridge.codex_connected","params":{"userAgent":result["userAgent"],"at_ms":now_ms()}}));
                     }
+                    PendingKind::ObserveThread(thread_id) => {
+                        cache.write().await.observe_thread(&result["thread"]);
+                        if !state.subscribed.contains(&thread_id)
+                            && matches!(result["thread"]["status"]["type"].as_str(), Some("idle" | "active" | "systemError")) {
+                            if let Err(reason) = state.request(&writer, "thread/resume", json!({"threadId":thread_id,"excludeTurns":true}), PendingKind::SubscribeThread(thread_id), false) { break reason; }
+                        } else if let Err(reason) = state.request(&writer, "thread/turns/list", json!({"threadId":thread_id,"limit":20,"itemsView":"full","sortDirection":"desc"}), PendingKind::ObserveTurns(thread_id), false) { break reason; }
+                    }
                     PendingKind::SubscribeThread(thread_id) => {
                         cache.write().await.observe_thread(&result["thread"]);
                         state.subscribed.insert(thread_id.clone());
-                        state.retry_observation_at.remove(&thread_id);
-                        for execute in state.resuming.remove(&thread_id).unwrap_or_default() {
-                            if let Err(reason) = state.command(&writer, execute) { break 'session reason; }
-                        }
+                        if let Err(reason) = state.request(&writer, "thread/turns/list", json!({"threadId":thread_id,"limit":20,"itemsView":"full","sortDirection":"desc"}), PendingKind::ObserveTurns(thread_id), false) { break reason; }
                     }
-                    PendingKind::Command(execute) => {
+                    PendingKind::ObserveTurns(thread_id) => {
+                        let mut cache = cache.write().await;
+                        let thread = cache.threads.entry(thread_id.clone()).or_default();
+                        if let Some(turns) = result["data"].as_array() {
+                            for turn in turns.iter().rev() { observe_turn(thread, turn); }
+                        }
+                        state.resuming.remove(&thread_id);
+                        state.retry_observation_at.insert(thread_id, Instant::now() + Duration::from_secs(5));
+                    }
+                    PendingKind::Request(execute) => {
                         cache.write().await.observe_thread(&result["thread"]);
-                        if matches!(execute.command, Command::StartThread { .. })
+                        if let NativeCall::Request { method, .. } = &execute.call
+                            && matches!(method.as_str(), "thread/start" | "thread/resume")
                             && let Some(id) = result["thread"]["id"].as_str() { state.subscribed.insert(id.into()); }
                         let _ = execute.reply.send(Ok(result));
                     }
@@ -658,7 +687,7 @@ mod tests {
 
             let querying = client.clone();
             let response = tokio::spawn(async move {
-                querying.execute(&Command::ReadThread { thread_id:"t".into() }).await
+                querying.request("thread/read", json!({"threadId":"t","includeTurns":false})).await
             });
             let request: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(request["method"], "thread/read");
@@ -671,12 +700,12 @@ mod tests {
 
             let replying = client.clone();
             let reply = tokio::spawn(async move {
-                replying.execute(&Command::RespondRequest { request_id:RpcId::Number(27), response:json!({"decision":"decline"}) }).await
+                replying.respond(json!(27), json!({"decision":"decline"})).await
             });
             let sent: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(sent, json!({"id":27,"result":{"decision":"decline"}}));
-            assert_eq!(reply.await.unwrap().unwrap(), json!({"sent":true}));
-            assert!(client.execute(&Command::RespondRequest { request_id:RpcId::Number(27), response:json!({"decision":"decline"}) }).await.is_err());
+            reply.await.unwrap().unwrap();
+            assert!(client.respond(json!(27), json!({"decision":"decline"})).await.is_err());
             server.close(None).await.unwrap();
             assert_eq!(session.await.unwrap(), "Codex connection closed");
         }).await.expect("mock Codex session must finish");
@@ -691,7 +720,7 @@ mod tests {
             let client = CodexClient::start(socket.clone(), events);
             client.set_observed_threads(vec!["known".into()]).unwrap();
             let mut sent_turns = 0;
-            for connection in 0..2 {
+            for connection in 0..3 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let initialize: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
@@ -699,21 +728,30 @@ mod tests {
                 server.send(Message::Text(json!({"id":initialize["id"],"result":{"userAgent":"test"}}).to_string().into())).await.unwrap();
                 let initialized: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(initialized["method"], "initialized");
-                let resume: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                assert_eq!(resume["method"], "thread/resume");
-                assert_eq!(resume["params"], json!({"threadId":"known","excludeTurns":true}));
-                server.send(Message::Text(json!({"id":resume["id"],"result":{"thread":{"id":"known","status":{"type":"active"}}}}).to_string().into())).await.unwrap();
+                let read: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(read["method"], "thread/read");
+                let status = if connection == 2 { "notLoaded" } else { "active" };
+                server.send(Message::Text(json!({"id":read["id"],"result":{"thread":{"id":"known","status":{"type":status}}}}).to_string().into())).await.unwrap();
+                if connection != 2 {
+                    let resume: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(resume["method"], "thread/resume");
+                    assert_eq!(resume["params"], json!({"threadId":"known","excludeTurns":true}));
+                    server.send(Message::Text(json!({"id":resume["id"],"result":{"thread":{"id":"known","status":{"type":"active"}}}}).to_string().into())).await.unwrap();
+                }
+                let turns: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(turns["method"], "thread/turns/list");
+                server.send(Message::Text(json!({"id":turns["id"],"result":{"data":[{"id":"previous-turn","status":"completed","items":[]}]}}).to_string().into())).await.unwrap();
                 if connection == 0 {
                     let sender = client.clone();
                     let sending = tokio::spawn(async move {
-                        sender.execute(&Command::StartTurn { thread_id:"known".into(), text:"write once".into() }).await
+                        sender.request("turn/start", json!({"threadId":"known","input":[{"type":"text","text":"write once","text_elements":[]}]})).await
                     });
                     let start: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                     assert_eq!(start["method"], "turn/start");
                     sent_turns += 1;
                     server.close(None).await.unwrap();
                     assert!(sending.await.unwrap().unwrap_err().uncertain);
-                } else {
+                } else if connection == 1 {
                     let approval = json!({"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"known"}});
                     let completed = json!({"method":"turn/completed","params":{"threadId":"known","turn":{"id":"turn","status":"failed","error":{"message":"declined"},"items":[]}}});
                     server.send(Message::Text(approval.to_string().into())).await.unwrap();
@@ -730,6 +768,12 @@ mod tests {
                     client.set_observed_threads(vec!["known".into(), "known".into()]).unwrap();
                     assert!(timeout(Duration::from_millis(300), server.next()).await.is_err());
                     server.close(None).await.unwrap();
+                } else {
+                    assert!(timeout(Duration::from_millis(300), server.next()).await.is_err());
+                    let snapshot = client.snapshot().await;
+                    assert_eq!(snapshot["threads"]["known"]["status"]["type"], "notLoaded");
+                    assert_eq!(snapshot["threads"]["known"]["last_turn"]["id"], "previous-turn");
+                    server.close(None).await.unwrap();
                 }
             }
             assert_eq!(sent_turns, 1);
@@ -739,26 +783,25 @@ mod tests {
     }
 
     #[test]
-    fn command_fields_match_codex_schema() {
-        let (method, params) = wire_command(&Command::SteerTurn {
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-            text: "continue".into(),
-        })
-        .unwrap();
-        assert_eq!(method, "turn/steer");
-        assert_eq!(
-            params,
-            json!({"threadId":"thread","expectedTurnId":"turn","input":[{"type":"text","text":"continue","text_elements":[]}]})
+    fn native_calls_validate_only_the_transport_boundary() {
+        assert!(
+            validate_request("future/nativeMethod", &json!({"unmodified":[1,true,null]})).is_ok()
         );
-        assert_eq!(
-            wire_command(&Command::ListTurns {
-                thread_id: "thread".into(),
-                cursor: Some("next".into())
-            })
-            .unwrap()
-            .1,
-            json!({"threadId":"thread","cursor":"next","limit":20,"itemsView":"full"})
+        assert!(validate_request("bad\nmethod", &json!({})).is_err());
+        assert!(validate_request("thread/read", &json!("x".repeat(1_048_577))).is_err());
+        assert!(
+            !NativeCall::Request {
+                method: "thread/read".into(),
+                params: json!({})
+            }
+            .uncertain()
+        );
+        assert!(
+            NativeCall::Request {
+                method: "future/nativeMethod".into(),
+                params: json!({})
+            }
+            .uncertain()
         );
     }
 
@@ -788,9 +831,9 @@ mod tests {
             .command(
                 &writer,
                 Execute {
-                    command: Command::InterruptTurn {
-                        thread_id: "t".into(),
-                        turn_id: "r".into(),
+                    call: NativeCall::Request {
+                        method: "turn/interrupt".into(),
+                        params: json!({"threadId":"t","turnId":"r"}),
                     },
                     reply,
                 },

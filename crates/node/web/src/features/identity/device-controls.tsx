@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, Plus } from 'lucide-react'
+import qrcode from 'qrcode-generator'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -7,6 +8,9 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import type { ConnectionEntry, Member, NodeRole, PairReceipt } from '@/lib/node'
+import { record, text } from '@/lib/node'
+import { invitationLink } from '@/lib/enrollment-reference'
+import { downloadConnectionFile } from '@/lib/connection-file'
 import { useDevice } from './context'
 import { RecoveryControls } from './recovery-controls'
 
@@ -15,12 +19,13 @@ const input = 'min-h-10'
 const panel = 'gap-4 p-5'
 const disclosure = 'h-auto min-h-14 w-full justify-between gap-3 rounded-none px-5 py-4 text-left whitespace-normal [&[data-state=open]>svg]:rotate-180'
 const roleLabels: Record<NodeRole, string> = {
-  gateway: '接入', relay: '中继', replica: '同步', scheduler: '调度', executor: '执行',
+  gateway: '接入', relay: '中继', replica: '同步', scheduler: '调度',
 }
-const nodeRoles: NodeRole[] = ['relay', 'replica', 'gateway', 'scheduler', 'executor']
+const nodeRoles: NodeRole[] = ['relay', 'replica', 'gateway', 'scheduler']
+type InvitationShare = { kind: 'client'; content: string; link: string; qr: string | null } | { kind: 'node'; content: string }
 
 function entryKey(entry: ConnectionEntry) {
-  return `${entry.address}|${entry.node_id}|${entry.relay}`
+  return `${entry.address}|${entry.peer_id}|${entry.relay}`
 }
 
 function MemberDetails({ member, compact = false }: { member: Member; compact?: boolean }) {
@@ -52,17 +57,17 @@ export function DeviceControls() {
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [address, setAddress] = useState('')
-  const [nodeId, setNodeId] = useState('')
+  const [peerId, setNodeId] = useState('')
   const [relay, setRelay] = useState(false)
   const [inviteKind, setInviteKind] = useState<'client' | 'node'>('client')
   const [roles, setRoles] = useState<NodeRole[]>(['relay'])
-  const [invitation, setInvitation] = useState('')
+  const [invitation, setInvitation] = useState<InvitationShare | null>(null)
   const [review, setReview] = useState<PairReceipt | null>(null)
   const [reviewConfirmed, setReviewConfirmed] = useState(false)
   const [revokeSubject, setRevokeSubject] = useState('')
 
   useEffect(() => {
-    setInvitation('')
+    setInvitation(null)
     setReview(null)
     setReviewConfirmed(false)
     setRevokeSubject('')
@@ -98,18 +103,27 @@ export function DeviceControls() {
     setRoles((previous) => {
       if (role === 'relay') return previous
       let next = checked ? [...previous, role] : previous.filter((item) => item !== role)
-      if (next.some((item) => item === 'gateway' || item === 'scheduler' || item === 'executor') && !next.includes('replica')) next = [...next, 'replica']
+      if (next.some((item) => item === 'gateway' || item === 'scheduler') && !next.includes('replica')) next = [...next, 'replica']
       return next
     })
   }
 
   const canManage = ready?.principal.can_manage === true
-  const needsReplica = roles.some((role) => role === 'gateway' || role === 'scheduler' || role === 'executor')
+  const localSession = ready?.principal.source === 'local_session'
+  const localInvitation = invitation?.kind === 'client' && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(invitation.link).hostname)
+  const needsReplica = roles.some((role) => role === 'gateway' || role === 'scheduler')
   const currentReview = review && pairs.find((pair) => pair.request_id === review.request_id && JSON.stringify(pair) === JSON.stringify(review))
 
   return <div className="space-y-5">
     {(busy || status) && <p role="status" className="text-sm text-muted-foreground">{busy ? '正在处理…' : status}</p>}
     {error && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error}</p>}
+
+    {(localSession || canManage) && <Card className={panel} aria-labelledby="local-auto-access-title">
+      <h2 id="local-auto-access-title" className="font-semibold">本机自动访问</h2>
+      <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={device.localAutoAccess === true} disabled={busy || device.localAutoAccess === null || localSession && !device.localAutoAccess} onChange={event => void run(() => device.setLocalAutoAccess(event.target.checked), '本机自动访问设置已保存。')} />从本机启动器打开网页时自动连接</label>
+      {device.localAutoAccess === null && <p role="status" className="text-sm text-muted-foreground">正在读取设置…</p>}
+      <p className="text-xs text-muted-foreground">关闭会断开通过本机入口连接的网页。使用管理设备可重新开启。</p>
+    </Card>}
 
     {canManage && pairs.length > 0 && <Card className={panel} aria-labelledby="pair-requests-title">
       <div className="flex flex-wrap items-center gap-2"><h2 id="pair-requests-title" className="font-semibold">待确认配对</h2><Badge variant="secondary">{pairs.length}</Badge></div>
@@ -164,30 +178,46 @@ export function DeviceControls() {
         <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
           <form className="space-y-4" onSubmit={(event) => {
             event.preventDefault()
-            setInvitation('')
+            setInvitation(null)
             void run(async () => {
               const connection = ready
               const content = await device.createInvitation(inviteKind, inviteKind === 'node' ? roles : [])
-              if (connection?.isCurrent()) setInvitation(content)
+              if (!connection?.isCurrent()) return
+              if (inviteKind === 'node') { setInvitation({ kind: 'node', content }); return }
+              const connectionInfo: unknown = JSON.parse(content)
+              const link = invitationLink(content, text(record(connectionInfo, '连接信息').url, '连接入口'))
+              let qr: string | null = null
+              try { const code = qrcode(0, 'M'); code.addData(link); code.make(); qr = code.createDataURL(4, 16) } catch { qr = null }
+              setInvitation({ kind: 'client', content, link, qr })
             }, '邀请已生成，请通过可信渠道发送。')
           }}>
             <fieldset disabled={busy} className="space-y-2">
               <legend className="mb-2 text-sm font-medium">设备类型</legend>
-              <label className="flex min-h-11 items-center gap-2 text-sm"><input type="radio" name="invite-kind" value="client" checked={inviteKind === 'client'} onChange={() => { setInviteKind('client'); setInvitation('') }} />浏览器或其他客户端</label>
-              <label className="flex min-h-11 items-center gap-2 text-sm"><input type="radio" name="invite-kind" value="node" checked={inviteKind === 'node'} onChange={() => { setInviteKind('node'); setInvitation('') }} />运行 Vibeface 的节点</label>
+              <label className="flex min-h-11 items-center gap-2 text-sm"><input type="radio" name="invite-kind" value="client" checked={inviteKind === 'client'} onChange={() => { setInviteKind('client'); setInvitation(null) }} />浏览器或其他客户端</label>
+              <label className="flex min-h-11 items-center gap-2 text-sm"><input type="radio" name="invite-kind" value="node" checked={inviteKind === 'node'} onChange={() => { setInviteKind('node'); setInvitation(null) }} />运行 Vibeface 的节点</label>
               {inviteKind === 'node' && <p className="text-sm text-muted-foreground">对方要在那台机器运行 <code>vibeface pair</code>，不能用这张网页接受。</p>}
             </fieldset>
             {inviteKind === 'node' && <fieldset disabled={busy} className="space-y-1">
               <legend className="mb-2 text-sm font-medium">节点角色</legend>
-              {nodeRoles.map((role) => <label key={role} className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={roles.includes(role)} disabled={role === 'relay' || (role === 'replica' && needsReplica)} onChange={(event) => { toggleRole(role, event.target.checked); setInvitation('') }} />{roleLabels[role]}{role === 'relay' ? '（节点连接必需）' : role === 'replica' && needsReplica ? '（所选角色必需）' : ''}</label>)}
+              {nodeRoles.map((role) => <label key={role} className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={roles.includes(role)} disabled={role === 'relay' || (role === 'replica' && needsReplica)} onChange={(event) => { toggleRole(role, event.target.checked); setInvitation(null) }} />{roleLabels[role]}{role === 'relay' ? '（节点连接必需）' : role === 'replica' && needsReplica ? '（所选角色必需）' : ''}</label>)}
             </fieldset>}
             <p className="text-xs text-muted-foreground">新设备不含管理权限。双方仍需核对指纹并确认配对。</p>
             <Button type="submit" className={button} disabled={busy}>生成邀请</Button>
           </form>
           {invitation && <div className="space-y-3 rounded-lg bg-muted/50 p-3">
-            <label className="grid gap-2 text-sm">邀请内容<Textarea className="min-h-28 font-mono text-xs" readOnly value={invitation} onFocus={(event) => event.target.select()} /></label>
-            <p className="text-xs text-muted-foreground">{inviteKind === 'node' ? '对方要在那台机器运行 vibeface pair，不能用这张网页接受。邀请含配对凭证，仅发送给你信任的设备。' : '邀请含配对凭证，仅发送给你信任的设备。浏览器邀请可以贴到对方的连接页。'}</p>
-            <div className="flex flex-wrap gap-2"><Button type="button" className={button} disabled={busy} onClick={() => void run(async () => { await navigator.clipboard.writeText(invitation) }, '邀请已复制。')}>复制邀请</Button><Button type="button" variant="outline" className={button} disabled={busy} onClick={() => setInvitation('')}>清除</Button></div>
+            {invitation.kind === 'client' && <>
+              {invitation.qr ? <img className="h-auto w-80 max-w-full rounded bg-white" src={invitation.qr} alt="在新设备上打开连接邀请的二维码" /> : <p role="status" className="text-sm text-muted-foreground">二维码无法生成，请使用连接链接或文件。</p>}
+              <label className="grid gap-2 text-sm">连接链接<Textarea className="min-h-24 font-mono text-xs" readOnly value={invitation.link} onFocus={event => event.target.select()} /></label>
+              {localInvitation && <p role="status" className="text-sm text-muted-foreground">此入口只能在这台电脑打开。连接手机前，请配置可访问的公网入口并重新生成邀请。</p>}
+            </>}
+            <label className="grid gap-2 text-sm">连接信息<Textarea className="min-h-28 font-mono text-xs" readOnly value={invitation.content} onFocus={(event) => event.target.select()} /></label>
+            <p className="text-xs text-muted-foreground">{invitation.kind === 'node' ? '对方要在那台机器运行 vibeface pair，不能用这张网页接受。连接文件含配对凭证，仅发送给你信任的设备。' : '用新设备扫描二维码、打开链接或导入文件，仍需双方核对并确认。连接信息含配对凭证，仅通过可信渠道发送。'}</p>
+            <div className="flex flex-wrap gap-2">
+              {invitation.kind === 'client' && <Button type="button" className={button} disabled={busy} onClick={() => void run(async () => { await navigator.clipboard.writeText(invitation.link) }, '连接链接已复制。')}>复制连接链接</Button>}
+              <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(async () => { await navigator.clipboard.writeText(invitation.content) }, '连接信息已复制。')}>复制连接信息</Button>
+              <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(async () => downloadConnectionFile(invitation.content), '连接文件已下载。')}>下载连接文件</Button>
+              <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => setInvitation(null)}>清除</Button>
+            </div>
           </div>}
         </CollapsibleContent>
       </Collapsible>
@@ -201,7 +231,7 @@ export function DeviceControls() {
           {entries.length > 0 && <ul className="space-y-3">
             {entries.map((entry) => <li key={entryKey(entry)} className="space-y-3 rounded-lg bg-muted/50 p-3">
               <p className="break-all text-sm">{entry.address}<span className="ml-2 text-xs text-muted-foreground">{entry.relay ? '中继' : '直连'}</span></p>
-              <p className="break-all font-mono text-xs text-muted-foreground">{entry.node_id}</p>
+              <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" className={button} disabled={busy || (ready !== null && entryKey(entry) === entryKey(ready.entry))} onClick={() => void run(() => device.connect(entry))}>
                   {ready && entryKey(entry) === entryKey(ready.entry) ? '当前入口' : '连接'}
@@ -217,13 +247,13 @@ export function DeviceControls() {
             event.preventDefault()
             setError('')
             try {
-              device.saveEntry({ address: address.trim(), node_id: nodeId.trim(), relay })
+              device.saveEntry({ address: address.trim(), peer_id: peerId.trim(), relay })
               setAddress(''); setNodeId(''); setRelay(false); setStatus('入口已保存。')
             } catch (failure: unknown) { setError(failure instanceof Error ? failure.message : '无法保存入口，请检查地址和指纹。') }
           }}>
             <h3 className="text-sm font-medium">添加入口</h3>
             <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="entry-address" autoComplete="url" required placeholder="http://192.168.0.99:4790" value={address} onChange={(event) => setAddress(event.target.value)} /></label>
-            <label className="grid gap-2 text-sm">目标节点完整指纹<Input className={`${input} font-mono`} name="entry-node-id" autoComplete="off" autoCapitalize="none" spellCheck={false} pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备指纹" required value={nodeId} onChange={(event) => setNodeId(event.target.value)} /></label>
+            <label className="grid gap-2 text-sm">目标节点完整指纹<Input className={`${input} font-mono`} name="entry-node-id" autoComplete="off" autoCapitalize="none" spellCheck={false} pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备指纹" required value={peerId} onChange={(event) => setNodeId(event.target.value)} /></label>
             <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={relay} onChange={(event) => setRelay(event.target.checked)} />通过入口中继到目标节点</label>
             <Button type="submit" className={button} disabled={busy}>保存入口</Button>
           </form>
@@ -238,11 +268,11 @@ export function DeviceControls() {
           <dl className="grid gap-3 text-xs">
             <div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{directory?.network_id || ready?.principal.network_id || '尚未连接'}</dd></div>
             {directory && <div className="space-y-1"><dt className="text-muted-foreground">授权版本</dt><dd>{directory.epoch}</dd></div>}
-            <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的设备指纹</dt><dd className="break-all font-mono">{identity?.nodeId || '正在读取'}</dd></div>
+            <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的设备指纹</dt><dd className="break-all font-mono">{identity?.peerId || '正在读取'}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的公钥</dt><dd className="break-all font-mono">{identity?.publicKey || '正在读取'}</dd></div>
             {ready && <>
               <div className="space-y-1"><dt className="text-muted-foreground">入口地址</dt><dd className="break-all">{ready.entry.address}{ready.entry.relay ? ' · 经中继连接' : ' · 直接连接'}</dd></div>
-              <div className="space-y-1"><dt className="text-muted-foreground">目标节点指纹</dt><dd className="break-all font-mono">{ready.entry.node_id}</dd></div>
+              <div className="space-y-1"><dt className="text-muted-foreground">目标节点指纹</dt><dd className="break-all font-mono">{ready.entry.peer_id}</dd></div>
             </>}
           </dl>
           {ready && <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => device.disconnect()}>断开连接</Button>}

@@ -36,11 +36,11 @@ function endpoint() {
             } catch (error) { fixture.free(); throw error; }
           }
           if (input.expected_node_id) {
-            try { assert(fixture.nodeId() === input.expected_node_id, 'fixture identity must retain the pinned target'); }
+            try { assert(fixture.peerId() === input.expected_node_id, 'fixture identity must retain the pinned target'); }
             catch (error) { fixture.free(); throw error; }
           }
           identity.free(); identity = fixture;
-          result = {public_key:identity.publicKeyHex(),node_id:identity.nodeId()};
+          result = {public_key:identity.publicKeyHex(),peer_id:identity.peerId()};
           break;
         }
         case 'fixture_reachability': {
@@ -48,11 +48,11 @@ function endpoint() {
           assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
           const fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
           try {
-            assert(fixture.nodeId() === input.expected_node_id, 'fixture signer must match the original target');
+            assert(fixture.peerId() === input.expected_node_id, 'fixture signer must match the original target');
             assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
             assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
             const issued = Math.floor(Date.now() / 1000);
-            const record = {node_id:fixture.nodeId(),public_key:fixture.publicKeyHex(),direct_urls:[],relay_urls:input.relay_urls,
+            const record = {peer_id:fixture.peerId(),public_key:fixture.publicKeyHex(),direct_urls:[],relay_urls:input.relay_urls,
               issued_at:issued,expires_at:issued+input.ttl_secs,signature:''};
             record.signature = fixture.sign('reachability',new TextEncoder().encode(JSON.stringify(record)));
             result = record;
@@ -93,7 +93,7 @@ function endpoint() {
         }
         case 'identity':
           if (input.secret_hex) { identity.free(); identity = crypto.Identity.fromSecretHex(input.secret_hex); }
-          result = { public_key: identity.publicKeyHex(), node_id: identity.nodeId() }; break;
+          result = { public_key: identity.publicKeyHex(), peer_id: identity.peerId() }; break;
         case 'recovery_seal': result = hex(crypto.recoverySeal(bytes(input.data), input.password)); break;
         case 'recovery_open': result = hex(crypto.recoveryOpen(bytes(input.data), input.password)); break;
         case 'sign': result = identity.sign(input.domain, bytes(input.data)); break;
@@ -133,16 +133,16 @@ async function selfTest() {
   async function pair(wrongIdentity = false) {
     const a = endpoint(); const b = native();
     const ai = await call(a, { op: 'identity' }); const bi = await call(b, { op: 'identity' });
-    await call(a, { op: 'handshake', initiator: true, expected_peer_id: wrongIdentity ? 'ab'.repeat(32) : bi.node_id, context: 'vibeface:client:v1' });
-    await call(b, { op: 'handshake', initiator: false, expected_peer_id: ai.node_id, context: 'vibeface:client:v1' });
+    await call(a, { op: 'handshake', initiator: true, expected_peer_id: wrongIdentity ? 'ab'.repeat(32) : bi.peer_id, context: 'vibeface:client:v1' });
+    await call(b, { op: 'handshake', initiator: false, expected_peer_id: ai.peer_id, context: 'vibeface:client:v1' });
     assert.equal(await call(a, { op: 'remote' }), null);
     assert.equal(await call(b, { op: 'read', data: await call(a, { op: 'write', data: '' }) }), '');
     const message2 = await call(b, { op: 'write', data: '' });
     if (wrongIdentity) { assert.equal((await a({ op: 'read', data: message2 })).ok, false); assert.equal((await a({ op: 'finish' })).ok, false); return; }
     assert.equal(await call(a, { op: 'read', data: message2 }), '');
     assert.equal(await call(b, { op: 'read', data: await call(a, { op: 'write', data: hex(Buffer.from('browser private hello')) }) }), hex(Buffer.from('browser private hello')));
-    assert.equal(await call(a, { op: 'remote' }), bi.node_id);
-    assert.equal(await call(b, { op: 'remote' }), ai.node_id);
+    assert.equal(await call(a, { op: 'remote' }), bi.peer_id);
+    assert.equal(await call(b, { op: 'remote' }), ai.peer_id);
     await call(a, { op: 'finish' }); await call(b, { op: 'finish' });
     const signature = await call(b, { op: 'sign', domain: 'client-challenge', data: '010203' });
     crypto.verify(bi.public_key, 'client-challenge', bytes('010203'), signature);

@@ -95,7 +95,7 @@ pub enum Service {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reachability {
-    pub node_id: String,
+    pub peer_id: String,
     pub public_key: String,
     pub direct_urls: Vec<String>,
     pub relay_urls: Vec<String>,
@@ -111,7 +111,7 @@ impl Reachability {
     }
     pub fn verify(&self, now: i64) -> Result<()> {
         ensure!(
-            self.node_id == fingerprint(&self.public_key)?,
+            self.peer_id == fingerprint(&self.public_key)?,
             "reachability identity mismatch"
         );
         ensure!(
@@ -156,7 +156,7 @@ enum Control {
         record: Option<Reachability>,
     },
     Reserve {
-        node_id: String,
+        peer_id: String,
         public_key: String,
         signature: String,
     },
@@ -180,7 +180,7 @@ enum Control {
 #[derive(Serialize)]
 struct ReservationProof<'a> {
     nonce: &'a str,
-    node_id: &'a str,
+    peer_id: &'a str,
 }
 #[derive(Serialize)]
 struct AttachmentProof<'a> {
@@ -355,7 +355,7 @@ struct State {
 #[derive(Clone)]
 struct MdnsSource {
     fullname: String,
-    node_id: String,
+    peer_id: String,
     urls: Vec<String>,
 }
 
@@ -388,7 +388,7 @@ impl MdnsSources {
     fn reset(&mut self, reason: &str) -> u64 {
         self.epoch = self.epoch.wrapping_add(1);
         for (_, source) in self.sources.drain() {
-            tracing::debug!(epoch = self.epoch, fullname = ?source.fullname, target = %source.node_id, urls = ?source.urls, event = "removed", reason, "mdns source changed");
+            tracing::debug!(epoch = self.epoch, fullname = ?source.fullname, target = %source.peer_id, urls = ?source.urls, event = "removed", reason, "mdns source changed");
         }
         self.verify.clear();
         tracing::debug!(epoch = self.epoch, reason, "mdns daemon reset");
@@ -401,7 +401,7 @@ impl MdnsSources {
         }
         let fullname = info.get_fullname();
         let key = fullname.to_ascii_lowercase();
-        let target = info.get_property_val_str("node_id").unwrap_or_default();
+        let target = info.get_property_val_str("peer_id").unwrap_or_default();
         let mut urls: Vec<_> = info
             .get_addresses()
             .iter()
@@ -454,7 +454,7 @@ impl MdnsSources {
             key,
             MdnsSource {
                 fullname: fullname.to_owned(),
-                node_id: target.to_owned(),
+                peer_id: target.to_owned(),
                 urls,
             },
         );
@@ -468,7 +468,7 @@ impl MdnsSources {
         let key = fullname.to_ascii_lowercase();
         self.verify.retain(|entry| entry != &key);
         if let Some(source) = self.sources.remove(&key) {
-            tracing::debug!(epoch, fullname = ?source.fullname, target = %source.node_id, urls = ?source.urls, event = "removed", reason, "mdns source changed");
+            tracing::debug!(epoch, fullname = ?source.fullname, target = %source.peer_id, urls = ?source.urls, event = "removed", reason, "mdns source changed");
             true
         } else {
             false
@@ -479,7 +479,7 @@ impl MdnsSources {
         let mut urls: Vec<_> = self
             .sources
             .values()
-            .filter(|source| source.node_id == target)
+            .filter(|source| source.peer_id == target)
             .flat_map(|source| source.urls.iter().cloned())
             .collect();
         urls.sort();
@@ -527,12 +527,12 @@ struct GenerationWindow {
 }
 
 impl RelayState {
-    fn next_generation(&mut self, node_id: &str, now: Instant) -> Result<GenerationWindow> {
+    fn next_generation(&mut self, peer_id: &str, now: Instant) -> Result<GenerationWindow> {
         let active = &self.reservations;
         self.generations.retain(|id, history| {
             active.contains_key(id) || now.duration_since(history.last) < Duration::from_secs(60)
         });
-        if let Some(history) = self.generations.get(node_id) {
+        if let Some(history) = self.generations.get(peer_id) {
             ensure!(
                 now.duration_since(history.last) >= GENERATION_INTERVAL,
                 "reservation_generation_rate"
@@ -573,7 +573,7 @@ fn generation_tag(id: &str) -> String {
 
 struct ReservationLease {
     state: Arc<StdMutex<RelayState>>,
-    node_id: String,
+    peer_id: String,
     id: String,
 }
 
@@ -582,18 +582,18 @@ impl Drop for ReservationLease {
         let mut state = relay_lock(&self.state);
         let current = state
             .reservations
-            .get(&self.node_id)
+            .get(&self.peer_id)
             .is_some_and(|record| record.id == self.id);
         if current {
-            state.reservations.remove(&self.node_id);
+            state.reservations.remove(&self.peer_id);
         }
         let before = state.attachments.len();
         state.attachments.retain(|_, attachment| {
-            attachment.target != self.node_id || attachment.reservation_id != self.id
+            attachment.target != self.peer_id || attachment.reservation_id != self.id
         });
         let removed = before - state.attachments.len();
         drop(state);
-        tracing::debug!(target = %self.node_id, generation = %generation_tag(&self.id), current, removed_pending = removed, "relay reservation removed");
+        tracing::debug!(target = %self.peer_id, generation = %generation_tag(&self.id), current, removed_pending = removed, "relay reservation removed");
     }
 }
 
@@ -833,13 +833,13 @@ impl NetworkHub {
                 send_control(&mut socket, &Control::Record { record }).await
             }
             Control::Reserve {
-                node_id,
+                peer_id,
                 public_key,
                 signature,
             } => {
                 ensure!(self.config.relay_enabled, "public relay is disabled");
                 ensure!(
-                    node_id == fingerprint(&public_key)?,
+                    peer_id == fingerprint(&public_key)?,
                     "reservation identity mismatch"
                 );
                 verify_payload(
@@ -847,11 +847,11 @@ impl NetworkHub {
                     "relay-reserve",
                     &serde_json::to_vec(&ReservationProof {
                         nonce: &nonce,
-                        node_id: &node_id,
+                        peer_id: &peer_id,
                     })?,
                     &signature,
                 )?;
-                self.reservation(socket, node_id, public_key).await
+                self.reservation(socket, peer_id, public_key).await
             }
             Control::Dial { target, service } => {
                 ensure!(self.config.relay_enabled, "public relay is disabled");
@@ -930,7 +930,7 @@ impl NetworkHub {
     }
 
     async fn lookup_local(&self, target: &str) -> Result<Option<Reachability>> {
-        if target == self.identity.node_id()? {
+        if target == self.identity.peer_id()? {
             return Ok(Some(self.local_record().await?));
         }
         let mut state = self.state.lock().await;
@@ -951,14 +951,14 @@ impl NetworkHub {
             "reachability expired while waiting"
         );
         state.records.retain(|_, r| r.expires_at > now);
-        if let Some(old) = state.records.get(&record.node_id) {
+        if let Some(old) = state.records.get(&record.peer_id) {
             if record.issued_at < old.issued_at {
                 return Ok(PublishOutcome::Accepted);
             }
         } else if state.records.len() >= MAX_RECORDS {
             return Ok(PublishOutcome::Full);
         }
-        state.records.insert(record.node_id.clone(), record);
+        state.records.insert(record.peer_id.clone(), record);
         Ok(PublishOutcome::Accepted)
     }
     async fn remember(&self, record: Reachability) -> Result<bool> {
@@ -970,14 +970,14 @@ impl NetworkHub {
             "reachability expired while waiting"
         );
         state.resolved.retain(|_, r| r.expires_at > now);
-        if let Some(old) = state.resolved.get(&record.node_id) {
+        if let Some(old) = state.resolved.get(&record.peer_id) {
             if record.issued_at < old.issued_at {
                 return Ok(false);
             }
         } else if state.resolved.len() >= MAX_RESOLVED {
             return Ok(false);
         }
-        state.resolved.insert(record.node_id.clone(), record);
+        state.resolved.insert(record.peer_id.clone(), record);
         Ok(true)
     }
     async fn known_records(&self, target: &str) -> Result<Vec<Reachability>> {
@@ -1005,7 +1005,7 @@ impl NetworkHub {
             .collect();
         relay_urls.sort();
         let mut record = Reachability {
-            node_id: self.identity.node_id()?,
+            peer_id: self.identity.peer_id()?,
             public_key: self.identity.public_key_hex()?,
             direct_urls: self.config.advertise_urls.clone(),
             relay_urls,
@@ -1044,7 +1044,7 @@ impl NetworkHub {
                             bail!("invalid directory reply");
                         };
                         if let Some(record) = &record {
-                            ensure!(record.node_id == target, "directory returned another node");
+                            ensure!(record.peer_id == target, "directory returned another node");
                             record.verify(now_secs()?)?;
                         }
                         Ok::<_, anyhow::Error>(record)
@@ -1344,7 +1344,7 @@ impl NetworkHub {
     async fn reservation(
         self: Arc<Self>,
         mut socket: NetworkSocket,
-        node_id: String,
+        peer_id: String,
         public_key: String,
     ) -> Result<()> {
         let id = random_token();
@@ -1357,7 +1357,7 @@ impl NetworkHub {
         let (cancel, mut cancelled) = watch::channel(false);
         let (mut pending, previous, old_cancel, _lease) = {
             let mut state = relay_lock(&self.relay);
-            let previous = state.reservations.get(&node_id).map(|old| {
+            let previous = state.reservations.get(&peer_id).map(|old| {
                 (
                     old.id.clone(),
                     old.slot,
@@ -1376,7 +1376,7 @@ impl NetworkHub {
                 );
             }
             let now = Instant::now();
-            let history = state.next_generation(&node_id, now)?;
+            let history = state.next_generation(&peer_id, now)?;
             let pending = if let Some((_, old_slot, _, _, _, _)) = &previous {
                 Some(socket.admitted()?.handoff(*old_slot)?)
             } else {
@@ -1385,11 +1385,11 @@ impl NetworkHub {
             };
             if let Some((old_id, _, _, _, _, _)) = &previous {
                 state.attachments.retain(|_, attachment| {
-                    attachment.target != node_id || attachment.reservation_id != *old_id
+                    attachment.target != peer_id || attachment.reservation_id != *old_id
                 });
             }
             state.reservations.insert(
-                node_id.clone(),
+                peer_id.clone(),
                 Reservation {
                     id: id.clone(),
                     public_key,
@@ -1401,16 +1401,16 @@ impl NetworkHub {
                     cancel,
                 },
             );
-            state.generations.insert(node_id.clone(), history);
+            state.generations.insert(peer_id.clone(), history);
             let lease = ReservationLease {
                 state: self.relay.clone(),
-                node_id: node_id.clone(),
+                peer_id: peer_id.clone(),
                 id: id.clone(),
             };
             let old_cancel = previous.as_ref().map(|old| old.3.clone());
             (pending, previous, old_cancel, lease)
         };
-        tracing::debug!(target = %node_id, %source, generation = %generation_tag(&id), previous = ?previous.as_ref().map(|old| generation_tag(&old.0)), previous_source = ?previous.as_ref().map(|old| old.4), previous_authenticated_secs = ?previous.as_ref().map(|old| old.5.elapsed().as_secs()), "relay reservation installed");
+        tracing::debug!(target = %peer_id, %source, generation = %generation_tag(&id), previous = ?previous.as_ref().map(|old| generation_tag(&old.0)), previous_source = ?previous.as_ref().map(|old| old.4), previous_authenticated_secs = ?previous.as_ref().map(|old| old.5.elapsed().as_secs()), "relay reservation installed");
         if let Some(cancel) = old_cancel {
             cancel.send_replace(true);
         }
@@ -1420,7 +1420,7 @@ impl NetworkHub {
                     .await
                     .context("reservation handoff close timed out")??;
                 socket.admitted()?.finish_handoff(ticket)?;
-                tracing::debug!(target = %node_id, generation = %generation_tag(&id), previous = ?previous.as_ref().map(|old| generation_tag(&old.0)), "relay reservation previous socket closed");
+                tracing::debug!(target = %peer_id, generation = %generation_tag(&id), previous = ?previous.as_ref().map(|old| generation_tag(&old.0)), "relay reservation previous socket closed");
             }
             drop(pending.take());
             send_control(&mut socket, &Control::Reserved).await?;
@@ -1428,12 +1428,12 @@ impl NetworkHub {
                 let mut state = relay_lock(&self.relay);
                 let reservation = state
                     .reservations
-                    .get_mut(&node_id)
+                    .get_mut(&peer_id)
                     .filter(|reservation| reservation.id == id)
                     .context("reservation replaced before ready")?;
                 reservation.ready = true;
             }
-            tracing::debug!(target = %node_id, %source, generation = %generation_tag(&id), "relay reservation ready");
+            tracing::debug!(target = %peer_id, %source, generation = %generation_tag(&id), "relay reservation ready");
             let deadline = tokio::time::sleep(RESERVATION_LIFETIME);
             tokio::pin!(deadline);
             let mut heartbeat = tokio::time::interval(HEARTBEAT);
@@ -1455,9 +1455,9 @@ impl NetworkHub {
                                 rate.charge(30)?;
                                 ensure!(text.len() <= MAX_CONTROL_BYTES, "network control too large");
                                 let Control::Publish { record } = serde_json::from_str(&text)? else { bail!("invalid reservation control"); };
-                                ensure!(record.node_id == node_id, "reservation may publish only its own record");
+                                ensure!(record.peer_id == peer_id, "reservation may publish only its own record");
                                 if self.publish(record).await? == PublishOutcome::Full {
-                                    tracing::debug!(target = %node_id, "reservation publication directory full");
+                                    tracing::debug!(target = %peer_id, "reservation publication directory full");
                                 }
                             }
                             Message::Ping(_) | Message::Pong(_) => {},
@@ -1655,18 +1655,18 @@ impl NetworkHub {
 
     async fn maintain_relay(self: Arc<Self>, url: &str) -> Result<()> {
         let (mut socket, nonce) = self.open(url, SocketClass::Reservation).await?;
-        let node_id = self.identity.node_id()?;
+        let peer_id = self.identity.peer_id()?;
         let signature = self.identity.sign_payload(
             "relay-reserve",
             &serde_json::to_vec(&ReservationProof {
                 nonce: &nonce,
-                node_id: &node_id,
+                peer_id: &peer_id,
             })?,
         )?;
         send_control(
             &mut socket,
             &Control::Reserve {
-                node_id,
+                peer_id,
                 public_key: self.identity.public_key_hex()?,
                 signature,
             },
@@ -1752,7 +1752,7 @@ impl NetworkHub {
             .map_err(|_| anyhow::anyhow!("network service queue full"))
     }
     async fn mdns(&self, listen: SocketAddr) -> Result<()> {
-        let node_id = self.identity.node_id()?;
+        let peer_id = self.identity.peer_id()?;
         loop {
             let epoch = mdns_lock(&self.mdns).reset("start");
             let _lease = MdnsLease {
@@ -1779,7 +1779,7 @@ impl NetworkHub {
                 }
                 let monitor = daemon.get().monitor()?;
                 let events = daemon.get().browse(SERVICE_TYPE)?;
-                if let Some(service) = mdns_service(&node_id, listen)? {
+                if let Some(service) = mdns_service(&peer_id, listen)? {
                     tracing::debug!(epoch, %listen, fullname = ?service.get_fullname(), addr_auto = service.is_addr_auto(), addresses = ?service.get_addresses(), "mdns service registered");
                     daemon.get().register(service)?;
                 }
@@ -1806,7 +1806,7 @@ impl NetworkHub {
                         _ = &mut failure => bail!("mdns injected generation error"),
                         event = events.recv_async() => match event.context("mdns browse stopped")? {
                             ServiceEvent::ServiceResolved(info) => {
-                                mdns_lock(&self.mdns).resolved(epoch, &info, &node_id);
+                                mdns_lock(&self.mdns).resolved(epoch, &info, &peer_id);
                             }
                             ServiceEvent::ServiceRemoved(_, fullname) => {
                                 mdns_lock(&self.mdns).removed(epoch, &fullname, "dns");
@@ -1828,7 +1828,7 @@ impl NetworkHub {
                             let source = mdns_lock(&self.mdns).next_verify();
                             if let Some(source) = source {
                                 daemon.get().verify(source.fullname.clone(), MDNS_VERIFY_TIMEOUT)?;
-                                tracing::debug!(epoch, fullname = ?source.fullname, target = %source.node_id, urls = ?source.urls, timeout_ms = MDNS_VERIFY_TIMEOUT.as_millis(), "mdns source verify");
+                                tracing::debug!(epoch, fullname = ?source.fullname, target = %source.peer_id, urls = ?source.urls, timeout_ms = MDNS_VERIFY_TIMEOUT.as_millis(), "mdns source verify");
                             }
                         }
                     }
@@ -1960,12 +1960,12 @@ impl Drop for MdnsGuard {
     }
 }
 
-fn mdns_service(node_id: &str, listen: SocketAddr) -> Result<Option<ServiceInfo>> {
-    check_id(node_id)?;
+fn mdns_service(peer_id: &str, listen: SocketAddr) -> Result<Option<ServiceInfo>> {
+    check_id(peer_id)?;
     if listen.ip().is_loopback() {
         return Ok(None);
     }
-    let properties = [("node_id", node_id), ("path", "/api/network/ws")];
+    let properties = [("peer_id", peer_id), ("path", "/api/network/ws")];
     let address = if listen.ip().is_unspecified() {
         String::new()
     } else {
@@ -1973,8 +1973,8 @@ fn mdns_service(node_id: &str, listen: SocketAddr) -> Result<Option<ServiceInfo>
     };
     let service = ServiceInfo::new(
         SERVICE_TYPE,
-        &node_id[..32],
-        &format!("vf-{}.local.", &node_id[..16]),
+        &peer_id[..32],
+        &format!("vf-{}.local.", &peer_id[..16]),
         address.as_str(),
         listen.port(),
         &properties[..],
@@ -2522,7 +2522,7 @@ mod tests {
                 key,
                 MdnsSource {
                     fullname,
-                    node_id: target.to_owned(),
+                    peer_id: target.to_owned(),
                     urls: chunk.to_vec(),
                 },
             );
@@ -2760,7 +2760,7 @@ mod tests {
 
     fn signed_record(identity: &LocalIdentity, issued_at: i64) -> Result<Reachability> {
         let mut record = Reachability {
-            node_id: identity.node_id()?,
+            peer_id: identity.peer_id()?,
             public_key: identity.public_key_hex()?,
             direct_urls: Vec::new(),
             relay_urls: Vec::new(),
@@ -2839,18 +2839,18 @@ mod tests {
         nonce: &str,
         identity: &LocalIdentity,
     ) -> Result<()> {
-        let node_id = identity.node_id()?;
+        let peer_id = identity.peer_id()?;
         let signature = identity.sign_payload(
             "relay-reserve",
             &serde_json::to_vec(&ReservationProof {
                 nonce,
-                node_id: &node_id,
+                peer_id: &peer_id,
             })?,
         )?;
         send_control(
             socket,
             &Control::Reserve {
-                node_id,
+                peer_id,
                 public_key: identity.public_key_hex()?,
                 signature,
             },
@@ -3099,7 +3099,7 @@ mod tests {
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let mut old = reserve_at(&url, &identity).await?;
         let old_task = accepts.recv().await.context("missing old accept task")?;
         let old_id = relay_lock(&relay.relay).reservations[&target].id.clone();
@@ -3216,7 +3216,7 @@ mod tests {
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let mut reservation = reserve_at(&url, &identity).await?;
         let reservation_task = accepts.recv().await.context("missing reservation task")?;
         let (entered, paused) = oneshot::channel();
@@ -3285,7 +3285,7 @@ mod tests {
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let mut old = reserve_at(&url, &identity).await?;
         let old_task = accepts.recv().await.context("missing old task")?;
         let (raw_url, mut receive) = serve_raw_sockets(relay.clone(), &mut tasks).await?;
@@ -3337,7 +3337,7 @@ mod tests {
         let (url, mut denied) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let mut old = reserve_at(&url, &identity).await?;
         let old_task = accepts.recv().await.context("missing old task")?;
         let mut clients = Vec::new();
@@ -3460,7 +3460,7 @@ mod tests {
         .await?;
         let (v6, _) = serve_observed(relay.clone(), "[::1]:0", &mut tasks, Some(observed)).await?;
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let mut old = reserve_at(&v4, &identity).await?;
         let old_task = accepts.recv().await.context("missing old task")?;
         let old_id = relay_lock(&relay.relay).reservations[&target].id.clone();
@@ -3511,7 +3511,7 @@ mod tests {
         send_control(
             &mut invalid,
             &Control::Reserve {
-                node_id: target.clone(),
+                peer_id: target.clone(),
                 public_key: identity.public_key_hex()?,
                 signature: "00".into(),
             },
@@ -3533,7 +3533,7 @@ mod tests {
         let unrelated_task = accepts.recv().await.context("missing unrelated task")?;
         assert_eq!(relay_lock(&relay.relay).generations[&target].count, 1);
         assert_eq!(
-            relay_lock(&relay.relay).generations[&unrelated_identity.node_id()?].count,
+            relay_lock(&relay.relay).generations[&unrelated_identity.peer_id()?].count,
             1
         );
         drop(clients.pop());
@@ -3602,7 +3602,7 @@ mod tests {
             let (url, _) =
                 serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
             let identity = LocalIdentity::generate();
-            let target = identity.node_id()?;
+            let target = identity.peer_id()?;
             let (raw_url, mut sockets) = serve_raw_sockets(relay.clone(), &mut tasks).await?;
             let (client, _) = tokio_tungstenite::connect_async(&raw_url).await?;
             let mut old_client = NetworkSocket::Client(Box::new(client));
@@ -3866,7 +3866,7 @@ mod tests {
                         }
                         if waits == [true; 2] && !lookup_done {
                             let (mut lookup, _) = open_control(&url).await?;
-                            send_control(&mut lookup, &Control::Lookup { target: identity.node_id()? }).await?;
+                            send_control(&mut lookup, &Control::Lookup { target: identity.peer_id()? }).await?;
                             assert!(matches!(receive_control(&mut lookup).await?, Control::Record { .. }));
                             assert!(accepts.recv().await.context("missing lookup task")?.done.await?.is_ok());
                             lookup_done = true;
@@ -3919,7 +3919,7 @@ mod tests {
         accepts: &mut mpsc::UnboundedReceiver<AcceptedTask>,
         receive_bytes: Option<u32>,
     ) -> Result<(NetworkSocket, NetworkSocket, AcceptedTask)> {
-        let mut caller = dial_pending(url, &identity.node_id()?).await?;
+        let mut caller = dial_pending(url, &identity.peer_id()?).await?;
         let task = accepts.recv().await.context("missing circuit task")?;
         let token = incoming_token(reservation).await?;
         let mut target = match receive_bytes {
@@ -4279,7 +4279,7 @@ mod tests {
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
         let identity = LocalIdentity::generate();
         let caller_identity = LocalIdentity::generate();
-        let target_id = identity.node_id()?;
+        let target_id = identity.peer_id()?;
         let mut reservation = reserve_at(&url, &identity).await?;
         let reservation_task = accepts.recv().await.context("missing reservation task")?;
         let (flow, mut flows) = mpsc::unbounded_channel();
@@ -4375,7 +4375,7 @@ mod tests {
         let second_identity = LocalIdentity::generate();
         let mut second_reservation = reserve_at(&url, &second_identity).await?;
         let second_reservation_task = accepts.recv().await.context("missing second reservation")?;
-        let mut second_caller = dial_pending(&url, &second_identity.node_id()?).await?;
+        let mut second_caller = dial_pending(&url, &second_identity.peer_id()?).await?;
         let second_circuit_task = accepts.recv().await.context("missing second circuit")?;
         let second_token = incoming_token(&mut second_reservation).await?;
         let mut second_target = attach_pending(&url, &second_identity, &second_token).await?;
@@ -4463,14 +4463,14 @@ mod tests {
         let mut client = Handshake::new(
             true,
             &caller_identity.secret_key_hex,
-            Some(target_identity.node_id()?),
+            Some(target_identity.peer_id()?),
             b"test:directory",
         )
         .map_err(anyhow::Error::msg)?;
         let mut server = Handshake::new(
             false,
             &target_identity.secret_key_hex,
-            Some(caller_identity.node_id()?),
+            Some(caller_identity.peer_id()?),
             b"test:directory",
         )
         .map_err(anyhow::Error::msg)?;
@@ -4563,13 +4563,13 @@ mod tests {
         IncomingSocket,
         vibeface_secure::Channel,
     )> {
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         let dial = hub.dial_authenticated(&target_id, service, |mut socket| async move {
             let result = async {
                 let mut handshake = Handshake::new(
                     true,
                     &caller_identity.secret_key_hex,
-                    Some(target_identity.node_id()?),
+                    Some(target_identity.peer_id()?),
                     domain,
                 )
                 .map_err(anyhow::Error::msg)?;
@@ -4608,7 +4608,7 @@ mod tests {
             let mut handshake = Handshake::new(
                 false,
                 &target_identity.secret_key_hex,
-                Some(caller_identity.node_id()?),
+                Some(caller_identity.peer_id()?),
                 domain,
             )
             .map_err(anyhow::Error::msg)?;
@@ -4799,7 +4799,7 @@ mod tests {
         let _reservation_a = reserve_at(&v4, &target_a).await?;
         let _reservation_b = reserve_at(&v4, &target_b).await?;
         let mut callers = Vec::new();
-        let target = target_a.node_id()?;
+        let target = target_a.peer_id()?;
         for _ in 0..4 {
             let (mut socket, _) = open_control(&v4).await?;
             send_control(
@@ -4823,7 +4823,7 @@ mod tests {
         send_control(
             &mut source_extra,
             &Control::Dial {
-                target: target_b.node_id()?,
+                target: target_b.peer_id()?,
                 service: Service::Client,
             },
         )
@@ -4834,7 +4834,7 @@ mod tests {
         send_control(
             &mut target_extra,
             &Control::Dial {
-                target: target_a.node_id()?,
+                target: target_a.peer_id()?,
                 service: Service::Client,
             },
         )
@@ -4846,7 +4846,7 @@ mod tests {
             send_control(
                 &mut socket,
                 &Control::Dial {
-                    target: target_b.node_id()?,
+                    target: target_b.peer_id()?,
                     service: Service::Client,
                 },
             )
@@ -4864,7 +4864,7 @@ mod tests {
             send_control(
                 &mut socket,
                 &Control::Lookup {
-                    target: target_a.node_id()?,
+                    target: target_a.peer_id()?,
                 },
             )
             .await?;
@@ -4961,8 +4961,8 @@ mod tests {
 
     #[test]
     fn mdns_uses_valid_dns_labels_and_retains_the_full_identity() -> Result<()> {
-        let node_id = LocalIdentity::generate().node_id()?;
-        let service = mdns_service(&node_id, "0.0.0.0:4790".parse()?)?
+        let peer_id = LocalIdentity::generate().peer_id()?;
+        let service = mdns_service(&peer_id, "0.0.0.0:4790".parse()?)?
             .context("wildcard registration missing")?;
         assert!(
             service
@@ -4971,15 +4971,15 @@ mod tests {
                 .all(|label| label.len() <= 63)
         );
         assert_eq!(
-            service.get_property_val_str("node_id"),
-            Some(node_id.as_str())
+            service.get_property_val_str("peer_id"),
+            Some(peer_id.as_str())
         );
         assert_eq!(service.get_port(), 4790);
         Ok(())
     }
 
-    fn mdns_info(instance: &str, node_id: &str, addresses: &str) -> Result<ServiceInfo> {
-        let properties = [("node_id", node_id), ("path", "/api/network/ws")];
+    fn mdns_info(instance: &str, peer_id: &str, addresses: &str) -> Result<ServiceInfo> {
+        let properties = [("peer_id", peer_id), ("path", "/api/network/ws")];
         Ok(ServiceInfo::new(
             SERVICE_TYPE,
             instance,
@@ -5104,10 +5104,10 @@ mod tests {
 
     #[test]
     fn m4_mdns_registration_matches_fixed_wildcard_and_loopback_listeners() -> Result<()> {
-        let node_id = LocalIdentity::generate().node_id()?;
+        let peer_id = LocalIdentity::generate().peer_id()?;
         for address in ["192.0.2.7:4790", "[2001:db8::7]:4790"] {
             let listen: SocketAddr = address.parse()?;
-            let service = mdns_service(&node_id, listen)?.unwrap();
+            let service = mdns_service(&peer_id, listen)?.unwrap();
             assert!(!service.is_addr_auto());
             assert_eq!(
                 service
@@ -5119,12 +5119,12 @@ mod tests {
             );
         }
         for address in ["0.0.0.0:4790", "[::]:4790"] {
-            let service = mdns_service(&node_id, address.parse()?)?.unwrap();
+            let service = mdns_service(&peer_id, address.parse()?)?.unwrap();
             assert!(service.is_addr_auto());
             assert!(service.get_addresses().is_empty());
         }
         for address in ["127.0.0.1:4790", "[::1]:4790"] {
-            assert!(mdns_service(&node_id, address.parse()?)?.is_none());
+            assert!(mdns_service(&peer_id, address.parse()?)?.is_none());
         }
         Ok(())
     }
@@ -5168,7 +5168,7 @@ mod tests {
         assert!(mdns_lock(&hub.mdns).resolved(
             old_epoch,
             &mdns_info("Old", &target, "192.0.2.1")?,
-            &hub.identity.node_id()?
+            &hub.identity.peer_id()?
         ));
         let (closed, old_closed) = oneshot::channel();
         let (next_started, next) = oneshot::channel();
@@ -5186,12 +5186,12 @@ mod tests {
         assert!(!mdns_lock(&hub.mdns).resolved(
             old_epoch,
             &mdns_info("Late", &target, "192.0.2.1")?,
-            &hub.identity.node_id()?
+            &hub.identity.peer_id()?
         ));
         assert!(mdns_lock(&hub.mdns).resolved(
             current_epoch,
             &mdns_info("Current", &target, "192.0.2.2")?,
-            &hub.identity.node_id()?
+            &hub.identity.peer_id()?
         ));
         owner.abort();
         assert!(owner.await.unwrap_err().is_cancelled());
@@ -5213,7 +5213,7 @@ mod tests {
         let browser = MdnsGuard::new(ServiceDaemon::new()?);
         publisher.get().disable_interface(IfKind::IPv6)?;
         browser.get().disable_interface(IfKind::IPv6)?;
-        let target = LocalIdentity::generate().node_id()?;
+        let target = LocalIdentity::generate().peer_id()?;
         let service =
             mdns_info(&format!("NET1-{}", &target[..12]), &target, "")?.enable_addr_auto();
         let expected = service.get_fullname().to_owned();
@@ -5311,7 +5311,7 @@ mod tests {
         directory.publish(record.clone()).await?;
         assert_eq!(
             directory
-                .lookup_local(&owner.node_id()?)
+                .lookup_local(&owner.peer_id()?)
                 .await?
                 .unwrap()
                 .signature,
@@ -5325,7 +5325,7 @@ mod tests {
             .push("ws://127.0.0.1:9/api/network/ws".to_owned());
         assert!(changed.verify(now_secs()?).is_err());
         changed = record.clone();
-        changed.node_id = "a".repeat(64);
+        changed.peer_id = "a".repeat(64);
         assert!(changed.verify(now_secs()?).is_err());
         assert!(validate_url("ws://user:password@example.com/api/network/ws").is_err());
         assert!(validate_url("file:///tmp/socket").is_err());
@@ -5336,7 +5336,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_keeps_newest_cache_when_bootstraps_return_different_revisions() -> Result<()> {
         let target = LocalIdentity::generate();
-        let target_id = target.node_id()?;
+        let target_id = target.peer_id()?;
         let (owner, _) = NetworkHub::new(target.clone(), NetworkConfig::default());
         let template = owner.local_record().await?;
         let now = now_secs()?;
@@ -5414,7 +5414,7 @@ mod tests {
     #[tokio::test]
     async fn net1_expiring_directory_record_does_not_abort_healthy_slow_directory() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let target_id = identity.node_id()?;
+        let target_id = identity.peer_id()?;
         let (owner, _) = NetworkHub::new(identity.clone(), NetworkConfig::default());
         let healthy = owner.local_record().await?;
         let mut expiring = healthy.clone();
@@ -5502,7 +5502,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut records = resolver.resolve(&target.node_id()?).await?;
+        let mut records = resolver.resolve(&target.peer_id()?).await?;
         let (observed, received) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 async {
@@ -5596,7 +5596,7 @@ mod tests {
                 .lock()
                 .await
                 .resolved
-                .get(&updated.node_id)
+                .get(&updated.peer_id)
                 .unwrap()
                 .signature,
             updated.signature
@@ -5606,10 +5606,10 @@ mod tests {
             PublishOutcome::Full
         );
         assert!(!resolver.remember(record.clone()).await?);
-        let records: Vec<_> = resolver.resolve(&record.node_id).await?.collect().await;
+        let records: Vec<_> = resolver.resolve(&record.peer_id).await?.collect().await;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].signature, record.signature);
-        assert!(resolver.lookup_local(&record.node_id).await?.is_none());
+        assert!(resolver.lookup_local(&record.peer_id).await?.is_none());
         let (mut socket, mut client, mut accepted, mut server) = dial_test_noise(
             &resolver,
             &caller_identity,
@@ -5623,7 +5623,7 @@ mod tests {
         let state = resolver.state.lock().await;
         assert_eq!(state.records.len(), MAX_RECORDS);
         assert_eq!(state.resolved.len(), MAX_RESOLVED);
-        assert!(!state.resolved.contains_key(&record.node_id));
+        assert!(!state.resolved.contains_key(&record.peer_id));
         eprintln!(
             "NET1_D1 cache_full public={} private={} cached=false noise=fixed_target",
             state.records.len(),
@@ -5659,7 +5659,7 @@ mod tests {
             },
         );
         let records: Vec<_> = resolver
-            .resolve(&identity.node_id()?)
+            .resolve(&identity.peer_id()?)
             .await?
             .collect()
             .await;
@@ -5673,7 +5673,7 @@ mod tests {
         }
         let state = resolver.state.lock().await;
         assert_eq!(state.resolved.len(), 1);
-        assert!(!state.resolved.contains_key(&wrong.node_id));
+        assert!(!state.resolved.contains_key(&wrong.peer_id));
         assert!(state.records.is_empty());
         assert_eq!(resolver.admission.snapshot().total, 0);
         Ok(())
@@ -5717,7 +5717,7 @@ mod tests {
         let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         assert_eq!(hub.publish(record.clone()).await?, PublishOutcome::Accepted);
         assert!(hub.remember(record.clone()).await?);
-        let mut stream = hub.resolve(&record.node_id).await?;
+        let mut stream = hub.resolve(&record.peer_id).await?;
         while now_secs()? < record.expires_at {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -5731,15 +5731,15 @@ mod tests {
         let state = hub.state.lock().await;
         assert_eq!(state.records.len(), 1);
         assert_eq!(state.resolved.len(), 1);
-        assert!(!state.records.contains_key(&record.node_id));
-        assert!(!state.resolved.contains_key(&record.node_id));
+        assert!(!state.records.contains_key(&record.peer_id));
+        assert!(!state.resolved.contains_key(&record.peer_id));
         Ok(())
     }
 
     #[tokio::test]
     async fn authenticated_dial_budgets_are_shared_across_all_candidate_sources() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let mut tasks = JoinSet::new();
         let (reject_url, mut attempts) = serve_directory(None, None, &mut tasks).await?;
         for relay_only in [false, true] {
@@ -5841,7 +5841,7 @@ mod tests {
         assert!(caller.remember(private.clone()).await?);
         seed_mdns_urls(
             &caller,
-            &private.node_id,
+            &private.peer_id,
             (0..8)
                 .map(|index| format!("{reject_url}/mdns-{index}"))
                 .collect(),
@@ -5932,7 +5932,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let records = resolver.resolve(&identity.node_id()?).await?;
+        let records = resolver.resolve(&identity.peer_id()?).await?;
         let (records, publication) =
             tokio::time::timeout(CONNECT_TIMEOUT + Duration::from_secs(1), async {
                 tokio::join!(records.collect::<Vec<_>>(), resolver.publish_at(&url))
@@ -6016,7 +6016,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let node_id = hub.identity.node_id()?;
+        let peer_id = hub.identity.peer_id()?;
         let run = tokio::spawn({
             let hub = hub.clone();
             async move { hub.run("127.0.0.1:0".parse()?).await }
@@ -6027,7 +6027,7 @@ mod tests {
             4,
             "one Publish plus three refused Reserve requests"
         );
-        assert!(directory.lookup_local(&node_id).await?.is_some());
+        assert!(directory.lookup_local(&peer_id).await?.is_some());
         assert!(relay_lock(&directory.relay).reservations.is_empty());
         assert!(hub.state.lock().await.active_relays.is_empty());
         run.abort();
@@ -6089,9 +6089,9 @@ mod tests {
         assert!(
             relay_lock(&relay.relay)
                 .reservations
-                .contains_key(&record.node_id)
+                .contains_key(&record.peer_id)
         );
-        assert!(relay.lookup_local(&record.node_id).await?.is_none());
+        assert!(relay.lookup_local(&record.peer_id).await?.is_none());
         let (mut public, _) = open_control(&url).await?;
         send_control(
             &mut public,
@@ -6121,7 +6121,7 @@ mod tests {
         assert!(
             !relay_lock(&relay.relay)
                 .reservations
-                .contains_key(&record.node_id)
+                .contains_key(&record.peer_id)
         );
         eprintln!(
             "NET1_D2 public_full_ack=false legacy_full_keeps_reservation=true legacy_invalid_closes=true"
@@ -6142,7 +6142,7 @@ mod tests {
         );
         let url = serve(relay.clone(), &mut tasks).await?;
         let identity = LocalIdentity::generate();
-        let target_id = identity.node_id()?;
+        let target_id = identity.peer_id()?;
         let (target, mut incoming) = NetworkHub::new(identity.clone(), NetworkConfig::default());
         let maintenance = tokio::spawn({
             let target = target.clone();
@@ -6303,7 +6303,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         let run_started = Instant::now();
         let target_run = target.clone();
         tasks.spawn(async move {
@@ -6375,8 +6375,8 @@ mod tests {
             (0, 1)
         );
         assert_eq!(incoming.service, Service::Client);
-        assert_ne!(relay_identity.node_id()?, target_id);
-        assert_ne!(relay_identity.node_id()?, caller_identity.node_id()?);
+        assert_ne!(relay_identity.peer_id()?, target_id);
+        assert_ne!(relay_identity.peer_id()?, caller_identity.peer_id()?);
 
         let canary = b"private context canary across an unrelated relay";
         for encrypted in client.seal_message(canary).map_err(anyhow::Error::msg)? {
@@ -6489,7 +6489,7 @@ mod tests {
         tasks.spawn(async move {
             let _ = runner.run("127.0.0.1:0".parse().unwrap()).await;
         });
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         let record = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(record) = relay.lookup_local(&target_id).await?
@@ -6612,7 +6612,7 @@ mod tests {
                 let mut handshake = Handshake::new(
                     false,
                     &server_identity.secret_key_hex,
-                    Some(server_owner.node_id()?),
+                    Some(server_owner.peer_id()?),
                     b"vibeface:peer:v1",
                 )
                 .map_err(anyhow::Error::msg)?;
@@ -6638,7 +6638,7 @@ mod tests {
         });
         let driver_peer = peer.clone();
         let driver_network = network.clone();
-        let driver_target = target_identity.node_id()?;
+        let driver_target = target_identity.peer_id()?;
         let driver_transport = transport.clone();
         let driver = tokio::spawn(async move {
             driver_peer
@@ -6691,10 +6691,10 @@ mod tests {
         let mut tasks = JoinSet::new();
         let url = serve(target, &mut tasks).await?;
         let (caller, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
-        seed_mdns_urls(&caller, &target_identity.node_id()?, vec![url]);
+        seed_mdns_urls(&caller, &target_identity.peer_id()?, vec![url]);
         let (entered, mut entered_rx) = mpsc::unbounded_channel();
         let started = Instant::now();
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         let mut dial = Box::pin(caller.dial_authenticated::<(), _, _>(
             &target_id,
             Service::Client,
@@ -6734,7 +6734,7 @@ mod tests {
     #[tokio::test]
     async fn m4_withdrawn_source_is_rechecked_when_the_attempt_is_first_polled() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let target = identity.node_id()?;
+        let target = identity.peer_id()?;
         let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         let url = "ws://127.0.0.1:1/api/network/ws".to_owned();
         seed_mdns_urls(&hub, &target, vec![url.clone()]);
@@ -6789,7 +6789,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         seed_mdns_urls(&caller, &target_id, vec![stalled_url.clone()]);
         let release_fast = async {
             let mut stalled = stalled_incoming
@@ -6881,7 +6881,7 @@ mod tests {
         tasks.spawn(async move {
             let _ = runner.run("127.0.0.1:0".parse().unwrap()).await;
         });
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         let record = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(record) = relay.lookup_local(&target_id).await?
@@ -7005,14 +7005,14 @@ mod tests {
             let result = async {
                 let mut accepted = bad_incoming.recv().await.context("malformed Hello path missing")?;
                 let mut handshake = Handshake::new(false, &bad_identity.secret_key_hex,
-                    Some(bad_owner.node_id()?), b"vibeface:peer:v1").map_err(anyhow::Error::msg)?;
+                    Some(bad_owner.peer_id()?), b"vibeface:peer:v1").map_err(anyhow::Error::msg)?;
                 assert!(handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?.is_empty());
                 send_frame(&mut accepted.socket, Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into())).await?;
                 let hello: serde_json::Value = serde_json::from_slice(&handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?)?;
-                assert_eq!(hello["node_id"], bad_owner.node_id()?);
+                assert_eq!(hello["peer_id"], bad_owner.peer_id()?);
                 let mut channel = handshake.finish().map_err(anyhow::Error::msg)?;
                 let malformed = serde_json::to_vec(&serde_json::json!({
-                    "version":crate::model::WIRE_VERSION,"network_id":bad_network,"node_id":untrusted.node_id()?
+                    "version":crate::model::WIRE_VERSION,"network_id":bad_network,"peer_id":untrusted.peer_id()?
                 }))?;
                 for record in channel.seal_message(&malformed).map_err(anyhow::Error::msg)? {
                     send_frame(&mut accepted.socket, Message::Binary(record.into())).await?;
@@ -7050,7 +7050,7 @@ mod tests {
                 .expect("healthy target response failed");
         });
         let (transport, _) = NetworkHub::new(owner.clone(), NetworkConfig::default());
-        let target_id = target_identity.node_id()?;
+        let target_id = target_identity.peer_id()?;
         let mut record = signed_record(&target_identity, now_secs()?)?;
         record.direct_urls = vec![bad_url.clone(), healthy_url.clone()];
         record.signature = target_identity.sign_payload("reachability", &record.unsigned()?)?;
@@ -7165,7 +7165,7 @@ mod tests {
         let (caller, _) = NetworkHub::new(caller_identity.clone(), NetworkConfig::default());
         seed_mdns_urls(
             &caller,
-            &target_identity.node_id()?,
+            &target_identity.peer_id()?,
             vec![target_url.clone()],
         );
         let (mut socket, mut client, mut accepted, mut server) = dial_test_noise(
@@ -7180,18 +7180,18 @@ mod tests {
         encrypted_round_trip(&mut client, &mut server, &mut socket, &mut accepted.socket).await?;
         let (mut socket, nonce) = open_control(&target_url).await?;
         let identity = LocalIdentity::generate();
-        let node_id = identity.node_id()?;
+        let peer_id = identity.peer_id()?;
         let signature = identity.sign_payload(
             "relay-reserve",
             &serde_json::to_vec(&ReservationProof {
                 nonce: &nonce,
-                node_id: &node_id,
+                peer_id: &peer_id,
             })?,
         )?;
         send_control(
             &mut socket,
             &Control::Reserve {
-                node_id,
+                peer_id,
                 public_key: identity.public_key_hex()?,
                 signature,
             },

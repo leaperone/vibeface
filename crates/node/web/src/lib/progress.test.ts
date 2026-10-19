@@ -13,8 +13,10 @@ test('only the normalized progress contract crosses the changed boundary', () =>
     null, [], { type: 'unknown' },
     { type: 'manager_progress', conversation_id: 'chat-a', trigger: 'turn-a', progress: { provider: 'arbitrary-json' } },
     { type: 'manager_progress', conversation_id: 'chat-a', trigger: 'turn-a', sequence: '1', progress: { type: 'text_delta', text: 'text' } },
-    { type: 'execution_progress', conversation_id: 'chat-a', session_id: {}, progress: { type: 'status', text: 'running' } },
-    { type: 'execution_progress', conversation_id: 'chat-a', session_id: 'session-a', progress: { type: 'tool', text: { secret: 'value' } } },
+    { type: 'execution_progress', conversation_id: 'chat-a', session_id: 'removed', progress: { type: 'status', text: 'running' } },
+    { type: 'native_progress', conversation_id: 'chat-a', work_id: {}, thread_id: 'thread-a', target_node: 'node-a', progress: { type: 'status', text: 'running' } },
+    { type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', thread_id: 'thread-a', target_node: 'node-a', progress: { type: 'tool', text: { secret: 'value' } } },
+    { type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', thread_id: 'thread-a', progress: { type: 'status', text: 'running' } },
   ]) assert.deepEqual(parseChanged(value), { type: 'invalidate' })
 })
 
@@ -32,17 +34,20 @@ test('text snapshots replace their item while deltas append once in sequence', (
   assert.equal(fourth[0].needsRefresh, false)
 })
 
-test('each invocation and execution operation keeps its own sequence and text', () => {
+test('each invocation and native turn keeps its own sequence and task association', () => {
   let state = mergeProgress([], manager(1, { type: 'text_delta', text: '第一轮' }))
   state = mergeProgress(state, manager(1, { type: 'text_delta', text: '第二轮' }, 'turn-b'))
-  for (const operation_id of ['operation-a', 'operation-b']) {
-    state = mergeProgress(state, parseChanged({ type: 'execution_progress', conversation_id: 'chat-a', session_id: 'session-a', operation_id, task_id: 'task-a', target_node: 'executor-a', sequence: 1, progress: { type: 'text_snapshot', text: operation_id } }))
+  for (const turn_id of ['turn-a', 'turn-b']) {
+    state = mergeProgress(state, parseChanged({ type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', thread_id: 'thread-a', turn_id, task_ref: 'task-a', target_node: 'node-a', sequence: 1, progress: { type: 'text_snapshot', text: turn_id } }))
   }
   assert.equal(state.length, 4)
-  assert.deepEqual(state.map(item => item.text), ['第一轮', '第二轮', 'operation-a', 'operation-b'])
-  assert.deepEqual(state.map(item => item.kind), ['manager', 'manager', 'execution', 'execution'])
-  assert.equal(state[2].task_id, 'task-a')
-  assert.equal(state[2].operation_id, 'operation-a')
+  assert.deepEqual(state.map(item => item.text), ['第一轮', '第二轮', 'turn-a', 'turn-b'])
+  assert.deepEqual(state.map(item => item.kind), ['manager', 'manager', 'native', 'native'])
+  assert.equal(state[2].kind === 'native' && state[2].task_ref, 'task-a')
+  assert.equal(state[2].kind === 'native' && state[2].work_id, 'work-a')
+  const next = mergeProgress(state, parseChanged({ type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', thread_id: 'thread-a', turn_id: 'turn-a', task_ref: null, target_node: 'node-b', sequence: 1, progress: { type: 'text_snapshot', text: 'other device' } }))
+  assert.equal(next.length, 5)
+  assert.equal(next[4].text, 'other device')
 })
 
 test('sequence gaps request a snapshot and status and tool descriptions remain visible', () => {

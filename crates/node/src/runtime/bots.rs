@@ -63,7 +63,7 @@ impl Runtime {
             "wrong personal network"
         );
         let store = self.store.lock().await;
-        store.authorize_node(&access.network_id, &self.identity.node_id()?, None)?;
+        store.authorize_node(&access.network_id, &self.identity.peer_id()?, None)?;
         let bots = store
             .bots(&access.network_id)?
             .into_iter()
@@ -81,7 +81,7 @@ impl Runtime {
         self.store.lock().await.authorize_node(
             network,
             &project.target_node,
-            Some(NodeRole::Executor),
+            Some(NodeRole::Scheduler),
         )?;
         let cwd = Path::new(&project.cwd);
         ensure!(
@@ -94,10 +94,10 @@ impl Runtime {
                 }),
             "Bot project must use an absolute directory without parent components"
         );
-        if project.target_node == self.identity.node_id()? {
+        if project.target_node == self.identity.peer_id()? {
             ensure!(
-                self.config.roles.contains(&NodeRole::Executor),
-                "project Node execution capability is disabled"
+                self.config.roles.contains(&NodeRole::Scheduler) && self.config.manager.is_some(),
+                "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;
         } else {
@@ -108,6 +108,10 @@ impl Runtime {
                     json!({"type":"capabilities"}),
                 )
                 .await?;
+            ensure!(
+                capabilities["manager"].is_string(),
+                "project Node has no coordination Agent"
+            );
             ensure!(
                 capabilities["roots"].as_array().is_some_and(|roots| {
                     roots

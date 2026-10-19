@@ -38,7 +38,7 @@ impl Runtime {
         if let Some(active) = controls.get(attempt_id) {
             return Ok(active.cancel.subscribe());
         }
-        let target = self.identity.node_id()?;
+        let target = self.identity.peer_id()?;
         let scope = access
             .conversation_id
             .as_deref()
@@ -75,11 +75,17 @@ impl Runtime {
     }
 
     pub async fn fence_manager_attempt(&self, attempt_id: &str) -> Result<()> {
+        if let Some(active) = self.manager_controls.lock().await.get(attempt_id).cloned() {
+            let _ = active.cancel.send(true);
+        }
+        self.seal_manager_tools(attempt_id).await
+    }
+
+    pub(crate) async fn seal_manager_tools(&self, attempt_id: &str) -> Result<()> {
         let active = self.manager_controls.lock().await.get(attempt_id).cloned();
         if let Some(active) = active {
             active.fenced.store(true, Ordering::Release);
             self.agent_tokens.lock().await.remove(&active.token);
-            let _ = active.cancel.send(true);
             let manager = active
                 .access
                 .manager
@@ -192,7 +198,7 @@ impl Runtime {
     }
 
     async fn manager_target(&self, network: &str, scope: &str, trigger: &str) -> Result<String> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let store = self.store.lock().await;
         if store
             .scheduler_job(network, scope, trigger, &local)?
@@ -215,13 +221,7 @@ impl Runtime {
                 scheduler_node: Some(target),
                 ..
             } if role == "user" => Ok(target.clone()),
-            EventBody::ExecutionObserved {
-                task_id: Some(task),
-                ..
-            } => Ok(store.followup_policy(network, scope, task)?.target_node),
-            EventBody::ExecutionObserved { task_id: None, .. } => Ok(store
-                .execution_result_policy(network, scope, trigger)?
-                .target_node),
+            EventBody::AgentMessage { message } => Ok(message.target_node.clone()),
             _ => anyhow::bail!("event is not a management trigger"),
         }
     }
@@ -233,7 +233,7 @@ impl Runtime {
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
         let target = self.manager_target(network, scope, trigger).await?;
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             self.require_role(network, NodeRole::Gateway).await?;
             return self.peer_request(network, &target, json!({"type":"cancel_manager","conversation_id":scope,"trigger":trigger,"human":true})).await;
         }
@@ -273,7 +273,7 @@ impl Runtime {
         let evidence = super::field(input, "evidence")?;
         self.require_scope(access, scope).await?;
         let target = self.manager_target(network, scope, trigger).await?;
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             self.require_role(network, NodeRole::Gateway).await?;
             return self.peer_request(network, &target, json!({"type":"resolve_manager_unknown","conversation_id":scope,"trigger":trigger,"evidence":evidence,"human":true})).await;
         }
@@ -293,126 +293,18 @@ impl Runtime {
             .context("management attempt missing")?
             .id;
         self.fence_manager_attempt(attempt).await?;
-        let refs = self
-            .store
-            .lock()
-            .await
-            .local_value(network, &format!("manager-tools:v1:{attempt}"))?
-            .unwrap_or(json!({}));
-        for reference in refs
-            .as_object()
-            .context("invalid management tool references")?
-            .values()
-        {
-            let operation = super::field(reference, "operation_id")?;
-            let executor = super::field(reference, "target_node")?;
-            let original = self
-                .store
-                .lock()
-                .await
-                .context(network, scope, &[])?
-                .events
-                .into_iter()
-                .find_map(|event| match event.body {
-                    EventBody::DispatchRecorded {
-                        operation_id,
-                        action,
-                        ..
-                    } if event.scope_id == scope && operation_id == operation => {
-                        Some(serde_json::from_value::<OperationRequest>(action))
-                    }
-                    _ => None,
-                })
-                .transpose()?;
-            let record: Option<OperationRecord> = if executor == self.identity.node_id()? {
-                self.store.lock().await.operation(network, operation)?
-            } else {
-                serde_json::from_value(
-                    self.read_peer(
-                        network,
-                        executor,
-                        json!({"type":"operation","operation_id":operation}),
-                    )
-                    .await?["operation"]
-                        .clone(),
-                )?
-            };
-            if let Some(record) = record {
-                Self::verify_manager_operation(
-                    network,
-                    scope,
-                    reference,
-                    original
-                        .as_ref()
-                        .context("original management dispatch is missing")?,
-                    &record,
-                )?;
-                ensure!(
-                    record.state != OperationState::Unknown,
-                    "reconcile the original execution operation before resolving this management reply"
-                );
-            } else {
-                ensure!(
-                    original.is_none(),
-                    "original dispatch has no confirmed execution receipt; reconcile it first"
-                );
-            }
-        }
+        let native = self
+            .native_work_for_attempt(network, scope, trigger, attempt)
+            .await?;
+        ensure!(
+            native.iter().all(|work| work.state.terminal()),
+            "verify the original native turns have stopped before resolving this Agent invocation"
+        );
         let mut store = self.store.lock().await;
         store.fence_manager_unknown(network, scope, &target, trigger, attempt)?;
         store.resolve_manager_unknown(network, scope, &target, trigger, attempt, evidence)?;
         drop(store);
         self.publish_changed(network, scope, trigger);
         Ok(json!({"resolved":true,"trigger":trigger}))
-    }
-
-    pub(super) fn verify_manager_operation(
-        network: &str,
-        scope: &str,
-        reference: &Value,
-        original: &OperationRequest,
-        record: &OperationRecord,
-    ) -> Result<()> {
-        ensure!(
-            original.network_id == network
-                && original.conversation_id == scope
-                && reference["operation_id"] == original.operation_id
-                && reference["target_node"] == original.target_node
-                && reference["session_id"] == serde_json::to_value(&original.session_id)?
-                && reference["task_id"] == serde_json::to_value(&original.task_id)?,
-            "management operation reference does not match its original dispatch"
-        );
-        let mut admitted = original.clone();
-        admitted.resources = record.request.resources.clone();
-        ensure!(
-            record.request == admitted,
-            "execution receipt does not match the original management operation"
-        );
-        Ok(())
-    }
-
-    pub(super) fn record_manager_operation(
-        store: &mut crate::store::Store,
-        access: &Access,
-        request: &OperationRequest,
-    ) -> Result<()> {
-        Self::check_manager_permission(store, access, true, request.task_id.as_deref())?;
-        if let Some(manager) = &access.manager {
-            let key = format!("manager-tools:v1:{}", manager.attempt_id);
-            let mut refs = store
-                .local_value(&access.network_id, &key)?
-                .unwrap_or(json!({}));
-            let reference = json!({"operation_id":request.operation_id,"target_node":request.target_node,"session_id":request.session_id,"task_id":request.task_id});
-            if let Some(previous) = refs.get(&request.operation_id) {
-                ensure!(
-                    previous == &reference,
-                    "management operation identity cannot change"
-                );
-            } else {
-                refs[&request.operation_id] = reference;
-            }
-            store.local_set(&access.network_id, &key, &refs)?;
-        }
-        Ok(())
     }
 }

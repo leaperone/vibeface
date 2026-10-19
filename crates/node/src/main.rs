@@ -18,12 +18,14 @@ use vibeface::{
     config::{self, Config, ManagerSettings},
     crypto::{LocalIdentity, digest},
     identity::{
-        IdentityKind, IdentityStore, Member, NetworkState,
+        IdentityKind, Member, NetworkState,
         local::{BootstrapCapability, InviteEnvelope, PairRequest, PairReview},
     },
+    local_access::Launcher,
     maintenance,
     network::NetworkConfig,
     runtime::Runtime,
+    store::Store,
     update::{self, Update},
 };
 
@@ -55,12 +57,23 @@ enum Action {
     Status(Access),
     /// Manage this user's installed node service and update timer.
     Service(service::Service),
-    /// Display this node's trusted frontend entry and initial pairing capability.
+    /// Display this node's trusted bootstrap or local browser entry.
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
     /// Join a personal network using its invite and pinned fingerprint.
     Pair(Pair),
+    /// Send a native Codex App Server method without retrying writes.
+    Codex {
+        method: String,
+        #[arg(long, default_value = "{}")]
+        json: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Keep reading notifications and accept manual JSON responses on stdin.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Call a node tool from a locally managed SDK process.
     Tool {
         name: String,
@@ -106,9 +119,15 @@ struct Init {
     /// Additional browser origins allowed to reach this node. May be repeated.
     #[arg(long = "allowed-origin")]
     allowed_origins: Vec<String>,
-    /// Existing directories that executors may access. May be repeated.
+    /// Existing project directories available to this device's Agent. May be repeated.
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
+    /// Serve Web and public discovery/relay without joining a personal network or starting an Agent.
+    #[arg(long, conflicts_with_all = ["manager", "roots", "codex_socket"])]
+    relay_only: bool,
+    /// Require ordinary device pairing for local browser access.
+    #[arg(long)]
+    no_local_auto_access: bool,
     #[arg(long)]
     allow_insecure_lan: bool,
     #[arg(long, value_enum, requires = "workspace")]
@@ -123,6 +142,10 @@ struct Init {
     node_bin: PathBuf,
     #[arg(long)]
     codex_sdk_script: Option<PathBuf>,
+    #[arg(long)]
+    codex_socket: Option<PathBuf>,
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
     /// Known discovery or relay WebSocket endpoints. May be repeated.
     #[arg(long = "bootstrap-url")]
     bootstrap_urls: Vec<String>,
@@ -162,7 +185,7 @@ struct Pair {
 #[serde(deny_unknown_fields)]
 struct Invitation {
     url: String,
-    node_id: String,
+    peer_id: String,
     relay: bool,
     invite: InviteSecret,
 }
@@ -178,7 +201,7 @@ struct InviteSecret {
 #[serde(deny_unknown_fields)]
 struct PendingPair {
     url: String,
-    node_id: String,
+    peer_id: String,
     relay: bool,
     invite_id: String,
     request_id: String,
@@ -216,11 +239,27 @@ async fn main() -> Result<()> {
                 result = maintenance::serve(runtime, options.data_dir) => result,
             }
         }
-        Action::Access(options) => access(options),
+        Action::Access(options) => access(options).await,
         Action::Status(options) => status(options).await,
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
         Action::Pair(options) => pair(options).await,
+        Action::Codex {
+            method,
+            json,
+            socket,
+            watch,
+        } => {
+            let socket = socket
+                .or_else(|| std::env::var_os("VIBEFACE_CODEX_SOCKET").map(PathBuf::from))
+                .context("--socket or VIBEFACE_CODEX_SOCKET is required")?;
+            let params: Value = serde_json::from_str(&json).context("--json must be valid JSON")?;
+            ensure!(
+                !method.is_empty() && method.len() <= 256 && params.is_object(),
+                "Codex method must be nonempty and --json must be an object"
+            );
+            vibeface_bridge::app_server::call(&socket, &method, params, watch).await
+        }
         Action::Tool {
             name,
             json,
@@ -251,10 +290,10 @@ async fn status(options: Access) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
-    let node_id = config::identity(&data)?.node_id()?;
+    let peer_id = config::identity(&data)?.peer_id()?;
     let health = maintenance::probe(&data).await.and_then(|health| {
         ensure!(
-            health.node_id == node_id,
+            health.peer_id == peer_id,
             "running node identity does not match this data directory"
         );
         Ok(health)
@@ -278,7 +317,7 @@ async fn status(options: Access) -> Result<()> {
         println!(
             "{}",
             json!({
-                "status":state, "node_id":node_id, "data_dir":data,
+                "status":state, "peer_id":peer_id, "data_dir":data,
                 "listen":configuration.listen, "roles":configuration.roles,
                 "version":health.as_ref().ok().map(|health| &health.version),
                 "cli_version":env!("CARGO_PKG_VERSION"), "error":error,
@@ -286,7 +325,7 @@ async fn status(options: Access) -> Result<()> {
         );
     } else {
         println!(
-            "Node: {node_id}\nStatus: {state}\nListen: {}\nData: {}",
+            "Node: {peer_id}\nStatus: {state}\nListen: {}\nData: {}",
             configuration.listen,
             data.display()
         );
@@ -307,9 +346,15 @@ fn init(options: Init) -> Result<()> {
     let roots: Vec<_> = options
         .roots
         .iter()
-        .map(|root| root.canonicalize().context("resolve execution root"))
+        .map(|root| root.canonicalize().context("resolve project root"))
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
+    configuration.local_auto_access = !options.no_local_auto_access && !options.relay_only;
+    configuration.codex_socket = options.codex_socket;
+    configuration.codex_bin = options.codex_bin;
+    if options.relay_only {
+        configuration.roles = vec![vibeface::model::NodeRole::Relay];
+    }
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     }
@@ -326,7 +371,7 @@ fn init(options: Init) -> Result<()> {
             .map(|value| network_url(value))
             .collect::<Result<_>>()?,
         mdns: options.mdns,
-        relay_enabled: options.public_relay,
+        relay_enabled: options.public_relay || options.relay_only,
     };
     if let Some(manager) = options.manager {
         let workspace = options
@@ -381,14 +426,14 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
     config::private_dir(dir)?;
     create_private(&dir.join("identity.json"), &encoded_identity)?;
     create_private(&dir.join("config.json"), &encoded_configuration)?;
-    let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
-    let capability = identities.bootstrap_capability()?;
+    let store = Store::open(dir.join("node.sqlite3"))?;
+    let capability = store.bootstrap_capability()?;
     create_private(
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
-    println!("Initialized node {}", identity.node_id()?);
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+    println!("Initialized node {}", identity.peer_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
 }
@@ -458,17 +503,18 @@ fn network_url(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn access(options: Access) -> Result<()> {
+async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":3}),
+        epoch == json!({"data_epoch":4}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
     let identity = config::identity(dir)?;
-    let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
-    let capability = if identities.has_network()? {
+    let store = Store::open_readonly(dir.join("node.sqlite3"))?;
+    let initialized = store.has_network()?;
+    let capability = if initialized {
         None
     } else {
         let capability: BootstrapCapability =
@@ -480,6 +526,64 @@ fn access(options: Access) -> Result<()> {
         );
         Some(capability.capability)
     };
+    if initialized && configuration.local_auto_access {
+        let path = dir.join("local-access.json");
+        let metadata = fs::symlink_metadata(&path)
+            .context("start the node before opening local browser access")?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "local launcher credential must be a private regular file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(
+                metadata.permissions().mode() & 0o077 == 0,
+                "local launcher credential must be private"
+            );
+        }
+        let launcher: Launcher = serde_json::from_slice(&read_bounded(&path, 4096)?)?;
+        let mut url = origin(&launcher.origin)?;
+        ensure!(
+            url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")
+                && launcher.peer_id == identity.peer_id()?
+                && launcher.capability.len() == 64
+                && hex::decode(&launcher.capability).is_ok(),
+            "local launcher does not match this node"
+        );
+        let entry: Value = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .post(url.join("/api/local/launch")?)
+            .bearer_auth(launcher.capability)
+            .json(&json!({}))
+            .send()
+            .await
+            .context("local node is unavailable; start it before opening browser access")?
+            .error_for_status()?
+            .json()
+            .await?;
+        let token = entry["token"]
+            .as_str()
+            .filter(|token| token.len() == 64 && hex::decode(token).is_ok())
+            .context("invalid local browser entry")?;
+        ensure!(
+            entry["peer_id"] == launcher.peer_id && entry["url"] == launcher.origin,
+            "local browser entry does not match this node"
+        );
+        url.set_fragment(Some(&format!("local={token}&node={}", launcher.peer_id)));
+        if options.json {
+            println!(
+                "{}",
+                json!({"url":url.to_string(),"peer_id":launcher.peer_id,"local":true})
+            );
+        } else {
+            println!("{url}");
+        }
+        return Ok(());
+    }
     let mut url = origin(&configuration.public_url)?;
     if url.scheme() == "http" && !is_loopback(&url) {
         ensure!(
@@ -493,7 +597,7 @@ fn access(options: Access) -> Result<()> {
         };
         url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
-    let entry = json!({"url":url.origin().ascii_serialization(),"node_id":identity.node_id()?,"capability":capability});
+    let entry = json!({"url":url.origin().ascii_serialization(),"peer_id":identity.peer_id()?,"capability":capability});
     if options.json {
         println!("{}", serde_json::to_string(&entry)?);
     } else {
@@ -530,7 +634,7 @@ fn invitation(options: &Pair) -> Result<Invitation> {
     let invitation: Invitation =
         serde_json::from_slice(&bytes).context("invalid invitation file")?;
     ensure!(
-        invitation.node_id.len() == 64 && hex::decode(&invitation.node_id).is_ok(),
+        invitation.peer_id.len() == 64 && hex::decode(&invitation.peer_id).is_ok(),
         "invitation requires a pinned Node identity"
     );
     ensure!(
@@ -595,7 +699,7 @@ async fn pair(options: Pair) -> Result<()> {
         let pending: PendingPair = serde_json::from_slice(&read_bounded(&pending_path, 8192)?)?;
         ensure!(
             pending.url == url
-                && pending.node_id == invitation.node_id
+                && pending.peer_id == invitation.peer_id
                 && pending.relay == invitation.relay
                 && pending.invite_id == payload.invite_id
                 && pending.name == options.name,
@@ -605,7 +709,7 @@ async fn pair(options: Pair) -> Result<()> {
     } else {
         let pending = PendingPair {
             url: url.clone(),
-            node_id: invitation.node_id.clone(),
+            peer_id: invitation.peer_id.clone(),
             relay: invitation.relay,
             invite_id: payload.invite_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -615,7 +719,7 @@ async fn pair(options: Pair) -> Result<()> {
         create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
         pending
     };
-    let mut client = Client::connect(&url, identity, &invitation.node_id, invitation.relay).await?;
+    let mut client = Client::connect(&url, identity, &invitation.peer_id, invitation.relay).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
     let mut accepted = false;
     loop {
@@ -643,7 +747,7 @@ async fn pair(options: Pair) -> Result<()> {
                     view.network_id == payload.network_id,
                     "paired network does not match the invitation"
                 );
-                let authorized = view.authorize_node(&identity.node_id()?, None)?;
+                let authorized = view.authorize_node(&identity.peer_id()?, None)?;
                 ensure!(
                     authorized == member
                         && authorized
@@ -653,7 +757,7 @@ async fn pair(options: Pair) -> Result<()> {
                     "paired network grants unexpected local permissions"
                 );
                 let installed = runtime.install_membership(state).await?;
-                let current = installed.authorize_node(&identity.node_id()?, None)?;
+                let current = installed.authorize_node(&identity.peer_id()?, None)?;
                 ensure!(
                     current == member,
                     "installed network no longer grants the requested local membership"
@@ -666,7 +770,7 @@ async fn pair(options: Pair) -> Result<()> {
                 fs::remove_file(pending_path)?;
                 println!(
                     "Paired node {} with network {}",
-                    identity.node_id()?,
+                    identity.peer_id()?,
                     payload.network_id
                 );
                 println!("Start the Node to connect to its personal network.");
@@ -781,7 +885,7 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     );
     let write = !matches!(
         name.as_str(),
-        "nodes" | "context" | "execution_status" | "call_lookup"
+        "nodes" | "context" | "task_status" | "call_lookup"
     );
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
@@ -898,12 +1002,12 @@ mod tests {
             configuration.save(&dir).unwrap();
             let identity = fs::read(dir.join("identity.json")).unwrap();
             let config = fs::read(dir.join("config.json")).unwrap();
-            let node_id = config::identity(&dir).unwrap().node_id().unwrap();
+            let peer_id = config::identity(&dir).unwrap().peer_id().unwrap();
             prepare_start(&dir).unwrap();
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
             let runtime = Runtime::open(&dir).await.unwrap();
-            assert_eq!(runtime.identity.node_id().unwrap(), node_id);
+            assert_eq!(runtime.identity.peer_id().unwrap(), peer_id);
             assert_eq!(runtime.config.timeout_secs, 1234);
             drop(runtime);
             fs::write(dir.join("config.json"), b"invalid configuration").unwrap();
@@ -1011,7 +1115,59 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch", "--json", "{}"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "tool", "send_task", "--json", "{}"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "codex",
+                "thread/read",
+                "--json",
+                "{}",
+                "--socket",
+                "/tmp/codex.sock",
+                "--watch"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn relay_only_initialization_does_not_join_a_personal_network() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-relay-only-{}", uuid::Uuid::new_v4()));
+        let cli = Cli::try_parse_from([
+            "vibeface",
+            "init",
+            "--relay-only",
+            "--data-dir",
+            dir.to_str().context("temporary path is invalid")?,
+        ])?;
+        let Some(Action::Init(options)) = cli.command else {
+            bail!("expected init command")
+        };
+        init(*options)?;
+        let configuration = Config::load(&dir)?;
+        assert_eq!(configuration.roles, vec![vibeface::model::NodeRole::Relay]);
+        assert!(configuration.network.relay_enabled);
+        assert!(configuration.manager.is_none() && configuration.roots.is_empty());
+        assert!(!configuration.local_auto_access);
+        let store = Store::open_readonly(dir.join("node.sqlite3"))?;
+        assert!(!store.has_network()?);
+        drop(store);
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "init",
+                "--relay-only",
+                "--manager",
+                "codex_sdk",
+                "--workspace",
+                "."
+            ])
+            .is_err()
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
@@ -1082,7 +1238,7 @@ mod tests {
         for relay in [false, true] {
             let mut envelope = json!({
                 "url":"ws://127.0.0.1:4790/api/network/ws",
-                "node_id":device.node_id().unwrap(),
+                "peer_id":device.peer_id().unwrap(),
                 "relay":relay,
                 "invite":{"invite":&invite,"capability":"fixture capability"}
             });

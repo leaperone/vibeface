@@ -1,8 +1,7 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
-  ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, OperationRecord,
-  PendingOperation,
-  FollowupMode, HumanRequest, SchedulerSnapshot, HumanQuestion, ExecutionActivityRecord, ExecutionControlRequest, BotRecord, CreateBotRequest, PendingBot,
+  AgentTaskRecord, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
+  HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot,
 } from "./types"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -42,10 +41,10 @@ export function parseNodes(value: unknown): NodeInfo[] {
     const data = record(item)
     const capabilities = data.capabilities == null ? null : record(data.capabilities)
     return {
-      node_id: text(data.node_id),
+      peer_id: text(data.peer_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked), roles: texts(data.roles),
-      capabilities: capabilities ? { manager: capabilities.manager === null ? null : text(capabilities.manager), executors: texts(capabilities.executors), roots: texts(capabilities.roots) } : undefined,
+      capabilities: capabilities ? { manager: capabilities.manager === null ? null : text(capabilities.manager), roots: texts(capabilities.roots) } : undefined,
     }
   })
 }
@@ -61,10 +60,6 @@ function message(value: unknown): TranscriptMessage {
 }
 function blobReferences(value: unknown) { return value == null ? undefined : list(value).map((item) => { const blob = record(item); return { hash: text(blob.hash), size: number(blob.size) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
-export function parseFollowupMode(value: unknown): FollowupMode {
-  if (value !== "off" && value !== "report" && value !== "continue") throw new Error("节点返回了未知的后续授权。")
-  return value
-}
 function humanRequest(value: unknown): HumanRequest {
   const data = record(value)
   const questions: HumanQuestion[] | undefined = data.questions == null ? undefined : list(data.questions).map((item) => {
@@ -82,25 +77,32 @@ function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
 export function hasQueuedMessage(scheduler: SchedulerSnapshot | null, pending: PendingMessage): boolean {
   return scheduler?.jobs.some((job) => job.message_id === pending.message_id && typeof job.target_node === "string" && job.target_node.length > 0 && (pending.scheduler_node === null || job.target_node === pending.scheduler_node) && ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown"].includes(job.state)) ?? false
 }
-export function parseOperation(value: unknown): OperationRecord {
-  const data = record(value), request = record(data.request)
-  const state = text(data.state)
-  if (!["accepted", "running", "unknown", "succeeded", "failed", "rejected"].includes(state)) throw new Error("未知的操作状态。")
-  return { state, request: { operation_id: text(request.operation_id), target_node: text(request.target_node), conversation_id: text(request.conversation_id), session_id: request.session_id === null ? null : text(request.session_id) }, raw: value }
+function agentTaskState(value: unknown): AgentTaskState {
+  switch (value) {
+    case "pending_delivery": case "queued": case "claimed": case "accepted": case "running": case "cancelling":
+    case "completed": case "failed": case "cancelled": case "interrupted": case "unknown": return value
+    default: throw new Error("未知的任务状态。")
+  }
 }
-function execution(value: unknown): ExecutionActivityRecord {
+function nativeSessionState(value: unknown): NativeSessionState {
+  switch (value) {
+    case "running": case "waiting": case "interrupting": case "completed": case "failed": case "interrupted": case "unknown": return value
+    default: throw new Error("未知的原生工作状态。")
+  }
+}
+function agentTask(value: unknown): AgentTaskRecord {
   const data = record(value)
-  const state = text(data.state)
-  if (!["accepted", "running", "unknown", "succeeded", "failed", "rejected"].includes(state)) throw new Error("未知的工作状态。")
-  if (data.freshness !== "local_ledger" && data.freshness !== "cached" && data.freshness !== "unknown") throw new Error("未知的执行状态读取来源。")
-  const goal = data.goal == null ? null : record(data.goal)
   return {
-    operation_id: text(data.operation_id), target_node: text(data.target_node), session_id: data.session_id === null ? null : text(data.session_id),
-    revision: number(data.revision), title: text(data.title), state, session_state: text(data.session_state),
-    capabilities: texts(data.capabilities), pending_requests: list(data.pending_requests).map(humanRequest), freshness: data.freshness,
-    checked_at_ms: data.checked_at_ms == null ? undefined : number(data.checked_at_ms), latest_progress: optionalText(data.latest_progress),
-    detail: text(data.detail), blobs: blobReferences(data.blobs) ?? [], source_trigger: optionalText(data.source_trigger), source_message_id: optionalText(data.source_message_id),
-    goal: goal ? { task_id: text(goal.task_id), title: text(goal.title), acceptance: text(goal.acceptance), status: text(goal.status), followup_mode: parseFollowupMode(goal.followup_mode), followup_version: number(goal.followup_version), followup_scheduler_node: optionalText(goal.followup_scheduler_node) } : undefined,
+    task_ref: text(data.task_ref), source_node: text(data.source_node), target_node: text(data.target_node),
+    origin_trigger: text(data.origin_trigger), state: agentTaskState(data.state), text: text(data.text), detail: text(data.detail),
+  }
+}
+function nativeSession(value: unknown): NativeSessionRecord {
+  const data = record(value)
+  return {
+    work_id: text(data.work_id), task_ref: data.task_ref === null ? null : text(data.task_ref),
+    target_node: text(data.target_node), thread_id: text(data.thread_id), turn_id: data.turn_id === null ? null : text(data.turn_id),
+    state: nativeSessionState(data.state), detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
   }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
@@ -110,31 +112,11 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
   return {
     conversation: owner, messages: list(data.messages).map(message), heads: texts(data.heads),
     missing: { events: texts(missing.events), blobs: list(missing.blobs), conflicts: texts(missing.conflicts) },
-    operations: list(data.operations).map(parseOperation),
+    agent_tasks: list(data.agent_tasks).map(agentTask),
+    native_sessions: list(data.native_sessions).map(nativeSession),
+    observation_targets: texts(data.observation_targets),
     scheduler: schedulerSnapshot(data.scheduler),
-    executions: list(data.executions).map(execution),
   }
-}
-function executionControlRequest(value: unknown): ExecutionControlRequest {
-  const data = record(value), action = record(data.action)
-  const request = { conversation_id: text(data.conversation_id), operation_id: text(data.operation_id), expected_operation_id: text(data.expected_operation_id), expected_revision: number(data.expected_revision) }
-  switch (action.type) {
-    case "interrupt": return { ...request, action: { type: "interrupt" } }
-    case "steer": return { ...request, action: { type: "steer", text: text(action.text) } }
-    case "respond_request":
-      if (!("response" in action)) throw new Error("待核对审批缺少本人决定。")
-      return { ...request, action: { type: "respond_request", request_id: typeof action.request_id === "string" ? action.request_id : number(action.request_id), response: action.response } }
-    default: throw new Error("未知的待核对控制。")
-  }
-}
-export function parsePending(value: unknown): PendingOperation[] {
-  return list(value).map((item) => {
-    const data = record(item)
-    const identity = { operation_id: text(data.operation_id), target_node: text(data.target_node), conversation_id: text(data.conversation_id), session_id: data.session_id === null ? null : text(data.session_id) }
-    const request = executionControlRequest(data.execution_control)
-    if (identity.operation_id !== request.operation_id || identity.conversation_id !== request.conversation_id) throw new Error("待核对控制内容不一致。")
-    return { ...identity, execution_control: request }
-  })
 }
 export function parsePendingMessages(value: unknown): PendingMessage[] {
   return list(value).map((item) => {

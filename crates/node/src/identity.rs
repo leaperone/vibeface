@@ -3,7 +3,6 @@
 pub use vibeface_secure::membership::*;
 
 pub mod local;
-pub use local::IdentityStore;
 
 #[cfg(test)]
 mod tests {
@@ -29,7 +28,7 @@ mod tests {
             version: 1,
             network_id: state.genesis.network_id.clone(),
             scope_id: "archive".into(),
-            author: old_node.node_id()?,
+            author: old_node.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -42,7 +41,7 @@ mod tests {
         state.append(GovernanceEvent::revoke(
             &admin,
             &state.project()?,
-            &old_node.node_id()?,
+            &old_node.peer_id()?,
         )?)?;
         let original = state.clone();
         let retained = state.historical_nodes()?;
@@ -57,7 +56,7 @@ mod tests {
         let author = fresh
             .historical_nodes()?
             .into_iter()
-            .find(|node| node.subject_id == old_node.node_id().unwrap())
+            .find(|node| node.subject_id == old_node.peer_id().unwrap())
             .unwrap();
         assert_eq!(
             crypto::verify_signed_event(&fresh.genesis.network_id, &event, &author.public_key)?
@@ -67,7 +66,7 @@ mod tests {
         assert!(
             fresh
                 .project()?
-                .authorize_node(&old_node.node_id()?, None)
+                .authorize_node(&old_node.peer_id()?, None)
                 .is_err()
         );
         assert_eq!(retained, original.historical_nodes()?);

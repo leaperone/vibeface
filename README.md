@@ -1,14 +1,14 @@
 # Vibeface
 
-在自己的 Mac 或 Linux 设备上运行 `vibeface`，创建有名称、职责和项目配置的机器人，直接在它的聊天中提出要求。机器人可以回答问题、运行受管命令，或按需委派编码 Agent。机器人定义、聊天历史和执行结果在本人授权的节点间同步，换一个入口也能查询原来的工作。
+在自己的 Mac 或 Linux 设备上运行 `vibeface`，创建有名称、职责和项目配置的机器人，直接在它的聊天中提出要求。协调 Agent 用宿主 SDK 的 Shell、文件工具和 Codex App Server 完成本机工作，也能向另一台设备的 Agent 发任务。机器人定义、聊天历史和任务结果在本人授权的节点间同步，换一个入口也能查询原来的工作。
 
 ```mermaid
 flowchart LR
     U[本人的网页或手机浏览器]
-    G[公网 Node<br>接入与中继]
-    A[Node A<br>管理 Agent]
-    B[Node B<br>编码执行器]
-    C[Node C<br>管理 Agent 与历史副本]
+    G[PVE Node<br>网页与公共中继]
+    A[Mac mini Node<br>协调 Agent]
+    B[Node B<br>协调 Agent 与本机工具]
+    C[Node C<br>协调 Agent 与历史副本]
     U -->|HTTPS| G
     U -->|LAN 直连| A
     U -->|切换入口| C
@@ -17,11 +17,11 @@ flowchart LR
     C <-->|出站 WebSocket| G
 ```
 
-所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以同时调度和执行。每个人拥有独立的设备网络，程序为每次请求选择已授权的可用节点，并固定已派发操作的目标。
+所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以按需启用 Agent，也可以只提供网页和公共中继。纯中继不加入个人设备网络。每个人拥有独立的设备网络，程序为每次请求选择已授权的可用节点，并固定已投递任务的目标。
 
 网页使用 React 和 TanStack Start 构建静态 SPA，随 Rust 程序内嵌分发，生产运行不需要 Node.js Web 服务。可信网页通过设备密钥和 Noise 通道连接指定 Node。
 
-Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和通知。Cursor SDK 聊天 Agent 通过原生自定义工具回调操作 Node，不需要 MCP。Codex 执行器通过 App Server 协议接收指令并上报事件。机器人定义和共享聊天历史独立于本机 SDK 缓存，创建机器人不会启动模型。
+Rust 核心负责认证、路由、DAG 同步、SQLite 存储、任务调度、去重和通知。Cursor SDK 聊天 Agent 通过原生自定义工具回调协调 Node，不需要 MCP。宿主命令和文件操作直接使用 SDK 工具；Codex 使用薄原生客户端访问 App Server，不经过独立执行适配层。机器人定义和共享聊天历史独立于本机 SDK 缓存，创建机器人不会启动模型。
 
 本版本使用新的机器人和数据库结构，部署时使用全新的数据目录重新初始化。旧数据库不自动升级，个人网络中的节点使用同一新版本。
 
@@ -49,7 +49,7 @@ vibeface
 
 ## 从源码开始
 
-从源码构建需要 Rust 1.89+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行编码任务前，安装并登录需要的执行器。
+从源码构建需要 Rust 1.89+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行任务前，安装并登录需要的 SDK 和 Codex CLI。
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -62,13 +62,15 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 3），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。`serve` 和 `pair` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 4，数据库 `user_version` 为 5。不注册网站账号，也不保存个人根私钥。`serve` 和 `pair` 用目录锁独占该目录。
 
 ```sh
 ./target/release/vibeface access --data-dir "$HOME/.vibeface"
 ```
 
-在自己信任的浏览器打开 `access` 打印的链接，填写此浏览器的设备名称，核对个人网络指纹，并保存加密恢复包。保存密钥的页面需要安全上下文，推荐 `http://localhost:4790`。之后自动核验设备指纹和成员授权，不使用账号密码。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
+首次在自己信任的浏览器打开 `access` 打印的链接，填写设备名称，核对个人网络指纹，并保存加密恢复包。保存密钥的页面需要安全上下文。网络建立后，默认开启的本机自动访问会通过独立回环入口建立本机会话，不必重复配对；可在网页或 `config.json` 关闭。公网访问仍验证设备身份。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。已启用 Agent 的 Node 可以启动私有 Codex App Server；网页可用不代表 Codex 已安装、登录或模型可用。
+
+PVE 只提供网页和中继时，使用 `init --relay-only`，然后让 Mac mini 的 `network.bootstrap_urls` 指向它。在手机上打开可信网页，导入 Mac mini 的连接信息并完成设备配对，实际认证目标是 Mac mini。见 [纯 Web 与 Relay](docs/node.md#纯-web-与-relay)。
 
 另一台 Node 使用独立的空数据目录先 `init`。管理客户端复制的 base64url 配对信息传给 `pair --invite`。`pair --invite-file` 读取解码后的 JSON 邀请，不是这段原文。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
@@ -84,7 +86,7 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 - [首次安装与 CLI 管理](docs/install.md) 包括 Stable/Nightly 一行安装、初始化、状态和后台服务命令。
 - [部署与使用 Node](docs/node.md) 包括局域网、公网中继、SDK、后台运行和制品安装。
-- [Node 协议参考](docs/node-protocol.md) 包括 HTTP、事件 DAG、操作状态和通知确认。
+- [Node 协议参考](docs/node-protocol.md) 包括 HTTP、事件 DAG、任务消息、原生状态和通知确认。
 - [构建与发布](docs/releasing.md) 说明 Linux x64（`x86_64-unknown-linux-gnu`）、Linux ARM64（`aarch64-unknown-linux-gnu`）和 macOS Apple Silicon（`aarch64-apple-darwin`）三个包、SHA256、Stable 与 Nightly 更新渠道，以及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
 - [选择更新渠道](docs/node.md#选择更新渠道) 可开启空闲时的后台升级；默认 Stable，自动更新默认关闭。
 - `scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，默认输出到 `.artifacts/packages/`。
@@ -97,4 +99,4 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-当前没有原生手机 App。Claude Code 和 Cursor CLI 执行器只支持打开及发送消息，不能代替 Codex 的完整会话控制。模型额度和计费由各 Provider 决定，每日决策次数限制不是 token 或费用上限。
+当前没有原生手机 App。模型额度和计费由各 Provider 决定，每日决策次数限制不是 token 或费用上限。

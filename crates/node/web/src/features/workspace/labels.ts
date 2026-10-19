@@ -6,12 +6,18 @@ export const roleNames: Record<string, string> = {
   relay: "中继",
   replica: "同步",
   scheduler: "调度",
-  executor: "执行",
 }
 
 export const stateNames: Record<string, string> = {
   accepted: "已接收",
+  pending_delivery: "等待设备接收",
+  queued: "等待处理",
+  claimed: "正在准备",
   running: "执行中",
+  waiting: "等待本人决定",
+  cancelling: "正在核对取消结果",
+  interrupting: "正在核对停止结果",
+  interrupted: "已中断",
   unknown: "结果未知",
   succeeded: "操作完成",
   failed: "失败",
@@ -40,7 +46,7 @@ export function nodeName(
   fallback?: string,
 ) {
   if (!id) return "未知设备"
-  const node = lookup?.nodes?.find((item) => item.node_id === id)
+  const node = lookup?.nodes?.find((item) => item.peer_id === id)
   if (node?.name) return node.name
   const member = lookup?.directory?.members.find((item) => item.subject_id === id)
   if (member?.name) return member.name

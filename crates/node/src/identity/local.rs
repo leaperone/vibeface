@@ -6,27 +6,14 @@
 use super::{AuthorizationView, IdentityKind, Member, NetworkState};
 use crate::crypto;
 use crate::model::NodeRole;
+use crate::store::Store;
 use anyhow::{Context, Result, bail, ensure};
 use rand::{RngCore, rngs::OsRng};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{self, OpenOptions},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-const SCHEMA: &str = include_str!("../../identity-migrations/202610170001_identity.sql");
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const INVITE_TTL_MS: i64 = 10 * 60_000;
-
-#[derive(Debug)]
-pub struct IdentityStore {
-    path: PathBuf,
-    connection: Mutex<Connection>,
-}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -197,83 +184,13 @@ pub struct PendingPair {
     pub new_subject_signature: String,
 }
 
-impl IdentityStore {
-    pub fn open(path: &Path) -> Result<Self> {
-        ensure!(
-            path != Path::new(":memory:"),
-            "identity state requires a private file"
-        );
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .context("identity state requires a private directory")?;
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-        let parent_meta = fs::symlink_metadata(parent)?;
-        ensure!(
-            parent_meta.is_dir()
-                && !parent_meta.file_type().is_symlink()
-                && parent_meta.permissions().mode() & 0o077 == 0,
-            "identity directory must be private and not a symlink"
-        );
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            ensure!(
-                meta.is_file() && !meta.file_type().is_symlink(),
-                "identity database must be a regular file"
-            );
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        } else {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-        }
-        let canonical_path = path.canonicalize()?;
-        let path = canonical_path.as_path();
-        private_sidecars(path)?;
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        let version: u64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                let tables:i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get(0))?;
-                ensure!(
-                    tables == 0,
-                    "unversioned identity database is not supported"
-                );
-                connection.execute_batch(&format!("BEGIN IMMEDIATE;{SCHEMA}COMMIT;"))?;
-            }
-            1 => {}
-            _ => bail!("unsupported identity schema version"),
-        }
-        private_sidecars(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            connection: Mutex::new(connection),
-        })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
+impl Store {
     fn transaction<T>(
         &self,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let value = operation(&tx)?;
         tx.commit()?;
         Ok(value)
@@ -325,11 +242,8 @@ impl IdentityStore {
     }
 
     pub fn verify_bootstrap_capability(&self, capability: &str) -> Result<()> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
-        verify_bootstrap_in(&conn, capability)
+        let conn = &self.connection;
+        verify_bootstrap_in(conn, capability)
     }
 
     fn bootstrap_network_inner(
@@ -363,24 +277,20 @@ impl IdentityStore {
     }
 
     pub fn public_state(&self) -> Result<NetworkState> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
-        let state = load_state(&conn)?;
+        let conn = &self.connection;
+        let state = load_state(conn)?;
         state.project()?;
         Ok(state)
     }
 
     pub fn has_network(&self) -> Result<bool> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
-        has_network_in(&conn)
+        let conn = &self.connection;
+        has_network_in(conn)
     }
 
-    pub fn install_state(&self, incoming: NetworkState) -> Result<AuthorizationView> {
+    pub fn install_state(&mut self, incoming: NetworkState) -> Result<AuthorizationView> {
+        incoming.project()?;
+        self.retire_identity_readers(&incoming.genesis.network_id);
         self.transaction(|tx| {
             let next = if has_network_in(tx)? {
                 let current = load_state(tx)?;
@@ -506,10 +416,7 @@ impl IdentityStore {
     }
 
     pub fn lookup_pair(&self, request_id: &str) -> Result<PairReview> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
+        let conn = &self.connection;
         let encoded: String = conn.query_row(
             "SELECT review FROM identity_pair_requests WHERE request_id=?",
             [request_id],
@@ -519,11 +426,8 @@ impl IdentityStore {
     }
 
     pub fn pending_pairs(&self, inviter_id: &str) -> Result<Vec<PendingPair>> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
-        let view = load_state(&conn)?.project()?;
+        let conn = &self.connection;
+        let view = load_state(conn)?.project()?;
         ensure!(
             view.authorize_client(inviter_id)?.manage,
             "management permission required"
@@ -574,7 +478,8 @@ impl IdentityStore {
         })
     }
 
-    pub fn store_signed_grant(&self, event: super::GovernanceEvent) -> Result<NetworkState> {
+    pub fn store_signed_grant(&mut self, event: super::GovernanceEvent) -> Result<NetworkState> {
+        self.retire_identity_readers(&event.network_id);
         let super::GovernanceAction::Grant { member } = &event.action else {
             bail!("pairing requires a grant")
         };
@@ -618,10 +523,7 @@ impl IdentityStore {
         subject_id: &str,
     ) -> Result<Option<NetworkState>> {
         super::validate_id(capability)?;
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("identity store lock poisoned"))?;
+        let conn = &self.connection;
         let hash: String = conn.query_row(
             "SELECT capability_hash FROM identity_invites WHERE invite_id=?",
             [invite_id],
@@ -654,7 +556,7 @@ impl IdentityStore {
         if done == 0 {
             return Ok(None);
         };
-        let state = load_state(&conn)?;
+        let state = load_state(conn)?;
         let view = state.project()?;
         ensure!(
             view.network_id == review.network_id && view.epoch == review.epoch,
@@ -667,23 +569,17 @@ impl IdentityStore {
 
 fn load_state(conn: &Connection) -> Result<NetworkState> {
     let encoded: String = conn
-        .query_row("SELECT state FROM identity_network LIMIT 1", [], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT bundle FROM networks LIMIT 1", [], |r| r.get(0))
         .optional()?
         .context("personal network is not installed")?;
     Ok(serde_json::from_str(&encoded)?)
 }
 fn save_state(conn: &Connection, state: &NetworkState) -> Result<()> {
-    conn.execute("INSERT INTO identity_network(network_id,state) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET state=excluded.state",params![state.genesis.network_id,serde_json::to_string(state)?])?;
+    crate::store::install_trust_bundle_in(conn, &state.genesis.network_id, state)?;
     Ok(())
 }
 fn has_network_in(conn: &Connection) -> Result<bool> {
-    Ok(
-        conn.query_row("SELECT COUNT(*) FROM identity_network", [], |r| {
-            r.get::<_, i64>(0)
-        })? > 0,
-    )
+    Ok(conn.query_row("SELECT COUNT(*) FROM networks", [], |r| r.get::<_, i64>(0))? > 0)
 }
 fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
     super::validate_id(capability)?;
@@ -756,21 +652,6 @@ fn invite_receipt(payload: &InvitePayload) -> Receipt {
         subject_id: payload.inviter_subject_id.clone(),
         kind: "invite".into(),
     }
-}
-fn private_sidecars(path: &Path) -> Result<()> {
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        let sidecar = PathBuf::from(name);
-        if let Ok(meta) = fs::symlink_metadata(&sidecar) {
-            ensure!(
-                meta.is_file() && !meta.file_type().is_symlink(),
-                "identity sidecar must be a regular file"
-            );
-            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o600))?;
-        }
-    }
-    Ok(())
 }
 fn validate_text(value: &str, max: usize) -> Result<()> {
     ensure!(
