@@ -81,7 +81,7 @@ export function AddDevice() {
               <Icon aria-hidden="true" className="size-6" />{label}
             </button>)}
           </div>
-          {kind === "node" ? <p className="text-meta text-muted-foreground">先在那台电脑上装好并启动 vibeface，再在它的本机网页里粘贴链接。</p> : null}
+          {kind === "node" ? <p className="text-meta text-muted-foreground">在那台电脑的 vibeface 本机网页里粘贴</p> : null}
           {!result ? <Button type="button" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} />生成链接</Button> : null}
           {result ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用新设备扫码打开" /> : null}

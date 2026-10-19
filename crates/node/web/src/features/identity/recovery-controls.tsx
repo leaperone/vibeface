@@ -66,7 +66,7 @@ export function RecoveryReview() {
         </div>
       })}
     </fieldset>
-    <p className="text-meta text-muted-foreground">这个浏览器「{review.newManager.name}」会成为管理员。完成后会下载新的恢复文件。</p>
+    <p className="text-meta text-muted-foreground">这个浏览器会成为管理员，完成后下载新的恢复文件</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" onClick={device.cancelSensitive}>取消</Button>
@@ -94,7 +94,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   return <div className="grid gap-4">
     {open === 'restore' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />用恢复文件找回</h2>
-      <p className="text-meta text-muted-foreground">只恢复设备列表和管理权限，对话记录留在原来的设备上。</p>
+      <p className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</p>
       <form className="grid gap-4" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
@@ -117,7 +117,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
     </section> : null}
     {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2>
-      <p className="text-meta text-muted-foreground">会下载一份用新密码的恢复文件，旧文件仍可用旧密码打开。</p>
+      <p className="text-meta text-muted-foreground">下载用新密码的恢复文件，旧文件不受影响</p>
       <form className="grid gap-4" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {

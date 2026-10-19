@@ -124,7 +124,7 @@ export function ConnectionScreen() {
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localJoin?.kind === 'joined' ? '这台电脑已加入' : '这台电脑'}>
     {device.localSetup.kind === 'initialized' && device.localSetup.local_launch
       ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开这台电脑</Button>
-      : <p className="text-muted-foreground">需要在已有设备上生成加入链接，或用恢复文件找回。</p>}
+      : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.peer_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
