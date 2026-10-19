@@ -102,6 +102,10 @@ pub async fn run(
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
     let manager_settings = serde_json::to_value(&settings)?;
+    // Claiming before the tool listener exists would turn a startup race into a failed job.
+    node.tool_url
+        .get()
+        .context("local tool listener is not ready")?;
     let network = access.network_id.clone();
     let target = node.identity.peer_id()?;
     let claimed = {

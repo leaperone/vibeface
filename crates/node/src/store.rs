@@ -2268,14 +2268,25 @@ fn recover_scheduler_session(
         }
         JobState::Running { .. } | JobState::Cancelling { .. } => {
             let detail = "Node restarted after the SDK start boundary; this call was not replayed";
-            save_pending_check(
+            // A returned, unfinalized SDK had exited and been fenced, so only its started work remains.
+            let sdk_exited = scheduler_load::<Value>(
                 connection,
                 network,
-                &job,
-                &attempt,
-                detail,
-                crate::runtime::now_ms(),
-            )?;
+                &format!("sdk-returned:v1:{}", attempt.id),
+            )?
+            .is_some_and(|marker| {
+                marker["sdk_returned"] == true && marker["finalization_started"] == false
+            });
+            if !sdk_exited {
+                save_pending_check(
+                    connection,
+                    network,
+                    &job,
+                    &attempt,
+                    detail,
+                    crate::runtime::now_ms(),
+                )?;
+            }
             job.state = JobState::Interrupted {
                 attempt,
                 detail: detail.into(),
