@@ -1,6 +1,8 @@
 //! Reads and local records for Node-to-Node sync: log ranges, heads, the signed address book,
 //! scheduler deliveries and resumable attachment downloads.
-use super::{Store, local_load, local_prefix, local_save, log, message_from, scheduler::admit_from};
+use super::{
+    Store, local_load, local_prefix, local_save, log, message_from, scheduler::admit_from,
+};
 use crate::{
     model::*,
     net::{AddressRecord, SignedAddress},
@@ -92,7 +94,12 @@ impl Store {
         Ok(false)
     }
 
-    pub fn remove_outbox(&mut self, network: &str, conversation: &str, trigger: &str) -> Result<()> {
+    pub fn remove_outbox(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+    ) -> Result<()> {
         self.local_delete(network, &scheduler_key("outbox", conversation, trigger))
     }
 
@@ -121,7 +128,10 @@ impl Store {
         let Some(message) = message_from(&tx, network, conversation, message_id)? else {
             return Ok(None);
         };
-        ensure!(message.role == Role::User, "only user messages are delivered");
+        ensure!(
+            message.role == Role::User,
+            "only user messages are delivered"
+        );
         let receipt = admit_from(
             &tx,
             network,
@@ -178,10 +188,12 @@ impl Store {
 
     /// Bytes of a download that were synced to disk; anything after this is discarded.
     pub fn committed_offset(&self, network: &str, hash: &str) -> Result<u64> {
-        Ok(
-            local_load(&self.connection, network, &format!("{PARTIAL_PREFIX}{hash}"))?
-                .unwrap_or(0),
-        )
+        Ok(local_load(
+            &self.connection,
+            network,
+            &format!("{PARTIAL_PREFIX}{hash}"),
+        )?
+        .unwrap_or(0))
     }
 
     pub fn commit_offset(&mut self, network: &str, hash: &str, offset: Option<u64>) -> Result<()> {

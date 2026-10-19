@@ -89,7 +89,9 @@ pub fn relay_url(value: &str) -> Result<RelayUrl> {
             && url.fragment().is_none(),
         "relay URL must be an HTTP(S) URL without credentials"
     );
-    value.parse().map_err(|error| anyhow!("invalid relay URL: {error}"))
+    value
+        .parse()
+        .map_err(|error| anyhow!("invalid relay URL: {error}"))
 }
 
 /// A joiner's relay credential: only someone holding the invite can derive it.

@@ -423,7 +423,11 @@ impl Runtime {
                     }
                     tokio::time::timeout(
                         Duration::from_secs(3),
-                        self.peer_request(network, &member.device_id, json!({"type":"capabilities"})),
+                        self.peer_request(
+                            network,
+                            &member.device_id,
+                            json!({"type":"capabilities"}),
+                        ),
                     )
                     .await
                     .ok()

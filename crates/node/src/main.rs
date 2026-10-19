@@ -721,7 +721,9 @@ mod tests {
             }
             assert!(!bad.exists());
         }
-        assert!(Cli::try_parse_from(["vibeface", "init", "--relay-url", "https://relay.test"]).is_err());
+        assert!(
+            Cli::try_parse_from(["vibeface", "init", "--relay-url", "https://relay.test"]).is_err()
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -742,7 +744,9 @@ mod tests {
             assert!(configuration.roots.is_empty() && configuration.manager.is_none());
             assert!(!configuration.allow_insecure_lan);
             assert!(configuration.network.relays.is_empty());
-            assert!(configuration.network.relay_listen.is_none() && !configuration.network.n0_relays);
+            assert!(
+                configuration.network.relay_listen.is_none() && !configuration.network.n0_relays
+            );
             configuration.timeout_secs = 1234;
             configuration.save(&dir).unwrap();
             let identity = fs::read(dir.join("identity.json")).unwrap();

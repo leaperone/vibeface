@@ -211,10 +211,7 @@ impl Runtime {
                     connection.close(2u32.into(), b"wrong personal network");
                     bail!("wrong personal network");
                 }
-                node.store
-                    .lock()
-                    .await
-                    .authorize_node(&network, &remote)?;
+                node.store.lock().await.authorize_node(&network, &remote)?;
                 if alpn == net::SYNC {
                     node.handle_sync(&network, &remote, &request).await
                 } else {
@@ -234,7 +231,10 @@ impl Runtime {
         mut payload: Value,
     ) -> Result<Value> {
         let local = self.identity.device_id()?;
-        ensure!(target != local, "this Node answers itself without the network");
+        ensure!(
+            target != local,
+            "this Node answers itself without the network"
+        );
         {
             let store = self.store.lock().await;
             store.authorize_node(network, &local)?;
@@ -246,7 +246,12 @@ impl Runtime {
             .await
     }
 
-    async fn handle_rpc(self: &Arc<Self>, network: &str, origin: &str, input: &Value) -> Result<Value> {
+    async fn handle_rpc(
+        self: &Arc<Self>,
+        network: &str,
+        origin: &str,
+        input: &Value,
+    ) -> Result<Value> {
         let kind = field(input, "type")?;
         let _work = (!matches!(kind, "capabilities" | "progress_read" | "addresses"))
             .then(|| self.maintenance.enter())
@@ -313,8 +318,8 @@ impl Runtime {
                 Ok(ours)
             }
             "membership" => {
-                let incoming: NetworkState = serde_json::from_value(input["state"].clone())
-                    .context("invalid membership")?;
+                let incoming: NetworkState =
+                    serde_json::from_value(input["state"].clone()).context("invalid membership")?;
                 ensure!(
                     incoming.genesis.network_id == network,
                     "wrong membership network"
@@ -331,11 +336,11 @@ impl Runtime {
                     .as_u64()
                     .unwrap_or(crate::store::MAX_PULL_EVENTS as u64)
                     as usize;
-                let events = self
-                    .store
-                    .lock()
-                    .await
-                    .events_from(network, author, from.max(1), limit)?;
+                let events =
+                    self.store
+                        .lock()
+                        .await
+                        .events_from(network, author, from.max(1), limit)?;
                 Ok(json!({"author":author,"events":events}))
             }
             "have" => {
@@ -483,8 +488,7 @@ impl Runtime {
                             PEER_TIMEOUT,
                         )
                         .await?;
-                    let events: Vec<SignedEvent> =
-                        serde_json::from_value(reply["events"].clone())?;
+                    let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
                     if events.is_empty() {
                         break;
                     }
@@ -717,7 +721,11 @@ impl Runtime {
                     .ok()
                     .and_then(|record| record.gateway_url)
                     .and_then(|url| reqwest::Url::parse(&url).ok())
-                    .is_some_and(|url| url.origin().ascii_serialization().eq_ignore_ascii_case(origin))
+                    .is_some_and(|url| {
+                        url.origin()
+                            .ascii_serialization()
+                            .eq_ignore_ascii_case(origin)
+                    })
             })
         })
     }
@@ -752,7 +760,9 @@ impl Runtime {
                         )?;
                         self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
                     }
-                    Ok(_) => tracing::debug!(owner = %entry.owner, "delivery answer had no receipt"),
+                    Ok(_) => {
+                        tracing::debug!(owner = %entry.owner, "delivery answer had no receipt")
+                    }
                     Err(error) => {
                         tracing::debug!(owner = %entry.owner, %error, "scheduler delivery pending")
                     }
@@ -798,7 +808,8 @@ impl Runtime {
                     .send_blob(&network, &remote, &mut send, &mut recv)
                     .await
                 {
-                    let _ = net::write_frame(&mut send, &json!({"error":format!("{error:#}")})).await;
+                    let _ =
+                        net::write_frame(&mut send, &json!({"error":format!("{error:#}")})).await;
                 }
                 send.finish().ok();
                 let _ = send.stopped().await;
@@ -960,4 +971,242 @@ fn staging_room(dir: &Path, size: u64) -> Result<()> {
         "attachment staging is full"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config, crypto::LocalIdentity};
+
+    async fn node(identity: &LocalIdentity) -> Result<(Arc<Runtime>, PathBuf)> {
+        node_with(
+            identity,
+            net::NetworkConfig {
+                bind: Some("127.0.0.1:0".parse()?),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn node_with(
+        identity: &LocalIdentity,
+        network: net::NetworkConfig,
+    ) -> Result<(Arc<Runtime>, PathBuf)> {
+        let dir = std::env::temp_dir().join(format!("vibeface-peers-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.network = network;
+        configuration.codex_socket = Some(dir.join("unavailable.sock"));
+        configuration.save(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
+        Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    fn user(identity: &LocalIdentity, network: &str, id: &str) -> Result<Attestation> {
+        identity
+            .fixture_admin()
+            .attest(
+                network,
+                "c",
+                EventBody::MessagePosted {
+                    message_id: id.into(),
+                    role: Role::User,
+                    text: id.into(),
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    attestation: None,
+                },
+            )?
+            .attestation()
+            .cloned()
+            .context("signed message")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn member_nodes_sync_ranges_and_attachments_without_jobs_and_refuse_outsiders()
+    -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let (outsider, dir_c) = node(&LocalIdentity::generate()).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+            }
+            for node in [&a, &b, &outsider] {
+                node.start_network().await?;
+            }
+            let content: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+            let blob = BlobRef {
+                hash: crate::crypto::digest(&content),
+                size: content.len() as u64,
+            };
+            {
+                let mut store = a.store.lock().await;
+                store.create_conversation(&ia, &network, "c", "Sync", now_ms())?;
+                store.put_blob(&blob, &content)?;
+                store.accept_message(&ia, &network, "c", "m1", "m1", vec![blob.clone()], true,
+                    user(&ia, &network, "m1")?, now_ms())?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            b.refresh_own_address(&network).await?;
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            let heads = a.store.lock().await.heads(&network)?;
+            assert_eq!(b.store.lock().await.heads(&network)?, heads);
+            assert!(b.store.lock().await.missing_blobs(&network)?.is_empty());
+            assert!(b.store.lock().await.scheduler_jobs(&network, "c")?.is_empty());
+            assert!(b.store.lock().await.scheduler_outbox(&network)?.is_empty());
+
+            for id in ["m2", "m3"] {
+                a.store.lock().await.accept_message(&ia, &network, "c", id, id, vec![], true,
+                    user(&ia, &network, id)?, now_ms())?;
+            }
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            assert_eq!(b.store.lock().await.heads(&network)?, a.store.lock().await.heads(&network)?);
+            assert_eq!(b.store.lock().await.messages(&network, "c")?.len(), 3);
+            assert!(b.store.lock().await.scheduler_jobs(&network, "c")?.is_empty());
+            assert!(
+                a.store.lock().await.address_book(&network)?.iter().any(|signed| signed
+                    .open(&network)
+                    .is_ok_and(|record| record.device_id == ib.device_id().unwrap_or_default())),
+                "the pulled Node learned the puller's signed address"
+            );
+            a.sync_peer(&network, &ib.device_id()?).await?;
+
+            b.store.lock().await.accept_message(&ib, &network, "c", "m4", "m4", vec![], true,
+                user(&ia, &network, "m4")?, now_ms())?;
+            assert_eq!(b.store.lock().await.scheduler_outbox(&network)?.len(), 1);
+            b.deliver_outbox().await?;
+            assert!(b.store.lock().await.scheduler_outbox(&network)?.is_empty());
+            let trigger = crate::scheduling::message_trigger("m4");
+            a.store.lock().await.scheduler_job(&network, "c", &trigger)?
+                .context("the owner admitted the delivered message")?;
+            let again = b.peer_request(&network, &ia.device_id()?,
+                json!({"type":"deliver","conversation_id":"c","trigger":trigger})).await?;
+            assert_eq!(again["receipt"]["trigger"], trigger.as_str());
+            assert_eq!(
+                a.store.lock().await.scheduler_jobs(&network, "c")?.iter().filter(|job| job.trigger == trigger).count(),
+                1,
+                "a repeated delivery returns the original admission"
+            );
+
+            let target = b.store.lock().await.blob_file(&blob.hash)?;
+            std::fs::remove_file(&target)?;
+            let part = b.store.lock().await.partial_blob_file(&blob.hash)?;
+            let mut seeded = content[..1024 * 1024].to_vec();
+            seeded[0] ^= 1;
+            seeded.extend_from_slice(b"bytes after the last synced offset");
+            std::fs::write(&part, &seeded)?;
+            b.store.lock().await.commit_offset(&network, &blob.hash, Some(1024 * 1024))?;
+            let corrupted = b.fetch_blob(&network, &ia.device_id()?, &blob).await;
+            assert!(corrupted.is_err() && !part.exists(), "resumed bytes keep the synced prefix and fail the hash check");
+            std::fs::write(&part, &content[..1024 * 1024])?;
+            b.store.lock().await.commit_offset(&network, &blob.hash, Some(1024 * 1024))?;
+            b.fetch_blob(&network, &ia.device_id()?, &blob).await?;
+            assert_eq!(std::fs::read(&target)?, content);
+            assert!(!part.exists());
+
+            outsider.net()?.learn(&a.net()?.addr()).await;
+            let hello = json!({"type":"hello","network_id":network,"vector":{},"membership_epoch":0,"membership":""});
+            assert!(outsider.net()?.request(&ia.device_id()?, net::SYNC, &hello, Duration::from_secs(5)).await.is_err());
+            assert!(outsider.net()?.request(&ia.device_id()?, net::RPC, &json!({"type":"capabilities","network_id":network}), Duration::from_secs(5)).await.is_err());
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&a, &b, &outsider] {
+            node.stop_network().await;
+        }
+        drop((a, b, outsider));
+        for dir in [dir_a, dir_b, dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nodes_without_direct_paths_sync_through_a_member_relay() -> Result<()> {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let relay_url = format!("http://127.0.0.1:{port}");
+        let ids = [
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        ];
+        let state = ids[0].sign_network_fixture(
+            1,
+            ids.iter()
+                .map(LocalIdentity::device_id)
+                .collect::<Result<_>>()?,
+        )?;
+        let network = ids[0].fixture_network_id()?;
+        let (relay, dir_r) = node_with(
+            &ids[0],
+            net::NetworkConfig {
+                bind: Some("127.0.0.1:0".parse()?),
+                relay_listen: Some(format!("127.0.0.1:{port}").parse()?),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let hidden = net::NetworkConfig {
+            relays: vec![relay_url.clone()],
+            relay_paths_only: true,
+            ..Default::default()
+        };
+        let (a, dir_a) = node_with(&ids[1], hidden.clone()).await?;
+        let (b, dir_b) = node_with(&ids[2], hidden).await?;
+        let result = async {
+            for node in [&relay, &a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            a.store.lock().await.create_conversation(
+                &ids[1],
+                &network,
+                "c",
+                "Relayed",
+                now_ms(),
+            )?;
+            let addr = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let addr = a.net()?.addr();
+                    if addr.relay_urls().next().is_some() {
+                        return Ok::<_, anyhow::Error>(addr);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .context("the hidden Node never reached its relay")??;
+            assert_eq!(
+                addr.ip_addrs().count(),
+                0,
+                "relay_paths_only advertises no IP path"
+            );
+            b.net()?.learn(&addr).await;
+            b.sync_peer(&network, &ids[1].device_id()?).await?;
+            assert_eq!(
+                b.store.lock().await.heads(&network)?,
+                a.store.lock().await.heads(&network)?
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&relay, &a, &b] {
+            node.stop_network().await;
+        }
+        drop((relay, a, b));
+        for dir in [dir_r, dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        result
+    }
 }

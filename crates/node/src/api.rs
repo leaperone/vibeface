@@ -686,7 +686,11 @@ fn validate_tool_call(name: &str) -> ApiResult<()> {
 
 async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
     let Ok(permit) = app.clients.clone().try_acquire_owned() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many client connections").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many client connections",
+        )
+            .into_response();
     };
     websocket
         .max_message_size(65535)
@@ -706,8 +710,7 @@ mod web_assets {
 
 async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     let path = uri.path();
-    if path == "/api" || path.starts_with("/api/") || path.starts_with("/sdk.v1.")
-    {
+    if path == "/api" || path.starts_with("/api/") || path.starts_with("/sdk.v1.") {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     }
     if method != Method::GET && method != Method::HEAD {

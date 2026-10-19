@@ -20,8 +20,6 @@ use iroh::{
     EndpointAddr, TransportAddr,
     endpoint::{Connection, ReadExactError, RecvStream, SendStream},
 };
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -29,6 +27,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use vibeface_secure::{
     Channel,
     join::{InviteRecord, Ticket, invite_id, join_commit, short_code},
@@ -41,9 +41,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
 
-type NativeSocket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type NativeSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// A client channel: the browser's WebSocket, the CLI's, or a stream another Gateway forwards
 /// over `vibeface/client/1`. Forwarded frames are `tag ‖ u32 length ‖ bytes`.
@@ -348,8 +347,7 @@ pub async fn serve_forwarded(node: Arc<Runtime>, connection: Connection) -> Resu
     while let Ok((send, recv)) = connection.accept_bi().await {
         let node = node.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_session(node, ClientSocket::forwarded(send, recv), None).await
+            if let Err(error) = serve_session(node, ClientSocket::forwarded(send, recv), None).await
             {
                 tracing::debug!(%error, "forwarded client session closed");
             }
@@ -655,8 +653,12 @@ async fn dispatch(
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
-                result["addresses"] =
-                    json!(node.store.lock().await.address_book(&state.genesis.network_id)?);
+                result["addresses"] = json!(
+                    node.store
+                        .lock()
+                        .await
+                        .address_book(&state.genesis.network_id)?
+                );
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
@@ -952,8 +954,18 @@ impl JoinLink {
             .iter()
             .map(|(url, _)| TransportAddr::Relay(url.clone()))
             .collect();
-        addrs.extend(ticket.entry.direct_addrs.iter().copied().map(TransportAddr::Ip));
-        ensure!(!addrs.is_empty(), "this invite carries no address of its entry Node");
+        addrs.extend(
+            ticket
+                .entry
+                .direct_addrs
+                .iter()
+                .copied()
+                .map(TransportAddr::Ip),
+        );
+        ensure!(
+            !addrs.is_empty(),
+            "this invite carries no address of its entry Node"
+        );
         let config = NetworkConfig {
             relay_paths_only: node.config.network.relay_paths_only,
             ..NetworkConfig::default()
@@ -1252,10 +1264,7 @@ mod tests {
         config::private_dir(&project)?;
         assert!(!workspace.exists());
         let mut latest = Config::load(&dir)?;
-        latest
-            .network
-            .relays
-            .push("https://relay.example/".into());
+        latest.network.relays.push("https://relay.example/".into());
         latest.daily_decision_limit = 11;
         latest.save(&dir)?;
         let settings = crate::runtime::NodeSettings {
