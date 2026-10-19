@@ -137,7 +137,7 @@ struct Pending {
 struct Hello {
     version: u32,
     network_id: NetworkId,
-    #[serde(rename = "node_id", alias = "peer_id")]
+
     peer_id: PeerId,
 }
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -1271,13 +1271,12 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     #[test]
-    fn peer_id_hello_keeps_v1_output_and_reads_new_alias() -> Result<()> {
-        let legacy = r#"{"version":1,"network_id":"network","node_id":"device"}"#;
-        let hello: Hello = serde_json::from_str(legacy)?;
+    fn peer_id_hello_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"version":1,"network_id":"network","peer_id":"device"}"#;
+        let hello: Hello = serde_json::from_str(wire)?;
         assert_eq!(hello.peer_id, "device");
-        assert_eq!(serde_json::to_string(&hello)?, legacy);
-        let renamed: Hello = serde_json::from_str(&legacy.replace("node_id", "peer_id"))?;
-        assert_eq!(serde_json::to_string(&renamed)?, legacy);
+        assert_eq!(serde_json::to_string(&hello)?, wire);
+        assert!(serde_json::from_str::<Hello>(&wire.replace("peer_id", "node_id")).is_err());
         Ok(())
     }
 

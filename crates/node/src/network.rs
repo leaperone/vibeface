@@ -95,7 +95,6 @@ pub enum Service {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reachability {
-    #[serde(rename = "node_id", alias = "peer_id")]
     pub peer_id: String,
     pub public_key: String,
     pub direct_urls: Vec<String>,
@@ -157,7 +156,6 @@ enum Control {
         record: Option<Reachability>,
     },
     Reserve {
-        #[serde(rename = "node_id", alias = "peer_id")]
         peer_id: String,
         public_key: String,
         signature: String,
@@ -182,7 +180,7 @@ enum Control {
 #[derive(Serialize)]
 struct ReservationProof<'a> {
     nonce: &'a str,
-    #[serde(rename = "node_id")]
+
     peer_id: &'a str,
 }
 #[derive(Serialize)]
@@ -404,10 +402,7 @@ impl MdnsSources {
         }
         let fullname = info.get_fullname();
         let key = fullname.to_ascii_lowercase();
-        let target = info
-            .get_property_val_str("peer_id")
-            .or_else(|| info.get_property_val_str("node_id"))
-            .unwrap_or_default();
+        let target = info.get_property_val_str("peer_id").unwrap_or_default();
         let mut urls: Vec<_> = info
             .get_addresses()
             .iter()
@@ -1971,11 +1966,7 @@ fn mdns_service(peer_id: &str, listen: SocketAddr) -> Result<Option<ServiceInfo>
     if listen.ip().is_loopback() {
         return Ok(None);
     }
-    let properties = [
-        ("peer_id", peer_id),
-        ("node_id", peer_id),
-        ("path", "/api/network/ws"),
-    ];
+    let properties = [("peer_id", peer_id), ("path", "/api/network/ws")];
     let address = if listen.ip().is_unspecified() {
         String::new()
     } else {
@@ -4970,47 +4961,34 @@ mod tests {
     }
 
     #[test]
-    fn peer_id_preserves_v1_signed_bytes_and_accepts_both_spellings() -> Result<()> {
+    fn peer_id_uses_canonical_signed_bytes() -> Result<()> {
         let identity = LocalIdentity {
             secret_key_hex: "01".repeat(32),
         };
         let peer_id = identity.peer_id()?;
         let public_key = identity.public_key_hex()?;
-        let legacy = format!(
-            r#"{{"node_id":"{peer_id}","public_key":"{public_key}","direct_urls":[],"relay_urls":[],"issued_at":1000,"expires_at":1180,"signature":""}}"#
+        let unsigned = format!(
+            r#"{{"peer_id":"{peer_id}","public_key":"{public_key}","direct_urls":[],"relay_urls":[],"issued_at":1000,"expires_at":1180,"signature":""}}"#
         );
-        let mut record: Reachability = serde_json::from_str(&legacy)?;
-        assert_eq!(record.unsigned()?, legacy.as_bytes());
-        record.signature = identity.sign_payload("reachability", legacy.as_bytes())?;
+        let mut record: Reachability = serde_json::from_str(&unsigned)?;
+        assert_eq!(record.unsigned()?, unsigned.as_bytes());
+        record.signature = identity.sign_payload("reachability", unsigned.as_bytes())?;
         record.verify(1001)?;
         let wire = serde_json::to_string(&record)?;
-        assert!(wire.starts_with(r#"{"node_id":"#));
-        assert!(!wire.contains("peer_id"));
-        let renamed: Reachability = serde_json::from_str(&wire.replace("node_id", "peer_id"))?;
-        renamed.verify(1001)?;
-        assert_eq!(serde_json::to_string(&renamed)?, wire);
-        let duplicate = wire.replacen(
-            "\"node_id\":",
-            &format!("\"peer_id\":\"{peer_id}\",\"node_id\":"),
-            1,
-        );
-        assert!(serde_json::from_str::<Reachability>(&duplicate).is_err());
+        assert!(serde_json::from_str::<Reachability>(&wire.replace("peer_id", "node_id")).is_err());
         assert_eq!(
             serde_json::to_string(&ReservationProof {
                 nonce: "ticket",
                 peer_id: &peer_id
             })?,
-            format!(r#"{{"nonce":"ticket","node_id":"{peer_id}"}}"#)
+            format!(r#"{{"nonce":"ticket","peer_id":"{peer_id}"}}"#)
         );
-        for key in ["node_id", "peer_id"] {
-            let input = format!(
-                r#"{{"type":"reserve","{key}":"{peer_id}","public_key":"{public_key}","signature":"signature"}}"#
-            );
-            let control: Control = serde_json::from_str(&input)?;
-            let output = serde_json::to_value(control)?;
-            assert_eq!(output["node_id"], peer_id);
-            assert!(output.get("peer_id").is_none());
-        }
+        let input = format!(
+            r#"{{"type":"reserve","peer_id":"{peer_id}","public_key":"{public_key}","signature":"signature"}}"#
+        );
+        let control: Control = serde_json::from_str(&input)?;
+        assert_eq!(serde_json::to_value(control)?["peer_id"], peer_id);
+        assert!(serde_json::from_str::<Control>(&input.replace("peer_id", "node_id")).is_err());
         Ok(())
     }
 
@@ -5029,16 +5007,13 @@ mod tests {
             service.get_property_val_str("peer_id"),
             Some(peer_id.as_str())
         );
-        assert_eq!(
-            service.get_property_val_str("node_id"),
-            Some(peer_id.as_str())
-        );
+        assert!(service.get_property_val_str("node_id").is_none());
         assert_eq!(service.get_port(), 4790);
         Ok(())
     }
 
     fn mdns_info(instance: &str, peer_id: &str, addresses: &str) -> Result<ServiceInfo> {
-        let properties = [("node_id", peer_id), ("path", "/api/network/ws")];
+        let properties = [("peer_id", peer_id), ("path", "/api/network/ws")];
         Ok(ServiceInfo::new(
             SERVICE_TYPE,
             instance,
@@ -7068,10 +7043,10 @@ mod tests {
                 assert!(handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?.is_empty());
                 send_frame(&mut accepted.socket, Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into())).await?;
                 let hello: serde_json::Value = serde_json::from_slice(&handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?)?;
-                assert_eq!(hello["node_id"], bad_owner.peer_id()?);
+                assert_eq!(hello["peer_id"], bad_owner.peer_id()?);
                 let mut channel = handshake.finish().map_err(anyhow::Error::msg)?;
                 let malformed = serde_json::to_vec(&serde_json::json!({
-                    "version":crate::model::WIRE_VERSION,"network_id":bad_network,"node_id":untrusted.peer_id()?
+                    "version":crate::model::WIRE_VERSION,"network_id":bad_network,"peer_id":untrusted.peer_id()?
                 }))?;
                 for record in channel.seal_message(&malformed).map_err(anyhow::Error::msg)? {
                     send_frame(&mut accepted.socket, Message::Binary(record.into())).await?;

@@ -49,7 +49,7 @@ struct RecoveryChallenge {
     network_id: String,
     owner_public_key: String,
     subject_id: String,
-    #[serde(rename = "target_node_id")]
+
     target_peer_id: String,
     genesis_hash: String,
     nonce: String,

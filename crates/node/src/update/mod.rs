@@ -89,7 +89,7 @@ struct Journal {
     phase: Phase,
     previous: PathBuf,
     candidate: PathBuf,
-    #[serde(rename = "node_id", alias = "peer_id")]
+
     peer_id: String,
     backup: PathBuf,
 }
@@ -298,7 +298,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("this package needs a manual bootstrap to the updater-enabled release")?;
     ensure!(
-        manifest.update_protocol == 2 && manifest.data_epoch == 3,
+        manifest.update_protocol == 2 && manifest.data_epoch == 4,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
@@ -521,9 +521,7 @@ async fn healthy(data: &Path, package: &Path, peer_id: &str) -> Result<()> {
                     Ok(response) if response.status().is_success() => {
                         if let Ok(info) = response.json::<serde_json::Value>().await {
                             ensure!(
-                                info.get("peer_id")
-                                    .or_else(|| info.get("node_id"))
-                                    .and_then(serde_json::Value::as_str)
+                                info.get("peer_id").and_then(serde_json::Value::as_str)
                                     == Some(peer_id)
                                     && info["version"] == version,
                                 "HTTP listener belongs to a different node or version"
@@ -872,13 +870,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn peer_id_journal_keeps_rollback_format() -> Result<()> {
-        let legacy = r#"{"phase":"prepared","previous":"old","candidate":"new","node_id":"device","backup":"backup"}"#;
-        let journal: Journal = serde_json::from_str(legacy)?;
+    fn peer_id_journal_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"phase":"prepared","previous":"old","candidate":"new","peer_id":"device","backup":"backup"}"#;
+        let journal: Journal = serde_json::from_str(wire)?;
         assert_eq!(journal.peer_id, "device");
-        assert_eq!(serde_json::to_string(&journal)?, legacy);
-        let renamed: Journal = serde_json::from_str(&legacy.replace("node_id", "peer_id"))?;
-        assert_eq!(serde_json::to_string(&renamed)?, legacy);
+        assert_eq!(serde_json::to_string(&journal)?, wire);
+        assert!(serde_json::from_str::<Journal>(&wire.replace("peer_id", "node_id")).is_err());
         Ok(())
     }
 
@@ -896,7 +893,7 @@ mod tests {
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":3}}"#),
+            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":4}}"#),
         )
         .unwrap();
         directory
@@ -935,7 +932,7 @@ mod tests {
         assert!(manifest(&old).is_err());
         fs::write(
             old.join("BUILD-INFO.json"),
-            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":3}"#,
+            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":4}"#,
         )
         .unwrap();
         assert!(manifest(&old).is_err());

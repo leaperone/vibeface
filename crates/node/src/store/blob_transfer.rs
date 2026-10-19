@@ -17,7 +17,7 @@ pub(crate) struct BlobTransfer {
 pub(crate) enum TransferPhase {
     Receiving {
         committed_offset: u64,
-        source_node_id: String,
+        source_peer_id: String,
     },
     Cleanup,
 }
@@ -41,7 +41,7 @@ impl BlobTransfer {
             blob: blob.clone(),
             phase: TransferPhase::Receiving {
                 committed_offset: offset,
-                source_node_id: source.into(),
+                source_peer_id: source.into(),
             },
         }
     }
@@ -52,14 +52,14 @@ impl BlobTransfer {
         );
         if let TransferPhase::Receiving {
             committed_offset,
-            source_node_id,
+            source_peer_id,
         } = &self.phase
         {
             ensure!(
                 *committed_offset <= self.blob.size
-                    && !source_node_id.is_empty()
-                    && source_node_id.len() <= 128
-                    && !source_node_id.chars().any(char::is_control),
+                    && !source_peer_id.is_empty()
+                    && source_peer_id.len() <= 128
+                    && !source_peer_id.chars().any(char::is_control),
                 "invalid receiving progress"
             );
         }
@@ -146,7 +146,7 @@ impl Store {
         previous: &BlobTransfer,
         next: &BlobTransfer,
     ) -> Result<()> {
-        let TransferPhase::Receiving { source_node_id, .. } = &next.phase else {
+        let TransferPhase::Receiving { source_peer_id, .. } = &next.phase else {
             bail!("receiving progress required");
         };
         ensure!(
@@ -158,7 +158,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         authorize_node_from(&tx, network, local_node, Some(NodeRole::Replica))?;
-        authorize_node_from(&tx, network, source_node_id, Some(NodeRole::Replica))?;
+        authorize_node_from(&tx, network, source_peer_id, Some(NodeRole::Replica))?;
         let (current, raw) =
             read_from(&tx, network, &next.blob)?.context("blob transfer disappeared")?;
         ensure!(current == *previous, "blob transfer changed concurrently");
@@ -192,7 +192,7 @@ impl Store {
             transfer.phase
                 == TransferPhase::Receiving {
                     committed_offset: expected.size,
-                    source_node_id: source.into()
+                    source_peer_id: source.into()
                 },
             "blob transfer is not ready for publication"
         );
@@ -306,7 +306,7 @@ mod tests {
         let mut receiving = manifest;
         receiving.phase = TransferPhase::Receiving {
             committed_offset: 0,
-            source_node_id: "revoked-source".into(),
+            source_peer_id: "revoked-source".into(),
         };
         store.local_set(&network, &key, &serde_json::to_value(receiving)?)?;
         let mut revoked = owner.certificate(vec![NodeRole::Replica])?;

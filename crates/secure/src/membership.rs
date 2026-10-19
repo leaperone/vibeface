@@ -17,11 +17,6 @@ pub trait MembershipSigner {
         fingerprint(&self.public_key_hex()?)
     }
 
-    #[deprecated(note = "use peer_id")]
-    fn node_id(&self) -> Result<String> {
-        self.peer_id()
-    }
-
     fn network_id(&self) -> Result<String> {
         self.peer_id()
     }
@@ -76,7 +71,6 @@ pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeCertificate {
-    #[serde(alias = "node_id")]
     pub peer_id: String,
     pub public_key: String,
     pub roles: Vec<NodeRole>,
@@ -1149,27 +1143,18 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(deprecated)]
-    fn peer_id_certificate_reads_legacy_and_sdk_aliases_keep_the_identity() -> Result<()> {
+    fn peer_id_certificate_uses_only_the_current_field() -> Result<()> {
         let device = Identity::from_secret_hex(&"01".repeat(32)).map_err(anyhow::Error::msg)?;
         assert_eq!(
             device.peer_id(),
             "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
         );
-        assert_eq!(device.peer_id(), device.node_id());
-        assert_eq!(
-            MembershipSigner::peer_id(&device)?,
-            MembershipSigner::node_id(&device)?
-        );
-        let legacy = serde_json::json!({"node_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
-        let certificate: NodeCertificate = serde_json::from_value(legacy)?;
-        let wire = serde_json::to_value(&certificate)?;
-        assert_eq!(wire["peer_id"], device.peer_id());
-        assert!(wire.get("node_id").is_none());
-        assert_eq!(
-            serde_json::from_value::<NodeCertificate>(wire)?,
-            certificate
-        );
+        assert_eq!(MembershipSigner::peer_id(&device)?, device.peer_id());
+        let wire = serde_json::json!({"peer_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
+        let certificate: NodeCertificate = serde_json::from_value(wire.clone())?;
+        assert_eq!(serde_json::to_value(certificate)?, wire);
+        let old = serde_json::json!({"node_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
+        assert!(serde_json::from_value::<NodeCertificate>(old).is_err());
         Ok(())
     }
 

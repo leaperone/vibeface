@@ -62,7 +62,7 @@ impl Store {
                 ensure!(tables == 0, "unversioned database is not supported");
                 connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
             }
-            3 => {}
+            4 => {}
             _ => bail!(
                 "unsupported database schema version {version}; initialize a fresh Node data directory"
             ),
@@ -119,7 +119,7 @@ impl Store {
         for member in merged.historical_nodes()? {
             let old: Option<String> = tx
                 .query_row(
-                    "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+                    "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
                     params![network_id, member.subject_id],
                     |r| r.get(0),
                 )
@@ -128,7 +128,7 @@ impl Store {
                 old.as_ref().is_none_or(|key| key == &member.public_key),
                 "historical Node identity key changed"
             );
-            tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,node_id,public_key) VALUES(?,?,?)",params![network_id,member.subject_id,member.public_key])?;
+            tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,peer_id,public_key) VALUES(?,?,?)",params![network_id,member.subject_id,member.public_key])?;
         }
         rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
@@ -160,14 +160,14 @@ impl Store {
     ) -> Result<()> {
         let peer_id = identity.peer_id()?;
         self.authorize_node(network_id, &peer_id, None)?;
-        self.connection.execute("INSERT INTO local_identities(network_id,node_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,node_id) DO UPDATE SET identity=excluded.identity",params![network_id,peer_id,serde_json::to_string(identity)?])?;
+        self.connection.execute("INSERT INTO local_identities(network_id,peer_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,peer_id) DO UPDATE SET identity=excluded.identity",params![network_id,peer_id,serde_json::to_string(identity)?])?;
         Ok(())
     }
     pub fn local_identity(&self, network_id: &str, peer_id: &str) -> Result<Option<LocalIdentity>> {
         optional_json(
             self.connection
                 .query_row(
-                    "SELECT identity FROM local_identities WHERE network_id=? AND node_id=?",
+                    "SELECT identity FROM local_identities WHERE network_id=? AND peer_id=?",
                     params![network_id, peer_id],
                     |r| r.get(0),
                 )
@@ -177,7 +177,7 @@ impl Store {
     fn public_key(&self, network_id: &str, author: &str) -> Result<String> {
         self.connection
             .query_row(
-                "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+                "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
                 params![network_id, author],
                 |r| r.get(0),
             )
@@ -1846,7 +1846,7 @@ impl Store {
             &binding.conversation_id,
         )? {
             let mut query =
-                tx.prepare("SELECT node_id FROM local_identities WHERE network_id=?")?;
+                tx.prepare("SELECT peer_id FROM local_identities WHERE network_id=?")?;
             let local_authors = query
                 .query_map([&binding.network_id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?;
@@ -2967,7 +2967,7 @@ fn import_legacy_scheduler_job(
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     let public_key: String = connection
         .query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+            "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
             params![network, event.author],
             |row| row.get(0),
         )
@@ -3678,7 +3678,7 @@ fn load_events_from(
         ensure!(envelope.hash == hash, "stored event hash mismatch");
         let body: Event = serde_json::from_str(&envelope.canonical_body)?;
         let public_key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+            "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
             params![network_id, body.author],
             |r| r.get(0),
         )?;
@@ -6363,7 +6363,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_keeps_unknown_effects_reserved_and_rejects_future_schema() -> Result<()> {
+    fn reopening_keeps_unknown_effects_reserved_and_rejects_other_schemas() -> Result<()> {
         let root = std::env::temp_dir().join(format!("vibeface-core-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root)?;
         let db = root.join("node.sqlite3");
@@ -6388,10 +6388,12 @@ mod tests {
             );
             assert_eq!(store.conversations(&network)?.len(), 1);
         }
-        let connection = Connection::open(&db)?;
-        connection.execute_batch("PRAGMA user_version=4;")?;
-        drop(connection);
-        assert!(Store::open(&db).is_err());
+        for version in [3, 5] {
+            let connection = Connection::open(&db)?;
+            connection.execute_batch(&format!("PRAGMA user_version={version};"))?;
+            drop(connection);
+            assert!(Store::open(&db).is_err());
+        }
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

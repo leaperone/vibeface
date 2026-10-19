@@ -610,7 +610,7 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
         "package build identity does not match the official release tag"
     );
     ensure!(
-        build.update_protocol == 2 && build.data_epoch == 3,
+        build.update_protocol == 2 && build.data_epoch == 4,
         "package requires an unsupported update protocol or data epoch"
     );
     for file in [
@@ -934,7 +934,7 @@ mod tests {
             checksum_url: String::new(),
             archive_size: 1,
         };
-        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": 2, "data_epoch": 3});
+        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": 2, "data_epoch": 4});
         for dir in [&package, &copy] {
             for file in [
                 "README.md",
@@ -1002,7 +1002,7 @@ mod tests {
             .unwrap();
             assert!(verify_build(&package, &release).is_err());
         }
-        for unsupported_epoch in [1, 2, 4] {
+        for unsupported_epoch in [1, 2, 3, 5] {
             let mut unsupported_build = build.clone();
             unsupported_build["data_epoch"] = serde_json::json!(unsupported_epoch);
             fs::write(

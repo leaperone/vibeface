@@ -16,11 +16,11 @@
 
 所有共享会话、事件、附件、执行账本及通知按 `network_id` 分区。公网发现目录不发布私人网络成员关系、项目或会话。一个物理 Node 可运行自己的调度执行，同时为其他网络转发密文。
 
-## Peer ID 术语与兼容
+## Peer ID 术语
 
-内部类型使用 `PeerId`，身份方法使用 `peer_id()`，浏览器 SDK 使用 `peerId()`。普通 JSON、RPC、邀请与连接记录使用 `peer_id`，新版同时读取旧 `node_id`。`network_id` 是网络编号，`subject_id` 仍是签名成员编号。
+内部类型使用 `PeerId`，身份方法使用 `peer_id()`，浏览器 SDK 使用 `peerId()`。JSON、RPC、邀请、连接记录、Peer 握手、发现记录、中转签名、维护响应和更新日志统一使用 `peer_id`。mDNS 只广告和读取 `peer_id`。
 
-v1 Peer 握手、发现签名与中转保留 `node_id` 的序列化名。维护 socket 与更新日志也保留旧键，避免破坏升级回滚。公开 `/api/info` 同时输出相同的 `peer_id` 和 `node_id`，供旧 updater 探活。其他普通输出不双写，旧客户端需要先升级。详见 [Peer ID 命名与兼容矩阵](peer-id-migration.md)。
+恢复挑战使用 `target_peer_id`，blob 下载清单使用 `source_peer_id`。`network_id` 是网络编号，`subject_id` 仍是签名成员编号。不保留旧名别名、双读或双写。当前数据目录格式为 epoch 4，旧目录不自动迁移。见 [Peer ID 命名与数据目录](peer-id-migration.md)。
 
 ## 本机配置
 
@@ -343,7 +343,7 @@ mDNS 按完整服务实例名保存来源，最多 256 个实例，每个实例�
 
 固定 IP 监听只宣告该 IP，回环监听只发现其他设备而不宣告自身。wildcard 监听的宣告与发现都限制在对应地址族，不使用没有接口范围的 IPv6 link-local 候选。接口变化不会自动重绑固定监听地址，也不提供 NAT 打洞。实例冲突后的撤销依赖实际缓存复核，不保证即时生效。
 
-`Reachability` 包含 `node_id`、`public_key`、`direct_urls`、`relay_urls`、`issued_at`、`expires_at` 和 `signature`。设备使用 Ed25519 的 `reachability` domain 签名。记录有效期受限，只按已知 Peer ID 查询，不提供全网枚举。签名证明设备声明该路径，不证明设备属于本人或路径此刻可达。
+`Reachability` 包含 `peer_id`、`public_key`、`direct_urls`、`relay_urls`、`issued_at`、`expires_at` 和 `signature`。设备使用 Ed25519 的 `reachability` domain 签名。记录有效期受限，只按已知 Peer ID 查询，不提供全网枚举。签名证明设备声明该路径，不证明设备属于本人或路径此刻可达。
 
 目录结果逐项验签并核对目标身份，过期或非法记录只影响对应来源。候选交付及拨号前再次检查有效期，健康来源不必等待其他目录全部返回。公共发布目录最多保存 2048 个身份，本机解析缓存另有 256 个名额；缓存满时仍可使用本次有效候选，公共查询不读取该私有缓存。
 

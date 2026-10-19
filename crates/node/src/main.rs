@@ -162,7 +162,7 @@ struct Pair {
 #[serde(deny_unknown_fields)]
 struct Invitation {
     url: String,
-    #[serde(alias = "node_id")]
+
     peer_id: String,
     relay: bool,
     invite: InviteSecret,
@@ -179,7 +179,7 @@ struct InviteSecret {
 #[serde(deny_unknown_fields)]
 struct PendingPair {
     url: String,
-    #[serde(alias = "node_id")]
+
     peer_id: String,
     relay: bool,
     invite_id: String,
@@ -389,7 +389,7 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
     println!("Initialized device with Peer ID {}", identity.peer_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
@@ -464,7 +464,7 @@ fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":3}),
+        epoch == json!({"data_epoch":4}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
@@ -849,15 +849,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peer_id_pending_pair_migrates_only_the_public_identifier() {
-        let legacy = json!({"url":"http://localhost:4790", "node_id":"device", "relay":false,
+    fn peer_id_pending_pair_uses_only_the_current_field() {
+        let wire = json!({"url":"http://localhost:4790", "peer_id":"device", "relay":false,
             "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
-        let pending: PendingPair = serde_json::from_value(legacy).unwrap();
+        let pending: PendingPair = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(pending.peer_id, "device");
-        let wire = serde_json::to_value(pending).unwrap();
-        assert_eq!(wire["peer_id"], "device");
-        assert!(wire.get("node_id").is_none());
-        assert!(serde_json::from_value::<PendingPair>(wire).is_ok());
+        assert_eq!(serde_json::to_value(pending).unwrap(), wire);
+        let mut old = wire;
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("peer_id");
+        fields.insert("node_id".into(), json!("device"));
+        assert!(serde_json::from_value::<PendingPair>(old).is_err());
     }
 
     #[test]
@@ -1111,17 +1113,11 @@ mod tests {
             assert_eq!(super::invitation(&options).unwrap().relay, relay);
             let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
             assert_eq!(parsed.peer_id, device.peer_id().unwrap());
-            let mut legacy = envelope.clone();
-            let fields = legacy.as_object_mut().unwrap();
+            let mut old = envelope.clone();
+            let fields = old.as_object_mut().unwrap();
             let peer_id = fields.remove("peer_id").unwrap();
             fields.insert("node_id".into(), peer_id);
-            assert_eq!(
-                serde_json::from_value::<Invitation>(legacy)
-                    .unwrap()
-                    .peer_id,
-                parsed.peer_id
-            );
-
+            assert!(serde_json::from_value::<Invitation>(old).is_err());
             envelope.as_object_mut().unwrap().remove("relay");
             options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
             assert!(super::invitation(&options).is_err());

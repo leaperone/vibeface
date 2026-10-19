@@ -58,12 +58,6 @@ impl Identity {
         hex::encode(Sha256::digest(self.key.verifying_key().as_bytes()))
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), deprecated(note = "use peer_id"))]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = nodeId))]
-    pub fn node_id(&self) -> String {
-        self.peer_id()
-    }
-
     pub fn sign(&self, domain: &str, payload: &[u8]) -> Result<String> {
         Ok(hex::encode(
             self.key.sign(&signing_message(domain, payload)?).to_bytes(),

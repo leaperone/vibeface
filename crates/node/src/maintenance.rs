@@ -165,7 +165,6 @@ impl Drop for MaintenanceGuard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
-    #[serde(rename = "node_id", alias = "peer_id")]
     pub peer_id: String,
     pub version: String,
 }
@@ -417,13 +416,12 @@ mod tests {
     };
 
     #[test]
-    fn peer_id_health_remains_readable_by_v1_updaters() -> Result<()> {
-        let legacy = r#"{"node_id":"device","version":"version"}"#;
-        let health: Health = serde_json::from_str(legacy)?;
+    fn peer_id_health_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"peer_id":"device","version":"version"}"#;
+        let health: Health = serde_json::from_str(wire)?;
         assert_eq!(health.peer_id, "device");
-        assert_eq!(serde_json::to_string(&health)?, legacy);
-        let renamed: Health = serde_json::from_str(&legacy.replace("node_id", "peer_id"))?;
-        assert_eq!(serde_json::to_string(&renamed)?, legacy);
+        assert_eq!(serde_json::to_string(&health)?, wire);
+        assert!(serde_json::from_str::<Health>(&wire.replace("peer_id", "node_id")).is_err());
         Ok(())
     }
 
@@ -469,7 +467,7 @@ mod tests {
             .join(format!("maintenance-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         config.codex_socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;

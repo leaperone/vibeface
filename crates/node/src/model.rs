@@ -3,8 +3,6 @@ use serde_json::Value;
 
 pub type NetworkId = String;
 pub type PeerId = String;
-#[deprecated(note = "use PeerId")]
-pub type NodeId = PeerId;
 pub type EventHash = String;
 pub type ScopeId = String;
 pub const WIRE_VERSION: u32 = 1;

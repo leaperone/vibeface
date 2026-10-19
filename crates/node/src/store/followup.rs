@@ -555,7 +555,7 @@ fn validate_task_result_from(
             "follow-up dispatch task binding mismatch"
         );
         let key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+            "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
             params![network, binding.binding.authority_node],
             |row| row.get(0),
         )?;

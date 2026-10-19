@@ -32,10 +32,6 @@ impl LocalIdentity {
     pub fn peer_id(&self) -> Result<PeerId> {
         fingerprint(&self.public_key_hex()?)
     }
-    #[deprecated(note = "use peer_id")]
-    pub fn node_id(&self) -> Result<PeerId> {
-        self.peer_id()
-    }
     pub fn network_id(&self) -> Result<NetworkId> {
         self.peer_id()
     }
@@ -291,14 +287,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    #[allow(deprecated)]
-    fn peer_id_keeps_the_legacy_rust_api() -> anyhow::Result<()> {
-        let identity = super::LocalIdentity::generate();
-        let legacy: crate::model::NodeId = identity.node_id()?;
-        assert_eq!(identity.peer_id()?, legacy);
-        Ok(())
-    }
 
     use super::*;
     #[test]
