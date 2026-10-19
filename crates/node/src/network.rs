@@ -6812,7 +6812,7 @@ mod tests {
                     false,
                     &server_identity.secret_key_hex,
                     Some(server_owner.peer_id()?),
-                    b"vibeface:peer:v1",
+                    b"vibeface:peer:v2",
                 )
                 .map_err(anyhow::Error::msg)?;
                 assert!(
@@ -7204,7 +7204,7 @@ mod tests {
             let result = async {
                 let mut accepted = bad_incoming.recv().await.context("malformed Hello path missing")?;
                 let mut handshake = Handshake::new(false, &bad_identity.secret_key_hex,
-                    Some(bad_owner.peer_id()?), b"vibeface:peer:v1").map_err(anyhow::Error::msg)?;
+                    Some(bad_owner.peer_id()?), b"vibeface:peer:v2").map_err(anyhow::Error::msg)?;
                 assert!(handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?.is_empty());
                 send_frame(&mut accepted.socket, Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into())).await?;
                 let hello: serde_json::Value = serde_json::from_slice(&handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?)?;
