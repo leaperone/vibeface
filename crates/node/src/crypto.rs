@@ -1,7 +1,5 @@
 use crate::model::*;
-#[cfg(test)]
-use anyhow::Context as _;
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use vibeface_secure::Identity;
 pub use vibeface_secure::digest;
