@@ -279,7 +279,7 @@ async fn process_groups(groups: &[u32]) -> Vec<Value> {
     let mut result = Vec::new();
     for group in groups {
         let probe = tokio::process::Command::new("/bin/kill")
-            .args(["-0", &format!("-{group}")])
+            .args(["-0", "--", &format!("-{group}")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
