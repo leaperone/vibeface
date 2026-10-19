@@ -2506,8 +2506,28 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
     request_id = work["pending_requests"][0]["request_id"]
     notifications = wait_for("duplicate native approval persists one notification", lambda:
         rows if len(rows := approval_notifications(name)) == 1 else None)
-    require(notifications[0]["event_hash"] == task["task_ref"],
-            "persisted native approval stays attached to the original Agent task")
+    notification = notifications[0]
+    require(notification["notification_id"] == "native-input-" + hashlib.sha256(json.dumps(
+        [native["work_id"], request_id], separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
+        "persisted native approval identifies the original work and request")
+    snapshot = b.client.rpc("export", conversation_id=name)
+    verify_snapshot(snapshot)
+    events = {signed["hash"]: json.loads(signed["canonical_body"]) for signed in snapshot["events"]}
+    raised = events.get(notification["event_hash"])
+    require(raised is not None and raised["network_id"] == network and raised["scope_id"] == name
+            and raised["author"] == b.peer_id and raised["body"] == {
+                "type": "notification_raised", "notification_id": notification["notification_id"],
+                "kind": notification["kind"], "text": notification["text"]},
+            "persisted native approval points to the target's signature-verified NotificationRaised event")
+    ancestors, pending_hashes = set(), raised["parents"] + ([raised["previous"]] if raised["previous"] else [])
+    while pending_hashes:
+        event_hash = pending_hashes.pop()
+        if event_hash in ancestors:
+            continue
+        ancestors.add(event_hash)
+        event = events[event_hash]
+        pending_hashes.extend(event["parents"] + ([event["previous"]] if event["previous"] else []))
+    require(task["task_ref"] in ancestors, "native approval retains the original Agent task as a causal ancestor")
     require(not any(row["message"].get("id") == request_id and "method" not in row["message"]
                     for row in fixture_records(run, "codex-rpc.jsonl")), "native observation never approves automatically")
     sdk_calls_before_restart = len(fixture_records(run))
