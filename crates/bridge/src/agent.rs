@@ -567,11 +567,7 @@ impl SdkProcess {
             }
         }
         command
-            .envs(
-                config.tool_env.iter().filter(|(key, _)| {
-                    !config.read_only || key.as_str() != "VIBEFACE_CODEX_SOCKET"
-                }),
-            )
+            .envs(&config.tool_env)
             .env("CURSOR_API_KEY", api_key)
             .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
         let mut child = command
@@ -1402,10 +1398,6 @@ mod tests {
             sdk_options(&config, "fixture-key").unwrap()["tools"],
             json!({"names":["mcp"]})
         );
-        config
-            .tool_env
-            .insert("VIBEFACE_CODEX_SOCKET".into(), "/node/codex.sock".into());
-        assert!(sdk_options(&config, "fixture-key").is_ok());
         config
             .tool_env
             .insert("CURSOR_API_KEY".into(), "override".into());

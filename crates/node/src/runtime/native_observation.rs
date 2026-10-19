@@ -5,6 +5,99 @@ use serde::{Deserialize, Serialize};
 const INDEX: &str = "native-observation:v1:index";
 const MAX_NATIVE_WORK: usize = 256;
 
+/// App Server methods an Agent may send and the parameters it may set.
+/// The Node owns approval, reviewer and sandbox fields; Agents cannot answer server requests.
+pub(crate) const AGENT_NATIVE_METHODS: &[(&str, &[&str])] = &[
+    (
+        "thread/start",
+        &[
+            "cwd",
+            "model",
+            "modelProvider",
+            "personality",
+            "serviceTier",
+            "ephemeral",
+        ],
+    ),
+    (
+        "thread/resume",
+        &[
+            "threadId",
+            "cwd",
+            "model",
+            "modelProvider",
+            "personality",
+            "serviceTier",
+            "excludeTurns",
+        ],
+    ),
+    (
+        "turn/start",
+        &[
+            "threadId",
+            "input",
+            "cwd",
+            "model",
+            "effort",
+            "summary",
+            "personality",
+            "outputSchema",
+            "serviceTier",
+        ],
+    ),
+    ("turn/interrupt", &["threadId", "turnId"]),
+    ("thread/read", &["threadId", "includeTurns"]),
+    (
+        "thread/turns/list",
+        &["threadId", "cursor", "limit", "sortDirection", "itemsView"],
+    ),
+    ("thread/loaded/list", &["cursor", "limit"]),
+];
+
+/// Rejects methods and fields outside the Agent allowlist, and pins every work-starting
+/// request to human approval inside an authorized root.
+pub(super) fn confine_agent_request(
+    method: &str,
+    params: &Value,
+    allowed_path: impl Fn(&str) -> Result<PathBuf>,
+) -> Result<Value> {
+    let (_, fields) = AGENT_NATIVE_METHODS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .with_context(|| format!("native method {method} is not available to Agents"))?;
+    let mut params = params
+        .as_object()
+        .context("native params must be a JSON object")?
+        .clone();
+    if let Some(field) = params.keys().find(|key| !fields.contains(&key.as_str())) {
+        bail!(
+            "native field {field} is not available to Agents; the Node sets approval and sandbox"
+        );
+    }
+    if fields.contains(&"cwd") {
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .context("native cwd is required and must be inside an allowed root")?;
+        let cwd = allowed_path(cwd)?
+            .to_str()
+            .context("native cwd must be UTF-8")?
+            .to_owned();
+        params.insert("approvalPolicy".into(), json!("on-request"));
+        params.insert("approvalsReviewer".into(), json!("user"));
+        if method == "turn/start" {
+            params.insert(
+                "sandboxPolicy".into(),
+                json!({"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":false}),
+            );
+        } else {
+            params.insert("sandbox".into(), json!("workspace-write"));
+        }
+        params.insert("cwd".into(), json!(cwd));
+    }
+    Ok(Value::Object(params))
+}
+
 pub(super) struct NativeRuntime {
     socket: PathBuf,
     client: vibeface_bridge::codex::CodexClient,
@@ -370,7 +463,7 @@ impl Runtime {
         self.native.get().map(|native| native.socket.as_path())
     }
 
-    fn native_client(&self) -> Result<&vibeface_bridge::codex::CodexClient> {
+    pub(super) fn native_client(&self) -> Result<&vibeface_bridge::codex::CodexClient> {
         self.native
             .get()
             .map(|native| &native.client)
@@ -1132,6 +1225,114 @@ mod tests {
         assert!(apply_event(&mut work, &completed));
         assert!(!apply_event(&mut work, &completed));
         assert!(matches!(outcome(&[work]), Some(JobOutcome::Completed)));
+    }
+
+    #[test]
+    fn agent_native_requests_are_allowlisted_and_pinned_to_human_approval_in_roots() {
+        let roots = |path: &str| {
+            ensure!(
+                path.starts_with("/root/project"),
+                "outside configured roots"
+            );
+            Ok(PathBuf::from(path))
+        };
+        for (method, params) in [
+            ("config/batchWrite", json!({})),
+            ("command/exec", json!({"command":["true"]})),
+            (
+                "item/commandExecution/requestApproval",
+                json!({"decision":"accept"}),
+            ),
+            (
+                "thread/start",
+                json!({"cwd":"/root/project","approvalPolicy":"never"}),
+            ),
+            (
+                "thread/start",
+                json!({"cwd":"/root/project","sandbox":"danger-full-access"}),
+            ),
+            (
+                "thread/start",
+                json!({"cwd":"/root/project","config":{"approval_policy":"never"}}),
+            ),
+            (
+                "thread/resume",
+                json!({"threadId":"t","cwd":"/root/project","approvalsReviewer":"auto_review"}),
+            ),
+            (
+                "turn/start",
+                json!({"threadId":"t","cwd":"/root/project","input":[],"sandboxPolicy":{"type":"dangerFullAccess"}}),
+            ),
+            ("thread/start", json!({"cwd":"/etc"})),
+            ("turn/start", json!({"threadId":"t","input":[]})),
+        ] {
+            assert!(
+                confine_agent_request(method, &params, roots).is_err(),
+                "{method} {params}"
+            );
+        }
+        assert_eq!(
+            confine_agent_request(
+                "thread/start",
+                &json!({"cwd":"/root/project","model":"m"}),
+                roots
+            )
+            .unwrap(),
+            json!({"cwd":"/root/project","model":"m","approvalPolicy":"on-request",
+                "approvalsReviewer":"user","sandbox":"workspace-write"})
+        );
+        assert_eq!(
+            confine_agent_request(
+                "turn/start",
+                &json!({"threadId":"t","cwd":"/root/project","input":[]}),
+                roots
+            )
+            .unwrap(),
+            json!({"threadId":"t","cwd":"/root/project","input":[],"approvalPolicy":"on-request",
+                "approvalsReviewer":"user","sandboxPolicy":{"type":"workspaceWrite",
+                "writableRoots":["/root/project"],"networkAccess":false}})
+        );
+        assert_eq!(
+            confine_agent_request(
+                "turn/interrupt",
+                &json!({"threadId":"t","turnId":"u"}),
+                roots
+            )
+            .unwrap(),
+            json!({"threadId":"t","turnId":"u"})
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_codex_tool_rejects_approval_bypass_before_reaching_the_socket() -> Result<()> {
+        let dir = crate::runtime::tests::fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = crate::runtime::tests::conversation(&node).await?;
+        let access = manager_access(&node, &network, "native-bypass").await?;
+        let manager = access.manager.clone().context("manager access missing")?;
+        node.register_manager_attempt(
+            "native-bypass-token".into(),
+            access.clone(),
+            &manager.attempt_id,
+            &manager.trigger,
+            false,
+        )
+        .await?;
+        for args in [
+            json!({"method":"thread/start","params":{"cwd":"/tmp","approvalPolicy":"never"}}),
+            json!({"method":"item/commandExecution/requestApproval","params":{"decision":"accept"}}),
+        ] {
+            let error = node
+                .agent_tool(access.clone(), "codex", args, "bypass-call")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not available to Agents"), "{error}");
+        }
+        assert!(node.native.get().is_none());
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

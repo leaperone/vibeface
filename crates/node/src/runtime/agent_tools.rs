@@ -47,10 +47,14 @@ impl Runtime {
                     | "call_lookup"
                     | "cancel_task"
                     | "observe_session"
+                    | "codex"
             ),
             "unknown or unavailable coordination tool"
         );
-        let write = matches!(name, "send_task" | "cancel_task" | "observe_session");
+        let write = matches!(
+            name,
+            "send_task" | "cancel_task" | "observe_session" | "codex"
+        );
         ensure!(
             !write || access.manager.is_some(),
             "task changes require a live agent invocation"
@@ -63,6 +67,28 @@ impl Runtime {
         .context("agent tool admission timed out")??;
         match name {
             "observe_session" => self.observe_session(&access, &args, call_id).await,
+            "codex" => {
+                let method = field(&args, "method")?;
+                let params = super::native_observation::confine_agent_request(
+                    method,
+                    args.get("params").unwrap_or(&json!({})),
+                    |path| self.allowed_path(path),
+                )?;
+                self.ensure_native_client().await?;
+                self.native_client()?
+                    .request(method, params)
+                    .await
+                    .map_err(|error| {
+                        if error.uncertain {
+                            anyhow::anyhow!(
+                                "{}; native outcome is unknown; reconcile with thread/read before any new write",
+                                error.message
+                            )
+                        } else {
+                            error.into()
+                        }
+                    })
+            }
             "nodes" => self.rpc_inner(access, json!({"method":"nodes"})).await,
             "context" => self.agent_context(&access, &args).await,
             "task_status" => self.store.lock().await.agent_task_status(
