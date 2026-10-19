@@ -164,7 +164,8 @@ struct Invitation {
     url: String,
 
     peer_id: String,
-    relay: bool,
+    #[serde(default, rename = "relay", skip_serializing)]
+    _legacy_relay: Option<bool>,
     invite: InviteSecret,
 }
 
@@ -181,7 +182,8 @@ struct PendingPair {
     url: String,
 
     peer_id: String,
-    relay: bool,
+    #[serde(default, rename = "relay", skip_serializing)]
+    _legacy_relay: Option<bool>,
     invite_id: String,
     request_id: String,
     name: String,
@@ -440,13 +442,14 @@ fn is_loopback(url: &Url) -> bool {
 fn network_url(value: &str) -> Result<String> {
     ensure!(value.len() <= 2048, "network URL is too long");
     let mut url = Url::parse(value).context("invalid network URL")?;
+    let network_endpoint = matches!(url.scheme(), "ws" | "wss");
     ensure!(
         url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && matches!(url.path(), "/" | "/api/network/ws"),
+            && (network_endpoint || matches!(url.path(), "/" | "/api/network/ws")),
         "network URL must identify the Node WebSocket endpoint without credentials"
     );
     let scheme = match url.scheme() {
@@ -456,7 +459,9 @@ fn network_url(value: &str) -> Result<String> {
     };
     url.set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
-    url.set_path("/api/network/ws");
+    if !network_endpoint {
+        url.set_path("/api/network/ws");
+    }
     Ok(url.to_string())
 }
 
@@ -598,7 +603,6 @@ async fn pair(options: Pair) -> Result<()> {
         ensure!(
             pending.url == url
                 && pending.peer_id == invitation.peer_id
-                && pending.relay == invitation.relay
                 && pending.invite_id == payload.invite_id
                 && pending.name == options.name,
             "finish the pending pairing with its original invitation and device name"
@@ -608,7 +612,7 @@ async fn pair(options: Pair) -> Result<()> {
         let pending = PendingPair {
             url: url.clone(),
             peer_id: invitation.peer_id.clone(),
-            relay: invitation.relay,
+            _legacy_relay: None,
             invite_id: payload.invite_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
             name: options.name.clone(),
@@ -617,7 +621,7 @@ async fn pair(options: Pair) -> Result<()> {
         create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
         pending
     };
-    let mut client = Client::connect(&url, identity, &invitation.peer_id, invitation.relay).await?;
+    let mut client = Client::connect(&url, identity, &invitation.peer_id).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
     let mut accepted = false;
     loop {
@@ -854,7 +858,9 @@ mod tests {
             "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
         let pending: PendingPair = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(pending.peer_id, "device");
-        assert_eq!(serde_json::to_value(pending).unwrap(), wire);
+        let mut normalized = wire.clone();
+        normalized.as_object_mut().unwrap().remove("relay");
+        assert_eq!(serde_json::to_value(pending).unwrap(), normalized);
         let mut old = wire;
         let fields = old.as_object_mut().unwrap();
         fields.remove("peer_id");
@@ -1110,7 +1116,10 @@ mod tests {
                 invite: Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())),
                 name: "Build Node".into(),
             };
-            assert_eq!(super::invitation(&options).unwrap().relay, relay);
+            assert_eq!(
+                super::invitation(&options).unwrap().peer_id,
+                device.peer_id().unwrap()
+            );
             let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
             assert_eq!(parsed.peer_id, device.peer_id().unwrap());
             let mut old = envelope.clone();
@@ -1120,7 +1129,7 @@ mod tests {
             assert!(serde_json::from_value::<Invitation>(old).is_err());
             envelope.as_object_mut().unwrap().remove("relay");
             options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
-            assert!(super::invitation(&options).is_err());
+            assert!(super::invitation(&options).is_ok());
         }
         let request_hash = digest(&request.signing_bytes().unwrap());
         let mut review = PairReview {
