@@ -20,7 +20,7 @@ Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查�
 
 Web 路径优先于 Node 路径。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
-Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行完整多节点业务验收，也不验证浏览器渲染。
+Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
 ## 定期、手动和发布检查
 
@@ -31,13 +31,14 @@ Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 ep
 | Rust 快、慢测试及 Clippy | 整个工作区；慢组为精确名称的 `SLOW_TESTS` |
 | 最低 Rust 版本 | 安装 Cargo 声明的 MSRV，检查整个工作区 |
 | 原生 release 制品 | Linux x64、Linux ARM64、macOS ARM64，分别校验身份并启动网页进程 |
-| 单 Node 调度与事件日志验收 | Linux x64 一次，使用 `--phase1`；多 Node 全量验收在统一网络第三期恢复 |
+| 单 Node 调度与事件日志验收 | Linux x64 一次，使用 `--phase1` |
+| 多 Node 同步、入口与投递验收 | Linux x64 一次，不带模式参数，四台 Node 经 iroh 和成员 relay 互连 |
 | 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
 | Nightly npm 包 | 组装三个原生包，三个平台分别安装、检查版本并执行 `--web-only` 冒烟 |
 
-慢组使用 `opt-level=1`，保留调试断言和整数溢出检查，使用独立缓存。快、慢组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。NET-1 七个进程专项不自动加入每日检查。
+慢组使用 `opt-level=1`，保留调试断言和整数溢出检查，使用独立缓存。快、慢组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。
 
-CI 不使用真实 AI Provider 或模型密钥。`--chat-agent` 使用受控 SDK 和 App Server 夹具；`--skip-codex` 跳过本机真实 Codex 协议检查。模拟协议通过不能证明真实模型理解需求或正确选择工具。
+CI 不使用真实 AI Provider 或模型密钥。默认模式、`--phase1`、`--auto-route` 和 `--chat-agent` 都使用受控 SDK 和 App Server 夹具。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
 只有版本 tag 可以发布。tag 必须与 Cargo 版本一致且提交已进入 `main`；扩展 gate、三平台制品及适用的 npm 检查必须通过。发布前继续校验资产清单并下载逐字节比对，详见 [构建与发布](releasing.md)。
 
@@ -67,18 +68,19 @@ MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 
 ```sh
 binary=/absolute/path/to/package/vibeface
 crypto=/absolute/path/to/package/web/vibeface_secure.js
-python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-node --skip-codex
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-node
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-auto-route --auto-route
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-queue --phase1
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
-python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-net --network-reliability --net1-lane 7
 ```
 
-身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、根恢复保留管理设备及未知写入不重放。跨入口转发在第三期随 iroh 恢复。
+身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、经另一台 Node 的 Gateway 跨入口访问、根恢复保留管理设备及未知写入不重放。
 
-队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、审批、中断、App Server 托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。统一网络第一期删除了多 Node 同步，不带模式参数的多 Node 全量验收在第三期恢复前不可用。其他网络协议、同步历史与附件传输改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
+Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默认模式（不带模式参数）。它启动四台真实 Node 和一台其他网络的 Node：P 运行成员 relay，B 只经 relay 连接（模拟严格 NAT），A 负责调度。覆盖经 iroh 加入与同步、签名入口记录（浏览器 WASM 验签，伪造记录被拒）、四条跨入口转发路径与非成员拒绝、成员 Gateway 的 Origin 放行、调度 Node 离线时入口保留并投递且只执行一次、经另一入口重发得到原结果、崩溃与重启后不重放、relay 中断时直连继续而只经 relay 的 Node 在 relay 恢复后追平、入口切换后每条消息只出现一次，以及撤销后不再列出和转发。
 
-默认模式省略 `--skip-codex` 时还需要本机安装的 Codex，`--codex-bin` 可指定路径；它检查真实会话协议，不发起模型生成。真正模型调用、浏览器渲染、实体设备授权、实际公网与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
+队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、审批、中断、App Server 托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。
+
+真正模型调用、浏览器渲染、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
 ## 合并门禁
 

@@ -666,6 +666,22 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 按 `docs/ci.md` 补跑同步与恢复专项并记录结果。
 - 入口列表区分可公网访问的入口与仅本机或局域网可达的入口，第二期的邀请入口选择据此判断。
 
+第三期实施记录（PR #63）。与上文的差异、核对方式和推迟项如下：
+
+- `iroh` 与 `iroh-relay` 锁定 `=1.3.0`，MSRV 1.91。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`，不启用 n0 DNS、pkarr 和局域网发现，n0 公共 relay 需在 `network.n0_relays` 中打开。QUIC 只绑定配置的 socket：默认在 `listen` 端口上绑定 IPv4 和 IPv6 通配地址（IPv6 失败不阻止启动），`network.bind` 指定单一地址，`relay_paths_only` 不绑定直连 socket。
+- 第 9 节第一条风险的结论是 relay 使用单独的 `relay_listen`（明文 HTTP，公网经反代提供 HTTPS），不挂在 Gateway 的 axum 监听器上。relay 只接纳当前成员 Node 和持有本 Node 所登记邀请令牌的加入者，令牌由 `invite_hash` 派生。因此邀请写明发邀请 Node 自己的 relay，只能经 relay 连通的加入者要用运行 relay 的 Node 发出的邀请。
+- 删除 `network.rs`、`network/admission.rs`、`peer.rs`、自建会合与中继、`mdns-sd`，以及 `bootstrap_urls`、`--bootstrap-url` 和 `--relay-only`。新增 `net.rs`（Endpoint、5 个 ALPN、长度前缀 JSON 帧、relay）、`runtime/peers.rs`（Hello、Pull、Have、地址簿、投递循环、附件续传）和 `store/sync.rs`（版本向量与按区间读取）。
+- 地址记录为 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，每次同步时交换。同步循环每 5 秒检查本机地址，变化后重签并立即唤醒同步；收到更新的记录也立即唤醒同步，不等 60 秒的 Hello 间隔。浏览器经 `entrances` 取得记录，用 WASM 按记录中的 `device_id` 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。HTTPS 且主机不是回环、私网或单段名称的入口算公网，邀请入口按此选择。
+- `/api/client` 的目标不是本 Node 时，经 `vibeface/client/1` 转发浏览器与目标之间的 Noise 帧。目标不是成员时回 `target_not_member`，连不上时回 `target_unreachable`，页面经错误表翻译。成员 Gateway 的 Origin 按地址簿放行。
+- `subscribe` 带浏览器已见的版本向量，入口回 `behind`；入口追平前页面保留已显示的消息，不因换入口而闪回旧历史。
+- 不是调度 Node 的入口收到消息时回执 `pending_delivery`，在本机 outbox 中每 3 秒投递一次，调度 Node 按触发事件幂等接纳。浏览器收到入口回执即删除自己的 outbox 项，此后投递由入口负责。
+- 页面接入第二期删除后重写的 `link.ts`（连接状态机）、`entrances.ts`、`outbox.ts`（IndexedDB）、`tabs.ts`（Web Locks 加 BroadcastChannel）和 `errors.ts`（后端与网关错误集中翻译）。与 4.5 节的差异：每个标签页各自保持 Noise 连接，主标签页负责结清 outbox 和探测入口，其他标签页收到主标签页的新入口后直接切换；建机器人仍用 localStorage 的待确认记录，没有并入 outbox；切换时跳过还不认识这个浏览器的入口；连接胶囊在进入“切换中”前会短暂显示“离线”。
+- 页面 origin 所在的 Gateway 停止后刷新，本机发现失败按“无本机设置”处理，页面按最近一次认证的网络经入口列表恢复，不再要求只保存一个地址。
+- 第二期遗留项：A-05 核实为截图时机，点击后内容立即显示，箭头经 150 ms 过渡转到 90°，开合的终态都正确，未改代码；A-07 在加入卡片显示时不弹 toast，面板关闭后照常弹出；本机会话按 cookie 摘要保存在 `local-sessions.json`，Node 重启后刷新无需重新兑换，取代第二期“重启后 cookie 失效”的记录。
+- `verify-node.py` 默认模式恢复为多 Node 验收，并加入扩展 CI 的 Linux x64；`--auto-route` 增加跨入口转发用例。删除 NET-1（`--network-reliability`、`--net1-lane`）和第一期后已不运行的旧默认模式检查（直接启动、维护、CLI status、本机访问、通道安全、真实 Codex 协议），`--skip-codex` 和 `--codex-bin` 一并删除。
+- 未按原标准核对的项：真实 NAT 与公网由 `relay_paths_only` 在回环上模拟；Gateway 上的转发内容没有做进程级抓包，依据是 Gateway 只搬运帧、Noise 在浏览器与目标之间完成并验证目标设备编号；入口地址在 n0 DNS 和 pkarr 中查不到没有抓包，依据是 Endpoint 未配置这两种发布；64 MiB 附件的进程级重启续传未做，目前没有产品路径写附件，Rust 测试覆盖 3 MiB 附件从已提交的 1 MiB 位置续传并校验哈希。
+- 转入第四期：加入请求只保存在发出邀请的入口 Node 上，管理页面换入口后看不到原入口上的请求；建机器人并入 outbox；附件写入路径和进程级续传验收；标签页共享一条连接（按需）。
+
 **第四期：协调层与跨入口上下文。** 调度依据改为版本向量，原生会话缓存记录已覆盖向量。实现 `dispatch_work`（含 `continues`）和 `interrupt_work` 的 `codex` 与 `agent` 两种执行器，审批回答经网关转发并验证设备签名。验收标准如下：
 
 - 受控 SDK 和 App Server 夹具下，从入口 A 发起的工作在入口 B 上能看到同一上下文并继续同一 thread。

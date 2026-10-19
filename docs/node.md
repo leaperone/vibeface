@@ -54,7 +54,7 @@ bash scripts/build-web.sh
 
 ### 本机自动访问
 
-个人网络建立后，`local_auto_access` 默认开启。在本机打开当前节点的 localhost 网页，先尝试原有签名身份。需要本机会话时，点击**打开本机访问**，网页重新取得短期入口并导航到独立回环页面，无需配对新的永久成员。一次性 token 放在 URL fragment 中，页面清除后兑换绑定浏览器 Noise 公钥的 HttpOnly 会话。已有有效会话可直接重连；Node 重启或会话失效后，重新打开本机网页并点击该入口。`vibeface access` 保留为备用方式。
+个人网络建立后，`local_auto_access` 默认开启。在本机打开当前节点的 localhost 网页，先尝试原有签名身份。需要本机会话时，点击**打开本机访问**，网页重新取得短期入口并导航到独立回环页面，无需配对新的永久成员。一次性 token 放在 URL fragment 中，页面清除后兑换绑定浏览器 Noise 公钥的 HttpOnly 会话。会话保存在数据目录的 `local-sessions.json`（只存 cookie 摘要），Node 重启后刷新页面即可继续，无需重新兑换；会话失效或本机访问被关闭后，重新打开本机网页并点击该入口。`vibeface access` 保留为备用方式。
 
 本机会话可使用本机业务、配置本机 Agent 和项目目录，并通过正常授权路由发送任务；不能签署成员授权、登录其他 Node 或替代网络管理客户端。已有签名管理身份继续保留管理权限。
 
@@ -160,69 +160,49 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。网页中的**配置公网入口**链接指向本节。
 
-## 发现与公共中继
+## Node 之间的连接
 
-Node 可启用局域网发现，从候选地址找到已知 Peer ID。公网发现由可替换的会合节点提供。发现记录带设备签名和过期时间，只说明某个设备声明了路径，连接时仍需核验身份及个人成员授权。
+Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。没有局域网发现，也不使用 n0 的 DNS 和 pkarr 地址发布：成员 Node 的地址只来自个人网络内部交换的签名地址记录。
 
-公网或可达主机运行同一个 Node，也可启用调度或执行能力。启用公共中继时，其他人的设备可预约出站通道并通过它连通。中继只转发端到端密文，不加入对方个人网络，不获得会话、项目目录或执行权限。
+每台 Node 定期为自己签一条地址记录，内容是 iroh 地址（relay URL 和直连 IP）以及网页入口 `gateway_url`。同步时双方交换记录，地址变化后几秒内传到其他成员。浏览器从当前入口读取这些记录，自己验签后作为可切换的访问地址，见下文“多个访问地址”。
 
-用 `--bootstrap-url` 指定自己选择的发现或中继入口。以下是三种独立用法：
+两台 Node 不能直连时经 relay 转发。relay 只转发 QUIC 密文，只接纳当前成员 Node 和持有本 Node 所发邀请的加入者，默认不使用 n0 公共 relay。网络设置只在 `init` 或首次直接启动时写入 `config.json`，修改后重启生效：
 
-```sh
-./vibeface --bootstrap-url https://relay.example
-./vibeface serve --bootstrap-url wss://relay.example/api/network/ws
-./vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
-```
+| 参数 | `config.json` 中的 `network` 字段 | 作用 |
+|---|---|---|
+| `--relay <URL>` | `relays` | 个人网络中另一台 Node 的 relay，可重复，最多 16 个 |
+| `--relay-listen <ADDR>` | `relay_listen` | 本 Node 在这个地址运行 relay |
+| `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，默认 `http://<relay-listen>`；监听全部网卡时必填 |
+| `--relay-paths-only` | `relay_paths_only` | 只经 relay 连接，用于模拟严格 NAT 或排障 |
+| 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
+| 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-参数可重复，最多指定 8 个入口。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点。URL 不接受凭证、查询参数或片段。HTTP(S) 仅接受根路径或 `/api/network/ws`，WS(S) 保留显式的非根路径，程序没有内置的公共入口。
-
-首次直接启动或显式 `init` 会保存传入的 URL。已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写原配置与身份；省略参数时沿用配置。`serve` 始终要求已初始化的数据目录。使用子命令时，将 `--bootstrap-url` 写在子命令后。入口提供路由和中继预约，设备仍须获得个人网络授权。
-
-网络配置如下，保留其他字段：
-
-```json
-{
-	"network": {
-		"bootstrap_urls": ["wss://relay.example/api/network/ws"],
-		"advertise_urls": ["wss://my-node.example/api/network/ws"],
-		"mdns": true,
-		"relay_enabled": false
-	}
-}
-```
-
-`bootstrap_urls` 可以配置多个已知会合入口。没有公网直连地址的设备可保持该列表，省略对外直连地址。提供公共中继时明确开启 `relay_enabled`，并按协议限制容量和流量。发现或中继服务不可达时换路径，不重做业务操作。
-
-各入口分别发布地址和维持中继预约。某个入口拒绝预约或暂时无响应时，其他有效入口仍能继续。无效或过期的目录记录只影响对应来源，连接仍须核验目标身份和成员授权。
-
-局域网发现按服务实例维护地址，移除一个实例后仍可使用同一设备的其他有效来源。固定 IP 监听只宣告该地址，回环监听不宣告自身；wildcard 监听只发现和宣告对应地址族。接口变化会撤销旧候选，但不会自动重绑固定监听地址。地址发现不保证设备已经获得授权或当前可以连接。
-
-中继按实际 TCP 来源限制连接容量和请求频率。经同一反向代理接入的连接共用来源额度，`X-Forwarded-For` 和 `Forwarded` 不改变归属。容量不足只拒绝本次新工作，已建立的预约和电路继续受各自限制保护。具体额度见[协议参考](node-protocol.md#发现对等连接与公共中继)。
-
-公网网页来源使用 HTTPS，WebSocket 使用 WSS。Node 本身可绑定回环 HTTP，由反向代理终止 TLS。代理保留公网 Host 与原始 Origin，并支持 `/api/network/ws` 的 WebSocket upgrade。中继不是可信网页发行者，使用本人信任的客户端代码来源。
-
-历史较多时，Node 分批保存和补齐内容，未完成项留待后续同步。某个副本缺少内容时，可从本人其他已授权副本补齐。已经完整且没有变化的历史再次同步不会重写业务投影。缺少必要历史或附件时，调度和执行仍会拒绝继续，导入旧历史不会重新执行操作。批读协议见[事件 DAG 协议](node-protocol.md#事件-dag)。
-
-附件下载的已收部分保存在本机私有暂存文件。断线或重启后，Node 重新核验授权并从已保存的位置继续；只有最终大小和 hash 校验通过的完整附件才能使用。暂存最多占用 256 MiB、64 个对象，清理失败时保留进度和占用，后续维护继续重试。连接恢复只继续传输，不重发业务操作。
-
-### 纯 Web 与 Relay
-
-PVE 仅提供网页和公共中继时，在独立空目录初始化：
+公网 Node 承担 relay 角色。例如 PVE 用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 
 ```sh
-vibeface init \
-	--data-dir "$HOME/.vibeface-relay" \
-	--relay-only \
-	--listen 127.0.0.1:4790 \
-	--public-url https://relay.example
-vibeface serve --data-dir "$HOME/.vibeface-relay"
+vibeface init --data-dir "$HOME/.vibeface" \
+	--relay-listen 127.0.0.1:3340 --relay-url https://relay.example \
+	--public-url https://vibe.example
+vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 ```
 
-该模式启用公共发现和中继，不初始化个人网络、不配置管理 Agent，也不启动 Codex。为 `https://relay.example` 配置 TLS 反向代理，并支持 `/api/network/ws` 的 WebSocket upgrade。
+家里的 Mac mini 用 `--relay https://relay.example` 初始化，无需入站端口。邀请链接写明发出邀请的 Node 自己的 relay。relay 只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
 
-在 Mac mini 的 `config.json` 中把 `network.bootstrap_urls` 设为 `["wss://relay.example/api/network/ws"]`，重启 Mac mini Node。Mac mini 主动登记签名路径并维持中继预约，无需入站公网端口。PVE 不需要加入 Mac mini 的成员目录。
+公网 Node 也是普通成员，可同时运行调度或执行。relay 不读取会话内容，也不给其他设备增加任何权限。
 
-手机打开可信的 PVE 网页，导入含 Mac mini 完整指纹的连接信息。首次访问仍在 Mac mini 完成配对和持钥验证，之后使用手机自己的设备凭据重连。公共目录只按已知 Peer ID 查路由，不枚举私人设备，也不能仅凭设备名称证明它属于你。公开发现和密文转发不要求个人网络成员身份，业务权限由 Mac mini 验证。
+历史按每台设备一条签名日志同步：双方交换版本向量，只拉对方缺的区间，入库前逐条验签并去重，中断后从已入库的位置续拉。同步只写入历史和投影，不会重新执行历史中的操作；调度和执行只发生在被指定的 Node 上，见[事件 DAG 协议](node-protocol.md#事件-dag)。
+
+附件下载的已收部分保存在本机私有暂存文件。断线或重启后，Node 重新核验授权并从已保存的位置继续；只有最终大小和 hash 校验通过的完整附件才能使用。暂存最多占用 256 MiB、64 个对象。连接恢复只继续传输，不重发业务操作。
+
+## 多个访问地址
+
+每台启用 Gateway 的 Node 都是同一个人网络的一个访问地址。浏览器连上任意一台后，会经它连到目标 Node：Noise 握手仍在浏览器和目标之间完成，中间的 Gateway 只转发密文；目标不是本网络成员时，Gateway 回“目标不在我的设备里”。
+
+左下角的连接状态显示在线、切换中或离线，点开可看到当前访问地址和其他可切换的地址，每个地址标明“公网”或“仅本机或局域网”。只有带公网 HTTPS `gateway_url` 的地址算公网，邀请的二维码只用公网地址。
+
+当前访问地址断开时，页面先重试它，再按最近成功的顺序试其他地址，不需要重新加入或刷新。还没确认送达的消息保存在浏览器 IndexedDB 中，切换后用原来的签名原样重发，Node 按消息编号去重，调度 Node 只执行一次。同一浏览器的多个标签页由其中一个负责重发和探测入口，其他标签页跟随它切换。页面所在 origin 的 Gateway 不可达时，刷新后应用外壳从 service worker 缓存打开，再经其他访问地址恢复会话。
+
+成员 Gateway 的 origin 自动被其他成员的 `/api/client` 接受，无需逐个写进 `allowed_origins`。撤销一台 Node 后，其他 Gateway 不再转发到它，浏览器也不再把它列为访问地址。
 
 ## 创建机器人并处理结果
 
@@ -274,7 +254,7 @@ A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，�
 
 同一调度 Node 对同一会话串行领取管理轮，不提供旧执行层的项目目录锁或跨设备全局文件锁。多个 Agent 需要修改同一项目时，使用独立 worktree 或独立根目录隔离。
 
-浏览器在当前入口的本地存储中保留尚未确认的消息正文、消息编号和原调度节点，收到目标持久入队确认后删除。入口仅保存待投递消息不算这个确认。刷新后重试须使用原内容、汇报意图和原目标；改写正文会被拒绝，避免把新目标误当成旧操作重试。
+浏览器在 IndexedDB 中保留尚未确认的消息和它的设备签名，入口把消息写进自己的签名日志并回执后删除。入口回执 `pending_delivery` 时，由入口负责继续投递给调度 Node，浏览器不再重发。回执丢失时，浏览器经同一或另一个访问地址原样重发同一请求，Node 按消息编号返回原来的结果。刷新后重试须使用原内容和汇报意图；改写正文会被拒绝，避免把新内容误当成旧操作重试。
 
 ## 作为后台应用运行
 

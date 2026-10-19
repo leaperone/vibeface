@@ -109,15 +109,14 @@ vibeface
 
 `init` 拒绝覆盖非空数据目录。显式 `vibeface serve` 只启动已初始化节点。已有节点先停止进程，再修改原 `config.json`，不要重新初始化身份。
 
-要使用自己的发现或中继入口，在初始化或启动时传入 URL：
+Node 之间经 iroh 连接。不能直连的 Node 经个人网络中另一台 Node 运行的 relay 转发，在初始化时指定：
 
 ```sh
-vibeface --bootstrap-url https://relay.example
-vibeface serve --bootstrap-url wss://relay.example/api/network/ws
-vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
+vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example   # 运行 relay 的公网 Node
+vibeface init --relay https://relay.example                                      # 其他 Node，可重复
 ```
 
-这三种命令分别使用，可重复 `--bootstrap-url` 指定多个入口，最多 8 个。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点，URL 不接受凭证、查询参数或片段。HTTP(S) 仅接受根路径或 `/api/network/ws`，WS(S) 保留显式的非根路径。程序不内置公共入口。首次直接启动和显式 `init` 将传入的 URL 保存到配置；已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写配置或身份。省略该参数时使用原配置。更多说明见[发现与公共中继](node.md#发现与公共中继)。
+设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。程序不内置公共 relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
 
 ## 用 CLI 管理后台服务
 

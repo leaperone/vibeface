@@ -67,7 +67,7 @@ cargo build --release -p vibeface --locked
 
 保存密钥的页面需要安全上下文，推荐固定使用 `http://localhost:4790`。网络建立后，默认开启的本机自动访问可通过独立回环入口建立本机会话，不必重复配对；可在网页或 `config.json` 关闭。本机会话可配置本机 Agent 和项目目录，个人网络成员管理仍要求签名管理身份。公网访问验证设备身份。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。启用 Codex SDK 时可启动私有 App Server；网页可用不代表 Codex 已安装、登录或模型可用。
 
-PVE 只提供网页和中继时，使用 `init --relay-only`，然后让 Mac mini 的 `network.bootstrap_urls` 指向它。在手机上打开可信网页，导入 Mac mini 的连接信息并完成设备配对，实际认证目标是 Mac mini。见 [纯 Web 与 Relay](docs/node.md#纯-web-与-relay)。
+Node 之间经 iroh QUIC 互连。有公网地址的 Node（例如 PVE）用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它；它也是普通成员和网页入口，浏览器可经任意一台成员 Gateway 访问其他设备。见 [Node 之间的连接](docs/node.md#node-之间的连接) 和 [多个访问地址](docs/node.md#多个访问地址)。
 
 另一台 Node 启动后，在它的 localhost 网页选择**使用节点邀请加入**，粘贴原网络管理客户端生成的 Node 邀请。核对并确认本机节点身份与权限，再由原管理客户端批准。Node 入网不授予浏览器永久成员管理权限；进入本机工作区可使用本机自动访问，管理网络成员须使用客户端邀请或恢复包取得签名授权。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
