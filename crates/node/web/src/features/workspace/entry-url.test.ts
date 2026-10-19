@@ -14,7 +14,7 @@ import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
-  conversation: { conversation_id: "chat", title: "test" }, messages: [], heads: ["head"],
+  conversation: { conversation_id: "chat", title: "test" }, messages: [], autonomy: { mode: "report", version: 0, scheduler_node: "" }, heads: ["head"],
   missing: { events: [], blobs: [], conflicts: [] }, agent_tasks: [], native_sessions: [], observation_targets: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
@@ -29,6 +29,9 @@ test("missing integrity fields fail closed instead of authorizing writes", () =>
   assert.throws(() => parseConversation({ ...context, missing: { events: [], blobs: [] } }, "chat"))
   assert.throws(() => parseConversation({ ...context, heads: ["head", 2] }, "chat"))
   assert.throws(() => parseConversation(context, "other"))
+  assert.throws(() => parseConversation({ ...context, autonomy: undefined }, "chat"))
+  assert.throws(() => parseConversation({ ...context, autonomy: { mode: "always", version: 1 } }, "chat"))
+  assert.equal(parseConversation({ ...context, autonomy: { mode: "off", version: null, error: "chain is invalid" } }, "chat").autonomy.version, null)
   assert.equal(isIncomplete(parseConversation({ ...context, missing: { events: [], blobs: [{ hash: "blob" }], conflicts: [] } }).missing), true)
 })
 test("nodeName prefers rpc and directory names over truncated peer ids", () => {

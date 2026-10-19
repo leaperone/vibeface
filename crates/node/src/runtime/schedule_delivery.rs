@@ -647,7 +647,7 @@ impl Runtime {
         Ok(())
     }
 
-    async fn select_chat_scheduler(&self, network: &str, scope: &str) -> Result<String> {
+    pub(super) async fn select_chat_scheduler(&self, network: &str, scope: &str) -> Result<String> {
         let local = self.identity.peer_id()?;
         let (preferred, local_available, mut candidates) = {
             let store = self.store.lock().await;

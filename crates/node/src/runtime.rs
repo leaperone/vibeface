@@ -2681,6 +2681,7 @@ mod tests {
     {
         use crate::store::followup::FollowupMode;
         let dir = fixture()?;
+        configure_manager(&dir)?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
         let access = Access {
@@ -2690,7 +2691,7 @@ mod tests {
             manager: None,
         };
         let grant = json!({"method":"set_autonomy","conversation_id":"chat",
-            "mode":"report","expected_version":0,"scheduler_node":node.identity.peer_id()?});
+            "mode":"report","expected_version":0});
         assert_eq!(
             node.rpc(access.clone(), grant.clone()).await?["autonomy"]["version"],
             1
@@ -2712,6 +2713,10 @@ mod tests {
             .await?;
         assert_eq!(snapshot["autonomy"]["mode"], "report");
         assert_eq!(snapshot["autonomy"]["version"], 1);
+        assert_eq!(
+            snapshot["autonomy"]["scheduler_node"],
+            node.identity.peer_id()?
+        );
         node.rpc(
             access,
             json!({"method":"set_autonomy","conversation_id":"chat",
