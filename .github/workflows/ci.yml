@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.action == 'edited' && !github.event.changes.base && github.run_id || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -21,7 +21,6 @@ permissions:
 
 jobs:
   plan:
-    if: github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-24.04
     outputs:
       plan: ${{ steps.select.outputs.plan }}
@@ -413,8 +412,8 @@ jobs:
           python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
 
   ci-gate:
-    name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'pr-metadata-only' || 'ci-gate' }}
-    if: always() && (github.event.action != 'edited' || github.event.changes.base != null)
+    name: ci-gate
+    if: always()
     needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
