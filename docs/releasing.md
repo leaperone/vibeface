@@ -67,6 +67,8 @@ nightly 表示开发预发布，需选择 Nightly 更新渠道或手动下载，
 
 ## 更新渠道
 
+npm Nightly 的制品与发布流程见下面的 npm 章节。npm 安装由 npm 更新，不使用本节的 Rust 自更新器。
+
 Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
 自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
@@ -102,3 +104,34 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 确认新程序可用后，再执行 `update configure` 设置渠道和自动更新。普通 `cargo install` 或直接复制 binary 不构成受管安装，更新器会要求先建立完整包与 `current` 链接。
 
 此版本不转换旧数据库，也不自动清空旧目录。需要恢复旧环境时，停止新程序，并使用旧程序及其对应的完整备份，不能让不同数据格式的程序共用目录。
+
+## npm Nightly 制品与发布
+
+npm 包名为 `@leaperone/vibeface`，Nightly 使用同名不可变版本和 `nightly` dist-tag。当前只配置分发与 CI，尚未公开发布，也未确认 npm scope 的发布权限。模板 `npm/package.json` 保持 private；打包脚本验证三个原生包后，为发布制品写入真实版本并移除 private 限制。
+
+`scripts/package-npm.mjs` 接收三个平台的完整 `.tar.gz` 与同名 SHA256，要求版本、源码提交、平台和包协议一致。它拒绝危险路径、链接、特殊文件、校验错配和缺失资源，把完整包放入 `vendor/<target>`，再生成一个含全部平台的 `.tgz`。只有一个 npm 发布身份和一次发布操作，代价是下载包含其他平台的程序。没有 postinstall、运行期下载或新增 npm 依赖。
+
+PR、main 和 Nightly tag 的 CI 都生成 `npm-package-<SHA>` artifact，包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在三个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本、真实进程及随包网页。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
+
+本地检查与打包命令如下。输入目录只能包含对应版本的三个包与三个 checksum，默认输出 `.artifacts/npm`，已有同名制品会被保留并报错：
+
+```sh
+node scripts/package-npm.mjs --self-test
+node scripts/package-npm.mjs --input /absolute/path/to/verified-packages --source-commit <full-commit-sha>
+node scripts/package-npm.mjs --verify /absolute/path/to/leaperone-vibeface-<version>.tgz --source-commit <full-commit-sha>
+```
+
+`npm-publish.yml` 只接受手动触发，不在 PR、merge 或 tag 时自动向 npm 发布。触发时必须选择与输入相同的 tag ref，并核对 checkout 提交等于工作流的 `GITHUB_SHA`，使 npm provenance 对应制品源码。默认 `publish=false`，从成功的对应 tag CI 下载已验收制品，重新核对身份并执行 `npm publish --dry-run`。发布阶段不重新构建另一份包。
+
+未来首次公开发布前，先确认 `@leaperone/vibeface` 的 npm scope 权限，在 npm 自己的登录流程中完成认证，并对审核过的 tag 制品执行一次人工 bootstrap。不要把 npm token 发到聊天或写入仓库。首次发布命令是 `npm publish /absolute/path/to/leaperone-vibeface-<version>.tgz --tag nightly --access public --ignore-scripts`。
+
+包存在后，在 npm 配置 GitHub trusted publisher，仓库为 `leaperone/vibeface`，workflow 文件为 `npm-publish.yml`，环境为 `npm-release`。GitHub 的同名 environment 应配置 required reviewers；该远端设置不由工作流文件自动保证。CI 使用 Node.js 24 内置的新版 npm 与 OIDC，不存长期 npm token。
+
+配置好发布权限后，先运行手动 dry run：
+
+```sh
+gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
+  -f tag=v<version> -F publish=false
+```
+
+明确决定公开该版本时，才把 `publish` 设为 true。工作流拒绝将 nightly 指向相同或更旧版本，使用 provenance 发布，再核对 registry 中的版本 integrity 与 nightly dist-tag。网络或结果未知时先查询 registry 对账，不直接重复发布。公开版本不能覆盖，不能通过复用 tag 更换内容。

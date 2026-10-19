@@ -1,0 +1,95 @@
+name: npm Nightly publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Nightly tag whose CI npm artifact will be used
+        type: string
+        required: true
+      publish:
+        description: Publish publicly to npm instead of validating a dry run
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: npm-nightly-publication
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    runs-on: ubuntu-24.04
+    environment: npm-release
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - name: Validate matching Nightly tag and workflow ref
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Resolve successful tag CI and download its npm artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          source_commit="$(git rev-parse HEAD)"
+          [[ "$source_commit" == "$GITHUB_SHA" ]]
+          git merge-base --is-ancestor "$source_commit" origin/main
+          run_id="$(gh run list --workflow ci.yml --event push --commit "$source_commit" --limit 100 --json databaseId,headBranch,status,conclusion --jq '.[] | select(.headBranch == env.RELEASE_TAG and .status == "completed" and .conclusion == "success") | .databaseId' | head -n 1)"
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          gh run download "$run_id" --name "npm-package-$source_commit" --dir .artifacts/npm
+          node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --source-commit "$source_commit"
+      - name: Validate npm publication without registry writes
+        if: ${{ !inputs.publish }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag nightly --access public --dry-run --ignore-scripts
+      - name: Publish using the configured npm trusted publisher
+        if: ${{ inputs.publish }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          const tags = JSON.parse(execFileSync('npm', ['view', '@leaperone/vibeface', 'dist-tags', '--json', '--registry=https://registry.npmjs.org/'], { encoding: 'utf8' }));
+          if (tags.nightly) {
+            const parts = version => {
+              assert(/^\d+\.\d+\.\d+-nightly\.\d{8}\.\d+$/.test(version), 'invalid published Nightly version');
+              return version.replace('-nightly.', '.').split('.').map(BigInt);
+            };
+            const before = parts(tags.nightly);
+            const after = parts(process.env.RELEASE_TAG.slice(1));
+            const difference = after.map((value, index) => value - before[index]).find(value => value !== 0n);
+            assert(difference > 0n, 'Nightly must advance; reconcile an existing publication before retrying');
+          }
+          JS
+          npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag nightly --access public --provenance --ignore-scripts
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { readFileSync } from 'node:fs';
+          const version = process.env.RELEASE_TAG.slice(1);
+          const artifact = JSON.parse(readFileSync(`.artifacts/npm/leaperone-vibeface-${version}.tgz.json`, 'utf8'));
+          const view = args => JSON.parse(execFileSync('npm', ['view', ...args, '--json', '--registry=https://registry.npmjs.org/'], { encoding: 'utf8' }));
+          assert.equal(view([`@leaperone/vibeface@${version}`, 'dist.integrity']), artifact.integrity);
+          assert.equal(view(['@leaperone/vibeface', 'dist-tags.nightly']), version);
+          console.log(`Published and verified @leaperone/vibeface@${version} on the nightly tag.`);
+          JS

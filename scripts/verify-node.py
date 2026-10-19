@@ -169,6 +169,9 @@ def verify_direct_start(run, binary):
     directory = run / "direct-start"
     provider_free = run / "provider-free-bin"
     provider_free.mkdir()
+    node_runtime = shutil.which("node")
+    if node_runtime:
+        (provider_free / "node").symlink_to(Path(node_runtime).resolve(strict=True))
     environment = {**os.environ, "PATH": str(provider_free)}
     missing = run / "explicit-serve-missing"
     result = subprocess.run([str(binary), "serve", "--data-dir", str(missing)],

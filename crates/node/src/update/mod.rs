@@ -120,6 +120,37 @@ pub fn managed_install_root(data: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+pub fn npm_install_root(executable: &Path) -> Result<Option<PathBuf>> {
+    let executable = fs::canonicalize(executable)?;
+    let Some(package) = executable.parent() else {
+        return Ok(None);
+    };
+    let Some(vendor) = package
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "vendor"))
+    else {
+        return Ok(None);
+    };
+    let root = vendor.parent().context("npm package root is missing")?;
+    #[derive(Deserialize)]
+    struct NpmPackage {
+        name: String,
+        version: semver::Version,
+    }
+    let npm: NpmPackage = serde_json::from_slice(&fs::read(root.join("package.json"))?)
+        .context("invalid npm package metadata")?;
+    ensure!(
+        npm.name == "@leaperone/vibeface"
+            && npm.version == manifest(package)?.version
+            && root.join("bin/vibeface.mjs").is_file()
+            && executable
+                .file_name()
+                .is_some_and(|name| name == "vibeface"),
+        "npm package does not match the native Vibeface program"
+    );
+    Ok(Some(root.to_path_buf()))
+}
+
 pub async fn run(options: Update) -> Result<()> {
     let data = match &options.action {
         Action::Configure { data, .. }
@@ -131,6 +162,25 @@ pub async fn run(options: Update) -> Result<()> {
     let data = fs::canonicalize(data).context("initialized data directory is required")?;
     config::identity(&data)?;
     let _lock = update_lock(&data)?;
+    if let Some(root) = npm_install_root(&std::env::current_exe()?)? {
+        match options.action {
+            Action::Status(_) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"distribution":"npm", "install_root":root,
+                    "current_version":env!("CARGO_PKG_VERSION"), "automatic":false,
+                    "recovery_required":data.join("update-pending.json").exists()})
+                );
+                return Ok(());
+            }
+            Action::Apply {
+                automatic: true, ..
+            } => return Ok(()),
+            _ => bail!(
+                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@nightly and restart the service"
+            ),
+        }
+    }
     let policy_path = data.join("update.json");
     let policy = policy(&data)?;
     match options.action {
@@ -275,7 +325,7 @@ pub async fn run(options: Update) -> Result<()> {
     }
 }
 
-fn update_lock(data: &Path) -> Result<File> {
+pub fn update_lock(data: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = OpenOptions::new()
         .read(true)
@@ -897,6 +947,37 @@ mod tests {
         )
         .unwrap();
         directory
+    }
+
+    #[test]
+    fn npm_installation_requires_matching_package_metadata() {
+        let root = sandbox();
+        let original = package(&root, "1.2.3-nightly.20261019.1");
+        assert_eq!(npm_install_root(&original.join("vibeface")).unwrap(), None);
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        let native = root.join("vendor/aarch64-apple-darwin");
+        fs::rename(original, &native).unwrap();
+        fs::create_dir(root.join("bin")).unwrap();
+        fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            npm_install_root(&native.join("vibeface")).unwrap(),
+            Some(root.clone())
+        );
+        for metadata in [
+            r#"{"name":"another-package","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"2.0.0"}"#,
+            r#"{"name":"@leaperone/vibeface"}"#,
+        ] {
+            fs::write(root.join("package.json"), metadata).unwrap();
+            assert!(npm_install_root(&native.join("vibeface")).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
