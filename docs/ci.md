@@ -33,6 +33,8 @@ PR 使用 `merge-base(base, head)..head` 的完整差异。删除与重命名同
 
 本地 Rust preflight 执行快测试和 Clippy。慢测试由正式 PR 的必需 `ci-gate` 检查，避免合并前在本机重复执行同一组重型场景。
 
+远端慢组使用 `opt-level=1` 的测试构建，并保留调试断言与整数溢出检查；它使用独立缓存，不改变用例或夹具规模。
+
 推送版本 tag 才触发发布，手动全量检查只生成制品。版本 tag 必须与 Cargo 版本完全一致且已经进入 `main`。只有全量 gate 与三平台制品成功后才运行发布；SHA256、源提交、存储 epoch、资产清单和下载比对规则保留。
 
 Nightly 版本的 Ready Node PR 和全量场景还会将三个已验收的原生包组装成 npm 包，在三个平台安装并运行进程烟测。Web-only 和 Draft PR 不组装全平台 npm 包。`npm-package` 和 `npm-smoke` 属于相应计划的必需检查，Nightly tag 必须等这些检查通过才能发布。
