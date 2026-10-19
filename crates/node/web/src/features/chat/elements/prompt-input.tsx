@@ -15,8 +15,6 @@ export function PromptInput({
   hint,
   disabled,
   busy,
-  reportResults,
-  onReportResults,
   onChange,
   onSubmit,
   onStop,
@@ -25,8 +23,6 @@ export function PromptInput({
   hint: string
   disabled: boolean
   busy: boolean
-  reportResults: boolean
-  onReportResults: (value: boolean) => void
   onChange: (value: string) => void
   onSubmit: () => void
   onStop?: () => void
@@ -79,17 +75,6 @@ export function PromptInput({
         </InputGroupAddon>
       </InputGroup>
       {hint ? <p id="manager-hint">{hint}</p> : null}
-      <label className="mt-3 flex min-h-11 items-start gap-2 text-sm">
-        <input
-          type="checkbox"
-          className="mt-1 size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50"
-          checked={reportResults}
-          disabled={disabled || busy}
-          onChange={(event) => onReportResults(event.target.checked)}
-        />
-        <span>完成后告诉我</span>
-      </label>
-      <p className="text-xs text-muted-foreground">只影响这条消息，不改后续授权。</p>
     </form>
   )
 }

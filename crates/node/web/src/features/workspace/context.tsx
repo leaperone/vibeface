@@ -280,10 +280,10 @@ function useWorkspaceState(connection: ReadyConnection) {
     setNoticeText(interrupt ? "停止请求已接收，是否结束以执行设备的最终结果为准。" : "本人操作已接收，请查看最新进展。")
     if (activeId.current === request.conversation_id) await refreshRef.current()
   }
-  const submitMessage = async (text: string, reportResults: boolean) => {
+  const submitMessage = async (text: string) => {
     const context = requireContext(), id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults })
+    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults: true })
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {
@@ -333,11 +333,11 @@ function useWorkspaceState(connection: ReadyConnection) {
     setView("chat")
     await refreshRef.current()
   }
-  const sendMessage = (input: string, reportResults = false) => withMutation(`message:${activeId.current}`, async () => {
+  const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选择机器人。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
-    try { return await submitMessage(text, reportResults) } finally { if (current()) setMessageBusy(false) }
+    try { return await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
   })
   const incomplete = !data || isIncomplete(data.missing)
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null

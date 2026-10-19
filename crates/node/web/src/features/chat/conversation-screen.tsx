@@ -17,7 +17,6 @@ import './chat.css'
 export function ConversationScreen() {
   const workspace = useWorkspace()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
-  const [reportResults, setReportResults] = useState(false)
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const text = drafts.get(conversationId) ?? ''
@@ -96,7 +95,7 @@ export function ConversationScreen() {
               {messagePending ? <div className="pending-message-actions">
                 <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对</ActionButton>
                 <ActionButton disabled={!workspace.writable || !originalEntry || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
-                  if (await workspace.sendMessage(messagePending.text, messagePending.report_results ?? false) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
+                  if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
                 })}>重试</ActionButton>
                 <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>解除</ActionButton>
               </div> : null}
@@ -127,13 +126,11 @@ export function ConversationScreen() {
         disabled={sendDisabled}
         busy={messageBusy}
         onStop={stopJob && workspace.writable && workspace.selectedBot ? () => { void workspace.run(() => workspace.cancelManager(stopJob.trigger)) } : undefined}
-        reportResults={reportResults}
-        onReportResults={setReportResults}
         onChange={(value) => setDrafts((current) => new Map(current).set(conversationId, value))}
         onSubmit={() => {
           if (sendDisabled || !text.trim()) return
           void workspace.run(async () => {
-            if (await workspace.sendMessage(text, reportResults) && workspace.isCurrent()) clearSentDraft(conversationId, text)
+            if (await workspace.sendMessage(text) && workspace.isCurrent()) clearSentDraft(conversationId, text)
           })
         }}
       />

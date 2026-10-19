@@ -231,7 +231,7 @@ test("workspace persists exact bot creation, routed messages and execution appro
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
-    await state.sendMessage("work", true)
+    await state.sendMessage("work")
     state = render()
     assert.ok(state.messagePending)
     const pending = JSON.parse(JSON.stringify(state.messagePending))

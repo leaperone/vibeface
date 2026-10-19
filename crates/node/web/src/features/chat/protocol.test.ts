@@ -43,7 +43,7 @@ test('invalid message content is rejected before a durable request is created', 
   assert.equal(prepareSend({ ...input, text: '中'.repeat(21846) }).ok, false)
   assert.equal(prepareSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
 })
-test('report authorization survives retries and only the exact durable queue receipt settles a message', () => {
+test('report results default on and survive retries; only the exact durable queue receipt settles a message', () => {
   const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerNodeId: 'scheduler', entryNode: 'entry', heads: [], pending: null, reportResults: true })
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
@@ -62,6 +62,7 @@ test('an automatically routed message settles only after the server confirms its
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
   assert.equal(prepared.body.scheduler_node, null)
+  assert.equal(prepared.body.report_results, true)
   const receipt = { accepted: true, queued: true, message_id: prepared.pending.message_id, scheduler_node: 'chosen' }
   assert.equal(isQueuedReceipt(receipt, prepared.pending), true)
   assert.equal(isQueuedReceipt({ ...receipt, message_id: 'other' }, prepared.pending), false)
