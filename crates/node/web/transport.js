@@ -8,7 +8,7 @@ let identity;
 let initializing;
 
 export function validTarget(value) {
-  if (typeof value !== "string" || !peerPattern.test(value)) throw new Error("填写完整的 64 位设备编号。请从本机终端或可信邀请中取得，不要使用中继提供的替代编号。");
+  if (typeof value !== "string" || !peerPattern.test(value)) throw new Error("填写完整的 64 位设备编号。请从节点本机页面或可信邀请中取得，不要使用中继提供的替代编号。");
   return value;
 }
 
@@ -146,7 +146,7 @@ export function readInvitation(value) {
   try { invitation = JSON.parse(content); }
   catch {
     try { invitation = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(content.replace(/-/g, "+").replace(/_/g, "/")), (character) => character.charCodeAt(0)))); }
-    catch { throw new Error("无法读取邀请。请粘贴完整邀请链接或终端输出的邀请内容。"); }
+    catch { throw new Error("无法读取邀请。请粘贴完整邀请链接或管理客户端复制的邀请内容。"); }
   }
   if (!invitation || typeof invitation !== "object" || Array.isArray(invitation)) throw new Error("邀请内容格式无效。");
   return invitation;

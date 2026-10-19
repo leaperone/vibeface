@@ -632,10 +632,11 @@ test("an old action completion cannot clear a new generation's busy state", asyn
 })
 
 test("connection form keeps current errors and busy ownership when an earlier connection is cancelled", async () => {
-  let generation = 1, work = pendingResult(), synchronousFailure = false
+  let generation = 1, work = pendingResult(), synchronousFailure = false, cancellations = 0
   const device = {
     connectionGeneration: () => generation, entries: [{ address: 'https://node.example', peer_id: 'target' }], initialInvitation: '',
-    identity: { peerId: 'browser' }, phase: 'disconnected', error: '',
+    identity: { peerId: 'browser' }, phase: 'disconnected', error: '', localSetup: null, localJoin: null,
+    cancelConnection() { cancellations++; generation++ },
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
   const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
@@ -654,6 +655,10 @@ test("connection form keeps current errors and busy ownership when an earlier co
     assert.equal(connect()?.disabled, false)
     synchronousFailure = true; connect()?.onClick?.(); await settleComponent()
     assert.equal(render().find(({ props }) => props.role === 'alert')?.props.children, 'current invalid input')
+    render().find(({ props }) => props.children === '使用邀请')?.props.onClick?.()
+    assert.equal(cancellations, 1)
+    render()
+    assert.equal(render().some(({ props }) => props.role === 'alert'), false)
   } finally { app.close() }
 })
 

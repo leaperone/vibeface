@@ -1,6 +1,13 @@
 import type { MembershipView } from "@/lib/node"
 import type { NodeInfo } from "./types"
 
+export const roleNames: Record<string, string> = {
+  gateway: "接入",
+  relay: "中继",
+  replica: "同步",
+  scheduler: "调度",
+}
+
 export const stateNames: Record<string, string> = {
   accepted: "已接收",
   pending_delivery: "等待设备接收",

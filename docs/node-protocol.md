@@ -24,7 +24,7 @@
 
 ## 本机配置
 
-`config.json` 由 `init` 生成，修改后重启生效。字段名固定，不接受未知字段。
+`config.json` 由 `init` 生成。网页通过加密客户端通道修改 `manager` 和 `roots` 后，新操作立即读取；其他字段手动修改后重启生效。字段名固定，不接受未知字段。
 
 | 字段 | 含义 |
 |---|---|
@@ -72,13 +72,23 @@
 | `/`、`/app.js`、`/transport.js`、`/style.css` | GET | 内置可信网页客户端 |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
 | `/api/info` | GET | Node 公开身份与能力信息 |
+| `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有集群的当前入口 |
+| `/api/local/join/request` | POST | 本机运行中的 Node 提交节点邀请和名称，保存申请收据 |
+| `/api/local/join/accept` | POST | 本人以申请编号及完整 review hash 确认节点身份和权限 |
+| `/api/local/join/status` | POST | 核对原申请并安装已授予的 Node 成员授权，不重发申请 |
 | `/api/network/ws` | GET，WebSocket upgrade | 直连、发现、中继及端到端客户端通道 |
 | `/api/tools` | POST | 本地管理 Agent 的受限工具调用 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | Cursor SDK 原生工具回调 |
 
 网站不提供用户名密码注册或明文业务 RPC。公网通道始终验证签名成员身份。独立回环入口另用本机启动凭据兑换绑定浏览器 Noise 公钥的 HttpOnly 会话 Cookie，不授予永久成员资格。网页的密钥存储需要安全上下文，普通 LAN HTTP 页面不能降级为无密钥认证。
 
-WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"PEER_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。客户端钉住目标 Peer ID，服务端在加密通道内验证客户端集群授权。
+`/api/local/setup` 要求正文为 JSON 空对象 `{}`。全部本机设置及加入路径要求实际 TCP 来源为 loopback、Host 为允许的字面 localhost 或 loopback 地址，且 Origin 与该入口完整一致。不接受 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP` 请求头，`0.0.0.0`、`::` 和公网入口不能使用。响应禁止缓存，初始化材料不进入公开的 `/api/info`。
+
+未初始化时返回 `{ kind: "uninitialized", invitation: { url, peer_id, capability } }`，其中一次性能力仍由原有签名建网或恢复协议消耗。已有集群时返回 `{ kind: "initialized", entry: { address, peer_id }, local_launch?: { url, peer_id, token } }`。先尝试原入口的签名身份；可选启动凭据仅用于本人明确选择本机自动访问时导航到独立回环入口，不自动切换浏览器来源。该响应不授予永久成员资格，也不重建协作集群。
+
+节点加入的响应状态为 `idle`、`review`、`pending`、`joined` 或 `uncertain`。`review` 与 `pending` 带 `request_id`、现有 `PairReview` 及其 canonical JSON 的 SHA256 `review_hash`。接受需要明确提交同一编号与 hash，原集群的管理客户端仍须批准。`joined` 只表示 Node 入网，不授予浏览器客户端权限。未知结果先查 `status`，不重新创建请求身份。
+
+WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"PEER_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。客户端钉住目标 Peer ID，服务端在加密通道内验证客户端协作集群授权。
 
 握手后的应用消息均为二进制加密记录。文本应用消息、身份错配、篡改及重放关闭通道。大消息通过 `sealMessage` 和 `openRecord` 分片重组，不能直接把一个超长 JSON 塞入单个 Noise record。
 
@@ -92,6 +102,8 @@ WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"d
 | `authenticate` | `cluster_id` | 验证握手客户端的成员授权，或独立入口已验证的本机会话 |
 | `local_access` | 可选 `enabled` | 查询本机自动访问；管理客户端可开关，本机会话可关闭 |
 | `directory` | `{}` | 返回当前签名目录及投影 |
+| `node_settings` | `{}` | 管理客户端或有效本机会话读取当前节点 manager、roots、默认程序路径及角色和依赖准备状态 |
+| `configure_node` | `manager`、`roots` | 管理客户端或有效本机会话验证并保存当前节点设置，更新后续操作读取的本机快照 |
 | `rpc` | 下节 RPC 对象 | 执行业务读写 |
 | `subscribe` | `{}` | 订阅本集群的 `changed` 消息及其语义 payload |
 | `prepare_invite` | `kind`、`node_roles`、`request_id` | 生成邀请正文与管理客户端待签名内容 |
@@ -110,7 +122,7 @@ WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"d
 | `prepare_recovery` | `challenge_id`、`members` | 生成更高 epoch checkpoint 及根待签名内容 |
 | `recover` | `challenge_id`、`checkpoint`、新节点的 `state` 与 `capability` | 安装根签 checkpoint 并授权新管理客户端 |
 
-`prepare_genesis` 返回 `state` 和 `signing { domain, payload }`。客户端使用本地根身份签名并写入 `state.genesis.signature`。`bootstrap` 和 `authenticate` 返回 `principal`、`state` 和 `view`。`principal` 包含 `cluster_id`、`subject_id`、`epoch`、`can_manage` 和 `source`，不能由客户端自行声明。`source=membership` 使用签名成员目录；`source=local_session` 绑定本机 Node、当前集群和浏览器 Noise 公钥，`can_manage=false`，不参加成员治理。已有签名管理身份优先保留其成员权限。
+`prepare_genesis` 返回 `state` 和 `signing { domain, payload }`。客户端使用本地根身份签名并写入 `state.genesis.signature`。`bootstrap` 和 `authenticate` 返回 `principal`、`state` 和 `view`。`principal` 包含 `cluster_id`、`subject_id`、`epoch`、`can_manage` 和 `source`，不能由客户端自行声明。`source=membership` 使用签名成员目录；`source=local_session` 绑定本机 Node、当前集群和浏览器 Noise 公钥，`can_manage=false`，不参加成员治理。本机设置写入在取得配置锁后重新核对 Cookie 的有效性、Node、集群及浏览器身份；关闭本机访问后，旧 Cookie 不能保存设置。已有签名管理身份优先保留其成员权限。
 
 邀请含管理客户端签名的 `InviteEnvelope`，新设备还要签署持钥证明和最终 review。管理客户端分别签署 review 与治理事件。只有一次性邀请，或只取得未确认的申请，都不能成为成员。在线新增成员不授予管理权限，管理客户端由根签初始化或恢复 checkpoint 明确建立。
 
@@ -158,7 +170,7 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 
 Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入或重建同版本定义不启动模型。
 
-Node 的 manager 配置保存本机 SDK adapter 和凭证，Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存仍按集群、scope 和本机节点保存。缓存不是共享聊天的事实来源。
+Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模型凭证。Provider 凭证由本机运行环境或 Provider 自身保存。Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存仍按集群、scope 和本机节点保存。缓存不是共享聊天的事实来源。
 
 `send_task` 在同一事务保存带稳定调用引用的签名任务及调度记录，固定原目标。恢复先用 `call_lookup` 或 `task_status` 查询原任务，不能根据同一文本猜测是否重复，也不能换目标重派。宿主 SDK 的 Shell 和原生写请求没有旧 Operation 账本，结果不明时必须核对真实副作用。
 

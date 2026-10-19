@@ -61,14 +61,20 @@ test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 2 }), false)
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 0 }), false)
   assert.equal(shouldAutoConnect({ hasInvitation: true, savedCount: 1 }), false)
-  assert.equal(primaryLane({ hasInvitation: true, savedCount: 3 }), 'invite')
-  assert.equal(primaryLane({ hasInvitation: false, savedCount: 0 }), 'invite')
-  assert.equal(primaryLane({ hasInvitation: false, savedCount: 1 }), 'saved')
-  assert.equal(primaryLane({ hasInvitation: false, savedCount: 2 }), 'saved')
+  assert.equal(primaryLane({ hasInvitation: true, savedCount: 3, hasLocalSetup: false }), 'invite')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 0, hasLocalSetup: false }), 'invite')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 1, hasLocalSetup: false }), 'saved')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: false }), 'saved')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 1, hasLocalSetup: true }), 'local')
+  assert.equal(primaryLane({ hasInvitation: true, savedCount: 0, hasLocalSetup: true }), 'invite')
 })
 
 const target = 'a'.repeat(64), cluster = 'b'.repeat(64), subject = 'c'.repeat(64), publicKey = 'd'.repeat(64)
 const entry: ConnectionEntry = { address: 'https://node.example', peer_id: target }
+const localEntry: ConnectionEntry = { address: 'http://localhost:4790', peer_id: target }
+const localCapability = 'f'.repeat(64)
+const localInvitation = { url: localEntry.address, peer_id: target, capability: localCapability }
+const localLaunch = { url: 'http://127.0.0.1:49781', peer_id: target, token: 'e'.repeat(64) }
 const genesis = { version: 2, cluster_id: cluster, owner_public_key: publicKey }
 const membership: MembershipView = { cluster_id: cluster, members: [], revoked: [], heads: [], epoch: 1 }
 const canonical = (value: unknown): string => value && typeof value === 'object'
@@ -80,19 +86,32 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 const settle = () => new Promise(setImmediate)
+function nodeJoinFixture() {
+  const expires_at_ms = Date.now() + 60000
+  const payload = { version: 2, invite_id: 'node-invite', cluster_id: cluster, inviter_subject_id: '9'.repeat(64), new_kind: 'node', manage: false, node_roles: ['relay'], epoch: 1, expires_at_ms }
+  const invitation = JSON.stringify({ url: entry.address, peer_id: '8'.repeat(64), invite: { capability: 'one-time-node-invite', invite: { payload, inviter_signature: 'signature' } } })
+  const review = { version: 2, invite_id: payload.invite_id, cluster_id: cluster, inviter_subject_id: payload.inviter_subject_id, new_member: { subject_id: target, public_key: publicKey, kind: 'node', name: 'node', node_roles: ['relay'], manage: false }, proposal_hash: '7'.repeat(64), parents: [], epoch: 1, expires_at_ms }
+  const receipt = { kind: 'review', request_id: 'node-pair', review, review_hash: createHash('sha256').update(canonical(review)).digest('hex') }
+  return { invitation, receipt }
+}
 
-function deviceHarness({ pairing = false, bootstrap = false, saved = false, local = false, fragment = '' } = {}) {
+function deviceHarness({ pairing = false, bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>() } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
-  const stored = new Map<string, string>(), calls: string[] = []
-  const discovery: { records: { peerId: string; publicKey: string; expiresAt: number; paths: ClusterPath[] }[]; signals: AbortSignal[]; rejected: Set<string> } = { records: [], signals: [], rejected: new Set() }
-  const signed: { view: MembershipView; mergeError?: Error; rejectNextAuthentication?: boolean } = { view: membership }
+  const stored = storage, calls: string[] = [], navigations: string[] = []
+  const requests: { method: string; params: Record<string, unknown> }[] = []
+  const setupRequests: { path: string; options: RequestInit }[] = []
+  const joinRequests: { action: string; params: unknown }[] = [], joinResponses = new Map<string, unknown>()
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; path?: ClusterPath; close(): void; drop(): void }[] = []
-  const localEntry = { address: 'https://node.example', peer_id: target, local: true }
-  const localState = { enabled: true }
+  const localState: { enabled: boolean; setup?: unknown } = { enabled: true }
+  const pageOrigin = local ? localEntry.address : entry.address
+  const sessionEntry: ConnectionEntry = { address: pageOrigin, peer_id: target, local: true }
   const clock = { now: Date.now() }
-  const location = { hash: fragment, href: `https://node.example/${fragment}`, origin: 'https://node.example' }
+  const hash = invitation ? `#invite=${encodeURIComponent(invitation)}` : fragment
+  const location = { hash, href: `${pageOrigin}/${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
+  const discovery: { records: { peerId: string; publicKey: string; expiresAt: number; paths: ClusterPath[] }[]; signals: AbortSignal[]; rejected: Set<string> } = { records: [], signals: [], rejected: new Set() }
+  const signed: { view: MembershipView; mergeError?: Error; rejectNextAuthentication?: boolean } = { view: membership }
   let cursor = 0, nextTimer = 0
   const react = {
     createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
@@ -132,10 +151,11 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
       sockets.push({ entry: candidate, close, drop: close })
       options.signal.addEventListener('abort', close)
       if (holds.has('open')) await holds.get('open')?.promise
-      return { peerId: candidate.peer_id, publicKey, close, async request(method: string) {
+      return { peerId: candidate.peer_id, publicKey, close, async request(method: string, params: Record<string, unknown> = {}) {
         calls.push(method)
+        requests.push({ method, params })
         if (holds.has(method)) { const held = await holds.get(method)?.promise; if (method !== 'authenticate') return held }
-        if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['gateway', 'replica'], initialized: !bootstrap }
+        if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['gateway', 'replica'], initialized: !bootstrap && local !== 'fresh' }
         if (method === 'authenticate') { if (discovery.rejected.has(candidate.peer_id)) throw Object.assign(new Error('entry has not synchronized authorization'), { responded: true }); return { principal: { cluster_id: cluster }, state: { genesis } } }
         if (method === 'directory') return { state: { genesis }, view: signed.view }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
@@ -151,9 +171,9 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   let verifications = 0, released = 0
   const secure = {
     mergeMembership: (state: unknown) => { if (signed.mergeError) throw signed.mergeError; return { state: state ?? { genesis }, view: signed.view } },
-    authorizeMembership: () => { if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); return { manage: false } },
+    authorizeMembership: () => { if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); return { manage: management } },
     MembershipRevokedError: class extends Error {},
-    verifyAuthentication: () => { verifications++; if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); if (signed.rejectNextAuthentication) { signed.rejectNextAuthentication = false; throw new Error('entry no longer authorized') }; return { auth: { local_auto_access: true }, principal: { source: local ? 'local_session' : 'membership', cluster_id: cluster, subject_id: subject, epoch: 1, can_manage: false }, view: signed.view } },
+    verifyAuthentication: (_auth: unknown, _own: unknown, trust: { kind: string } | null) => { verifications++; if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); if (signed.rejectNextAuthentication) { signed.rejectNextAuthentication = false; throw new Error('entry no longer authorized') }; return { auth: { local_auto_access: true }, principal: { source: trust?.kind === 'local' && !management ? 'local_session' : 'membership', cluster_id: cluster, subject_id: subject, epoch: 1, can_manage: management }, view: signed.view } },
     verifiedView: () => signed.view,
     openPackage: async () => ({ clusterId: cluster, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ peerId: () => cluster, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
@@ -165,15 +185,27 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   const sandbox = createContext({
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
     location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, Uint8Array, Error, crypto: globalThis.crypto, Date: class extends Date { static now() { return clock.now } },
-    fetch: async (url: string, options: RequestInit) => {
-      if (!local) return { ok: false }
-      if (url === '/api/local/info') return { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, subject_id: subject, cluster_id: cluster, entry: localEntry }) }
-      assert.equal(url, '/api/local/exchange')
-      assert.equal(options.credentials, 'same-origin')
-      assert.equal(options.redirect, 'error')
-      assert.deepEqual(JSON.parse(String(options.body)), { token: 'f'.repeat(64), peer_id: target, subject_id: subject, public_key: publicKey })
-      calls.push('local-exchange')
-      return { ok: true, json: async () => ({ cluster_id: cluster, entry: localEntry }) }
+    async fetch(path: string, options: RequestInit) {
+      if (path === '/api/local/info') return localSession
+        ? { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, subject_id: subject, cluster_id: cluster, entry: sessionEntry }) }
+        : { ok: false, status: 404 }
+      if (path === '/api/local/exchange') {
+        assert.equal(localSession, true)
+        assert.equal(options.credentials, 'same-origin')
+        assert.equal(options.redirect, 'error')
+        assert.deepEqual(JSON.parse(String(options.body)), { token: 'f'.repeat(64), peer_id: target, subject_id: subject, public_key: publicKey })
+        calls.push('local-exchange')
+        return { ok: true, json: async () => ({ cluster_id: cluster, entry: sessionEntry }) }
+      }
+      if (path.startsWith('/api/local/join/')) {
+        const action = path.slice('/api/local/join/'.length), key = `local_join:${action}`
+        calls.push(key); joinRequests.push({ action, params: JSON.parse(String(options.body)) })
+        const value = holds.has(key) ? await holds.get(key)?.promise : joinResponses.get(action) ?? { kind: 'idle' }
+        return { status: 200, ok: true, json: async () => value }
+      }
+      calls.push('local_setup'); setupRequests.push({ path, options })
+      const value = holds.has('local_setup') ? await holds.get('local_setup')?.promise : localState.setup ?? (local === 'fresh' ? { kind: 'uninitialized', invitation: localInvitation } : { kind: 'initialized', entry: localEntry })
+      return { status: 200, ok: true, json: async () => value }
     },
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
   })
@@ -204,11 +236,383 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, calls, holds, discovery, signed, sockets, stored, timers, location, localState, clock, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, calls, requests, setupRequests, joinRequests, joinResponses, holds, discovery, signed, sockets, stored, timers, location, localState, navigations, clock, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
+for (const local of ['fresh', 'initialized']) for (const selection of ['target', 'recent']) test(`${selection} Cluster survives ${local} localhost setup and an ambient cookie`, async () => {
+  const app = deviceHarness({ local, localSession: true })
+  const directory = 'wss://directory.example/custom/socket'
+  const selected: ClusterTarget = { kind: 'cluster', clusterId: cluster, directories: [directory] }
+  try {
+    app.signed.view = { ...membership, members: [gatewayMember(target)] }
+    app.stored.set(`vibeface.cluster-state.${cluster}`, JSON.stringify({ genesis }))
+    if (selection === 'target') app.stored.set('vibeface.cluster-target', JSON.stringify(selected))
+    else app.stored.set('vibeface.last-authenticated', JSON.stringify({ kind: 'cluster', clusterId: cluster, target: selected, path: { address: directory, peer_id: target, mode: 'relay' } }))
+    app.discovery.records = [{ peerId: target, publicKey, expiresAt: Date.now() / 1000 + 60, paths: [{ address: directory, mode: 'relay' }] }]
+    app.render(); await settle()
+    assert.equal(app.render().localSetup?.kind, local === 'fresh' ? 'uninitialized' : 'initialized')
+    assert.equal(app.render().ready?.entry.address, directory)
+    assert.equal(app.render().ready?.entry.local, undefined)
+    assert.deepEqual(app.sockets.map(socket => socket.path), [{ address: directory, mode: 'relay' }])
+    assert.deepEqual(JSON.parse(app.stored.get('vibeface.cluster-target') ?? 'null'), selected)
+    assert.equal(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? 'null').kind, 'cluster')
+    assert.equal(app.calls.includes('local-exchange'), false)
+  } finally { app.close() }
+})
+
+test('cancelling a connection generation preserves the explicit Cluster and last successful source', async () => {
+  const app = deviceHarness(), directory = 'wss://directory.example/custom/socket'
+  try {
+    app.render(); await settle()
+    app.discovery.records = [{ peerId: target, publicKey, expiresAt: Date.now() / 1000 + 60, paths: [{ address: directory, mode: 'relay' }] }]
+    await app.render().connectCluster({ kind: 'cluster', clusterId: cluster, directories: [directory] })
+    const savedTarget = app.stored.get('vibeface.cluster-target'), recent = app.stored.get('vibeface.last-authenticated')
+    assert.ok(recent)
+    const generation = app.render().connectionGeneration()
+    app.render().cancelConnection()
+    assert.equal(app.render().connectionGeneration(), generation + 1)
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().phase, 'disconnected')
+    assert.equal(app.timers.size, 0)
+    assert.equal(app.stored.get('vibeface.cluster-target'), savedTarget)
+    assert.equal(app.stored.get('vibeface.last-authenticated'), recent)
+    app.render().disconnect()
+    assert.equal(app.stored.get('vibeface.cluster-target'), 'null')
+    assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
+  } finally { app.close() }
+})
+
+test('fresh localhost discovers its one-time invitation without opening transport or saving the capability', async () => {
+  const app = deviceHarness({ local: 'fresh', saved: true })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().localSetup?.kind, 'uninitialized')
+    assert.deepEqual(app.calls, ['local_setup', 'local_join:status'])
+    assert.equal(app.setupRequests[0].path, '/api/local/setup')
+    assert.equal(app.setupRequests[0].options.method, 'POST')
+    assert.equal(app.setupRequests[0].options.body, '{}')
+    assert.equal(app.setupRequests[0].options.cache, 'no-store')
+    assert.equal(app.setupRequests[0].options.credentials, 'omit')
+    assert.equal([...app.stored.values()].some(value => value.includes(localCapability)), false)
+    await app.render().createLocalCluster('browser', 'test-only-passphrase')
+    assert.equal(app.render().review?.kind, 'bootstrap')
+    assert.equal(app.calls.includes('bootstrap'), false)
+    app.render().downloadBackup()
+    await app.render().confirmBootstrap(true)
+    assert.equal(app.render().ready?.entry.address, localEntry.address)
+    assert.equal(app.render().localSetup?.kind, 'initialized')
+    assert.equal(app.requests.find(request => request.method === 'bootstrap')?.params.capability, localCapability)
+    assert.equal(app.calls.filter(call => call === 'bootstrap').length, 1)
+  } finally { app.close() }
+})
+
+test('initialized localhost requires member authorization and cannot create a second network', async () => {
+  const app = deviceHarness({ local: 'initialized' })
+  const hold = deferred(); app.holds.set('authenticate', hold)
+  try {
+    app.render(); await settle()
+    hold.reject(Object.assign(new Error('not a member'), { responded: true })); await settle()
+    assert.equal(app.render().localSetup?.kind, 'initialized')
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().phase, 'unpaired')
+    assert.match(app.render().error, /尚未获得设备授权/)
+    await assert.rejects(app.render().createLocalCluster('browser', 'test-only-passphrase'), /已加入协作集群/)
+    assert.equal(app.calls.includes('prepare_genesis'), false)
+    assert.equal(app.calls.includes('bootstrap'), false)
+  } finally { app.close() }
+})
+
+test('initialized localhost authenticates the signed manager on its original entry before offering local access', async () => {
+  const app = deviceHarness({ local: 'initialized', management: true })
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().ready?.principal.source, 'membership')
+    assert.equal(app.render().ready?.principal.can_manage, true)
+    assert.equal(app.render().ready?.entry.address, localEntry.address)
+    assert.equal(app.render().ready?.entry.local, undefined)
+    assert.equal(app.sockets[0]?.entry.address, localEntry.address)
+    assert.equal(app.calls.includes('local-exchange'), false)
+    assert.equal(app.navigations.length, 0)
+    assert.equal(app.location.origin, localEntry.address)
+  } finally { app.close() }
+})
+
+test('opening local access requires a click and fetches a fresh launcher before changing origin', async () => {
+  const app = deviceHarness({ local: 'initialized' }), auth = deferred()
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.holds.set('authenticate', auth)
+  try {
+    app.render(); await settle()
+    auth.reject(Object.assign(new Error('not a member'), { responded: true })); await settle()
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().localSetup?.kind, 'initialized')
+    assert.equal(app.navigations.length, 0)
+    assert.equal(app.calls.includes('local-exchange'), false)
+    const fresh = { ...localLaunch, token: '1'.repeat(64) }
+    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: fresh }
+    await app.render().openLocalAccess()
+    assert.equal(app.setupRequests.length, 2)
+    assert.equal(app.navigations.length, 1)
+    const opened = new URL(app.navigations[0])
+    assert.equal(opened.origin, fresh.url)
+    assert.equal(new URLSearchParams(opened.hash.slice(1)).get('local'), fresh.token)
+    assert.equal(new URLSearchParams(opened.hash.slice(1)).get('node'), target)
+    assert.equal(app.joinRequests.length, 0)
+    assert.equal([...app.stored.values()].some(value => value.includes(fresh.token)), false)
+  } finally { app.close() }
+})
+
+test('disabling local automatic access before the click prevents launching its stale token', async () => {
+  const app = deviceHarness({ local: 'initialized' }), auth = deferred()
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.holds.set('authenticate', auth)
+  try {
+    app.render(); await settle()
+    auth.reject(Object.assign(new Error('not a member'), { responded: true })); await settle()
+    app.localState.setup = { kind: 'initialized', entry: localEntry }
+    await assert.rejects(app.render().openLocalAccess(), /自动访问已关闭/)
+    assert.equal(app.navigations.length, 0)
+    const setup = app.render().localSetup
+    assert.equal(setup?.kind === 'initialized' && setup.local_launch, undefined)
+  } finally { app.close() }
+})
+
+test('local launch metadata rejects an unrelated node, unsafe address, or malformed token', async () => {
+  const invalid = [
+    { ...localLaunch, peer_id: '0'.repeat(64) },
+    { ...localLaunch, token: 'e'.repeat(63) },
+    { ...localLaunch, token: 'E'.repeat(64) },
+    ...['https://127.0.0.1:49781', 'http://localhost:49781', 'http://127.0.0.1', 'http://user:password@127.0.0.1:49781', 'http://127.0.0.1:49781/path', 'http://127.0.0.1:49781?token=unsafe', 'http://127.0.0.1:49781#unsafe'].map(url => ({ ...localLaunch, url })),
+  ]
+  for (const launch of invalid) {
+    const app = deviceHarness({ local: 'initialized' })
+    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: launch }
+    try {
+      app.render(); await settle()
+      assert.equal(app.render().localSetup, null)
+      assert.match(app.render().error, /本机启动入口与此节点不一致/)
+      assert.equal(app.sockets.length, 0)
+      assert.equal(app.navigations.length, 0)
+    } finally { app.close() }
+  }
+})
+
+for (const kind of ['uninitialized', 'initialized']) test(`late ${kind} discovery cannot replace a manually chosen connection`, async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  const hold = deferred(); app.holds.set('local_setup', hold)
+  try {
+    app.render(); await settle()
+    app.render().disconnect()
+    await app.render().connect(entry)
+    hold.resolve(kind === 'uninitialized' ? { kind, invitation: localInvitation } : { kind, entry: localEntry })
+    await settle()
+    assert.equal(app.render().ready?.entry.address, entry.address)
+    assert.equal(app.render().localSetup, null)
+    assert.equal(app.calls.filter(call => call.startsWith('open:')).length, 1)
+    assert.equal(app.calls.includes('bootstrap'), false)
+  } finally { app.close() }
+})
+
+test('an invitation in the page URL takes precedence over local discovery', async () => {
+  const invitation = JSON.stringify({ ...localInvitation, url: entry.address })
+  const app = deviceHarness({ local: 'fresh', invitation })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().initialInvitation, invitation)
+    assert.equal(app.render().localSetup, null)
+    assert.deepEqual(app.calls, [])
+  } finally { app.close() }
+})
+
+test('a local setup response cannot redirect onboarding to another origin', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  const hold = deferred(); app.holds.set('local_setup', hold)
+  try {
+    app.render(); await settle()
+    hold.resolve({ kind: 'uninitialized', invitation: { ...localInvitation, url: entry.address } }); await settle()
+    assert.equal(app.render().localSetup, null)
+    assert.match(app.render().error, /当前页面不一致/)
+    assert.equal(app.sockets.length, 0)
+  } finally { app.close() }
+})
+
+test('local setup cannot silently select the cookie channel instead of the ordinary member entry', async () => {
+  const app = deviceHarness({ local: 'initialized' })
+  app.localState.setup = { kind: 'initialized', entry: { ...localEntry, local: true }, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().localSetup, null)
+    assert.match(app.render().error, /本机设置入口与当前页面不一致/)
+    assert.equal(app.sockets.length, 0)
+    assert.equal(app.navigations.length, 0)
+  } finally { app.close() }
+})
+
+test('unmounting aborts pending local discovery without publishing setup state', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  const hold = deferred(); app.holds.set('local_setup', hold)
+  app.render(); await settle()
+  app.close()
+  assert.equal(app.setupRequests[0].options.signal?.aborted, true)
+  hold.resolve({ kind: 'uninitialized', invitation: localInvitation }); await settle()
+  assert.deepEqual(app.calls, ['local_setup'])
+  assert.equal(app.render().localSetup, null)
+})
+
+test('a node invitation uses the local Node endpoint and requires explicit acceptance of the displayed review', async () => {
+  const app = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
+  try {
+    app.render(); await settle()
+    app.joinResponses.set('request', receipt)
+    await app.render().pair(invitation, 'node')
+    assert.equal(app.render().localJoin?.kind, 'review')
+    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 0)
+    assert.equal(app.sockets.length, 0)
+    assert.equal(app.render().ready, null)
+    app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
+    await app.render().acceptLocalJoin()
+    assert.equal(app.render().localJoin?.kind, 'pending')
+    assert.deepEqual(app.joinRequests.find(request => request.action === 'accept')?.params, { request_id: 'node-pair', review_hash: receipt.review_hash })
+    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+    app.joinResponses.set('status', { kind: 'joined', cluster_id: cluster, peer_id: target })
+    await app.render().refreshLocalJoin()
+    assert.equal(app.render().localJoin?.kind, 'joined')
+    assert.equal(app.render().localSetup?.kind, 'initialized')
+    const setup = app.render().localSetup
+    assert.equal(setup?.kind === 'initialized' && setup.local_launch?.url, localLaunch.url)
+    assert.equal(app.setupRequests.length, 3)
+    assert.equal(app.navigations.length, 0)
+    assert.equal(app.render().ready, null)
+    assert.equal(app.calls.includes('authenticate'), false)
+    assert.equal([...app.stored.values()].some(value => value.includes('one-time-node-invite')), false)
+  } finally { app.close() }
+})
+
+test('refreshing a local Node restores its review without resending a request or accepting it', async () => {
+  const app = deviceHarness({ local: 'fresh' }), { receipt } = nodeJoinFixture()
+  app.joinResponses.set('status', receipt)
+  try {
+    app.render(); await settle(); await settle()
+    assert.equal(app.render().localJoin?.kind, 'review')
+    assert.deepEqual(app.joinRequests.map(request => request.action), ['status'])
+    assert.equal(app.render().ready, null)
+  } finally { app.close() }
+})
+
+test('Node joining verifies the displayed hash and refuses a mismatched local identity', async () => {
+  for (const mismatch of ['hash', 'identity', 'invitation']) {
+    const app = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
+    try {
+      app.render(); await settle()
+      if (mismatch === 'hash') app.joinResponses.set('request', { ...receipt, review_hash: '0'.repeat(64) })
+      else {
+        const review = { ...receipt.review, ...(mismatch === 'invitation' ? { cluster_id: '6'.repeat(64) } : { new_member: { ...receipt.review.new_member, subject_id: '5'.repeat(64) } }) }
+        app.joinResponses.set('request', { ...receipt, review, review_hash: createHash('sha256').update(canonical(review)).digest('hex') })
+      }
+      await assert.rejects(app.render().pair(invitation, 'node'), /不一致/)
+      assert.equal(app.render().localJoin?.kind, 'idle')
+      assert.equal(app.joinRequests.some(request => request.action === 'accept'), false)
+    } finally { app.close() }
+  }
+})
+
+test('a lost Node acceptance response is reconciled through its original receipt without automatic resubmission', async () => {
+  const app = deviceHarness({ local: 'fresh' }), restored = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
+  const selected: ClusterTarget = { kind: 'cluster', clusterId: cluster, directories: ['wss://directory.example/custom/socket'] }
+  const recent = JSON.stringify({ kind: 'cluster', clusterId: cluster, target: selected, path: { address: selected.directories[0], peer_id: target, mode: 'relay' } })
+  try {
+    app.render(); await settle()
+    app.stored.set('vibeface.cluster-target', JSON.stringify(selected))
+    app.stored.set('vibeface.last-authenticated', recent)
+    app.joinResponses.set('request', receipt)
+    await app.render().pair(invitation, 'node')
+    assert.equal(app.stored.get('vibeface.cluster-target'), 'null')
+    assert.equal(app.stored.get('vibeface.last-authenticated'), recent)
+    assert.deepEqual(JSON.parse(JSON.stringify(app.joinRequests.find(request => request.action === 'request')?.params)), { invitation, name: 'node' })
+    const hold = deferred(); app.holds.set('local_join:accept', hold)
+    const accepting = app.render().acceptLocalJoin(), rejected = assert.rejects(accepting, /response lost/)
+    await settle(); hold.reject(new Error('response lost')); await rejected
+    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
+    assert.deepEqual(JSON.parse(JSON.stringify(app.joinRequests.find(request => request.action === 'accept')?.params)), { request_id: receipt.request_id, review_hash: receipt.review_hash })
+    app.joinResponses.set('status', { kind: 'uncertain', request_id: receipt.request_id, message: 'check original receipt' })
+    await app.render().refreshLocalJoin()
+    assert.equal(app.render().localJoin?.kind, 'uncertain')
+    app.joinResponses.set('status', { ...receipt, kind: 'pending' })
+    await app.render().refreshLocalJoin()
+    assert.equal(app.render().localJoin?.kind, 'pending')
+    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
+    assert.equal(app.calls.includes('authenticate'), false)
+    for (const [key, value] of app.stored) restored.stored.set(key, value)
+    restored.joinResponses.set('status', { ...receipt, kind: 'pending' })
+    restored.render()
+    for (let tries = 0; tries < 100 && restored.render().localJoin === null; tries++) await settle()
+    const resumed = restored.render().localJoin
+    assert.equal(resumed?.kind, 'pending')
+    assert.equal((resumed?.kind === 'pending' || resumed?.kind === 'review') && resumed.request_id, receipt.request_id)
+    assert.deepEqual(restored.joinRequests.map(request => request.action), ['status'])
+    assert.equal(restored.sockets.length, 0)
+    assert.equal(restored.stored.get('vibeface.last-authenticated'), recent)
+    assert.equal(restored.render().ready, null)
+  } finally { app.close(); restored.close() }
+})
+
+test('switching away while a Node join request is pending prevents a stale review', async () => {
+  const app = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
+  try {
+    app.render(); await settle()
+    const hold = deferred(); app.holds.set('local_join:request', hold)
+    const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /切换/)
+    await settle(); assert.ok(app.calls.includes('local_join:request'))
+    app.render().disconnect()
+    hold.resolve(receipt); await rejected
+    assert.equal(app.render().localJoin?.kind, 'idle')
+    assert.equal(app.render().ready, null)
+    assert.equal(app.sockets.length, 0)
+  } finally { app.close() }
+})
+
+test('recovering onto a fresh localhost Node reuses local setup authority without a pasted invitation', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  try {
+    app.render(); await settle()
+    const challenge = { cluster_id: cluster, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+    const challengeHold = deferred(), contextHold = deferred()
+    app.holds.set('recovery_challenge', challengeHold); app.holds.set('recovery_context', contextHold)
+    challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
+    const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: localEntry, bootstrap: '' })
+    const rejected = assert.rejects(recovering, /stop after authority check/)
+    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    assert.equal(app.requests.find(request => request.method === 'recovery_context')?.params.capability, localCapability)
+    contextHold.reject(new Error('stop after authority check')); await rejected
+    assert.equal(app.render().ready, null)
+    assert.equal(app.released(), 1)
+  } finally { app.close() }
+})
+
+test('localhost recovery can use a remote fresh Node invitation without sending local setup authority', async () => {
+  const app = deviceHarness({ local: 'fresh' }), remote = { ...entry, peer_id: '6'.repeat(64) }, capability = '4'.repeat(64)
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().localSetup?.kind, 'uninitialized')
+    const challenge = { cluster_id: cluster, owner_public_key: publicKey, subject_id: subject, target_peer_id: remote.peer_id, challenge_id: 'remote-challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+    const challengeHold = deferred(), contextHold = deferred()
+    app.holds.set('recovery_challenge', challengeHold); app.holds.set('recovery_context', contextHold)
+    challengeHold.resolve({ challenge_id: challenge.challenge_id, challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
+    const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: remote, bootstrap: JSON.stringify({ url: remote.address, peer_id: remote.peer_id, capability }) })
+    const rejected = assert.rejects(recovering, /stop after remote authority check/)
+    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    const sent = app.requests.find(request => request.method === 'recovery_context')?.params.capability
+    assert.equal(sent, capability)
+    assert.notEqual(sent, localCapability)
+    contextHold.reject(new Error('stop after remote authority check')); await rejected
+    assert.equal(app.render().ready, null)
+    assert.equal(app.released(), 1)
+  } finally { app.close() }
+})
+
 test('a local browser reuses its cookie-bound identity and can disable its own automatic access', async () => {
-  const app = deviceHarness({ local: true })
+  const app = deviceHarness({ localSession: true })
   try {
     app.render(); await settle()
     assert.equal(app.render().ready?.principal.source, 'local_session')
@@ -226,8 +630,30 @@ test('a local browser reuses its cookie-bound identity and can disable its own a
   } finally { app.close() }
 })
 
+test('a signed management browser keeps its permissions through the local cookie channel, reconnect, and reload', async () => {
+  const storage = new Map<string, string>()
+  for (let reload = 0; reload < 2; reload++) {
+    const app = deviceHarness({ localSession: true, management: true, storage })
+    try {
+      app.render(); await settle()
+      assert.equal(app.sockets[0]?.entry.local, true)
+      assert.equal(app.render().ready?.principal.source, 'membership')
+      assert.equal(app.render().ready?.principal.can_manage, true)
+      assert.equal(app.render().ready?.entry.local, false)
+      assert.equal(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? 'null').entry.local, false)
+      app.sockets[0]?.drop()
+      const [id, retry] = [...app.timers.entries()][0]
+      app.timers.delete(id); retry(); await settle()
+      assert.equal(app.sockets[1]?.entry.local, undefined)
+      assert.equal(app.render().ready?.principal.source, 'membership')
+      assert.equal(app.render().ready?.principal.can_manage, true)
+      assert.equal(app.verifications(), 2)
+    } finally { app.close() }
+  }
+})
+
 test('the launcher fragment is cleared before its token is exchanged for the browser key', async () => {
-  const app = deviceHarness({ local: true, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  const app = deviceHarness({ localSession: true, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
   try {
     app.render()
     assert.equal(app.location.hash, '')
@@ -239,7 +665,7 @@ test('the launcher fragment is cleared before its token is exchanged for the bro
 })
 
 test('revoking local access in another tab stops reconnecting the revoked cookie', async () => {
-  const app = deviceHarness({ local: true })
+  const app = deviceHarness({ localSession: true })
   try {
     app.render(); await settle()
     assert.equal(app.render().ready?.principal.source, 'local_session')
@@ -255,7 +681,7 @@ test('revoking local access in another tab stops reconnecting the revoked cookie
 })
 
 for (const responded of [true, false]) test(`a ${responded ? 'rejected' : 'disconnected'} local access change preserves its real outcome`, async () => {
-  const app = deviceHarness({ local: true })
+  const app = deviceHarness({ localSession: true })
   try {
     app.render(); await settle()
     const pending = deferred(); app.holds.set('local_access', pending)

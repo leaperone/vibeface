@@ -23,7 +23,16 @@ export type PairReview = { version: number; invite_id: string; cluster_id: strin
 export type PairReceipt = { request_id: string; review: PairReview; new_subject_signature: string }
 export type Signing = { domain: string; payload: string }
 export type WaitingPair = { request_id: string; cluster_id: string; entry: ConnectionEntry; review: PairReview; signing: Signing; accepted: boolean }
-export type Invitation = { kind: 'bootstrap'; entry: ConnectionEntry; capability: string } | { kind: 'pair'; entry: ConnectionEntry; invite: Record<string, unknown>; capability: string; payload: Record<string, unknown> }
+export type Invitation = { kind: 'bootstrap'; entry: ConnectionEntry; capability: string } | { kind: 'pair' | 'node'; entry: ConnectionEntry; invite: Record<string, unknown>; capability: string; payload: Record<string, unknown> }
+export type LocalSetup = { kind: 'uninitialized'; invitation: Extract<Invitation, { kind: 'bootstrap' }> } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; peer_id: string; token: string } }
+export type LocalJoin = { kind: 'idle' } | { kind: 'review' | 'pending'; request_id: string; review: PairReview; review_hash: string } | { kind: 'joined'; cluster_id: string; peer_id: string } | { kind: 'uncertain'; request_id: string; message: string }
+export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string; node_bin: string; codex_sdk_script: string }
+export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
+export type NodeSettingsResponse = {
+  settings: NodeSettings
+  defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin' | 'node_bin' | 'codex_sdk_script'>
+  readiness: { manager: 'disabled' | 'role_unavailable' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[]; scheduler_available: boolean }
+}
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
   if (!isRecord(value)) throw new Error(`${label}格式无效。`)
@@ -106,10 +115,63 @@ export function parseInvitation(value: unknown): Invitation {
   const invite = record(envelope.invite, '配对授权')
   const payload = record(invite.payload, '邀请权限')
   if (payload.version !== 2) throw new Error('邀请版本无效。请创建新邀请。')
-  if (payload.new_kind !== 'client') throw new Error('这是运行节点邀请。请在目标电脑上运行 vibeface pair。')
-  if (payload.manage !== false || roles(payload.node_roles).length || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请已过期或权限无效。请创建新邀请。')
+  if (payload.new_kind !== 'client' && payload.new_kind !== 'node') throw new Error('邀请设备类型无效。')
+  const nodeRoles = roles(payload.node_roles)
+  if (payload.manage !== false || payload.new_kind === 'client' && nodeRoles.length || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请已过期或权限无效。请创建新邀请。')
   validTarget(payload.cluster_id)
-  return { kind: 'pair', entry, invite, capability: text(envelope.capability), payload }
+  return { kind: payload.new_kind === 'node' ? 'node' : 'pair', entry, invite, capability: text(envelope.capability), payload }
+}
+export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
+  const v = record(value, '本机设置')
+  let setup: LocalSetup
+  if (v.kind === 'uninitialized') {
+    const invitation = parseInvitation(v.invitation)
+    if (invitation.kind !== 'bootstrap') throw new Error('本机设置返回了不同用途的邀请。')
+    setup = { kind: 'uninitialized', invitation }
+  } else if (v.kind === 'initialized') {
+    const entry = parseEntry(v.entry)
+    setup = { kind: 'initialized', entry }
+    if (v.local_launch !== undefined) {
+      const launch = record(v.local_launch), url = new URL(text(launch.url)), peer_id = validTarget(launch.peer_id), token = text(launch.token)
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || peer_id !== entry.peer_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机启动入口与此节点不一致。')
+      setup.local_launch = { url: url.origin, peer_id, token }
+    }
+  }
+  else throw new Error('本机设置状态无效。')
+  const entry = setup.kind === 'uninitialized' ? setup.invitation.entry : setup.entry
+  if (entry.address !== origin || entry.local) throw new Error('本机设置入口与当前页面不一致。')
+  return setup
+}
+export function parseNodeSettings(value: unknown): NodeSettingsResponse {
+  const v = record(value, '节点设置'), settings = record(v.settings), defaults = record(v.defaults), readiness = record(v.readiness)
+  let manager: ManagerSettings | null = null
+  if (settings.manager !== null) {
+    const m = record(settings.manager)
+    if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('管理 Agent 设置格式无效。')
+    manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
+  }
+  if (readiness.manager !== 'disabled' && readiness.manager !== 'role_unavailable' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('节点准备状态无效。')
+  return {
+    settings: { roots: strings(settings.roots), manager },
+    defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
+    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)), scheduler_available: boolean(readiness.scheduler_available) },
+  }
+}
+export function parseLocalJoin(value: unknown, entry: ConnectionEntry): LocalJoin {
+  const v = record(value, '节点加入状态')
+  if (v.kind === 'idle') return { kind: 'idle' }
+  if (v.kind === 'joined') {
+    const peer_id = validTarget(v.peer_id)
+    if (peer_id !== entry.peer_id) throw new Error('加入结果与本机节点不一致。')
+    return { kind: 'joined', peer_id, cluster_id: validTarget(v.cluster_id) }
+  }
+  if (v.kind === 'uncertain') return { kind: 'uncertain', request_id: text(v.request_id), message: text(v.message) }
+  if (v.kind === 'review' || v.kind === 'pending') {
+    const review = parseReview(v.review)
+    if (review.new_member.kind !== 'node' || review.new_member.subject_id !== entry.peer_id) throw new Error('加入确认与本机节点不一致。')
+    return { kind: v.kind, request_id: text(v.request_id), review, review_hash: validTarget(v.review_hash) }
+  }
+  throw new Error('节点加入状态无效。')
 }
 export function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)

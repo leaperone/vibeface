@@ -299,7 +299,14 @@ async fn dispatch(
         ensure!(
             matches!(
                 method,
-                "info" | "authenticate" | "directory" | "subscribe" | "rpc" | "local_access"
+                "info"
+                    | "authenticate"
+                    | "directory"
+                    | "subscribe"
+                    | "rpc"
+                    | "local_access"
+                    | "node_settings"
+                    | "configure_node"
             ),
             "local browser access cannot manage cluster membership"
         );
@@ -310,6 +317,7 @@ async fn dispatch(
         "info"
             | "authenticate"
             | "directory"
+            | "node_settings"
             | "subscribe"
             | "pair_status"
             | "pair_requests"
@@ -322,7 +330,7 @@ async fn dispatch(
     };
     match method {
         "info" => Ok(
-            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node)?}),
+            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
         ),
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
@@ -341,6 +349,28 @@ async fn dispatch(
             current_principal(node, session).await?;
             let view = node.membership_state().await?.project()?;
             Ok(json!({"state":node.membership_state().await?,"view":view}))
+        }
+        "node_settings" => {
+            let principal = current_principal(node, session).await?;
+            ensure!(
+                principal.can_manage || principal.source == "local_session",
+                "management permission or local browser access required"
+            );
+            node.node_settings().await
+        }
+        "configure_node" => {
+            let principal = current_principal(node, session).await?;
+            ensure!(
+                principal.can_manage || principal.source == "local_session",
+                "management permission or local browser access required"
+            );
+            let settings = serde_json::from_value(params).context("invalid Node settings")?;
+            let cookie = match &session.source {
+                SessionSource::Membership => None,
+                SessionSource::LocalSession(cookie) => Some(cookie.as_str()),
+            };
+            node.configure_node(settings, &session.subject_id, cookie)
+                .await
         }
         "subscribe" => {
             current_principal(node, session).await?;
@@ -377,6 +407,7 @@ async fn dispatch(
             Ok(result)
         }
         "local_access" => {
+            let _save = node.config_save.lock().await;
             let principal = current_principal(node, session).await?;
             if let Some(enabled) = params.get("enabled") {
                 let enabled = enabled.as_bool().context("enabled must be a boolean")?;
@@ -669,13 +700,17 @@ async fn dispatch(
                 .authorize_member(&session.subject_id)
                 .is_ok_and(|member| member == review.new_member)
             {
-                Ok(json!({"status":"granted","state":state}))
+                Ok(json!({"status":"granted","state":state,"review":review}))
             } else {
-                ensure!(
-                    review.expires_at_ms > crate::runtime::now_ms(),
-                    "pair review expired"
-                );
-                Ok(json!({"status":"pending","request_id":request_id,"review":review}))
+                let accepted = node.store.lock().await.pair_accepted(request_id)?;
+                let status = if review.expires_at_ms > crate::runtime::now_ms() {
+                    "pending"
+                } else {
+                    "expired"
+                };
+                Ok(
+                    json!({"status":status,"request_id":request_id,"review":review,"accepted":accepted}),
+                )
             }
         }
         "prepare_revoke" => {
@@ -826,10 +861,10 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
     );
     Ok(view)
 }
-fn connection_entry(node: &Runtime) -> Result<Value> {
-    let relay = node.config.network.bootstrap_urls.first();
-    let url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
-    let address = if relay.is_some() {
+async fn connection_entry(node: &Runtime) -> Result<Value> {
+    let entry = node.network.bootstrap_url().await;
+    let url = reqwest::Url::parse(entry.as_deref().unwrap_or(&node.config.public_url))?;
+    let address = if entry.is_some() {
         url.to_string()
     } else {
         url.origin().ascii_serialization()
@@ -1251,15 +1286,16 @@ mod tests {
         )?;
         crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
         let mut node = Runtime::open(&dir).await?;
-        node.config.network.bootstrap_urls = vec!["wss://relay.example/custom/ws".into()];
         assert_eq!(
-            connection_entry(&node)?,
-            json!({"address":"wss://relay.example/custom/ws","peer_id":node.identity.peer_id()?})
-        );
-        node.config.network.bootstrap_urls.clear();
-        assert_eq!(
-            connection_entry(&node)?,
+            connection_entry(&node).await?,
             json!({"address":node.config.public_url,"peer_id":node.identity.peer_id()?})
+        );
+        node.network
+            .add_bootstrap("wss://relay.example/custom/ws")
+            .await?;
+        assert_eq!(
+            connection_entry(&node).await?,
+            json!({"address":"wss://relay.example/custom/ws","peer_id":node.identity.peer_id()?})
         );
         let admin = LocalIdentity::generate();
         let mut state = ClusterState::new(Genesis::create(
@@ -1307,6 +1343,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
+    -> Result<()> {
+        use crate::{
+            config::{self, Config, ManagerSettings},
+            model::NodeRole,
+        };
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        config.roles = vec![
+            NodeRole::Gateway,
+            NodeRole::Relay,
+            NodeRole::Replica,
+            NodeRole::Scheduler,
+        ];
+        let native_socket = dir.join("unavailable-codex.sock");
+        config.codex_socket = Some(native_socket.clone());
+        config.save(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        assert!(node.native_socket().is_none());
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let client = LocalIdentity::generate();
+        let state = ClusterState::new(Genesis::create(
+            &root,
+            vec![
+                Member::client(&admin, "admin", true)?,
+                Member::client(&client, "browser", false)?,
+                Member::node(&node.identity, "node", node.config.roles.clone())?,
+            ],
+        )?)?;
+        let cluster = state.genesis.cluster_id.clone();
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                subject_id: identity.peer_id()?,
+                public_key: identity.public_key_hex()?,
+                subscribed: false,
+                recovery: None,
+                observation: None,
+                source: SessionSource::Membership,
+            })
+        };
+        for identity in [&client, &LocalIdentity::generate()] {
+            let mut unauthorized = session(identity)?;
+            assert!(
+                dispatch(&node, &mut unauthorized, "node_settings", json!({}))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut unauthorized,
+                    "configure_node",
+                    json!({"roots":[],"manager":null})
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut manager_session = session(&admin)?;
+        assert_eq!(
+            dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
+            json!({"address":"http://127.0.0.1:4790","peer_id":node.identity.peer_id()?})
+        );
+        node.network
+            .add_bootstrap("wss://relay.example/custom-route")
+            .await?;
+        assert!(node.config.network.bootstrap_urls.is_empty());
+        assert_eq!(
+            dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
+            json!({"address":"wss://relay.example/custom-route","peer_id":node.identity.peer_id()?})
+        );
+        let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
+        assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
+        let before = std::fs::read(dir.join("config.json"))?;
+        for invalid in [
+            json!({"roots":["relative-project"],"manager":null}),
+            json!({"roots":[],"manager":null,"codex_bin":"arbitrary"}),
+        ] {
+            assert!(
+                dispatch(&node, &mut manager_session, "configure_node", invalid)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
+            assert!(node.settings_snapshot().roots.is_empty());
+        }
+        let project = dir.join("project");
+        let workspace = std::path::PathBuf::from(
+            initial["defaults"]["workspace"]
+                .as_str()
+                .context("default workspace missing")?,
+        );
+        config::private_dir(&project)?;
+        assert!(!workspace.exists());
+        let mut latest = Config::load(&dir)?;
+        latest
+            .network
+            .bootstrap_urls
+            .push("wss://relay.example/api/network/ws".into());
+        latest.daily_decision_limit = 11;
+        latest.save(&dir)?;
+        let settings = crate::runtime::NodeSettings {
+            roots: vec![project.clone(), project.join(".")],
+            manager: Some(ManagerSettings {
+                provider: "cursor_sdk".into(),
+                workspace: workspace.clone(),
+                model: "auto".into(),
+                cursor_sdk_bin: dir.join("missing-cursor-sdk"),
+                node_bin: "node".into(),
+                codex_sdk_script: dir.join("sidecars/codex-manager.mjs"),
+            }),
+        };
+        let mut missing_workspace = settings.clone();
+        missing_workspace.manager.as_mut().unwrap().workspace =
+            dir.join("custom-workspace-not-created");
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(missing_workspace)?
+            )
+            .await
+            .is_err()
+        );
+        assert!(!dir.join("custom-workspace-not-created").exists());
+        std::os::unix::fs::symlink(&project, &workspace)?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&settings)?
+            )
+            .await
+            .is_err()
+        );
+        std::fs::remove_file(&workspace)?;
+        let saved = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await?;
+        assert!(workspace.is_dir());
+        assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
+        assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
+        assert_eq!(saved["readiness"]["scheduler_available"], true);
+        assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
+        assert_eq!(node.info()["manager_available"], true);
+        let nodes = node
+            .rpc(
+                Access {
+                    cluster_id: cluster,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"nodes"}),
+            )
+            .await?;
+        assert_eq!(
+            nodes["nodes"][0]["capabilities"]["roots"],
+            json!([project.canonicalize()?])
+        );
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
+        let persisted = Config::load(&dir)?;
+        assert_eq!(
+            persisted.network.bootstrap_urls,
+            latest.network.bootstrap_urls
+        );
+        assert_eq!(persisted.daily_decision_limit, 11);
+        assert_eq!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&settings)?
+            )
+            .await?["settings"],
+            saved["settings"]
+        );
+        let mut codex_settings = settings.clone();
+        codex_settings.manager.as_mut().unwrap().provider = "codex_sdk".into();
+        dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&codex_settings)?,
+        )
+        .await?;
+        assert_eq!(node.native_socket(), Some(native_socket.as_path()));
+        dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await?;
+        assert_eq!(node.native_socket(), Some(native_socket.as_path()));
+        drop(node);
+        let reopened = Runtime::open(&dir).await?;
+        assert_eq!(
+            serde_json::to_value(reopened.settings_snapshot())?,
+            saved["settings"]
+        );
+        drop(reopened);
+        let mut restricted = Config::load(&dir)?;
+        restricted.roles = vec![NodeRole::Relay, NodeRole::Replica];
+        restricted.save(&dir)?;
+        let restricted = Runtime::open(&dir).await?;
+        assert_eq!(
+            restricted.node_settings().await?["readiness"]["manager"],
+            "role_unavailable"
+        );
+        assert_eq!(restricted.info()["manager_available"], false);
+        drop(restricted);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()
     -> Result<()> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -1327,7 +1596,7 @@ mod tests {
         async fn browser_node(
             dir: &std::path::Path,
             manager: &LocalIdentity,
-        ) -> Result<Arc<Runtime>> {
+        ) -> Result<(Arc<Runtime>, LocalIdentity)> {
             crate::config::private_dir(dir)?;
             let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let listen = reservation.local_addr()?;
@@ -1339,22 +1608,23 @@ mod tests {
             )?;
             crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
             let node = Arc::new(Runtime::open(dir).await?);
+            let root = LocalIdentity::generate();
             node.install_membership(ClusterState::new(Genesis::create(
-                &LocalIdentity::generate(),
+                &root,
                 vec![
                     Member::node(&node.identity, "local device", node.config.roles.clone())?,
                     Member::client(manager, "management browser", true)?,
                 ],
             )?)?)
             .await?;
-            Ok(node)
+            Ok((node, root))
         }
 
         let dir =
             std::env::temp_dir().join(format!("vibeface-local-browser-{}", uuid::Uuid::new_v4()));
         let manager = LocalIdentity::generate();
         let browser = LocalIdentity::generate();
-        let node = browser_node(&dir, &manager).await?;
+        let (node, root) = browser_node(&dir, &manager).await?;
         let listen = node.config.listen;
         let serving = node.clone();
         let server = tokio::spawn(async move { crate::api::serve(serving).await });
@@ -1387,7 +1657,7 @@ mod tests {
                 assert_eq!(http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.status(), 401);
             }
             let second_dir = dir.join("second");
-            let second = browser_node(&second_dir, &manager).await?;
+            let (second, _) = browser_node(&second_dir, &manager).await?;
             second_server = Some(tokio::spawn(async move { crate::api::serve(second).await }));
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !second_dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
@@ -1433,6 +1703,16 @@ mod tests {
             assert_eq!(auth["principal"]["can_manage"], false);
             assert!(!auth["view"]["members"].as_array().context("members missing")?.iter().any(|member| member["subject_id"] == browser.peer_id().unwrap()));
             assert!(local.call("prepare_invite", json!({"kind":"client"})).await.is_err());
+            let local_project = dir.join("local-project");
+            crate::config::private_dir(&local_project)?;
+            let settings = local.call("node_settings", json!({})).await?;
+            assert_eq!(settings["settings"]["manager"], Value::Null);
+            let saved = local.call("configure_node", json!({"roots":[local_project],"manager":null})).await?;
+            assert_eq!(saved["settings"]["roots"], json!([local_project.canonicalize()?]));
+            assert_eq!(local.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            let before = std::fs::read(dir.join("config.json"))?;
+            assert!(node.configure_node(node.settings_snapshot(), &browser.peer_id()?, Some(&"0".repeat(64))).await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
             let conversation = uuid::Uuid::new_v4().to_string();
             local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser"})).await?;
             let conversations = local.call("rpc", json!({"method":"conversations"})).await?;
@@ -1443,13 +1723,69 @@ mod tests {
             let auth = signed.call("authenticate", json!({})).await?;
             assert_eq!(auth["principal"]["source"], "membership");
             assert_eq!(auth["principal"]["can_manage"], true);
-            local.call("local_access", json!({"enabled":false})).await?;
+            let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
+            let browser_id = browser.peer_id()?;
+            let mut local_session = Session {
+                subject_id: browser_id.clone(), public_key: browser.public_key_hex()?,
+                subscribed: false, recovery: None, observation: None,
+                source: SessionSource::LocalSession(cookie.into()),
+            };
+            let save = node.config_save.lock().await;
+            let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
+            assert!(futures_util::poll!(queued_disable.as_mut()).is_pending());
+            node.local_access.set_enabled(false)?;
+            let after_close = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_disable.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_close);
             assert!(!crate::config::Config::load(&dir)?.local_auto_access);
+            let before = std::fs::read(dir.join("config.json"))?;
+            assert!(node.configure_node(node.settings_snapshot(), &browser.peer_id()?, Some(cookie)).await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
             assert!(local.call("rpc", json!({"method":"conversations"})).await.is_err());
             assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
             assert_eq!(signed.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             signed.call("local_access", json!({"enabled":true})).await?;
             assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            node.local_access.set_enabled(false)?;
+            let mut manager_session = Session {
+                subject_id: manager.peer_id()?, public_key: manager.public_key_hex()?,
+                subscribed: false, recovery: None, observation: None, source: SessionSource::Membership,
+            };
+            let save = node.config_save.lock().await;
+            let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
+            assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
+            let replacement_manager = LocalIdentity::generate();
+            let mut state = node.membership_state().await?;
+            let checkpoint = RootCheckpoint::create_with_history(&root, state.epoch() + 1, vec![
+                Member::node(&node.identity, "local device", node.config.roles.clone())?,
+                Member::client(&replacement_manager, "replacement manager", true)?,
+            ], state.historical_nodes()?)?;
+            state.recover(checkpoint)?;
+            node.install_membership(state).await?;
+            let after_recovery = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_enable.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_recovery);
+            assert!(!node.local_access.enabled());
+            node.local_access.set_enabled(true)?;
+            let mut state = node.membership_state().await?;
+            let node_id = node.identity.peer_id()?;
+            let token = node.local_access.issue_from_local_setup(&node_id, &state.genesis.cluster_id)?;
+            let cookie = node.local_access.exchange(&token, &node_id, &state.genesis.cluster_id, &browser_id, &browser.public_key_hex()?)?;
+            let mut settings = node.settings_snapshot();
+            settings.roots.clear();
+            let save = node.config_save.lock().await;
+            let mut queued_settings = Box::pin(node.configure_node(settings, &browser_id, Some(&cookie)));
+            assert!(futures_util::poll!(queued_settings.as_mut()).is_pending());
+            state.append(GovernanceEvent::revoke(&replacement_manager, &state.project()?, &node_id)?)?;
+            node.install_membership(state.clone()).await?;
+            assert!(node.local_access.session(&cookie, &node_id, &state.genesis.cluster_id).is_ok());
+            let after_revoke = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_settings.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_revoke);
+            assert_eq!(node.settings_snapshot().roots, vec![local_project.canonicalize()?]);
             Ok(())
         }.await;
         server.abort();

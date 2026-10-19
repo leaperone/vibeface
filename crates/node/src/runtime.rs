@@ -29,9 +29,11 @@ mod manager_control_tests;
 pub(crate) mod native_observation;
 mod observation;
 mod schedule_delivery;
+mod settings;
 mod sync;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::ObservationGuard;
+pub use settings::NodeSettings;
 use sync::{HistoryPage, HistoryReply, ReadClass, SyncCoordinator};
 
 fn node_display_names(bundle: &ClusterState) -> BTreeMap<String, String> {
@@ -3032,6 +3034,9 @@ struct RouteFlight {
 
 pub struct Runtime {
     pub config: Config,
+    pub(crate) data_dir: PathBuf,
+    settings: std::sync::Mutex<NodeSettings>,
+    pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
     pub network: Arc<NetworkHub>,
@@ -3048,9 +3053,9 @@ pub struct Runtime {
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
-    codex: Option<vibeface_bridge::codex::CodexClient>,
+    native: tokio::sync::OnceCell<native_observation::NativeRuntime>,
+    native_events: mpsc::UnboundedSender<Value>,
     pub local_access: Arc<crate::local_access::LocalAccess>,
-    _codex_process: Option<tokio::process::Child>,
     _process_lock: Arc<std::fs::File>,
     peer_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
     network_rx: Mutex<Option<mpsc::Receiver<IncomingSocket>>>,
@@ -3140,75 +3145,17 @@ impl Runtime {
         let (transport, network_rx) = NetworkHub::new(identity.clone(), config.network.clone());
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
-        let manages_codex = config
-            .manager
-            .as_ref()
-            .is_some_and(|manager| manager.provider == "codex_sdk");
-        let managed_socket = manages_codex && config.codex_socket.is_none();
-        if managed_socket {
-            let socket_dir =
-                PathBuf::from("/tmp").join(format!("vibeface-{}", &identity.peer_id()?[..32]));
-            match std::fs::create_dir(&socket_dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                let metadata = std::fs::symlink_metadata(&socket_dir)?;
-                ensure!(
-                    metadata.is_dir()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.uid() == std::fs::metadata(dir)?.uid(),
-                    "private socket directory has unexpected ownership"
-                );
-                std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))?;
-            }
-            config.codex_socket = Some(socket_dir.join("codex.sock"));
-        }
-        let mut codex_process = None;
-        if managed_socket && config.roles.contains(&NodeRole::Scheduler) {
-            let socket = config.codex_socket.as_ref().unwrap();
-            let existing = tokio::net::UnixStream::connect(socket).await.is_ok();
-            if !existing {
-                if socket.exists() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::FileTypeExt;
-                        ensure!(
-                            std::fs::symlink_metadata(socket)?.file_type().is_socket(),
-                            "private Codex socket path is occupied by another file"
-                        );
-                    }
-                    std::fs::remove_file(socket)?;
-                }
-                match tokio::process::Command::new(&config.codex_bin)
-                    .args(["app-server", "--listen"])
-                    .arg(format!("unix://{}", socket.display()))
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                {
-                    Ok(child) => codex_process = Some(child),
-                    Err(error) => {
-                        tracing::warn!(error=%error,"Codex not available; check the local management SDK configuration")
-                    }
-                }
-            }
-        }
-        let codex = config
-            .codex_socket
-            .clone()
-            .filter(|_| config.manager.is_some())
-            .map(|socket| vibeface_bridge::codex::CodexClient::start(socket, tx));
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,
             config.local_auto_access,
         )?);
         let node = Self {
+            data_dir: dir.to_owned(),
+            settings: std::sync::Mutex::new(NodeSettings {
+                roots: config.roots.clone(),
+                manager: config.manager.clone(),
+            }),
+            config_save: Mutex::new(()),
             config,
             identity,
             store,
@@ -3226,15 +3173,21 @@ impl Runtime {
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
-            codex,
+            native: tokio::sync::OnceCell::new(),
+            native_events: tx,
             local_access,
-            _codex_process: codex_process,
             _process_lock: process_lock,
             peer_rx: Mutex::new(Some(peer_rx)),
             network_rx: Mutex::new(Some(network_rx)),
             native_rx: Mutex::new(Some(rx)),
         };
         node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
+        if node.settings_snapshot().manager.is_some_and(|manager| {
+            manager.provider == "codex_sdk" || node.config.codex_socket.is_some()
+        }) && let Err(error) = node.ensure_native_client().await
+        {
+            tracing::warn!(%error, "native Codex is unavailable");
+        }
         Ok(node)
     }
     pub async fn install_membership(&self, incoming: ClusterState) -> Result<AuthorizationView> {
@@ -3262,7 +3215,9 @@ impl Runtime {
         self.store.lock().await.public_state()
     }
     pub fn info(&self) -> Value {
-        json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
+        let manager_available = self.config.roles.contains(&NodeRole::Scheduler)
+            && self.settings_snapshot().manager.is_some();
+        json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available})
     }
     async fn refresh_local_cluster(&self) {
         let state = self.store.lock().await.public_state();
@@ -4081,8 +4036,9 @@ impl Runtime {
         ))
     }
     fn capabilities(&self) -> Value {
+        let settings = self.settings_snapshot();
         let manager =
-            self.config
+            settings
                 .manager
                 .as_ref()
                 .and_then(|settings| match settings.provider.as_str() {
@@ -4090,8 +4046,8 @@ impl Runtime {
                     "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk),
                     _ => None,
                 });
-        json!({"roots":self.config.roots,
-            "manager":self.config.manager.as_ref().map(|m|m.provider.clone()),
+        json!({"roots":settings.roots,
+            "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
             "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1},
             "history_batch":history_batch_capability()})
     }
@@ -4371,7 +4327,7 @@ impl Runtime {
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
         let path = std::fs::canonicalize(path).context("execution path does not exist")?;
         ensure!(
-            self.config
+            self.settings_snapshot()
                 .roots
                 .iter()
                 .filter_map(|r| std::fs::canonicalize(r).ok())

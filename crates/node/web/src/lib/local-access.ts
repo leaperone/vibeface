@@ -4,7 +4,7 @@ import type { ConnectionEntry, PublicIdentity } from './node'
 type LocalLaunch = { token: string; peerId: string }
 
 async function localResponse(response: Response): Promise<unknown> {
-  if (!response.ok) throw new Error('本机入口已过期或已关闭。请在这台电脑运行 vibeface access 后重新打开。')
+  if (!response.ok) throw new Error('本机入口已过期或已关闭。请返回节点原来的本机设置页刷新入口，或从本机启动器重新打开。')
   return response.json()
 }
 

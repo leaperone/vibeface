@@ -3,10 +3,10 @@ import type { ReactNode } from 'react'
 import { connectClusterPath, connectDevice, discoverCluster, initClient, readInvitation, signClient, validEndpoint, validTarget } from '../../../transport.js'
 import type { ClusterPath, DeviceChannel } from '../../../transport.js'
 import {
-  array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
+  array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation, parseLocalJoin, parseLocalSetup,
   parseClusterTarget, parseMember, parsePairReceipt, parseReview, parseSigning, record, same, signingPayload, text,
 } from '@/lib/node'
-import type { ClientPrincipal, ClusterTarget, ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
+import type { ClientPrincipal, ClusterTarget, ConnectionEntry, EntryInfo, LocalJoin, LocalSetup, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
 import { shouldAutoConnect } from './connection-lane'
 import { localBrowserEntry } from '@/lib/local-access'
 import { parseChanged } from '@/lib/progress'
@@ -25,9 +25,11 @@ type DeviceContextValue = {
   connectionGeneration(): number
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
-  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string
-  connect(entry: ConnectionEntry): Promise<void>; connectCluster(target: ClusterTarget): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null; localJoin: LocalJoin | null
+  connect(entry: ConnectionEntry): Promise<void>; connectCluster(target: ClusterTarget): Promise<void>; cancelConnection(): void; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; pair(invitation: string, name: string, password?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
+  createLocalCluster(name: string, password: string): Promise<void>; openLocalAccess(): Promise<void>
+  acceptLocalJoin(): Promise<void>; refreshLocalJoin(): Promise<void>; useAnotherNodeInvitation(): void
   refreshDirectory(): Promise<void>; createInvitation(kind: 'client' | 'node', roles: NodeRole[]): Promise<string>; approvePair(requestId: string): Promise<void>; revoke(subjectId: string): Promise<void>
   beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }): Promise<void>
   reencrypt(input: { file: File; oldPassword: string; password: string }): Promise<void>
@@ -80,6 +82,21 @@ function loadWaiting(): WaitingPair | null {
 function ownerOf(state: unknown) { return text(record(record(state).genesis).owner_public_key) }
 function sign(signing: unknown, domain: string, expected: unknown) { return signClient(domain, signingPayload(signing, domain, expected)) }
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
+async function discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | null> {
+  const url = new URL(location.href)
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null
+  const response = await fetch('/api/local/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', cache: 'no-store', credentials: 'omit', signal })
+  if (response.status === 404) return null
+  if (!response.ok) throw new Error('无法读取此节点的本机设置。请核对本机地址并刷新页面。')
+  return parseLocalSetup(await response.json(), url.origin)
+}
+async function localJoinRequest(action: 'request' | 'accept' | 'status', params: Record<string, unknown>, entry: ConnectionEntry, signal: AbortSignal): Promise<LocalJoin> {
+  const response = await fetch(`/api/local/join/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params), cache: 'no-store', credentials: 'omit', signal })
+  if (!response.ok) throw new Error('节点加入操作尚未确认。请先核对加入状态，再决定下一步。')
+  const joined = parseLocalJoin(await response.json(), entry)
+  if ((joined.kind === 'review' || joined.kind === 'pending') && await digest(joined.review) !== joined.review_hash) throw new Error('加入确认的内容与校验值不一致，已停止操作。')
+  return joined
+}
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
@@ -94,6 +111,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [waiting, setWaiting] = useState<WaitingPair | null>(null)
   const [review, setReview] = useState<Review | null>(null)
   const [initialInvitation, setInitialInvitation] = useState('')
+  const [localSetup, setLocalSetup] = useState<LocalSetup | null>(null)
+  const [localJoin, setLocalJoin] = useState<LocalJoin | null>(null)
   const [localAutoAccess, setLocalAutoAccessState] = useState<boolean | null>(null)
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
@@ -241,6 +260,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       isCurrent: () => session.current === active && generation.current === active.generation,
     }
     setDirectory(view); setReady(connection); setPhase('ready'); setError(''); waitingRef.current = null; setWaiting(null)
+    setLocalSetup(local => {
+      if (!local) return null
+      const entry = local.kind === 'uninitialized' ? local.invitation.entry : local.entry
+      return entryKey(entry) === entryKey(active.entry) ? { kind: 'initialized', entry } : local
+    })
   }
   function scheduleReconnect(immediate = false) {
     const target = reconnect.current
@@ -257,7 +281,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           const local = own && await localBrowserEntry(own, null)
           if (reconnect.current !== target) return
           if (!local || entryKey(local) !== entryKey(entry)) {
-            resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请在这台电脑运行 vibeface access，或使用普通邀请配对。')
+            resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用普通邀请配对。')
             return
           }
         }
@@ -480,6 +504,21 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function pair(invitationText: string, nameValue: string, password?: string) {
     const invitation = parseInvitation(readInvitation(invitationText))
     const name = deviceName(nameValue)
+    if (invitation.kind === 'node') {
+      resetConnection()
+      const version = generation.current, controller = new AbortController(); connecting.current = controller
+      const setup = await discoverLocalSetup(controller.signal)
+      if (version !== generation.current) throw changed()
+      if (setup?.kind !== 'uninitialized') throw new Error('请在待加入节点的 localhost 页面打开此邀请。已有集群的节点不能加入另一集群。')
+      store('cluster-target', null)
+      setLocalSetup(setup)
+      const result = await localJoinRequest('request', { invitation: JSON.stringify(readInvitation(invitationText)), name }, setup.invitation.entry, controller.signal)
+      if (version !== generation.current) throw changed()
+      if ((result.kind === 'review' || result.kind === 'pending') && (result.review.cluster_id !== invitation.payload.cluster_id || result.review.inviter_subject_id !== invitation.payload.inviter_subject_id || result.review.invite_id !== invitation.payload.invite_id || result.review.epoch !== invitation.payload.epoch || result.review.new_member.name !== name || !same(result.review.new_member.node_roles, invitation.payload.node_roles) || result.review.expires_at_ms > integer(invitation.payload.expires_at_ms))) throw new Error('节点加入确认与原邀请不一致，已停止操作。')
+      setLocalJoin(result)
+      if (result.kind === 'joined') await refreshJoinedSetup(setup.invitation.entry, version, controller.signal)
+      return
+    }
     const active = await open({ kind: 'peer', entry: invitation.entry })
     const request = scoped(active)
     const own = identityRef.current
@@ -542,6 +581,52 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const next = { request_id: text(receipt.request_id), cluster_id: pairReview.cluster_id, entry: active.entry, review: pairReview, signing, accepted: false }
     waitingRef.current = next; store('waiting-pair', next); setWaiting(next)
   }
+  async function createLocalCluster(name: string, password: string) {
+    if (localSetup?.kind !== 'uninitialized') throw new Error('此节点已加入协作集群。请使用邀请或恢复包授权此浏览器。')
+    const { entry, capability } = localSetup.invitation
+    await pair(JSON.stringify({ url: entry.address, peer_id: entry.peer_id, capability }), name, password)
+  }
+  async function openLocalAccess() {
+    if (localSetup?.kind !== 'initialized') throw new Error('请先打开此节点的本机设置页。')
+    const version = generation.current, controller = new AbortController(); connecting.current = controller
+    const setup = await discoverLocalSetup(controller.signal)
+    if (version !== generation.current) throw changed()
+    if (setup?.kind !== 'initialized' || setup.entry.peer_id !== localSetup.entry.peer_id) throw new Error('本机设置的节点已变化，请刷新页面后核对。')
+    setLocalSetup(setup)
+    if (!setup.local_launch) throw new Error('本机自动访问已关闭。请使用成员邀请或恢复包授权此浏览器。')
+    const url = new URL(setup.local_launch.url)
+    url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.peer_id }).toString()
+    location.assign(url.href)
+  }
+  async function refreshJoinedSetup(entry: ConnectionEntry, version: number, signal: AbortSignal) {
+    setLocalSetup({ kind: 'initialized', entry })
+    try {
+      const setup = await discoverLocalSetup(signal)
+      if (version !== generation.current) return
+      if (setup?.kind !== 'initialized' || setup.entry.peer_id !== entry.peer_id) throw new Error('本机设置的节点状态已变化。')
+      setLocalSetup(setup)
+    } catch (cause) {
+      if (version === generation.current) setError(`此节点已加入集群，但本机入口尚未刷新。请刷新此页后继续。${messageOf(cause)}`)
+    }
+  }
+  async function refreshLocalJoin() {
+    if (!localSetup) throw new Error('请先打开此节点的 localhost 页面。')
+    const entry = localSetup.kind === 'uninitialized' ? localSetup.invitation.entry : localSetup.entry
+    const version = generation.current, controller = new AbortController(); connecting.current = controller
+    const result = await localJoinRequest('status', {}, entry, controller.signal)
+    if (version !== generation.current) throw changed()
+    setLocalJoin(result); setError('')
+    if (result.kind === 'joined') await refreshJoinedSetup(entry, version, controller.signal)
+  }
+  async function acceptLocalJoin() {
+    if (!localSetup || localJoin?.kind !== 'review') throw new Error('请先核对节点加入信息。')
+    const entry = localSetup.kind === 'uninitialized' ? localSetup.invitation.entry : localSetup.entry
+    const version = generation.current, controller = new AbortController(); connecting.current = controller
+    const result = await localJoinRequest('accept', { request_id: localJoin.request_id, review_hash: localJoin.review_hash }, entry, controller.signal)
+    if (version !== generation.current) throw changed()
+    setLocalJoin(result); setError('')
+    if (result.kind === 'joined') await refreshJoinedSetup(entry, version, controller.signal)
+  }
   async function acceptPair() {
     const request = scoped()
     const pending = waitingRef.current
@@ -579,6 +664,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (bootstrap.kind !== 'bootstrap' || entryKey(bootstrap.entry) !== entryKey(active.entry)) throw new Error('初始化邀请与恢复目标不一致。')
         capability = bootstrap.capability
       }
+      if (!capability && !active.info.initialized && localSetup?.kind === 'uninitialized' && entryKey(localSetup.invitation.entry) === entryKey(active.entry)) capability = localSetup.invitation.capability
       if (!active.info.initialized && !capability) throw new Error('新节点恢复需要此节点本机生成的初始化邀请。')
       const own = identityRef.current
       if (!own) throw new Error('浏览器密钥尚未初始化。')
@@ -642,6 +728,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let mounted = true
     let version = generation.current
+    const setupController = new AbortController()
     setEntries(savedEntries())
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = fragment.get('bootstrap') || fragment.get('invite') || ''
@@ -654,29 +741,58 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       identityRef.current = own; setIdentity(own)
       if (version !== generation.current) return
       setPhase('disconnected')
-      if (!invitation) {
+      if (invitation) return
+      if (localLaunch) {
         const local = await localBrowserEntry(own, localLaunch)
         if (!mounted || version !== generation.current) return
-        if (local) { const opening = connect(local); version = generation.current; await opening; return }
+        if (local) { const opening = connect(local); version = generation.current; await opening }
+        return
       }
-      const pending = invitation ? null : loadWaiting()
-      const clusterTarget = load('cluster-target')
-      const recent = loadAuthenticated()
+      const pending = loadWaiting()
       if (pending && pending.review.new_member.subject_id === own.peerId) {
         const opening = open({ kind: 'peer', entry: pending.entry }); version = generation.current
         const active = await opening
         if (!mounted || session.current !== active) return
         waitingRef.current = pending; setWaiting(pending)
-      } else if (!invitation && (clusterTarget || recent?.kind === 'cluster')) {
+        return
+      }
+      let local: LocalSetup | null = null
+      try { local = await discoverLocalSetup(setupController.signal) }
+      catch (cause) { if (mounted && version === generation.current) setError(messageOf(cause)) }
+      if (!mounted || version !== generation.current) return
+      setLocalSetup(local)
+      if (local?.kind === 'uninitialized') {
+        try {
+          const result = await localJoinRequest('status', {}, local.invitation.entry, setupController.signal)
+          if (!mounted || version !== generation.current) return
+          setLocalJoin(result)
+          if (result.kind === 'joined') await refreshJoinedSetup(local.invitation.entry, version, setupController.signal)
+          if (result.kind !== 'idle') return
+        } catch (cause) {
+          if (mounted && version === generation.current) setError(messageOf(cause))
+          return
+        }
+      }
+      const clusterTarget = load('cluster-target'), recent = loadAuthenticated()
+      if (clusterTarget || recent?.kind === 'cluster') {
         const saved = parseClusterTarget(clusterTarget || (recent?.kind === 'cluster' ? recent.target : null))
         const opening = connectCluster(saved); version = generation.current
         void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
-      } else if (shouldAutoConnect({ hasInvitation: Boolean(invitation), savedCount: savedEntries().length })) {
-        const [only] = savedEntries()
-        if (only) { const opening = connect(only); version = generation.current; void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) }) }
+        return
       }
+      const cookieEntry = await localBrowserEntry(own, null)
+      if (!mounted || version !== generation.current) return
+      if (cookieEntry) { const opening = connect(cookieEntry); version = generation.current; await opening; return }
+      if (local?.kind === 'initialized') {
+        const opening = connect(local.entry); version = generation.current
+        void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
+        return
+      }
+      if (local || !shouldAutoConnect({ hasInvitation: false, savedCount: savedEntries().length })) return
+      const [only] = savedEntries()
+      if (only) { const opening = connect(only); version = generation.current; void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) }) }
     }).catch(cause => { if (mounted && version === generation.current) { setPhase(cause instanceof Error && 'code' in cause && cause.code === 'key_lost' ? 'key_lost' : 'blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; probing.current?.controller.abort(); probing.current = null; generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
+    return () => { mounted = false; setupController.abort(); probing.current?.controller.abort(); probing.current = null; generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
     if (!waiting?.accepted) return
@@ -684,10 +800,17 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const timer = setInterval(() => { checkPair().catch(cause => { if (waitingRef.current === pending && version === generation.current) setError(messageOf(cause)) }) }, 3000)
     return () => clearInterval(timer)
   }, [waiting])
+  useEffect(() => {
+    if (localJoin?.kind !== 'pending') return
+    const version = generation.current
+    const timer = setInterval(() => { refreshLocalJoin().catch(cause => { if (version === generation.current) setError(messageOf(cause)) }) }, 3000)
+    return () => clearInterval(timer)
+  }, [localJoin])
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current,
-    identity, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation, localAutoAccess, setLocalAutoAccess,
-    connect, connectCluster, disconnect, saveEntry, removeEntry, replaceLostKey, pair, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
+    identity, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation, localSetup, localJoin, localAutoAccess, setLocalAutoAccess,
+    connect, connectCluster, cancelConnection: resetConnection, disconnect, saveEntry, removeEntry, replaceLostKey, pair, createLocalCluster, openLocalAccess, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
+    acceptLocalJoin, refreshLocalJoin, useAnotherNodeInvitation() { resetConnection(); setLocalJoin(null) },
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有待下载的恢复包。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },

@@ -425,6 +425,14 @@ impl Store {
         Ok(serde_json::from_str(&encoded)?)
     }
 
+    pub fn pair_accepted(&self, request_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT new_subject_signature<>'' FROM identity_pair_requests WHERE request_id=?",
+            [request_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn pending_pairs(&self, inviter_id: &str) -> Result<Vec<PendingPair>> {
         let conn = &self.connection;
         let view = load_state(conn)?.project()?;

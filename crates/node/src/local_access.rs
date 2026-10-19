@@ -145,6 +145,22 @@ impl LocalAccess {
                 && crypto::digest(capability.as_bytes()) == state.launcher_hash,
             "local access launcher credential is invalid or disabled"
         );
+        Self::issue_pending(&mut state, peer_id, cluster_id)
+    }
+
+    pub(crate) fn issue_from_local_setup(&self, peer_id: &str, cluster_id: &str) -> Result<String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("local access state unavailable"))?;
+        ensure!(
+            state.enabled && state.origin.is_some(),
+            "local access is unavailable"
+        );
+        Self::issue_pending(&mut state, peer_id, cluster_id)
+    }
+
+    fn issue_pending(state: &mut State, peer_id: &str, cluster_id: &str) -> Result<String> {
         state
             .tokens
             .retain(|_, pending| pending.expires > Instant::now());
