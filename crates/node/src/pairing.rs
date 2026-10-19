@@ -641,6 +641,7 @@ impl NodePairing {
                 .push(pending.url.clone());
             configuration.validate()?;
         }
+        configuration.network.validate()?;
         let installed = self.node.install_membership(state).await?;
         ensure!(
             installed.authorize_node(&self.node.identity.peer_id()?, None)? == member,
@@ -987,6 +988,89 @@ mod tests {
         drop(inviter);
         fs::remove_dir_all(dir)?;
         result
+    }
+
+    #[tokio::test]
+    async fn node_join_validates_bootstrap_capacity_before_installing_membership() -> Result<()> {
+        let dir = directory()?;
+        let inviter = open_node(&dir.join("inviter"), "127.0.0.1:4791".parse()?).await?;
+        let admin = LocalIdentity::generate();
+        let state = NetworkState::new(Genesis::create(
+            &LocalIdentity::generate(),
+            vec![
+                Member::client(&admin, "manager", true)?,
+                Member::node(
+                    &inviter.identity,
+                    "existing Node",
+                    inviter.config.roles.clone(),
+                )?,
+            ],
+        )?)?;
+        inviter.install_membership(state.clone()).await?;
+        for count in [7, 8] {
+            let node_dir = dir.join(format!("joiner-{count}"));
+            let node = open_node(&node_dir, "127.0.0.1:4790".parse()?).await?;
+            let mut configuration = Config::load(&node_dir)?;
+            configuration.network.bootstrap_urls = (0..count)
+                .map(|index| format!("ws://127.0.0.1:{}/api/network/ws", 5900 + index))
+                .collect();
+            configuration.save(&node_dir)?;
+            drop(node);
+            let node = Arc::new(Runtime::open(&node_dir).await?);
+            let capability = node.identities.bootstrap_capability()?;
+            let pairing = NodePairing::new(node.clone());
+            let invitation = invitation(&inviter, &admin, "ws://127.0.0.1:9/api/network/ws")?;
+            let mut granted = state.clone();
+            granted.append(GovernanceEvent::grant(
+                &admin,
+                &granted.project()?,
+                Member::node(
+                    &node.identity,
+                    "Mac mini",
+                    invitation.invite.invite.payload.node_roles.clone(),
+                )?,
+            )?)?;
+            let pending = PendingPair {
+                url: invitation.url.clone(),
+                peer_id: invitation.peer_id.clone(),
+                relay: false,
+                invite_id: invitation.invite.invite.payload.invite_id.clone(),
+                request_id: "accepted-request".into(),
+                name: "Mac mini".into(),
+                request_hash: None,
+                invitation: Some(invitation),
+                review: None,
+                phase: Phase::Accepted,
+            };
+            pairing.save(&pending)?;
+            let config_before = fs::read(node_dir.join("config.json"))?;
+            let receipt_before = fs::read(&pairing.pending_path)?;
+            let result = pairing.finish(&pending, granted).await;
+            if count == 8 {
+                assert_eq!(result.unwrap_err().to_string(), "too many network URLs");
+                assert!(!node.has_membership().await?);
+                node.identities
+                    .verify_bootstrap_capability(&capability.capability)?;
+                assert_eq!(fs::read(node_dir.join("config.json"))?, config_before);
+                assert_eq!(fs::read(&pairing.pending_path)?, receipt_before);
+            } else {
+                assert!(matches!(result?, JoinState::Joined { .. }));
+                assert!(node.has_membership().await?);
+                assert!(!pairing.pending_path.exists());
+                let saved = Config::load(&node_dir)?;
+                assert_eq!(saved.network.bootstrap_urls.len(), 8);
+                assert_eq!(saved.network.bootstrap_urls.last(), Some(&pending.url));
+            }
+            drop(pairing);
+            drop(node);
+            let reopened = Runtime::open(&node_dir).await?;
+            assert_eq!(reopened.has_membership().await?, count == 7);
+            assert_eq!(Config::load(&node_dir)?.network.bootstrap_urls.len(), 8);
+            drop(reopened);
+        }
+        drop(inviter);
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

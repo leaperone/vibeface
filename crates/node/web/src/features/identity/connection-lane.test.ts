@@ -346,6 +346,27 @@ test('recovering onto a fresh localhost Node reuses local setup authority withou
   } finally { app.close() }
 })
 
+test('localhost recovery can use a remote fresh Node invitation without sending local setup authority', async () => {
+  const app = deviceHarness({ local: 'fresh' }), remote = { ...entry, peer_id: '6'.repeat(64) }, capability = '4'.repeat(64)
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().localSetup?.kind, 'uninitialized')
+    const challenge = { network_id: network, owner_public_key: publicKey, subject_id: subject, target_peer_id: remote.peer_id, challenge_id: 'remote-challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+    const challengeHold = deferred(), contextHold = deferred()
+    app.holds.set('recovery_challenge', challengeHold); app.holds.set('recovery_context', contextHold)
+    challengeHold.resolve({ challenge_id: challenge.challenge_id, challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
+    const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: remote, bootstrap: JSON.stringify({ url: remote.address, peer_id: remote.peer_id, relay: remote.relay, capability }) })
+    const rejected = assert.rejects(recovering, /stop after remote authority check/)
+    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    const sent = app.requests.find(request => request.method === 'recovery_context')?.params.capability
+    assert.equal(sent, capability)
+    assert.notEqual(sent, localCapability)
+    contextHold.reject(new Error('stop after remote authority check')); await rejected
+    assert.equal(app.render().ready, null)
+    assert.equal(app.released(), 1)
+  } finally { app.close() }
+})
+
 for (const stage of ['authenticate', 'subscribe']) test(`cancelPair during ${stage} cannot restore the cancelled connection`, async () => {
   const app = deviceHarness({ pairing: true })
   try {

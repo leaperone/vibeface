@@ -118,7 +118,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
             <label className="grid gap-2 text-sm">目标入口地址<Input className={input} type="url" name="address" required defaultValue={target?.address || ''} /></label>
             <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="peer_id" required pattern="[a-f0-9]{64}" defaultValue={target?.peer_id || ''} autoComplete="off" spellCheck={false} /></label>
             <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" name="relay" defaultChecked={target?.relay || false} />通过入口中继到目标节点</label>
-            {!localEntry && <label className="grid gap-2 text-sm">新节点的本机初始化邀请，可选<Textarea className="min-h-20 font-mono text-xs" name="bootstrap" autoComplete="off" spellCheck={false} /></label>}
+            <label className="grid gap-2 text-sm">新节点的本机初始化邀请，可选<Textarea className="min-h-20 font-mono text-xs" name="bootstrap" autoComplete="off" spellCheck={false} /></label>
             <Button className={button} type="submit">解锁并核对恢复授权</Button>
           </fieldset></form>
         </CollapsibleContent>
