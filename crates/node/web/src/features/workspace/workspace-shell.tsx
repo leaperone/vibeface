@@ -198,7 +198,7 @@ function ConnectionCapsule() {
         {entrances.length > 1 ? <>
           <p className="mt-1 font-medium">可切换的访问地址</p>
           <ul className="grid gap-1" aria-label="可切换的访问地址">{entrances.map((item) => <li key={item.device_id} className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 flex-1 truncate" title={item.gateway_url}>{addressName(item.gateway_url)}</span>
+            <span className="min-w-0 flex-1 truncate" title={item.gateway_url}>{device.directory?.members.find((member) => member.device_id === item.device_id)?.name || addressName(item.gateway_url)}</span>
             <span className="shrink-0 text-muted-foreground">{item.device_id === device.ready?.entry.device_id ? "当前" : item.public ? "公网" : "仅本机或局域网"}</span>
           </li>)}</ul>
         </> : null}
