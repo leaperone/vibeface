@@ -170,7 +170,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: check
-      - name: Check affected crates with Clippy and the declared minimum Rust version
+      - name: Check affected crates with Clippy and optional minimum Rust version
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
           MSRV: ${{ needs.plan.outputs.msrv }}
@@ -295,12 +295,11 @@ jobs:
           "$package/vibeface" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Verify packaged Web assets and process
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
       - name: Verify unpacked Node processes without model calls
-        if: needs.plan.outputs.package_mode == 'node'
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
@@ -406,12 +405,12 @@ jobs:
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
           [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
           "$prefix/bin/vibeface" --help
-      - name: Verify npm native processes and bundled web
+      - name: Verify npm startup and bundled web
         env:
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
-          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --skip-codex
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
 
   ci-gate:
     name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'pr-metadata-only' || 'ci-gate' }}

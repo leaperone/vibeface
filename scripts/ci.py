@@ -64,9 +64,8 @@ def scope_plan(scopes, event, draft, ref_type, channel):
     ):
         raise ValueError("Invalid CI scopes or scenario")
     draft = event == "pull_request" and draft
-    full = "full" in scopes or event in {"schedule", "workflow_dispatch", "merge_group"} or ref_type == "tag"
-    if event == "push" and scopes - {"docs"}:
-        full = True
+    extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
+    full = "full" in scopes or extended or event == "merge_group"
     affected = set(DEPENDENTS) if full else scopes & set(DEPENDENTS)
     for crate in tuple(affected):
         pending = list(DEPENDENTS[crate])
@@ -77,10 +76,12 @@ def scope_plan(scopes, event, draft, ref_type, channel):
                 pending.extend(DEPENDENTS[dependent])
     packages = [package for crate, package in CRATES.items() if crate in affected]
     web = full or "web" in scopes or "node" in affected
-    slow = "node" in affected and not draft
-    platforms = PLATFORMS if "node" in affected and not draft else PLATFORMS[:1]
+    slow = "node" in affected and extended
+    platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
     plan = {
         "full": full,
+        "extended": extended,
+        "check_msrv": bool(packages) and extended,
         "docs_only": not web and not packages,
         "draft": draft,
         "event": event,
@@ -91,9 +92,9 @@ def scope_plan(scopes, event, draft, ref_type, channel):
         "node": "node" in affected,
         "rust_packages": packages,
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
-        "package_mode": "node" if "node" in affected else "web",
+        "package_mode": "node" if "node" in affected and extended else "web",
         "package_matrix": {"include": list(platforms) if web else []},
-        "npm": channel == "nightly" and "node" in affected and not draft,
+        "npm": channel == "nightly" and "node" in affected and extended,
     }
     required = {"quick-check"}
     if web:
@@ -191,7 +192,9 @@ def write_plan(plan, output=None):
             destination.write(
                 "### Selected CI coverage\n\n"
                 f"- Changed paths: {plan['changed_files']}\n"
-                f"- Full scope: {plan['full']}\n"
+                f"- Full workspace scope: {plan['full']}\n"
+                f"- Coverage tier: {'extended' if plan['extended'] else 'core'}\n"
+                f"- Minimum Rust version check: {plan['check_msrv']}\n"
                 f"- Rust packages: {', '.join(plan['rust_packages']) or 'none'}\n"
                 f"- Test tiers: {', '.join(plan['test_tiers']) or 'none'}\n"
                 f"- Package acceptance: {plan['package_mode'] if plan['web'] else 'none'}\n"
@@ -250,7 +253,16 @@ def run_test(packages, tier):
     subprocess.run(command, check=True)
 
 
+def run_check(packages, msrv=None):
+    selected = package_args(packages)
+    subprocess.run(["cargo", "clippy", "--all-targets", "--locked", *selected, "--", "-D", "warnings"], check=True)
+    if msrv:
+        subprocess.run(["rustup", "toolchain", "install", msrv, "--profile", "minimal"], check=True)
+        subprocess.run(["cargo", f"+{msrv}", "check", "--locked", *selected], check=True)
+
+
 def self_test():
+    from unittest.mock import patch
     web = make_plan(["crates/node/web/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
@@ -266,8 +278,8 @@ def self_test():
     }
     for crate, packages in expected.items():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])
-        assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast", "slow"]
-        assert plan["package_mode"] == "node" and plan["package_matrix"]["include"] == list(PLATFORMS)
+        assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
+        assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
         draft = make_plan([f"crates/{crate}/src/lib.rs"], draft=True)
         assert draft["rust_packages"] == packages and draft["test_tiers"] == ["fast"]
         assert draft["package_matrix"]["include"] == list(PLATFORMS[:1])
@@ -279,13 +291,23 @@ def self_test():
     for event in ("schedule", "workflow_dispatch", "merge_group"):
         assert make_plan(["README.md"], event)["rust_packages"] == list(PACKAGES)
     assert make_plan(["README.md"], "push")["docs_only"]
-    assert make_plan(["crates/node/web/src/a.tsx"], "push")["rust_packages"] == list(PACKAGES)
+    assert make_plan(["crates/node/web/src/a.tsx"], "push")["rust_packages"] == []
     assert make_plan(["README.md"], "push", ref_type="tag")["test_tiers"] == ["fast", "slow"]
     assert make_plan(["README.md"], "push", ref_type="tag")["package_matrix"]["include"] == list(PLATFORMS)
-    assert make_plan(["crates/node/src/api.rs"])["npm"]
+    assert not make_plan(["crates/node/src/api.rs"])["npm"]
     assert not make_plan(["crates/node/src/api.rs"], draft=True)["npm"]
     assert not make_plan(["crates/node/src/api.rs"], channel="stable")["npm"]
     assert not make_plan(["crates/node/src/api.rs"], channel="rc")["npm"]
+    for event in ("pull_request", "push", "merge_group"):
+        core = make_plan(["Cargo.lock"], event)
+        assert core["test_tiers"] == ["fast"] and not core["check_msrv"] and not core["npm"]
+        assert core["package_matrix"]["include"] == list(PLATFORMS[:1])
+        assert core["package_mode"] == "web" and "rust-check" in core["required_jobs"]
+    for event, ref_type in (("schedule", "branch"), ("workflow_dispatch", "branch"), ("push", "tag")):
+        extended = make_plan([], event, ref_type=ref_type)
+        assert extended["test_tiers"] == ["fast", "slow"] and extended["check_msrv"] and extended["npm"]
+        assert extended["package_matrix"]["include"] == list(PLATFORMS)
+        assert extended["package_mode"] == "node"
     needs = {job: {"result": "success" if job in web["required_jobs"] else "skipped"} for job in JOBS}
     needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(web)}}
     gate(needs)
@@ -301,10 +323,11 @@ def self_test():
     expect_failure(lambda: gate(broken))
     weakened = dict(web, required_jobs=["quick-check"])
     expect_failure(lambda: gate(needs, weakened))
-    ready = make_plan(["crates/node/src/api.rs"])
+    ready = make_plan([], "workflow_dispatch")
     expect_failure(lambda: gate(needs, dict(ready, test_tiers=["fast"])))
     expect_failure(lambda: gate(needs, dict(ready, package_matrix={"include": list(PLATFORMS[:1])})))
     expect_failure(lambda: gate(needs, dict(ready, npm=False)))
+    expect_failure(lambda: gate(needs, dict(ready, check_msrv=False)))
     complete = {job: {"result": "success"} for job in JOBS}
     complete["plan"] = {"result": "success", "outputs": {"plan": json.dumps(ready)}}
     gate(complete)
@@ -345,7 +368,6 @@ def self_test():
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", "advance base", cwd=directory)
         new_base = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         assert set(changed_paths(new_base, pr_head, "pull_request", cwd=directory)) == set(paths)
-        from unittest.mock import patch
         event_file = Path(directory) / "event.json"
         arguments = argparse.Namespace(event=None, base=new_base, head=pr_head, draft=False)
         environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF_TYPE": "branch", "GITHUB_EVENT_PATH": str(event_file)}
@@ -356,7 +378,7 @@ def self_test():
                 selected = event_plan(arguments)
                 diff.assert_called_with(new_base, pr_head, "pull_request")
                 assert selected["draft"] == draft
-                assert selected["test_tiers"] == (["fast"] if draft else ["fast", "slow"])
+                assert selected["test_tiers"] == ["fast"]
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git") as ancestor:
@@ -368,7 +390,16 @@ def self_test():
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)):
                 expect_failure(lambda: release_metadata("branch", ""))
-    print("CI selector, event, test partition, rename/delete and gate self-tests passed")
+    for check_msrv in (False, True):
+        with patch("subprocess.run") as run:
+            run_check(["vibeface"], "1.89" if check_msrv else None)
+            commands = [call.args[0] for call in run.call_args_list]
+            assert commands[0] == ["cargo", "clippy", "--all-targets", "--locked", "-p", "vibeface", "--", "-D", "warnings"]
+            assert commands[1:] == ([
+                ["rustup", "toolchain", "install", "1.89", "--profile", "minimal"],
+                ["cargo", "+1.89", "check", "--locked", "-p", "vibeface"],
+            ] if check_msrv else [])
+    print("CI selector, event, test partition, check commands, rename/delete and gate self-tests passed")
 
 
 def expect_failure(check):
@@ -402,7 +433,7 @@ def main():
         if name == "test":
             command.add_argument("--tier", choices=("fast", "slow"), required=True)
         else:
-            command.add_argument("--msrv", required=True)
+            command.add_argument("--msrv", help="also check the declared minimum Rust version")
     args = parser.parse_args()
     if args.self_test:
         self_test()
@@ -416,10 +447,10 @@ def main():
         if args.command == "test":
             run_test(packages, args.tier)
         else:
-            selected = package_args(packages)
-            subprocess.run(["cargo", "clippy", "--all-targets", "--locked", *selected, "--", "-D", "warnings"], check=True)
-            subprocess.run(["rustup", "toolchain", "install", args.msrv, "--profile", "minimal"], check=True)
-            subprocess.run(["cargo", f"+{args.msrv}", "check", "--locked", *selected], check=True)
+            plan = json.loads(os.environ[args.plan_env]) if args.plan_env else None
+            if plan and plan["check_msrv"] and not args.msrv:
+                parser.error("The selected CI plan requires --msrv")
+            run_check(packages, args.msrv if plan is None or plan["check_msrv"] else None)
     else:
         parser.error("Select a command or --self-test")
 
