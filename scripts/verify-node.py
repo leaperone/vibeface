@@ -4245,7 +4245,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         require(time.monotonic() < held_started + 10, "recovered Noise and canary complete while the other pending requests remain unexpired")
         require(not trace("relay reservation removed", target=owner.peer_id, generation=current_generation), "current reservation was not torn down by rejected Dial")
         core = network_core_evidence(evidence_dir, "a1", ["full_data_capacity_refuses_only_the_incoming_and_recovers_on_the_same_reservation"])
-        generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_cancels_blocked_publish_and_preserves_ready_circuit",
+        generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_preserves_ready_circuit_during_blocked_directory_publication",
             "a2_outer_abort_drops_an_attached_socket_waiting_in_the_receiver", "a2_real_full_source_and_global_handoff_uses_a_full_logical_table_fixture"])
         case.update({"status": "passed", "target_peer_id": owner.peer_id, "old_generation": old_generation, "new_generation": generation,
                      "old_ready": old_ready, "new_installed": installed, "previous_socket_closed": previous_closed,
@@ -4710,7 +4710,7 @@ def network_reliability_directory(run, binary, workspace, fixture, helper, modul
                                           "directory_stream_delivers_before_slow_reply_and_drop_releases_sockets",
                                           "records_expiring_while_waiting_for_state_are_not_stored_or_delivered"]),
                                   ("d2", ["publication_preserves_relay_changes_during_an_inflight_publish",
-                                          "legacy_reservation_publish_full_keeps_reservation_but_invalid_record_closes_it",
+                                          "reservation_rejects_publish_and_public_full_publish_is_not_acknowledged",
                                           "relay_refusal_does_not_republish_and_duplicate_entries_do_not_duplicate_tasks",
                                           "directory_operations_have_one_deadline_across_welcome_and_reply"])):
             manifest_path = evidence_dir / f"m3-{slice_name}-core-slice.json"

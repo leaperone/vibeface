@@ -1,11 +1,11 @@
-import * as React from "react"
-import { ChevronRightIcon } from "lucide-react"
 import { cn } from "cn"
+import { ChevronRightIcon } from "lucide-react"
+import * as React from "react"
 
 import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
+Collapsible,
+CollapsibleContent,
+CollapsibleTrigger,
 } from "@/components/ui/collapsible"
 
 function Trace({ className, ...props }: React.ComponentProps<"div">) {
@@ -60,19 +60,6 @@ function TraceTitle({ className, ...props }: React.ComponentProps<"span">) {
     <span
       data-slot="trace-title"
       className={cn("min-w-0 truncate motion-reduce:shimmer-none", className)}
-      {...props}
-    />
-  )
-}
-
-function TraceDescription({
-  className,
-  ...props
-}: React.ComponentProps<"span">) {
-  return (
-    <span
-      data-slot="trace-description"
-      className={cn("shrink-0 text-muted-foreground/70 tabular-nums", className)}
       {...props}
     />
   )
@@ -146,13 +133,4 @@ function TraceCollapsibleContent({
   )
 }
 
-export {
-  Trace,
-  TraceLine,
-  TraceIcon,
-  TraceTitle,
-  TraceDescription,
-  TraceCollapsible,
-  TraceCollapsibleTrigger,
-  TraceCollapsibleContent,
-}
+export { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceIcon, TraceLine, TraceTitle }
