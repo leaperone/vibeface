@@ -16,6 +16,7 @@ Add --net1-lane 3 to verify a 100001-event closure across three authorized repli
 Add --net1-lane 4 to check production discovery through isolated directory sources.
 Add --net1-lane 5 or 6 to check reservation generations and real-source quotas.
 Add --net1-lane 7 to check actual mDNS sources and intermediate-route recovery.
+--auto-route checks target-directed clients through isolated public entries.
 """
 
 import argparse
@@ -243,6 +244,9 @@ class RelayCapture:
         self.listener.settimeout(0.2)
         self.stopped = threading.Event()
         self.paused = threading.Event()
+        self.reply_gate = threading.Event()
+        self.reply_gate.set()
+        self.reply_connections = None
         self.lock = threading.Lock()
         self.generation = 0
         self.next_connection = 0
@@ -308,6 +312,10 @@ class RelayCapture:
                 if not part:
                     return
                 received_wall_time, received_monotonic = time.time(), time.monotonic()
+                while (direction == "from_relay" and (self.reply_connections is None or connection in self.reply_connections)
+                       and not self.reply_gate.wait(.1)):
+                    if self.stopped.is_set() or self.paused.is_set():
+                        return
                 target.sendall(part)
                 buffer.extend(part)
                 if headers:
@@ -423,6 +431,7 @@ if (process.argv[2]) {
 } else clientIdentity = Identity.generate();
 const keys = new Map([['client', clientIdentity], ['root', Identity.generate()]]);
 const connections = new Map();
+const routeStats = new Map();
 const identity = name => { const key = keys.get(name); if (!key) throw new Error('unknown local identity'); return key; };
 const exposed = key => ({ public_key: key.publicKeyHex(), subject_id: key.peerId() });
 async function networkProbe(input) {
@@ -583,6 +592,47 @@ async function connect(input) {
     close,
   };
 }
+async function automaticConnect(input) {
+  const stats = {controls:[],opened:0,closed:0,active_data:0,max_active_data:0,authenticated_sessions:0,calls:[]};
+  routeStats.set(input.connection || 'main',stats);
+  class ObservedSocket extends WebSocket {
+    constructor(url) {
+      super(url);
+      stats.opened++;
+      this.dataPath = false;
+      this.addEventListener('close',() => { stats.closed++; if (this.dataPath) stats.active_data--; });
+    }
+    send(value) {
+      if (typeof value === 'string') {
+        const control = JSON.parse(value);
+        stats.controls.push({url:this.url,type:control.type,target:control.target});
+        if (['dial','direct'].includes(control.type) && !this.dataPath) {
+          this.dataPath = true;
+          stats.active_data++; stats.max_active_data = Math.max(stats.max_active_data,stats.active_data);
+        }
+      }
+      super.send(value);
+    }
+  }
+  const source = (await readFile(input.transport,'utf8')).replace(/^import .*;\n/,'').replace(/^export /gm,'');
+  const transport = new Function('init','Identity','Handshake','verify','WebSocket','location',
+    source + '\nreturn {connectDevice, setIdentity(value) {identity=value;}};')(
+      init,Identity,Handshake,verify,ObservedSocket,{protocol:'http:'});
+  transport.setIdentity(identity(input.identity || 'client'));
+  const events = [], controller = new AbortController();
+  const timer = input.cancel_after_ms === undefined ? undefined : setTimeout(() => controller.abort(),input.cancel_after_ms);
+  let selected;
+  try {
+    selected = await transport.connectDevice({address:input.url,peer_id:input.peer_id},
+      {signal:controller.signal,onEvent:event => events.push(event)});
+    stats.authenticated_sessions++;
+  } finally { clearTimeout(timer); }
+  return {events,frames:[],close:() => selected.close(),async request(method,params) {
+    stats.calls.push({method,rpc_method:params?.method,operation_id:params?.request?.operation_id});
+    try { return {result:await selected.request(method,params)}; }
+    catch (error) { return {error:String(error)}; }
+  }};
+}
 for await (const line of createInterface({input:process.stdin})) {
   try {
     const input = JSON.parse(line);
@@ -613,7 +663,8 @@ for await (const line of createInterface({input:process.stdin})) {
       finally { verified.free(); }
     }
     else if (input.op === 'forget_root') { identity('root').free(); keys.delete('root'); result = {forgotten:true}; }
-    else if (input.op === 'connect') { const old = connections.get(input.connection || 'main'); old?.close(); const value = await connect(input); connections.set(input.connection || 'main', value); result = {connected:true}; }
+    else if (input.op === 'connect' || input.op === 'connect_auto') { const old = connections.get(input.connection || 'main'); old?.close(); const value = await (input.op === 'connect_auto' ? automaticConnect(input) : connect(input)); connections.set(input.connection || 'main', value); result = {connected:true}; }
+    else if (input.op === 'route_stats') result = routeStats.get(input.connection || 'main');
     else { const connection = connections.get(input.connection || 'main'); if (!connection) throw new Error('no connection');
       if (input.op === 'request') result = await connection.request(input.method,input.params || {});
       else if (input.op === 'events') result = connection.events;
@@ -819,13 +870,13 @@ class Node:
             self.log = None
             return returncode
 
-    def pair(self, owner, network, *, relay_url=None):
+    def pair(self, owner, network, *, entry_url=None):
         original_config = json.loads((self.directory / "config.json").read_text())
         network_config = original_config["network"]
         invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler", "executor"])
         path = self.directory / "pair-invitation.json"
-        private_json(path, {"url": relay_url or owner.url, "peer_id": owner.peer_id,
-                            "relay": relay_url is not None, "invite": invitation})
+        private_json(path, {"url": entry_url or owner.url, "peer_id": owner.peer_id,
+                            "invite": invitation})
         log_path = self.directory / f"pair-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None
@@ -2126,7 +2177,7 @@ def recover_fresh_node(node, backup, password):
     return updated
 
 
-def verify_recovery(node, other, nodes, network):
+def verify_recovery(node, other, nodes, network, *, entry_url=None):
     wrong = other.command("recover_material", backup=node.backup,
                           password="wrong-acceptance-passphrase", check=False)
     require(wrong["ok"] is False, "encrypted recovery package rejects a wrong password")
@@ -2137,8 +2188,12 @@ def verify_recovery(node, other, nodes, network):
     require(rejected["ok"] is False, "recovery rejects missing encrypted key material")
     material = other.command("recover_material", backup=node.backup, password=node.backup_password)
     require(material["network_id"] == network, "recovered root retains the original personal fingerprint")
-    other.url = node.url
-    other.connect(node.peer_id)
+    other.url = entry_url or node.url
+    if entry_url:
+        other.command("connect_auto", url=entry_url, peer_id=node.peer_id,
+                      transport=str(Path(__file__).resolve().parents[1] / "crates/node/web/transport.js"))
+    else:
+        other.connect(node.peer_id)
     wrong_challenge = other.call("recovery_challenge", {"network_id": network,
                                  "owner_public_key": material["genesis"]["owner_public_key"],
                                  "genesis": material["genesis"]})
@@ -3071,7 +3126,7 @@ def acceptance(options):
 
         b.pair(a, network)
         report["relay_readiness"] = wait_for_relay_target(a, capture, a_relay_restart_connection)
-        c.pair(a, network, relay_url=capture.url)
+        c.pair(a, network, entry_url=capture.url)
         b.start()
         c.start()
         b.client.connect()
@@ -3590,7 +3645,7 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             node.configure(network=device_network)
         source.start(env=trace_env)
         network = source.bootstrap()
-        receiver.pair(source, network, relay_url=capture.url)
+        receiver.pair(source, network, entry_url=capture.url)
         for node in (source, receiver):
             node.configure(roles=["gateway", "replica"])
         receiver.start(env=trace_env)
@@ -5479,7 +5534,7 @@ def network_reliability_acceptance(options):
         source.start()
         network = source.bootstrap()
         report["relay_readiness"] = wait_for_relay_target(source, capture, source_relay_start_connection)
-        receiver.pair(source, network, relay_url=capture.url)
+        receiver.pair(source, network, entry_url=capture.url)
         receiver.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=debug", "NO_COLOR": "1"} if lane == 1 else None)
         receiver.client.connect(receiver.peer_id)
         wait_for("receiver client authorization", lambda: receiver.client.authenticate())
@@ -5690,6 +5745,258 @@ def unknown_record(client, node, operation_id):
     return record if record and record["state"] == "unknown" else None
 
 
+def auto_route_acceptance(options):
+    repository = Path(__file__).resolve().parents[1]
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    artifacts = options.artifacts.resolve()
+    require(artifacts.is_relative_to(repository / ".artifacts"), "routing fixtures stay in the task worktree")
+    require(subprocess.run(["git", "check-ignore", "--quiet", str(artifacts / "probe")],
+                           cwd=repository).returncode == 0, "routing artifacts are ignored")
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts / ("auto-route-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir()
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    fixture = fixture_wrapper(run, "fixture-executor", "--fixture-executor")
+    transport = repository / "crates/node/web/transport.js"
+    nodes, clients, captures, directories = [], [], [], []
+    report = {"status": "running", "source_commit": subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip(),
+        "binary_sha256": file_sha256(binary), "transport_sha256": file_sha256(transport),
+        "provider_calls": 0, "cases": {}, "artifacts": str(run),
+        "not_checked": ["rendered browser UI", "production ingress", "provider models"],
+        "measurement": "one functional run per case; includes helper startup, Noise, authorization and read, not UI latency or a speed comparison"}
+
+    def ws(url):
+        return url.replace("http:", "ws:") + "/api/network/ws"
+
+    def fresh(url, *, identity_file=None):
+        client = Client(url, helper, module, identity_file=identity_file)
+        clients.append(client)
+        return client
+
+    def connect(client, target, *, network=None):
+        client.peer_id = target
+        started = time.monotonic()
+        client.command("connect_auto", url=client.url, peer_id=target, transport=str(transport))
+        require(client.call("info")["peer_id"] == target, "production transport reads the fixed authenticated target")
+        if network:
+            client.authenticate(network)
+            client.call("subscribe")
+            client.rpc("nodes")
+        stats = wait_for("only the winning data channel survives", lambda:
+                         (lambda value: value if value["active_data"] == 1 else None)(client.command("route_stats")))
+        require(stats["max_active_data"] <= 2 and stats["authenticated_sessions"] == 1,
+                "routing respects concurrency and selects one authenticated session")
+        stats["ready_seconds"] = time.monotonic() - started
+        return stats
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS auto-route " + name, flush=True)
+
+    def publish(url, record):
+        stream = NetworkControlSocket(ws(url))
+        try:
+            stream.send_control({"type": "publish", "record": record})
+            require(stream.control()["type"] == "published", "real entry accepts target-signed reachability")
+        finally:
+            stream.close()
+
+    def signed_record(node, *, direct=None, relay=None, ttl=180):
+        result = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
+            input=json.dumps({"op": "fixture_reachability", "identity_file": str(node.directory / "identity.json"),
+                              "expected_peer_id": node.peer_id, "direct_urls": direct or [],
+                              "relay_urls": relay or [], "ttl_secs": ttl}) + "\n",
+            text=True, capture_output=True, timeout=10)
+        reply = json.loads(result.stdout)
+        require(result.returncode == 0 and reply["ok"], "actual target key signs the fixture record")
+        return reply["result"]
+
+    try:
+        for name in ("R1", "R2", "TARGET"):
+            node = Node(run, name, binary, workspace, fixture, helper, module)
+            nodes.append(node)
+            node.configure(roles=["relay"] if name != "TARGET" else ["gateway", "replica", "relay", "scheduler", "executor"],
+                           network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False,
+                                    "relay_enabled": name != "TARGET"})
+            capture = RelayCapture(node.port)
+            captures.append(capture)
+            node.configure(allowed_origins=[capture.url])
+        r1, r2, target = nodes
+        c1, c2, local = captures
+        target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable)
+        r1.start()
+        r2.start()
+        target.configure(network={"bootstrap_urls": [ws(c2.url)], "advertise_urls": [],
+                                  "mdns": False, "relay_enabled": False})
+        target.start()
+        network = target.bootstrap()
+        wait_for_relay_target(target, c2, 0)
+        record = target.client.command("network_probe", kind="record", url=r2.url, target=target.peer_id)
+        require(record["direct_urls"] == [] and record["relay_urls"] == [ws(c2.url)],
+                "target is advertised only through R2")
+        browser = fresh(local.url, identity_file=target.client.identity_file)
+        stats = connect(browser, target.peer_id, network=network)
+        require(sum(item["type"] in {"dial", "direct"} for item in stats["controls"]) == 1,
+                "self target uses exactly one data channel with public relay disabled")
+        passed("local-with-relay-disabled", target=target.peer_id, stats=stats)
+        browser.url = c2.url
+        passed("same-entry-reservation", target=target.peer_id, stats=connect(browser, target.peer_id, network=network))
+        publish(r1.url, record)
+        browser.url = c1.url
+        stats = connect(browser, target.peer_id, network=network)
+        require(any(item["type"] == "dial" and item["url"] == ws(c2.url) for item in stats["controls"]),
+                "client follows R1's signed record to R2 without changing its entry")
+        passed("other-entry", entry=c1.url, target=target.peer_id, stats=stats)
+        fallback = signed_record(target, direct=[f"ws://127.0.0.1:{available_port()}/api/network/ws"], relay=[ws(c2.url)])
+        directory = NetworkDirectoryFixture("fallback", record=fallback)
+        directories.append(directory)
+        browser.url = directory.url.replace("ws:", "http:").removesuffix("/api/network/ws")
+        stats = connect(browser, target.peer_id, network=network)
+        require(any(item["type"] == "dial" and item["url"] == ws(c2.url) for item in stats["controls"]),
+                "failed direct candidate retains the healthy signed relay")
+        passed("failed-direct-fallback", stats=stats)
+        for kind in ("signature", "expired", "other-target"):
+            invalid = copy.deepcopy(record)
+            if kind == "signature":
+                invalid["signature"] = "00" * 64
+            elif kind == "expired":
+                invalid["expires_at"] = int(time.time()) - 1
+            else:
+                invalid = signed_record(r1, relay=[ws(c2.url)])
+            directory = NetworkDirectoryFixture(kind, record=invalid)
+            directories.append(directory)
+            rejected = fresh(directory.url.replace("ws:", "http:").removesuffix("/api/network/ws"))
+            result = rejected.command("connect_auto", url=rejected.url, peer_id=target.peer_id,
+                                      transport=str(transport), check=False)
+            stats = rejected.command("route_stats")
+            require(not result["ok"] and not stats["authenticated_sessions"]
+                    and all(item["url"] != ws(c2.url) for item in stats["controls"]),
+                    "unverified candidates never receive a connection")
+            passed("reject-" + kind, stats=stats)
+        cancelled_directory = NetworkDirectoryFixture("cancelled")
+        directories.append(cancelled_directory)
+        cancelled_directory.reply_gate.clear()
+        cancelled = fresh(cancelled_directory.url.replace("ws:", "http:").removesuffix("/api/network/ws"))
+        result = cancelled.command("connect_auto", url=cancelled.url, peer_id=target.peer_id,
+                                   transport=str(transport), cancel_after_ms=50, check=False)
+        cancelled_directory.reply_gate.set()
+        stats = wait_for("cancel releases every transport socket", lambda:
+                         (lambda value: value if value["opened"] == value["closed"] else None)(cancelled.command("route_stats")))
+        require(not result["ok"] and stats["active_data"] == 0, "cancelled routing cannot select a session")
+        passed("cancel", stats=stats)
+        outsider = fresh(c1.url)
+        connect(outsider, target.peer_id)
+        outsider.call("rpc", {"method": "nodes"}, status=401)
+        wrong = outsider.command("connect_auto", url=c1.url, peer_id="ab" * 32,
+                                 transport=str(transport), check=False)
+        require(not wrong["ok"], "wrong target cannot authenticate an available entry")
+        browser.url = c1.url
+        connect(browser, target.peer_id, network=network)
+        invitation = target.client.invite("client")
+        guest = fresh(c1.url)
+        connect(guest, target.peer_id)
+        prepared = guest.call("prepare_pair_request", {**invitation, "name": "Auto-route guest", "request_id": uuid.uuid4().hex})
+        prepared["request"]["proof"] = guest.command("sign", **prepared["signing"])
+        receipt = guest.call("pair_request", {"request": prepared["request"]})
+        guest.call("pair_accept", {"request_id": receipt["request_id"],
+                                   "signature": guest.command("sign", **receipt["signing"])})
+        target.client.approve(receipt["request_id"])
+        require(guest.call("pair_status", {"request_id": receipt["request_id"]})["status"] == "granted",
+                "cross-entry invitation retains its original dual-signed request")
+        guest.authenticate(network)
+        revocation = target.client.call("prepare_revoke", {"subject_id": guest.command("identity")["subject_id"]})
+        revocation["event"]["signature"] = target.client.command("sign", **revocation["signing"])
+        target.client.call("revoke", {"event": revocation["event"]})
+        guest.call("rpc", {"method": "nodes"}, status=403)
+        connect(guest, target.peer_id)
+        guest.call("authenticate", {"network_id": network}, status=403)
+        passed("invitation-and-revocation", request_id=receipt["request_id"], network=network, target=target.peer_id)
+        joining = Node(run, "CLI", binary, workspace, fixture, helper, module)
+        nodes.append(joining)
+        joining.pair(target, network, entry_url=c1.url)
+        passed("cli-other-entry-invitation", subject=joining.peer_id, target=target.peer_id)
+        conversation, task = "acceptance-conversation", "auto-route-task"
+        browser.rpc("create_conversation", conversation_id=conversation, title="Automatic routing")
+        browser.rpc("create_task", conversation_id=conversation, task_id=task, title="Route recovery", goal="One execution", acceptance="No replay")
+        browser.rpc("message", conversation_id=conversation, message_id="message-original", text="Keep this context after A disconnects.")
+        opened = request(network, conversation, target, "auto-route-open", "auto-route-session",
+                         {"type": "open", "executor": "claude_code", "cwd": str(workspace)}, task=task)
+        dispatch(browser, opened)
+        wait_for("route fixture session ready", lambda: succeeded(target.client, target, opened["operation_id"]))
+        session = browser.rpc("session", target_node=target.peer_id, session_id="auto-route-session")["session"]
+        unknown = request(network, conversation, target, "auto-route-unknown", "auto-route-session",
+                          {"type": "send", "text": json.dumps({"label": "auto-route", "gate": str(run / "never-release")})},
+                          revision=session["revision"], task=task)
+        connect(browser, target.peer_id, network=network)
+        with c2.lock:
+            circuit = next(item for item in reversed(c2.controls) if item["direction"] == "to_relay"
+                           and item["type"] == "dial" and item.get("target") == target.peer_id)
+        c2.reply_connections = {circuit["connection"]}
+        c2.reply_gate.clear()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(dispatch, browser, unknown)
+            wait_for("exactly one real write starts before its response is delivered", lambda: len(invocations(run, "auto-route")) == 1)
+            c2.pause()
+            try:
+                pending.result(timeout=10)
+                raise AssertionError("withheld write response must remain unconfirmed")
+            except AssertionError as error:
+                require("加密连接已断开" in str(error), "lost reply is reported as an unconfirmed write")
+        target.stop()
+        target.configure(network={"bootstrap_urls": [ws(c1.url)], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        target.start()
+        target.client.connect()
+        target.client.authenticate()
+        wait_for_relay_target(target, c1, 0)
+        stats = connect(browser, target.peer_id, network=network)
+        require(operation(browser, target, unknown["operation_id"])["state"] == "unknown", "same-ID reconciliation preserves the interrupted result")
+        browser.rpc("reconcile", target_node=target.peer_id, operation_id=unknown["operation_id"])
+        require(operation(browser, target, unknown["operation_id"])["state"] == "unknown"
+                and len(invocations(run, "auto-route")) == 1
+                and not any(item.get("rpc_method") == "operate" for item in browser.command("route_stats")["calls"]),
+                "changed path restores reads without replaying the original write")
+        passed("uncertain-write-and-path-change", operation_id=unknown["operation_id"], invocations=1, stats=stats)
+        recovered = fresh(c1.url)
+        backup = verify_recovery(target, recovered, [target], network, entry_url=c1.url)
+        require(backup["network_id"] == network, "automatic-route recovery retains the original network")
+        passed("recovery", network=network, target=target.peer_id)
+        for relay in (r1, r2):
+            with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+                require(database.execute("SELECT COUNT(*) FROM events WHERE network_id=?", (network,)).fetchone()[0] == 0,
+                        "public entries never acquire private network history")
+        require(all(b"Keep this context after A disconnects." not in b"".join(capture.payloads) for capture in (c1, c2)),
+                "relays cannot see encrypted business text")
+        passed("blind-public-entries", private_event_count=0, plaintext_canary_found=False)
+        report["status"] = "passed"
+    except BaseException as error:
+        report["status"] = "failed"
+        report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        for client in reversed(clients):
+            client.close()
+        for node in reversed(nodes):
+            node.client.close()
+            node.stop()
+        for directory in reversed(directories):
+            directory.close()
+        for capture in reversed(captures):
+            capture.close()
+        require(not any(capture.errors for capture in captures), "routing captures remain valid")
+        report["cleanup"] = {"remaining_nodes": sum(node.process is not None for node in nodes),
+                             "remaining_clients": sum(client.process is not None for client in clients),
+                             "remaining_directory_sockets": sum(directory.snapshot()["active_sockets"] for directory in directories)}
+        private_json(run / "report.json", report)
+        if options.evidence_dir:
+            options.evidence_dir.mkdir(parents=True, exist_ok=True)
+            private_json(options.evidence_dir / "auto-route-process.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+
+
 def revoked_remote(client, target):
     client.rpc("session", target_node=target.peer_id, session_id="fixture-main", status=400)
     return True
@@ -5716,11 +6023,14 @@ if __name__ == "__main__":
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run taskless tools, command isolation and startup subscription process checks")
         modes.add_argument("--network-reliability", action="store_true", help="record NET-1 isolated process baselines without provider calls")
+        modes.add_argument("--auto-route", action="store_true", help="check production target routing, invitation, recovery and uncertain writes")
         arguments = parser.parse_args()
         if arguments.net1_lane and not arguments.network_reliability:
             parser.error("--net1-lane requires --network-reliability")
         try:
-            if arguments.network_reliability:
+            if arguments.auto_route:
+                auto_route_acceptance(arguments)
+            elif arguments.network_reliability:
                 network_reliability_acceptance(arguments)
             elif arguments.chat_agent:
                 chat_agent_acceptance(arguments)
