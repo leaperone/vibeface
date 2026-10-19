@@ -4021,7 +4021,9 @@ mod tests {
                 tokio::select! {
                     result = &mut circuit.done => return Ok::<_, anyhow::Error>(result?.unwrap_err()),
                     observation = flows.recv() => {
-                        let observation = observation.context("duplex observations ended")?;
+                        let Some(observation) = observation else {
+                            return Ok((&mut circuit.done).await?.unwrap_err());
+                        };
                         assert_forward_bounds(&observation);
                         accepted = accepted.max(observation.accepted_bytes);
                         if observation.event == "rate_wait" {
