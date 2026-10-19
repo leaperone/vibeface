@@ -59,7 +59,7 @@ Rust 快、慢组可独立运行。Clippy 默认不安装 MSRV，需要时显式
 python3 scripts/ci.py test --tier fast --packages vibeface-bridge vibeface
 python3 scripts/ci.py test --tier slow --packages vibeface
 python3 scripts/ci.py check --packages vibeface
-python3 scripts/ci.py check --packages vibeface --msrv 1.89
+python3 scripts/ci.py check --packages vibeface --msrv 1.91
 ```
 
 MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 Node 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#ci-验证范围) 生成资源和制品，然后设置以下路径：

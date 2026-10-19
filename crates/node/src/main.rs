@@ -18,7 +18,7 @@ use vibeface::{
     identity::local::BootstrapCapability,
     local_access::Launcher,
     maintenance,
-    network::{NetworkConfig, network_url},
+    net::NetworkConfig,
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -38,9 +38,6 @@ struct Cli {
     /// Data directory for direct startup. Subcommands accept their own --data-dir.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Discovery or relay endpoints for direct startup. May be repeated.
-    #[arg(long = "bootstrap-url", value_name = "URL")]
-    bootstrap_urls: Vec<String>,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -55,7 +52,7 @@ enum Action {
     Status(Access),
     /// Manage this user's installed node service and update timer.
     Service(service::Service),
-    /// Display this node's trusted bootstrap or local browser entry.
+    /// Display this node's local browser entry.
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
@@ -82,9 +79,6 @@ struct DataDir {
 struct Serve {
     #[command(flatten)]
     data: DataDir,
-    /// Override discovery or relay endpoints for this run. May be repeated.
-    #[arg(long = "bootstrap-url", value_name = "URL")]
-    bootstrap_urls: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -121,9 +115,6 @@ struct Init {
     /// Existing project directories available to this device's Agent. May be repeated.
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
-    /// Serve Web and public discovery/relay without joining a personal network or starting an Agent.
-    #[arg(long, conflicts_with_all = ["manager", "roots", "codex_socket"])]
-    relay_only: bool,
     /// Require ordinary device pairing for local browser access.
     #[arg(long)]
     no_local_auto_access: bool,
@@ -145,17 +136,18 @@ struct Init {
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
-    /// Discovery or relay endpoints to save in the configuration. May be repeated.
-    #[arg(long = "bootstrap-url", value_name = "URL")]
-    bootstrap_urls: Vec<String>,
-    /// Reachable WebSocket addresses published for this Node. May be repeated.
-    #[arg(long = "advertise-url")]
-    advertise_urls: Vec<String>,
+    /// iroh relay of another Node in the personal network, e.g. `https://relay.example`. May be repeated.
+    #[arg(long = "relay", value_name = "URL")]
+    relays: Vec<String>,
+    /// Run an iroh relay for the personal network on this address.
+    #[arg(long, value_name = "ADDR")]
+    relay_listen: Option<SocketAddr>,
+    /// The relay's URL as other Nodes reach it; defaults to `http://<relay-listen>`.
+    #[arg(long, value_name = "URL", requires = "relay_listen")]
+    relay_url: Option<String>,
+    /// Reach other Nodes only through relays, as behind a strict NAT.
     #[arg(long)]
-    mdns: bool,
-    /// Offer bounded encrypted forwarding to other personal networks.
-    #[arg(long)]
-    public_relay: bool,
+    relay_paths_only: bool,
 }
 
 #[derive(Args)]
@@ -177,29 +169,13 @@ struct Join {
     name: Option<String>,
 }
 
-impl Cli {
-    fn normalize_bootstrap_urls(&mut self) -> Result<()> {
-        let urls = match &mut self.command {
-            None => &mut self.bootstrap_urls,
-            Some(Action::Serve(options)) => &mut options.bootstrap_urls,
-            Some(Action::Init(options)) => &mut options.bootstrap_urls,
-            _ => return Ok(()),
-        };
-        for url in urls {
-            *url = network_url(url)?;
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
-    let mut cli = Cli::parse();
-    cli.normalize_bootstrap_urls()?;
+    let cli = Cli::parse();
     let command = match cli.command {
         Some(command) => command,
         None => {
@@ -207,10 +183,9 @@ async fn main() -> Result<()> {
             if !data_dir.join("config.json").exists() {
                 check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
             }
-            prepare_start(&data_dir, &cli.bootstrap_urls)?;
+            prepare_start(&data_dir)?;
             Action::Serve(Serve {
                 data: DataDir { data_dir },
-                bootstrap_urls: cli.bootstrap_urls,
             })
         }
     };
@@ -220,10 +195,7 @@ async fn main() -> Result<()> {
             init(*options)
         }
         Action::Serve(options) => {
-            let runtime = Arc::new(
-                Runtime::open_with_bootstrap_urls(&options.data.data_dir, &options.bootstrap_urls)
-                    .await?,
-            );
+            let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
             runtime.start().await?;
             eprintln!("Web: {}", runtime.config.public_url);
             if runtime.config.listen.ip().is_loopback()
@@ -268,7 +240,7 @@ fn check_ports(listen: SocketAddr, local_listen: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn prepare_start(dir: &Path, bootstrap_urls: &[String]) -> Result<()> {
+fn prepare_start(dir: &Path) -> Result<()> {
     let empty = match dir.symlink_metadata() {
         Ok(metadata) => {
             ensure!(
@@ -281,9 +253,7 @@ fn prepare_start(dir: &Path, bootstrap_urls: &[String]) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if empty {
-        let mut configuration = Config::local(DEFAULT_LISTEN, vec![], false);
-        configuration.network.bootstrap_urls = bootstrap_urls.to_vec();
-        initialize(dir, configuration)?;
+        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false))?;
     }
     Ok(())
 }
@@ -352,25 +322,19 @@ fn init(options: Init) -> Result<()> {
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
     configuration.local_listen = options.local_listen;
-    configuration.local_auto_access = !options.no_local_auto_access && !options.relay_only;
+    configuration.local_auto_access = !options.no_local_auto_access;
     configuration.codex_socket = options.codex_socket;
     configuration.codex_bin = options.codex_bin;
-    if options.relay_only {
-        configuration.roles = vec![vibeface::model::NodeRole::Relay];
-    }
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     }
     configuration.allowed_origins = options.allowed_origins;
     configuration.network = NetworkConfig {
-        bootstrap_urls: options.bootstrap_urls,
-        advertise_urls: options
-            .advertise_urls
-            .iter()
-            .map(|value| network_url(value))
-            .collect::<Result<_>>()?,
-        mdns: options.mdns,
-        relay_enabled: options.public_relay || options.relay_only,
+        relays: options.relays,
+        relay_listen: options.relay_listen,
+        relay_url: options.relay_url,
+        relay_paths_only: options.relay_paths_only,
+        ..NetworkConfig::default()
     };
     if let Some(manager) = options.manager {
         let workspace = options
@@ -684,7 +648,6 @@ mod tests {
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
         assert!(default.command.is_none() && default.data_dir.is_none());
-        assert!(default.bootstrap_urls.is_empty());
         let direct = Cli::try_parse_from(["vibeface", "--data-dir", "/private/node data"]).unwrap();
         assert!(direct.command.is_none());
         assert_eq!(direct.data_dir.unwrap(), Path::new("/private/node data"));
@@ -695,7 +658,6 @@ mod tests {
         };
         assert!(explicit.data_dir.is_none());
         assert_eq!(options.data.data_dir, Path::new("/private/node data"));
-        assert!(options.bootstrap_urls.is_empty());
         for arguments in [
             vec!["vibeface", "--data-dir", "/one", "serve"],
             vec![
@@ -714,168 +676,52 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_urls_normalize_for_direct_start_serve_and_init() {
-        for command in [None, Some("serve"), Some("init")] {
-            let mut arguments = vec!["vibeface"];
-            arguments.extend(command);
-            arguments.extend([
-                "--bootstrap-url",
-                "https://node.test",
-                "--bootstrap-url",
-                "ws://127.0.0.1:4790/api/network/ws",
-            ]);
-            let mut cli = Cli::try_parse_from(arguments).unwrap();
-            cli.normalize_bootstrap_urls().unwrap();
-            let urls = match cli.command {
-                None => cli.bootstrap_urls,
-                Some(Action::Serve(options)) => options.bootstrap_urls,
-                Some(Action::Init(options)) => options.bootstrap_urls,
-                _ => panic!("expected startup or initialization"),
-            };
-            assert_eq!(
-                urls,
-                [
-                    "wss://node.test/api/network/ws",
-                    "ws://127.0.0.1:4790/api/network/ws"
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_bootstrap_urls_do_not_initialize_data_directories() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "vibeface-invalid-bootstrap-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir(&root)?;
-        for command in [None, Some("serve"), Some("init")] {
-            let dir = root.join(command.unwrap_or("direct"));
-            for url in [
-                "file:///tmp/node",
-                "https://fixture-user:fixture-password@node.test",
-                "https://node.test/?token=fixture-query",
-                "https://node.test/other",
-                "https://node.test/#fragment",
-            ] {
-                let mut arguments = vec!["vibeface"];
-                arguments.extend(command);
-                arguments.extend(["--data-dir", dir.to_str().unwrap(), "--bootstrap-url", url]);
-                let mut cli = Cli::try_parse_from(arguments)?;
-                let error = cli.normalize_bootstrap_urls().unwrap_err().to_string();
-                for secret in ["fixture-user", "fixture-password", "fixture-query"] {
-                    assert!(!error.contains(secret));
-                }
-                assert!(!dir.exists());
-            }
-        }
-        let urls = vec![String::from("wss://node.test/api/network/ws"); 9];
-        assert!(prepare_start(&root.join("direct"), &urls).is_err());
-        let dir = root.join("init");
-        let mut arguments = vec!["vibeface", "init", "--data-dir", dir.to_str().unwrap()];
-        for _ in 0..9 {
-            arguments.extend(["--bootstrap-url", "https://node.test"]);
-        }
-        let mut cli = Cli::try_parse_from(arguments)?;
-        cli.normalize_bootstrap_urls()?;
+    fn relay_flags_are_saved_and_invalid_relays_leave_no_directory() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vibeface-relays-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("node");
+        let cli = Cli::try_parse_from([
+            "vibeface",
+            "init",
+            "--data-dir",
+            dir.to_str().context("temporary path is invalid")?,
+            "--relay",
+            "https://relay.test",
+            "--relay-listen",
+            "127.0.0.1:0",
+            "--relay-paths-only",
+        ])?;
         let Some(Action::Init(options)) = cli.command else {
-            panic!("expected init")
+            bail!("expected init command")
         };
-        assert!(init(*options).is_err());
-        assert!(fs::read_dir(&root)?.next().is_none());
-        fs::remove_dir(root)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn startup_bootstrap_urls_persist_and_overrides_preserve_saved_config() -> Result<()> {
-        let root =
-            std::env::temp_dir().join(format!("vibeface-bootstrap-{}", uuid::Uuid::new_v4()));
-        for command in [None, Some("init")] {
-            let dir = root.join(command.unwrap_or("direct"));
-            let mut arguments = vec!["vibeface"];
-            arguments.extend(command);
-            arguments.extend([
-                "--data-dir",
-                dir.to_str().unwrap(),
-                "--bootstrap-url",
-                "https://first.test",
-                "--bootstrap-url",
-                "http://second.test",
-            ]);
-            let mut cli = Cli::try_parse_from(arguments)?;
-            cli.normalize_bootstrap_urls()?;
-            match cli.command {
-                None => prepare_start(&dir, &cli.bootstrap_urls)?,
-                Some(Action::Init(options)) => init(*options)?,
-                _ => panic!("expected direct startup or init"),
-            }
-            let mut configuration = Config::load(&dir)?;
-            assert_eq!(
-                configuration.network.bootstrap_urls,
-                [
-                    "wss://first.test/api/network/ws",
-                    "ws://second.test/api/network/ws"
-                ]
-            );
-            configuration.roles = vec![vibeface::model::NodeRole::Replica];
-            configuration.codex_socket = Some(dir.join("codex.sock"));
-            configuration.save(&dir)?;
-            let saved = fs::read(dir.join("config.json"))?;
-            let identity = fs::read(dir.join("identity.json"))?;
-            let mut cli = Cli::try_parse_from([
+        init(*options)?;
+        let network = Config::load(&dir)?.network;
+        assert_eq!(network.relays, ["https://relay.test"]);
+        assert_eq!(network.relay_listen, Some("127.0.0.1:0".parse()?));
+        assert!(network.relay_paths_only);
+        for url in [
+            "file:///tmp/node",
+            "https://fixture-user:fixture-password@relay.test",
+            "https://relay.test/?token=fixture-query",
+        ] {
+            let bad = root.join("bad");
+            let cli = Cli::try_parse_from([
                 "vibeface",
-                "serve",
+                "init",
                 "--data-dir",
-                dir.to_str().unwrap(),
-                "--bootstrap-url",
-                "https://override.test",
+                bad.to_str().context("temporary path is invalid")?,
+                "--relay",
+                url,
             ])?;
-            cli.normalize_bootstrap_urls()?;
-            let Some(Action::Serve(options)) = cli.command else {
-                panic!("expected serve")
+            let Some(Action::Init(options)) = cli.command else {
+                bail!("expected init command")
             };
-            prepare_start(&dir, &options.bootstrap_urls)?;
-            let runtime =
-                Runtime::open_with_bootstrap_urls(&options.data.data_dir, &options.bootstrap_urls)
-                    .await?;
-            assert_eq!(
-                runtime.config.network.bootstrap_urls,
-                ["wss://override.test/api/network/ws"]
-            );
-            assert!(Runtime::open(&dir).await.is_err());
-            assert_eq!(fs::read(dir.join("config.json"))?, saved);
-            assert_eq!(fs::read(dir.join("identity.json"))?, identity);
-            drop(runtime);
-            let runtime = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match Runtime::open(&dir).await {
-                        Ok(runtime) => break Ok(runtime),
-                        Err(error)
-                            if matches!(
-                                error.downcast_ref::<std::fs::TryLockError>(),
-                                Some(std::fs::TryLockError::WouldBlock)
-                            ) =>
-                        {
-                            tokio::task::yield_now().await;
-                        }
-                        Err(error) => break Err(error),
-                    }
-                }
-            })
-            .await
-            .context("data directory lock was not released after dropping Runtime")??;
-            assert_eq!(
-                runtime.config.network.bootstrap_urls,
-                [
-                    "wss://first.test/api/network/ws",
-                    "ws://second.test/api/network/ws"
-                ]
-            );
-            assert_eq!(fs::read(dir.join("config.json"))?, saved);
-            assert_eq!(fs::read(dir.join("identity.json"))?, identity);
-            drop(runtime);
+            let error = format!("{:#}", init(*options).unwrap_err());
+            for secret in ["fixture-user", "fixture-password", "fixture-query"] {
+                assert!(!error.contains(secret));
+            }
+            assert!(!bad.exists());
         }
+        assert!(Cli::try_parse_from(["vibeface", "init", "--relay-url", "https://relay.test"]).is_err());
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -889,21 +735,20 @@ mod tests {
             if name == "empty" {
                 fs::create_dir(&dir).unwrap();
             }
-            prepare_start(&dir, &[]).unwrap();
+            prepare_start(&dir).unwrap();
             let mut configuration = Config::load(&dir).unwrap();
             assert_eq!(configuration.listen, "127.0.0.1:4790".parse().unwrap());
             assert_eq!(configuration.public_url, "http://127.0.0.1:4790");
             assert!(configuration.roots.is_empty() && configuration.manager.is_none());
-            assert!(!configuration.allow_insecure_lan && !configuration.network.mdns);
-            assert!(configuration.network.bootstrap_urls.is_empty());
-            assert!(configuration.network.advertise_urls.is_empty());
-            assert!(!configuration.network.relay_enabled);
+            assert!(!configuration.allow_insecure_lan);
+            assert!(configuration.network.relays.is_empty());
+            assert!(configuration.network.relay_listen.is_none() && !configuration.network.n0_relays);
             configuration.timeout_secs = 1234;
             configuration.save(&dir).unwrap();
             let identity = fs::read(dir.join("identity.json")).unwrap();
             let config = fs::read(dir.join("config.json")).unwrap();
             let device_id = config::identity(&dir).unwrap().device_id().unwrap();
-            prepare_start(&dir, &[]).unwrap();
+            prepare_start(&dir).unwrap();
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
             let runtime = Runtime::open(&dir).await.unwrap();
@@ -911,7 +756,7 @@ mod tests {
             assert_eq!(runtime.config.timeout_secs, 1234);
             drop(runtime);
             fs::write(dir.join("config.json"), b"invalid configuration").unwrap();
-            prepare_start(&dir, &[]).unwrap();
+            prepare_start(&dir).unwrap();
             assert!(Runtime::open(&dir).await.is_err());
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(
@@ -922,7 +767,7 @@ mod tests {
         let uninitialized = root.join("uninitialized");
         fs::create_dir(&uninitialized).unwrap();
         fs::write(uninitialized.join("existing-data"), b"preserve me").unwrap();
-        prepare_start(&uninitialized, &[]).unwrap();
+        prepare_start(&uninitialized).unwrap();
         assert!(Runtime::open(&uninitialized).await.is_err());
         assert_eq!(
             fs::read(uninitialized.join("existing-data")).unwrap(),
@@ -931,12 +776,12 @@ mod tests {
         assert!(!uninitialized.join("identity.json").exists());
         let file = root.join("file");
         fs::write(&file, b"preserve file").unwrap();
-        assert!(prepare_start(&file, &[]).is_err());
+        assert!(prepare_start(&file).is_err());
         #[cfg(unix)]
         for target in [root.join("empty"), root.join("absent")] {
             let link = root.join("link");
             std::os::unix::fs::symlink(target, &link).unwrap();
-            assert!(prepare_start(&link, &[]).is_err());
+            assert!(prepare_start(&link).is_err());
             fs::remove_file(link).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
@@ -984,12 +829,12 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "init",
-                "--bootstrap-url",
-                "wss://relay.test/api/network/ws",
-                "--advertise-url",
-                "wss://node.test/api/network/ws",
-                "--mdns",
-                "--public-relay"
+                "--relay",
+                "https://relay.test",
+                "--relay-listen",
+                "0.0.0.0:3340",
+                "--relay-url",
+                "https://relay.test"
             ])
             .is_ok()
         );
@@ -1022,45 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_only_initialization_does_not_join_a_personal_network() -> Result<()> {
-        let dir =
-            std::env::temp_dir().join(format!("vibeface-relay-only-{}", uuid::Uuid::new_v4()));
-        let cli = Cli::try_parse_from([
-            "vibeface",
-            "init",
-            "--relay-only",
-            "--data-dir",
-            dir.to_str().context("temporary path is invalid")?,
-        ])?;
-        let Some(Action::Init(options)) = cli.command else {
-            bail!("expected init command")
-        };
-        init(*options)?;
-        let configuration = Config::load(&dir)?;
-        assert_eq!(configuration.roles, vec![vibeface::model::NodeRole::Relay]);
-        assert!(configuration.network.relay_enabled);
-        assert!(configuration.manager.is_none() && configuration.roots.is_empty());
-        assert!(!configuration.local_auto_access);
-        let store = Store::open_readonly(dir.join("node.sqlite3"))?;
-        assert!(!store.has_network()?);
-        drop(store);
-        assert!(
-            Cli::try_parse_from([
-                "vibeface",
-                "init",
-                "--relay-only",
-                "--manager",
-                "codex_sdk",
-                "--workspace",
-                "."
-            ])
-            .is_err()
-        );
-        fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
     fn node_url_rejects_paths_and_embedded_credentials() {
         for value in [
             "http://user:password@localhost:4790",
@@ -1073,34 +879,6 @@ mod tests {
         assert!(is_loopback(&origin("http://127.0.0.1:4790").unwrap()));
         assert!(is_loopback(&origin("http://[::1]:4790").unwrap()));
         assert!(!is_loopback(&origin("http://192.168.1.5:4790").unwrap()));
-    }
-
-    #[test]
-    fn network_urls_normalize_without_accepting_credentials() {
-        assert_eq!(
-            network_url("ws://node.test").unwrap(),
-            "ws://node.test/api/network/ws"
-        );
-        assert_eq!(
-            network_url("wss://node.test/custom/network").unwrap(),
-            "wss://node.test/custom/network"
-        );
-        assert_eq!(
-            network_url("https://node.test").unwrap(),
-            "wss://node.test/api/network/ws"
-        );
-        assert_eq!(
-            network_url("ws://127.0.0.1:4790/api/network/ws").unwrap(),
-            "ws://127.0.0.1:4790/api/network/ws"
-        );
-        for value in [
-            "file:///tmp/node",
-            "https://user:secret@node.test",
-            "https://node.test/?token=secret",
-            "https://node.test/other",
-        ] {
-            assert!(network_url(value).is_err());
-        }
     }
 
     #[test]

@@ -4,8 +4,6 @@ use crate::{
     identity::{AuthorizationView, GovernanceAction, IdentityKind, NetworkState},
     maintenance::Gate,
     model::*,
-    network::{IncomingSocket, NetworkHub, Service},
-    peer::{AuthorizationDenied, Inbound, PeerHub, RequestFailure},
     store::Store,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -16,7 +14,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 mod agent_tools;
 mod bots;
@@ -25,6 +23,7 @@ mod executor;
 mod followup;
 mod manager_control;
 mod observation;
+mod peers;
 mod schedule_delivery;
 mod settings;
 mod work;
@@ -106,39 +105,6 @@ pub struct Update {
     pub network_id: String,
     pub payload: Value,
 }
-const MAX_ROUTE_FLIGHTS: usize = 128;
-
-#[derive(Clone, Debug)]
-enum RouteFailure {
-    Denied(AuthorizationDenied),
-    Busy,
-    Unavailable(String),
-}
-impl RouteFailure {
-    fn from_error(error: &anyhow::Error) -> Self {
-        if let Some(error) = error.downcast_ref::<AuthorizationDenied>() {
-            Self::Denied(error.clone())
-        } else if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy)
-            || error.downcast_ref::<crate::network::Denied>().is_some()
-        {
-            Self::Busy
-        } else {
-            Self::Unavailable(format!("{error:#}"))
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum RouteFlightState {
-    Connecting,
-    Ready(String),
-    Failed(RouteFailure),
-}
-struct RouteFlight {
-    id: String,
-    state: watch::Sender<RouteFlightState>,
-}
-
 pub struct Runtime {
     pub config: Config,
     pub(crate) data_dir: PathBuf,
@@ -146,9 +112,13 @@ pub struct Runtime {
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
-    pub network: Arc<NetworkHub>,
-    pub hub: Arc<PeerHub>,
-    route_flights: Arc<Mutex<HashMap<(String, String), RouteFlight>>>,
+    net: std::sync::OnceLock<Arc<crate::net::Net>>,
+    router: Mutex<Option<iroh::protocol::Router>>,
+    relay: Mutex<Option<iroh_relay::server::Server>>,
+    sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
+    sync_wakeup: tokio::sync::Notify,
+    have_wakeup: tokio::sync::Notify,
+    outbox_wakeup: tokio::sync::Notify,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
@@ -162,8 +132,6 @@ pub struct Runtime {
     progress_sequence: std::sync::atomic::AtomicU64,
     pub local_access: Arc<crate::local_access::LocalAccess>,
     _process_lock: Arc<std::fs::File>,
-    peer_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
-    network_rx: Mutex<Option<mpsc::Receiver<IncomingSocket>>>,
     executor_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
 pub fn now_ms() -> i64 {
@@ -197,20 +165,12 @@ fn id(v: &Value, key: &str) -> Result<String> {
 }
 impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
-        Self::open_with_bootstrap_urls(dir, &[]).await
-    }
-
-    pub async fn open_with_bootstrap_urls(dir: &Path, bootstrap_urls: &[String]) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
             epoch == json!({"data_epoch":6}),
             "this Node requires an initialized data epoch 6 directory"
         );
-        let mut config = Config::load(dir)?;
-        if !bootstrap_urls.is_empty() {
-            config.network.bootstrap_urls = bootstrap_urls.to_vec();
-            config.network.validate()?;
-        }
+        let config = Config::load(dir)?;
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
@@ -222,8 +182,6 @@ impl Runtime {
             }
         }
         let store = Arc::new(Mutex::new(store));
-        let (hub, peer_rx) = PeerHub::new(identity.clone(), store.clone(), &config.roles);
-        let (network, network_rx) = NetworkHub::new(identity.clone(), config.network.clone());
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         let executor = Arc::new(executor::ExecutorHost::open(&config, &identity, dir, tx)?);
@@ -241,13 +199,17 @@ impl Runtime {
             config,
             identity,
             store,
-            network,
-            hub,
+            net: std::sync::OnceLock::new(),
+            router: Mutex::new(None),
+            relay: Mutex::new(None),
+            sync_peers: std::sync::Mutex::new(HashMap::new()),
+            sync_wakeup: tokio::sync::Notify::new(),
+            have_wakeup: tokio::sync::Notify::new(),
+            outbox_wakeup: tokio::sync::Notify::new(),
             events,
             agent_tokens: Mutex::new(HashMap::new()),
             manager_controls: Mutex::new(HashMap::new()),
             schedule_workers: Mutex::new(BTreeSet::new()),
-            route_flights: Arc::new(Mutex::new(HashMap::new())),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
@@ -257,8 +219,6 @@ impl Runtime {
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             local_access,
             _process_lock: process_lock,
-            peer_rx: Mutex::new(Some(peer_rx)),
-            network_rx: Mutex::new(Some(network_rx)),
             executor_rx: Mutex::new(Some(rx)),
         };
         Ok(node)
@@ -275,6 +235,9 @@ impl Runtime {
         if view.node(&self.identity.device_id()?).is_ok() {
             store.save_local_identity(&view.network_id, &self.identity)?;
         }
+        drop(store);
+        self.forget_revoked(&view).await;
+        self.wake_sync_all();
         Ok(view)
     }
 
@@ -300,98 +263,7 @@ impl Runtime {
         self.start_executor(events);
         self.start_schedule_delivery();
         self.start_observation_worker();
-        let mut receiver = self
-            .peer_rx
-            .lock()
-            .await
-            .take()
-            .context("runtime already started")?;
-        let node = self.clone();
-        tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                let n = node.clone();
-                tokio::spawn(async move {
-                    let response = n.handle_peer(&message).await;
-                    let request_type = message.payload["type"].as_str();
-                    let operation_id = message.payload["operation_id"]
-                        .as_str()
-                        .or_else(|| message.payload["request"]["operation_id"].as_str());
-                    let trigger = message.payload["trigger"].as_str();
-                    tracing::debug!(network=%message.network_id, origin=%message.origin,
-                        request_id=%message.request_id, request_type, operation_id, trigger,
-                        outcome=if response.is_ok() { "ok" } else { "error" },
-                        "peer business request handled");
-                    if !message.broadcast {
-                        let value = response.unwrap_or_else(|e| json!({"error":format!("{e:#}")}));
-                        let _ = n.hub.respond(&message, value).await;
-                    }
-                });
-            }
-        });
-        let mut incoming = self
-            .network_rx
-            .lock()
-            .await
-            .take()
-            .context("runtime already started")?;
-        let node = self.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = incoming.recv().await {
-                let node = node.clone();
-                tokio::spawn(async move {
-                    let result = match incoming.service {
-                        Service::Peer => node.hub.clone().accept_transport(incoming.socket).await,
-                        Service::Client => {
-                            crate::client::serve(node.clone(), incoming.socket).await
-                        }
-                    };
-                    if let Err(error) = result {
-                        tracing::debug!(%error,"authenticated channel closed");
-                    }
-                });
-            }
-        });
-        let transport = self.network.clone();
-        let listen = self.config.listen;
-        tokio::spawn(async move {
-            if let Err(error) = transport.run(listen).await {
-                tracing::warn!(%error,"network discovery stopped");
-            }
-        });
-        let node = self.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(3));
-            loop {
-                tick.tick().await;
-                let Ok(state) = node.store.lock().await.public_state() else {
-                    continue;
-                };
-                let Ok(view) = state.project() else { continue };
-                let online = node.hub.online(&view.network_id).await;
-                for member in view.members.clone().into_iter().filter(|member| {
-                    member.kind == IdentityKind::Node && view.cutoff(&member.device_id).is_none()
-                }) {
-                    if member.device_id == node.identity.device_id().unwrap_or_default()
-                        || online.contains(&member.device_id)
-                    {
-                        continue;
-                    }
-                    if let Err(error) = node
-                        .route_flight(
-                            &view.network_id,
-                            &member.device_id,
-                            "background",
-                            None,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::debug!(%error, "personal peer reconnect pending");
-                    }
-                }
-            }
-        });
-        Ok(())
+        self.start_network().await
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         let store = self.store.lock().await;
@@ -405,6 +277,7 @@ impl Runtime {
     }
     /// Stops the managed App Server; the Node calls this on SIGTERM before exiting.
     pub async fn shutdown(&self) {
+        self.stop_network().await;
         self.executor.stop().await;
     }
     pub async fn append(&self, network: &str, scope: &str, body: EventBody) -> Result<SignedEvent> {
@@ -438,6 +311,7 @@ impl Runtime {
             network_id: network.into(),
             payload: json!({"type":"changed","conversation_id":scope,"event_hash":event_hash}),
         });
+        self.have_wakeup.notify_one();
     }
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
         let state = self.membership_state().await?;
@@ -476,125 +350,6 @@ impl Runtime {
             .await
             .authorize_node(network, &self.identity.device_id()?)?;
         Ok(())
-    }
-    async fn route_flight(
-        &self,
-        network: &str,
-        target: &str,
-        trigger: &'static str,
-        request_type: Option<&str>,
-        operation_id: Option<&str>,
-    ) -> Result<watch::Receiver<RouteFlightState>> {
-        let key = (network.to_owned(), target.to_owned());
-        let mut flights = self.route_flights.lock().await;
-        if let Some(existing) = flights.get(&key) {
-            let state = existing.state.borrow().clone();
-            let current = match &state {
-                RouteFlightState::Ready(id) => self.hub.link_matches(network, target, id).await,
-                _ => true,
-            };
-            if current {
-                tracing::debug!(network, target, flight_id=%existing.id, trigger, request_type, operation_id,
-                    state=?state, "peer route flight joined");
-                return Ok(existing.state.subscribe());
-            }
-            flights.remove(&key);
-        }
-        ensure!(flights.len() < MAX_ROUTE_FLIGHTS, RequestFailure::Busy);
-        let id = uuid::Uuid::new_v4().to_string();
-        let deadline = tokio::time::Instant::now() + crate::network::DIAL_TIMEOUT;
-        let (state, receive) = watch::channel(RouteFlightState::Connecting);
-        flights.insert(
-            key.clone(),
-            RouteFlight {
-                id: id.clone(),
-                state: state.clone(),
-            },
-        );
-        tracing::debug!(network, target, flight_id=%id, trigger, request_type, operation_id, "peer route flight started");
-        let hub = self.hub.clone();
-        let transport = self.network.clone();
-        let registry = self.route_flights.clone();
-        tokio::spawn(async move {
-            let (ready, receive_ready) = oneshot::channel();
-            let connection = hub.connect_target(
-                key.0.clone(),
-                key.1.clone(),
-                transport,
-                Some(ready),
-                deadline,
-            );
-            tokio::pin!(connection);
-            let result = tokio::select! {
-                ready = receive_ready => {
-                    if let Ok(link_id) = ready {
-                        state.send_replace(RouteFlightState::Ready(link_id.clone()));
-                        tracing::debug!(network=%key.0, target=%key.1, flight_id=%id, link_id,
-                            state="ready", "peer route flight ready");
-                    }
-                    connection.await
-                }
-                result = &mut connection => result,
-            };
-            let failure = match result {
-                Err(error) => RouteFailure::from_error(&error),
-                Ok(()) => RouteFailure::Unavailable("peer connection closed".to_owned()),
-            };
-            tracing::debug!(network=%key.0, target=%key.1, flight_id=%id,
-                state=?failure, "peer route flight finished");
-            state.send_replace(RouteFlightState::Failed(failure));
-            let mut flights = registry.lock().await;
-            if flights.get(&key).is_some_and(|entry| entry.id == id) {
-                flights.remove(&key);
-            }
-        });
-        Ok(receive)
-    }
-
-    async fn raw_peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
-        let local = self.identity.device_id()?;
-        self.hub.authorize(network, &local).await?;
-        self.hub.authorize(network, target).await?;
-        if target != local && !self.hub.has_route(network, target).await {
-            let request_type = payload["type"].as_str();
-            let operation_id = payload["operation_id"]
-                .as_str()
-                .or_else(|| payload["request"]["operation_id"].as_str());
-            let mut receive = self
-                .route_flight(network, target, "on_demand", request_type, operation_id)
-                .await?;
-            loop {
-                let state = receive.borrow().clone();
-                match state {
-                    RouteFlightState::Connecting => receive
-                        .changed()
-                        .await
-                        .map_err(|_| RequestFailure::NoRoute)?,
-                    RouteFlightState::Ready(_) => break,
-                    RouteFlightState::Failed(RouteFailure::Denied(error)) => {
-                        return Err(error.into());
-                    }
-                    RouteFlightState::Failed(RouteFailure::Busy) => {
-                        return Err(RequestFailure::Busy.into());
-                    }
-                    RouteFlightState::Failed(RouteFailure::Unavailable(error)) => {
-                        tracing::debug!(network, target, %error, "peer route unavailable before first send");
-                        break;
-                    }
-                }
-            }
-        }
-        self.hub.authorize(network, &local).await?;
-        self.hub.authorize(network, target).await?;
-        self.hub.request(network, target, payload).await
-    }
-
-    async fn peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
-        let reply = self.raw_peer_request(network, target, payload).await?;
-        if let Some(error) = reply["error"].as_str() {
-            bail!("{error}");
-        }
-        Ok(reply)
     }
     async fn capabilities(&self) -> Value {
         use executor::Executor as _;
@@ -652,37 +407,33 @@ impl Runtime {
                     .await
                     .trust_bundle(network)?
                     .context("unknown network")?;
-                let online = self.hub.online(network).await;
                 let local = self.identity.device_id()?;
                 let max_seq = self.store.lock().await.version_vector(network)?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
                 let display_names = node_display_names(&bundle);
-                for member in view
+                let members: Vec<_> = view
                     .members
                     .into_iter()
                     .filter(|member| member.kind == IdentityKind::Node)
-                {
+                    .collect();
+                let probes = members.iter().map(|member| async {
+                    if member.device_id == local {
+                        return self.capabilities().await;
+                    }
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        self.peer_request(network, &member.device_id, json!({"type":"capabilities"})),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(Value::Null)
+                });
+                let probes = futures_util::future::join_all(probes).await;
+                for (member, capabilities) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
-                    let live = here || online.contains(&member.device_id);
-                    let capabilities = if here {
-                        self.capabilities().await
-                    } else if live {
-                        tokio::time::timeout(
-                            Duration::from_secs(3),
-                            self.peer_request(
-                                network,
-                                &member.device_id,
-                                json!({"type":"capabilities"}),
-                            ),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    };
+                    let live = !capabilities.is_null();
                     let roles = capabilities.get("roles").cloned().unwrap_or(json!([]));
                     let seq = max_seq.get(&member.device_id).copied().unwrap_or(0);
                     nodes.push(json!({"device_id":member.device_id,"name":member.name,"roles":roles,"revoked":false,"local":here,"online":live,"max_seq":seq,"capabilities":capabilities}));
@@ -806,66 +557,5 @@ impl Runtime {
         );
         ensure!(path.is_dir(), "execution path must be a directory");
         Ok(path)
-    }
-    async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
-        self.membership_state().await?;
-        let network = &message.network_id;
-        let input = &message.payload;
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, &message.origin)?;
-        let kind = field(input, "type")?;
-        let _work = (!matches!(kind, "capabilities" | "progress_read"))
-            .then(|| self.maintenance.enter())
-            .transpose()?;
-        match kind {
-            "capabilities" => Ok(self.capabilities().await),
-            "trust" => {
-                let state: NetworkState = serde_json::from_value(input["state"].clone())?;
-                ensure!(
-                    state.genesis.network_id == *network,
-                    "wrong membership network"
-                );
-                self.install_membership(state).await?;
-                Ok(json!({"received":true}))
-            }
-            "manager_status" => {
-                self.manager_status(
-                    network,
-                    field(input, "conversation_id")?,
-                    field(input, "trigger")?,
-                )
-                .await
-            }
-            "progress_read" => {
-                ensure!(
-                    !message.broadcast,
-                    "progress observation requires a direct request"
-                );
-                self.read_progress(network, &message.origin, input).await
-            }
-            "cancel_manager" | "reconcile" | "resolve" => {
-                self.store
-                    .lock()
-                    .await
-                    .authorize_node(network, &message.origin)?;
-                ensure!(
-                    input["human"] == true,
-                    "management control requires the user"
-                );
-                let access = Access {
-                    network_id: network.clone(),
-                    human: true,
-                    conversation_id: Some(field(input, "conversation_id")?.into()),
-                    manager: None,
-                };
-                match kind {
-                    "cancel_manager" => self.cancel_manager(&access, input).await,
-                    _ => self.pending_check_control(&access, input, kind).await,
-                }
-            }
-            _ => bail!("unknown peer message"),
-        }
     }
 }

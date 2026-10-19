@@ -136,8 +136,8 @@ pub struct AdmissionReceipt {
     pub state: String,
 }
 
-/// A user message whose conversation owner is another Node. Phase 1 has no delivery loop:
-/// the message waits here and the UI shows the owner as offline.
+/// A user message whose conversation owner is another Node, kept until the owner returns a
+/// receipt for its trigger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
     pub version: u32,

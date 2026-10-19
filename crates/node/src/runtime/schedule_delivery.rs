@@ -1,5 +1,5 @@
 //! Local scheduling: the owner Node drains its durable admissions one conversation at a time.
-//! Phase 1 has no cross-device delivery; a message for another owner waits in the outbox.
+//! A message for another owner waits in the outbox until `peers` delivers it.
 use super::*;
 use crate::scheduling::{JobOutcome, JobState, PendingCheck, SchedulerJob};
 use futures_util::FutureExt;
@@ -159,6 +159,7 @@ impl Runtime {
     pub(super) fn spawn_scheduler(&self, _network: &str, _scope: &str) -> Result<()> {
         let _work = self.maintenance.enter()?;
         self.schedule_wakeup.notify_one();
+        self.outbox_wakeup.notify_one();
         Ok(())
     }
 

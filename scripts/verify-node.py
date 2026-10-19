@@ -2030,7 +2030,7 @@ def verify_web_assets(node, module):
     require(uses_external_crypto, "client chunks import the single same-origin generated cryptography module")
     require({"text/css", "text/javascript", "font/woff2"} <= content_types,
             "real JavaScript, CSS and bundled font resources are reachable")
-    for path in ("/api", "/api/not-a-route", "/peer/not-a-route", "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+    for path in ("/api", "/api/not-a-route", "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
                  "/assets", "/assets/not-a-file", "/assets/missing.js", "/generated", "/generated/not-a-file", "/missing.css"):
         body, missing_headers = fetch(path, status=404)
         require(body != shell and missing_headers["Cache-Control"] == "no-store", "unknown API and assets return uncached 404, never the SPA shell")
@@ -2823,7 +2823,7 @@ def web_acceptance(options):
               "not_checked": ["Node business tests", "provider behavior", "rendered browser UI"]}
     node = None
     try:
-        node = Node(run, "WEB", binary, workspace, None, None, module, relay_only=True)
+        node = Node(run, "WEB", binary, workspace, None, None, module)
         node.configure(codex_socket=str(run / "unavailable.sock"))
         node.start()
         verify_web_assets(node, module)

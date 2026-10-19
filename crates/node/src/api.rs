@@ -22,11 +22,23 @@ use tokio::net::TcpListener;
 
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
+const MAX_CLIENT_SOCKETS: usize = 256;
 
 #[derive(Clone)]
 struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
+    clients: Arc<tokio::sync::Semaphore>,
+}
+
+impl App {
+    fn new(node: Arc<Runtime>, sites: Vec<Site>) -> Self {
+        Self {
+            node,
+            sites,
+            clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -155,10 +167,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 }
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
-    let app = App {
-        node,
-        sites: vec![site],
-    };
+    let app = App::new(node, vec![site]);
     Router::new()
         .route("/api/tools", post(tool))
         .route(
@@ -191,7 +200,7 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
 }
 
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
-    let app = App { sites, node };
+    let app = App::new(node, sites);
     let mut routes = Router::new()
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
@@ -199,8 +208,6 @@ fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
         .route("/api/info", get(info))
         .route("/api/local/setup", post(local_setup))
         .route("/api/client", get(client_gateway))
-        .route("/peer", get(peer))
-        .route("/api/network/ws", get(network))
         .fallback(frontend);
     if local {
         routes = routes
@@ -277,10 +284,9 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    let site = if path == "/api/network/ws" && *method == Method::GET {
-        host_site(&app.sites, headers)?
-    } else if path == "/api/client" && *method == Method::GET {
-        // Cross-origin by design: any of this Node's browser origins may use it as a Gateway.
+    let site = if path == "/api/client" && *method == Method::GET {
+        // Cross-origin by design: this Node's browser origins and those of the personal
+        // network's other Gateways, as their signed address records state them.
         let site = host_site(&app.sites, headers)?;
         if let Some(origin) = headers.get(header::ORIGIN) {
             let origin = one_header(headers, header::ORIGIN.as_str())
@@ -290,6 +296,7 @@ async fn check_boundary(
                 .sites
                 .iter()
                 .any(|site| site.origin.eq_ignore_ascii_case(origin))
+                && !app.node.member_gateway_origin(origin).await
             {
                 return Err(ApiError::forbidden());
             }
@@ -497,7 +504,7 @@ async fn local_websocket(
         .on_upgrade(move |socket| async move {
             if let Err(error) = crate::client::serve_local(
                 app.node,
-                crate::network::NetworkSocket::server(socket),
+                crate::client::ClientSocket::server(socket),
                 cookie,
             )
             .await
@@ -677,52 +684,19 @@ fn validate_tool_call(name: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn network(
-    State(app): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    websocket: WebSocketUpgrade,
-) -> Response {
-    let admission = match app.node.network.admit(peer.ip()) {
-        Ok(admission) => admission,
-        Err(error) => {
-            let status = if error.rate() {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            return (status, error.code()).into_response();
-        }
+async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
+    let Ok(permit) = app.clients.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many client connections").into_response();
     };
     websocket
         .max_message_size(65535)
         .max_frame_size(65535)
         .on_upgrade(move |socket| async move {
-            if let Err(error) = app.node.network.clone().accept(socket, admission).await {
-                tracing::debug!(%error, "network connection closed");
-            }
-        })
-}
-
-async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
-    websocket
-        .max_message_size(65535)
-        .max_frame_size(65535)
-        .on_upgrade(move |socket| async move {
-            let socket = crate::network::NetworkSocket::server(socket);
+            let socket = crate::client::ClientSocket::server(socket);
             if let Err(error) = crate::client::serve_gateway(app.node, socket).await {
                 tracing::debug!(%error, "client connection closed");
             }
-        })
-}
-
-async fn peer(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
-    websocket
-        .max_message_size(MAX_BODY_BYTES)
-        .max_frame_size(MAX_BODY_BYTES)
-        .on_upgrade(move |socket| async move {
-            if let Err(error) = app.node.hub.clone().accept(socket).await {
-                tracing::warn!(%error, "peer connection closed");
-            }
+            drop(permit);
         })
 }
 
@@ -732,11 +706,7 @@ mod web_assets {
 
 async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     let path = uri.path();
-    if path == "/api"
-        || path.starts_with("/api/")
-        || path == "/peer"
-        || path.starts_with("/peer/")
-        || path.starts_with("/sdk.v1.")
+    if path == "/api" || path.starts_with("/api/") || path.starts_with("/sdk.v1.")
     {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     }

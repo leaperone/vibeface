@@ -18,6 +18,8 @@ pub(crate) mod bots;
 mod log;
 mod reduce;
 pub(crate) mod scheduler;
+mod sync;
+pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
 #[cfg(test)]
 mod tests;
 pub(crate) mod work;

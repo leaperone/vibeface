@@ -48,7 +48,7 @@ vibeface
 
 ## 从源码开始
 
-从源码构建需要 Rust 1.89+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行任务前，安装并登录需要的 SDK 和 Codex CLI。
+从源码构建需要 Rust 1.91+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行任务前，安装并登录需要的 SDK 和 Codex CLI。
 
 ```sh
 rustup target add wasm32-unknown-unknown

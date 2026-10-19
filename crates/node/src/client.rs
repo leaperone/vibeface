@@ -10,12 +10,18 @@ use crate::{
         RootCheckpoint,
         local::{Join, JoinRequest, JoinStatus},
     },
-    network::NetworkSocket,
+    net::{self, Net, NetworkConfig},
     runtime::{Access, Runtime},
 };
-use anyhow::{Context, Result, bail, ensure};
-use axum::extract::ws::Message;
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
+use iroh::{
+    EndpointAddr, TransportAddr,
+    endpoint::{Connection, ReadExactError, RecvStream, SendStream},
+};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +39,139 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
+const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
+
+type NativeSocket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// A client channel: the browser's WebSocket, the CLI's, or a stream another Gateway forwards
+/// over `vibeface/client/1`. Forwarded frames are `tag ‖ u32 length ‖ bytes`.
+pub enum ClientSocket {
+    Server(Box<WebSocket>),
+    Client(Box<NativeSocket>),
+    Forwarded(Box<Forwarded>),
+}
+
+pub struct Forwarded {
+    send: SendStream,
+    frames: mpsc::Receiver<Result<Message>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+impl Drop for Forwarded {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+impl ClientSocket {
+    pub fn server(socket: WebSocket) -> Self {
+        Self::Server(Box::new(socket))
+    }
+
+    fn forwarded(send: SendStream, mut recv: RecvStream) -> Self {
+        let (frames, receiver) = mpsc::channel(16);
+        let reader = tokio::spawn(async move {
+            loop {
+                let frame = match read_forwarded(&mut recv).await {
+                    Ok(Some(frame)) => Ok(frame),
+                    Ok(None) => return,
+                    Err(error) => Err(error),
+                };
+                let failed = frame.is_err();
+                if frames.send(frame).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Self::Forwarded(Box::new(Forwarded {
+            send,
+            frames: receiver,
+            reader,
+        }))
+    }
+
+    /// Cancel-safe, so callers may race it in `select!`.
+    pub async fn next(&mut self) -> Option<Result<Message>> {
+        match self {
+            Self::Server(socket) => socket.next().await.map(|frame| frame.map_err(Into::into)),
+            Self::Client(socket) => loop {
+                let frame = match socket.next().await? {
+                    Ok(frame) => frame,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                return Some(Ok(match frame {
+                    NativeMessage::Text(text) => Message::Text(text.as_str().to_owned().into()),
+                    NativeMessage::Binary(bytes) => Message::Binary(bytes),
+                    NativeMessage::Ping(bytes) => Message::Ping(bytes),
+                    NativeMessage::Pong(bytes) => Message::Pong(bytes),
+                    NativeMessage::Close(_) => Message::Close(None),
+                    NativeMessage::Frame(_) => continue,
+                }));
+            },
+            Self::Forwarded(forwarded) => forwarded.frames.recv().await,
+        }
+    }
+
+    pub async fn send(&mut self, message: Message) -> Result<()> {
+        match self {
+            Self::Server(socket) => socket.send(message).await.map_err(Into::into),
+            Self::Client(socket) => socket
+                .send(match message {
+                    Message::Text(text) => NativeMessage::Text(text.as_str().to_owned().into()),
+                    Message::Binary(bytes) => NativeMessage::Binary(bytes),
+                    Message::Ping(bytes) => NativeMessage::Ping(bytes),
+                    Message::Pong(bytes) => NativeMessage::Pong(bytes),
+                    Message::Close(_) => NativeMessage::Close(None),
+                })
+                .await
+                .map_err(Into::into),
+            Self::Forwarded(forwarded) => {
+                let (tag, bytes) = match message {
+                    Message::Binary(bytes) => (0, bytes.to_vec()),
+                    Message::Text(text) => (1, text.as_str().as_bytes().to_vec()),
+                    Message::Ping(bytes) => (2, bytes.to_vec()),
+                    Message::Pong(bytes) => (3, bytes.to_vec()),
+                    Message::Close(_) => {
+                        forwarded.send.finish().ok();
+                        return Ok(());
+                    }
+                };
+                ensure!(bytes.len() <= MAX_FORWARDED_FRAME, "client frame too large");
+                let mut frame = vec![tag];
+                frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                frame.extend_from_slice(&bytes);
+                forwarded
+                    .send
+                    .write_all(&frame)
+                    .await
+                    .map_err(|error| anyhow!("forwarded client stream failed: {error}"))
+            }
+        }
+    }
+}
+
+async fn read_forwarded(recv: &mut RecvStream) -> Result<Option<Message>> {
+    let mut header = [0u8; 5];
+    match recv.read_exact(&mut header).await {
+        Ok(()) => {}
+        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(error) => bail!("forwarded client stream failed: {error}"),
+    }
+    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    ensure!(length <= MAX_FORWARDED_FRAME, "client frame too large");
+    let mut bytes = vec![0; length];
+    recv.read_exact(&mut bytes)
+        .await
+        .map_err(|error| anyhow!("forwarded client stream failed: {error}"))?;
+    Ok(Some(match header[0] {
+        0 => Message::Binary(bytes.into()),
+        1 => Message::Text(String::from_utf8(bytes)?.into()),
+        2 => Message::Ping(bytes.into()),
+        3 => Message::Pong(bytes.into()),
+        _ => bail!("unknown forwarded client frame"),
+    }))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,7 +214,7 @@ struct Principal {
 }
 
 pub struct Client {
-    socket: NetworkSocket,
+    socket: ClientSocket,
     channel: Channel,
 }
 impl Client {
@@ -87,7 +226,7 @@ impl Client {
         )
         .await
         .context("Gateway connection timed out")??;
-        let mut socket = NetworkSocket::Client(Box::new(socket));
+        let mut socket = ClientSocket::Client(Box::new(socket));
         let connect = serde_json::to_string(&Connect::Connect {
             target: target.to_owned(),
         })?;
@@ -95,7 +234,7 @@ impl Client {
         Self::from_socket(socket, identity, target).await
     }
     async fn from_socket(
-        mut socket: NetworkSocket,
+        mut socket: ClientSocket,
         identity: &LocalIdentity,
         target: &str,
     ) -> Result<Self> {
@@ -142,8 +281,9 @@ impl Client {
     }
 }
 
-/// `/api/client`: read the connect frame, then end Noise here when the target is this Node.
-pub async fn serve_gateway(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> {
+/// `/api/client`: read the connect frame, then end Noise here when the target is this Node,
+/// or relay the ciphertext to the target member Node over `vibeface/client/1`.
+pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Result<()> {
     let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next())
         .await
         .context("connect frame timed out")?
@@ -153,27 +293,103 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: NetworkSocket) -> Res
     };
     let Connect::Connect { target } =
         serde_json::from_str(&text).context("invalid connect frame")?;
-    if target != node.identity.device_id()? {
-        // ponytail: phase 3 forwards other targets over iroh `vibeface/client/1`.
-        let error = json!({"type":"error","error":"this Gateway can only reach itself"});
-        let _ = socket.send(Message::Text(error.to_string().into())).await;
-        bail!("client target is not this Node");
+    if target == node.identity.device_id()? {
+        return serve_session(node, socket, None).await;
     }
-    serve_session(node, socket, None).await
+    let forwarded = match open_forward(&node, &target).await {
+        Ok(forwarded) => forwarded,
+        Err((code, error)) => {
+            let refusal = json!({"type":"error","code":code,"error":format!("{error:#}")});
+            let _ = socket.send(Message::Text(refusal.to_string().into())).await;
+            return Err(error.context("client target refused"));
+        }
+    };
+    relay_frames(socket, forwarded).await
 }
 
-pub async fn serve_local(node: Arc<Runtime>, socket: NetworkSocket, cookie: String) -> Result<()> {
+async fn open_forward(
+    node: &Runtime,
+    target: &str,
+) -> std::result::Result<ClientSocket, (&'static str, anyhow::Error)> {
+    let member = async {
+        let network = node.membership_state().await?.genesis.network_id;
+        node.store.lock().await.authorize_node(&network, target)
+    };
+    member.await.map_err(|error| ("target_not_member", error))?;
+    let opened = async {
+        let connection = node.net()?.connect(target, net::CLIENT).await?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|error| anyhow!("target connection closed: {error}"))?;
+        Ok::<_, anyhow::Error>(ClientSocket::forwarded(send, recv))
+    };
+    opened.await.map_err(|error| ("target_unreachable", error))
+}
+
+/// Copies frames both ways without reading them; the Noise session ends at the target.
+async fn relay_frames(mut client: ClientSocket, mut target: ClientSocket) -> Result<()> {
+    loop {
+        tokio::select! {
+            frame = client.next() => match frame {
+                Some(Ok(Message::Close(_))) | None => return Ok(()),
+                Some(frame) => target.send(frame?).await?,
+            },
+            frame = target.next() => match frame {
+                None => return Ok(()),
+                Some(frame) => client.send(frame?).await?,
+            },
+        }
+    }
+}
+
+/// The target side of `vibeface/client/1`: each stream is one forwarded client session.
+pub async fn serve_forwarded(node: Arc<Runtime>, connection: Connection) -> Result<()> {
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        let node = node.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                serve_session(node, ClientSocket::forwarded(send, recv), None).await
+            {
+                tracing::debug!(%error, "forwarded client session closed");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// `vibeface/join/1`: any device may call `join` and `join_status`, nothing else. QUIC proves
+/// the caller's key, so the session's device is the connection's remote ID.
+pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: String) -> Result<()> {
+    net::serve_streams(connection, move |request: Value| {
+        let (node, remote) = (node.clone(), remote.clone());
+        async move {
+            let method = text(&request, "method")?;
+            ensure!(
+                matches!(method, "join" | "join_status") && request["params"].is_object(),
+                "a join connection only joins"
+            );
+            let mut session = Session {
+                device_id: remote,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            };
+            let result = dispatch(&node, &mut session, method, request["params"].clone()).await?;
+            Ok(json!({"result":result}))
+        }
+    })
+    .await;
+    Ok(())
+}
+
+pub async fn serve_local(node: Arc<Runtime>, socket: ClientSocket, cookie: String) -> Result<()> {
     serve_session(node, socket, Some(cookie)).await
-}
-
-/// Legacy multi-hop network sockets; phase 3 removes them with `network.rs`.
-pub async fn serve(node: Arc<Runtime>, socket: NetworkSocket) -> Result<()> {
-    serve_session(node, socket, None).await
 }
 
 async fn serve_session(
     node: Arc<Runtime>,
-    mut socket: NetworkSocket,
+    mut socket: ClientSocket,
     cookie: Option<String>,
 ) -> Result<()> {
     let mut local_changes = node.local_access.subscribe();
@@ -297,6 +513,7 @@ async fn dispatch(
             | "subscribe"
             | "join_status"
             | "recovery_state"
+            | "entrances"
     ) {
         None
     } else {
@@ -398,7 +615,16 @@ async fn dispatch(
                 .lock()
                 .await
                 .register_invite(&record, &session.device_id)?;
-            Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?}))
+            let entry = node.net().ok().map(|net| {
+                let addr = net.addr();
+                json!({"relay_url":addr.relay_urls().next(),
+                    "direct_addrs":addr.ip_addrs().take(8).collect::<Vec<_>>()})
+            });
+            Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry}))
+        }
+        "entrances" => {
+            let principal = principal(node, session).await?;
+            Ok(json!({"entrances":node.entrances(&principal.network_id).await?}))
         }
         "join" => {
             let join: Join = serde_json::from_value(params).context("invalid join request")?;
@@ -428,7 +654,10 @@ async fn dispatch(
             }
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
-                result["state"] = serde_json::to_value(node.membership_state().await?)?;
+                let state = node.membership_state().await?;
+                result["addresses"] =
+                    json!(node.store.lock().await.address_book(&state.genesis.network_id)?);
+                result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
         }
@@ -452,7 +681,6 @@ async fn dispatch(
                     .await
                     .approve_grant(join_id, admin, event)?;
                 node.install_membership(state.clone()).await?;
-                announce_membership(node, &state).await;
                 request
             };
             notify_join(node, &request);
@@ -469,7 +697,6 @@ async fn dispatch(
             let mut state = node.membership_state().await?;
             state.append(event)?;
             node.install_membership(state.clone()).await?;
-            announce_membership(node, &state).await;
             authentication(node, session).await
         }
         "recovery_state" => {
@@ -546,7 +773,6 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
             .node(&node.identity.device_id()?)
             .context("this recovery removes this Node; send it to a Node that stays")?;
         node.install_membership(state.clone()).await?;
-        announce_membership(node, &state).await;
     }
     Ok(())
 }
@@ -636,27 +862,8 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
 }
 
 async fn connection_entry(node: &Runtime) -> Result<Value> {
-    let entry = node.network.bootstrap_url().await;
-    let mut url = reqwest::Url::parse(entry.as_deref().unwrap_or(&node.config.public_url))?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        scheme => scheme,
-    }
-    .to_owned();
-    url.set_scheme(&scheme)
-        .map_err(|_| anyhow::anyhow!("invalid public browser entry"))?;
+    let url = reqwest::Url::parse(&node.config.public_url)?;
     Ok(json!({"address":url.origin().ascii_serialization(),"device_id":node.identity.device_id()?}))
-}
-
-async fn announce_membership(node: &Runtime, state: &NetworkState) {
-    let _ = node
-        .hub
-        .broadcast(
-            &state.genesis.network_id,
-            json!({"type":"trust","state":state}),
-        )
-        .await;
 }
 
 fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
@@ -725,9 +932,51 @@ struct PendingJoin {
     nonce: String,
 }
 
+/// The joining Node's side of `vibeface/join/1`, through the ticket's addresses. The relay
+/// admits a non-member holding the invite's derived token.
+struct JoinLink {
+    net: Net,
+    entry: String,
+}
+impl JoinLink {
+    async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
+        let entry = ticket.entry_id();
+        let token = net::relay_token(&ticket.invite_hash());
+        let relays = ticket
+            .entry
+            .relay_url
+            .iter()
+            .map(|url| Ok((net::relay_url(url)?, Some(token.clone()))))
+            .collect::<Result<Vec<_>>>()?;
+        let mut addrs: Vec<TransportAddr> = relays
+            .iter()
+            .map(|(url, _)| TransportAddr::Relay(url.clone()))
+            .collect();
+        addrs.extend(ticket.entry.direct_addrs.iter().copied().map(TransportAddr::Ip));
+        ensure!(!addrs.is_empty(), "this invite carries no address of its entry Node");
+        let config = NetworkConfig {
+            relay_paths_only: node.config.network.relay_paths_only,
+            ..NetworkConfig::default()
+        };
+        let link = Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?;
+        link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
+            .await;
+        Ok(Self { net: link, entry })
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let request = json!({"method":method,"params":params});
+        let reply = self
+            .net
+            .request(&self.entry, net::JOIN, &request, CALL_TIMEOUT)
+            .await?;
+        Ok(reply["result"].clone())
+    }
+}
+
 /// `vibeface join`: this Node asks the ticket's entry to admit it and waits for approval.
 pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkState> {
-    let (origin, ticket) = parse_join_link(link)?;
+    let (_, ticket) = parse_join_link(link)?;
     let node = Runtime::open(dir).await?;
     ensure!(
         !node.has_membership().await?,
@@ -749,8 +998,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
     );
     crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
     let device = node.identity.device_id()?;
-    let entry = ticket.entry_id();
-    let mut client = Client::connect(&origin, &node.identity, &entry).await?;
+    let client = JoinLink::open(&node, &ticket).await?;
     let request: JoinRequest = serde_json::from_value(
         client
             .call(
@@ -785,6 +1033,10 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
                 );
                 state.project()?.node(&device)?;
                 node.install_membership(state.clone()).await?;
+                let addresses: Vec<net::SignedAddress> =
+                    serde_json::from_value(status["addresses"].clone()).unwrap_or_default();
+                node.merge_addresses(&request.network_id, addresses).await?;
+                client.net.close().await;
                 let _ = std::fs::remove_file(&path);
                 return Ok(state);
             }
@@ -863,7 +1115,7 @@ fn validate_request(request: &Request) -> Result<()> {
     );
     Ok(())
 }
-async fn send_frame(socket: &mut NetworkSocket, record: Vec<u8>) -> Result<()> {
+async fn send_frame(socket: &mut ClientSocket, record: Vec<u8>) -> Result<()> {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         socket.send(Message::Binary(record.into())),
@@ -871,7 +1123,7 @@ async fn send_frame(socket: &mut NetworkSocket, record: Vec<u8>) -> Result<()> {
     .await
     .context("client send timed out")?
 }
-async fn next_binary(socket: &mut NetworkSocket) -> Result<Vec<u8>> {
+async fn next_binary(socket: &mut ClientSocket) -> Result<Vec<u8>> {
     while let Some(frame) = socket.next().await {
         match frame? {
             Message::Binary(bytes) => {
@@ -886,7 +1138,7 @@ async fn next_binary(socket: &mut NetworkSocket) -> Result<Vec<u8>> {
     bail!("client disconnected")
 }
 async fn send_value<T: Serialize>(
-    socket: &mut NetworkSocket,
+    socket: &mut ClientSocket,
     channel: &mut Channel,
     value: &T,
 ) -> Result<()> {
@@ -896,7 +1148,7 @@ async fn send_value<T: Serialize>(
     }
     Ok(())
 }
-async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Result<Vec<u8>> {
+async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Result<Vec<u8>> {
     loop {
         if let Some(value) = secure(channel.open_record(&next_binary(socket).await?))? {
             return Ok(value);
@@ -976,14 +1228,6 @@ mod tests {
             dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
             json!({"address":"http://127.0.0.1:4790","device_id":node.identity.device_id()?})
         );
-        node.network
-            .add_bootstrap("wss://relay.example/custom-route")
-            .await?;
-        assert!(node.config.network.bootstrap_urls.is_empty());
-        assert_eq!(
-            dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
-            json!({"address":"https://relay.example","device_id":node.identity.device_id()?})
-        );
         let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
         assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
         let before = std::fs::read(dir.join("config.json"))?;
@@ -1010,8 +1254,8 @@ mod tests {
         let mut latest = Config::load(&dir)?;
         latest
             .network
-            .bootstrap_urls
-            .push("wss://relay.example/api/network/ws".into());
+            .relays
+            .push("https://relay.example/".into());
         latest.daily_decision_limit = 11;
         latest.save(&dir)?;
         let settings = crate::runtime::NodeSettings {
@@ -1081,10 +1325,7 @@ mod tests {
         );
         assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
         let persisted = Config::load(&dir)?;
-        assert_eq!(
-            persisted.network.bootstrap_urls,
-            latest.network.bootstrap_urls
-        );
+        assert_eq!(persisted.network.relays, latest.network.relays);
         assert_eq!(persisted.daily_decision_limit, 11);
         assert_eq!(
             dispatch(
@@ -1148,7 +1389,7 @@ mod tests {
             let mut request = endpoint.into_client_request()?;
             request.headers_mut().insert("cookie", cookie.parse()?);
             let (socket, _) = tokio_tungstenite::connect_async(request).await?;
-            Client::from_socket(NetworkSocket::Client(Box::new(socket)), identity, target).await
+            Client::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
         }
 
         async fn browser_node(
@@ -1494,7 +1735,7 @@ mod tests {
             assert_eq!(recovered["principal"]["can_manage"], true);
             assert_eq!(manager.call("authenticate", json!({})).await?["principal"]["epoch"], epoch);
 
-            // Only this Node is reachable in phase 2, and its key is pinned.
+            // A target outside the personal network is refused.
             assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());
 
             // `/api/client` takes the configured cross-origin page; other paths stay same-origin.
@@ -1504,7 +1745,7 @@ mod tests {
                 Ok(request)
             };
             let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
-            let mut socket = NetworkSocket::Client(Box::new(socket));
+            let mut socket = ClientSocket::Client(Box::new(socket));
             socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
             let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
             assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
