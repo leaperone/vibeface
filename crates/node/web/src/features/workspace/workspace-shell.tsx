@@ -76,7 +76,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     setCreatingBot(true); setOpenMobile(false)
   }
 
-  const waitingHere = Boolean(workspace.data?.native_sessions.some((session) => session.pending_requests.length))
+  const waitingHere = Boolean(workspace.data?.works.some((work) => work.open_approvals.length))
 
   return (
     <CreateBot.Provider value={openCreator}>

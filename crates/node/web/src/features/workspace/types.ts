@@ -9,35 +9,27 @@ export type NodeInfo = {
   roles: string[]
   capabilities?: { manager: string | null; roots: string[] }
 }
-export type ConversationSummary = { conversation_id: string; title: string }
+export type ConversationSummary = { conversation_id: string; title: string; owner: string | null }
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
-export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; command?: string; cwd?: string; reason?: string; files?: string[]; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
-export type AgentTaskState = "pending_delivery" | "queued" | "claimed" | "accepted" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted" | "pending_check"
-export type NativeSessionState = "running" | "waiting" | "interrupting" | "completed" | "failed" | "interrupted" | "unknown"
-export type AgentTaskRecord = {
-  task_ref: string
-  source_node: string
-  target_node: string
-  origin_trigger: string
-  state: AgentTaskState
-  text: string
-  detail: string
-}
-/** One line per request a person answered; kept by the executing device after it leaves `pending_requests`. */
-export type AnsweredRequest = { request_id: string | number; kind: string; decision: "accept" | "decline" | "cancel" | "answer"; command?: string; at_ms: number }
-export type NativeSessionRecord = {
+/** An open executor request. `form` exists only on the device that runs the work. */
+export type WorkApproval = { request_id: string; kind: string; summary: string; answering?: boolean; form?: { command?: string; cwd?: string; reason?: string; files?: string[]; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] } }
+/** An answered request stays as one line in the chat; the decision comes from the shared `ApprovalAnswered` event. */
+export type WorkAnswer = { request_id: string; kind: string; summary: string; decision: string }
+export type WorkState = "accepted" | "starting" | "running" | "waiting_approval" | "interrupting" | "finished" | "unverified"
+export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
+export type WorkRecord = {
   work_id: string
-  task_ref: string | null
-  origin_trigger?: string
-  answered_requests?: AnsweredRequest[]
+  trigger: string
   target_node: string
-  thread_id: string
-  turn_id: string | null
-  state: NativeSessionState
-  freshness: "observed" | "cached"
-  can_control: boolean
-  detail: string
-  pending_requests: HumanRequest[]
+  cwd: string
+  prompt: string
+  state: WorkState | null
+  summary: string
+  outcome: WorkOutcome | null
+  result_text: string
+  failure_reason: string | null
+  open_approvals: WorkApproval[]
+  answered_approvals: WorkAnswer[]
 }
 export type ManagerJob = {
   trigger: string
@@ -45,11 +37,9 @@ export type ManagerJob = {
   kind: string
   sequence: number
   message_id?: string
-  target_node?: string
   reply_message_id?: string
   read_only?: boolean
   error?: string
-  delivery_error?: string
   pending_check?: boolean
 }
 export type SchedulerSnapshot = {
@@ -58,31 +48,24 @@ export type SchedulerSnapshot = {
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
 }
-/** One record per started work whose outcome only its original Node can settle; nothing is resent. */
+/** A started process or work whose outcome this Node cannot prove; nothing is resent. */
 export type PendingCheck = {
   check_id: string
-  kind: "manager_process" | "native_turn"
-  target_node: string
-  trigger: string
+  kind: "manager_process" | "work"
   detail: string
-  freshness: "observed" | "cached"
   process_groups: number[]
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
-export type MissingContext = { events: string[]; blobs: unknown[]; conflicts: string[] }
 export type AutonomyMode = "off" | "report" | "continue"
-export type ConversationAutonomy = { mode: AutonomyMode; version: number | null; scheduler_node: string; error?: string }
+export type ConversationAutonomy = { mode: AutonomyMode; version: number }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
   autonomy: ConversationAutonomy
-  heads: string[]
-  missing: MissingContext
-  agent_tasks: AgentTaskRecord[]
-  native_sessions: NativeSessionRecord[]
-  observation_targets: string[]
+  works: WorkRecord[]
   scheduler: SchedulerSnapshot | null
   pending_checks: PendingCheck[]
+  local_node: string
 }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
 export type WorkspaceView = "chat" | "other"

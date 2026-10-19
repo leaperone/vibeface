@@ -13,7 +13,7 @@ function InboxPage() {
   return <ul className="mx-auto grid max-w-3xl gap-3">
     {items.map((item) => <li key={item.key}>
       {item.pair ? <JoinCard pair={item.pair} /> : item.approval ? <div className="grid gap-1">
-        <ApprovalCard session={item.approval.session} request={item.approval.request} meta={item.meta} />
+        <ApprovalCard work={item.approval.work} request={item.approval.request} meta={item.meta} />
         <Link to={item.to} className="flex min-h-9 w-fit items-center gap-1 px-1 text-meta text-muted-foreground hover:text-foreground">去对话<ChevronRight aria-hidden="true" className="size-4" /></Link>
       </div> : <Link to={item.to} className="flex min-h-14 items-center gap-3 rounded-xl border bg-card px-4 py-3 hover:bg-muted/50">
         <item.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />

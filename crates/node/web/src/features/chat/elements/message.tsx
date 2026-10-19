@@ -1,6 +1,6 @@
 import { CirclePause, LoaderCircle } from 'lucide-react'
 import { Markdown, PlainText } from '@/components/app/markdown'
-import { messageKey } from '../protocol.ts'
+import { messageKey, replyStatusLabel } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
 import { Artifact } from './artifact'
 
@@ -9,6 +9,7 @@ export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupt
 export function Message({ message }: { message: ChatMessage }) {
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
+  const ended = message.state === 'interrupted' ? '已中断' : replyStatusLabel(message.status)
   const time = when ? <time className="sr-only" dateTime={when.toISOString()}>{when.toLocaleString('zh-CN')}</time> : null
   if (user) return <div className="flex justify-end" data-message-id={messageKey(message)}>
     <div className="grid min-w-0 max-w-[85%] gap-2">
@@ -20,7 +21,7 @@ export function Message({ message }: { message: ChatMessage }) {
     <span className="sr-only">助手：</span>
     <Markdown text={message.text} />
     {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className="size-4 animate-spin text-muted-foreground" /> : null}
-    {message.state === 'interrupted' ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />已中断</span> : null}
+    {ended ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}</span> : null}
     {time}
     {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
   </div>

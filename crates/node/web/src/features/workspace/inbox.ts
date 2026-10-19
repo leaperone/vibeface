@@ -3,9 +3,9 @@ import { useIgnoredPairs } from "@/features/devices/ignored"
 import { useDevice } from "@/features/identity/context"
 import type { PairReceipt } from "@/lib/node"
 import { useWorkspace } from "./context"
-import type { HumanRequest, NativeSessionRecord } from "./types"
+import type { WorkApproval, WorkRecord } from "./types"
 
-export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "approval" | "confirm" | "join" | "setup" | "attention"; approval?: { session: NativeSessionRecord; request: HumanRequest }; pair?: PairReceipt }
+export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "approval" | "confirm" | "join" | "setup" | "attention"; approval?: { work: WorkRecord; request: WorkApproval }; pair?: PairReceipt }
 
 /**
  * Everything waiting on the person, newest kinds first.
@@ -19,10 +19,10 @@ export function useInbox(): InboxItem[] {
   const ignored = useIgnoredPairs()
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
-  for (const session of data?.native_sessions ?? []) {
-    for (const request of session.pending_requests) items.push({ key: `approval:${session.work_id}:${request.request_id}`, icon: Hand, title: "需要你同意", meta: bot?.name, to: chat, kind: "approval", approval: { session, request } })
+  for (const work of data?.works ?? []) {
+    for (const request of work.open_approvals) items.push({ key: `approval:${work.work_id}:${request.request_id}`, icon: Hand, title: "需要你同意", meta: bot?.name, to: chat, kind: "approval", approval: { work, request } })
   }
-  const checks = (data?.pending_checks.length ?? 0) + (data?.agent_tasks.filter((task) => task.state === "pending_check").length ?? 0)
+  const checks = data?.pending_checks.length ?? 0
   if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
   if (device.ready?.principal.can_manage) {

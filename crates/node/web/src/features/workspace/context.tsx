@@ -5,11 +5,10 @@ import type { ReadyConnection } from "@/lib/node"
 import { messageOf } from "@/lib/node"
 import { mergeProgress, type LiveProgress } from "@/lib/progress"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol"
-import { isIncomplete, mergeBasis } from "./labels"
 import {
-  frontierMap, inputText, parseConversation, parseNodes, parseNotifications,
+  inputText, parseConversation, parseNodes, parseNotifications,
   parsePendingMessages, parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, hasQueuedMessage,
+  parseArtifactPage,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
@@ -59,7 +58,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const requireContext = (id = activeId.current) => {
     requireCurrent()
     const context = dataRef.current
-    if (readConnection.current !== connection || !id || id !== activeId.current || context?.conversation?.conversation_id !== id || isIncomplete(context.missing)) throw new Error("先选择并读取上下文完整的对话。")
+    if (readConnection.current !== connection || !id || id !== activeId.current || context?.conversation?.conversation_id !== id) throw new Error("先选择并读取对话。")
     return context
   }
   const requireBotContext = (id = activeId.current) => {
@@ -73,7 +72,6 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
-  const readFrontiers = () => frontierMap(readStorage<unknown>(networkKey("frontiers", networkId), {}, true))
   const replaceMessages = (next: PendingMessage[]) => {
     requireWritable()
     writeStorage(scoped("pending-messages"), next, true)
@@ -92,19 +90,15 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   }
   const readConversation = async (id: string) => {
     const sequence = ++readSequence.current
-    const basis = readFrontiers()[id] ?? []
-    const next = parseConversation(await connection.rpc("conversation", { conversation_id: id, basis_heads: basis }), id)
+    const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
     if (activeId.current !== id || sequence !== readSequence.current) throw new Error("对话有更新，请再查一次。")
-    if (!isIncomplete(next.missing)) {
-      const latest = readFrontiers()
-      const concurrent = (latest[id] ?? []).filter((head) => !basis.includes(head))
-      writeStorage(networkKey("frontiers", networkId), { ...latest, [id]: [...new Set([...next.heads, ...concurrent])] }, true)
-    }
     dataRef.current = next
     setData(next)
-    if (current() && readConnection.current === connection && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
-      replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
+    // A message settles once the Node's own history holds it; nothing is resent.
+    const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
+    if (current() && readConnection.current === connection && messagesRef.current.some(admitted)) {
+      replaceMessages(messagesRef.current.filter((item) => !admitted(item)))
     }
     // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
     const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && ["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
@@ -117,11 +111,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     writeStorage(scoped("interrupted"), kept.slice(-50))
     setInterrupted(kept.filter((item) => item.conversation_id === id))
     setLiveProgress((previous) => previous.filter((progress) => {
-      if (progress.kind === "native") return next.native_sessions.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.thread_id === progress.thread_id && item.turn_id === (progress.turn_id ?? null))
+      if (progress.kind === "native") return next.works.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.state !== "finished")
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
-    if (current() && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
+    if (current() && readConnection.current === connection && view === "chat" && !document.hidden) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
@@ -215,15 +209,12 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(""); setNoticeText("")
     try {
-      const url = new URL(window.location.href), params = url.searchParams
+      const url = new URL(window.location.href)
       const routeBot = /^\/b\/([^/]+)/.exec(url.pathname)?.[1]
       if (routeBot) writeStorage(scoped("selected-bot"), decodeURIComponent(routeBot))
       activeId.current = ""
       loadPending()
       setConversationId(activeId.current)
-      const frontiers = readFrontiers(), heads = frontiers[activeId.current] ?? []
-      const basis = mergeBasis(heads, params.get("basis"))
-      if (activeId.current && basis !== heads) writeStorage(networkKey("frontiers", networkId), { ...frontiers, [activeId.current]: basis }, true)
       setBooted(true)
     } catch (caught) { showError(caught) }
     return () => { alive.current = false }
@@ -273,19 +264,15 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     scheduleRefresh()
   }
   const submitMessage = async (text: string) => {
-    const context = requireContext(), id = activeId.current
+    requireContext()
+    const id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, schedulerPeerId: null, entryNode: connection.entry.peer_id, pending: prior, heads: context.heads, reportResults: true })
+    const prepared = prepareSend({ conversationId: id, text, entryNode: connection.entry.peer_id, pending: prior, reportResults: true })
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {
       const receipt = await connection.rpc("message", prepared.body)
       requireCurrent()
-      const response = record(receipt)
-      if (response.accepted === true && response.message_id === prepared.pending.message_id && typeof response.scheduler_node === "string" && response.scheduler_node && (prepared.pending.scheduler_node === null || prepared.pending.scheduler_node === response.scheduler_node)) {
-        const schedulerNode = response.scheduler_node
-        replaceMessages(messagesRef.current.map((item) => item.message_id === prepared.pending.message_id ? { ...item, scheduler_node: schedulerNode } : item))
-      }
       if (!isQueuedReceipt(receipt, prepared.pending)) {
         if (activeId.current === id) await refreshRef.current().catch(showError)
         return false
@@ -330,9 +317,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     setMessageBusy(true)
     try { return await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
   })
-  const incomplete = !data || isIncomplete(data.missing)
+  const incomplete = !data
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
-  const chatSlot = { conversationId: conversationId || null, missing: incomplete }
+  const chatSlot = { conversationId: conversationId || null }
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
@@ -340,9 +327,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     writable: booted && current() && readConnection.current === connection,
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
-    syncText: !data ? "发一条消息开始对话。" : incomplete
-      ? "对话还在同步。"
-      : "已加载能拿到的记录，离线设备上可能还有没同步的内容。",
+    syncText: !data ? "发一条消息开始对话。" : "已加载这台设备上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
@@ -410,51 +395,41 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       setNoticeText(mode === "off" ? "已停止这个对话的后续。" : mode === "report" ? "后续只汇报结果，不再继续动手。" : "已允许 Agent 收到结果后继续工作。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    cancelAgentTask: (taskRef: string) => withMutation(`cancel-task:${taskRef}`, async () => {
+    interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      if (!context.agent_tasks.some((task) => task.task_ref === taskRef)) throw new Error("找不到这个任务，请再查一次。")
-      try { await connection.rpc("cancel_agent_task", { conversation_id: id, task_ref: taskRef }) }
-      catch (caught) { requireControlRefresh(); throw caught }
-      requireCurrent()
-      setNoticeText("已提交取消任务请求，最终结果以目标设备回报为准。")
-      if (activeId.current === id) await refreshRef.current()
-    }),
-    interruptNative: (workId: string, targetNode: string) => withMutation(`native-control:${targetNode}:${workId}`, async () => {
-      const id = activeId.current, context = requireBotContext(id)
-      const session = context.native_sessions.find((item) => item.work_id === workId && item.target_node === targetNode)
-      if (!session?.turn_id || !["running", "waiting"].includes(session.state)) throw new Error("这个任务现在停不了，请再查一次。")
-      try { await connection.rpc("native_interrupt", { conversation_id: id, work_id: workId, target_node: targetNode }) }
+      const work = context.works.find((item) => item.work_id === workId)
+      if (!work || !["running", "waiting_approval"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
+      try { await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       setNoticeText("已请求停止任务。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    respondNative: (workId: string, targetNode: string, requestId: string | number, response: unknown) => withMutation(`native-control:${targetNode}:${workId}`, async () => {
+    answerApproval: (workId: string, requestId: string, response: unknown) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      const session = context.native_sessions.find((item) => item.work_id === workId && item.target_node === targetNode)
-      const request = session?.pending_requests.find((item) => item.request_id === requestId)
-      if (!session || !["running", "waiting"].includes(session.state) || !request) throw new Error("找不到这个请求，请再查一次。")
-      if (request.questions?.some((question) => question.is_secret)) throw new Error("这项内容请到执行设备上填写。")
-      try { await connection.rpc("native_respond", { conversation_id: id, work_id: workId, target_node: targetNode, request_id: requestId, response }) }
+      const work = context.works.find((item) => item.work_id === workId)
+      const request = work?.open_approvals.find((item) => item.request_id === requestId)
+      if (!work || work.state !== "waiting_approval" || !request?.form) throw new Error("找不到这个请求，请再查一次。")
+      if (request.form.questions?.some((question) => question.is_secret)) throw new Error("这项内容请到执行设备上填写。")
+      try { await connection.rpc("answer_approval", { conversation_id: id, work_id: workId, request_id: requestId, response }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       setNoticeText("已提交。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.target_node}:${check.check_id}`, async () => {
+    reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
-      const result = record(await connection.rpc("reconcile", { conversation_id: id, target_node: check.target_node, check_id: check.check_id }))
+      const result = record(await connection.rpc("reconcile", { conversation_id: id, check_id: check.check_id }))
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
       return result
     }),
-    resolveCheck: (check: PendingCheck, evidence: string, outcome?: string) => withMutation(`pending-check:${check.target_node}:${check.check_id}`, async () => {
+    resolveCheck: (check: PendingCheck, evidence: string) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
       if (new TextEncoder().encode(evidence.trim()).length < 12) throw new Error("说明太短了。")
-      if (check.kind === "native_turn" && !outcome) throw new Error("请选择实际结果。")
-      await connection.rpc("resolve", { conversation_id: id, target_node: check.target_node, check_id: check.check_id, evidence: evidence.trim(), ...(outcome ? { outcome } : {}) })
+      await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id, evidence: evidence.trim() })
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
