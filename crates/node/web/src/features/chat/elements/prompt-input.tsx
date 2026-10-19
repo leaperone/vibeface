@@ -1,4 +1,4 @@
-import { useRef, type ChangeEvent, type KeyboardEvent } from 'react'
+import { useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from 'react'
 import { ArrowUpIcon, SquareIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { isSubmitKey } from '../protocol'
@@ -18,6 +18,7 @@ export function PromptInput({
   onChange,
   onSubmit,
   onStop,
+  children,
 }: {
   value: string
   hint: string
@@ -26,6 +27,7 @@ export function PromptInput({
   onChange: (value: string) => void
   onSubmit: () => void
   onStop?: () => void
+  children?: ReactNode
 }) {
   const formRef = useRef<HTMLFormElement>(null)
   return (
@@ -47,7 +49,7 @@ export function PromptInput({
           value={value}
           placeholder="发消息"
           disabled={disabled || busy}
-          aria-label="给机器人发消息"
+          aria-label="给助手发消息"
           aria-describedby={hint ? 'manager-hint' : undefined}
           title="Enter 发送，Shift+Enter 换行"
           className="min-h-14 max-h-[min(12rem,30dvh)] overflow-y-auto p-3"
@@ -62,11 +64,12 @@ export function PromptInput({
         <InputGroupAddon align="block-end" className="pt-1">
           <InputGroupButton
             type={onStop ? 'button' : 'submit'}
-            variant="default"
+            variant={onStop ? 'outline' : 'default'}
             size="icon-sm"
             disabled={!onStop && (disabled || busy || !value.trim())}
             aria-busy={busy || undefined}
-            aria-label={onStop ? '停止回复' : '发送消息'}
+            aria-label={onStop ? '停止' : '发送'}
+            title={onStop ? '停止' : '发送'}
             className="ms-auto size-11 rounded-full"
             onClick={onStop}
           >
@@ -74,7 +77,10 @@ export function PromptInput({
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
-      {hint ? <p id="manager-hint">{hint}</p> : null}
+      <div className="grid gap-1 pt-2 text-meta text-muted-foreground">
+        {hint ? <p id="manager-hint">{hint}</p> : null}
+        {children}
+      </div>
     </form>
   )
 }

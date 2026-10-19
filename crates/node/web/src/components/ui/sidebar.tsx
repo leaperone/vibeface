@@ -334,6 +334,18 @@ function SidebarGroupLabel({
   )
 }
 
+function SidebarGroupAction({ className, ...props }: React.ComponentProps<"button">) {
+  return (
+    <button
+      type="button"
+      data-slot="sidebar-group-action"
+      data-sidebar="group-action"
+      className={cn("absolute top-1.5 right-2 flex size-7 items-center justify-center rounded-md text-sidebar-foreground/70 outline-hidden hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 disabled:opacity-50 max-md:size-9 max-md:top-0 [&>svg]:size-4", className)}
+      {...props}
+    />
+  )
+}
+
 function SidebarGroupContent({
   className,
   ...props
@@ -417,4 +429,4 @@ function SidebarMenuButton({
 
 }
 
-export { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar }
+export { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupAction, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar }

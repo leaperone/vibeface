@@ -134,7 +134,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'pair_status') return { status: 'granted' }
         if (method === 'prepare_genesis') {
-          const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
+          const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: String(params.node_name), node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
           return { state: { genesis, checkpoint: null, events: [] }, signing: { domain: 'identity-genesis', payload: canonical(genesis) } }
         }
         return {}
@@ -240,8 +240,8 @@ test('initialized localhost requires member authorization and cannot create a se
     assert.equal(app.render().localSetup?.kind, 'initialized')
     assert.equal(app.render().ready, null)
     assert.equal(app.render().phase, 'unpaired')
-    assert.match(app.render().error, /尚未获得设备授权/)
-    await assert.rejects(app.render().createLocalNetwork('browser', 'test-only-passphrase'), /已加入个人网络/)
+    assert.match(app.render().error, /还没加入/)
+    await assert.rejects(app.render().createLocalNetwork('browser', 'test-only-passphrase'), /已经在用了/)
     assert.equal(app.calls.includes('prepare_genesis'), false)
     assert.equal(app.calls.includes('bootstrap'), false)
   } finally { app.close() }
@@ -296,7 +296,7 @@ test('disabling local automatic access before the click prevents launching its s
     app.render(); await settle()
     auth.reject(Object.assign(new Error('not a member'), { responded: true })); await settle()
     app.localState.setup = { kind: 'initialized', entry: localEntry }
-    await assert.rejects(app.render().openLocalAccess(), /自动访问已关闭/)
+    await assert.rejects(app.render().openLocalAccess(), /免确认打开”已关闭/)
     assert.equal(app.navigations.length, 0)
     const setup = app.render().localSetup
     assert.equal(setup?.kind === 'initialized' && setup.local_launch, undefined)
@@ -316,7 +316,7 @@ test('local launch metadata rejects an unrelated node, unsafe address, or malfor
     try {
       app.render(); await settle()
       assert.equal(app.render().localSetup, null)
-      assert.match(app.render().error, /本机启动入口与此节点不一致/)
+      assert.match(app.render().error, /本机链接和这台电脑对不上/)
       assert.equal(app.sockets.length, 0)
       assert.equal(app.navigations.length, 0)
     } finally { app.close() }
@@ -357,7 +357,7 @@ test('a local setup response cannot redirect onboarding to another origin', asyn
     app.render(); await settle()
     hold.resolve({ kind: 'uninitialized', invitation: { ...localInvitation, url: entry.address } }); await settle()
     assert.equal(app.render().localSetup, null)
-    assert.match(app.render().error, /当前页面不一致/)
+    assert.match(app.render().error, /当前页面对不上/)
     assert.equal(app.sockets.length, 0)
   } finally { app.close() }
 })
@@ -368,7 +368,7 @@ test('local setup cannot silently select the cookie channel instead of the ordin
   try {
     app.render(); await settle()
     assert.equal(app.render().localSetup, null)
-    assert.match(app.render().error, /本机设置入口与当前页面不一致/)
+    assert.match(app.render().error, /本机设置和当前页面对不上/)
     assert.equal(app.sockets.length, 0)
     assert.equal(app.navigations.length, 0)
   } finally { app.close() }
@@ -385,19 +385,17 @@ test('unmounting aborts pending local discovery without publishing setup state',
   assert.equal(app.render().localSetup, null)
 })
 
-test('a node invitation uses the local Node endpoint and requires explicit acceptance of the displayed review', async () => {
+test('a node invitation uses the local Node endpoint and sends its acceptance once the review checks out', async () => {
   const app = deviceHarness({ local: 'fresh' }), { invitation, receipt } = nodeJoinFixture()
   try {
     app.render(); await settle()
     app.joinResponses.set('request', receipt)
+    app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
     await app.render().pair(invitation, 'node')
-    assert.equal(app.render().localJoin?.kind, 'review')
-    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 0)
+    assert.equal(app.render().localJoin?.kind, 'pending')
+    assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
     assert.equal(app.sockets.length, 0)
     assert.equal(app.render().ready, null)
-    app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
-    await app.render().acceptLocalJoin()
-    assert.equal(app.render().localJoin?.kind, 'pending')
     assert.deepEqual(app.joinRequests.find(request => request.action === 'accept')?.params, { request_id: 'node-pair', review_hash: receipt.review_hash })
     app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
     app.joinResponses.set('status', { kind: 'joined', network_id: network, peer_id: target })
@@ -414,13 +412,15 @@ test('a node invitation uses the local Node endpoint and requires explicit accep
   } finally { app.close() }
 })
 
-test('refreshing a local Node restores its review without resending a request or accepting it', async () => {
+test('refreshing a local Node whose acceptance never landed sends it once without resending the request', async () => {
   const app = deviceHarness({ local: 'fresh' }), { receipt } = nodeJoinFixture()
   app.joinResponses.set('status', receipt)
+  app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
   try {
-    app.render(); await settle(); await settle()
-    assert.equal(app.render().localJoin?.kind, 'review')
-    assert.deepEqual(app.joinRequests.map(request => request.action), ['status'])
+    app.render()
+    for (let tries = 0; tries < 50 && app.render().localJoin?.kind !== 'pending'; tries++) await settle()
+    assert.equal(app.render().localJoin?.kind, 'pending')
+    assert.deepEqual(app.joinRequests.map(request => request.action), ['status', 'accept'])
     assert.equal(app.render().ready, null)
   } finally { app.close() }
 })
@@ -435,7 +435,7 @@ test('Node joining verifies the displayed hash and refuses a mismatched local id
         const review = { ...receipt.review, ...(mismatch === 'invitation' ? { network_id: '6'.repeat(64) } : { new_member: { ...receipt.review.new_member, subject_id: '5'.repeat(64) } }) }
         app.joinResponses.set('request', { ...receipt, review, review_hash: createHash('sha256').update(canonical(review)).digest('hex') })
       }
-      await assert.rejects(app.render().pair(invitation, 'node'), /不一致/)
+      await assert.rejects(app.render().pair(invitation, 'node'), /对不上|不一致/)
       assert.equal(app.render().localJoin?.kind, 'idle')
       assert.equal(app.joinRequests.some(request => request.action === 'accept'), false)
     } finally { app.close() }
@@ -447,10 +447,11 @@ test('a lost Node acceptance response is reconciled through status without autom
   try {
     app.render(); await settle()
     app.joinResponses.set('request', receipt)
-    await app.render().pair(invitation, 'node')
     const hold = deferred(); app.holds.set('local_join:accept', hold)
-    const accepting = app.render().acceptLocalJoin(), rejected = assert.rejects(accepting, /response lost/)
-    await settle(); hold.reject(new Error('response lost')); await rejected
+    const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /response lost/)
+    for (let tries = 0; tries < 50 && !app.calls.includes('local_join:accept'); tries++) await settle()
+    hold.reject(new Error('response lost')); await rejected
+    assert.equal(app.render().localJoin?.kind, 'review')
     assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
     app.joinResponses.set('status', { ...receipt, kind: 'pending' })
     await app.render().refreshLocalJoin()
@@ -464,7 +465,7 @@ test('switching away while a Node join request is pending prevents a stale revie
   try {
     app.render(); await settle()
     const hold = deferred(); app.holds.set('local_join:request', hold)
-    const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /切换/)
+    const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /换了/)
     await settle(); assert.ok(app.calls.includes('local_join:request'))
     app.render().disconnect()
     hold.resolve(receipt); await rejected
@@ -596,7 +597,7 @@ for (const responded of [true, false]) test(`a ${responded ? 'rejected' : 'disco
       assert.equal(app.render().localAutoAccess, true)
     } else {
       assert.equal(app.render().ready, null)
-      assert.match(app.render().error, /结果尚未确认/)
+      assert.match(app.render().error, /还不确定/)
     }
   } finally { app.close() }
 })
@@ -607,7 +608,7 @@ for (const stage of ['authenticate', 'subscribe']) test(`cancelPair during ${sta
     app.render(); await settle(); app.render()
     const hold = deferred(); app.holds.set(stage, hold)
     const checking = app.render().checkPair()
-    const rejected = assert.rejects(checking, /切换|取消/)
+    const rejected = assert.rejects(checking, /换了|取消/)
     await settle()
     assert.ok(app.calls.includes(stage))
     app.render().cancelPair()
@@ -629,7 +630,7 @@ for (const stage of ['bootstrap', 'subscribe']) test(`cancelSensitive during ${s
     app.render().downloadBackup()
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
-    const rejected = assert.rejects(confirming, /切换|取消/)
+    const rejected = assert.rejects(confirming, /换了|取消/)
     await settle(); assert.ok(app.calls.includes(stage))
     app.render().cancelSensitive()
     hold.resolve({})
@@ -653,7 +654,7 @@ for (const flow of ['pair', 'sensitive']) test(`cancelling ${flow} after subscri
     }
     const hold = deferred(); app.holds.set('subscribe', hold)
     const checking = flow === 'pair' ? app.render().checkPair() : app.render().confirmBootstrap(true)
-    const rejected = assert.rejects(checking, /切换|取消/)
+    const rejected = assert.rejects(checking, /换了|取消/)
     await settle(); assert.ok(app.calls.includes('subscribe'))
     hold.resolve({})
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => {
@@ -680,7 +681,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
       challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
       work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })
     }
-    const rejected = assert.rejects(work, /切换|取消/)
+    const rejected = assert.rejects(work, /换了|取消/)
     for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
     assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'))
     hold.resolve({ state: { genesis }, view: membership })
@@ -738,7 +739,7 @@ test('revoked authorization stops reconnection and releases the rejected session
     hold.reject(Object.assign(new Error('authorization revoked'), { responded: true })); await settle()
     assert.equal(app.render().ready, null)
     assert.equal(app.render().phase, 'unpaired')
-    assert.match(app.render().error, /无法恢复原网络授权/)
+    assert.match(app.render().error, /登录失效了/)
     assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
     assert.equal(app.timers.size, 0)
     app.sockets[1].drop(); assert.equal(app.timers.size, 0)

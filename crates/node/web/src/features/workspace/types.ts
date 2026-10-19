@@ -11,7 +11,7 @@ export type NodeInfo = {
 }
 export type ConversationSummary = { conversation_id: string; title: string }
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
-export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
+export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; command?: string; cwd?: string; reason?: string; files?: string[]; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
 export type AgentTaskState = "pending_delivery" | "queued" | "claimed" | "accepted" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted" | "pending_check"
 export type NativeSessionState = "running" | "waiting" | "interrupting" | "completed" | "failed" | "interrupted" | "unknown"
 export type AgentTaskRecord = {
@@ -23,9 +23,13 @@ export type AgentTaskRecord = {
   text: string
   detail: string
 }
+/** One line per request a person answered; kept by the executing device after it leaves `pending_requests`. */
+export type AnsweredRequest = { request_id: string | number; kind: string; decision: "accept" | "decline" | "cancel" | "answer"; command?: string; at_ms: number }
 export type NativeSessionRecord = {
   work_id: string
   task_ref: string | null
+  origin_trigger?: string
+  answered_requests?: AnsweredRequest[]
   target_node: string
   thread_id: string
   turn_id: string | null
@@ -80,7 +84,8 @@ export type ConversationPayload = {
   scheduler: SchedulerSnapshot | null
   pending_checks: PendingCheck[]
 }
-export type WorkspaceView = "chat" | "settings"
+/** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
+export type WorkspaceView = "chat" | "other"
 export type { PendingMessage }
 
 export type BotProject = { target_node: string; cwd: string }

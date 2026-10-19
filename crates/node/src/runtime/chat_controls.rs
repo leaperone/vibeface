@@ -16,7 +16,21 @@ pub(super) fn pending_requests(
         .filter(|request| serde_json::from_value::<vibeface_protocol::RpcId>(request["id"].clone()).is_ok())
         .map(|request| {
             let method = request["method"].as_str().unwrap_or("request");
-            let mut projected = json!({"request_id":request["id"],"kind":method,"text":request_text(method,&request["params"])});
+            let params = &request["params"];
+            let mut projected = json!({"request_id":request["id"],"kind":method,"text":request_text(method,params)});
+            // Structured copies of the text lines so the web can lay them out.
+            if let Some(reason) = params["reason"].as_str().filter(|reason| !reason.trim().is_empty()) {
+                projected["reason"] = json!(reason);
+            }
+            if let Some(command) = request_command(params) {
+                projected["command"] = json!(command);
+            }
+            if let Some(cwd) = params["cwd"].as_str().or(params["grantRoot"].as_str()) {
+                projected["cwd"] = json!(cwd);
+            }
+            if let Some(changes) = params["changes"].as_object() {
+                projected["files"] = json!(changes.keys().collect::<Vec<_>>());
+            }
             if matches!(method, "item/commandExecution/requestApproval" | "item/fileChange/requestApproval") {
                 let decisions = request["params"]["availableDecisions"].as_array();
                 let choices = [("批准一次", "accept"), ("拒绝", "decline"), ("取消本轮", "cancel")]
@@ -35,6 +49,18 @@ pub(super) fn pending_requests(
         }).collect()
 }
 
+pub(super) fn request_command(params: &Value) -> Option<String> {
+    params["command"].as_str().map(str::to_owned).or_else(|| {
+        params["command"].as_array().map(|command| {
+            command
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    })
+}
+
 fn request_text(method: &str, params: &Value) -> String {
     let mut lines = vec![match method {
         "item/commandExecution/requestApproval" => "原生 Agent请求运行命令。".to_owned(),
@@ -49,17 +75,8 @@ fn request_text(method: &str, params: &Value) -> String {
         lines.push(reason.into());
     }
     if method == "item/commandExecution/requestApproval" {
-        if let Some(command) = params["command"].as_str() {
+        if let Some(command) = request_command(params) {
             lines.push(format!("命令：{command}"));
-        } else if let Some(command) = params["command"].as_array() {
-            lines.push(format!(
-                "命令：{}",
-                command
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
         }
         if let Some(cwd) = params["cwd"].as_str() {
             lines.push(format!("目录：{cwd}"));
@@ -441,6 +458,22 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_requests_carry_structured_fields() {
+        let snapshot = json!({"pending_requests":[
+            {"id":1,"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"u",
+                "command":["npm","test"],"cwd":"/p","reason":"run tests","availableDecisions":["accept","decline"]}},
+            {"id":2,"method":"item/fileChange/requestApproval","params":{"threadId":"t","turnId":"u",
+                "grantRoot":"/p","changes":{"a.ts":{}}}}]});
+        let requests = pending_requests(&snapshot, Some("t"), Some("u"));
+        assert_eq!(requests[0]["command"], "npm test");
+        assert_eq!(requests[0]["cwd"], "/p");
+        assert_eq!(requests[0]["reason"], "run tests");
+        assert_eq!(requests[0]["choices"].as_array().map(Vec::len), Some(2));
+        assert_eq!(requests[1]["files"], json!(["a.ts"]));
+        assert_eq!(requests[1]["cwd"], "/p");
+    }
 
     #[test]
     fn remote_native_snapshot_survives_reopen_and_unavailable_reads_without_controls() -> Result<()>

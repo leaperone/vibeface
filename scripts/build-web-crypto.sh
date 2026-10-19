@@ -20,3 +20,10 @@ target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_direct
 mkdir -p "$out"
 "$bindgen" "$target/wasm32-unknown-unknown/release/vibeface_secure.wasm" \
   --target web --out-dir "$out"
+# Shrinks the module by about a quarter (names section and size passes). Skipped with a note when binaryen is missing.
+opt="${WASM_OPT:-wasm-opt}"
+if command -v "$opt" >/dev/null 2>&1; then
+  "$opt" -Oz "$out/vibeface_secure_bg.wasm" -o "$out/vibeface_secure_bg.wasm"
+else
+  printf 'wasm-opt not found; keeping the unoptimized module.\n' >&2
+fi

@@ -1,36 +1,48 @@
-import { useEffect, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
-import { ChevronDown } from 'lucide-react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { ArchiveRestore, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, ShieldAlert, type LucideIcon } from 'lucide-react'
+import { cn } from 'cn'
+import { Details, DetailRow, EmptyState, FilePicker, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
+import { useCheckCode } from '@/lib/check-code'
+import { addressName } from '@/features/workspace/labels'
 import { readInvitation } from '../../../transport.js'
 import { messageOf, parseEntry, parseInvitation } from '@/lib/node'
 import { readConnectionFile } from '@/lib/connection-file'
 import { passphrase } from '@/lib/secure'
+import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
+import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from './connection-lane'
-import { StatusOrb } from '@/components/status-orb'
-import { roleNames } from '@/features/workspace/labels'
 import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 
-const input = 'min-h-11'
-const button = 'min-h-11'
-const panel = 'min-w-0 gap-4 p-4 sm:p-5'
-const check = 'size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50'
-const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
-type Lane = 'local' | 'invite' | 'saved' | 'manual' | 'recovery' | 'passphrase'
+type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'bootstrap' | 'pair' | 'node' | 'invalid'
+const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
 
 function purposeOf(invitation: string): Purpose {
-  const text = invitation.trim()
-  if (!text) return 'empty'
-  try {
-    const parsed = parseInvitation(readInvitation(text))
-    return parsed.kind
-  } catch { return 'invalid' }
+  if (!invitation.trim()) return 'empty'
+  try { return parseInvitation(readInvitation(invitation.trim())).kind } catch { return 'invalid' }
+}
+
+
+function Steps({ step }: { step: number }) {
+  return <div className="flex items-center gap-3 text-meta text-muted-foreground">
+    <span className="flex gap-1.5" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn('size-2 rounded-full', item <= step ? 'bg-foreground' : 'bg-muted-foreground/30')} />)}</span>
+    第 {step} 步，共 4 步
+  </div>
+}
+
+function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
+  return <section className="grid gap-4 rounded-xl border bg-card p-5">
+    <h2 className="flex items-center gap-2 text-heading font-semibold"><Icon aria-hidden="true" className="size-5 text-muted-foreground" />{title}</h2>
+    {children}
+  </section>
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 }
 
 export function ConnectionScreen() {
@@ -40,21 +52,20 @@ export function ConnectionScreen() {
   const busy = busyGeneration === generation
   const pending = useRef<number | null>(null)
   const [error, setError] = useState('')
-  const [confirmed, setConfirmed] = useState(false)
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(null)
+  const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup) })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing'].includes(device.phase)
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
-  useEffect(() => {
-    if (device.initialInvitation) setInvitation(current => current.trim() ? current : device.initialInvitation)
-  }, [device.initialInvitation])
+  useEffect(() => { if (device.initialInvitation) setInvitation((current) => current.trim() ? current : device.initialInvitation) }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
-  useEffect(() => { setConfirmed(false); if (device.localJoin?.kind === 'joined') setLane('local') }, [device.localJoin])
+  useEffect(() => { if (device.localJoin?.kind === 'joined') setLane('local') }, [device.localJoin])
+
   function chooseLane(next: Lane) {
-    if (!device.entry || !['recovery', 'passphrase'].includes(next)) device.disconnect()
+    if (!device.entry || next !== 'recovery') device.disconnect()
     setLane(next)
   }
   async function run(action: () => Promise<void>) {
@@ -66,28 +77,14 @@ export function ConnectionScreen() {
       owner = device.connectionGeneration(); pending.current = owner; setBusyGeneration(owner)
       await work
     } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
-    finally { if (pending.current === owner) pending.current = null; setBusyGeneration(active => active === owner ? null : active) }
-  }
-  function connect(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const form = event.currentTarget
-    void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id') })))
+    finally { if (pending.current === owner) pending.current = null; setBusyGeneration((current) => current === owner ? null : current) }
   }
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    void run(() => device.pair(invitation, value(form, 'name'), purpose === 'bootstrap' ? passphrase(value(form, 'password'), value(form, 'confirmation')) : undefined))
+    void run(() => purpose === 'bootstrap' ? device.pair(invitation, value(form, 'name'), passphrase(value(form, 'password'), value(form, 'confirmation')), value(form, 'computer')) : device.pair(invitation, value(form, 'name')))
   }
-  function createLocalNetwork(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const form = event.currentTarget
-    void run(async () => {
-      try { await device.createLocalNetwork(value(form, 'name'), passphrase(value(form, 'password'), value(form, 'confirmation'))) }
-      finally { form.reset() }
-    })
-  }
-  async function importConnectionFile(file: File) {
-    chooseLane('invite')
+  async function importFile(file: File) {
     const owner = device.connectionGeneration()
     const content = await readConnectionFile(file)
     if (owner !== device.connectionGeneration()) return
@@ -95,151 +92,196 @@ export function ConnectionScreen() {
     parseInvitation(parsed)
     setInvitation(JSON.stringify(parsed))
   }
-  const subtitle = device.review?.kind === 'bootstrap' ? '先保存恢复包，再创建网络。'
-    : device.review ? '选择要留下的设备。'
-    : device.waiting ? '核对后等待确认。'
-    : device.localJoin?.kind === 'review' ? '核对要加入的个人网络及此节点权限。'
-    : device.localJoin?.kind === 'pending' ? '等待原网络的管理设备确认此节点。'
-    : device.localJoin?.kind === 'uncertain' ? '先核对加入状态，不自动重发申请。'
-    : active === 'local' && device.localSetup?.kind === 'uninitialized' ? '在此浏览器创建个人网络并管理本机节点。'
-    : active === 'local' ? '连接本机节点，核验此浏览器的授权。'
-    : active === 'saved' && device.entries.length === 1 && ['connecting', 'reconnecting'].includes(device.phase) ? '正在连接。'
-    : active === 'saved' ? '选一个入口。'
-    : active === 'manual' ? '填写地址和设备编号。'
-    : active === 'recovery' ? '用恢复包恢复。'
-    : active === 'passphrase' ? '只更换口令，不连接。'
-    : purpose === 'bootstrap' ? '设置口令后连接。'
-    : purpose === 'pair' ? '提交加入请求。'
-    : '用邀请加入或创建。'
-  const inviteAction = purpose === 'bootstrap' ? '连接并准备创建' : purpose === 'pair' ? '提交加入请求' : purpose === 'node' ? '申请此节点加入' : '连接'
-  const inviteDetail = purpose === 'bootstrap' ? '保存恢复包之后才会创建网络。'
-    : purpose === 'pair' ? '还要等管理设备确认。'
-    : purpose === 'node' ? '此邀请授权正在运行的本机节点。还需核对权限，并由原网络的管理设备确认。'
-    : ''
+
+  // Not being a member yet is the normal state on this screen, so it reads as a hint rather than an error.
+  const alert = error || device.error && !['reconnecting', 'unpaired'].includes(device.phase) ? <InlineError error={error || device.error} />
+    : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p> : null
   const joining = device.localJoin && device.localJoin.kind !== 'idle' && device.localJoin.kind !== 'joined'
   const focused = Boolean(device.review || device.waiting || joining)
-  const showConnectOrb = linking || ['initializing', 'connecting', 'reconnecting'].includes(device.phase)
-  return <main className="h-[var(--app-height,100dvh)] overflow-x-hidden overflow-y-auto overscroll-contain">
-    <div className="mx-auto w-full min-w-0 max-w-2xl space-y-5 py-8 pb-[max(2rem,env(safe-area-inset-bottom))] ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:py-12 sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
-      <header className="space-y-2 pb-2">
-        <p className="text-sm font-medium text-muted-foreground">Vibeface</p>
-        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">{active === 'local' && device.localSetup?.kind === 'uninitialized' ? '设置此节点' : '连接设备'}</h1>
-        <p className="text-sm text-muted-foreground">{subtitle}</p>
+  const setup = device.localSetup?.kind === 'uninitialized'
+  const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
+    <p className="text-meta text-muted-foreground">其他方式</p>
+    <div className="flex flex-wrap gap-2">
+      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : '这台电脑'}</Button> : null}
+      {active !== 'saved' && device.entries.length > 0 ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
+      {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />已有设备？用加入链接</Button> : null}
+      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
+    </div>
+  </div> : null
+
+  let body: ReactNode
+  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="请用本机地址或 HTTPS 打开" />
+  else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
+    <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
+    <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
+  </Panel>
+  else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
+  else if (device.review) body = <RecoveryReview />
+  else if (joining && device.localJoin) body = <NodeJoin busy={busy} run={run} />
+  else if (device.waiting) body = <BrowserJoin busy={busy} run={run} />
+  else if (active === 'local' && setup && !names) body = <NamesStep onNext={setNames} />
+  else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => setNames(null)} run={run} />
+  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localJoin?.kind === 'joined' ? '这台电脑已加入' : '这台电脑'}>
+    {device.localSetup.kind === 'initialized'
+      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>{device.localJoin?.kind === 'joined' ? '打开这台电脑' : '重新打开这台电脑'}</Button>
+      : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
+  </Panel>
+  else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
+    <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.peer_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
+      <span className="min-w-0 flex-1 truncate" title={entry.address}>{addressName(entry.address)}</span>
+      <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
+    </li>)}</ul>
+  </Panel>
+  else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
+  else body = <Panel icon={Link2} title={purpose === 'node' ? '把这台电脑加入' : '加入我的设备'}>
+    <form className="grid gap-4" onSubmit={submitInvitation}>
+      <fieldset disabled={linking || !usable} className="grid gap-4">
+        {purpose === 'empty' || purpose === 'invalid' ? <>
+          <Field label="加入链接"><Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
+          {purpose === 'invalid' ? <p role="alert" className="text-meta text-danger">这不是有效的加入链接</p> : null}
+          <FilePicker label="导入文件" accept=".json,application/json,text/plain" onFile={(file) => void run(() => importFile(file))} />
+        </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
+          <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
+          <span className="min-w-0 flex-1 truncate">已读取加入链接</span>
+          <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
+        </p>}
+        <Field label={purpose === 'node' ? '这台电脑叫什么？' : '这个浏览器叫什么？'}><Input name="name" required maxLength={128} autoComplete="off" defaultValue={purpose === 'node' ? defaultComputerName() : defaultBrowserName()} key={purpose === 'node' ? 'node' : 'browser'} /></Field>
+        {purpose === 'bootstrap' ? <>
+          <Field label="电脑叫什么？"><Input name="computer" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
+          <Field label="恢复密码"><Input type="password" name="password" autoComplete="new-password" minLength={12} required /></Field>
+          <Field label="再输一次"><Input type="password" name="confirmation" autoComplete="new-password" minLength={12} required /></Field>
+        </> : null}
+        <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button>
+      </fieldset>
+    </form>
+  </Panel>
+
+  return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
+    <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
+      <header className="grid gap-3">
+        <span className="text-heading font-semibold tracking-tight">vibeface</span>
+        {active === 'local' && setup && !focused ? <Steps step={names ? 2 : 1} /> : device.review?.kind === 'bootstrap' ? <Steps step={2} /> : null}
       </header>
-      {showConnectOrb ? <div className="flex items-center gap-3"><StatusOrb place="connection" size={64} /><p role="status" className="text-sm text-muted-foreground">{device.phase === 'reconnecting' ? '正在重连…' : '正在连接…'}</p></div> : null}
-      {device.phase === 'unpaired' && !showConnectOrb && !focused ? <p role="status" className="text-sm text-muted-foreground">还没授权。</p> : null}
-      {(error || device.error && device.phase !== 'reconnecting') && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
-      {device.phase === 'blocked' && <Card className={panel} aria-labelledby="secure-page-title"><h2 id="secure-page-title" className="font-semibold">需要安全页面</h2><p className="text-sm text-muted-foreground">请用本机或 HTTPS 打开。</p></Card>}
-      {device.phase === 'key_lost' && <Card className={panel} aria-labelledby="lost-key-title"><h2 id="lost-key-title" className="font-semibold">密钥已丢失</h2><p className="text-sm text-muted-foreground">新密钥需要重新配对。</p><Button variant="outline" className={`${button} self-start`} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新密钥</Button></Card>}
-      {device.review && <RecoveryReview />}
-      {joining && device.localJoin && <Card className={panel} aria-labelledby="node-join-title">
-        <h2 id="node-join-title" className="font-semibold">{device.localJoin.kind === 'review' ? '确认此节点加入网络' : device.localJoin.kind === 'pending' ? '等待管理设备确认此节点' : '核对节点加入状态'}</h2>
-        {(device.localJoin.kind === 'review' || device.localJoin.kind === 'pending') && <>
-          <dl className="grid gap-3 text-sm"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono text-xs">{device.localJoin.review.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono text-xs">{device.localJoin.review.inviter_subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">本机节点</dt><dd className="break-all font-mono text-xs">{device.localJoin.review.new_member.subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">节点名称</dt><dd>{device.localJoin.review.new_member.name}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">节点权限</dt><dd>{device.localJoin.review.new_member.node_roles.map(role => roleNames[role] ?? role).join('、')}</dd></div></dl>
-          {device.localJoin.kind === 'review' && <>
-            <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对网络、节点编号及权限</label>
-            <Button className={`${button} self-start`} type="button" disabled={busy || !confirmed || device.localJoin.review.expires_at_ms <= Date.now()} onClick={() => void run(device.acceptLocalJoin)}>确认此节点加入</Button>
-          </>}
-        </>}
-        {device.localJoin.kind === 'uncertain' && <p className="text-sm text-muted-foreground">{device.localJoin.message}</p>}
-        <p className="text-xs text-muted-foreground">节点加入后，可通过本机访问配置 Agent。添加网络成员仍需管理客户端授权。</p>
-        <div className="flex flex-wrap gap-2"><Button className={button} variant="outline" type="button" disabled={busy} onClick={() => void run(device.refreshLocalJoin)}>核对加入状态</Button><Button className={button} variant="ghost" type="button" disabled={busy} onClick={() => { device.useAnotherNodeInvitation(); setLane('invite') }}>返回邀请输入</Button></div>
-      </Card>}
-      {device.localJoin?.kind === 'joined' && <p role="status" className="text-sm text-muted-foreground">此节点已加入个人网络。可打开本机访问配置此节点。添加网络成员仍需原管理客户端或恢复包授权。</p>}
-      {device.waiting && <Card className={panel} aria-labelledby="pair-review-title">
-        <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入网络'}</h2>
-        <p className="text-sm text-muted-foreground">{device.waiting.accepted ? '等待对方确认。' : '核对设备编号后确认。'}</p>
-        <dl className="grid gap-3 text-sm"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono text-xs">{device.waiting.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono text-xs">{device.waiting.review.inviter_subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">此浏览器</dt><dd className="break-all font-mono text-xs">{device.waiting.review.new_member.subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">设备名称</dt><dd className="break-all">{device.waiting.review.new_member.name}</dd></div></dl>
-        {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对个人网络及双方设备编号</label>}
-        <div className="flex flex-wrap gap-2"><Button className={button} type="button" disabled={busy || !device.waiting.accepted && !confirmed} onClick={() => void run(device.waiting?.accepted ? device.checkPair : device.acceptPair)}>{device.waiting.accepted ? '检查配对进度' : '确认加入'}</Button><Button variant="outline" className={button} type="button" onClick={() => { device.cancelPair(); setConfirmed(false) }}>取消本地配对</Button></div>
-        <p className="text-xs text-muted-foreground">只取消本机记录。</p>
-      </Card>}
-      {!focused && active === 'local' && device.localSetup && <Card className={panel} aria-labelledby="local-setup-title">
-        <h2 id="local-setup-title" className="font-semibold">{device.localSetup.kind === 'uninitialized' ? '创建个人网络' : '连接本机节点'}</h2>
-        {device.localSetup.kind === 'uninitialized' ? <>
-          <p className="text-sm text-muted-foreground">此节点尚未加入个人网络。先填写浏览器名称并设置恢复包口令，再保存加密恢复包。</p>
-          <form className="space-y-4" onSubmit={createLocalNetwork}>
-            <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
-              <label className="grid gap-2 text-sm">此浏览器名称<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
-              <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} required aria-describedby="local-passphrase-hint" aria-invalid={error.includes('口令') || undefined} /></label>
-              <label className="grid gap-2 text-sm">再次填写口令<Input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
-              <p id="local-passphrase-hint" className="text-xs text-muted-foreground">至少 12 个字符。请独立保存口令，丢失后无法解锁恢复包。</p>
-              <Button className={button} type="submit">准备创建网络</Button>
-            </fieldset>
-          </form>
-          <p className="text-xs text-muted-foreground">已有个人网络时，在下方选择「使用邀请」或「恢复管理权限」。</p>
-        </> : <>
-          <p className="text-sm text-muted-foreground">{device.localSetup.local_launch ? '此节点已加入个人网络。先核验此浏览器的成员授权，也可打开本机访问配置此节点。' : '此节点已加入个人网络。已授权的浏览器可直接连接；新浏览器需要原有成员的邀请或加密恢复包。'}</p>
-          <p className="break-all text-sm text-muted-foreground">{device.localSetup.entry.address}</p>
-          <Button className={`${button} self-start`} type="button" disabled={linking || !usable} onClick={() => { const setup = device.localSetup; if (setup?.kind === 'initialized') void run(() => device.connect(setup.entry)) }}>连接此节点</Button>
-          {device.localSetup.local_launch && <>
-            <Button className={`${button} self-start`} variant="outline" type="button" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开本机访问</Button>
-            <p className="text-xs text-muted-foreground">本机访问可配置此节点的 Agent。添加网络成员仍需管理客户端授权。</p>
-          </>}
-        </>}
-        {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
-      </Card>}
-      {!focused && active === 'saved' && <Card className={panel} aria-labelledby="saved-entries-title">
-        <h2 id="saved-entries-title" className="font-semibold">{device.entries.length === 1 ? '已保存的入口' : '选择已保存的入口'}</h2>
-        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.peer_id}:${entry.local === true}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
-          <div className="flex flex-wrap items-center justify-between gap-3"><p className="min-w-0 break-all text-sm">{entry.address}</p><Button className={button} type="button" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>{device.entries.length === 1 && device.phase === 'connecting' ? '正在连接' : '连接'}</Button></div>
-          <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
-        </li>)}</ul>
-        {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
-      </Card>}
-      {!focused && active === 'invite' && <Card className={panel} aria-labelledby="invite-title">
-        <h2 id="invite-title" className="font-semibold">{purpose === 'bootstrap' ? '准备创建网络' : purpose === 'pair' ? '授权此浏览器' : purpose === 'node' ? '将此节点加入网络' : '使用邀请'}</h2>
-        <p className="text-sm text-muted-foreground">{purpose === 'bootstrap' ? '口令至少 12 个字符。' : '粘贴连接链接或邀请，也可以导入连接文件。'}</p>
-        <form className="space-y-4" onSubmit={submitInvitation}>
-          <fieldset disabled={linking || !usable || !!device.review} className="space-y-4 disabled:opacity-70">
-            <label className="grid gap-2 text-sm">导入连接文件<Input className={input} type="file" name="connection-file" accept=".json,application/json,text/plain" aria-describedby="connection-file-hint" onChange={event => {
-              const file = event.currentTarget.files?.item(0)
-              event.currentTarget.value = ''
-              if (file) void run(() => importConnectionFile(file))
-            }} /></label>
-            <p id="connection-file-hint" className="text-xs text-muted-foreground">文件不超过 64 KiB。请从管理设备通过可信渠道取得。</p>
-            <label className="grid gap-2 text-sm">连接链接或邀请内容<Textarea className="min-h-28 font-mono text-xs" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} onChange={event => { if (lane !== 'invite') chooseLane('invite'); setInvitation(event.target.value) }} /></label>
-            <label className="grid gap-2 text-sm">{purpose === 'node' ? '此节点名称' : '此浏览器名称'}<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
-            {purpose === 'bootstrap' && <>
-              <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
-              <label className="grid gap-2 text-sm">再次填写口令<Input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
-              <p className="text-xs text-muted-foreground">请独立保存口令，丢失后无法解锁恢复包。</p>
-            </>}
-            <Button className={button} type="submit">{inviteAction}</Button>
-            {inviteDetail ? <p className="text-xs text-muted-foreground">{inviteDetail}</p> : null}
+      {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
+      {alert}
+      {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
+      {other}
+      {device.identity && !focused ? <Details>
+        <DetailRow label="这个浏览器的设备编号" value={device.identity.peerId} mono />
+        {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id') }))) }}>
+          <fieldset disabled={linking} className="grid gap-3">
+            <legend className="mb-3 text-foreground">手填访问地址</legend>
+            <Field label="访问地址"><Input type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
+            <Field label="设备编号"><Input className="font-mono" name="peer_id" required pattern="[a-f0-9]{64}" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>
-        </form>
-        {purpose === 'node' && device.localSetup && <Button variant="outline" className={`${button} self-start`} type="button" disabled={linking || !usable} onClick={() => void run(device.refreshLocalJoin)}>核对已有加入申请</Button>}
-        {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
-      </Card>}
-      {!focused && active === 'manual' && <Card className={panel} aria-labelledby="manual-entry-title">
-        <h2 id="manual-entry-title" className="font-semibold">手填入口地址</h2>
-        <form className="space-y-4" onSubmit={connect}>
-          <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
-            <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} placeholder="http://192.168.0.99:4790" /></label>
-            <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="peer_id" required pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
-            <Button className={button} type="submit">连接</Button>
-          </fieldset>
-        </form>
-        {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
-      </Card>}
-      {!focused && active === 'recovery' && usable && <RecoveryControls only="restore" />}
-      {!focused && active === 'passphrase' && usable && <RecoveryControls only="passphrase" />}
-      {!focused && device.phase !== 'blocked' && device.phase !== 'key_lost' && <div className="space-y-2">
-        <p className="text-xs text-muted-foreground">其他方式</p>
-        <div className="flex flex-wrap gap-2">
-          {active !== 'local' && device.localSetup && <Button variant="ghost" className={button} type="button" onClick={() => chooseLane('local')}>设置此节点</Button>}
-          {active !== 'saved' && device.entries.length > 0 && <Button variant="ghost" className={button} type="button" onClick={() => chooseLane('saved')}>已保存的入口</Button>}
-          {active !== 'invite' && <Button variant="ghost" className={button} type="button" onClick={() => chooseLane('invite')}>使用邀请</Button>}
-          {active !== 'manual' && <Button variant="ghost" className={button} type="button" onClick={() => chooseLane('manual')}>手填入口地址</Button>}
-          {active !== 'recovery' && usable && <Button variant="ghost" className={button} type="button" onClick={() => chooseLane('recovery')}>恢复管理权限</Button>}
-          {active !== 'passphrase' && usable && <Button variant="ghost" className={button} type="button" onClick={() => chooseLane('passphrase')}>更换恢复包口令</Button>}
-        </div>
-      </div>}
-      {device.identity && <Collapsible className="px-1">
-        <CollapsibleTrigger asChild><Button variant="ghost" className="min-h-11 w-full justify-between text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">此浏览器的设备编号<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
-        <CollapsibleContent forceMount className="px-3 pb-3 data-[state=closed]:hidden"><p className="break-all font-mono text-xs text-muted-foreground">{device.identity.peerId}</p></CollapsibleContent>
-      </Collapsible>}
+        </form> : null}
+      </Details> : null}
     </div>
   </main>
+}
+
+function NamesStep({ onNext }: { onNext(names: { computer: string; browser: string }): void }) {
+  return <Panel icon={Laptop} title="给设备起名">
+    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() }) }}>
+      <Field label="这台电脑叫什么？"><Input name="computer" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
+      <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
+      <Button type="submit" className="w-fit justify-self-end">下一步</Button>
+    </form>
+  </Panel>
+}
+
+type Run = (action: () => Promise<void>) => Promise<void>
+
+/** Step 2a: the recovery password; the file is sealed with it right away. */
+function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: { computer: string; browser: string }; onBack(): void; run: Run }) {
+  const device = useDevice()
+  const [show, setShow] = useState(false)
+  return <Panel icon={FileKey} title="设置恢复">
+    <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
+    <form className="grid gap-4" onSubmit={(event) => {
+      event.preventDefault()
+      const form = event.currentTarget
+      void run(async () => {
+        try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password'), value(form, 'password')), names.computer) }
+        finally { form.reset() }
+      })
+    }}>
+      <fieldset disabled={busy || disabled} className="grid gap-4">
+        <Field label="恢复密码">
+          <span className="flex gap-2">
+            <Input type={show ? 'text' : 'password'} name="password" autoComplete="new-password" minLength={12} required />
+            <Button type="button" variant="ghost" size="icon" aria-label={show ? '隐藏密码' : '显示密码'} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
+          </span>
+          <span className="font-normal text-muted-foreground">至少 12 个字符，忘了就无法找回</span>
+        </Field>
+        <div className="flex justify-between gap-2">
+          <Button type="button" variant="ghost" onClick={onBack}>上一步</Button>
+          <Button type="submit">{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
+        </div>
+      </fieldset>
+    </form>
+  </Panel>
+}
+
+/** Step 2b: download the sealed file, confirm it is stored apart from the password, then create. */
+function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
+  const device = useDevice()
+  const [downloaded, setDownloaded] = useState(false)
+  const [saved, setSaved] = useState(false)
+  return <Panel icon={FileKey} title="保存恢复文件">
+    <p className="text-muted-foreground">设备都丢了时，用它找回。</p>
+    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
+    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
+    <div className="flex justify-between gap-2">
+      <Button type="button" variant="ghost" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
+      <Button type="button" disabled={!saved || busy} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+    </div>
+  </Panel>
+}
+
+/** A browser joining through a link: its request is already out; the admin compares the code and allows. */
+function BrowserJoin({ busy, run }: { busy: boolean; run: Run }) {
+  const device = useDevice()
+  const waiting = device.waiting!
+  const code = useCheckCode(waiting.network_id, waiting.review.inviter_subject_id, waiting.review.new_member.subject_id)
+  return <Panel icon={Hourglass} title="等待批准">
+    <p className="text-muted-foreground">在已有设备上看到同样的码再点允许</p>
+    {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
+    {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
+    <div className="flex flex-wrap justify-between gap-2">
+      <Button type="button" variant="ghost" onClick={() => device.cancelPair()}>取消</Button>
+      {waiting.accepted ? null : <Button type="button" variant="outline" disabled={busy || !code || device.phase === 'reconnecting'} onClick={() => void run(device.acceptPair)}>重试</Button>}
+    </div>
+    <Details>
+      <DetailRow label="这个浏览器" value={waiting.review.new_member.subject_id} mono />
+      <DetailRow label="邀请方" value={waiting.review.inviter_subject_id} mono />
+      <DetailRow label="个人网络" value={waiting.network_id} mono />
+    </Details>
+  </Panel>
+}
+
+/** A computer joining through a link opened on its own local page. */
+function NodeJoin({ busy, run }: { busy: boolean; run: Run }) {
+  const device = useDevice()
+  const join = device.localJoin!
+  const review = join.kind === 'review' || join.kind === 'pending' ? join.review : null
+  const code = useCheckCode(review?.network_id ?? '', review?.inviter_subject_id ?? '', review?.new_member.subject_id ?? '')
+  return <Panel icon={join.kind === 'uncertain' ? Laptop : Hourglass} title={join.kind === 'uncertain' ? '还不确定是否已加入' : '等待批准'}>
+    {review ? <>
+      <p className="text-muted-foreground">在已有设备上点允许后，这里会自动进入</p>
+      {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
+    </> : <p className="text-muted-foreground">再查一次，不会重复提交。</p>}
+    <div className="flex flex-wrap justify-between gap-2">
+      <Button type="button" variant="ghost" disabled={busy} onClick={device.useAnotherNodeInvitation}>换一个链接</Button>
+      {join.kind === 'review'
+        ? <Button type="button" variant="outline" disabled={busy || !code || join.review.expires_at_ms <= Date.now()} onClick={() => void run(device.acceptLocalJoin)}>重试</Button>
+        : join.kind === 'uncertain' ? <Button type="button" variant="outline" disabled={busy} onClick={() => void run(device.refreshLocalJoin)}>再查一次</Button> : null}
+    </div>
+    {review ? <Details>
+      <DetailRow label="这台电脑" value={review.new_member.subject_id} mono />
+      <DetailRow label="邀请方" value={review.inviter_subject_id} mono />
+      <DetailRow label="个人网络" value={review.network_id} mono />
+    </Details> : null}
+  </Panel>
 }

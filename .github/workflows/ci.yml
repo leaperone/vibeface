@@ -104,6 +104,7 @@ jobs:
       - name: Build shared browser cryptography
         run: |
           cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          npm install -g binaryen@132.0.0
           bash scripts/build-web-crypto.sh
           cargo build -p vibeface-secure --example secure-probe --locked
           node scripts/crypto-client.mjs --self-test --native-probe target/debug/examples/secure-probe

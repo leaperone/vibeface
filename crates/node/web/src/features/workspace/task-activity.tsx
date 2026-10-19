@@ -1,159 +1,140 @@
 "use client"
 
-import { useId, useState } from "react"
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { useId, useState, type ReactNode } from "react"
+import { CircleQuestionMark, Ellipsis, Hand, TriangleAlert } from "lucide-react"
+import { Popover } from "radix-ui"
+import { ActionCard, Details } from "@/components/app/kit"
+import { Button } from "@/components/ui/button"
+import { Field, FieldLabel } from "@/components/ui/field"
+import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
-import { nodeName } from "./labels"
-import { ActionButton, StatusBadge, SubmitButton } from "./present"
-import type { AgentTaskRecord, HumanRequest, NativeSessionRecord, PendingCheck } from "./types"
+import { approvalKind, approvalRisk, nodeName } from "./labels"
+import { ActionButton, SubmitButton } from "./present"
+import type { HumanRequest, NativeSessionRecord, PendingCheck } from "./types"
 
-export function AgentTaskActivity({ task, sessions }: { task: AgentTaskRecord; sessions: NativeSessionRecord[] }) {
-  const workspace = useWorkspace()
-  const { directory, ready } = useDevice()
-  const lookup = { nodes: workspace.nodes, directory }
-  const canCancel = ["pending_delivery", "queued", "claimed", "accepted", "running"].includes(task.state)
-  const canCancelHere = ready?.entry.peer_id === task.source_node || ready?.entry.peer_id === task.target_node
-  return <section className="grid min-w-0 gap-3" aria-label="Agent 任务">
-    <div className="flex flex-wrap items-center gap-2"><StatusBadge value={task.state} /><span className="text-xs text-muted-foreground">由 {nodeName(task.source_node, lookup)} 交给 {nodeName(task.target_node, lookup)}</span></div>
-    <p className="whitespace-pre-wrap break-words text-sm">{task.text}</p>
-    {task.detail && task.detail !== task.text ? <p className="whitespace-pre-wrap break-words text-sm">{task.detail}</p> : null}
-    {task.state === "pending_check" ? <p role="status" className="text-sm">原任务已中断，目标设备结清后再汇报，不会重派。</p> : null}
-    {canCancel ? <div><ActionButton className="min-h-11" variant="destructive" disabled={!workspace.writable || !workspace.selectedBot || !canCancelHere} action={async () => { if (canCancelHere) await workspace.run(() => workspace.cancelAgentTask(task.task_ref)) }}>请求取消任务</ActionButton></div> : null}
-    {canCancel && !canCancelHere ? <p className="text-sm text-muted-foreground">请连接任务来源或目标设备后取消任务。</p> : null}
-    {sessions.map((session) => <NativeSessionActivity key={`${session.target_node}:${session.work_id}`} session={session} />)}
-  </section>
-}
+const decisionOf = (response: unknown) => response && typeof response === "object" ? (response as { decision?: unknown }).decision : undefined
 
-export function NativeSessionActivity({ session, compact = false }: { session: NativeSessionRecord; compact?: boolean }) {
+/** Shared by the chat stream, the task panel and /inbox; `stoppable` is off where the view has its own stop button. */
+export function ApprovalCard({ session, request, meta, stoppable = true }: { session: NativeSessionRecord; request: HumanRequest; meta?: ReactNode; stoppable?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
-  const targetOnline = workspace.nodes.some((node) => node.peer_id === session.target_node && node.online && !node.revoked)
-  const active = session.state === "running" || session.state === "waiting"
-  const canControl = workspace.writable && Boolean(workspace.selectedBot) && targetOnline && active && session.freshness === "observed" && session.can_control
-  const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === session.work_id && item.target_node === session.target_node && item.thread_id === session.thread_id && (item.turn_id ?? null) === session.turn_id)
-  const approvals = session.pending_requests.map((request) => <NativeApproval key={`${typeof request.request_id}:${request.request_id}`} session={session} request={request} disabled={!canControl} />)
-  if (compact) return approvals.length ? <div className="grid gap-3">{approvals}</div> : null
-  return <section className="grid min-w-0 gap-3 rounded-lg border p-3" aria-label="原生工作">
-    <div className="flex flex-wrap items-center gap-2"><StatusBadge value={session.state} label={session.freshness === "observed" && session.pending_requests.length && active ? "等待本人决定" : undefined} /><span className="text-xs text-muted-foreground">{nodeName(session.target_node, { nodes: workspace.nodes, directory })} · 原生工作</span></div>
-    {session.freshness === "cached" ? <p role="status" className="text-sm text-muted-foreground">上次记录的状态与进展，当前待核对。确认最新进展后才能操作。</p> : null}
-    {progress?.status ? <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{progress.status}</p> : null}
-    {progress?.text ? <p className="whitespace-pre-wrap break-words text-sm">{progress.text}</p> : null}
-    {session.detail && session.detail !== progress?.text ? <p className="whitespace-pre-wrap break-words text-sm">{session.detail}</p> : null}
-    {session.state === "unknown" ? <p role="status" className="text-sm">结果未知，已列入待核对，不会自动重跑。</p> : null}
-    {!targetOnline ? <p role="status" className="text-sm text-muted-foreground">设备恢复连接后可核对最新进展。</p> : null}
-    {active && !session.turn_id ? <p className="text-sm text-muted-foreground">尚未关联当前轮次，暂不能停止。</p> : null}
-    <div className="flex flex-wrap gap-2">
-      <ActionButton className="min-h-11" disabled={!workspace.connectionOnline} action={() => workspace.run(() => workspace.refresh())}>核对进展</ActionButton>
-      {active && session.turn_id ? <ActionButton className="min-h-11" variant="destructive" disabled={!canControl} action={async () => { if (canControl) await workspace.run(() => workspace.interruptNative(session.work_id, session.target_node)) }}>停止原生工作</ActionButton> : null}
-    </div>
-    {approvals}
-  </section>
-}
-
-export function NativeApproval({ session, request, disabled }: { session: NativeSessionRecord; request: HumanRequest; disabled: boolean }) {
-  const workspace = useWorkspace()
+  const id = useId()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === workspace.generation
-  const blocked = disabled || session.freshness !== "observed" || !session.can_control
-  const id = useId()
+  const node = workspace.nodes.find((item) => item.peer_id === session.target_node)
+  const active = session.state === "running" || session.state === "waiting"
+  const disabled = !workspace.writable || !node?.online || Boolean(node.revoked) || !active || session.freshness !== "observed" || !session.can_control
+  const respond = (response: unknown) => async () => {
+    if (disabled) return
+    await workspace.respondNative(session.work_id, session.target_node, request.request_id, response)
+  }
+  const choice = (decision: string) => request.choices?.find((item) => decisionOf(item.response) === decision)
+  const accept = choice("accept"), decline = choice("decline"), cancel = choice("cancel")
+  const reject = decline ?? cancel
   const questions = request.questions ?? []
-  return (
-    <section className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" aria-label="人工审批">
-      <h4 className="text-sm font-semibold">{request.title || "等待本人决定"}</h4>
-      <p className="whitespace-pre-line break-words text-sm">{request.text}</p>
-      {session.freshness === "cached" ? <p role="status" className="text-sm text-muted-foreground">这是上次记录的请求，待核对当前状态后才能回复。</p> : null}
-      {!questions.some((question) => question.is_secret) && request.choices?.length ? (
-        <div className="flex flex-wrap gap-2">
-          {request.choices.map((choice, index) => <ActionButton key={index} className="min-h-11" disabled={busy || blocked} action={async () => {
-            if (blocked || busy || !workspace.writable) return
-            const generation = workspace.generation
-            setBusyGeneration(generation)
-            try {
-              await workspace.run(async () => { await workspace.respondNative(session.work_id, session.target_node, request.request_id, choice.response) })
-            } finally {
-              setBusyGeneration(owner => owner === generation ? null : owner)
-            }
-          }}>{choice.label}</ActionButton>)}
-        </div>
-      ) : questions.length > 0 && !questions.some((question) => question.is_secret) ? (
-        <form onSubmit={(event) => {
-          event.preventDefault()
-          if (blocked || busy || !workspace.writable) return
-          const form = event.currentTarget
-          if (!form.reportValidity()) return
-          const values = new FormData(form)
-          const generation = workspace.generation
-          setBusyGeneration(generation)
-          void workspace.run(async () => {
-            const answers = Object.fromEntries(questions.map((question, index) => {
-              const answer = String(values.get(`answer-${index}`) ?? '').trim()
-              if (!answer) throw new Error('请回答每个问题后再提交。')
-              return [question.id, { answers: [answer] }]
-            }))
-            await workspace.respondNative(session.work_id, session.target_node, request.request_id, { answers })
-          }).finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
-        }}>
-          <fieldset disabled={blocked || busy || !workspace.writable} className="min-w-0">
-            <FieldGroup>
-              {questions.map((question, index) => <Field key={question.id}>
-                <FieldLabel htmlFor={`${id}-answer-${index}`}>{question.header || question.question}</FieldLabel>
-                {question.header ? <p className="text-sm">{question.question}</p> : null}
-                {question.options?.length ? <NativeSelect id={`${id}-answer-${index}`} name={`answer-${index}`} defaultValue="" required>
-                  <NativeSelectOption value="" disabled>请选择</NativeSelectOption>
-                  {question.options.map((option) => <NativeSelectOption key={option.label} value={option.label}>{option.label}{option.description ? ` · ${option.description}` : ''}</NativeSelectOption>)}
-                </NativeSelect> : <Textarea id={`${id}-answer-${index}`} name={`answer-${index}`} rows={2} required maxLength={50000} />}
-              </Field>)}
-              <SubmitButton busy={busy} variant="secondary">发送本人回答</SubmitButton>
-            </FieldGroup>
-          </fieldset>
-        </form>
-      ) : <p className="text-sm text-muted-foreground">{questions.some((question) => question.is_secret) ? '此请求包含敏感输入，请在工作设备填写。' : '此请求暂无可用的回复选项，请到工作设备人工核对。'}</p>}
-    </section>
-  )
-}
+  const secret = questions.some((question) => question.is_secret)
+  const single = questions.length === 1 && questions[0].options?.length ? questions[0] : null
+  const risk = approvalRisk(request, node?.capabilities?.roots ?? [])
+  const elsewhere = secret ? "到执行设备上填写" : !questions.length && !accept && !reject ? "到执行设备上处理" : ""
 
-function reconcileSummary(result: Record<string, unknown>): string {
-  if (result.pending === false) return "原生工作已有最终结果。"
-  const groups = Array.isArray(result.process_groups) ? result.process_groups as { process_group: number; exited: boolean }[] : []
-  const running = groups.filter((group) => !group.exited).map((group) => group.process_group)
-  if (!groups.length) return "原生工作仍无法确认结果。"
-  return running.length ? `进程组 ${running.join("、")} 仍在运行或无法检查。` : "记录的进程组均已退出；脱离的工具和外部副作用仍需本人核对。"
-}
-
-export function PendingCheckItem({ check }: { check: PendingCheck }) {
-  const workspace = useWorkspace()
-  const { directory } = useDevice()
-  const fieldId = useId()
-  const [busy, setBusy] = useState(false)
-  const [summary, setSummary] = useState("")
-  const disabled = !workspace.writable || !workspace.selectedBot
-  return <section className="grid min-w-0 gap-3 rounded-lg border p-3" aria-label="待核对">
-    <div className="flex flex-wrap items-center gap-2"><StatusBadge value="pending" label={check.kind === "native_turn" ? "原生工作待核对" : "管理进程待核对"} /><span className="text-xs text-muted-foreground">{nodeName(check.target_node, { nodes: workspace.nodes, directory })}{check.freshness === "cached" ? " · 上次记录" : ""}</span></div>
-    {check.detail ? <p className="whitespace-pre-wrap break-words text-sm">{check.detail}</p> : null}
-    <p className="text-sm text-muted-foreground">{check.kind === "native_turn" ? "复查只读取原轮次。查不到时，请本人确认实际结果。" : "复查只确认进程是否退出。进程运行期间的副作用需本人核对后提交证据。"}</p>
-    {summary ? <p role="status" className="text-sm">{summary}</p> : null}
-    <div><ActionButton className="min-h-11" disabled={disabled} action={() => workspace.run(async () => { setSummary(reconcileSummary(await workspace.reconcileCheck(check))) })}>复查原目标</ActionButton></div>
-    <form className="space-y-3" onSubmit={(event) => {
+  return <ActionCard
+    icon={Hand}
+    title={`需要你同意 · ${approvalKind(request)}`}
+    meta={meta ?? nodeName(session.target_node, { nodes: workspace.nodes, directory })}
+    menu={stoppable && decline && cancel ? <Popover.Root>
+      <Popover.Trigger asChild><Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="更多" title="更多"><Ellipsis aria-hidden="true" /></Button></Popover.Trigger>
+      <Popover.Portal><Popover.Content align="end" sideOffset={4} className="z-50 rounded-xl border bg-popover p-1 shadow-lg">
+        <ActionButton variant="ghost" className="text-danger" disabled={disabled} action={respond(cancel.response)}>停止这个任务</ActionButton>
+      </Popover.Content></Popover.Portal>
+    </Popover.Root> : undefined}
+    actions={elsewhere || questions.length ? undefined : <>
+      {reject ? <ActionButton disabled={disabled} action={respond(reject.response)}>{decline ? "拒绝" : "拒绝并停止"}</ActionButton> : null}
+      {accept ? <ActionButton variant="default" disabled={disabled} action={respond(accept.response)}>同意一次</ActionButton> : null}
+    </>}
+  >
+    {request.command ? <code className="block whitespace-pre-wrap break-all rounded-lg bg-background/70 px-3 py-2 font-mono text-meta">{request.command}</code> : null}
+    {request.cwd ? <p className="break-all text-meta text-muted-foreground">在 {request.cwd}</p> : null}
+    {risk ? <p className="flex items-center gap-1.5 text-meta font-medium text-warning"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{risk}</p> : null}
+    {request.files?.length ? <Details label={`会修改 ${request.files.length} 个文件`}>{request.files.map((file) => <span key={file} className="font-mono">{file}</span>)}</Details> : null}
+    {request.reason ? <p className="text-meta"><span className="text-muted-foreground">原因：</span>{request.reason}</p> : null}
+    {session.freshness !== "observed" ? <p role="status" className="text-meta text-muted-foreground">正在确认最新状态</p> : null}
+    {elsewhere ? <p className="text-meta text-muted-foreground">{elsewhere}</p> : single ? <div className="grid gap-2">
+      <p>{single.question}</p>
+      <div className="flex flex-wrap gap-2">{single.options!.map((option) => <ActionButton key={option.label} disabled={disabled} action={respond({ answers: { [single.id]: { answers: [option.label] } } })}>{option.label}</ActionButton>)}</div>
+    </div> : questions.length ? <form onSubmit={(event) => {
       event.preventDefault()
+      if (disabled || busy) return
       const form = event.currentTarget
       if (!form.reportValidity()) return
-      const data = new FormData(form)
-      setBusy(true)
-      void workspace.run(() => workspace.resolveCheck(check, String(data.get("evidence") ?? ""), check.kind === "native_turn" ? String(data.get("outcome") ?? "") : undefined)).finally(() => setBusy(false))
+      const values = new FormData(form)
+      const generation = workspace.generation
+      setBusyGeneration(generation)
+      void workspace.run(async () => {
+        const answers = Object.fromEntries(questions.map((question, index) => {
+          const answer = String(values.get(`answer-${index}`) ?? "").trim()
+          if (!answer) throw new Error("每个问题都要回答。")
+          return [question.id, { answers: [answer] }]
+        }))
+        await respond({ answers })()
+      }).finally(() => setBusyGeneration((owner) => owner === generation ? null : owner))
     }}>
-      <FieldGroup>
-        {check.kind === "native_turn" ? <Field><FieldLabel htmlFor={`${fieldId}-outcome`}>实际结果</FieldLabel><NativeSelect id={`${fieldId}-outcome`} name="outcome" required defaultValue="" disabled={disabled}>
-          <NativeSelectOption value="" disabled>请选择</NativeSelectOption>
-          <NativeSelectOption value="completed">已完成</NativeSelectOption>
-          <NativeSelectOption value="failed">已失败</NativeSelectOption>
-          <NativeSelectOption value="interrupted">已停止</NativeSelectOption>
-        </NativeSelect></Field> : null}
-        <Field><FieldLabel htmlFor={`${fieldId}-evidence`}>本人核查证据</FieldLabel><Textarea id={`${fieldId}-evidence`} name="evidence" rows={3} required minLength={6} disabled={disabled} /></Field>
-      </FieldGroup>
-      <SubmitButton busy={busy} disabled={disabled}>确认已核对</SubmitButton>
-    </form>
-  </section>
+      <fieldset disabled={disabled || busy} className="grid min-w-0 gap-3">
+        {questions.map((question, index) => <Field key={question.id}>
+          <FieldLabel htmlFor={`${id}-answer-${index}`}>{question.question}</FieldLabel>
+          {question.options?.length ? <NativeSelect id={`${id}-answer-${index}`} name={`answer-${index}`} defaultValue="" required>
+            <NativeSelectOption value="" disabled>请选择</NativeSelectOption>
+            {question.options.map((option) => <NativeSelectOption key={option.label} value={option.label}>{option.label}</NativeSelectOption>)}
+          </NativeSelect> : <Input id={`${id}-answer-${index}`} name={`answer-${index}`} required maxLength={50000} />}
+        </Field>)}
+        <div className="flex justify-end"><SubmitButton busy={busy}>发送</SubmitButton></div>
+      </fieldset>
+    </form> : null}
+  </ActionCard>
+}
+
+/** Plain-language reason; the original text stays in the details. */
+export function checkReason(check: PendingCheck): string {
+  if (/restart/i.test(check.detail)) return "设备在助手工作时重启了，系统不会自动重做。"
+  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和助手的连接断了，系统不会自动重做。"
+  return "这次的结果没法自动确认，系统不会自动重做。"
+}
+
+function recheckSummary(result: Record<string, unknown>): string {
+  if (result.pending === false) return "已经有最终结果了。"
+  const groups = Array.isArray(result.process_groups) ? result.process_groups as { exited: boolean }[] : []
+  if (!groups.length) return "还是查不到结果，请按实际情况选。"
+  return groups.some((group) => !group.exited) ? "还有程序在运行，稍后再查。" : "相关程序都已结束，请按实际情况选。"
+}
+
+/** "需要确认": the person says whether interrupted work actually finished. Nothing is re-run. */
+export function ConfirmCard({ check }: { check: PendingCheck }) {
+  const workspace = useWorkspace()
+  const { directory } = useDevice()
+  const id = useId()
+  const [note, setNote] = useState("")
+  const [summary, setSummary] = useState("")
+  const disabled = !workspace.writable || !workspace.selectedBot
+  const native = check.kind === "native_turn"
+  const answer = (choice: string, outcome: string) => async () => {
+    const evidence = `用户在网页上选择：${choice}${note.trim() ? `。${note.trim()}` : ""}`
+    await workspace.resolveCheck(check, evidence, native ? outcome : undefined)
+  }
+  return <ActionCard
+    icon={CircleQuestionMark}
+    title={`需要确认 · ${native ? "任务被打断" : "上次回复被打断"}`}
+    meta={nodeName(check.target_node, { nodes: workspace.nodes, directory })}
+    actions={<>
+      <ActionButton variant="ghost" disabled={disabled} action={async () => { setSummary(""); setSummary(recheckSummary(await workspace.reconcileCheck(check))) }}>不确定，再查一次</ActionButton>
+      <ActionButton disabled={disabled} action={answer("没做完", "interrupted")}>没做完</ActionButton>
+      <ActionButton variant="default" disabled={disabled} action={answer("做完了", "completed")}>做完了</ActionButton>
+    </>}
+  >
+    <p>{checkReason(check)}{native ? "那个任务实际做完了吗？" : "那次要做的事实际做完了吗？"}</p>
+    {summary ? <p role="status" className="text-meta text-muted-foreground">{summary}</p> : null}
+    <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
+    {check.detail ? <Details><span>{check.detail}</span></Details> : null}
+  </ActionCard>
 }

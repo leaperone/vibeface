@@ -9,50 +9,256 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as IndexRouteImport } from './routes/index'
+import { Route as AppRouteImport } from './routes/_app'
+import { Route as JoinRouteImport } from './routes/join'
+import { Route as SetupRouteImport } from './routes/setup'
+import { Route as AppIndexRouteImport } from './routes/_app/index'
+import { Route as AppInboxRouteImport } from './routes/_app/inbox'
+import { Route as AppSettingsRouteImport } from './routes/_app/settings'
+import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
+import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
+import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
+import { Route as AppBBotIdWorkWorkIdRouteImport } from './routes/_app/b.$botId.work.$workId'
 
-const IndexRoute = IndexRouteImport.update({
+const AppRoute = AppRouteImport.update({
+  id: '/_app',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const JoinRoute = JoinRouteImport.update({
+  id: '/join',
+  path: '/join',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SetupRoute = SetupRouteImport.update({
+  id: '/setup',
+  path: '/setup',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AppIndexRoute = AppIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => rootRouteImport,
+  getParentRoute: () => AppRoute,
+} as any)
+const AppInboxRoute = AppInboxRouteImport.update({
+  id: '/inbox',
+  path: '/inbox',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsRoute = AppSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppBBotIdRoute = AppBBotIdRouteImport.update({
+  id: '/b/$botId',
+  path: '/b/$botId',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDevicesIndexRoute = AppDevicesIndexRouteImport.update({
+  id: '/devices/',
+  path: '/devices/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDevicesDeviceIdRoute = AppDevicesDeviceIdRouteImport.update({
+  id: '/devices/$deviceId',
+  path: '/devices/$deviceId',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppBBotIdWorkWorkIdRoute = AppBBotIdWorkWorkIdRouteImport.update({
+  id: '/work/$workId',
+  path: '/work/$workId',
+  getParentRoute: () => AppBBotIdRoute,
 } as any)
 
 export interface FileRoutesByFullPath {
-  '/': typeof IndexRoute
+  '/': typeof AppIndexRoute
+  '/join': typeof JoinRoute
+  '/setup': typeof SetupRoute
+  '/inbox': typeof AppInboxRoute
+  '/settings': typeof AppSettingsRoute
+  '/b/$botId': typeof AppBBotIdRouteWithChildren
+  '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/devices/': typeof AppDevicesIndexRoute
+  '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesByTo {
-  '/': typeof IndexRoute
+  '/join': typeof JoinRoute
+  '/setup': typeof SetupRoute
+  '/inbox': typeof AppInboxRoute
+  '/settings': typeof AppSettingsRoute
+  '/': typeof AppIndexRoute
+  '/b/$botId': typeof AppBBotIdRouteWithChildren
+  '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/devices': typeof AppDevicesIndexRoute
+  '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
-  '/': typeof IndexRoute
+  '/_app': typeof AppRouteWithChildren
+  '/join': typeof JoinRoute
+  '/setup': typeof SetupRoute
+  '/_app/inbox': typeof AppInboxRoute
+  '/_app/settings': typeof AppSettingsRoute
+  '/_app/': typeof AppIndexRoute
+  '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
+  '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/_app/devices/': typeof AppDevicesIndexRoute
+  '/_app/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/join'
+    | '/setup'
+    | '/inbox'
+    | '/settings'
+    | '/b/$botId'
+    | '/devices/$deviceId'
+    | '/devices/'
+    | '/b/$botId/work/$workId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/join'
+    | '/setup'
+    | '/inbox'
+    | '/settings'
+    | '/'
+    | '/b/$botId'
+    | '/devices/$deviceId'
+    | '/devices'
+    | '/b/$botId/work/$workId'
+  id:
+    | '__root__'
+    | '/_app'
+    | '/join'
+    | '/setup'
+    | '/_app/inbox'
+    | '/_app/settings'
+    | '/_app/'
+    | '/_app/b/$botId'
+    | '/_app/devices/$deviceId'
+    | '/_app/devices/'
+    | '/_app/b/$botId/work/$workId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  IndexRoute: typeof IndexRoute
+  AppRoute: typeof AppRouteWithChildren
+  JoinRoute: typeof JoinRoute
+  SetupRoute: typeof SetupRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
+    '/_app': {
+      id: '/_app'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof AppRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/join': {
+      id: '/join'
+      path: '/join'
+      fullPath: '/join'
+      preLoaderRoute: typeof JoinRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/setup': {
+      id: '/setup'
+      path: '/setup'
+      fullPath: '/setup'
+      preLoaderRoute: typeof SetupRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_app/': {
+      id: '/_app/'
       path: '/'
       fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
+      preLoaderRoute: typeof AppIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/inbox': {
+      id: '/_app/inbox'
+      path: '/inbox'
+      fullPath: '/inbox'
+      preLoaderRoute: typeof AppInboxRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings': {
+      id: '/_app/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof AppSettingsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/b/$botId': {
+      id: '/_app/b/$botId'
+      path: '/b/$botId'
+      fullPath: '/b/$botId'
+      preLoaderRoute: typeof AppBBotIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/devices/': {
+      id: '/_app/devices/'
+      path: '/devices'
+      fullPath: '/devices/'
+      preLoaderRoute: typeof AppDevicesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/devices/$deviceId': {
+      id: '/_app/devices/$deviceId'
+      path: '/devices/$deviceId'
+      fullPath: '/devices/$deviceId'
+      preLoaderRoute: typeof AppDevicesDeviceIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/b/$botId/work/$workId': {
+      id: '/_app/b/$botId/work/$workId'
+      path: '/work/$workId'
+      fullPath: '/b/$botId/work/$workId'
+      preLoaderRoute: typeof AppBBotIdWorkWorkIdRouteImport
+      parentRoute: typeof AppBBotIdRoute
     }
   }
 }
 
+interface AppBBotIdRouteChildren {
+  AppBBotIdWorkWorkIdRoute: typeof AppBBotIdWorkWorkIdRoute
+}
+
+const AppBBotIdRouteChildren: AppBBotIdRouteChildren = {
+  AppBBotIdWorkWorkIdRoute: AppBBotIdWorkWorkIdRoute,
+}
+
+const AppBBotIdRouteWithChildren = AppBBotIdRoute._addFileChildren(
+  AppBBotIdRouteChildren,
+)
+
+interface AppRouteChildren {
+  AppInboxRoute: typeof AppInboxRoute
+  AppSettingsRoute: typeof AppSettingsRoute
+  AppIndexRoute: typeof AppIndexRoute
+  AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
+  AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
+  AppDevicesIndexRoute: typeof AppDevicesIndexRoute
+}
+
+const AppRouteChildren: AppRouteChildren = {
+  AppInboxRoute: AppInboxRoute,
+  AppSettingsRoute: AppSettingsRoute,
+  AppIndexRoute: AppIndexRoute,
+  AppBBotIdRoute: AppBBotIdRouteWithChildren,
+  AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,
+  AppDevicesIndexRoute: AppDevicesIndexRoute,
+}
+
+const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
-  IndexRoute: IndexRoute,
+  AppRoute: AppRouteWithChildren,
+  JoinRoute: JoinRoute,
+  SetupRoute: SetupRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

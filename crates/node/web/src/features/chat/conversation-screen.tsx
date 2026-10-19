@@ -1,58 +1,105 @@
 import { useEffect, useRef, useState } from 'react'
-import { Reasoning } from '@/components/ai-elements/reasoning'
-import { Task } from '@/components/ai-elements/task'
-import { Tool } from '@/components/ai-elements/tool'
-import { StatusOrb } from '@/components/status-orb'
+import { Link } from '@tanstack/react-router'
+import { Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ActionCard, InlineError } from '@/components/app/kit'
+import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceLine, TraceTitle } from '@/components/ui/trace'
-import type { OrbPlace } from './orb-state'
+import { useDevice } from '@/features/identity/context'
 import { useWorkspace } from '@/features/workspace/context'
 import { ActionButton } from '@/features/workspace/present'
-import { Chat } from './elements/chat'
+import { ChatSkeleton } from '@/features/workspace/workspace-shell'
+import { ApprovalCard, ConfirmCard } from '@/features/workspace/task-activity'
+import { approvalKind, decisionLabel, nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
+import type { AnsweredRequest, AutonomyMode, ManagerJob, NativeSessionRecord } from '@/features/workspace/types'
+import { Chat, type ChatEntry } from './elements/chat'
+import { Message, type ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
 import { canSend, composerHint } from './protocol'
-import { AgentTaskActivity, NativeSessionActivity, PendingCheckItem } from '@/features/workspace/task-activity'
-import { stateLabel } from '@/features/workspace/labels'
-import type { AutonomyMode } from '@/features/workspace/types'
-import { ManagerStatus, managerTraceStatus, managerTraceTitle } from './elements/manager-status'
 import './chat.css'
+
+const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
+const replyStates: Record<string, string> = { failed: '回复失败', rejected: '没有处理' }
+const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
 
 export function ConversationScreen() {
   const workspace = useWorkspace()
+  const { directory } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
+  const [sendError, setSendError] = useState<unknown>(null)
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
+  const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
   const originalEntry = !messagePending || messagePending.entry_node === workspace.info.peer_id
   const jobs = data?.scheduler?.jobs ?? []
-  const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling'].includes(job.state))
+  const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const pendingChecks = data?.pending_checks ?? []
-  const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)
-  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'interrupted', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0 }))
-  const messages = [...(data?.messages ?? []), ...liveMessages]
+  const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
-  const sendDisabled = !workspace.writable || !workspace.selectedBot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
-  const assistantBusy = activeJobs.some((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling'].includes(job.state))
-  const stopJob = jobs.find((job) => workspace.data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
-  const pendingShown = messagePending && !messages.some((message) => message.message_id === messagePending.message_id)
-    ? [{ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0 }]
-    : []
-  const shown = [...messages, ...pendingShown]
-  const needsCheck = Boolean(messagePending && !messageBusy && !assistantBusy) || pendingChecks.length > 0 || data?.agent_tasks.some((item) => item.state === 'pending_check')
-  const hint = !workspace.connectionOnline ? '连接中断，稍等。'
-    : needsCheck && messagePending ? (!originalEntry ? '上一条还没确认送达，请回到原来的入口核对。' : messagePending.rejected ? '上一条没有发出。展开上方「需要核对」重试或解除。' : '上一条还没确认送达。展开上方「需要核对」核对或重试。')
-    : workspace.writeNotice || (!workspace.selectedBot ? '' : composerHint(gate))
-      || (!agentReady ? '还没有可用的 Agent。请到「设置」为节点启用管理 Agent。' : '')
-      || (pendingChecks.length ? '有待核对的工作。展开上方「需要核对」处理。' : '')
-      || (stopJob ? '正在回复。可以先写下一条，回复结束后再发送。' : '')
-  const hasDetails = Boolean(data && (visibleJobs.length > 0 || pendingChecks.length > 0 || data.agent_tasks.length > 0 || data.native_sessions.length > 0 || messagePending))
-  const reasoning = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
-  const awaitingDecision = data?.native_sessions.some((session) => session.pending_requests.length > 0)
-  const workRunning = data?.agent_tasks.some((task) => ['pending_delivery', 'queued', 'claimed', 'accepted', 'running', 'cancelling'].includes(task.state)) || data?.native_sessions.some((session) => ['running', 'waiting', 'interrupting'].includes(session.state))
-  const multiStep = visibleJobs.length + (data?.agent_tasks.length ?? 0) + (data?.native_sessions.length ?? 0) > 1
-  const tracePlace: OrbPlace | null = needsCheck ? 'reconcile' : workRunning ? 'wait' : multiStep ? 'trace' : null
-  const waitLabel = messageBusy && !assistantBusy ? '稍等' : '正在回复'
+  const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
+  const assistantBusy = activeJobs.length > 0
+  const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
+  const lookup = { nodes: workspace.nodes, directory }
+
+  const pendingRow = (message: ChatMessage) => ({ key: message.message_id, anchor: message.role === 'user', node: <Message message={message} /> })
+  const interruptedRow = (reply: (typeof workspace.interrupted)[number]): ChatMessage => ({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: 0, state: 'interrupted' })
+
+  // Tasks and the approvals answered inside them sit right after the message that started them.
+  const sessions = data?.native_sessions ?? []
+  const tasks: TaskRow[] = (data?.agent_tasks ?? []).map((task) => ({ id: task.task_ref, state: task.state as string, device: task.target_node, summary: task.text, trigger: task.origin_trigger, sessions: sessions.filter((session) => session.task_ref === task.task_ref) }))
+    .concat(sessions.filter((session) => !session.task_ref || !data?.agent_tasks.some((task) => task.task_ref === session.task_ref)).map((session) => ({ id: session.work_id, state: shownState(session), device: session.target_node, summary: session.detail, trigger: session.origin_trigger ?? '', sessions: [session] })))
+  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'pending_check' || task.state === 'unknown')
+  const placed = new Set<string>()
+  const taskRows = (task: TaskRow) => {
+    placed.add(task.id)
+    const rows = bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} open={openTasks.includes(task)} /> }] : []
+    for (const session of task.sessions) for (const answer of session.answered_requests ?? []) rows.push({ key: `answered:${session.work_id}:${answer.request_id}`, node: <AnsweredLine answer={answer} /> })
+    return rows
+  }
+
+  const entries: ChatEntry[] = []
+  for (const message of data?.messages ?? []) {
+    entries.push(pendingRow(message))
+    for (const job of jobs) {
+      if (job.message_id !== message.message_id) continue
+      for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
+      if ((job.state === 'failed' || job.state === 'rejected')) entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+    }
+    for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
+  }
+  for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
+  for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
+  if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
+  for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
+
+  const approvals = sessions.flatMap((session) => session.pending_requests.map((request) => ({ session, request, key: `${session.target_node}:${session.work_id}:${request.request_id}` })))
+  const needsConfirm = pendingChecks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
+  const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
+  if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p> })
+
+  // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
+  const cards = [
+    messagePending && !messageBusy ? <ActionCard key="undelivered" icon={MessageSquareWarning} title="消息可能没送达" actions={<>
+      <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
+      <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
+      <ActionButton variant="default" disabled={!workspace.writable || !originalEntry || workspace.incomplete} action={async () => {
+        if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
+      }}>重新发送</ActionButton>
+    </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
+    ...pendingChecks.map((check) => <ConfirmCard key={`${check.target_node}:${check.check_id}`} check={check} />),
+    ...approvals.map(({ session, request, key }) => <ApprovalCard key={key} session={session} request={request} />),
+  ].filter(Boolean)
+  if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
+
+  const managerOffline = workspace.nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager)
+  const hint = !workspace.connectionOnline ? '离线，恢复后可发送'
+    : workspace.writeNotice ? '同步中，稍后可发送'
+    : messagePending ? (!originalEntry ? '这条消息要回到原来的设备上处理' : '上一条消息还没确认送达')
+    : needsConfirm ? '先处理上面这件事'
+    : bot && !agentReady ? (managerOffline ? '能运行助手的设备离线了' : '暂时没有能运行助手的设备')
+    : bot ? composerHint(gate) : ''
+  const needsSetup = Boolean(bot && !agentReady)
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -66,6 +113,7 @@ export function ConversationScreen() {
       return next
     })
   }, [conversationId, data, messagePending])
+  useEffect(() => { setSendError(null) }, [conversationId])
 
   function clearSentDraft(id: string, sent: string) {
     setDrafts((current) => {
@@ -75,83 +123,85 @@ export function ConversationScreen() {
       return next
     })
   }
+  const setText = (value: string) => setDrafts((current) => new Map(current).set(conversationId, value))
+
+  if (bot && !data) return <section className="conversation-screen" aria-label="对话"><ChatSkeleton /></section>
 
   return (
     <section className="conversation-screen" aria-label="对话">
       <Chat
         key={conversationId}
-        messages={shown}
-        emptyTitle={workspace.selectedBot ? workspace.selectedBot.name : workspace.bots.length ? '选择一个机器人' : '还没有机器人'}
-        emptyDetail={workspace.selectedBot ? workspace.selectedBot.instructions || '发一条消息开始聊。' : workspace.bots.length ? '从侧栏选择机器人，开始对话。' : '先创建一个机器人，再开始对话。'}
-        emptyMark={workspace.selectedBot ? <StatusOrb place="idle-chat" size={20} /> : undefined}
-      >
-        {reasoning ? <Reasoning text={reasoning} running={assistantBusy} /> : null}
-        {(messageBusy || assistantBusy) && liveMessages.length === 0 ? <p role="status" className="replying" aria-label={waitLabel}><StatusOrb place={assistantBusy ? 'reply' : 'wait'} size={20} /><span>{waitLabel}</span></p> : null}
-      </Chat>
-      {awaitingDecision || hasDetails ? <div className="chat-activity">
-      {awaitingDecision ? <div className="chat-approvals">
-        {data?.native_sessions.map((session) => <NativeSessionActivity key={`approval-${session.target_node}:${session.work_id}`} session={session} compact />)}
-      </div> : null}
-      {hasDetails ? <div>
-        <Trace>
-          <TraceCollapsible defaultOpen={false}>
-            <TraceCollapsibleTrigger>
-              <TraceLine status={needsCheck || awaitingDecision ? 'pending' : workRunning || assistantBusy ? 'running' : undefined}>
-                {tracePlace ? <StatusOrb place={tracePlace} size={20} /> : null}
-                <TraceTitle>{needsCheck ? '需要核对' : awaitingDecision ? '等待本人决定' : workRunning || assistantBusy ? '工作进行中' : '工作进展'}</TraceTitle>
-              </TraceLine>
-            </TraceCollapsibleTrigger>
-            <TraceCollapsibleContent>
-              {messagePending ? <div className="pending-message-actions">
-                <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对</ActionButton>
-                <ActionButton disabled={!workspace.writable || !originalEntry || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
-                  if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
-                })}>重试</ActionButton>
-                <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>解除</ActionButton>
-              </div> : null}
-              <Trace>
-                {pendingChecks.map((check) => <Task key={`${check.target_node}:${check.check_id}`} title={check.kind === 'native_turn' ? '原生工作待核对' : '管理进程待核对'} status="pending"><PendingCheckItem check={check} /></Task>)}
-                {visibleJobs.map((job) => <Tool key={job.trigger} title={managerTraceTitle(job)} status={managerTraceStatus(job.state)}>
-                  <ManagerStatus job={job} progress={workspace.liveProgress.find((item) => item.kind === 'manager' && item.trigger === job.trigger)?.status} hasLiveProgress={workspace.liveProgress.some((item) => item.kind === 'manager' && item.trigger === job.trigger)} />
-                </Tool>)}
-                {data?.agent_tasks.map((task) => <Task key={task.task_ref} title={`Agent 任务 · ${stateLabel(task.state)}`} status={task.state === 'failed' ? 'error' : task.state === 'pending_check' ? 'pending' : ['completed', 'interrupted', 'cancelled'].includes(task.state) ? undefined : 'running'}>
-                  <AgentTaskActivity task={task} sessions={data.native_sessions.filter((session) => session.task_ref === task.task_ref)} />
-                </Task>)}
-                {data?.native_sessions.filter((session) => !session.task_ref || !data.agent_tasks.some((task) => task.task_ref === session.task_ref)).map((session) => <Task key={`${session.target_node}:${session.work_id}`} title={`原生工作 · ${stateLabel(session.state)}`} status={session.state === 'failed' ? 'error' : session.state === 'unknown' || session.state === 'waiting' ? 'pending' : ['running', 'interrupting'].includes(session.state) ? 'running' : undefined}>
-                  <NativeSessionActivity session={session} />
-                </Task>)}
-              </Trace>
-            </TraceCollapsibleContent>
-          </TraceCollapsible>
-        </Trace>
-      </div> : null}
-      </div> : null}
-      {data && workspace.selectedBot ? <div className="autonomy-control">
-        <label htmlFor="autonomy-mode">收到结果后</label>
-        <NativeSelect id="autonomy-mode" size="sm" value={data.autonomy.mode} disabled={!workspace.writable || data.autonomy.version === null} onChange={(event) => {
-          const mode = event.currentTarget.value as AutonomyMode
-          void workspace.run(() => workspace.setAutonomy(mode))
-        }}>
-          <NativeSelectOption value="off">停止后续</NativeSelectOption>
-          <NativeSelectOption value="report">只汇报</NativeSelectOption>
-          <NativeSelectOption value="continue">继续工作</NativeSelectOption>
-        </NativeSelect>
-        {data.autonomy.version === null ? <span>授权记录无法读取</span> : null}
-      </div> : null}
+        entries={entries}
+        empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
+          <Bot aria-hidden="true" className="size-8 text-muted-foreground" />
+          <h2 className="text-heading font-semibold">{bot.name}</h2>
+          <div className="flex flex-wrap justify-center gap-2">
+            {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => setText(example)}>{example}</Button>)}
+          </div>
+        </div> : null}
+      />
       <PromptInput
         value={text}
         hint={hint}
         disabled={sendDisabled}
         busy={messageBusy}
-        onStop={stopJob && workspace.writable && workspace.selectedBot ? () => { void workspace.run(() => workspace.cancelManager(stopJob.trigger)) } : undefined}
-        onChange={(value) => setDrafts((current) => new Map(current).set(conversationId, value))}
+        onStop={stopJob && workspace.writable && bot ? () => { setSendError(null); workspace.cancelManager(stopJob.trigger).catch(setSendError) } : undefined}
+        onChange={setText}
         onSubmit={() => {
           if (sendDisabled || !text.trim()) return
-          void workspace.run(async () => {
-            if (await workspace.sendMessage(text) && workspace.isCurrent()) clearSentDraft(conversationId, text)
-          })
+          setSendError(null)
+          workspace.sendMessage(text).then((sent) => { if (sent && workspace.isCurrent()) clearSentDraft(conversationId, text) }).catch(setSendError)
         }}
-      />
+      >
+        <InlineError error={sendError} />
+        {cards.length ? <button type="button" className="w-fit font-medium text-foreground underline underline-offset-4" onClick={() => document.getElementById('chat-waiting')?.scrollIntoView({ block: 'end', behavior: 'smooth' })}>去处理</button> : null}
+        {needsSetup ? <Link to="/devices" className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
+        {data && bot ? <label className="flex w-fit items-center gap-1">
+          完成后：
+          <NativeSelect size="sm" aria-label="完成后" value={data.autonomy.mode} disabled={!workspace.writable || data.autonomy.version === null} onChange={(event) => {
+            const mode = event.currentTarget.value as AutonomyMode
+            void workspace.run(() => workspace.setAutonomy(mode))
+          }}>
+            <NativeSelectOption value="off">停下</NativeSelectOption>
+            <NativeSelectOption value="report">只汇报</NativeSelectOption>
+            <NativeSelectOption value="continue">继续做</NativeSelectOption>
+          </NativeSelect>
+        </label> : null}
+      </PromptInput>
     </section>
   )
+}
+
+type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; sessions: NativeSessionRecord[] }
+
+/** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
+function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string; device: string; open: boolean }) {
+  const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'cancelled'
+  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+    {failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
+    <span className="min-w-0 truncate">任务 · {device} · {taskLabel(task.state)}</span>
+    <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
+  </Link>
+  return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
+    <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+    <span className="min-w-0 flex-1 truncate"><span className="font-medium">任务</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
+    <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
+  </Link>
+}
+
+function AnsweredLine({ answer }: { answer: AnsweredRequest }) {
+  const agreed = answer.decision === 'accept' || answer.decision === 'answer'
+  return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
+    {agreed ? <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /> : <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />}
+    <span className="min-w-0 flex-1 truncate">{decisionLabel(answer.decision)} · {approvalKind(answer)}{answer.command ? <span className="font-mono"> {answer.command}</span> : null}</span>
+    <time className="shrink-0 tabular-nums" dateTime={new Date(answer.at_ms).toISOString()}>{new Date(answer.at_ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
+  </p>
+}
+
+function JobLine({ job }: { job: ManagerJob }) {
+  return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-danger">
+    <CircleX aria-hidden="true" className="size-4 shrink-0" />
+    <span className="shrink-0">{replyStates[job.state] ?? '回复失败'}</span>
+    {job.error ? <span className="min-w-0 truncate" title={job.error}>{job.error.split('\n')[0]}</span> : null}
+  </p>
 }

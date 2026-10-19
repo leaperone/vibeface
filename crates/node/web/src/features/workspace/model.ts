@@ -1,6 +1,6 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
-  AgentTaskRecord, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
+  AgentTaskRecord, AnsweredRequest, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
   HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
 } from "./types"
 
@@ -12,23 +12,23 @@ export function inputText(value: string, label: string, maxBytes: number): strin
 }
 
 export function record(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("节点响应必须是对象。")
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("设备返回的内容格式不对。")
   return value as Record<string, unknown>
 }
 function text(value: unknown): string {
-  if (typeof value !== "string") throw new Error("节点响应缺少文本字段。")
+  if (typeof value !== "string") throw new Error("设备返回的内容缺少文字。")
   return value
 }
 function number(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("节点响应包含无效编号。")
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("设备返回的数字不对。")
   return value
 }
 function flag(value: unknown): boolean {
-  if (typeof value !== "boolean") throw new Error("节点响应缺少布尔字段。")
+  if (typeof value !== "boolean") throw new Error("设备返回的内容缺少开关值。")
   return value
 }
 function list(value: unknown): unknown[] {
-  if (!Array.isArray(value)) throw new Error("节点响应缺少列表字段。")
+  if (!Array.isArray(value)) throw new Error("设备返回的内容缺少列表。")
   return value
 }
 function texts(value: unknown): string[] { return list(value).map(text) }
@@ -67,7 +67,7 @@ function humanRequest(value: unknown): HumanRequest {
     return { id: text(question.id), header: text(question.header), question: text(question.question), is_secret: question.is_secret == null ? undefined : flag(question.is_secret), options: question.options == null ? undefined : list(question.options).map((item) => { const option = record(item); return { label: text(option.label), description: optionalText(option.description) } }) }
   })
   if (questions?.some((question) => !question.id) || questions && new Set(questions.map((question) => question.id)).size !== questions.length) throw new Error("人工问题编号无效或重复。")
-  return { request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind), title: optionalText(data.title), text: text(data.text), choices: data.choices == null ? undefined : list(data.choices).map((item) => { const choice = record(item); if (!("response" in choice)) throw new Error("人工决定缺少回复内容。"); return { label: text(choice.label), response: choice.response } }), questions }
+  return { request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind), title: optionalText(data.title), text: text(data.text), command: optionalText(data.command), cwd: optionalText(data.cwd), reason: optionalText(data.reason), files: data.files == null ? undefined : list(data.files).map(text), choices: data.choices == null ? undefined : list(data.choices).map((item) => { const choice = record(item); if (!("response" in choice)) throw new Error("人工决定缺少回复内容。"); return { label: text(choice.label), response: choice.response } }), questions }
 }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
@@ -87,7 +87,7 @@ function agentTaskState(value: unknown): AgentTaskState {
 function nativeSessionState(value: unknown): NativeSessionState {
   switch (value) {
     case "running": case "waiting": case "interrupting": case "completed": case "failed": case "interrupted": case "unknown": return value
-    default: throw new Error("未知的原生工作状态。")
+    default: throw new Error("任务状态无法识别。")
   }
 }
 function agentTask(value: unknown): AgentTaskRecord {
@@ -106,12 +106,20 @@ function nativeSession(value: unknown): NativeSessionRecord {
     target_node: text(data.target_node), thread_id: text(data.thread_id), turn_id: data.turn_id === null ? null : text(data.turn_id),
     state: nativeSessionState(data.state), freshness, can_control: flag(data.can_control),
     detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
+    origin_trigger: optionalText(data.origin_trigger), answered_requests: list(data.answered_requests ?? []).map(answeredRequest),
+  }
+}
+function answeredRequest(value: unknown): AnsweredRequest {
+  const data = record(value), decision = data.decision
+  return {
+    request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind),
+    decision: decision === "accept" || decision === "decline" || decision === "cancel" ? decision : "answer", command: optionalText(data.command), at_ms: number(data.at_ms),
   }
 }
 function pendingCheck(value: unknown): PendingCheck {
   const data = record(value), kind = data.kind, freshness = data.freshness
-  if (kind !== "manager_process" && kind !== "native_turn") throw new Error("未知的待核对类型。")
-  if (freshness !== "observed" && freshness !== "cached") throw new Error("未知的待核对读取来源。")
+  if (kind !== "manager_process" && kind !== "native_turn") throw new Error("需要确认的事项无法识别。")
+  if (freshness !== "observed" && freshness !== "cached") throw new Error("需要确认的事项来源无法识别。")
   return { check_id: text(data.check_id), kind, target_node: text(data.target_node), trigger: text(data.trigger), detail: text(data.detail), freshness, process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number) }
 }
 function autonomyMode(value: unknown): AutonomyMode {
@@ -130,7 +138,7 @@ function autonomy(value: unknown): ConversationAutonomy {
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
   const data = record(value), missing = record(data.missing)
   const owner = data.conversation === null ? null : conversation(data.conversation)
-  if (expectedId && owner?.conversation_id !== expectedId) throw new Error("节点返回了其他会话，已暂停操作。")
+  if (expectedId && owner?.conversation_id !== expectedId) throw new Error("设备返回了别的对话，已暂停。")
   return {
     conversation: owner, messages: list(data.messages).map(message), autonomy: autonomy(data.autonomy), heads: texts(data.heads),
     missing: { events: texts(missing.events), blobs: list(missing.blobs), conflicts: texts(missing.conflicts) },

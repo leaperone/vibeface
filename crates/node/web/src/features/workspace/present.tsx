@@ -4,6 +4,7 @@ import { useState, type ReactNode } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
+import { InlineError } from "@/components/app/kit"
 import { stateLabel } from "./labels"
 import { useWorkspace } from "./context"
 
@@ -41,7 +42,9 @@ export function ActionButton({
   const workspace = useWorkspace()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === workspace.generation
+  const [failure, setFailure] = useState<unknown>(null)
   return (
+    <span className="inline-grid gap-1">
     <Button
       type="button"
       variant={variant}
@@ -52,12 +55,15 @@ export function ActionButton({
         if (busy) return
         const generation = workspace.generation
         setBusyGeneration(generation)
-        void action().finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
+        setFailure(null)
+        void action().catch(setFailure).finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
       }}
     >
       {busy ? <Spinner /> : null}
       {children}
     </Button>
+    <InlineError error={failure} />
+    </span>
   )
 }
 

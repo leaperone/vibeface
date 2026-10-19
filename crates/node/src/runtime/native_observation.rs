@@ -141,6 +141,11 @@ fn key(work_id: &str) -> String {
     format!("native-observation:v1:work:{work_id}")
 }
 
+/// Requests a person answered on this device, so the chat can keep a line for each after it leaves `pending_requests`.
+fn answers_key(work_id: &str) -> String {
+    format!("native-observation:v1:answers:{work_id}")
+}
+
 pub(super) fn sessions_from(store: &Store, network: &str) -> Result<Vec<NativeWork>> {
     let ids: Vec<String> =
         serde_json::from_value(store.local_value(network, INDEX)?.unwrap_or(json!([])))?;
@@ -952,6 +957,11 @@ impl Runtime {
                     Some(&work.thread_id),
                     work.turn_id.as_deref()
                 ));
+                value["answered_requests"] = store
+                    .local_value(network, &answers_key(&work.work_id))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| json!([]));
                 value
             })
             .collect::<Vec<_>>();
@@ -1030,9 +1040,28 @@ impl Runtime {
             })
             .context("the native request no longer belongs to the original turn")?;
         validate_response(request, &input["response"])?;
+        let mut answered = json!({"request_id":request_id,"kind":request["method"],
+            "decision":input["response"]["decision"].as_str().unwrap_or("answer"),"at_ms":now_ms()});
+        if let Some(command) = super::chat_controls::request_command(&request["params"]) {
+            answered["command"] = json!(command);
+        }
         self.native_client()?
             .respond(request_id.clone(), input["response"].clone())
             .await?;
+        // The answer is already delivered; failing to keep this display record must not look like a failed answer.
+        let mut store = self.store.lock().await;
+        let key = answers_key(work_id);
+        let mut answers = store
+            .local_value(network, &key)
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        answers.push(answered);
+        let skip = answers.len().saturating_sub(32);
+        if let Err(error) = store.local_set(network, &key, &json!(answers[skip..])) {
+            tracing::warn!(%error, "answered native request was not recorded for display");
+        }
         Ok(json!({"work_id":work_id,"responded":true}))
     }
 

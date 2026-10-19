@@ -47,13 +47,13 @@ export function integer(value: unknown): number { if (typeof value !== 'number' 
 export function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
 export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
 export function roles(value: unknown): NodeRole[] {
-  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': return role; default: throw new Error('设备返回了不支持的角色。') } })
+  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': return role; default: throw new Error('设备返回了无法识别的能力。') } })
 }
 export function parseEntry(value: unknown): ConnectionEntry {
-  const v = record(value, '连接入口')
+  const v = record(value, '访问地址')
   const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id) }
   if (v.local === true) {
-    if (entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
+    if (entry.address !== location.origin) throw new Error('本机打开时只能连这台电脑。')
     return { ...entry, local: true }
   }
   return entry
@@ -93,7 +93,7 @@ export function parseReview(value: unknown): PairReview {
 export function parseSigning(value: unknown): Signing { const v = record(value); return { domain: text(v.domain), payload: text(v.payload) } }
 export function parsePairReceipt(value: unknown): PairReceipt {
   const v = record(value)
-  if (typeof v.new_subject_signature !== 'string') throw new Error('配对确认签名无效。')
+  if (typeof v.new_subject_signature !== 'string') throw new Error('加入确认没通过校验。')
   return { request_id: text(v.request_id), review: parseReview(v.review), new_subject_signature: v.new_subject_signature }
 }
 export function parseInvitation(value: unknown): Invitation {
@@ -121,24 +121,24 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
     setup = { kind: 'initialized', entry }
     if (v.local_launch !== undefined) {
       const launch = record(v.local_launch), url = new URL(text(launch.url)), peer_id = validTarget(launch.peer_id), token = text(launch.token)
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || peer_id !== entry.peer_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机启动入口与此节点不一致。')
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || peer_id !== entry.peer_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这台电脑对不上。')
       setup.local_launch = { url: url.origin, peer_id, token }
     }
   }
   else throw new Error('本机设置状态无效。')
   const entry = setup.kind === 'uninitialized' ? setup.invitation.entry : setup.entry
-  if (entry.address !== origin || entry.local) throw new Error('本机设置入口与当前页面不一致。')
+  if (entry.address !== origin || entry.local) throw new Error('本机设置和当前页面对不上。')
   return setup
 }
 export function parseNodeSettings(value: unknown): NodeSettingsResponse {
-  const v = record(value, '节点设置'), settings = record(v.settings), defaults = record(v.defaults), readiness = record(v.readiness)
+  const v = record(value, '设备设置'), settings = record(v.settings), defaults = record(v.defaults), readiness = record(v.readiness)
   let manager: ManagerSettings | null = null
   if (settings.manager !== null) {
     const m = record(settings.manager)
-    if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('管理 Agent 设置格式无效。')
+    if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('助手设置格式不对。')
     manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
   }
-  if (readiness.manager !== 'disabled' && readiness.manager !== 'role_unavailable' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('节点准备状态无效。')
+  if (readiness.manager !== 'disabled' && readiness.manager !== 'role_unavailable' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
     defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
@@ -146,32 +146,32 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   }
 }
 export function parseLocalJoin(value: unknown, entry: ConnectionEntry): LocalJoin {
-  const v = record(value, '节点加入状态')
+  const v = record(value, '加入状态')
   if (v.kind === 'idle') return { kind: 'idle' }
   if (v.kind === 'joined') {
     const peer_id = validTarget(v.peer_id)
-    if (peer_id !== entry.peer_id) throw new Error('加入结果与本机节点不一致。')
+    if (peer_id !== entry.peer_id) throw new Error('加入结果和这台电脑对不上。')
     return { kind: 'joined', peer_id, network_id: validTarget(v.network_id) }
   }
   if (v.kind === 'uncertain') return { kind: 'uncertain', request_id: text(v.request_id), message: text(v.message) }
   if (v.kind === 'review' || v.kind === 'pending') {
     const review = parseReview(v.review)
-    if (review.new_member.kind !== 'node' || review.new_member.subject_id !== entry.peer_id) throw new Error('加入确认与本机节点不一致。')
+    if (review.new_member.kind !== 'node' || review.new_member.subject_id !== entry.peer_id) throw new Error('加入确认和这台电脑对不上。')
     return { kind: v.kind, request_id: text(v.request_id), review, review_hash: validTarget(v.review_hash) }
   }
-  throw new Error('节点加入状态无效。')
+  throw new Error('加入状态格式不对。')
 }
 export function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
   if (isRecord(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`
-  throw new Error('签名内容包含无效的数据。')
+  throw new Error('待确认的内容格式不对。')
 }
 export function same(left: unknown, right: unknown): boolean { return canonical(left) === canonical(right) }
 export function signingPayload(value: unknown, domain: string, expected: unknown): string {
   const signing = parseSigning(value)
-  if (signing.domain !== domain || signing.payload.length > 262144 || signing.payload !== canonical(expected)) throw new Error('签名内容与正在确认的设备或权限不一致，已停止授权。')
+  if (signing.domain !== domain || signing.payload.length > 262144 || signing.payload !== canonical(expected)) throw new Error('待确认的内容和这台设备对不上，已停止。')
   return signing.payload
 }
 export async function digest(value: unknown): Promise<string> {
