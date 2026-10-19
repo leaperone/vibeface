@@ -35,6 +35,8 @@ pub struct ManagerConfig {
     pub kind: ManagerKind,
     pub workspace: PathBuf,
     pub model: String,
+    #[serde(default)]
+    pub read_only: bool,
     pub timeout_secs: u64,
     pub cursor_sdk_bin: PathBuf,
     pub node_bin: PathBuf,
@@ -56,6 +58,7 @@ impl Default for ManagerConfig {
             kind: ManagerKind::CursorSdk,
             workspace: ".".into(),
             model: "auto".into(),
+            read_only: false,
             timeout_secs: 600,
             cursor_sdk_bin: "cursor-sdk-bridge".into(),
             node_bin: "node".into(),
@@ -155,6 +158,8 @@ where
                     workspace: config.workspace.clone(),
                     timeout_secs: config.timeout_secs,
                     model: config.model.clone(),
+                    read_only: config.read_only,
+                    tool_env: config.tool_env.clone(),
                     custom_tools: config.custom_tools.clone(),
                     tool_callback: callback,
                 },
@@ -272,7 +277,7 @@ where
     let mut reader = BufReader::new(stdout);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
-            "tool_cli":tool_cli,"tool_env":config.tool_env,"custom_tools":config.custom_tools})).await?;
+            "tool_cli":tool_cli,"tool_env":config.tool_env,"custom_tools":config.custom_tools,"read_only":config.read_only})).await?;
         let ready = read_message(&mut reader).await?;
         ensure!(
             ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),

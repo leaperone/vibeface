@@ -10,7 +10,8 @@ import { ActionButton } from '@/features/workspace/present'
 import { Chat } from './elements/chat'
 import { PromptInput } from './elements/prompt-input'
 import { canSend, composerHint } from './protocol'
-import { ExecutionActivity, PendingExecutionControl, UnknownOperationActivity } from '@/features/workspace/execution-activity'
+import { AgentTaskActivity, NativeSessionActivity } from '@/features/workspace/task-activity'
+import { stateLabel } from '@/features/workspace/labels'
 import { ManagerStatus, managerTraceStatus, managerTraceTitle } from './elements/manager-status'
 import './chat.css'
 
@@ -34,13 +35,14 @@ export function ConversationScreen() {
     ? [{ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0 }]
     : []
   const shown = [...messages, ...pendingShown]
-  const needsCheck = Boolean(messagePending && !messageBusy && !assistantBusy) || Boolean(data?.scheduler?.write_frozen) || data?.operations.some((item) => item.state === 'unknown') || workspace.pending.some((item) => item.conversation_id === conversationId)
+  const needsCheck = Boolean(messagePending && !messageBusy && !assistantBusy) || Boolean(data?.scheduler?.write_frozen) || data?.agent_tasks.some((item) => item.state === 'unknown') || data?.native_sessions.some((item) => item.state === 'unknown')
   const hint = !workspace.connectionOnline ? '连接中断，稍等。' : needsCheck && messagePending ? (originalEntry ? '上一条还没发出。' : '请回到原来的入口。') : workspace.writeNotice || (!workspace.selectedBot ? '' : composerHint(gate)) || (data?.scheduler?.write_frozen ? '先核对上一条。' : '')
-  const hasDetails = Boolean(data && (visibleJobs.length > 0 || data.executions.length > 0 || workspace.pending.some((item) => item.conversation_id === conversationId) || data.operations.some((item) => item.state === 'unknown') || messagePending))
+  const hasDetails = Boolean(data && (visibleJobs.length > 0 || data.agent_tasks.length > 0 || data.native_sessions.length > 0 || messagePending))
   const reasoning = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
-  const planning = data?.executions.some((execution) => execution.goal && !['completed', 'failed', 'cancelled', 'rejected'].includes(execution.state)) ?? false
-  const multiStep = visibleJobs.length + (data?.executions.length ?? 0) > 1
-  const tracePlace: OrbPlace | null = needsCheck ? 'reconcile' : planning ? 'plan' : multiStep ? 'trace' : null
+  const awaitingDecision = data?.native_sessions.some((session) => session.pending_requests.length > 0)
+  const workRunning = data?.agent_tasks.some((task) => ['pending_delivery', 'queued', 'claimed', 'accepted', 'running', 'cancelling'].includes(task.state)) || data?.native_sessions.some((session) => ['running', 'waiting', 'interrupting'].includes(session.state))
+  const multiStep = visibleJobs.length + (data?.agent_tasks.length ?? 0) + (data?.native_sessions.length ?? 0) > 1
+  const tracePlace: OrbPlace | null = needsCheck ? 'reconcile' : workRunning ? 'wait' : multiStep ? 'trace' : null
   const waitLabel = messageBusy && !assistantBusy ? '稍等' : '正在回复'
 
   useEffect(() => {
@@ -75,20 +77,16 @@ export function ConversationScreen() {
         emptyMark={workspace.selectedBot ? <StatusOrb place="idle-chat" size={20} /> : undefined}
       >
         {reasoning ? <Reasoning text={reasoning} running={assistantBusy} /> : null}
-        {data?.executions.map((execution) => {
-          const progress = workspace.liveProgress.find((item) => item.kind === 'execution' && item.session_id === execution.session_id && item.target_node === execution.target_node && item.operation_id === execution.operation_id)
-          const projected = progress ? { ...execution, latest_progress: progress.text || progress.status || execution.latest_progress } : execution
-          return <ExecutionActivity key={execution.operation_id} execution={projected} conversationId={conversationId} compact />
-        })}
+        {data?.native_sessions.map((session) => <NativeSessionActivity key={`approval-${session.target_node}:${session.work_id}`} session={session} compact />)}
         {(messageBusy || assistantBusy) && liveMessages.length === 0 ? <p role="status" className="replying" aria-label={waitLabel}><StatusOrb place={assistantBusy ? 'reply' : 'wait'} size={20} /><span>{waitLabel}</span></p> : null}
       </Chat>
       {hasDetails ? <div className="chat-trace">
         <Trace>
           <TraceCollapsible defaultOpen={false}>
             <TraceCollapsibleTrigger>
-              <TraceLine status={needsCheck ? 'pending' : undefined}>
+              <TraceLine status={needsCheck || awaitingDecision ? 'pending' : workRunning ? 'running' : undefined}>
                 {tracePlace ? <StatusOrb place={tracePlace} size={20} /> : null}
-                <TraceTitle>{needsCheck ? '需要核对' : '详情'}</TraceTitle>
+                <TraceTitle>{needsCheck ? '需要核对' : awaitingDecision ? '等待本人决定' : workRunning ? '工作进行中' : '工作进展'}</TraceTitle>
               </TraceLine>
             </TraceCollapsibleTrigger>
             <TraceCollapsibleContent>
@@ -103,18 +101,12 @@ export function ConversationScreen() {
                 {visibleJobs.map((job) => <Tool key={job.trigger} title={managerTraceTitle(job)} status={managerTraceStatus(job.state)}>
                   <ManagerStatus job={job} progress={workspace.liveProgress.find((item) => item.kind === 'manager' && item.trigger === job.trigger)?.status} hasLiveProgress={workspace.liveProgress.some((item) => item.kind === 'manager' && item.trigger === job.trigger)} />
                 </Tool>)}
-                {data?.executions.map((execution) => {
-                  const progress = workspace.liveProgress.find((item) => item.kind === 'execution' && item.session_id === execution.session_id && item.target_node === execution.target_node && item.operation_id === execution.operation_id)
-                  const projected = progress ? { ...execution, latest_progress: progress.text || progress.status || execution.latest_progress } : execution
-                  const running = ['running', 'accepted', 'claimed'].includes(execution.state)
-                  const failed = execution.state === 'failed' || execution.state === 'rejected'
-                  const plan = Boolean(execution.goal) && !['completed', 'failed', 'cancelled', 'rejected'].includes(execution.state)
-                  return <Task key={`detail-${execution.operation_id}`} title={execution.title || '执行'} status={failed ? 'error' : execution.state === 'unknown' ? 'pending' : running ? 'running' : undefined} mark={plan ? <StatusOrb place="plan" size={20} /> : running ? <StatusOrb place="wait" size={20} /> : undefined}>
-                    <ExecutionActivity execution={projected} conversationId={conversationId} />
-                  </Task>
-                })}
-                {data ? workspace.pending.filter((item) => item.conversation_id === conversationId && !data.executions.some((execution) => item.execution_control?.expected_operation_id === execution.operation_id || execution.session_id !== null && item.target_node === execution.target_node && item.session_id === execution.session_id)).map((operation) => <Tool key={operation.operation_id} title="操作待核对" status="pending"><PendingExecutionControl operation={operation} /></Tool>) : null}
-                {data?.operations.filter((operation) => operation.state === 'unknown' && !data.executions.some((execution) => execution.operation_id === operation.request.operation_id)).map((operation) => <Tool key={operation.request.operation_id} title="结果待核查" status="pending"><UnknownOperationActivity operation={operation} /></Tool>)}
+                {data?.agent_tasks.map((task) => <Task key={task.task_ref} title={`Agent 任务 · ${stateLabel(task.state)}`} status={task.state === 'failed' ? 'error' : task.state === 'unknown' ? 'pending' : ['completed', 'interrupted', 'cancelled'].includes(task.state) ? undefined : 'running'}>
+                  <AgentTaskActivity task={task} sessions={data.native_sessions.filter((session) => session.task_ref === task.task_ref)} />
+                </Task>)}
+                {data?.native_sessions.filter((session) => !session.task_ref || !data.agent_tasks.some((task) => task.task_ref === session.task_ref)).map((session) => <Task key={`${session.target_node}:${session.work_id}`} title={`原生工作 · ${stateLabel(session.state)}`} status={session.state === 'failed' ? 'error' : session.state === 'unknown' || session.state === 'waiting' ? 'pending' : ['running', 'interrupting'].includes(session.state) ? 'running' : undefined}>
+                  <NativeSessionActivity session={session} />
+                </Task>)}
               </Trace>
             </TraceCollapsibleContent>
           </TraceCollapsible>

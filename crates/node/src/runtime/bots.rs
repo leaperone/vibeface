@@ -81,7 +81,7 @@ impl Runtime {
         self.store.lock().await.authorize_node(
             network,
             &project.target_node,
-            Some(NodeRole::Executor),
+            Some(NodeRole::Scheduler),
         )?;
         let cwd = Path::new(&project.cwd);
         ensure!(
@@ -96,8 +96,9 @@ impl Runtime {
         );
         if project.target_node == self.identity.peer_id()? {
             ensure!(
-                self.config.roles.contains(&NodeRole::Executor),
-                "project Node execution capability is disabled"
+                self.config.roles.contains(&NodeRole::Scheduler)
+                    && self.settings_snapshot().manager.is_some(),
+                "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;
         } else {
@@ -108,6 +109,10 @@ impl Runtime {
                     json!({"type":"capabilities"}),
                 )
                 .await?;
+            ensure!(
+                capabilities["manager"].is_string(),
+                "project Node has no coordination Agent"
+            );
             ensure!(
                 capabilities["roots"].as_array().is_some_and(|roots| {
                     roots

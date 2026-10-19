@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
+    #[serde(default = "default_local_auto_access")]
+    pub local_auto_access: bool,
     pub roles: Vec<NodeRole>,
     pub roots: Vec<PathBuf>,
     #[serde(default)]
@@ -24,8 +26,6 @@ pub struct Config {
     pub manager: Option<ManagerSettings>,
     pub codex_socket: Option<PathBuf>,
     pub codex_bin: PathBuf,
-    pub claude_bin: PathBuf,
-    pub cursor_bin: PathBuf,
     pub timeout_secs: u64,
     pub daily_decision_limit: u64,
 }
@@ -46,20 +46,18 @@ impl Config {
             public_url: format!("http://{listen}"),
             allowed_origins: vec![],
             allow_insecure_lan,
+            local_auto_access: true,
             roles: vec![
                 NodeRole::Gateway,
                 NodeRole::Relay,
                 NodeRole::Replica,
                 NodeRole::Scheduler,
-                NodeRole::Executor,
             ],
             roots,
             network: crate::network::NetworkConfig::default(),
             manager: None,
             codex_socket: None,
             codex_bin: "codex".into(),
-            claude_bin: "claude".into(),
-            cursor_bin: "cursor-agent".into(),
             timeout_secs: 600,
             daily_decision_limit: 20,
         }
@@ -88,12 +86,12 @@ impl Config {
         self.browser_origins()?;
         ensure!(
             self.timeout_secs > 0 && self.timeout_secs <= 86400,
-            "invalid executor timeout"
+            "invalid SDK timeout"
         );
         for root in &self.roots {
             ensure!(
                 root.is_absolute() && root.is_dir(),
-                "execution root must be an existing absolute directory"
+                "project root must be an existing absolute directory"
             );
         }
         if let Some(m) = &self.manager {
@@ -153,6 +151,10 @@ impl Config {
         self.validate()?;
         private_write(&dir.join("config.json"), &serde_json::to_vec_pretty(self)?)
     }
+}
+
+fn default_local_auto_access() -> bool {
+    true
 }
 
 fn browser_origin(value: &str) -> Result<reqwest::Url> {
@@ -298,16 +300,15 @@ mod tests {
             vec![NodeRole::Relay, NodeRole::Replica],
             vec![NodeRole::Gateway, NodeRole::Relay, NodeRole::Replica],
             vec![NodeRole::Scheduler, NodeRole::Replica],
-            vec![NodeRole::Executor, NodeRole::Replica],
         ] {
             config.roles = roles;
             assert!(config.validate().is_ok());
         }
-        for role in [NodeRole::Gateway, NodeRole::Scheduler, NodeRole::Executor] {
+        for role in [NodeRole::Gateway, NodeRole::Scheduler] {
             config.roles = vec![role, NodeRole::Relay];
             assert_eq!(
                 config.validate().unwrap_err().to_string(),
-                "gateway, scheduler and executor roles require replica"
+                "gateway and scheduler roles require replica"
             );
         }
     }

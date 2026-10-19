@@ -1286,7 +1286,6 @@ mod tests {
             NodeRole::Relay,
             NodeRole::Replica,
             NodeRole::Scheduler,
-            NodeRole::Executor,
         ]
     }
     fn hub(

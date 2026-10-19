@@ -8,6 +8,39 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import { createHash } from 'node:crypto'
 import type { ConnectionEntry } from '../../lib/node.ts'
 import { primaryLane, shouldAutoConnect } from './connection-lane.ts'
+import { invitationLink } from '../../lib/enrollment-reference.ts'
+import { readConnectionFile } from '../../lib/connection-file.ts'
+
+test('connection links preserve the invitation in the fragment of the trusted web page', () => {
+  const content = '{"url":"https://relay.example","peer_id":"pinned-node","relay":true,"capability":"配对凭证"}'
+  const link = new URL(invitationLink(content, 'https://web.example/devices?old=secret#old'))
+  assert.equal(link.origin, 'https://web.example')
+  assert.equal(link.pathname, '/')
+  assert.equal(link.search, '')
+  const encoded = new URLSearchParams(link.hash.slice(1)).get('invite')
+  assert.equal(typeof encoded, 'string')
+  assert.ok(encoded)
+  assert.equal(Buffer.from(encoded, 'base64url').toString('utf8'), '{"url":"https://relay.example","peer_id":"pinned-node","relay":true,"capability":"配对凭证"}')
+  assert.equal(new URL(invitationLink('{}', 'http://localhost:4790')).origin, 'http://localhost:4790')
+  for (const page of ['http://relay.example', 'https://user:password@web.example', 'file:///page']) assert.throws(() => invitationLink(content, page), /HTTPS|URL/)
+})
+
+test('connection files keep the original content and reject empty or oversized files', async () => {
+  assert.equal(await readConnectionFile(new File(['{"capability":"original"}'], 'connection.json')), '{"capability":"original"}')
+  await assert.rejects(readConnectionFile(new File([], 'empty.json')), /64 KiB/)
+  await assert.rejects(readConnectionFile(new File([new Uint8Array(65537)], 'large.json')), /64 KiB/)
+})
+
+test('an invitation link opens the configured relay while preserving the pinned target', () => {
+  const content = '{"url":"https://relay.example","peer_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relay":true,"invite":{"capability":"original"}}'
+  const link = new URL(invitationLink(content, 'https://relay.example'))
+  assert.equal(link.origin, 'https://relay.example')
+  const encoded = new URLSearchParams(link.hash.slice(1)).get('invite')
+  assert.ok(encoded)
+  const invitation: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
+  assert.deepEqual(invitation, { url: 'https://relay.example', peer_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', relay: true, invite: { capability: 'original' } })
+  for (const page of ['http://127.0.0.1:4790', 'http://[::1]:4790']) assert.equal(new URL(invitationLink(content, page)).origin, page)
+})
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -27,6 +60,7 @@ const entry: ConnectionEntry = { address: 'https://node.example', peer_id: targe
 const localEntry: ConnectionEntry = { address: 'http://localhost:4790', peer_id: target, relay: false }
 const localCapability = 'f'.repeat(64)
 const localInvitation = { url: localEntry.address, peer_id: target, capability: localCapability }
+const localLaunch = { url: 'http://127.0.0.1:49781', peer_id: target, token: 'e'.repeat(64) }
 const genesis = { version: 1, network_id: network, owner_public_key: publicKey }
 const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1 }
 const canonical = (value: unknown): string => value && typeof value === 'object'
@@ -47,15 +81,20 @@ function nodeJoinFixture() {
   return { invitation, receipt }
 }
 
-function deviceHarness({ pairing = false, bootstrap = false, saved = false, local = '', invitation = '' } = {}) {
+function deviceHarness({ pairing = false, bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>() } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
-  const stored = new Map<string, string>(), calls: string[] = []
+  const stored = storage, calls: string[] = [], navigations: string[] = []
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinRequests: { action: string; params: unknown }[] = [], joinResponses = new Map<string, unknown>()
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
+  const sessionEntry: ConnectionEntry = { address: 'https://node.example', peer_id: target, relay: false, local: true }
+  const localState: { enabled: boolean; setup?: unknown } = { enabled: true }
+  const pageOrigin = local ? localEntry.address : entry.address
+  const hash = invitation ? `#invite=${encodeURIComponent(invitation)}` : fragment
+  const location = { hash, href: `${pageOrigin}/${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
   let cursor = 0, nextTimer = 0
   const react = {
     createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
@@ -90,6 +129,8 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
         requests.push({ method, params })
         if (holds.has(method)) return holds.get(method)?.promise
         if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['relay'], initialized: !bootstrap && local !== 'fresh' }
+        if (method === 'authenticate' && localSession) return { principal: { network_id: network } }
+        if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'pair_status') return { status: 'granted' }
         if (method === 'prepare_genesis') {
           const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
@@ -101,7 +142,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   }
   let verifications = 0, released = 0
   const secure = {
-    verifyAuthentication: () => { verifications++; return { principal: { network_id: network, subject_id: subject, epoch: 1, can_manage: false }, view: membership } },
+    verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: localSession && !management ? 'local_session' : 'membership', network_id: network, subject_id: subject, epoch: 1, can_manage: management }, view: membership } },
     verifiedView: () => membership,
     openPackage: async () => ({ networkId: network, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ peerId: () => network, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
@@ -110,8 +151,19 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
-    location: { hash: invitation ? `#invite=${encodeURIComponent(invitation)}` : '', href: local ? localEntry.address : entry.address }, history: { replaceState() {} }, URL, URLSearchParams, AbortController, TextEncoder, Uint8Array, Error, crypto: globalThis.crypto,
+    location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, Uint8Array, Error, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
+      if (path === '/api/local/info') return localSession
+        ? { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, subject_id: subject, network_id: network, entry: sessionEntry }) }
+        : { ok: false, status: 404 }
+      if (path === '/api/local/exchange') {
+        assert.equal(localSession, true)
+        assert.equal(options.credentials, 'same-origin')
+        assert.equal(options.redirect, 'error')
+        assert.deepEqual(JSON.parse(String(options.body)), { token: 'f'.repeat(64), peer_id: target, subject_id: subject, public_key: publicKey })
+        calls.push('local-exchange')
+        return { ok: true, json: async () => ({ network_id: network, entry: sessionEntry }) }
+      }
       if (path.startsWith('/api/local/join/')) {
         const action = path.slice('/api/local/join/'.length), key = `local_join:${action}`
         calls.push(key); joinRequests.push({ action, params: JSON.parse(String(options.body)) })
@@ -119,7 +171,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
         return { status: 200, ok: true, json: async () => value }
       }
       calls.push('local_setup'); setupRequests.push({ path, options })
-      const value = holds.has('local_setup') ? await holds.get('local_setup')?.promise : local === 'fresh' ? { kind: 'uninitialized', invitation: localInvitation } : { kind: 'initialized', entry: localEntry }
+      const value = holds.has('local_setup') ? await holds.get('local_setup')?.promise : localState.setup ?? (local === 'fresh' ? { kind: 'uninitialized', invitation: localInvitation } : { kind: 'initialized', entry: localEntry })
       return { status: 200, ok: true, json: async () => value }
     },
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
@@ -151,7 +203,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, calls, requests, setupRequests, joinRequests, joinResponses, holds, sockets, stored, timers, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, calls, requests, setupRequests, joinRequests, joinResponses, holds, sockets, stored, timers, location, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 test('fresh localhost discovers its one-time invitation without opening transport or saving the capability', async () => {
@@ -194,6 +246,82 @@ test('initialized localhost requires member authorization and cannot create a se
   } finally { app.close() }
 })
 
+test('initialized localhost authenticates the signed manager on its original entry before offering local access', async () => {
+  const app = deviceHarness({ local: 'initialized', management: true })
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().ready?.principal.source, 'membership')
+    assert.equal(app.render().ready?.principal.can_manage, true)
+    assert.equal(app.render().ready?.entry.address, localEntry.address)
+    assert.equal(app.render().ready?.entry.local, undefined)
+    assert.equal(app.sockets[0]?.entry.address, localEntry.address)
+    assert.equal(app.calls.includes('local-exchange'), false)
+    assert.equal(app.navigations.length, 0)
+    assert.equal(app.location.origin, localEntry.address)
+  } finally { app.close() }
+})
+
+test('opening local access requires a click and fetches a fresh launcher before changing origin', async () => {
+  const app = deviceHarness({ local: 'initialized' }), auth = deferred()
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.holds.set('authenticate', auth)
+  try {
+    app.render(); await settle()
+    auth.reject(Object.assign(new Error('not a member'), { responded: true })); await settle()
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().localSetup?.kind, 'initialized')
+    assert.equal(app.navigations.length, 0)
+    assert.equal(app.calls.includes('local-exchange'), false)
+    const fresh = { ...localLaunch, token: '1'.repeat(64) }
+    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: fresh }
+    await app.render().openLocalAccess()
+    assert.equal(app.setupRequests.length, 2)
+    assert.equal(app.navigations.length, 1)
+    const opened = new URL(app.navigations[0])
+    assert.equal(opened.origin, fresh.url)
+    assert.equal(new URLSearchParams(opened.hash.slice(1)).get('local'), fresh.token)
+    assert.equal(new URLSearchParams(opened.hash.slice(1)).get('node'), target)
+    assert.equal(app.joinRequests.length, 0)
+    assert.equal([...app.stored.values()].some(value => value.includes(fresh.token)), false)
+  } finally { app.close() }
+})
+
+test('disabling local automatic access before the click prevents launching its stale token', async () => {
+  const app = deviceHarness({ local: 'initialized' }), auth = deferred()
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.holds.set('authenticate', auth)
+  try {
+    app.render(); await settle()
+    auth.reject(Object.assign(new Error('not a member'), { responded: true })); await settle()
+    app.localState.setup = { kind: 'initialized', entry: localEntry }
+    await assert.rejects(app.render().openLocalAccess(), /自动访问已关闭/)
+    assert.equal(app.navigations.length, 0)
+    const setup = app.render().localSetup
+    assert.equal(setup?.kind === 'initialized' && setup.local_launch, undefined)
+  } finally { app.close() }
+})
+
+test('local launch metadata rejects an unrelated node, unsafe address, or malformed token', async () => {
+  const invalid = [
+    { ...localLaunch, peer_id: '0'.repeat(64) },
+    { ...localLaunch, token: 'e'.repeat(63) },
+    { ...localLaunch, token: 'E'.repeat(64) },
+    ...['https://127.0.0.1:49781', 'http://localhost:49781', 'http://127.0.0.1', 'http://user:password@127.0.0.1:49781', 'http://127.0.0.1:49781/path', 'http://127.0.0.1:49781?token=unsafe', 'http://127.0.0.1:49781#unsafe'].map(url => ({ ...localLaunch, url })),
+  ]
+  for (const launch of invalid) {
+    const app = deviceHarness({ local: 'initialized' })
+    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: launch }
+    try {
+      app.render(); await settle()
+      assert.equal(app.render().localSetup, null)
+      assert.match(app.render().error, /本机启动入口与此节点不一致/)
+      assert.equal(app.sockets.length, 0)
+      assert.equal(app.navigations.length, 0)
+    } finally { app.close() }
+  }
+})
+
 for (const kind of ['uninitialized', 'initialized']) test(`late ${kind} discovery cannot replace a manually chosen connection`, async () => {
   const app = deviceHarness({ local: 'fresh' })
   const hold = deferred(); app.holds.set('local_setup', hold)
@@ -233,6 +361,18 @@ test('a local setup response cannot redirect onboarding to another origin', asyn
   } finally { app.close() }
 })
 
+test('local setup cannot silently select the cookie channel instead of the ordinary member entry', async () => {
+  const app = deviceHarness({ local: 'initialized' })
+  app.localState.setup = { kind: 'initialized', entry: { ...localEntry, local: true }, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().localSetup, null)
+    assert.match(app.render().error, /本机设置入口与当前页面不一致/)
+    assert.equal(app.sockets.length, 0)
+    assert.equal(app.navigations.length, 0)
+  } finally { app.close() }
+})
+
 test('unmounting aborts pending local discovery without publishing setup state', async () => {
   const app = deviceHarness({ local: 'fresh' })
   const hold = deferred(); app.holds.set('local_setup', hold)
@@ -258,10 +398,15 @@ test('a node invitation uses the local Node endpoint and requires explicit accep
     await app.render().acceptLocalJoin()
     assert.equal(app.render().localJoin?.kind, 'pending')
     assert.deepEqual(app.joinRequests.find(request => request.action === 'accept')?.params, { request_id: 'node-pair', review_hash: receipt.review_hash })
+    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
     app.joinResponses.set('status', { kind: 'joined', network_id: network, peer_id: target })
     await app.render().refreshLocalJoin()
     assert.equal(app.render().localJoin?.kind, 'joined')
     assert.equal(app.render().localSetup?.kind, 'initialized')
+    const setup = app.render().localSetup
+    assert.equal(setup?.kind === 'initialized' && setup.local_launch?.url, localLaunch.url)
+    assert.equal(app.setupRequests.length, 3)
+    assert.equal(app.navigations.length, 0)
     assert.equal(app.render().ready, null)
     assert.equal(app.calls.includes('authenticate'), false)
     assert.equal([...app.stored.values()].some(value => value.includes('one-time-node-invite')), false)
@@ -364,6 +509,94 @@ test('localhost recovery can use a remote fresh Node invitation without sending 
     contextHold.reject(new Error('stop after remote authority check')); await rejected
     assert.equal(app.render().ready, null)
     assert.equal(app.released(), 1)
+  } finally { app.close() }
+})
+
+test('a local browser reuses its cookie-bound identity and can disable its own automatic access', async () => {
+  const app = deviceHarness({ localSession: true })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().ready?.principal.source, 'local_session')
+    assert.equal(app.render().ready?.principal.can_manage, false)
+    assert.equal(app.render().localAutoAccess, true)
+    assert.equal(app.calls.filter(method => method === 'pair_request').length, 0)
+    assert.equal(app.sockets[0]?.entry.address, 'https://node.example')
+    assert.equal(app.sockets[0]?.entry.peer_id, target)
+    assert.equal(app.sockets[0]?.entry.local, true)
+    assert.equal(app.sockets[0]?.entry.relay, false)
+    await app.render().setLocalAutoAccess(false)
+    assert.equal(app.render().ready, null)
+    assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
+    assert.equal(app.calls.filter(method => method === 'local_access').length, 1)
+  } finally { app.close() }
+})
+
+test('a signed management browser keeps its permissions through the local cookie channel, reconnect, and reload', async () => {
+  const storage = new Map<string, string>()
+  for (let reload = 0; reload < 2; reload++) {
+    const app = deviceHarness({ localSession: true, management: true, storage })
+    try {
+      app.render(); await settle()
+      assert.equal(app.sockets[0]?.entry.local, true)
+      assert.equal(app.render().ready?.principal.source, 'membership')
+      assert.equal(app.render().ready?.principal.can_manage, true)
+      assert.equal(app.render().ready?.entry.local, false)
+      assert.equal(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? 'null').entry.local, false)
+      app.sockets[0]?.drop()
+      const [id, retry] = [...app.timers.entries()][0]
+      app.timers.delete(id); retry(); await settle()
+      assert.equal(app.sockets[1]?.entry.local, undefined)
+      assert.equal(app.render().ready?.principal.source, 'membership')
+      assert.equal(app.render().ready?.principal.can_manage, true)
+      assert.equal(app.verifications(), 2)
+    } finally { app.close() }
+  }
+})
+
+test('the launcher fragment is cleared before its token is exchanged for the browser key', async () => {
+  const app = deviceHarness({ localSession: true, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  try {
+    app.render()
+    assert.equal(app.location.hash, '')
+    await settle()
+    assert.equal(app.render().ready?.principal.source, 'local_session')
+    assert.equal(app.calls.filter(method => method === 'local-exchange').length, 1)
+    assert.equal([...app.stored.values()].some(value => value.includes('f'.repeat(64))), false)
+  } finally { app.close() }
+})
+
+test('revoking local access in another tab stops reconnecting the revoked cookie', async () => {
+  const app = deviceHarness({ localSession: true })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().ready?.principal.source, 'local_session')
+    app.localState.enabled = false
+    app.sockets[0]?.drop()
+    const retry = app.timers.values().next().value
+    assert.equal(typeof retry, 'function')
+    retry?.(); await settle()
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().phase, 'unpaired')
+    assert.equal(app.calls.filter(method => method.startsWith('open:')).length, 1)
+  } finally { app.close() }
+})
+
+for (const responded of [true, false]) test(`a ${responded ? 'rejected' : 'disconnected'} local access change preserves its real outcome`, async () => {
+  const app = deviceHarness({ localSession: true })
+  try {
+    app.render(); await settle()
+    const pending = deferred(); app.holds.set('local_access', pending)
+    const changing = app.render().setLocalAutoAccess(false)
+    const rejected = assert.rejects(changing, /configuration unavailable/)
+    pending.reject(Object.assign(new Error('configuration unavailable'), { responded }))
+    await rejected
+    if (responded) {
+      assert.equal(app.render().ready?.principal.source, 'local_session')
+      assert.equal(app.render().localAutoAccess, true)
+    } else {
+      assert.equal(app.render().ready, null)
+      assert.match(app.render().error, /结果尚未确认/)
+    }
   } finally { app.close() }
 })
 

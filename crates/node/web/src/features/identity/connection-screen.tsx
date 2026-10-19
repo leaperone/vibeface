@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { readInvitation } from '../../../transport.js'
 import { messageOf, parseEntry, parseInvitation } from '@/lib/node'
+import { readConnectionFile } from '@/lib/connection-file'
 import { passphrase } from '@/lib/secure'
 import { primaryLane } from './connection-lane'
 import { StatusOrb } from '@/components/status-orb'
@@ -51,7 +52,7 @@ export function ConnectionScreen() {
     if (device.initialInvitation) setInvitation(current => current.trim() ? current : device.initialInvitation)
   }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
-  useEffect(() => { setConfirmed(false) }, [device.localJoin])
+  useEffect(() => { setConfirmed(false); if (device.localJoin?.kind === 'joined') setLane('local') }, [device.localJoin])
   function chooseLane(next: Lane) {
     if (!device.entry || !['recovery', 'passphrase'].includes(next)) device.disconnect()
     setLane(next)
@@ -87,6 +88,15 @@ export function ConnectionScreen() {
       try { await device.createLocalNetwork(value(form, 'name'), passphrase(password, password)) }
       finally { form.reset() }
     })
+  }
+  async function importConnectionFile(file: File) {
+    chooseLane('invite')
+    const owner = device.connectionGeneration()
+    const content = await readConnectionFile(file)
+    if (owner !== device.connectionGeneration()) return
+    const parsed = readInvitation(content)
+    parseInvitation(parsed)
+    setInvitation(JSON.stringify(parsed))
   }
   const subtitle = device.review?.kind === 'bootstrap' ? '先保存恢复包，再创建网络。'
     : device.review ? '选择要留下的设备。'
@@ -135,10 +145,10 @@ export function ConnectionScreen() {
           </>}
         </>}
         {device.localJoin.kind === 'uncertain' && <p className="text-sm text-muted-foreground">{device.localJoin.message}</p>}
-        <p className="text-xs text-muted-foreground">节点加入不会授予此浏览器管理权限。浏览器仍需成员邀请或恢复包。</p>
+        <p className="text-xs text-muted-foreground">节点加入后，可通过本机访问配置 Agent。添加网络成员仍需管理客户端授权。</p>
         <div className="flex flex-wrap gap-2"><Button className={button} variant="outline" type="button" disabled={busy} onClick={() => void run(device.refreshLocalJoin)}>核对加入状态</Button><Button className={button} variant="ghost" type="button" disabled={busy} onClick={() => { device.useAnotherNodeInvitation(); setLane('invite') }}>返回邀请输入</Button></div>
       </Card>}
-      {device.localJoin?.kind === 'joined' && <p role="status" className="text-sm text-muted-foreground">此节点已加入个人网络。使用浏览器邀请或恢复包授权后，可进入工作区。</p>}
+      {device.localJoin?.kind === 'joined' && <p role="status" className="text-sm text-muted-foreground">此节点已加入个人网络。可打开本机访问配置此节点。添加网络成员仍需原管理客户端或恢复包授权。</p>}
       {device.waiting && <Card className={panel} aria-labelledby="pair-review-title">
         <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入网络'}</h2>
         <p className="text-sm text-muted-foreground">{device.waiting.accepted ? '等待对方确认。' : '核对设备编号后确认。'}</p>
@@ -162,9 +172,13 @@ export function ConnectionScreen() {
           <p className="text-xs text-muted-foreground">已有个人网络时，使用节点邀请加入，或导入恢复包。</p>
           <Button variant="outline" className={`${button} self-start`} type="button" onClick={() => chooseLane('invite')}>使用节点邀请加入</Button>
         </> : <>
-          <p className="text-sm text-muted-foreground">此节点已加入个人网络。此浏览器需要原有成员的邀请或加密恢复包授权。</p>
+          <p className="text-sm text-muted-foreground">{device.localSetup.local_launch ? '此节点已加入个人网络。先核验此浏览器的成员授权，也可打开本机访问配置此节点。' : '此节点已加入个人网络。请使用原有成员的邀请或加密恢复包授权此浏览器。'}</p>
           <p className="break-all text-sm text-muted-foreground">{device.localSetup.entry.address}</p>
           <Button className={`${button} self-start`} type="button" disabled={linking || !usable} onClick={() => { const setup = device.localSetup; if (setup?.kind === 'initialized') void run(() => device.connect(setup.entry)) }}>连接此节点</Button>
+          {device.localSetup.local_launch && <>
+            <Button className={`${button} self-start`} variant="outline" type="button" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开本机访问</Button>
+            <p className="text-xs text-muted-foreground">本机访问可配置此节点的 Agent。添加网络成员仍需管理客户端授权。</p>
+          </>}
         </>}
         {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
       </Card>}
@@ -178,10 +192,16 @@ export function ConnectionScreen() {
       </Card>}
       {!focused && active === 'invite' && <Card className={panel} aria-labelledby="invite-title">
         <h2 id="invite-title" className="font-semibold">{purpose === 'bootstrap' ? '准备创建网络' : purpose === 'pair' ? '授权此浏览器' : purpose === 'node' ? '将此节点加入网络' : '使用邀请'}</h2>
-        <p className="text-sm text-muted-foreground">{purpose === 'bootstrap' ? '口令至少 12 个字符。' : '粘贴邀请。'}</p>
+        <p className="text-sm text-muted-foreground">{purpose === 'bootstrap' ? '口令至少 12 个字符。' : '粘贴连接链接或邀请，也可以导入连接文件。'}</p>
         <form className="space-y-4" onSubmit={submitInvitation}>
           <fieldset disabled={linking || !usable || !!device.review} className="space-y-4 disabled:opacity-70">
-            <label className="grid gap-2 text-sm">邀请内容<Textarea className="min-h-28 font-mono text-xs" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} onChange={event => { if (lane !== 'invite') chooseLane('invite'); setInvitation(event.target.value) }} /></label>
+            <label className="grid gap-2 text-sm">导入连接文件<Input className={input} type="file" name="connection-file" accept=".json,application/json,text/plain" aria-describedby="connection-file-hint" onChange={event => {
+              const file = event.currentTarget.files?.item(0)
+              event.currentTarget.value = ''
+              if (file) void run(() => importConnectionFile(file))
+            }} /></label>
+            <p id="connection-file-hint" className="text-xs text-muted-foreground">文件不超过 64 KiB。请从管理设备通过可信渠道取得。</p>
+            <label className="grid gap-2 text-sm">连接链接或邀请内容<Textarea className="min-h-28 font-mono text-xs" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} onChange={event => { if (lane !== 'invite') chooseLane('invite'); setInvitation(event.target.value) }} /></label>
             <label className="grid gap-2 text-sm">{purpose === 'node' ? '此节点名称' : '此浏览器名称'}<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
             {purpose === 'bootstrap' && <>
               <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>

@@ -1,12 +1,10 @@
-//! Personal node runtime, with role-independent replication and execution adapters.
+//! Personal Node coordination, authenticated replication and local SDK tools.
 pub mod api;
-pub mod binding;
 pub mod client;
-pub mod command;
 pub mod config;
 pub mod crypto;
-pub mod engine;
 pub mod identity;
+pub mod local_access;
 pub mod maintenance;
 pub mod manager;
 pub mod model;

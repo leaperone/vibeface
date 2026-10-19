@@ -19,6 +19,7 @@ const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,255}$/;
 const RESERVED_TOOL_ENV = new Set([
   "CODEX_HOME",
   "CODEX_API_KEY",
+  "CURSOR_API_KEY",
   "HOME",
   "PATH",
   "OPENAI_API_KEY",
@@ -35,6 +36,7 @@ const INIT_FIELDS = new Set([
   "tool_cli",
   "tool_env",
   "custom_tools",
+  "read_only",
 ]);
 
 class InputClosedError extends Error {}
@@ -138,6 +140,11 @@ function validateInit(value) {
     : requireString(value.model, "model", MAX_MODEL_BYTES);
   const toolCli = value.tool_cli === undefined || value.tool_cli === null ? undefined : value.tool_cli;
   if (toolCli !== undefined) requireAbsolutePath(toolCli, "tool_cli");
+  if (value.read_only !== undefined && typeof value.read_only !== "boolean") throw new ProtocolError("read_only must be a boolean");
+  const toolEnv = validateEnv(value.tool_env, "tool_env");
+  if (toolEnv.VIBEFACE_CODEX_SOCKET !== undefined) requireAbsolutePath(toolEnv.VIBEFACE_CODEX_SOCKET, "VIBEFACE_CODEX_SOCKET");
+  const readOnly = value.read_only ?? false;
+  if (readOnly) delete toolEnv.VIBEFACE_CODEX_SOCKET;
   return {
     prompt,
     sessionId,
@@ -145,8 +152,9 @@ function validateInit(value) {
     model,
     codexPath: value.codex_path,
     toolCli,
-    toolEnv: validateEnv(value.tool_env, "tool_env"),
+    toolEnv,
     customTools: validateTools(value.custom_tools),
+    readOnly,
   };
 }
 
@@ -202,7 +210,7 @@ function closeInput() {
   if (!process.stdin.destroyed) process.stdin.destroy();
 }
 
-function sdkConfig() {
+function sdkConfig(input) {
   return {
     approval_policy: "never",
     default_permissions: "vibeface_manager",
@@ -218,7 +226,7 @@ function sdkConfig() {
     shell_environment_policy: {
       inherit: "all",
       ignore_default_excludes: true,
-      include_only: ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "VIBEFACE_NODE_URL", "VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_CONVERSATION", "VIBEFACE_NODE_NETWORK"],
+      include_only: ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", ...Object.keys(input.toolEnv)],
     },
     mcp_servers: {},
     features: {
@@ -247,7 +255,7 @@ function sdkConfig() {
       codex_apps_mcp_20260728: false,
       tool_suggest: false,
       skip_host_skill_discovery: true,
-      apply_patch_freeform: false,
+      apply_patch_freeform: !input.readOnly,
     },
   };
 }
@@ -283,11 +291,14 @@ function childEnvironment(input) {
   return env;
 }
 
-function managerPrompt(prompt, toolCli, tools) {
+function managerPrompt(prompt, toolCli, tools, readOnly) {
   if (toolCli === undefined) return prompt;
   const executable = `'${toolCli.replaceAll("'", "'\"'\"'")}'`;
   const catalog = Object.entries(tools).map(([name, spec]) => `${name}\n${spec.description || ""}\nJSON schema: ${JSON.stringify(spec.inputSchema)}`).join("\n\n");
-  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor every write tool, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references, even when their command text is equal. Returned work_ref values select existing work without exposing SDK session bookkeeping.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Use only the listed Node tools for execution; do not edit project files or launch executors directly. Report failed calls honestly. Conversation and network scope come from the CLI.\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
+  const host = readOnly
+    ? "This invocation is read-only. Read existing status and files; do not edit files, start work, interrupt work, or answer native requests."
+    : `Use your local shell and file tools in the configured working directory to complete the task. For native Codex App Server calls, run ${executable} codex METHOD --json 'JSON_OBJECT'; the socket is supplied by VIBEFACE_CODEX_SOCKET. Register native thread and turn IDs with observe_session so the Node can track their progress. Never approve a native request automatically. A coordinating SDK response does not prove that background native work has finished.`;
+  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor every write tool, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. ${host}\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
 }
@@ -458,14 +469,18 @@ async function run(input, reader, secrets) {
   const cwd = await validateCwd(input.cwd);
   const codexPath = await validateExecutable(input.codexPath, "codex_path");
   const toolCli = input.toolCli === undefined ? undefined : await validateExecutable(input.toolCli, "tool_cli");
-  const prompt = managerPrompt(input.prompt, toolCli, input.customTools);
+  const prompt = managerPrompt(input.prompt, toolCli, input.customTools, input.readOnly);
+  const socket = input.toolEnv.VIBEFACE_CODEX_SOCKET;
+  const network = input.readOnly
+    ? 'permissions.vibeface_manager.network={enabled=true,allow_local_binding=true,mode="limited",domains={"127.0.0.1"="allow","localhost"="allow"}}'
+    : `permissions.vibeface_manager.network={enabled=true,allow_local_binding=true,mode="full",domains={"*"="allow"},unix_sockets={${socket === undefined ? "" : `${JSON.stringify(socket)}="allow"`}}}`;
 
   const codex = new Codex({
     codexPathOverride: codexPath,
-    config: sdkConfig(),
+    config: sdkConfig(input),
     configOverrides: [
-      'permissions.vibeface_manager.filesystem={":root"="read"}',
-      'permissions.vibeface_manager.network={enabled=true,allow_local_binding=true,mode="limited",domains={"127.0.0.1"="allow","localhost"="allow"}}',
+      `permissions.vibeface_manager.filesystem={":root"="${input.readOnly ? "read" : "write"}"}`,
+      network,
     ],
     env: childEnvironment(input),
   });

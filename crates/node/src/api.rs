@@ -112,6 +112,17 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
     let listener = TcpListener::bind(node.config.listen).await?;
+    let local_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let local_url = format!("http://{}", local_listener.local_addr()?);
+    node.local_access
+        .publish_listener(local_url.clone(), node.identity.peer_id()?)?;
+    let pairing = Arc::new(NodePairing::new(node.clone()));
+    let local = browser_router(
+        node.clone(),
+        vec![Site::parse(&local_url)?],
+        true,
+        pairing.clone(),
+    );
     let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let tool_url = format!("http://{}", tools.local_addr()?);
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
@@ -122,7 +133,15 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         async {
             axum::serve(
                 listener,
-                router_with_sites(node, sites).into_make_service_with_connect_info::<SocketAddr>(),
+                browser_router(node.clone(), sites, false, pairing)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        },
+        async {
+            axum::serve(
+                local_listener,
+                local.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
         },
@@ -171,12 +190,22 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
+    let pairing = Arc::new(NodePairing::new(node.clone()));
+    browser_router(node, sites, false, pairing)
+}
+
+fn browser_router(
+    node: Arc<Runtime>,
+    sites: Vec<Site>,
+    local: bool,
+    pairing: Arc<NodePairing>,
+) -> Router {
     let app = App {
-        pairing: Arc::new(NodePairing::new(node.clone())),
         sites,
         node,
+        pairing,
     };
-    Router::new()
+    let mut routes = Router::new()
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
@@ -187,7 +216,15 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
         .route("/api/local/join/status", post(local_join_status))
         .route("/peer", get(peer))
         .route("/api/network/ws", get(network))
-        .fallback(frontend)
+        .fallback(frontend);
+    if local {
+        routes = routes
+            .route("/api/local/info", get(local_info))
+            .route("/api/local/launch", post(local_launch))
+            .route("/api/local/exchange", post(local_exchange))
+            .route("/api/local/ws", get(local_websocket));
+    }
+    routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
         .with_state(app)
@@ -267,7 +304,7 @@ async fn check_boundary(
     if !http_site_allowed(site, app.node.config.allow_insecure_lan, ip) {
         return Err(ApiError::forbidden());
     }
-    if path.starts_with("/api/local/") {
+    if path == "/api/local/setup" || path.starts_with("/api/local/join/") {
         check_local_setup(site, headers, ip)?;
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
@@ -281,7 +318,7 @@ async fn check_boundary(
                 "application/json required".into(),
             ));
         }
-        let is_tool = path == "/api/tools" || path == CALLBACK;
+        let is_tool = path == "/api/tools" || path == CALLBACK || path == "/api/local/launch";
         let bearer_call = is_tool && bearer(headers).is_some();
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
@@ -348,6 +385,129 @@ async fn info(State(app): State<App>) -> Json<Value> {
     Json(app.node.info())
 }
 
+async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let network_id = if app.node.has_membership().await.map_err(ApiError::bad)? {
+        Some(
+            app.node
+                .membership_state()
+                .await
+                .map_err(ApiError::bad)?
+                .genesis
+                .network_id,
+        )
+    } else {
+        None
+    };
+    let local_session = network_id.as_ref().and_then(|network_id| {
+        local_cookie(&headers, &peer_id).and_then(|cookie| {
+            app.node
+                .local_access
+                .session(cookie, &peer_id, network_id)
+                .ok()
+        })
+    });
+    Ok(Json(
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true}}),
+    ))
+}
+
+async fn local_launch(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let capability = bearer(&headers).ok_or_else(ApiError::auth)?;
+    let state = app.node.membership_state().await.map_err(ApiError::bad)?;
+    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let token = app
+        .node
+        .local_access
+        .issue(capability, &peer_id, &state.genesis.network_id)
+        .map_err(|_| ApiError::auth())?;
+    Ok(Json(
+        json!({"url":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"token":token}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalExchange {
+    token: String,
+    peer_id: String,
+    subject_id: String,
+    public_key: String,
+}
+
+async fn local_exchange(
+    State(app): State<App>,
+    Json(input): Json<LocalExchange>,
+) -> ApiResult<Response> {
+    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    if input.peer_id != peer_id {
+        return Err(ApiError::auth());
+    }
+    let state = app.node.membership_state().await.map_err(ApiError::bad)?;
+    let cookie = app
+        .node
+        .local_access
+        .exchange(
+            &input.token,
+            &peer_id,
+            &state.genesis.network_id,
+            &input.subject_id,
+            &input.public_key,
+        )
+        .map_err(|_| ApiError::auth())?;
+    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true},"network_id":state.genesis.network_id})).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{}={cookie}; HttpOnly; SameSite=Strict; Path=/api/local; Max-Age={}",
+            crate::local_access::cookie_name(&peer_id),
+            crate::local_access::SESSION_SECONDS
+        ))
+        .map_err(ApiError::bad)?,
+    );
+    Ok(response)
+}
+
+fn local_cookie<'a>(headers: &'a HeaderMap, peer_id: &str) -> Option<&'a str> {
+    let name = crate::local_access::cookie_name(peer_id);
+    let mut cookies = one_header(headers, header::COOKIE.as_str())?
+        .split(';')
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter(|(cookie_name, _)| *cookie_name == name);
+    let (_, value) = cookies.next()?;
+    cookies.next().is_none().then_some(value)
+}
+
+async fn local_websocket(
+    State(app): State<App>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let cookie = local_cookie(&headers, &peer_id)
+        .ok_or_else(ApiError::auth)?
+        .to_owned();
+    let state = app.node.membership_state().await.map_err(ApiError::bad)?;
+    app.node
+        .local_access
+        .session(&cookie, &peer_id, &state.genesis.network_id)
+        .map_err(|_| ApiError::auth())?;
+    Ok(websocket
+        .max_message_size(65535)
+        .max_frame_size(65535)
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = crate::client::serve_local(
+                app.node,
+                crate::network::NetworkSocket::server(socket),
+                cookie,
+            )
+            .await
+            {
+                tracing::debug!(%error, "local browser connection closed");
+            }
+        }))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalSetupRequest {}
@@ -355,8 +515,21 @@ struct LocalSetupRequest {}
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LocalSetup {
-    Uninitialized { invitation: BootstrapInvitation },
-    Initialized { entry: LocalEntry },
+    Uninitialized {
+        invitation: BootstrapInvitation,
+    },
+    Initialized {
+        entry: LocalEntry,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_launch: Option<LocalLaunch>,
+    },
+}
+
+#[derive(Serialize)]
+struct LocalLaunch {
+    url: String,
+    peer_id: String,
+    token: String,
 }
 
 #[derive(Serialize)]
@@ -381,17 +554,44 @@ async fn local_setup(
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
     let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
     if app.node.has_membership().await.map_err(ApiError::bad)? {
+        let local_launch = if app.node.local_access.enabled() {
+            match app.node.local_access.origin() {
+                Ok(url) => {
+                    let network_id = app
+                        .node
+                        .membership_state()
+                        .await
+                        .map_err(ApiError::bad)?
+                        .genesis
+                        .network_id;
+                    let token = app
+                        .node
+                        .local_access
+                        .issue_from_local_setup(&peer_id, &network_id)
+                        .map_err(ApiError::bad)?;
+                    Some(LocalLaunch {
+                        url,
+                        peer_id: peer_id.clone(),
+                        token,
+                    })
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         return Ok(Json(LocalSetup::Initialized {
             entry: LocalEntry {
                 address: origin.into(),
                 peer_id,
                 relay: false,
             },
+            local_launch,
         }));
     }
-    let capability = (|| -> Result<BootstrapCapability> {
+    let capability = async {
         let mut bytes = Vec::new();
-        std::fs::File::open(app.node.identities.path().with_file_name("bootstrap.json"))?
+        std::fs::File::open(app.node.data_dir.join("bootstrap.json"))?
             .take(4097)
             .read_to_end(&mut bytes)?;
         ensure!(
@@ -400,10 +600,13 @@ async fn local_setup(
         );
         let capability: BootstrapCapability = serde_json::from_slice(&bytes)?;
         app.node
-            .identities
+            .store
+            .lock()
+            .await
             .verify_bootstrap_capability(&capability.capability)?;
-        Ok(capability)
-    })()
+        Ok::<_, anyhow::Error>(capability)
+    }
+    .await
     .map_err(|_| {
         ApiError(
             StatusCode::CONFLICT,
@@ -509,7 +712,7 @@ async fn tool_callback(
     }
     let write = !matches!(
         input.tool_name.as_str(),
-        "nodes" | "context" | "execution_status" | "call_lookup"
+        "nodes" | "context" | "task_status" | "call_lookup"
     );
     let call_id = match input.tool_call_id {
         Some(id) => id,
@@ -786,18 +989,18 @@ mod tests {
         let mut config = Config::local(address, vec![], false);
         config.roles = vec![NodeRole::Relay];
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
-        let identities = crate::identity::IdentityStore::open(&dir.join("identity.sqlite3"))?;
-        let capability = identities.bootstrap_capability()?;
+        let store = crate::store::Store::open(dir.join("node.sqlite3"))?;
+        let capability = store.bootstrap_capability()?;
         config::private_write(
             &dir.join("bootstrap.json"),
             &serde_json::to_vec(&capability)?,
         )?;
-        drop(identities);
+        drop(store);
         let node = Arc::new(Runtime::open(&dir).await?);
         let app = router(node.clone());
         let server = tokio::spawn(async move {
@@ -850,11 +1053,27 @@ mod tests {
                 Member::client(&admin, "browser", true)?,
                 Member::node(&node.identity, "node", node.config.roles.clone())?,
             ])?)?;
-            node.identities.bootstrap_network(state, &capability.capability, &admin.peer_id()?)?;
+            node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.peer_id()?)?;
             let initialized: Value = request().send().await?.json().await?;
             assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"peer_id":node.identity.peer_id()?,"relay":false}}));
             assert!(!initialized.to_string().contains(&capability.capability));
-            assert!(node.identities.verify_bootstrap_capability(&capability.capability).is_err());
+            assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
+            let local_origin = "http://127.0.0.1:4791";
+            node.local_access.publish_listener(local_origin.into(), node.identity.peer_id()?)?;
+            let launched: Value = request().send().await?.json().await?;
+            assert_eq!(launched["entry"], initialized["entry"]);
+            assert_eq!(launched["local_launch"]["url"], local_origin);
+            assert_eq!(launched["local_launch"]["peer_id"], node.identity.peer_id()?);
+            let token = launched["local_launch"]["token"].as_str().context("local token missing")?;
+            assert!(token.len() == 64 && hex::decode(token).is_ok());
+            let browser = LocalIdentity::generate();
+            let network_id = node.membership_state().await?.genesis.network_id;
+            let cookie = node.local_access.exchange(token, &node.identity.peer_id()?, &network_id, &browser.peer_id()?, &browser.public_key_hex()?)?;
+            assert_eq!(node.local_access.session(&cookie, &node.identity.peer_id()?, &network_id)?.subject_id, browser.peer_id()?);
+            assert!(node.local_access.exchange(token, &node.identity.peer_id()?, &network_id, &browser.peer_id()?, &browser.public_key_hex()?).is_err());
+            node.local_access.set_enabled(false)?;
+            assert_eq!(request().send().await?.json::<Value>().await?, initialized);
+            assert!(node.local_access.session(&cookie, &node.identity.peer_id()?, &network_id).is_err());
             let joined: Value = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?.json().await?;
             assert_eq!(joined["kind"], "joined");
             assert_eq!(joined["peer_id"], node.identity.peer_id()?);
@@ -875,7 +1094,7 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
-        assert!(validate_tool_call("dispatch", "stable-call-id").is_ok());
-        assert!(validate_tool_call("dispatch", "").is_err());
+        assert!(validate_tool_call("send_task", "stable-call-id").is_ok());
+        assert!(validate_tool_call("send_task", "").is_err());
     }
 }

@@ -154,10 +154,7 @@ pub struct NodePairing {
 
 impl NodePairing {
     pub fn new(node: Arc<Runtime>) -> Self {
-        let pending_path = node
-            .identities
-            .path()
-            .with_file_name("pairing.pending.json");
+        let pending_path = node.data_dir.join("pairing.pending.json");
         Self {
             node,
             pending_path,
@@ -709,7 +706,7 @@ mod tests {
     async fn open_node(dir: &Path, listen: SocketAddr) -> Result<Arc<Runtime>> {
         config::private_dir(dir)?;
         Config::local(listen, vec![], false).save(dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -774,10 +771,11 @@ mod tests {
         Ok(url)
     }
 
-    fn invitation(node: &Runtime, admin: &LocalIdentity, url: &str) -> Result<Invitation> {
-        let view = node.identities.public_state()?.project()?;
+    async fn invitation(node: &Runtime, admin: &LocalIdentity, url: &str) -> Result<Invitation> {
+        let store = node.store.lock().await;
+        let view = store.public_state()?.project()?;
         let capability = "f1".repeat(32);
-        let payload = node.identities.create_invite(InviteRequest {
+        let payload = store.create_invite(InviteRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             network_id: view.network_id,
             inviter_subject_id: admin.peer_id()?,
@@ -793,7 +791,7 @@ mod tests {
             payload,
             inviter_signature,
         };
-        node.identities.commit_invite(invite.clone())?;
+        store.commit_invite(invite.clone())?;
         Ok(Invitation {
             url: url.into(),
             peer_id: node.identity.peer_id()?,
@@ -908,7 +906,7 @@ mod tests {
         let joiner_dir = dir.join("joiner");
         let joiner = open_node(&joiner_dir, "127.0.0.1:4790".parse()?).await?;
         let pairing = NodePairing::new(joiner.clone());
-        let invitation = invitation(&inviter, &admin, &url)?;
+        let invitation = invitation(&inviter, &admin, &url).await?;
         let result = async {
             assert!(matches!(pairing.status().await?, JoinState::Idle));
             let initial = pairing.request(invitation.clone(), "Mac mini").await?;
@@ -916,10 +914,10 @@ mod tests {
             assert_eq!(review.new_member.subject_id, joiner.identity.peer_id()?);
             assert_eq!(review.new_member.kind, IdentityKind::Node);
             assert_eq!(review.new_member.node_roles, invitation.invite.invite.payload.node_roles);
-            assert!(!inviter.identities.pair_accepted(&request_id)?);
+            assert!(!inviter.store.lock().await.pair_accepted(&request_id)?);
             assert!(!joiner.has_membership().await?);
             assert!(pairing.accept(&request_id, &"0".repeat(64)).await.is_err());
-            let counter = rusqlite::Connection::open(inviter.identities.path())?;
+            let counter = rusqlite::Connection::open(inviter.data_dir.join("node.sqlite3"))?;
             counter.execute_batch("CREATE TABLE acceptance_writes(count INTEGER NOT NULL); INSERT INTO acceptance_writes VALUES(0); CREATE TRIGGER count_acceptance AFTER UPDATE OF new_subject_signature ON identity_pair_requests BEGIN UPDATE acceptance_writes SET count=count+1; END;")?;
             let mut pending = pairing.load()?.unwrap();
             pending.review = None;
@@ -1030,9 +1028,10 @@ mod tests {
                 Config::load(&node_dir)?.network.bootstrap_urls.len(),
                 if startup_override { 0 } else { count }
             );
-            let capability = node.identities.bootstrap_capability()?;
+            let capability = node.store.lock().await.bootstrap_capability()?;
             let pairing = NodePairing::new(node.clone());
-            let invitation = invitation(&inviter, &admin, "ws://127.0.0.1:9/api/network/ws")?;
+            let invitation =
+                invitation(&inviter, &admin, "ws://127.0.0.1:9/api/network/ws").await?;
             let mut granted = state.clone();
             granted.append(GovernanceEvent::grant(
                 &admin,
@@ -1063,7 +1062,9 @@ mod tests {
             if count == 8 {
                 assert_eq!(result.unwrap_err().to_string(), "too many network URLs");
                 assert!(!node.has_membership().await?);
-                node.identities
+                node.store
+                    .lock()
+                    .await
                     .verify_bootstrap_capability(&capability.capability)?;
                 assert_eq!(fs::read(node_dir.join("config.json"))?, config_before);
                 assert_eq!(fs::read(&pairing.pending_path)?, receipt_before);
@@ -1113,7 +1114,7 @@ mod tests {
         )?)?;
         node.install_membership(state.clone()).await?;
         let pairing = NodePairing::new(node.clone());
-        let mut invitation = invitation(&node, &admin, "ws://127.0.0.1:9/api/network/ws")?;
+        let mut invitation = invitation(&node, &admin, "ws://127.0.0.1:9/api/network/ws").await?;
         assert!(
             pairing
                 .request(invitation.clone(), "Mac mini")

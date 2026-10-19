@@ -162,13 +162,13 @@ impl Drop for ObservationGuard {
 fn valid_progress(event: &Value, scope: &str, source: &str) -> bool {
     matches!(
         event["type"].as_str(),
-        Some("manager_progress" | "execution_progress")
+        Some("manager_progress" | "native_progress")
     ) && event["conversation_id"].as_str() == Some(scope)
         && event["source_node"].as_str() == Some(source)
         && event["sequence"]
             .as_u64()
             .is_some_and(|sequence| sequence > 0)
-        && (event["type"] != "execution_progress" || event["target_node"].as_str() == Some(source))
+        && (event["type"] != "native_progress" || event["target_node"].as_str() == Some(source))
         && serde_json::to_vec(event).is_ok_and(|bytes| bytes.len() <= MAX_EVENT_BYTES)
 }
 
@@ -180,7 +180,7 @@ fn bounded_text(text: &str, limit: usize) -> String {
 }
 
 /// Provider tool arguments, raw outputs and reasoning never enter the live UI protocol.
-pub(super) fn execution_progress(event: &Value) -> Value {
+pub(super) fn native_progress(event: &Value) -> Value {
     let method = event["method"].as_str().unwrap_or("");
     let params = &event["params"];
     let item = &params["item"];
@@ -198,52 +198,6 @@ pub(super) fn execution_progress(event: &Value) -> Value {
         && let Some(text) = item["text"].as_str()
     {
         return json!({"type":"text_snapshot","item_id":bounded_text(item_id,128),"text":bounded_text(text,8000)});
-    }
-    if event["kind"] == "executor_progress" {
-        let content = &event["event"];
-        if content["type"] == "stream_event" {
-            let stream = &content["event"];
-            if stream["type"] == "content_block_delta"
-                && stream["delta"]["type"] == "text_delta"
-                && let Some(text) = stream["delta"]["text"].as_str()
-            {
-                return json!({"type":"text_delta","item_id":"assistant","text":bounded_text(text,8000)});
-            }
-            if stream["type"] == "message_start" {
-                return json!({"type":"text_snapshot","item_id":"assistant","text":""});
-            }
-        }
-        if content["type"] == "assistant" {
-            let message = &content["message"];
-            let body = message
-                .get("content")
-                .or_else(|| message.get("text"))
-                .or_else(|| content.get("text"))
-                .unwrap_or(message);
-            let text = body.as_str().map(String::from).or_else(|| {
-                body.as_array().map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter(|block| block["type"] == "text")
-                        .filter_map(|block| block["text"].as_str())
-                        .map(|text| bounded_text(text, 8000))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            });
-            if let Some(text) = text.filter(|text| !text.is_empty()) {
-                return json!({"type":"text_snapshot","item_id":"assistant","text":bounded_text(&text,8000)});
-            }
-        }
-        let kind = content["type"].as_str().unwrap_or("working");
-        return match kind {
-            "tool_use" | "tool_call" | "tool_result" => {
-                json!({"type":"tool","name":"executor","status":"running"})
-            }
-            "error" => json!({"type":"status","status":"failed"}),
-            "result" => json!({"type":"status","status":"completed"}),
-            _ => json!({"type":"status","status":"running"}),
-        };
     }
     if method == "turn/completed" {
         let status = match params["turn"]["status"].as_str() {
@@ -580,43 +534,27 @@ mod tests {
 
     #[test]
     fn execution_text_distinguishes_deltas_snapshots_and_private_tool_arguments() {
-        let delta = execution_progress(
+        let delta = native_progress(
             &json!({"method":"item/agentMessage/delta","params":{"itemId":"reply","delta":"你好\n"}}),
         );
         assert_eq!(
             delta,
             json!({"type":"text_delta","item_id":"reply","text":"你好\n"})
         );
-        let snapshot = execution_progress(
+        let snapshot = native_progress(
             &json!({"method":"item/completed","params":{"item":{"id":"reply","type":"agentMessage","text":"你好\n完成"}}}),
         );
         assert_eq!(
             snapshot,
             json!({"type":"text_snapshot","item_id":"reply","text":"你好\n完成"})
         );
-        let cli = execution_progress(
-            &json!({"kind":"executor_progress","event":{"type":"assistant","message":{"content":[{"type":"text","text":"第一行"},{"type":"text","text":"第二行"},{"type":"tool_use","input":{"secret":"private-value"}}]}}}),
-        );
-        assert_eq!(cli["text"], "第一行\n第二行");
-        assert_eq!(
-            execution_progress(
-                &json!({"kind":"executor_progress","event":{"type":"assistant","message":"working"}})
-            )["text"],
-            "working"
-        );
-        assert_eq!(
-            execution_progress(
-                &json!({"kind":"executor_progress","event":{"type":"assistant","message":{"text":"working"}}})
-            )["text"],
-            "working"
-        );
-        let tool = execution_progress(
+        let tool = native_progress(
             &json!({"method":"item/completed","params":{"item":{"id":"tool","type":"commandExecution","command":"private-value","output":"private-value"}}}),
         );
         assert_eq!(tool["type"], "tool");
         assert_eq!(tool["status"], "completed");
         assert!(!tool.to_string().contains("private-value"));
-        let reasoning = execution_progress(
+        let reasoning = native_progress(
             &json!({"method":"item/reasoning/textDelta","params":{"delta":"private-value"}}),
         );
         assert!(!reasoning.to_string().contains("private-value"));

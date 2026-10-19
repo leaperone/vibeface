@@ -35,18 +35,16 @@ impl Runtime {
             .clone()
     }
 
-    pub(crate) fn node_settings(&self) -> Result<Value> {
+    pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
-        let view = self.identities.public_state()?.project()?;
+        let view = self.membership_state().await?.project()?;
         let peer = self.identity.peer_id()?;
         let scheduler_available = self.config.roles.contains(&NodeRole::Scheduler)
             && view
                 .authorize_node(&peer, Some(NodeRole::Scheduler))
                 .is_ok();
-        let executor_available = self.config.roles.contains(&NodeRole::Executor)
-            && view.authorize_node(&peer, Some(NodeRole::Executor)).is_ok();
         let defaults = json!({
-            "workspace":self.identities.path().parent().context("identity store has no directory")?.canonicalize()?.join("manager-workspace"),
+            "workspace":self.data_dir.canonicalize()?.join("manager-workspace"),
             "cursor_sdk_bin":"cursor-sdk-bridge",
             "node_bin":"node",
             "codex_sdk_script":std::env::current_exe()?.parent().context("Node executable has no directory")?.join("sidecars/codex-manager.mjs"),
@@ -72,6 +70,9 @@ impl Runtime {
                 }) {
                     missing.push("Codex SDK dependencies");
                 }
+                if scheduler_available && self.native_socket().is_none() {
+                    missing.push("Codex App Server");
+                }
             }
         }
         let readiness = if settings.manager.is_none() {
@@ -84,7 +85,7 @@ impl Runtime {
             "missing_prerequisites"
         };
         Ok(
-            json!({"settings":settings,"defaults":defaults,"readiness":{"manager":readiness,"missing":missing,"scheduler_available":scheduler_available,"executor_available":executor_available}}),
+            json!({"settings":settings,"defaults":defaults,"readiness":{"manager":readiness,"missing":missing,"scheduler_available":scheduler_available}}),
         )
     }
 
@@ -92,36 +93,38 @@ impl Runtime {
         &self,
         mut settings: NodeSettings,
         subject: &str,
+        local_cookie: Option<&str>,
     ) -> Result<Value> {
         let _save = self.config_save.lock().await;
         let _work = self.maintenance.enter()?;
-        ensure!(
-            self.membership_state()
-                .await?
-                .project()?
-                .principal(subject)?
-                .can_manage,
-            "management permission required"
-        );
-        let directory = self
-            .identities
-            .path()
-            .parent()
-            .context("identity store has no directory")?;
+        let view = self.membership_state().await?.project()?;
+        if let Some(cookie) = local_cookie {
+            let session =
+                self.local_access
+                    .session(cookie, &self.identity.peer_id()?, &view.network_id)?;
+            ensure!(
+                session.subject_id == subject,
+                "local session identity changed"
+            );
+        } else {
+            ensure!(
+                view.principal(subject)?.can_manage,
+                "management permission required"
+            );
+        }
+        let directory = &self.data_dir;
         let default_workspace = directory.canonicalize()?.join("manager-workspace");
         ensure!(
             settings.roots.len() <= 128,
-            "at most 128 execution roots are allowed"
+            "at most 128 project roots are allowed"
         );
         for root in &mut settings.roots {
             ensure!(
                 root.is_absolute(),
-                "execution root must be an existing absolute directory"
+                "project root must be an existing absolute directory"
             );
-            *root = root
-                .canonicalize()
-                .context("execution root does not exist")?;
-            ensure!(root.is_dir(), "execution root must be a directory");
+            *root = root.canonicalize().context("project root does not exist")?;
+            ensure!(root.is_dir(), "project root must be a directory");
         }
         settings.roots.sort();
         settings.roots.dedup();
@@ -177,7 +180,13 @@ impl Runtime {
             .settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
+        if self.settings_snapshot().manager.is_some_and(|manager| {
+            manager.provider == "codex_sdk" || self.config.codex_socket.is_some()
+        }) && let Err(error) = self.ensure_native_client().await
+        {
+            tracing::warn!(%error, "native Codex is unavailable after settings change");
+        }
         self.schedule_wakeup.notify_one();
-        self.node_settings()
+        self.node_settings().await
     }
 }

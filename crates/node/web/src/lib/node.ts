@@ -1,11 +1,11 @@
 import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
 
-export type ConnectionEntry = { address: string; peer_id: string; relay: boolean }
+export type ConnectionEntry = { address: string; peer_id: string; relay: boolean; local?: boolean }
 export type PublicIdentity = { peerId: string; publicKey: string }
-export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number; can_manage: boolean }
-export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler' | 'executor'
-export type EntryInfo = { peer_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean }
+export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
+export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
+export type EntryInfo = { peer_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
   readonly generation: number
   entry: ConnectionEntry
@@ -23,14 +23,14 @@ export type PairReceipt = { request_id: string; review: PairReview; new_subject_
 export type Signing = { domain: string; payload: string }
 export type WaitingPair = { request_id: string; network_id: string; entry: ConnectionEntry; review: PairReview; signing: Signing; accepted: boolean }
 export type Invitation = { kind: 'bootstrap'; entry: ConnectionEntry; capability: string } | { kind: 'pair' | 'node'; entry: ConnectionEntry; invite: Record<string, unknown>; capability: string; payload: Record<string, unknown> }
-export type LocalSetup = { kind: 'uninitialized'; invitation: Extract<Invitation, { kind: 'bootstrap' }> } | { kind: 'initialized'; entry: ConnectionEntry }
+export type LocalSetup = { kind: 'uninitialized'; invitation: Extract<Invitation, { kind: 'bootstrap' }> } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; peer_id: string; token: string } }
 export type LocalJoin = { kind: 'idle' } | { kind: 'review' | 'pending'; request_id: string; review: PairReview; review_hash: string } | { kind: 'joined'; network_id: string; peer_id: string } | { kind: 'uncertain'; request_id: string; message: string }
 export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string; node_bin: string; codex_sdk_script: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type NodeSettingsResponse = {
   settings: NodeSettings
   defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin' | 'node_bin' | 'codex_sdk_script'>
-  readiness: { manager: 'disabled' | 'role_unavailable' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[]; scheduler_available: boolean; executor_available: boolean }
+  readiness: { manager: 'disabled' | 'role_unavailable' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[]; scheduler_available: boolean }
 }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -47,16 +47,21 @@ export function integer(value: unknown): number { if (typeof value !== 'number' 
 export function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
 export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
 export function roles(value: unknown): NodeRole[] {
-  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': case 'executor': return role; default: throw new Error('设备返回了不支持的角色。') } })
+  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': return role; default: throw new Error('设备返回了不支持的角色。') } })
 }
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '连接入口')
-  return { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id), relay: boolean(v.relay) }
+  const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id), relay: boolean(v.relay) }
+  if (v.local === true) {
+    if (entry.relay || entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
+    return { ...entry, local: true }
+  }
+  return entry
 }
-export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.relay}`
+export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.relay}:${entry.local === true}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
-  return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized) }
+  return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized), ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }) }
 }
 export function parseMember(value: unknown): Member {
   const v = record(value)
@@ -71,7 +76,13 @@ export function parseView(value: unknown): MembershipView {
 }
 export function parsePrincipal(value: unknown): ClientPrincipal {
   const v = record(value)
-  return { network_id: validTarget(v.network_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch), can_manage: boolean(v.can_manage) }
+  const principal = { network_id: validTarget(v.network_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch) }
+  if (v.source === 'local_session') {
+    if (v.can_manage !== false) throw new Error('本机会话不能取得设备管理权限。')
+    return { ...principal, source: 'local_session', can_manage: false }
+  }
+  if (v.source !== undefined && v.source !== 'membership') throw new Error('设备返回了未知授权来源。')
+  return { ...principal, source: 'membership', can_manage: boolean(v.can_manage) }
 }
 export function parseReview(value: unknown): PairReview {
   const v = record(value)
@@ -105,10 +116,18 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
     const invitation = parseInvitation(v.invitation)
     if (invitation.kind !== 'bootstrap') throw new Error('本机设置返回了不同用途的邀请。')
     setup = { kind: 'uninitialized', invitation }
-  } else if (v.kind === 'initialized') setup = { kind: 'initialized', entry: parseEntry(v.entry) }
+  } else if (v.kind === 'initialized') {
+    const entry = parseEntry(v.entry)
+    setup = { kind: 'initialized', entry }
+    if (v.local_launch !== undefined) {
+      const launch = record(v.local_launch), url = new URL(text(launch.url)), peer_id = validTarget(launch.peer_id), token = text(launch.token)
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || peer_id !== entry.peer_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机启动入口与此节点不一致。')
+      setup.local_launch = { url: url.origin, peer_id, token }
+    }
+  }
   else throw new Error('本机设置状态无效。')
   const entry = setup.kind === 'uninitialized' ? setup.invitation.entry : setup.entry
-  if (entry.address !== origin || entry.relay) throw new Error('本机设置入口与当前页面不一致。')
+  if (entry.address !== origin || entry.relay || entry.local) throw new Error('本机设置入口与当前页面不一致。')
   return setup
 }
 export function parseNodeSettings(value: unknown): NodeSettingsResponse {
@@ -123,7 +142,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   return {
     settings: { roots: strings(settings.roots), manager },
     defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
-    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)), scheduler_available: boolean(readiness.scheduler_available), executor_available: boolean(readiness.executor_available) },
+    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)), scheduler_available: boolean(readiness.scheduler_available) },
   }
 }
 export function parseLocalJoin(value: unknown, entry: ConnectionEntry): LocalJoin {

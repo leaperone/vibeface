@@ -1,8 +1,7 @@
 use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
-    engine::{Engine, EngineAction, ExecutorConfig, ExecutorKind, ExecutorSession},
-    identity::{AuthorizationView, GovernanceAction, IdentityKind, IdentityStore, NetworkState},
+    identity::{AuthorizationView, GovernanceAction, IdentityKind, NetworkState},
     maintenance::{Busy, Gate},
     model::*,
     network::{IncomingSocket, NetworkHub, Service},
@@ -10,7 +9,6 @@ use crate::{
     store::Store,
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -24,12 +22,11 @@ mod agent_tools;
 mod blob_transfer;
 mod bots;
 mod chat_controls;
-mod commands;
-mod execution_subscription;
 mod followup;
 mod manager_control;
 #[cfg(test)]
 mod manager_control_tests;
+pub(crate) mod native_observation;
 mod observation;
 mod schedule_delivery;
 mod settings;
@@ -84,7 +81,7 @@ mod node_display_names_tests {
             Member::node(
                 &node,
                 "Mac Studio",
-                vec![NodeRole::Replica, NodeRole::Executor],
+                vec![NodeRole::Replica, NodeRole::Scheduler],
             )?,
         )?)?;
         state.append(GovernanceEvent::revoke(
@@ -128,7 +125,7 @@ mod tests {
             .join(subdir)
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
         cfg.save(&dir)?;
@@ -565,7 +562,17 @@ mod tests {
                 .iter()
                 .any(|(index, hash, offset)| *index == 2 && hash == &empty.hash && *offset == 0)
         );
-        assert!(nodes[0].store.lock().await.operations(&network)?.is_empty());
+        {
+            let store = nodes[0].store.lock().await;
+            for scope in store.scopes(&network)? {
+                assert!(
+                    store
+                        .scheduler_jobs(&network, &scope, &nodes[0].identity.peer_id()?)?
+                        .is_empty()
+                );
+            }
+            assert!(store.scheduler_outbox_all(&network)?.is_empty());
+        }
         drop(connection);
         for disconnect in disconnects {
             disconnect.notify_one();
@@ -588,6 +595,26 @@ mod tests {
     async fn net1_pending_basis_rejects_before_scanning_history_and_ready_rechecks_content()
     -> Result<()> {
         let dir = fixture_under("network-reliability")?;
+        let script = dir.join("fixture-manager.py");
+        let verifier = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/verify-node.py")
+            .canonicalize()?;
+        config::private_write(&script,format!(
+            "import os\nos.execv('/usr/bin/python3',['/usr/bin/python3',{},'--fixture-manager','--fixture-root',{}])\n",
+            json!(verifier.to_string_lossy()),json!(dir.to_string_lossy()),
+        ).as_bytes())?;
+        let mut cfg = Config::load(&dir)?;
+        cfg.listen = "127.0.0.1:0".parse()?;
+        cfg.codex_bin = "/usr/bin/true".into();
+        cfg.manager = Some(config::ManagerSettings {
+            provider: "codex_sdk".into(),
+            workspace: dir.canonicalize()?,
+            model: "controlled-fixture".into(),
+            cursor_sdk_bin: "unused".into(),
+            node_bin: "/usr/bin/python3".into(),
+            codex_sdk_script: script,
+        });
+        cfg.save(&dir)?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
         let content = b"basis content must be verified";
@@ -654,96 +681,23 @@ mod tests {
             conversation_id: Some("chat".into()),
             manager: None,
         };
-        let request = OperationRequest {
-            operation_id: "pending-open".into(),
-            network_id: network.clone(),
-            conversation_id: "chat".into(),
-            task_id: None,
-            target_node: node.identity.peer_id()?,
-            session_id: Some("pending-session".into()),
-            expected_revision: 0,
-            basis_heads: vec![pending.hash.clone()],
-            action: json!({"type":"open","executor":"claude_code","cwd":dir}),
-            resources: vec![],
-            binding: None,
-            manager_authority: None,
-        };
+        let input = json!({"method":"message","conversation_id":"chat","message_id":"verified-sdk-work",
+            "scheduler_node":node.identity.peer_id()?,"basis_heads":[pending.hash],"report_results":false,
+            "text":json!({"phase1":true,"label":"net1-basis","host_command":"printf net1 >> pending-effect","host_cwd":dir.canonicalize()?}).to_string()});
         assert_eq!(
-            node.rpc(human.clone(), json!({"method":"operate","request":request}))
+            node.rpc(human.clone(), input.clone())
                 .await
                 .unwrap_err()
                 .to_string(),
-            "operation basis is incomplete or conflicting"
+            "context is incomplete; wait for synchronization"
         );
-        let mut agent_request = request.clone();
-        agent_request.operation_id = "pending-agent-open".into();
-        let agent = Access {
-            human: false,
-            ..human.clone()
-        };
-        assert_eq!(
-            node.dispatch(agent, agent_request)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "operation basis is incomplete or conflicting"
-        );
-        let mut command = request.clone();
-        command.operation_id = "pending-command".into();
-        command.session_id = None;
-        command.action = json!({"type":"command","command":"printf net1 >> pending-effect","cwd":dir,"timeout_secs":1});
-        assert_eq!(
-            node.dispatch(human.clone(), command.clone())
-                .await
-                .unwrap_err()
-                .to_string(),
-            "operation basis is incomplete or conflicting"
-        );
-        assert_eq!(
-            node.admit_operation(request.clone(), true)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "required context is incomplete or conflicting"
-        );
-        assert_eq!(
-            node.admit_operation(command.clone(), true)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "required context is incomplete or conflicting"
-        );
-        let mut missing = command.clone();
-        missing.operation_id = "missing-root-command".into();
-        missing.basis_heads = vec![crypto::digest(b"missing basis")];
-        assert_eq!(
-            node.dispatch(human.clone(), missing)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "operation basis is incomplete or conflicting"
-        );
-        let scoped_elsewhere = Access {
-            conversation_id: Some("elsewhere".into()),
-            ..human.clone()
-        };
-        assert_eq!(
-            node.dispatch(scoped_elsewhere, command.clone())
-                .await
-                .unwrap_err()
-                .to_string(),
-            "outside this tool's conversation"
-        );
-        assert!(node.store.lock().await.operations(&network)?.is_empty());
         assert!(
             node.store
                 .lock()
                 .await
-                .session(&network, &node.identity.peer_id()?, "pending-session")?
-                .is_none()
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
+                .is_empty()
         );
-        let dispatches: usize = connection.query_row("SELECT count(*) FROM events WHERE network_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.type')='dispatch_recorded'", [&network], |row| row.get(0))?;
-        assert_eq!(dispatches, 0);
         assert!(!dir.join("pending-effect").exists());
         connection.execute(
             "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
@@ -760,6 +714,34 @@ mod tests {
             "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
             rusqlite::params![vec![b'x'; content.len()], network, blob.hash],
         )?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .missing_dependencies(&network, std::slice::from_ref(&pending.hash))?
+                .blobs,
+            vec![blob.clone()]
+        );
+        assert_eq!(
+            node.rpc(human.clone(), input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "context is incomplete; wait for synchronization"
+        );
+        assert!(
+            node.store
+                .lock()
+                .await
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
+                .is_empty()
+        );
+        assert!(!dir.join("pending-effect").exists());
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            rusqlite::params![serde_json::to_string(&corrupt)?, network, sentinel.hash],
+        )?;
         assert!(
             !node
                 .store
@@ -768,118 +750,62 @@ mod tests {
                 .has_known_basis_gap(&network, std::slice::from_ref(&pending.hash))?
         );
         assert_eq!(
-            node.dispatch(human.clone(), command.clone())
+            node.rpc(human.clone(), input.clone())
                 .await
                 .unwrap_err()
                 .to_string(),
-            "operation basis is incomplete or conflicting"
+            "invalid signature"
         );
-        assert_eq!(
-            node.admit_operation(command.clone(), true)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "required context is incomplete or conflicting"
-        );
-        assert!(node.store.lock().await.operations(&network)?.is_empty());
-        assert!(!dir.join("pending-effect").exists());
-        node.store.lock().await.put_blob(&network, &blob, content)?;
-        node.dispatch(human, command.clone()).await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if node
-                    .store
-                    .lock()
-                    .await
-                    .operation(&network, &command.operation_id)?
-                    .is_some_and(|record| record.state == OperationState::Succeeded)
-                {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await??;
-        assert_eq!(std::fs::read(dir.join("pending-effect"))?, b"net1");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn net1_existing_unknown_operation_keeps_normalization_and_never_redispatches()
-    -> Result<()> {
-        let dir = fixture_under("network-reliability")?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = OperationRequest {
-            operation_id: "unknown-original".into(),
-            network_id: network.clone(),
-            conversation_id: "chat".into(),
-            task_id: None,
-            target_node: node.identity.peer_id()?,
-            session_id: None,
-            expected_revision: 0,
-            basis_heads: node.store.lock().await.heads(&network, "chat")?,
-            action: json!({"type":"command","command":"printf net1 >> unknown-effect; sleep 30","cwd":dir,"timeout_secs":1}),
-            resources: vec![],
-            binding: None,
-            manager_authority: None,
-        };
-        node.admit_operation(request.clone(), true).await?;
-        let old = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(record) = node
-                    .store
-                    .lock()
-                    .await
-                    .operation(&network, &request.operation_id)?
-                    && record.state == OperationState::Unknown
-                {
-                    return Ok::<_, anyhow::Error>(record);
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await??;
-        assert_eq!(std::fs::read(dir.join("unknown-effect"))?, b"net1");
-        let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
-        connection.execute(
-            "UPDATE events SET status='pending' WHERE network_id=? AND hash=?",
-            rusqlite::params![network, request.basis_heads[0]],
-        )?;
-        let mut retry = request.clone();
-        retry.resources = vec![
-            format!("{}/.", node.config.roots[0].display()),
-            node.config.roots[0].to_string_lossy().into(),
-        ];
-        let repeated = node.admit_operation(retry.clone(), true).await?;
-        assert_eq!(repeated["operation"], serde_json::to_value(&old)?);
-        let mut changed = retry.clone();
-        changed.action["command"] = json!("printf changed >> unknown-effect");
-        assert_eq!(
-            node.admit_operation(changed, true)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "operation ID reused with different body"
-        );
-        let mut outside = retry;
-        outside.resources = vec!["/".into()];
-        assert_eq!(
-            node.admit_operation(outside, true)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "execution path is outside configured roots"
-        );
-        tokio::task::yield_now().await;
-        assert_eq!(
+        assert!(
             node.store
                 .lock()
                 .await
-                .operation(&network, &request.operation_id)?,
-            Some(old)
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
+                .is_empty()
         );
-        assert_eq!(std::fs::read(dir.join("unknown-effect"))?, b"net1");
+        assert!(!dir.join("pending-effect").exists());
+        connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            rusqlite::params![serde_json::to_string(&sentinel)?, network, sentinel.hash],
+        )?;
+        let accepted = node.rpc(human, input).await?;
+        let api_node = node.clone();
+        let api = tokio::spawn(async move { crate::api::serve(api_node).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while node.tool_url.get().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let access = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("chat".into()),
+            manager: None,
+        };
+        let trigger = accepted["trigger"]
+            .as_str()
+            .context("accepted trigger missing")?
+            .to_owned();
+        for _ in 0..2 {
+            assert_eq!(
+                crate::scheduler::run(node.clone(), access.clone(), "chat".into(), trigger.clone())
+                    .await?["state"],
+                "completed"
+            );
+        }
+        assert_eq!(std::fs::read(dir.join("pending-effect"))?, b"net1");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("manager-invocations.jsonl"))?
+                .lines()
+                .count(),
+            1
+        );
+        api.abort();
+        let _ = api.await;
+        drop(connection);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -1513,7 +1439,17 @@ mod tests {
                 .messages(&network, "chat")?
                 .is_empty()
         );
-        assert!(node.store.lock().await.operations(&network)?.is_empty());
+        {
+            let store = node.store.lock().await;
+            for scope in store.scopes(&network)? {
+                assert!(
+                    store
+                        .scheduler_jobs(&network, &scope, &node.identity.peer_id()?)?
+                        .is_empty()
+                );
+            }
+            assert!(store.scheduler_outbox_all(&network)?.is_empty());
+        }
         drop(external);
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1981,7 +1917,17 @@ mod tests {
             .await?;
         assert_eq!(noop.state, SyncState::Complete);
         assert!(!noop.changed);
-        assert!(nodes[0].store.lock().await.operations(&network)?.is_empty());
+        {
+            let store = nodes[0].store.lock().await;
+            for scope in store.scopes(&network)? {
+                assert!(
+                    store
+                        .scheduler_jobs(&network, &scope, &nodes[0].identity.peer_id()?)?
+                        .is_empty()
+                );
+            }
+            assert!(store.scheduler_outbox_all(&network)?.is_empty());
+        }
         let fifth_bytes = b"fifth blob makes progress after four unavailable objects";
         let fifth = BlobRef {
             hash: crypto::digest(fifth_bytes),
@@ -2100,20 +2046,6 @@ mod tests {
                 )?
                 .is_none()
         );
-        let request = OperationRequest {
-            operation_id: "revoked-sessionless-command".into(),
-            network_id: network.clone(),
-            conversation_id: "chat".into(),
-            task_id: None,
-            target_node: nodes[0].identity.peer_id()?,
-            session_id: None,
-            expected_revision: 0,
-            basis_heads: vec![head.hash.clone()],
-            action: json!({"type":"command","command":"printf forbidden > revoked-effect","cwd":dirs[0],"timeout_secs":1}),
-            resources: vec![],
-            binding: None,
-            manager_authority: None,
-        };
         let dispatch = author.sign_event(Event {
             version: 1,
             network_id: network.clone(),
@@ -2123,12 +2055,11 @@ mod tests {
             previous: Some(head.hash.clone()),
             parents: vec![head.hash.clone()],
             created_at_ms: 3,
-            body: EventBody::DispatchRecorded {
-                operation_id: request.operation_id.clone(),
-                task_id: None,
-                target_node: request.target_node.clone(),
-                session_id: None,
-                action: json!(request),
+            body: EventBody::MessagePosted {
+                message_id: "revoked-before-schedule".into(),
+                role: "user".into(),
+                text: "do not start an Agent after revocation".into(),
+                scheduler_node: Some(nodes[0].identity.peer_id()?),
             },
             blobs: vec![],
         })?;
@@ -2158,7 +2089,7 @@ mod tests {
             origin: preferred.clone(),
             request_id: "revoked-dispatch".into(),
             broadcast: false,
-            payload: json!({"type":"execute","human":true,"request":request,"dispatch_head":dispatch.hash}),
+            payload: json!({"type":"schedule","version":1,"target_node":nodes[0].identity.peer_id()?,"conversation_id":"chat","trigger":dispatch.hash,"basis_heads":[dispatch.hash]}),
         };
         let error = nodes[0].handle_peer(&execute).await.unwrap_err();
         assert_eq!(
@@ -2174,15 +2105,19 @@ mod tests {
                 .missing
                 .is_complete()
         );
-        assert_eq!(
+        assert!(
             nodes[0]
                 .store
                 .lock()
                 .await
-                .operation(&network, &request.operation_id)?,
-            None
+                .scheduler_job(
+                    &network,
+                    "chat",
+                    &dispatch.hash,
+                    &nodes[0].identity.peer_id()?
+                )?
+                .is_none()
         );
-        assert!(!dirs[0].join("revoked-effect").exists());
         let schedule_author = &nodes[3].identity;
         let (trigger, schedule_basis) = {
             let mut store = nodes[3].store.lock().await;
@@ -2303,34 +2238,23 @@ mod tests {
             vec![],
             4,
         )?;
-        let local_request = OperationRequest {
-            operation_id: "local-replica-revoked-command".into(),
-            network_id: network.clone(),
-            conversation_id: local_scope.into(),
-            task_id: None,
-            target_node: nodes[0].identity.peer_id()?,
-            session_id: None,
-            expected_revision: 0,
-            basis_heads: vec![local_root.hash.clone()],
-            action: json!({"type":"command","command":"printf forbidden > local-replica-effect","cwd":dirs[0],"timeout_secs":1}),
-            resources: vec![],
-            binding: None,
-            manager_authority: None,
-        };
-        let local_dispatch = nodes[3].store.lock().await.append_event(
+        let (local_dispatch, _) = nodes[3].store.lock().await.accept_message(
             &nodes[3].identity,
             &network,
             local_scope,
-            EventBody::DispatchRecorded {
-                operation_id: local_request.operation_id.clone(),
-                task_id: None,
-                target_node: local_request.target_node.clone(),
-                session_id: None,
-                action: json!(local_request),
+            EventBody::MessagePosted {
+                message_id: "local-role-revoked-schedule".into(),
+                role: "user".into(),
+                text: "do not start an Agent after the local Replica role is revoked".into(),
+                scheduler_node: Some(nodes[0].identity.peer_id()?),
             },
             vec![],
             5,
+            &nodes[3].identity.peer_id()?,
+            &nodes[0].identity.peer_id()?,
+            false,
         )?;
+        let local_basis = nodes[3].store.lock().await.heads(&network, local_scope)?;
         let update = owner.sign_network_fixture(
             4,
             nodes
@@ -2354,7 +2278,7 @@ mod tests {
             origin: nodes[3].identity.peer_id()?,
             request_id: "local-role-revoked-dispatch".into(),
             broadcast: false,
-            payload: json!({"type":"execute","human":true,"request":local_request,"dispatch_head":local_dispatch.hash}),
+            payload: json!({"type":"schedule","version":1,"target_node":nodes[0].identity.peer_id()?,"conversation_id":local_scope,"trigger":local_dispatch.hash,"basis_heads":local_basis}),
         };
         let error = nodes[0].handle_peer(&execute).await.unwrap_err();
         assert_eq!(error.to_string(), "Node lacks required role");
@@ -2381,13 +2305,17 @@ mod tests {
         assert!(store.event(&network, &local_root.hash)?.is_none());
         assert!(
             store
-                .operation(&network, &local_request.operation_id)?
+                .scheduler_job(
+                    &network,
+                    local_scope,
+                    &local_dispatch.hash,
+                    &nodes[0].identity.peer_id()?
+                )?
                 .is_none()
         );
-        assert!(!dirs[0].join("local-replica-effect").exists());
         drop(store);
         println!(
-            "NET1_M5 local_replica_role_removed_during_real_noise_response=true local_relay_membership_retained=true received_page_imports=0 operation_admissions=0 command_effects=0"
+            "NET1_M5 local_replica_role_removed_during_real_noise_response=true local_relay_membership_retained=true received_page_imports=0 scheduler_admissions=0 sdk_starts=0"
         );
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
@@ -2398,45 +2326,6 @@ mod tests {
         Ok(())
     }
 
-    async fn queued(
-        node: &Runtime,
-        network: &str,
-        operation: &str,
-        action: Value,
-    ) -> Result<OperationRequest> {
-        let local = node.identity.peer_id()?;
-        let mut store = node.store.lock().await;
-        store.upsert_session(
-            network,
-            &ExecutionSession {
-                network_id: network.into(),
-                target_node: local.clone(),
-                session_id: operation.into(),
-                revision: 0,
-                state: "idle".into(),
-                executor: "claude_code".into(),
-                cwd: node.config.roots[0].to_string_lossy().into_owned(),
-                native_session_id: Some("native-test".into()),
-            },
-        )?;
-        let mut request = OperationRequest {
-            operation_id: operation.into(),
-            network_id: network.into(),
-            conversation_id: "chat".into(),
-            task_id: None,
-            target_node: local,
-            session_id: Some(operation.into()),
-            expected_revision: 0,
-            basis_heads: store.heads(network, "chat")?,
-            action,
-            resources: vec![node.config.roots[0].to_string_lossy().into_owned()],
-            binding: None,
-            manager_authority: None,
-        };
-        store.bind_test_operation(&node.identity, &mut request)?;
-        store.accept_operation(network, &request)?;
-        Ok(request)
-    }
     fn configure_manager(dir: &Path) -> Result<()> {
         let mut config = Config::load(dir)?;
         config.manager = Some(config::ManagerSettings {
@@ -2483,7 +2372,7 @@ mod tests {
     async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
         let dir = fixture()?;
         let config = std::fs::read(dir.join("config.json"))?;
-        for epoch in [None, Some(1), Some(2), Some(3), Some(5)] {
+        for epoch in [None, Some(1), Some(2), Some(3), Some(4), Some(6)] {
             if let Some(epoch) = epoch {
                 config::private_write(
                     &dir.join("data-epoch.json"),
@@ -2534,7 +2423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn membership_reopen_recovers_either_durable_store_without_root_secrets() -> Result<()> {
+    async fn membership_reopen_uses_the_single_store_without_root_secrets() -> Result<()> {
         let dir = fixture()?;
         let node = Runtime::open(&dir).await?;
         assert!(!node.has_membership().await?);
@@ -2543,7 +2432,7 @@ mod tests {
             1,
             vec![node.identity.certificate(node.config.roles.clone())?],
         )?;
-        node.identities.init_network(initial.clone())?;
+        node.store.lock().await.install_state(initial.clone())?;
         drop(node);
         let node = Runtime::open(&dir).await?;
         assert_eq!(node.membership_state().await?, initial);
@@ -2555,428 +2444,17 @@ mod tests {
                     .certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
             ],
         )?;
-        node.store
-            .lock()
-            .await
-            .install_trust_bundle(&owner.fixture_network_id()?, &updated)?;
+        node.store.lock().await.install_state(updated.clone())?;
         drop(node);
         let node = Runtime::open(&dir).await?;
         assert_eq!(node.membership_state().await?, updated);
-        assert_eq!(node.identities.public_state()?, updated);
+        assert_eq!(node.store.lock().await.public_state()?, updated);
         assert!(!dir.join("auth.sqlite3").exists());
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
-    #[tokio::test]
-    async fn executor_followup_only_accepts_its_authorized_dispatched_result() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        task(&node, &network, "task", true).await?;
-        task(&node, &network, "unapproved", false).await?;
-        let executor = LocalIdentity::generate();
-        let origin = executor.peer_id()?;
-        let owner = test_owner(&node)?;
-        let mut store = node.store.lock().await;
-        let mut nodes = store
-            .trust_bundle(&network)?
-            .unwrap()
-            .project()?
-            .members
-            .into_iter()
-            .filter(|member| member.kind == IdentityKind::Node)
-            .map(|member| member.certificate())
-            .collect::<Result<Vec<_>>>()?;
-        nodes.push(executor.certificate(vec![NodeRole::Replica, NodeRole::Executor])?);
-        store.install_trust_bundle(&network, &owner.sign_network_fixture(2, nodes)?)?;
-        let mut request = OperationRequest {
-            operation_id: "operation".into(),
-            network_id: network.clone(),
-            conversation_id: "chat".into(),
-            task_id: Some("task".into()),
-            target_node: origin.clone(),
-            session_id: Some("session".into()),
-            expected_revision: 0,
-            basis_heads: store.heads(&network, "chat")?,
-            action: json!({"type":"send","text":"test"}),
-            resources: vec![],
-            binding: None,
-            manager_authority: None,
-        };
-        store.bind_test_operation(&node.identity, &mut request)?;
-        let scheduler = node.identity.peer_id()?;
-        store.append_event(
-            &node.identity,
-            &network,
-            "chat",
-            EventBody::DispatchRecorded {
-                operation_id: request.operation_id.clone(),
-                task_id: request.task_id.clone(),
-                target_node: origin.clone(),
-                session_id: request.session_id.clone(),
-                action: json!(request),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        let result = EventBody::ExecutionObserved {
-            operation_id: request.operation_id.clone(),
-            task_id: request.task_id.clone(),
-            target_node: origin.clone(),
-            session_id: request.session_id.clone(),
-            status: "succeeded".into(),
-            detail: json!({"result":"done"}),
-        };
-        let envelope = store.append_event(
-            &executor,
-            &network,
-            "chat",
-            result.clone(),
-            vec![],
-            now_ms(),
-        )?;
-        store.validate_followup_result(&network, "chat", &envelope.hash, &scheduler)?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &envelope.hash, &origin)
-                .is_err()
-        );
-        assert!(
-            store
-                .validate_followup_result(&network, "another-chat", &envelope.hash, &scheduler)
-                .is_err()
-        );
-        let message = store.append_event(
-            &executor,
-            &network,
-            "chat",
-            EventBody::MessagePosted {
-                message_id: "forged-user".into(),
-                role: "user".into(),
-                text: "wake manager".into(),
-                scheduler_node: Some(node.identity.peer_id()?),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &message.hash, &scheduler)
-                .is_err()
-        );
-        for (operation, target, status) in [
-            ("not-dispatched", origin.as_str(), "succeeded"),
-            ("operation", "another-executor", "succeeded"),
-            ("operation", origin.as_str(), "unknown"),
-        ] {
-            let mut invalid = result.clone();
-            if let EventBody::ExecutionObserved {
-                operation_id,
-                target_node,
-                status: state,
-                ..
-            } = &mut invalid
-            {
-                *operation_id = operation.into();
-                *target_node = target.into();
-                *state = status.into();
-            }
-            let invalid =
-                store.append_event(&executor, &network, "chat", invalid, vec![], now_ms())?;
-            assert!(
-                store
-                    .validate_followup_result(&network, "chat", &invalid.hash, &scheduler)
-                    .is_err()
-            );
-        }
-        let mut unapproved = request.clone();
-        unapproved.operation_id = "unapproved-operation".into();
-        unapproved.task_id = Some("unapproved".into());
-        unapproved.binding = None;
-        store.bind_test_operation(&node.identity, &mut unapproved)?;
-        store.append_event(
-            &node.identity,
-            &network,
-            "chat",
-            EventBody::DispatchRecorded {
-                operation_id: unapproved.operation_id.clone(),
-                task_id: unapproved.task_id.clone(),
-                target_node: origin.clone(),
-                session_id: unapproved.session_id.clone(),
-                action: json!(unapproved),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        let invalid = store.append_event(
-            &executor,
-            &network,
-            "chat",
-            EventBody::ExecutionObserved {
-                operation_id: unapproved.operation_id,
-                task_id: unapproved.task_id,
-                target_node: origin.clone(),
-                session_id: unapproved.session_id,
-                status: "succeeded".into(),
-                detail: json!({}),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &invalid.hash, &scheduler)
-                .is_err()
-        );
-        store.append_event(
-            &node.identity,
-            &network,
-            "chat",
-            EventBody::TaskChanged {
-                task_id: "task".into(),
-                status: "cancelled".into(),
-                detail: "user stopped".into(),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        assert!(
-            store
-                .validate_followup_result(&network, "chat", &envelope.hash, &scheduler)
-                .is_err()
-        );
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn unstarted_followup_survives_reopen_and_claimed_attempt_is_not_repeated() -> Result<()>
-    {
-        use crate::scheduling::{JobState, TriggerKind};
-
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let local = node.identity.peer_id()?;
-        task(&node, &network, "task", false).await?;
-        let mut request = queued(
-            &node,
-            &network,
-            "seed",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, "seed")?;
-            store.finish_operation(&network, "seed", OperationState::Failed, json!({}))?;
-            request.operation_id = "followup".into();
-            request.task_id = Some("task".into());
-            request.expected_revision = store
-                .session(
-                    &network,
-                    &request.target_node,
-                    request
-                        .session_id
-                        .as_deref()
-                        .context("execution session is required")?,
-                )?
-                .unwrap()
-                .revision;
-            request.basis_heads = store.heads(&network, "chat")?;
-            store.bind_test_operation(&node.identity, &mut request)?;
-            store.append_event(
-                &node.identity,
-                &network,
-                "chat",
-                EventBody::DispatchRecorded {
-                    operation_id: request.operation_id.clone(),
-                    task_id: request.task_id.clone(),
-                    target_node: request.target_node.clone(),
-                    session_id: request.session_id.clone(),
-                    action: json!(request),
-                },
-                vec![],
-                now_ms(),
-            )?;
-            store.accept_operation(&network, &request)?;
-            store.claim_operation(&network, &request.operation_id)?;
-        }
-        node.finish(
-            &request,
-            OperationState::Succeeded,
-            json!({"result":"done"}),
-        )
-        .await?;
-        node.flush_completions(&network).await?;
-        let marker_key = "followup-wait:v1:followup";
-        let result_hash = {
-            let mut store = node.store.lock().await;
-            let result = store
-                .context(&network, "chat", &[])?
-                .events
-                .into_iter()
-                .find(|event| {
-                    matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. }
-                        if operation_id == "followup" && status == "succeeded")
-                })
-                .context("completed operation has no durable result")?;
-            let result_hash = crypto::digest(&serde_json::to_vec(&result)?);
-            assert!(
-                store
-                    .local_value(&network, "completion:followup")?
-                    .is_none()
-            );
-            assert_eq!(
-                store.local_value(&network, marker_key)?.unwrap()["trigger"],
-                result_hash
-            );
-            assert!(store.scheduler_jobs(&network, "chat", &local)?.is_empty());
-            store.seal_binding(&node.identity, request.binding.as_ref().unwrap())?;
-            result_hash
-        };
-        drop(node);
-
-        let node = Arc::new(Runtime::open(&dir).await?);
-        node.flush_completions(&network).await?;
-        {
-            let store = node.store.lock().await;
-            assert!(
-                store
-                    .local_value(&network, "completion:followup")?
-                    .is_none()
-            );
-            assert_eq!(
-                store.local_value(&network, marker_key)?.unwrap()["trigger"],
-                result_hash
-            );
-            assert!(store.scheduler_jobs(&network, "chat", &local)?.is_empty());
-        }
-        let grant = node
-            .set_followup(
-                &Access {
-                    network_id: network.clone(),
-                    human: true,
-                    conversation_id: Some("chat".into()),
-                    manager: None,
-                },
-                "chat",
-                &json!({"task_id":"task","mode":"report","expected_version":0,
-                    "scheduler_node":local}),
-            )
-            .await?;
-        assert_eq!(grant["policy"]["mode"], "report");
-        assert_eq!(grant["policy"]["version"], 1);
-        assert!(node.maybe_followup(&request, &result_hash).await?);
-        assert!(node.maybe_followup(&request, &result_hash).await?);
-        let queued_job = {
-            let store = node.store.lock().await;
-            assert!(store.local_value(&network, marker_key)?.is_none());
-            let jobs = store.scheduler_jobs(&network, "chat", &local)?;
-            assert_eq!(jobs.len(), 1);
-            let job = jobs.into_iter().next().unwrap();
-            assert_eq!(job.trigger, result_hash);
-            assert_eq!(job.kind, TriggerKind::Autonomous);
-            assert_eq!(job.state, JobState::Queued);
-            job
-        };
-        drop(node);
-
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let attempt = {
-            let mut store = node.store.lock().await;
-            assert_eq!(
-                store.scheduler_jobs(&network, "chat", &local)?,
-                vec![queued_job.clone()]
-            );
-            let claimed = store
-                .claim_next(&network, "chat", &local, "followup-boot-a", "test-sdk")?
-                .context("authorized result was not queued")?;
-            assert_eq!(claimed.job.trigger, result_hash);
-            assert_eq!(claimed.job.sequence, queued_job.sequence);
-            assert_eq!(claimed.job.message_id, queued_job.message_id);
-            let attempt = claimed.job.state.attempt().unwrap().clone();
-            assert!(attempt.read_only);
-            assert_eq!(attempt.followup_version, Some(1));
-            let started =
-                store.mark_started(&network, "chat", &local, &result_hash, &attempt.id)?;
-            assert_eq!(
-                started.state,
-                JobState::Running {
-                    attempt: attempt.clone()
-                }
-            );
-            attempt
-        };
-        drop(node);
-
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let recovered = {
-            let mut store = node.store.lock().await;
-            assert!(
-                store
-                    .claim_next(&network, "chat", &local, "followup-boot-b", "test-sdk")?
-                    .is_none()
-            );
-            let job = store
-                .scheduler_job(&network, "chat", &result_hash, &local)?
-                .context("started follow-up was lost after reopen")?;
-            assert_eq!(
-                job.state,
-                JobState::Unknown {
-                    attempt,
-                    detail:
-                        "Node restarted after the SDK start boundary; this call was not replayed"
-                            .into(),
-                    fenced: false,
-                }
-            );
-            job
-        };
-        node.flush_completions(&network).await?;
-        node.finish(
-            &request,
-            OperationState::Succeeded,
-            json!({"result":"done"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            assert_eq!(
-                store.scheduler_jobs(&network, "chat", &local)?,
-                vec![recovered]
-            );
-            assert!(
-                store
-                    .local_value(&network, "completion:followup")?
-                    .is_none()
-            );
-            assert!(store.local_value(&network, marker_key)?.is_none());
-            assert!(
-                store
-                    .claim_next(&network, "chat", &local, "followup-boot-b", "test-sdk")?
-                    .is_none()
-            );
-            assert_eq!(
-                store
-                    .context(&network, "chat", &[])?
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. }
-                            if operation_id == "followup" && status == "succeeded")
-                    })
-                    .count(),
-                1
-            );
-        }
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
     #[tokio::test]
     async fn agent_cannot_reopen_or_start_new_work_for_a_user_finalized_task() -> Result<()> {
         let dir = fixture()?;
@@ -3004,142 +2482,7 @@ mod tests {
                     .to_string()
                     .contains("only the user may reopen")
             );
-            let request = OperationRequest {
-                operation_id: format!("new-{status}"),
-                network_id: network.clone(),
-                conversation_id: "chat".into(),
-                task_id: Some("task".into()),
-                target_node: node.identity.peer_id()?,
-                session_id: Some(format!("session-{status}")),
-                expected_revision: 0,
-                basis_heads: node.store.lock().await.heads(&network, "chat")?,
-                action: json!({"type":"open","executor":"claude_code","cwd":dir}),
-                resources: vec![],
-                binding: None,
-                manager_authority: None,
-            };
-            assert!(
-                node.dispatch(agent.clone(), request.clone())
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("only the user may reopen")
-            );
-            assert!(
-                node.admit_operation(request, false)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("only the user may reopen")
-            );
             node.rpc(human.clone(), update).await?;
-        }
-        assert!(node.store.lock().await.operations(&network)?.is_empty());
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn agent_cannot_silently_detach_a_session_from_its_latest_admitted_task() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        task(&node, &network, "task", false).await?;
-        task(&node, &network, "next-task", false).await?;
-        let human = Access {
-            network_id: network.clone(),
-            human: true,
-            conversation_id: Some("chat".into()),
-
-            manager: None,
-        };
-        let mut associated = queued(
-            &node,
-            &network,
-            "seed",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, "seed")?;
-            store.finish_operation(&network, "seed", OperationState::Succeeded, json!({}))?;
-            associated.operation_id = "associated".into();
-            associated.task_id = Some("task".into());
-            associated.expected_revision = 1;
-            associated.binding = None;
-            store.bind_test_operation(&node.identity, &mut associated)?;
-            store.accept_operation(&network, &associated)?;
-            let mut concurrent = associated.clone();
-            concurrent.operation_id = "concurrent-untasked-steer".into();
-            concurrent.task_id = Some("task".into());
-            concurrent.action = json!({"type":"steer","turn_id":"turn","text":"test"});
-            concurrent.resources.clear();
-            store.accept_control_operation(&network, &concurrent)?;
-            for operation in [&associated, &concurrent] {
-                store.claim_operation(&network, &operation.operation_id)?;
-            }
-            for operation in [&associated, &concurrent] {
-                store.finish_operation(
-                    &network,
-                    &operation.operation_id,
-                    OperationState::Succeeded,
-                    json!({}),
-                )?;
-            }
-        }
-        let mut request = associated.clone();
-        request.operation_id = "untasked".into();
-        request.task_id = None;
-        request.expected_revision = 2;
-        request.resources.clear();
-        for status in ["working", "accepted", "cancelled"] {
-            node.rpc(human.clone(), json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":status})).await?;
-            for action in [
-                json!({"type":"steer","turn_id":"turn","text":"test"}),
-                json!({"type":"send","text":"test"}),
-                json!({"type":"open","executor":"claude_code","cwd":dir}),
-            ] {
-                request.action = action;
-                assert!(
-                    node.admit_operation(request.clone(), false)
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("task_id is required")
-                );
-            }
-        }
-        assert_eq!(
-            node.admit_operation(associated.clone(), false).await?["operation"]["state"],
-            "succeeded"
-        );
-        let mut unadmitted = request.clone();
-        unadmitted.operation_id = "unadmitted".into();
-        unadmitted.expected_revision = 99;
-        node.append(
-            &network,
-            "chat",
-            EventBody::DispatchRecorded {
-                operation_id: unadmitted.operation_id.clone(),
-                task_id: None,
-                target_node: unadmitted.target_node.clone(),
-                session_id: unadmitted.session_id.clone(),
-                action: json!(unadmitted),
-            },
-        )
-        .await?;
-        assert!(node.admit_operation(request.clone(), false).await.is_err());
-        request.action = json!({"type":"steer","turn_id":"turn","text":"test"});
-        for (operation, human, task_id) in [
-            ("retask", false, Some("next-task")),
-            ("human-detach", true, None),
-            ("agent-after-detach", false, None),
-        ] {
-            request.operation_id = operation.into();
-            request.task_id = task_id.map(String::from);
-            request.basis_heads = node.store.lock().await.heads(&network, "chat")?;
-            assert!(node.admit_operation(request.clone(), human).await.is_err());
         }
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -3175,52 +2518,10 @@ mod tests {
                 },
             )
             .await?;
-        let request = queued(
-            &node,
-            &network,
-            "unknown-role-test",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, &request.operation_id)?;
-            store.finish_operation(
-                &network,
-                &request.operation_id,
-                OperationState::Unknown,
-                json!({}),
-            )?;
-        }
-        for (origin, human, expected) in [
-            (&scheduler, true, "origin cannot assert human authority"),
-            (
-                &scheduler,
-                false,
-                "history is Unreachable: 1 events, 0 blobs, 0 conflicts",
-            ),
-            (
-                &owner,
-                true,
-                "history is Unreachable: 1 events, 0 blobs, 0 conflicts",
-            ),
-        ] {
-            let message = Inbound {
-                network_id: network.clone(),
-                origin: origin.peer_id()?,
-                request_id: "approval-origin-test".into(),
-                payload: json!({"type":"execute","human":human,"request":request,"dispatch_head":"f".repeat(64)}),
-                broadcast: false,
-            };
-            assert_eq!(
-                node.handle_peer(&message).await.unwrap_err().to_string(),
-                expected
-            );
-        }
         let missing = crypto::digest(b"not present on the receiver");
         let schedule = json!({"type":"schedule","version":1,"target_node":node.identity.peer_id()?,
             "conversation_id":"chat","trigger":missing,"basis_heads":[missing]});
-        let resolution = json!({"type":"resolve_unknown","target_node":node.identity.peer_id()?,"operation_id":request.operation_id,"outcome":"succeeded","evidence":"verified test fixture process stopped"});
+        let resolution = json!({"type":"resolve_manager_unknown","conversation_id":"chat","trigger":"missing","human":true,"evidence":"verified fixture stopped"});
         for origin in [&replica, &relay] {
             let message = Inbound {
                 network_id: network.clone(),
@@ -3242,15 +2543,6 @@ mod tests {
                 "origin cannot schedule"
             );
         }
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
-            OperationState::Unknown
-        );
         for origin in [&owner, &scheduler] {
             let message = Inbound {
                 network_id: network.clone(),
@@ -3271,10 +2563,6 @@ mod tests {
             payload: resolution,
             broadcast: false,
         };
-        assert_eq!(
-            node.handle_peer(&message).await?["operation"]["state"],
-            "succeeded"
-        );
         let message = Inbound {
             origin: replica.peer_id()?,
             payload: json!({"type":"event","hash":event.hash}),
@@ -3405,80 +2693,6 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn shared_execution_session_is_projected_once_for_multiple_bound_tasks() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let local = node.identity.peer_id()?;
-        for task_id in ["a-old", "b-new"] {
-            task(&node, &network, task_id, false).await?;
-            let mut store = node.store.lock().await;
-            let creation = store.task_creation(&network, "chat", task_id)?;
-            store.bind_task(
-                &node.identity,
-                &crate::binding::TaskBinding {
-                    network_id: network.clone(),
-                    conversation_id: "chat".into(),
-                    task_ref: creation.hash,
-                    task_id: task_id.into(),
-                    authority_node: local.clone(),
-                    generation: 1,
-                    target_node: local.clone(),
-                    session_id: "shared".into(),
-                    open_spec: json!({"type":"open","executor":"codex","cwd":dir}),
-                    previous_binding_hash: None,
-                    previous_seal: None,
-                },
-            )?;
-        }
-        node.store.lock().await.upsert_session(
-            &network,
-            &ExecutionSession {
-                network_id: network.clone(),
-                target_node: local.clone(),
-                session_id: "shared".into(),
-                revision: 0,
-                state: "idle".into(),
-                executor: "codex".into(),
-                cwd: dir.to_string_lossy().into_owned(),
-                native_session_id: None,
-            },
-        )?;
-        let snapshot = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"conversation","conversation_id":"chat"}),
-            )
-            .await?;
-        assert_eq!(
-            snapshot["tasks"].as_array().context("tasks missing")?.len(),
-            2
-        );
-        assert_eq!(
-            snapshot["sessions"]
-                .as_array()
-                .context("sessions missing")?
-                .len(),
-            1
-        );
-        assert!(
-            snapshot["tasks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|task| task["binding"]["session_id"] == "shared")
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn task_retry_requires_explicit_versioned_grant_without_reopening() -> Result<()> {
         use crate::store::followup::FollowupMode;
         let dir = fixture()?;
@@ -3570,121 +2784,6 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn completion_receipt_recovers_history_and_notifies_once_after_reopen() -> Result<()> {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "done",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        let result = json!({"result":"verified completion"});
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, "done")?;
-            store.local_set(
-                &network,
-                "completion:done",
-                &json!({"state":"succeeded","result":result}),
-            )?;
-            store.finish_operation(&network, "done", OperationState::Succeeded, result)?;
-        }
-        drop(node);
-        let node = Arc::new(Runtime::open(&dir).await?);
-        node.flush_completions(&network).await?;
-        node.flush_completions(&network).await?;
-        let store = node.store.lock().await;
-        let events = store.context(&network, "chat", &[])?.events;
-        assert_eq!(events.iter().filter(|e|matches!(&e.body,EventBody::ExecutionObserved{operation_id,status,..} if operation_id==&request.operation_id && status=="succeeded")).count(),1);
-        assert_eq!(store.pending_notifications(&network, "client")?.len(), 1);
-        assert!(store.local_value(&network, "completion:done")?.is_none());
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn failed_claude_spawn_does_not_leave_a_nonexistent_native_session() -> Result<()> {
-        let dir = fixture()?;
-        let mut cfg = Config::load(&dir)?;
-        cfg.claude_bin = dir.join("missing-claude");
-        cfg.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "not-started",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            let mut session = store
-                .session(
-                    &network,
-                    &request.target_node,
-                    request
-                        .session_id
-                        .as_deref()
-                        .context("execution session is required")?,
-                )?
-                .unwrap();
-            session.native_session_id = None;
-            store.upsert_session(&network, &session)?;
-        }
-        node.clone().execute_operation(request.clone()).await?;
-        let store = node.store.lock().await;
-        assert_eq!(
-            store
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
-            OperationState::Failed
-        );
-        assert!(
-            store
-                .session(
-                    &network,
-                    &request.target_node,
-                    request
-                        .session_id
-                        .as_deref()
-                        .context("execution session is required")?
-                )?
-                .unwrap()
-                .native_session_id
-                .is_none()
-        );
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn reconciliation_reports_only_the_executors_confirmed_absence() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let local = node.identity.peer_id()?;
-        let result = node.reconcile(&network, &local, "never-received").await?;
-        assert_eq!(result["state"], "not_found");
-        assert_eq!(result["target_node"], local);
-        assert!(result["operation"].is_null());
-        assert!(result["checked_at_ms"].as_i64().is_some_and(|t| t > 0));
-        assert!(
-            node.reconcile(&network, "offline-node", "never-received")
-                .await
-                .is_err()
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
     async fn retrying_an_undelivered_message_reuses_its_event_and_pending_delivery() -> Result<()> {
         let dir = fixture()?;
         configure_manager(&dir)?;
@@ -3739,227 +2838,6 @@ mod tests {
         let fresh = node.rpc(access, json!({"method":"message","conversation_id":"chat","message_id":"fresh-message","text":"new request"})).await?;
         assert_eq!(fresh["scheduler_node"], node.identity.peer_id()?);
         assert_ne!(fresh["scheduler_node"], first["scheduler_node"]);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn completion_requires_the_exact_persisted_turn_even_after_unknown() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "uncertain",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            let mut session = store
-                .session(
-                    &network,
-                    &request.target_node,
-                    request
-                        .session_id
-                        .as_deref()
-                        .context("execution session is required")?,
-                )?
-                .unwrap();
-            session.executor = "codex".into();
-            store.upsert_session(&network, &session)?;
-            store.claim_operation(&network, &request.operation_id)?;
-        }
-        node.finish(
-            &request,
-            OperationState::Unknown,
-            json!({"error":"start response lost"}),
-        )
-        .await?;
-        let completion = json!({"method":"turn/completed","params":{"threadId":"native-test","turn":{"id":"unrelated","status":"completed"}}});
-        node.observe_engine(completion.clone()).await?;
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
-            OperationState::Unknown
-        );
-        node.store.lock().await.local_set(
-            &network,
-            "turn:uncertain",
-            &json!({"turn":{"id":"expected"}}),
-        )?;
-        node.observe_engine(completion.clone()).await?;
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
-            OperationState::Unknown
-        );
-        let mut matching = completion;
-        matching["params"]["turn"]["id"] = json!("expected");
-        node.observe_engine(matching).await?;
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
-            OperationState::Succeeded
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn accepted_recovery_rechecks_config_and_rejects_before_any_external_call() -> Result<()>
-    {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "queued",
-            json!({"type":"send","text":"must not run"}),
-        )
-        .await?;
-        drop(node);
-        let mut cfg = Config::load(&dir)?;
-        cfg.roles.retain(|r| r != &NodeRole::Executor);
-        cfg.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        assert!(node.clone().execute_operation(request).await.is_err());
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, "queued")?
-                .unwrap()
-                .state,
-            OperationState::Rejected
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn stale_accepted_send_is_rejected_after_a_control_advances_revision() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "send",
-            json!({"type":"send","text":"must not run"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            let mut control = request.clone();
-            control.operation_id = "control".into();
-            control.resources.clear();
-            control.action = json!({"type":"interrupt","turn_id":"turn"});
-            store.accept_control_operation(&network, &control)?;
-            store.claim_operation(&network, "control")?;
-            store.finish_operation(&network, "control", OperationState::Succeeded, json!({}))?;
-        }
-        assert!(node.clone().execute_operation(request).await.is_err());
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, "send")?
-                .unwrap()
-                .state,
-            OperationState::Rejected
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn maintenance_waits_for_local_outcomes_and_completion_but_not_remote_operations()
-    -> Result<()> {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let owner = LocalIdentity::generate();
-        let remote = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        node.install_membership(owner.sign_network_fixture(
-            1,
-            vec![
-                node.identity.certificate(node.config.roles.clone())?,
-                remote.certificate(vec![NodeRole::Executor, NodeRole::Replica])?,
-            ],
-        )?)
-        .await?;
-        node.append(
-            &network,
-            "chat",
-            EventBody::ConversationCreated {
-                title: "test".into(),
-            },
-        )
-        .await?;
-        node.maintenance_idle().await?;
-        let request = queued(
-            &node,
-            &network,
-            "local",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        assert!(
-            node.maintenance_idle()
-                .await
-                .unwrap_err()
-                .downcast_ref::<Busy>()
-                .is_some()
-        );
-        node.store.lock().await.claim_operation(&network, "local")?;
-        assert!(node.maintenance_idle().await.is_err());
-        node.store.lock().await.finish_operation(
-            &network,
-            "local",
-            OperationState::Unknown,
-            json!({}),
-        )?;
-        assert!(node.maintenance_idle().await.is_err());
-        node.store.lock().await.finish_operation(
-            &network,
-            "local",
-            OperationState::Succeeded,
-            json!({}),
-        )?;
-        node.maintenance_idle().await?;
-        node.store
-            .lock()
-            .await
-            .local_set(&network, "completion:local", &json!({}))?;
-        assert!(node.maintenance_idle().await.is_err());
-        {
-            let mut store = node.store.lock().await;
-            store.local_delete(&network, "completion:local")?;
-            let mut remote_request = request;
-            remote_request.operation_id = "remote".into();
-            remote_request.target_node = remote.peer_id()?;
-            remote_request.resources.clear();
-            remote_request.task_id = Some("remote-fixture".into());
-            remote_request.binding = None;
-            store.bind_test_operation(&node.identity, &mut remote_request)?;
-            store.accept_operation(&network, &remote_request)?;
-        }
-        node.maintenance_idle().await?;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -4156,11 +3034,11 @@ struct RouteFlight {
 
 pub struct Runtime {
     pub config: Config,
+    pub(crate) data_dir: PathBuf,
     settings: std::sync::Mutex<NodeSettings>,
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
-    pub identities: Arc<IdentityStore>,
     pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
     route_flights: Arc<Mutex<HashMap<(String, String), RouteFlight>>>,
@@ -4175,14 +3053,13 @@ pub struct Runtime {
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
-    completion_lock: Mutex<()>,
-    progress_sequences: std::sync::Mutex<HashMap<(String, String), u64>>,
-    pub engine: Engine,
-    _codex_process: Option<tokio::process::Child>,
+    native: tokio::sync::OnceCell<native_observation::NativeRuntime>,
+    native_events: mpsc::UnboundedSender<Value>,
+    pub local_access: Arc<crate::local_access::LocalAccess>,
     _process_lock: Arc<std::fs::File>,
     peer_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
     network_rx: Mutex<Option<mpsc::Receiver<IncomingSocket>>>,
-    engine_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    native_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -4240,8 +3117,8 @@ impl Runtime {
     pub async fn open_with_bootstrap_urls(dir: &Path, bootstrap_urls: &[String]) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
-            epoch == json!({"data_epoch":4}),
-            "this Node requires an initialized data epoch 4 directory"
+            epoch == json!({"data_epoch":5}),
+            "this Node requires an initialized data epoch 5 directory"
         );
         let mut config = Config::load(dir)?;
         if !bootstrap_urls.is_empty() {
@@ -4253,36 +3130,14 @@ impl Runtime {
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
-        let identities = Arc::new(IdentityStore::open(&dir.join("identity.sqlite3"))?);
-        let networks = store.networks()?;
-        ensure!(
-            networks.len() <= 1,
-            "one installation can join only one personal network"
-        );
-        let stored = networks
-            .first()
-            .map(|network| store.trust_bundle(network))
-            .transpose()?
-            .flatten();
-        let local = if identities.has_network()? {
-            Some(identities.public_state()?)
-        } else {
-            None
-        };
-        let state = match (local, stored) {
-            (Some(a), Some(b)) => Some(if a.epoch() >= b.epoch() {
-                b.merge(&a)?
-            } else {
-                a.merge(&b)?
-            }),
-            (a, b) => a.or(b),
-        };
-        if let Some(state) = state {
-            let view = state.project()?;
-            store.install_trust_bundle(&view.network_id, &state)?;
-            identities.install_state(state)?;
-            if view.authorize_node(&identity.peer_id()?, None).is_ok() {
-                store.save_local_identity(&view.network_id, &identity)?;
+        if store.has_network()? {
+            let state = store.public_state()?;
+            if state
+                .project()?
+                .authorize_node(&identity.peer_id()?, None)
+                .is_ok()
+            {
+                store.save_local_identity(&state.genesis.network_id, &identity)?;
             }
         }
         let store = Arc::new(Mutex::new(store));
@@ -4290,71 +3145,12 @@ impl Runtime {
         let (network, network_rx) = NetworkHub::new(identity.clone(), config.network.clone());
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
-        let managed_socket = config.codex_socket.is_none();
-        if managed_socket {
-            let socket_dir =
-                PathBuf::from("/tmp").join(format!("vibeface-{}", &identity.peer_id()?[..32]));
-            match std::fs::create_dir(&socket_dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                let metadata = std::fs::symlink_metadata(&socket_dir)?;
-                ensure!(
-                    metadata.is_dir()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.uid() == std::fs::metadata(dir)?.uid(),
-                    "private socket directory has unexpected ownership"
-                );
-                std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))?;
-            }
-            config.codex_socket = Some(socket_dir.join("codex.sock"));
-        }
-        let mut codex_process = None;
-        if managed_socket && config.roles.contains(&NodeRole::Executor) {
-            let socket = config.codex_socket.as_ref().unwrap();
-            let existing = tokio::net::UnixStream::connect(socket).await.is_ok();
-            if !existing {
-                if socket.exists() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::FileTypeExt;
-                        ensure!(
-                            std::fs::symlink_metadata(socket)?.file_type().is_socket(),
-                            "private Codex socket path is occupied by another file"
-                        );
-                    }
-                    std::fs::remove_file(socket)?;
-                }
-                match tokio::process::Command::new(&config.codex_bin)
-                    .args(["app-server", "--listen"])
-                    .arg(format!("unix://{}", socket.display()))
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                {
-                    Ok(child) => codex_process = Some(child),
-                    Err(error) => {
-                        tracing::warn!(error=%error,"Codex not available; configure an executor before sending tasks")
-                    }
-                }
-            }
-        }
-        let engine = Engine::new(
-            ExecutorConfig {
-                codex_socket: config.codex_socket.clone(),
-                claude_bin: config.claude_bin.clone(),
-                cursor_bin: config.cursor_bin.clone(),
-                timeout_secs: config.timeout_secs,
-            },
-            tx,
-        );
+        let local_access = Arc::new(crate::local_access::LocalAccess::open(
+            dir,
+            config.local_auto_access,
+        )?);
         let node = Self {
+            data_dir: dir.to_owned(),
             settings: std::sync::Mutex::new(NodeSettings {
                 roots: config.roots.clone(),
                 manager: config.manager.clone(),
@@ -4363,7 +3159,6 @@ impl Runtime {
             config,
             identity,
             store,
-            identities,
             network,
             hub,
             events,
@@ -4378,39 +3173,32 @@ impl Runtime {
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
-            completion_lock: Mutex::new(()),
-            progress_sequences: std::sync::Mutex::new(HashMap::new()),
-            engine,
-            _codex_process: codex_process,
+            native: tokio::sync::OnceCell::new(),
+            native_events: tx,
+            local_access,
             _process_lock: process_lock,
             peer_rx: Mutex::new(Some(peer_rx)),
             network_rx: Mutex::new(Some(network_rx)),
-            engine_rx: Mutex::new(Some(rx)),
+            native_rx: Mutex::new(Some(rx)),
         };
         node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
+        if node.settings_snapshot().manager.is_some_and(|manager| {
+            manager.provider == "codex_sdk" || node.config.codex_socket.is_some()
+        }) && let Err(error) = node.ensure_native_client().await
+        {
+            tracing::warn!(%error, "native Codex is unavailable");
+        }
         Ok(node)
     }
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;
         let mut state = incoming;
-        let networks = store.networks()?;
-        ensure!(
-            networks
-                .iter()
-                .all(|network| network == &state.genesis.network_id),
-            "installation belongs to a different personal network"
-        );
-        if self.identities.has_network()? {
-            let previous = self.identities.public_state()?;
-            state = previous.merge(&state)?;
-        }
-        if let Some(previous) = store.trust_bundle(&state.genesis.network_id)? {
-            state = previous.merge(&state)?;
+        if store.has_network()? {
+            state = store.public_state()?.merge(&state)?;
         }
         let view = state.project()?;
-        self.identities.install_state(state.clone())?;
-        store.install_trust_bundle(&view.network_id, &state)?;
+        store.install_state(state)?;
         if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
             store.save_local_identity(&view.network_id, &self.identity)?;
         }
@@ -4418,82 +3206,21 @@ impl Runtime {
     }
 
     pub async fn has_membership(&self) -> Result<bool> {
-        let in_identity = self.identities.has_network()?;
-        let in_store = !self.store.lock().await.networks()?.is_empty();
-        if !in_identity && !in_store {
-            return Ok(false);
-        }
-        self.membership_state().await?;
-        Ok(true)
+        self.store.lock().await.has_network()
     }
 
     pub async fn membership_state(&self) -> Result<NetworkState> {
-        let local = if self.identities.has_network()? {
-            Some(self.identities.public_state()?)
-        } else {
-            None
-        };
-        let mut store = self.store.lock().await;
-        let networks = store.networks()?;
-        ensure!(
-            networks.len() <= 1,
-            "one installation can join only one personal network"
-        );
-        let stored = networks
-            .first()
-            .map(|network| store.trust_bundle(network))
-            .transpose()?
-            .flatten();
-        let merged = match (&local, &stored) {
-            (Some(a), Some(b)) => {
-                if a.epoch() >= b.epoch() {
-                    b.merge(a)?
-                } else {
-                    a.merge(b)?
-                }
-            }
-            (Some(state), None) | (None, Some(state)) => state.clone(),
-            (None, None) => bail!("personal network is not installed"),
-        };
-        if stored.as_ref() != Some(&merged) || local.as_ref() != Some(&merged) {
-            let _work = self.maintenance.enter()?;
-            self.identities.install_state(merged.clone())?;
-            store.install_trust_bundle(&merged.genesis.network_id, &merged)?;
-            let view = merged.project()?;
-            if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
-                store.save_local_identity(&view.network_id, &self.identity)?;
-            }
-        }
-        Ok(merged)
+        self.store.lock().await.public_state()
     }
     pub fn info(&self) -> Value {
-        let manager_available = self.settings_snapshot().manager.is_some()
-            && self.config.roles.contains(&NodeRole::Scheduler)
-            && self
-                .identities
-                .public_state()
-                .and_then(|state| {
-                    state
-                        .project()?
-                        .authorize_node(&self.identity.peer_id()?, Some(NodeRole::Scheduler))
-                        .map(|_| ())
-                })
-                .is_ok();
+        let manager_available = self.config.roles.contains(&NodeRole::Scheduler)
+            && self.settings_snapshot().manager.is_some();
         json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         self.start_schedule_delivery();
         self.start_observation_worker();
-        let restore = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                interval.tick().await;
-                if let Err(error) = restore.restore_execution_subscriptions().await {
-                    tracing::debug!(%error,"execution subscription recovery pending");
-                }
-            }
-        });
+        self.start_native_observation();
         let mut receiver = self
             .peer_rx
             .lock()
@@ -4523,7 +3250,7 @@ impl Runtime {
             }
         });
         let mut receiver = self
-            .engine_rx
+            .native_rx
             .lock()
             .await
             .take()
@@ -4531,8 +3258,8 @@ impl Runtime {
         let node = self.clone();
         tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                if let Err(e) = node.observe_engine(event).await {
-                    tracing::warn!(error=%e,"could not persist executor event");
+                if let Err(e) = node.observe_native(event).await {
+                    tracing::warn!(error=%e,"could not persist native observation");
                 }
             }
         });
@@ -4571,7 +3298,7 @@ impl Runtime {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tick.tick().await;
-                let Ok(state) = node.identities.public_state() else {
+                let Ok(state) = node.store.lock().await.public_state() else {
                     continue;
                 };
                 let Ok(view) = state.project() else { continue };
@@ -4608,73 +3335,21 @@ impl Runtime {
                 let networks = node.store.lock().await.networks().unwrap_or_default();
                 for network in networks {
                     let _ = node.enqueue_sync_all(&network).await;
-                    let _ = node.flush_completions(&network).await;
                 }
             }
         });
-        if self.maintenance.is_open() {
-            self.recover_operations().await?;
-        } else {
-            let node = self.clone();
-            tokio::spawn(async move {
-                let _work = node.maintenance.enter_when_open().await;
-                if let Err(error) = node.recover_operations().await {
-                    tracing::warn!(%error, "deferred operation recovery failed");
-                }
-            });
-        }
-        Ok(())
-    }
-    async fn recover_operations(self: &Arc<Self>) -> Result<()> {
-        let _work = self.maintenance.enter()?;
-        let networks = self.store.lock().await.networks()?;
-        for network in networks {
-            self.flush_completions(&network).await?;
-            let operations = self.store.lock().await.operations(&network)?;
-            for operation in operations {
-                if operation.state == OperationState::Unknown {
-                    self.finish(&operation.request,OperationState::Unknown,if operation.result.is_null(){json!({"error":"Node restarted while the external outcome was unresolved; reconcile before retrying"})}else{operation.result}).await?;
-                    continue;
-                }
-                if operation.state != OperationState::Accepted {
-                    continue;
-                }
-                let node = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = node.execute_operation(operation.request).await {
-                        tracing::warn!(error=%e,"accepted operation recovery failed");
-                    }
-                });
-            }
-        }
         Ok(())
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
-        let local = self.identity.peer_id()?;
         let store = self.store.lock().await;
         for network in store.networks()? {
-            for operation in store.operations(&network)? {
-                if operation.request.target_node != local {
-                    continue;
-                }
-                ensure!(
-                    operation.state.terminal(),
-                    Busy(format!(
-                        "local operation {} is {:?}",
-                        operation.request.operation_id, operation.state
-                    ))
-                );
-                ensure!(
-                    store
-                        .local_value(
-                            &network,
-                            &format!("completion:{}", operation.request.operation_id)
-                        )?
-                        .is_none(),
-                    Busy("execution completion is pending".into())
-                );
-            }
             crate::scheduler::maintenance_idle(&store, &network)?;
+            ensure!(
+                native_observation::sessions_from(&store, &network)?
+                    .iter()
+                    .all(|work| work.state.terminal()),
+                Busy("native work still has an unresolved outcome".into())
+            );
         }
         Ok(())
     }
@@ -5368,29 +4043,16 @@ impl Runtime {
                     "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk),
                     _ => None,
                 });
-        json!({"roots":settings.roots,"executors":["codex","claude_code","cursor_agent"],
-            "executor_capabilities":{
-                "codex":{"actions":ExecutorKind::Codex.capabilities(),"verified":false},
-                "claude_code":{"actions":ExecutorKind::ClaudeCode.capabilities(),"verified":false},
-                "cursor_agent":{"actions":ExecutorKind::CursorAgent.capabilities(),"verified":false}},
+        json!({"roots":settings.roots,
             "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
             "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1},
             "history_batch":history_batch_capability()})
     }
+
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let write = !matches!(
             input["method"].as_str(),
-            Some(
-                "nodes"
-                    | "conversation"
-                    | "conversations"
-                    | "bots"
-                    | "execution_status"
-                    | "session"
-                    | "operation"
-                    | "notifications"
-                    | "export"
-            )
+            Some("nodes" | "conversation" | "conversations" | "bots" | "notifications" | "export")
         );
         let task = input["task_id"]
             .as_str()
@@ -5413,7 +4075,7 @@ impl Runtime {
         let method = field(&input, "method")?;
         if !access.human {
             ensure!(
-                matches!(method, "nodes" | "create_task" | "update_task" | "operate"),
+                matches!(method, "nodes" | "create_task" | "update_task"),
                 "method unavailable to Agent tokens"
             );
         }
@@ -5510,7 +4172,21 @@ impl Runtime {
                 )
             }
             "conversation" => self.conversation_snapshot(&access, &input).await,
-            "message" => self.accept_chat_message(&access, &input).await,
+            "message" => {
+                {
+                    let store = self.store.lock().await;
+                    let scope = scope.as_deref().context("conversation_id is required")?;
+                    let existing = store.messages(network, scope)?.iter().any(|message| {
+                        input["message_id"].as_str() == Some(message.message_id.as_str())
+                            && message.role == "user"
+                    });
+                    ensure!(
+                        existing || !store.has_known_basis_gap(network, &heads(&input)?)?,
+                        "context is incomplete; wait for synchronization"
+                    );
+                }
+                self.accept_chat_message(&access, &input).await
+            }
             "set_followup" => {
                 let scope = scope.context("conversation_id is required")?;
                 let result = self.set_followup(&access, &scope, &input).await?;
@@ -5518,9 +4194,8 @@ impl Runtime {
                 Ok(result)
             }
             "read_artifact" => self.read_artifact(&access, &input).await,
-            "task_control" => self.task_control(&access, &input).await,
-            "execution_control" => self.execution_control(&access, &input).await,
-            "execution_status" => self.execution_status(&access, &input).await,
+            "cancel_agent_task" => self.cancel_task_rpc(&access, &input).await,
+            "native_interrupt" | "native_respond" => self.native_control(&access, &input).await,
             "bots" => self.bots(&access).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
@@ -5596,35 +4271,6 @@ impl Runtime {
                 self.publish_changed(network, &scope, &event.hash);
                 Ok(json!(event))
             }
-            "rebind_execution" => self.rebind_execution(&access, &input).await,
-            "operate" => {
-                let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
-                self.require_scope(&access, &request.conversation_id)
-                    .await?;
-                self.dispatch(access, request).await
-            }
-            "session" => {
-                self.session_fact(
-                    network,
-                    field(&input, "target_node")?,
-                    field(&input, "session_id")?,
-                )
-                .await
-            }
-            "operation" => {
-                let target = field(&input, "target_node")?;
-                let op = field(&input, "operation_id")?;
-                if target == self.identity.peer_id()? {
-                    Ok(json!({"operation":self.store.lock().await.operation(network,op)?}))
-                } else {
-                    self.peer_request(
-                        network,
-                        target,
-                        json!({"type":"operation","operation_id":op}),
-                    )
-                    .await
-                }
-            }
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
             ),
@@ -5659,19 +4305,6 @@ impl Runtime {
                     self.store.lock().await.export_snapshot(network, &scope)?
                 ))
             }
-            "reconcile" => {
-                ensure!(access.human, "reconciliation requires the user");
-                self.reconcile(
-                    network,
-                    field(&input, "target_node")?,
-                    field(&input, "operation_id")?,
-                )
-                .await
-            }
-            "resolve_unknown" => {
-                ensure!(access.human, "resolution requires the user");
-                self.resolve_unknown(network, &input).await
-            }
             _ => bail!("unknown method"),
         }
     }
@@ -5691,599 +4324,6 @@ impl Runtime {
         self.require_scope(&access, scope).await?;
         self.agent_tool(access, name, args, call_id).await
     }
-    async fn cache_context_bindings(&self, network: &str, scope: &str) -> Result<()> {
-        let context = self.store.lock().await.context(network, scope, &[])?;
-        let mut proofs = context
-            .events
-            .iter()
-            .filter_map(|event| {
-                if let EventBody::DispatchRecorded { action, .. } = &event.body {
-                    serde_json::from_value::<OperationRequest>(action.clone())
-                        .ok()
-                        .and_then(|request| request.binding)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        proofs.sort_by_key(|proof| proof.binding.generation);
-        let mut store = self.store.lock().await;
-        for proof in proofs {
-            store.install_historical_binding(&proof)?;
-        }
-        Ok(())
-    }
-
-    async fn confirm_binding(
-        self: &Arc<Self>,
-        binding: crate::binding::TaskBinding,
-    ) -> Result<crate::binding::SignedBinding> {
-        let proof = if binding.authority_node == self.identity.peer_id()? {
-            self.store
-                .lock()
-                .await
-                .bind_task(&self.identity, &binding)?
-        } else {
-            let reply = self
-                .peer_request(
-                    &binding.network_id,
-                    &binding.authority_node,
-                    serde_json::json!({"type":"bind_task","binding":binding}),
-                )
-                .await
-                .context("task binding authority is unreachable; execution was not reassigned")?;
-            serde_json::from_value(reply["binding"].clone())?
-        };
-        self.store.lock().await.install_binding(&proof)?;
-        Ok(proof)
-    }
-
-    async fn prepare_operation_binding(
-        self: &Arc<Self>,
-        request: &mut OperationRequest,
-    ) -> Result<()> {
-        self.cache_context_bindings(&request.network_id, &request.conversation_id)
-            .await?;
-        if let Some(proof) = &request.binding {
-            self.store.lock().await.install_binding(proof)?;
-            return self.store.lock().await.validate_operation_binding(request);
-        }
-        if request.task_id.is_none() {
-            let context = self.store.lock().await.context(
-                &request.network_id,
-                &request.conversation_id,
-                &[],
-            )?;
-            if let Some(proof) = context.events.iter().rev().find_map(|event| {
-                if let EventBody::DispatchRecorded {
-                    action,
-                    target_node,
-                    session_id,
-                    ..
-                } = &event.body
-                    && target_node == &request.target_node
-                    && session_id == &request.session_id
-                {
-                    serde_json::from_value::<OperationRequest>(action.clone())
-                        .ok()
-                        .and_then(|request| request.binding)
-                } else {
-                    None
-                }
-            }) {
-                request.task_id = Some(proof.binding.task_id.clone());
-                request.binding = Some(proof);
-                return self.store.lock().await.validate_operation_binding(request);
-            }
-            return self.store.lock().await.validate_operation_binding(request);
-        }
-        let task_id = request
-            .task_id
-            .as_ref()
-            .context("task binding requires a task")?;
-        let (creation, event) = {
-            let store = self.store.lock().await;
-            let creation =
-                store.task_creation(&request.network_id, &request.conversation_id, task_id)?;
-            let event = store.verify_event(&request.network_id, &creation)?;
-            (creation, event)
-        };
-        let mut existing = self
-            .store
-            .lock()
-            .await
-            .task_binding(&request.network_id, &creation.hash)?;
-        if event.author != self.identity.peer_id()?
-            && existing.as_ref().is_none_or(|proof| {
-                proof.binding.target_node != request.target_node
-                    || Some(proof.binding.session_id.as_str()) != request.session_id.as_deref()
-            })
-            && let Ok(reply) = self
-                .peer_request(
-                    &request.network_id,
-                    &event.author,
-                    serde_json::json!({"type":"task_binding","task_ref":creation.hash}),
-                )
-                .await
-            && !reply["binding"].is_null()
-        {
-            let proof: crate::binding::SignedBinding =
-                serde_json::from_value(reply["binding"].clone())?;
-            self.store.lock().await.install_binding(&proof)?;
-            existing = Some(proof);
-        }
-        if let Some(proof) = existing {
-            request.binding = Some(proof);
-            return self.store.lock().await.validate_operation_binding(request);
-        }
-        let open_spec = if request.action["type"] == "open" {
-            request.action.clone()
-        } else {
-            let value = self
-                .session_fact(
-                    &request.network_id,
-                    &request.target_node,
-                    request
-                        .session_id
-                        .as_deref()
-                        .context("execution session is required")?,
-                )
-                .await?;
-            serde_json::json!({"type":"open","executor":value["session"]["executor"],"cwd":value["session"]["cwd"]})
-        };
-        let binding = crate::binding::TaskBinding {
-            network_id: request.network_id.clone(),
-            conversation_id: request.conversation_id.clone(),
-            task_ref: creation.hash,
-            task_id: task_id.clone(),
-            authority_node: event.author,
-            generation: 1,
-            target_node: request.target_node.clone(),
-            session_id: request
-                .session_id
-                .clone()
-                .context("task binding requires a session")?,
-            open_spec,
-            previous_binding_hash: None,
-            previous_seal: None,
-        };
-        request.binding = Some(self.confirm_binding(binding).await?);
-        self.store.lock().await.validate_operation_binding(request)
-    }
-
-    async fn rebind_execution(self: &Arc<Self>, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "moving execution requires the user");
-        let scope = field(input, "conversation_id")?;
-        self.require_scope(access, scope).await?;
-        self.sync_all(&access.network_id).await?;
-        ensure!(
-            self.store
-                .lock()
-                .await
-                .context(&access.network_id, scope, &[])?
-                .missing
-                .is_complete(),
-            "task history is incomplete"
-        );
-        self.cache_context_bindings(&access.network_id, scope)
-            .await?;
-        let creation = self.store.lock().await.task_creation(
-            &access.network_id,
-            scope,
-            field(input, "task_id")?,
-        )?;
-        let previous = self
-            .store
-            .lock()
-            .await
-            .task_binding(&access.network_id, &creation.hash)?
-            .context("task has no confirmed execution binding")?;
-        let old = &previous.binding;
-        let seal = if old.target_node == self.identity.peer_id()? {
-            self.store
-                .lock()
-                .await
-                .seal_binding(&self.identity, &previous)?
-        } else {
-            let reply = self
-                .peer_request(
-                    &access.network_id,
-                    &old.target_node,
-                    serde_json::json!({"type":"seal_binding","binding":previous,"human":true}),
-                )
-                .await
-                .context("original executor is unreachable; task was not reassigned")?;
-            serde_json::from_value(reply["seal"].clone())?
-        };
-        let next = crate::binding::TaskBinding {
-            network_id: old.network_id.clone(),
-            conversation_id: old.conversation_id.clone(),
-            task_ref: old.task_ref.clone(),
-            task_id: old.task_id.clone(),
-            authority_node: old.authority_node.clone(),
-            generation: old
-                .generation
-                .checked_add(1)
-                .context("binding generation overflow")?,
-            target_node: field(input, "target_node")?.into(),
-            session_id: id(input, "session_id")?,
-            open_spec: serde_json::json!({"type":"open","executor":field(input,"executor")?,"cwd":field(input,"cwd")?}),
-            previous_binding_hash: Some(crate::binding::binding_hash(old)?),
-            previous_seal: Some(seal),
-        };
-        Ok(serde_json::json!({"binding":self.confirm_binding(next).await?}))
-    }
-
-    pub async fn dispatch(
-        self: &Arc<Self>,
-        access: Access,
-        mut request: OperationRequest,
-    ) -> Result<Value> {
-        let _work = self.maintenance.enter()?;
-        ensure!(
-            request.network_id == access.network_id,
-            "operation belongs to another network"
-        );
-        self.require_scope(&access, &request.conversation_id)
-            .await?;
-        id(&json!({"id":request.operation_id}), "id")?;
-        if let Some(session) = &request.session_id {
-            id(&json!({"id":session}), "id")?;
-        }
-        ensure!(
-            (request.action["type"] == "command") == request.session_id.is_none(),
-            "commands must be sessionless and SDK operations require a session"
-        );
-        ensure!(
-            access.human || request.action["type"] != "respond_request",
-            "only the user may answer approvals"
-        );
-        if !access.human && !matches!(request.action["type"].as_str(), Some("open" | "command")) {
-            self.require_execution_scope(
-                &access,
-                &request.conversation_id,
-                &request.target_node,
-                request
-                    .session_id
-                    .as_deref()
-                    .context("execution session is required")?,
-            )
-            .await?;
-        }
-        {
-            let waiting = Instant::now();
-            let store = self.store.lock().await;
-            let waited = waiting.elapsed();
-            let held = Instant::now();
-            store.authorize_node(
-                &access.network_id,
-                &request.target_node,
-                Some(NodeRole::Executor),
-            )?;
-            let known_gap = !request.basis_heads.is_empty()
-                && store
-                    .operation(&request.network_id, &request.operation_id)?
-                    .is_none()
-                && store.has_known_basis_gap(&request.network_id, &request.basis_heads)?;
-            tracing::trace!(network=%request.network_id, scope=%request.conversation_id, stage="dispatch_basis", wait_ms=waited.as_millis() as u64,
-                hold_ms=held.elapsed().as_millis() as u64, known_gap, "history store phase finished");
-            ensure!(!known_gap, "operation basis is incomplete or conflicting");
-        }
-        if !access.human
-            && matches!(
-                request.action["type"].as_str(),
-                Some("open" | "send" | "steer")
-            )
-            && let Some(task) = &request.task_id
-        {
-            require_task_write(
-                &*self.store.lock().await,
-                &request.network_id,
-                &request.conversation_id,
-                task,
-                false,
-            )?;
-        }
-        request.manager_authority =
-            access
-                .manager
-                .as_ref()
-                .map(|manager| ManagerDispatchAuthority {
-                    scheduler_node: manager.target_node.clone(),
-                    trigger: manager.trigger.clone(),
-                    followup_version: manager.followup_version.unwrap_or(0),
-                });
-        self.prepare_operation_binding(&mut request).await?;
-        Self::record_manager_operation(&mut *self.store.lock().await, &access, &request)?;
-        let context = self.store.lock().await.context(
-            &access.network_id,
-            &request.conversation_id,
-            &request.basis_heads,
-        )?;
-        ensure!(
-            context.missing.is_complete(),
-            "operation basis is incomplete or conflicting"
-        );
-        let old = context.events.iter().find_map(|e| {
-            if let EventBody::DispatchRecorded {
-                operation_id,
-                action,
-                ..
-            } = &e.body
-            {
-                (operation_id == &request.operation_id).then_some((e, action))
-            } else {
-                None
-            }
-        });
-        let head = if let Some((event, old)) = old {
-            ensure!(
-                old == &serde_json::to_value(&request)?,
-                "operation ID reused with different request"
-            );
-            crypto::digest(&serde_json::to_vec(event)?)
-        } else {
-            if !access.human
-                && matches!(
-                    request.action["type"].as_str(),
-                    Some("open" | "send" | "steer")
-                )
-                && let Some(task) = &request.task_id
-            {
-                require_task_write(
-                    &*self.store.lock().await,
-                    &request.network_id,
-                    &request.conversation_id,
-                    task,
-                    false,
-                )?;
-            }
-            let event = {
-                let mut store = self.store.lock().await;
-                Self::check_manager_permission(&store, &access, true, request.task_id.as_deref())?;
-                store.append_event(
-                    &self.identity,
-                    &access.network_id,
-                    &request.conversation_id,
-                    EventBody::DispatchRecorded {
-                        operation_id: request.operation_id.clone(),
-                        task_id: request.task_id.clone(),
-                        target_node: request.target_node.clone(),
-                        session_id: request.session_id.clone(),
-                        action: serde_json::to_value(&request)?,
-                    },
-                    vec![],
-                    now_ms(),
-                )?
-            };
-            self.publish_changed(&access.network_id, &request.conversation_id, &event.hash);
-            event.hash
-        };
-        if request.target_node == self.identity.peer_id()? {
-            self.admit_operation_checked(request, access.human, Some(&access), None)
-                .await
-        } else {
-            Self::check_manager_permission(
-                &*self.store.lock().await,
-                &access,
-                true,
-                request.task_id.as_deref(),
-            )?;
-            self.peer_request(&access.network_id,&request.target_node,json!({"type":"execute","request":request,"dispatch_head":head,"human":access.human})).await
-        }
-    }
-    #[cfg(test)]
-    async fn admit_operation(
-        self: &Arc<Self>,
-        request: OperationRequest,
-        human: bool,
-    ) -> Result<Value> {
-        self.admit_operation_checked(request, human, None, None)
-            .await
-    }
-    async fn admit_operation_checked(
-        self: &Arc<Self>,
-        mut request: OperationRequest,
-        human: bool,
-        manager_access: Option<&Access>,
-        peer_origin: Option<&str>,
-    ) -> Result<Value> {
-        let _work = self.maintenance.enter()?;
-        self.require_role(&request.network_id, NodeRole::Executor)
-            .await?;
-        ensure!(
-            request.target_node == self.identity.peer_id()?,
-            "wrong execution target"
-        );
-        let kind = field(&request.action, "type")?;
-        ensure!(
-            human || kind != "respond_request",
-            "only the user may answer approvals"
-        );
-        let mut store = self.store.lock().await;
-        if let Some(origin) = peer_origin {
-            let sender = store.authorize_node(&request.network_id, origin, None)?;
-            ensure!(
-                sender.roles.contains(&NodeRole::Scheduler)
-                    || sender.roles.contains(&NodeRole::Gateway),
-                "origin cannot dispatch"
-            );
-            ensure!(
-                !human || sender.roles.contains(&NodeRole::Gateway),
-                "origin cannot assert human authority"
-            );
-        }
-        if let Some(access) = manager_access {
-            Self::check_manager_permission(&store, access, true, request.task_id.as_deref())?;
-        }
-        let existing_operation = store.operation(&request.network_id, &request.operation_id)?;
-        if existing_operation.is_none() && !request.basis_heads.is_empty() {
-            ensure!(
-                !store.has_known_basis_gap(&request.network_id, &request.basis_heads)?,
-                "required context is incomplete or conflicting"
-            );
-        }
-        if kind == "command" {
-            ensure!(
-                request.session_id.is_none()
-                    && request.task_id.is_none()
-                    && request.binding.is_none(),
-                "commands cannot bind an SDK session or task"
-            );
-            let spec = self.command_spec(&request.action)?;
-            let cwd = self.allowed_path(
-                spec.cwd
-                    .to_str()
-                    .context("command directory must be UTF-8")?,
-            )?;
-            let mut resources = vec![
-                cwd.to_str()
-                    .context("command directory must be UTF-8")?
-                    .to_owned(),
-            ];
-            for resource in &request.resources {
-                resources.push(
-                    self.allowed_path(resource)?
-                        .to_str()
-                        .context("resource must be UTF-8")?
-                        .to_owned(),
-                );
-            }
-            resources.sort();
-            resources.dedup();
-            request.resources = resources;
-            if let Some(old) = existing_operation {
-                ensure!(
-                    old.request == request,
-                    "operation ID reused with different body"
-                );
-                return Ok(json!({"operation":old}));
-            }
-            let operation = store.accept_operation(&request.network_id, &request)?;
-            drop(store);
-            let node = self.clone();
-            tokio::spawn(async move {
-                if let Err(error) = node.execute_command(request).await {
-                    tracing::warn!(%error,"command requires reconciliation");
-                }
-            });
-            return Ok(json!({"operation":operation}));
-        }
-        let current = store.session(
-            &request.network_id,
-            &request.target_node,
-            request
-                .session_id
-                .as_deref()
-                .context("execution session is required")?,
-        )?;
-        if !human && existing_operation.is_none() && matches!(kind, "open" | "send" | "steer") {
-            if let Some(task) = &request.task_id {
-                require_task_write(
-                    &store,
-                    &request.network_id,
-                    &request.conversation_id,
-                    task,
-                    false,
-                )?;
-            } else {
-                let previous: Vec<_> = store
-                    .operations(&request.network_id)?
-                    .into_iter()
-                    .map(|operation| operation.request)
-                    .filter(|operation| {
-                        operation.target_node == request.target_node
-                            && operation.session_id == request.session_id
-                            && matches!(
-                                operation.action["type"].as_str(),
-                                Some("open" | "send" | "steer")
-                            )
-                    })
-                    .collect();
-                let latest_revision = previous
-                    .iter()
-                    .map(|operation| operation.expected_revision)
-                    .max();
-                ensure!(
-                    !previous.iter().any(|operation| {
-                        Some(operation.expected_revision) == latest_revision
-                            && operation.task_id.is_some()
-                    }),
-                    "task_id is required for new agent work in a task-associated execution session"
-                );
-            }
-        }
-        let session = if kind == "open" {
-            ensure!(
-                current.is_none() || existing_operation.is_some(),
-                "execution session already exists"
-            );
-            let executor: ExecutorKind =
-                serde_json::from_value(request.action["executor"].clone())?;
-            let cwd = self.allowed_path(field(&request.action, "cwd")?)?;
-            current.unwrap_or(ExecutionSession {
-                network_id: request.network_id.clone(),
-                target_node: request.target_node.clone(),
-                session_id: request
-                    .session_id
-                    .clone()
-                    .context("SDK operation requires a session")?,
-                revision: 0,
-                state: "opening".into(),
-                executor: serde_json::to_value(executor)?.as_str().unwrap().into(),
-                cwd: cwd.to_str().context("directory must be UTF-8")?.into(),
-                native_session_id: None,
-            })
-        } else {
-            current.context("execution session is not open")?
-        };
-        let action = self.engine_action(&request.action)?;
-        action.validate()?;
-        let control = !matches!(action, EngineAction::Open {} | EngineAction::Send { .. });
-        if control {
-            ensure!(
-                request.resources.is_empty(),
-                "control operations cannot reserve resources"
-            );
-        } else {
-            let path = self.allowed_path(&session.cwd)?;
-            let mut resources = vec![path.to_str().context("directory must be UTF-8")?.to_owned()];
-            for resource in &request.resources {
-                resources.push(
-                    self.allowed_path(resource)?
-                        .to_str()
-                        .context("resource must be UTF-8")?
-                        .to_owned(),
-                );
-            }
-            resources.sort();
-            resources.dedup();
-            request.resources = resources;
-        }
-        if let Some(old) = existing_operation {
-            ensure!(
-                old.request == request,
-                "operation ID reused with different body"
-            );
-            return Ok(json!({"operation":old}));
-        }
-        let operation = if control {
-            store.accept_control_operation(&request.network_id, &request)?
-        } else {
-            store.accept_operation(&request.network_id, &request)?
-        };
-        if kind == "open" {
-            store.upsert_session(&request.network_id, &session)?;
-        }
-        drop(store);
-        let node = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = node.execute_operation(request).await {
-                tracing::warn!(error=%e,"operation execution requires reconciliation");
-            }
-        });
-        Ok(json!({"operation":operation}))
-    }
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
         let path = std::fs::canonicalize(path).context("execution path does not exist")?;
         ensure!(
@@ -6297,453 +4337,11 @@ impl Runtime {
         ensure!(path.is_dir(), "execution path must be a directory");
         Ok(path)
     }
-    async fn require_execution_scope(
-        &self,
-        access: &Access,
-        scope: &str,
-        target: &str,
-        session: &str,
-    ) -> Result<()> {
-        let context = self
-            .store
-            .lock()
-            .await
-            .context(&access.network_id, scope, &[])?;
-        ensure!(context.events.iter().any(|e| e.scope_id==scope && matches!(&e.body,EventBody::DispatchRecorded{target_node,session_id,..} if target_node==target && session_id.as_deref()==Some(session))),"execution session is outside this conversation");
-        Ok(())
-    }
-    fn engine_action(&self, action: &Value) -> Result<EngineAction> {
-        if action["type"] == "open" {
-            let map = action.as_object().context("invalid action")?;
-            ensure!(
-                map.keys()
-                    .all(|k| matches!(k.as_str(), "type" | "executor" | "cwd")),
-                "unexpected open field"
-            );
-            Ok(EngineAction::Open {})
-        } else {
-            Ok(serde_json::from_value(action.clone())?)
-        }
-    }
-    async fn execute_operation(self: Arc<Self>, request: OperationRequest) -> Result<()> {
-        let _work = self.maintenance.enter()?;
-        if request.action["type"] == "command" {
-            return self.execute_command(request).await;
-        }
-        let action = self.engine_action(&request.action)?;
-        let preparation: Result<ExecutionSession> = async {
-            self.require_role(&request.network_id, NodeRole::Executor)
-                .await?;
-            let mut store = self.store.lock().await;
-            let session = store
-                .session(
-                    &request.network_id,
-                    &request.target_node,
-                    request
-                        .session_id
-                        .as_deref()
-                        .context("execution session is required")?,
-                )?
-                .context("accepted operation has no local session")?;
-            store.validate_operation_binding(&request)?;
-            self.allowed_path(&session.cwd)?;
-            for resource in &request.resources {
-                self.allowed_path(resource)?;
-            }
-            store.claim_operation(&request.network_id, &request.operation_id)?;
-            Ok(session)
-        }
-        .await;
-        let session = match preparation {
-            Ok(session) => session,
-            Err(error) => {
-                let accepted = self
-                    .store
-                    .lock()
-                    .await
-                    .operation(&request.network_id, &request.operation_id)?
-                    .is_some_and(|o| o.state == OperationState::Accepted);
-                if accepted {
-                    self.finish(
-                        &request,
-                        OperationState::Rejected,
-                        json!({"error":format!("{error:#}")}),
-                    )
-                    .await?;
-                }
-                return Err(error);
-            }
-        };
-        let native = ExecutorSession {
-            executor: serde_json::from_value(json!(session.executor))?,
-            cwd: PathBuf::from(&session.cwd),
-            native_session_id: session.native_session_id.clone(),
-        };
-        let store = self.store.clone();
-        let mut persisted = session.clone();
-        let network = request.network_id.clone();
-        let result = self
-            .engine
-            .execute(&native, action.clone(), move |id| async move {
-                persisted.native_session_id = Some(id);
-                store.lock().await.upsert_session(&network, &persisted)?;
-                Ok(())
-            })
-            .await;
-        match result {
-            Ok(result) => {
-                let mut store = self.store.lock().await;
-                if store
-                    .operation(&request.network_id, &request.operation_id)?
-                    .is_some_and(|o| o.state.terminal())
-                {
-                    return Ok(());
-                }
-                let mut session = store
-                    .session(
-                        &request.network_id,
-                        &request.target_node,
-                        request
-                            .session_id
-                            .as_deref()
-                            .context("execution session is required")?,
-                    )?
-                    .context("session disappeared")?;
-                session.native_session_id = result.native_session_id;
-                if native.executor == ExecutorKind::Codex
-                    && matches!(action, EngineAction::Send { .. })
-                {
-                    session.state = "running".into();
-                    store.upsert_session(&request.network_id, &session)?;
-                    store.local_set(
-                        &request.network_id,
-                        &format!("turn:{}", request.operation_id),
-                        &result.result,
-                    )?;
-                    drop(store);
-                    self.append(
-                        &request.network_id,
-                        &request.conversation_id,
-                        EventBody::ExecutionObserved {
-                            operation_id: request.operation_id.clone(),
-                            task_id: request.task_id.clone(),
-                            target_node: request.target_node.clone(),
-                            session_id: request.session_id.clone(),
-                            status: "running".into(),
-                            detail: result.result,
-                        },
-                    )
-                    .await?;
-                    self.reconcile(
-                        &request.network_id,
-                        &request.target_node,
-                        &request.operation_id,
-                    )
-                    .await?;
-                } else {
-                    store.upsert_session(&request.network_id, &session)?;
-                    drop(store);
-                    self.finish(&request, OperationState::Succeeded, result.result)
-                        .await?;
-                }
-            }
-            Err(error) => {
-                {
-                    let mut store = self.store.lock().await;
-                    let mut session = store
-                        .session(
-                            &request.network_id,
-                            &request.target_node,
-                            request
-                                .session_id
-                                .as_deref()
-                                .context("execution session is required")?,
-                        )?
-                        .context("session disappeared")?;
-                    session.native_session_id = error.native_session_id.clone();
-                    store.upsert_session(&request.network_id, &session)?;
-                }
-                let state = if error.uncertain {
-                    OperationState::Unknown
-                } else {
-                    OperationState::Failed
-                };
-                self.finish(
-                    &request,
-                    state,
-                    json!({"error":error.message,"native_session_id":error.native_session_id}),
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-    async fn finish(
-        self: &Arc<Self>,
-        request: &OperationRequest,
-        state: OperationState,
-        result: Value,
-    ) -> Result<()> {
-        let _work = self.maintenance.enter()?;
-        let _completion = self.completion_lock.lock().await;
-        let status = serde_json::to_value(&state)?.as_str().unwrap().to_owned();
-        let completion_key = format!("completion:{}", request.operation_id);
-        {
-            let mut store = self.store.lock().await;
-            if let Some(old) = store.operation(&request.network_id, &request.operation_id)?
-                && old.state.terminal()
-                && (old.state != state || old.result != result)
-            {
-                return Ok(());
-            }
-            store.local_set(
-                &request.network_id,
-                &completion_key,
-                &json!({"state":state,"result":result}),
-            )?;
-            store.finish_operation(
-                &request.network_id,
-                &request.operation_id,
-                state.clone(),
-                result.clone(),
-            )?;
-            if let Some(mut session) = request
-                .session_id
-                .as_deref()
-                .map(|session| store.session(&request.network_id, &request.target_node, session))
-                .transpose()?
-                .flatten()
-            {
-                let outstanding = store
-                    .operations(&request.network_id)?
-                    .into_iter()
-                    .filter(|o| {
-                        o.request.target_node == request.target_node
-                            && o.request.session_id == request.session_id
-                            && !o.state.terminal()
-                    })
-                    .collect::<Vec<_>>();
-                session.state = if outstanding
-                    .iter()
-                    .any(|o| o.state == OperationState::Unknown)
-                {
-                    "unknown"
-                } else if !outstanding.is_empty() {
-                    "running"
-                } else {
-                    "idle"
-                }
-                .into();
-                store.upsert_session(&request.network_id, &session)?;
-            }
-        }
-        let mut blobs = vec![];
-        let mut detail = result;
-        let bytes = serde_json::to_vec(&detail)?;
-        if bytes.len() > 262144 {
-            let blob = BlobRef {
-                hash: crypto::digest(&bytes),
-                size: bytes.len() as u64,
-            };
-            self.store
-                .lock()
-                .await
-                .put_blob(&request.network_id, &blob, &bytes)?;
-            detail = json!({"result_blob":blob});
-            blobs.push(blob);
-        }
-        let existing=self.store.lock().await.context(&request.network_id,&request.conversation_id,&[])?.events.into_iter().find(|e|matches!(&e.body,EventBody::ExecutionObserved{operation_id,status:s,..} if operation_id==&request.operation_id && s==&status));
-        let event_hash = if let Some(existing) = existing {
-            crypto::digest(&serde_json::to_vec(&existing)?)
-        } else {
-            self.append_blobs(
-                &request.network_id,
-                &request.conversation_id,
-                EventBody::ExecutionObserved {
-                    operation_id: request.operation_id.clone(),
-                    task_id: request.task_id.clone(),
-                    target_node: request.target_node.clone(),
-                    session_id: request.session_id.clone(),
-                    status: status.clone(),
-                    detail,
-                },
-                blobs,
-            )
-            .await?
-            .hash
-        };
-        if !matches!(request.action["type"].as_str(), Some("read")) {
-            let notification_id = format!("result:{}:{}", request.operation_id, status);
-            let already=self.store.lock().await.context(&request.network_id,&request.conversation_id,&[])?.events.iter().any(|e|matches!(&e.body,EventBody::NotificationRaised{notification_id:id,..} if id==&notification_id));
-            if !already {
-                self.append(
-                    &request.network_id,
-                    &request.conversation_id,
-                    EventBody::NotificationRaised {
-                        notification_id,
-                        kind: status.clone(),
-                        text: match state {
-                            OperationState::Succeeded => "后台工作已完成。",
-                            OperationState::Unknown => "后台工作的结果仍需核对。",
-                            _ => "后台工作未完成，请查看详情。",
-                        }
-                        .into(),
-                    },
-                )
-                .await?;
-            }
-            if state.terminal() && !self.maybe_followup(request, &event_hash).await? {
-                return Ok(());
-            }
-        }
-        if state.terminal() {
-            self.progress_sequences
-                .lock()
-                .expect("progress sequence lock")
-                .remove(&(request.network_id.clone(), request.operation_id.clone()));
-        }
-        self.store
-            .lock()
-            .await
-            .local_delete(&request.network_id, &completion_key)?;
-        Ok(())
-    }
-    async fn flush_completions(self: &Arc<Self>, network: &str) -> Result<()> {
-        let _work = self.maintenance.enter()?;
-        let operations = self.store.lock().await.operations(network)?;
-        for operation in operations {
-            let key = format!("completion:{}", operation.request.operation_id);
-            let pending = self.store.lock().await.local_value(network, &key)?;
-            if let Some(value) = pending {
-                self.finish(
-                    &operation.request,
-                    serde_json::from_value(value["state"].clone())?,
-                    value["result"].clone(),
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-    async fn session_fact(&self, network: &str, target: &str, session_id: &str) -> Result<Value> {
-        if target != self.identity.peer_id()? {
-            return self
-                .read_peer(
-                    network,
-                    target,
-                    json!({"type":"session","session_id":session_id}),
-                )
-                .await;
-        }
-        let session = self
-            .store
-            .lock()
-            .await
-            .session(network, target, session_id)?
-            .context("execution session not found")?;
-        let mut snapshot = self.engine.snapshot().await;
-        if let Some(requests) = snapshot["pending_requests"].as_array_mut() {
-            requests.retain(|r| {
-                r["params"]["threadId"].as_str() == session.native_session_id.as_deref()
-            });
-        }
-        let native = ExecutorSession {
-            executor: serde_json::from_value(json!(session.executor))?,
-            cwd: session.cwd.clone().into(),
-            native_session_id: session.native_session_id.clone(),
-        };
-        let read = self
-            .engine
-            .execute(&native, EngineAction::Read {}, |_| async {
-                bail!("read must not create a session")
-            })
-            .await;
-        let last_turn = session
-            .native_session_id
-            .as_deref()
-            .map(|id| snapshot["threads"][id]["last_turn"].clone())
-            .unwrap_or(Value::Null);
-        let actual = match read {
-            Ok(r) => {
-                json!({"thread":r.result,"last_turn":last_turn,"pending_requests":snapshot["pending_requests"]})
-            }
-            Err(e) => {
-                json!({"error":e.message,"uncertain":e.uncertain,"last_turn":last_turn,"pending_requests":snapshot["pending_requests"]})
-            }
-        };
-        Ok(json!({"session":session,"actual":actual}))
-    }
     pub async fn current_facts(&self, network: &str, scope: &str) -> Result<Value> {
-        let context = self.store.lock().await.context(network, scope, &[])?;
-        let terminal: BTreeSet<_> = context
-            .events
-            .iter()
-            .filter_map(|event| {
-                if event.scope_id == scope
-                    && let EventBody::ExecutionObserved {
-                        operation_id,
-                        target_node,
-                        status,
-                        ..
-                    } = &event.body
-                    && event.author == *target_node
-                    && matches!(
-                        status.as_str(),
-                        "succeeded" | "failed" | "rejected" | "completed" | "interrupted"
-                    )
-                {
-                    Some(operation_id.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut keys = BTreeSet::new();
-        let mut operations = BTreeSet::new();
-        for event in &context.events {
-            if event.scope_id != scope {
-                continue;
-            }
-            if let EventBody::DispatchRecorded {
-                target_node,
-                session_id,
-                operation_id,
-                ..
-            } = &event.body
-                && !terminal.contains(operation_id.as_str())
-            {
-                if let Some(session_id) = session_id {
-                    keys.insert((target_node.clone(), session_id.clone()));
-                }
-                operations.insert((target_node.clone(), operation_id.clone()));
-            }
-        }
-        let mut sessions = vec![];
-        let mut facts = vec![];
-        let mut records = vec![];
-        for (target, session) in keys {
-            match tokio::time::timeout(Duration::from_secs(3),self.session_fact(network,&target,&session)).await {Ok(Ok(value))=>{sessions.push(value["session"].clone());facts.push(value);},_=>facts.push(json!({"target_node":target,"session_id":session,"state":"unreachable","freshness":"unknown"}))}
-        }
-        for (target, op) in operations {
-            if target == self.identity.peer_id()? {
-                if let Some(record) = self.store.lock().await.operation(network, &op)? {
-                    records.push(json!(record));
-                }
-            } else if let Ok(Ok(value)) = tokio::time::timeout(
-                Duration::from_secs(3),
-                self.peer_request(
-                    network,
-                    &target,
-                    json!({"type":"operation","operation_id":op}),
-                ),
-            )
-            .await
-                && !value["operation"].is_null()
-            {
-                records.push(value["operation"].clone());
-            }
-        }
-        Ok(json!({"sessions":sessions,"operations":records,"facts":facts}))
+        Ok(
+            json!({"agent_tasks":self.agent_task_projections(network, scope).await?,
+            "native_sessions":self.native_session_projections(network, scope).await?,"freshness":"locally_known"}),
+        )
     }
     async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
         self.membership_state().await?;
@@ -6761,11 +4359,8 @@ impl Runtime {
                 | "event"
                 | "history_batch"
                 | "blob"
-                | "operation"
-                | "task_binding"
                 | "progress_read"
-                | "chat_task_status"
-                | "chat_execution_status"
+                | "native_status"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
@@ -6864,7 +4459,7 @@ impl Runtime {
                 let offset = input["offset"].as_u64().context("offset required")?;
                 let limit = input["limit"].as_u64().unwrap_or(65536).clamp(1, 65536) as usize;
                 let mut store = self.store.lock().await;
-                let view = self.identities.public_state()?.project()?;
+                let view = store.public_state()?.project()?;
                 ensure!(view.network_id == *network, "wrong personal network");
                 view.authorize_node(&self.identity.peer_id()?, Some(NodeRole::Replica))?;
                 let (size, bytes) = store
@@ -6890,114 +4485,6 @@ impl Runtime {
                 self.install_membership(state).await?;
                 Ok(json!({"received":true}))
             }
-            "task_binding" => Ok(
-                json!({"binding":self.store.lock().await.task_binding(network,field(input,"task_ref")?)?}),
-            ),
-            "bind_task" => {
-                let sender =
-                    self.store
-                        .lock()
-                        .await
-                        .authorize_node(network, &message.origin, None)?;
-                ensure!(
-                    sender.roles.contains(&NodeRole::Scheduler)
-                        || sender.roles.contains(&NodeRole::Gateway),
-                    "origin cannot propose execution binding"
-                );
-                let binding: crate::binding::TaskBinding =
-                    serde_json::from_value(input["binding"].clone())?;
-                ensure!(binding.network_id == *network, "wrong binding network");
-                Ok(json!({"binding":self.store.lock().await.bind_task(&self.identity,&binding)?}))
-            }
-            "seal_binding" => {
-                let sender = self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Gateway),
-                )?;
-                ensure!(
-                    input["human"] == true && sender.roles.contains(&NodeRole::Gateway),
-                    "sealing execution requires the user"
-                );
-                let proof: crate::binding::SignedBinding =
-                    serde_json::from_value(input["binding"].clone())?;
-                ensure!(
-                    proof.binding.network_id == *network,
-                    "wrong binding network"
-                );
-                Ok(json!({"seal":self.store.lock().await.seal_binding(&self.identity,&proof)?}))
-            }
-            "execute" => {
-                let sender =
-                    self.store
-                        .lock()
-                        .await
-                        .authorize_node(network, &message.origin, None)?;
-                ensure!(
-                    sender.roles.contains(&NodeRole::Scheduler)
-                        || sender.roles.contains(&NodeRole::Gateway),
-                    "origin cannot dispatch"
-                );
-                let human = input["human"].as_bool().unwrap_or(false);
-                ensure!(
-                    !human || sender.roles.contains(&NodeRole::Gateway),
-                    "origin cannot assert human authority"
-                );
-                let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
-                ensure!(request.network_id == *network, "wrong operation network");
-                // Admission holds the complete dispatched history before any external call.
-                let mut wanted = request.basis_heads.clone();
-                wanted.push(field(input, "dispatch_head")?.into());
-                self.fetch_closure(network, &request.conversation_id, &message.origin, &wanted)
-                    .await?
-                    .require_complete()?;
-                ensure!(
-                    self.store
-                        .lock()
-                        .await
-                        .missing_dependencies(network, &wanted)?
-                        .is_complete(),
-                    "dispatch context is incomplete"
-                );
-                {
-                    let store = self.store.lock().await;
-                    let envelope = store
-                        .event(network, field(input, "dispatch_head")?)?
-                        .context("dispatch event is missing")?;
-                    let event = store.verify_event(network, &envelope)?;
-                    ensure!(
-                        event.author == message.origin
-                            && event.scope_id == request.conversation_id
-                            && matches!(&event.body, EventBody::DispatchRecorded { operation_id, task_id, target_node, session_id, action }
-                            if operation_id == &request.operation_id && task_id == &request.task_id && target_node == &request.target_node && session_id == &request.session_id && action == &serde_json::to_value(&request)?),
-                        "execution request does not match its original signed dispatch"
-                    );
-                    if let Some(authority) = &request.manager_authority {
-                        ensure!(
-                            !human && authority.scheduler_node == message.origin,
-                            "invalid autonomous dispatch authority"
-                        );
-                    }
-                }
-                self.cache_context_bindings(network, &request.conversation_id)
-                    .await?;
-                if let Some(proof) = &request.binding {
-                    self.store.lock().await.install_binding(proof)?;
-                }
-                self.admit_operation_checked(request, human, None, Some(&message.origin))
-                    .await
-            }
-            "session" => {
-                self.session_fact(
-                    network,
-                    &self.identity.peer_id()?,
-                    field(input, "session_id")?,
-                )
-                .await
-            }
-            "operation" => Ok(
-                json!({"operation":self.store.lock().await.operation(network,field(input,"operation_id")?)?}),
-            ),
             "schedule" => self.receive_schedule(message).await,
             "manager_status" => {
                 self.manager_status(
@@ -7014,32 +4501,27 @@ impl Runtime {
                 );
                 self.read_progress(network, &message.origin, input).await
             }
-            "chat_task_status" | "chat_execution_status" => {
-                let sender =
-                    self.store
-                        .lock()
-                        .await
-                        .authorize_node(network, &message.origin, None)?;
-                ensure!(
-                    sender.roles.contains(&NodeRole::Gateway)
-                        || sender.roles.contains(&NodeRole::Scheduler),
-                    "origin cannot observe execution controls"
-                );
-                if kind == "chat_execution_status" {
-                    self.chat_execution_status(
-                        network,
-                        field(input, "conversation_id")?,
-                        field(input, "operation_id")?,
-                    )
+            "native_status" => {
+                self.native_status(network, field(input, "conversation_id")?)
                     .await
-                } else {
-                    self.chat_task_status(
-                        network,
-                        field(input, "conversation_id")?,
-                        field(input, "task_id")?,
-                    )
-                    .await
-                }
+            }
+            "cancel_agent_task" => {
+                self.cancel_agent_task(
+                    network,
+                    field(input, "conversation_id")?,
+                    field(input, "task_ref")?,
+                    &message.origin,
+                )
+                .await
+            }
+            "native_interrupt" | "native_respond" => {
+                self.store.lock().await.authorize_node(
+                    network,
+                    &message.origin,
+                    Some(NodeRole::Gateway),
+                )?;
+                ensure!(input["human"] == true, "native controls require the user");
+                self.native_control_local(network, input, kind).await
             }
             "cancel_manager" | "resolve_manager_unknown" => {
                 self.store.lock().await.authorize_node(
@@ -7063,295 +4545,7 @@ impl Runtime {
                     self.resolve_manager_invocation(&access, input).await
                 }
             }
-            "reconcile" => {
-                self.reconcile(
-                    network,
-                    &self.identity.peer_id()?,
-                    field(input, "operation_id")?,
-                )
-                .await
-            }
-            "resolve_unknown" => {
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Gateway),
-                )?;
-                self.resolve_unknown(network, input).await
-            }
             _ => bail!("unknown peer message"),
         }
-    }
-    async fn observe_engine(self: &Arc<Self>, event: Value) -> Result<()> {
-        let _work = self.maintenance.enter_when_open().await;
-        let cli_progress = event["kind"] == "executor_progress";
-        let method = event["method"].as_str().unwrap_or(if cli_progress {
-            "executor/progress"
-        } else {
-            ""
-        });
-        let thread = event["params"]["threadId"]
-            .as_str()
-            .or_else(|| event["params"]["thread_id"].as_str())
-            .or_else(|| event["params"]["session_id"].as_str())
-            .or_else(|| event["native_session_id"].as_str());
-        let networks = self.store.lock().await.networks()?;
-        for network in networks {
-            let operations = self.store.lock().await.operations(&network)?;
-            for operation in operations.into_iter().filter(|o| {
-                matches!(o.state, OperationState::Running | OperationState::Unknown)
-                    && o.request.action["type"] == "send"
-            }) {
-                let request = &operation.request;
-                let session = self
-                    .store
-                    .lock()
-                    .await
-                    .session(
-                        &network,
-                        &request.target_node,
-                        request
-                            .session_id
-                            .as_deref()
-                            .context("execution session is required")?,
-                    )?
-                    .context("running operation lost session")?;
-                if method == "bridge.codex_disconnected"
-                    && session.executor == "codex"
-                    && operation.state == OperationState::Running
-                {
-                    self.finish(
-                        request,
-                        OperationState::Unknown,
-                        json!({"error":"Codex disconnected; reconcile before any retry"}),
-                    )
-                    .await?;
-                    continue;
-                }
-                if thread.is_none() || thread != session.native_session_id.as_deref() {
-                    continue;
-                }
-                if cli_progress && event["executor"] != session.executor {
-                    continue;
-                }
-                let sequence = {
-                    let mut sequences = self
-                        .progress_sequences
-                        .lock()
-                        .expect("progress sequence lock");
-                    let sequence = sequences
-                        .entry((network.clone(), request.operation_id.clone()))
-                        .or_default();
-                    *sequence += 1;
-                    *sequence
-                };
-                let turn = self
-                    .store
-                    .lock()
-                    .await
-                    .local_value(&network, &format!("turn:{}", request.operation_id))?;
-                self.publish_progress(&network, json!({"type":"execution_progress","conversation_id":request.conversation_id,
-                    "task_id":request.task_id,"task_ref":request.binding.as_ref().map(|proof| &proof.binding.task_ref),
-                    "target_node":request.target_node,"session_id":request.session_id,"operation_id":request.operation_id,
-                    "turn_id":turn.as_ref().and_then(|value|value["turn"]["id"].as_str()),
-                    "source":self.identity.peer_id()?,"source_node":self.identity.peer_id()?,"sequence":sequence,"progress":observation::execution_progress(&event)}));
-                if method == "turn/completed" {
-                    let turn = field(&event["params"]["turn"], "id")?;
-                    let known = self
-                        .store
-                        .lock()
-                        .await
-                        .local_value(&network, &format!("turn:{}", request.operation_id))?;
-                    if known.as_ref().and_then(|v| v["turn"]["id"].as_str()) != Some(turn) {
-                        continue;
-                    }
-                    let state = if event["params"]["turn"]["status"] == "completed" {
-                        OperationState::Succeeded
-                    } else {
-                        OperationState::Failed
-                    };
-                    self.finish(request, state, event.clone()).await?;
-                } else if !method.ends_with("/delta")
-                    && (method == "item/completed"
-                        || event.get("id").is_some()
-                        || (cli_progress && event["event"]["type"] != "stream_event"))
-                {
-                    let bytes = serde_json::to_vec(&event)?;
-                    let request_digest = crypto::digest(&bytes);
-                    let request_notification =
-                        format!("approval:{}:{}", request.operation_id, request_digest);
-                    if event.get("id").is_some() {
-                        let context = self.store.lock().await.context(
-                            &network,
-                            &request.conversation_id,
-                            &[],
-                        )?;
-                        let observed = context.events.iter().any(|existing| {
-                            matches!(&existing.body,
-                            EventBody::ExecutionObserved { operation_id, status, detail, .. }
-                            if operation_id == &request.operation_id && status == "needs_input"
-                            && (detail == &event || detail["event_blob"]["hash"] == request_digest))
-                        });
-                        let notified = context.events.iter().any(|existing| matches!(&existing.body,
-                            EventBody::NotificationRaised { notification_id, .. } if notification_id == &request_notification));
-                        if observed && notified {
-                            continue;
-                        }
-                    }
-                    let mut blobs = vec![];
-                    let detail = if bytes.len() > 262144 {
-                        let blob = BlobRef {
-                            hash: crypto::digest(&bytes),
-                            size: bytes.len() as u64,
-                        };
-                        self.store.lock().await.put_blob(&network, &blob, &bytes)?;
-                        blobs.push(blob.clone());
-                        json!({"event_blob":blob})
-                    } else {
-                        event.clone()
-                    };
-                    self.append_blobs(
-                        &network,
-                        &request.conversation_id,
-                        EventBody::ExecutionObserved {
-                            operation_id: request.operation_id.clone(),
-                            task_id: request.task_id.clone(),
-                            target_node: request.target_node.clone(),
-                            session_id: request.session_id.clone(),
-                            status: if event.get("id").is_some() {
-                                "needs_input"
-                            } else {
-                                "progress"
-                            }
-                            .into(),
-                            detail,
-                        },
-                        blobs,
-                    )
-                    .await?;
-                    if event.get("id").is_some() {
-                        let exists = self.store.lock().await.context(&network, &request.conversation_id, &[])?.events.iter().any(|existing|
-                            matches!(&existing.body, EventBody::NotificationRaised { notification_id, .. } if notification_id == &request_notification));
-                        if !exists {
-                            self.append(
-                                &network,
-                                &request.conversation_id,
-                                EventBody::NotificationRaised {
-                                    notification_id: request_notification,
-                                    kind: "needs_input".into(),
-                                    text: "助手正在等待本人审批或补充输入。".into(),
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    async fn reconcile(
-        self: &Arc<Self>,
-        network: &str,
-        target: &str,
-        operation_id: &str,
-    ) -> Result<Value> {
-        if target != self.identity.peer_id()? {
-            return self
-                .peer_request(
-                    network,
-                    target,
-                    json!({"type":"reconcile","operation_id":operation_id}),
-                )
-                .await;
-        }
-        let Some(operation) = self.store.lock().await.operation(network, operation_id)? else {
-            return Ok(
-                json!({"operation":null,"state":"not_found","target_node":target,"checked_at_ms":now_ms()}),
-            );
-        };
-        if operation.state.terminal() {
-            return Ok(json!({"operation":operation}));
-        }
-        let Some(session_id) = operation.request.session_id.as_deref() else {
-            return Ok(
-                json!({"operation":operation,"actual":{"state":"unknown","detail":"Command process outcome requires evidence from the execution device; it will not be replayed."}}),
-            );
-        };
-        let mut actual = self.session_fact(network, target, session_id).await?;
-        let known = self
-            .store
-            .lock()
-            .await
-            .local_value(network, &format!("turn:{operation_id}"))?;
-        if let Some(turn_id) = known.as_ref().and_then(|v| v["turn"]["id"].as_str()) {
-            let native_id = actual["session"]["native_session_id"]
-                .as_str()
-                .context("execution session has no native ID")?;
-            let turn = match self.engine.read_turn(native_id, turn_id).await {
-                Ok(turn) => turn,
-                Err(error) => {
-                    actual["reconcile_error"] = json!(format!("{error:#}"));
-                    None
-                }
-            };
-            if let Some(turn) = turn
-                && matches!(
-                    turn["status"].as_str(),
-                    Some("completed" | "failed" | "interrupted")
-                )
-            {
-                self.finish(
-                    &operation.request,
-                    if turn["status"] == "completed" {
-                        OperationState::Succeeded
-                    } else {
-                        OperationState::Failed
-                    },
-                    json!({"reconciled_turn":turn}),
-                )
-                .await?;
-            }
-        }
-        Ok(
-            json!({"operation":self.store.lock().await.operation(network,operation_id)?,"actual":actual}),
-        )
-    }
-    async fn resolve_unknown(self: &Arc<Self>, network: &str, input: &Value) -> Result<Value> {
-        let target = field(input, "target_node")?;
-        if target != self.identity.peer_id()? {
-            let mut value = input.clone();
-            value["type"] = json!("resolve_unknown");
-            return self.peer_request(network, target, value).await;
-        }
-        let operation = self
-            .store
-            .lock()
-            .await
-            .operation(network, field(input, "operation_id")?)?
-            .context("operation not found")?;
-        ensure!(
-            operation.state == OperationState::Unknown,
-            "only unknown outcomes require a human resolution"
-        );
-        let evidence = field(input, "evidence")?;
-        ensure!(
-            evidence.len() >= 12,
-            "describe how you verified the process and external effects"
-        );
-        let state = match field(input, "outcome")? {
-            "succeeded" => OperationState::Succeeded,
-            "failed" => OperationState::Failed,
-            _ => bail!("invalid resolution"),
-        };
-        self.finish(
-            &operation.request,
-            state,
-            json!({"human_verified":true,"evidence":evidence}),
-        )
-        .await?;
-        Ok(
-            json!({"operation":self.store.lock().await.operation(network,&operation.request.operation_id)?}),
-        )
     }
 }

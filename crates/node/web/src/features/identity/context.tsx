@@ -8,6 +8,7 @@ import {
 } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, LocalJoin, LocalSetup, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
 import { shouldAutoConnect } from './connection-lane'
+import { localBrowserEntry } from '@/lib/local-access'
 import { parseChanged } from '@/lib/progress'
 import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
@@ -22,10 +23,11 @@ type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 type DeviceContextValue = {
   connectionGeneration(): number
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
+  localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null; localJoin: LocalJoin | null
   connect(entry: ConnectionEntry): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; pair(invitation: string, name: string, password?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
-  createLocalNetwork(name: string, password: string): Promise<void>
+  createLocalNetwork(name: string, password: string): Promise<void>; openLocalAccess(): Promise<void>
   acceptLocalJoin(): Promise<void>; refreshLocalJoin(): Promise<void>; useAnotherNodeInvitation(): void
   refreshDirectory(): Promise<void>; createInvitation(kind: 'client' | 'node', roles: NodeRole[]): Promise<string>; approvePair(requestId: string): Promise<void>; revoke(subjectId: string): Promise<void>
   beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }): Promise<void>
@@ -96,6 +98,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [initialInvitation, setInitialInvitation] = useState('')
   const [localSetup, setLocalSetup] = useState<LocalSetup | null>(null)
   const [localJoin, setLocalJoin] = useState<LocalJoin | null>(null)
+  const [localAutoAccess, setLocalAutoAccessState] = useState<boolean | null>(null)
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
   const connecting = useRef<AbortController | null>(null)
@@ -116,7 +119,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     connecting.current?.abort(); connecting.current = null
     const previous = session.current; session.current = null
     previous?.channel.close()
-    listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setInfo(null); setEntry(null)
+    listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setInfo(null); setEntry(null); setLocalAutoAccessState(null)
     waitingRef.current = null; setWaiting(null); setPhase('disconnected'); setError('')
   }, [releaseSensitive])
   const disconnect = useCallback(() => {
@@ -150,7 +153,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!own) throw new Error('浏览器密钥尚未初始化。')
     let verified: ReturnType<typeof verifyAuthentication>
     try {
-      verified = verifyAuthentication(authValue, own, expected)
+      const trust: AuthenticationTrust | null = active.entry.local === true
+        ? { kind: 'local', networkId: expected?.networkId ?? validTarget(record(record(authValue).principal).network_id), peerId: active.entry.peer_id, nodePublicKey: active.info.public_key }
+        : expected
+      verified = verifyAuthentication(authValue, own, trust)
       const pinnedNetwork = load(`network-for.${active.entry.peer_id}`)
       if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
@@ -158,6 +164,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const { principal, view } = verified
     await request('subscribe')
     if (session.current !== active || active.generation !== generation.current) throw changed()
+    if (principal.source === 'membership' && active.entry.local) active.entry = { ...active.entry, local: false }
+    setLocalAutoAccessState(typeof verified.auth.local_auto_access === 'boolean' ? verified.auth.local_auto_access : null)
     store(`network-for.${active.entry.peer_id}`, principal.network_id)
     saveEntry(active.entry)
     store('last-authenticated', { entry: active.entry, networkId: principal.network_id } satisfies AuthenticatedEntry)
@@ -186,6 +194,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (reconnect.current !== target) return
       let active: Session | null = null
       try {
+        if (target.entry.local) {
+          const own = identityRef.current
+          const local = own && await localBrowserEntry(own, null)
+          if (reconnect.current !== target) return
+          if (!local || entryKey(local) !== entryKey(target.entry)) {
+            resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用普通邀请配对。')
+            return
+          }
+        }
         active = await open(target.entry, true)
         const auth = await callSession(active, 'authenticate', { network_id: target.networkId })
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
@@ -267,11 +284,25 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
     setDirectory(view); setPairs(pending)
   }
+  async function setLocalAutoAccess(enabled: boolean) {
+    const active = current(), connection = ready
+    if (!connection?.isCurrent() || !connection.principal.can_manage && !(connection.principal.source === 'local_session' && !enabled)) throw new Error('此连接不能变更本机自动访问设置。')
+    try {
+      const response = record(await callSession(active, 'local_access', { enabled }))
+      setLocalAutoAccessState(boolean(response.enabled))
+    } catch (cause) {
+      if (connection.principal.source === 'local_session' && !enabled && !isResponseError(cause)) {
+        disconnect(); setError('关闭本机自动访问的结果尚未确认。请在本机配置中核对，或重新连接检查。')
+      }
+      throw cause
+    }
+    if (connection.principal.source === 'local_session' && !enabled) disconnect()
+  }
   async function createInvitation(kind: 'client' | 'node', selectedRoles: NodeRole[]) {
     if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
     const request = scoped()
     const requestedRoles = kind === 'node' ? [...new Set(selectedRoles)].sort() : []
-    if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler', 'executor'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入、调度和执行同时需要同步权限。')
+    if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入和调度同时需要同步权限。')
     const prepared = record(await request('prepare_invite', { kind, node_roles: requestedRoles, request_id: crypto.randomUUID() }))
     const invite = record(prepared.invite); const payload = record(invite.payload)
     if (payload.new_kind !== kind || !same(payload.node_roles, requestedRoles) || payload.manage !== false || payload.inviter_subject_id !== identityRef.current.peerId || payload.network_id !== ready.principal.network_id || payload.epoch !== ready.principal.epoch || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请模板与所选权限不一致。')
@@ -280,7 +311,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     invite.inviter_signature = sign(prepared.signing, 'identity-invite', payload)
     const result = record(await request('commit_invite', { invite, capability: prepared.capability }))
     if (!same(result.invite, invite) || result.capability !== prepared.capability) throw new Error('保存后的邀请与已签名内容不一致。')
-    return JSON.stringify({ url: ready.entry.address, peer_id: ready.entry.peer_id, relay: ready.entry.relay, invite: result })
+    const route = ready.info.connection_entry ?? ready.entry
+    return JSON.stringify({ url: route.address, peer_id: ready.entry.peer_id, relay: route.relay, invite: result })
   }
   async function approvePair(requestId: string) {
     if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
@@ -321,7 +353,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (version !== generation.current) throw changed()
       if ((result.kind === 'review' || result.kind === 'pending') && (result.review.network_id !== invitation.payload.network_id || result.review.inviter_subject_id !== invitation.payload.inviter_subject_id || result.review.invite_id !== invitation.payload.invite_id || result.review.epoch !== invitation.payload.epoch || result.review.new_member.name !== name || !same(result.review.new_member.node_roles, invitation.payload.node_roles) || result.review.expires_at_ms > integer(invitation.payload.expires_at_ms))) throw new Error('节点加入确认与原邀请不一致，已停止操作。')
       setLocalJoin(result)
-      if (result.kind === 'joined') setLocalSetup({ kind: 'initialized', entry: setup.invitation.entry })
+      if (result.kind === 'joined') await refreshJoinedSetup(setup.invitation.entry, version, controller.signal)
       return
     }
     const active = await open(invitation.entry)
@@ -391,6 +423,29 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const { entry, capability } = localSetup.invitation
     await pair(JSON.stringify({ url: entry.address, peer_id: entry.peer_id, capability }), name, password)
   }
+  async function openLocalAccess() {
+    if (localSetup?.kind !== 'initialized') throw new Error('请先打开此节点的本机设置页。')
+    const version = generation.current, controller = new AbortController(); connecting.current = controller
+    const setup = await discoverLocalSetup(controller.signal)
+    if (version !== generation.current) throw changed()
+    if (setup?.kind !== 'initialized' || setup.entry.peer_id !== localSetup.entry.peer_id) throw new Error('本机设置的节点已变化，请刷新页面后核对。')
+    setLocalSetup(setup)
+    if (!setup.local_launch) throw new Error('本机自动访问已关闭。请使用成员邀请或恢复包授权此浏览器。')
+    const url = new URL(setup.local_launch.url)
+    url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.peer_id }).toString()
+    location.assign(url.href)
+  }
+  async function refreshJoinedSetup(entry: ConnectionEntry, version: number, signal: AbortSignal) {
+    setLocalSetup({ kind: 'initialized', entry })
+    try {
+      const setup = await discoverLocalSetup(signal)
+      if (version !== generation.current) return
+      if (setup?.kind !== 'initialized' || setup.entry.peer_id !== entry.peer_id) throw new Error('本机设置的节点状态已变化。')
+      setLocalSetup(setup)
+    } catch (cause) {
+      if (version === generation.current) setError(`此节点已加入网络，但本机入口尚未刷新。请刷新此页后继续。${messageOf(cause)}`)
+    }
+  }
   async function refreshLocalJoin() {
     if (!localSetup) throw new Error('请先打开此节点的 localhost 页面。')
     const entry = localSetup.kind === 'uninitialized' ? localSetup.invitation.entry : localSetup.entry
@@ -398,7 +453,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const result = await localJoinRequest('status', {}, entry, controller.signal)
     if (version !== generation.current) throw changed()
     setLocalJoin(result); setError('')
-    if (result.kind === 'joined') setLocalSetup({ kind: 'initialized', entry })
+    if (result.kind === 'joined') await refreshJoinedSetup(entry, version, controller.signal)
   }
   async function acceptLocalJoin() {
     if (!localSetup || localJoin?.kind !== 'review') throw new Error('请先核对节点加入信息。')
@@ -407,7 +462,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const result = await localJoinRequest('accept', { request_id: localJoin.request_id, review_hash: localJoin.review_hash }, entry, controller.signal)
     if (version !== generation.current) throw changed()
     setLocalJoin(result); setError('')
-    if (result.kind === 'joined') setLocalSetup({ kind: 'initialized', entry })
+    if (result.kind === 'joined') await refreshJoinedSetup(entry, version, controller.signal)
   }
   async function acceptPair() {
     const request = scoped()
@@ -511,6 +566,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     setEntries(savedEntries())
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = fragment.get('bootstrap') || fragment.get('invite') || ''
+    const localToken = fragment.get('local')
+    const localLaunch = localToken ? { token: localToken, peerId: fragment.get('node') ?? '' } : null
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
     if (invitation) setInitialInvitation(invitation)
     initClient().then(async own => {
@@ -518,6 +575,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       identityRef.current = own; setIdentity(own)
       if (version !== generation.current) return
       setPhase('disconnected')
+      if (!invitation) {
+        const local = await localBrowserEntry(own, localLaunch)
+        if (!mounted || version !== generation.current) return
+        if (local) { const opening = connect(local); version = generation.current; await opening; return }
+      }
       const pending = invitation ? null : loadWaiting()
       if (pending && pending.review.new_member.subject_id === own.peerId) {
         const opening = open(pending.entry); version = generation.current
@@ -535,7 +597,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             const result = await localJoinRequest('status', {}, local.invitation.entry, setupController.signal)
             if (!mounted || version !== generation.current) return
             setLocalJoin(result)
-            if (result.kind === 'joined') setLocalSetup({ kind: 'initialized', entry: local.invitation.entry })
+            if (result.kind === 'joined') await refreshJoinedSetup(local.invitation.entry, version, setupController.signal)
           } catch (cause) { if (mounted && version === generation.current) setError(messageOf(cause)) }
           return
         }
@@ -565,8 +627,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }, [localJoin])
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current,
-    identity, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation, localSetup, localJoin,
-    connect, disconnect, saveEntry, removeEntry, replaceLostKey, pair, createLocalNetwork, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
+    identity, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation, localSetup, localJoin, localAutoAccess, setLocalAutoAccess,
+    connect, disconnect, saveEntry, removeEntry, replaceLostKey, pair, createLocalNetwork, openLocalAccess, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
     acceptLocalJoin, refreshLocalJoin, useAnotherNodeInvitation() { resetConnection(); setLocalJoin(null) },
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有待下载的恢复包。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },

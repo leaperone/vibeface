@@ -36,8 +36,8 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const wasOpen = useRef(false)
   useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
   const projects = workspace.nodes.flatMap((node, index) => {
-    if (node.revoked || !node.online || !node.roles.includes("executor")) return []
-    const deviceName = nodeName(node.peer_id, { nodes: workspace.nodes, directory }, node.local ? "本机" : `执行设备 ${index + 1}`)
+    if (node.revoked || !node.online || !node.capabilities?.manager) return []
+    const deviceName = nodeName(node.peer_id, { nodes: workspace.nodes, directory }, node.local ? "本机" : `工作设备 ${index + 1}`)
     return (node.capabilities?.roots ?? []).map((cwd) => {
       const project = { target_node: node.peer_id, cwd }
       return { key: projectKey(project), project, label: `${deviceName} · ${cwd}` }
@@ -45,7 +45,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   })
   const savedProject = pending?.project
   const savedProjectLabel = savedProject
-    ? projects.find((item) => item.key === projectKey(savedProject))?.label ?? `${nodeName(savedProject.target_node, { nodes: workspace.nodes, directory }, "原执行设备")} · ${savedProject.cwd}`
+    ? projects.find((item) => item.key === projectKey(savedProject))?.label ?? `${nodeName(savedProject.target_node, { nodes: workspace.nodes, directory }, "原工作设备")} · ${savedProject.cwd}`
     : "不关联项目"
 
   useEffect(() => {

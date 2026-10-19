@@ -18,6 +18,7 @@ const draftOf = (value: NodeSettingsResponse): Draft => ({
 
 export function NodeSettingsControls({ active }: { active: boolean }) {
   const { ready } = useDevice()
+  const canConfigure = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
   const [busy, setBusy] = useState(false)
@@ -28,7 +29,7 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
   useEffect(() => {
     const owner = ++sequence.current
     setResponse(null); setDraft(null); setError(''); setStatus(''); setBusy(false); pending.current = false
-    if (!active || !ready?.principal.can_manage) return
+    if (!active || !ready || !canConfigure) return
     setBusy(true)
     void ready.request('node_settings').then(value => {
       if (owner !== sequence.current || !ready.isCurrent()) return
@@ -38,9 +39,9 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
       if (owner === sequence.current && ready.isCurrent()) setError(messageOf(cause))
     }).finally(() => { if (owner === sequence.current) setBusy(false) })
     return () => { sequence.current += 1 }
-  }, [active, ready])
+  }, [active, ready, canConfigure])
   async function run(save: boolean) {
-    if (pending.current || !ready?.isCurrent() || !ready.principal.can_manage || save && !draft) return
+    if (pending.current || !ready?.isCurrent() || !canConfigure || save && !draft) return
     const connection = ready, owner = ++sequence.current
     pending.current = true; setBusy(true); setError(''); setStatus('')
     try {
@@ -64,7 +65,7 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
       if (owner === sequence.current) { pending.current = false; setBusy(false) }
     }
   }
-  if (!ready?.principal.can_manage) return null
+  if (!ready || !canConfigure) return null
   return <Card>
     <CardHeader><CardTitle>此节点的 Agent 与项目目录</CardTitle></CardHeader>
     <CardContent className="space-y-4">
@@ -75,7 +76,6 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
         : response.readiness.manager === 'role_unavailable' ? '此节点没有调度角色授权，当前不能运行管理 Agent。保存配置不会授予新角色。'
         : response.readiness.manager === 'missing_prerequisites' ? `还缺少 ${response.readiness.missing.join('、')}。请先在此节点安装所需程序。`
         : '已检测到所需程序，Provider 登录和真实模型调用尚未验证。'}</p>}
-      {response && !response.readiness.executor_available && <p className="text-sm text-muted-foreground">此节点没有执行角色授权。设置项目目录不会启用编码执行。</p>}
       {draft && <form className="space-y-4" onSubmit={event => { event.preventDefault(); void run(true) }}>
         <fieldset disabled={busy} className="space-y-4 disabled:opacity-70">
           <label className="grid gap-2 text-sm">管理 Agent<NativeSelect className="w-full [&>select]:min-h-11" name="provider" value={draft.provider} onChange={event => {
@@ -98,8 +98,8 @@ export function NodeSettingsControls({ active }: { active: boolean }) {
               </CollapsibleContent>
             </Collapsible>
           </>}
-          <label className="grid gap-2 text-sm">允许执行的项目目录<Textarea name="roots" className="min-h-28 font-mono text-xs" value={draft.roots} placeholder="/absolute/path/to/project" aria-describedby="execution-roots-hint" onChange={event => setDraft({ ...draft, roots: event.target.value })} /></label>
-          <p id="execution-roots-hint" className="text-xs text-muted-foreground">每行填写一个此节点已有的绝对目录。留空时，不允许执行器访问项目目录。</p>
+          <label className="grid gap-2 text-sm">Agent 可使用的项目目录<Textarea name="roots" className="min-h-28 font-mono text-xs" value={draft.roots} placeholder="/absolute/path/to/project" aria-describedby="project-roots-hint" onChange={event => setDraft({ ...draft, roots: event.target.value })} /></label>
+          <p id="project-roots-hint" className="text-xs text-muted-foreground">每行填写一个此节点已有的绝对目录。留空时，Agent 不使用项目目录。</p>
           <Button className="min-h-11" type="submit">保存节点设置</Button>
         </fieldset>
       </form>}
