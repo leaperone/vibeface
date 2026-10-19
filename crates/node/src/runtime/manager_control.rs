@@ -98,6 +98,7 @@ impl Runtime {
             )?;
             // Wait for admitted tools before declaring this attempt unable to write.
             let _drained = active.admission.clone().write_owned().await;
+            self.clear_agent_blob_attempt(attempt_id).await;
         }
         Ok(())
     }
@@ -108,6 +109,7 @@ impl Runtime {
             active.fenced.store(true, Ordering::Release);
             self.agent_tokens.lock().await.remove(&active.token);
             let _drained = active.admission.clone().write_owned().await;
+            self.clear_agent_blob_attempt(attempt_id).await;
             self.manager_controls.lock().await.remove(attempt_id);
         }
     }

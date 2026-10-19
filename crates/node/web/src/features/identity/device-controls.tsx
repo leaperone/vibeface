@@ -45,8 +45,10 @@ function MemberDetails({ member, compact = false }: { member: Member; compact?: 
 export function DeviceControls() {
   const device = useDevice()
   const { ready, identity, entries, directory, pairs } = device
-  const [busy, setBusy] = useState(false)
-  const actionPending = useRef(false)
+  const generation = device.connectionGeneration()
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === generation
+  const actionPending = useRef<number | null>(null)
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [address, setAddress] = useState('')
@@ -75,10 +77,10 @@ export function DeviceControls() {
   }, [ready])
 
   async function run(action: () => Promise<void>, success = '') {
-    if (actionPending.current) return
-    actionPending.current = true
+    if (actionPending.current === generation) return
+    actionPending.current = generation
     const connection = ready
-    setBusy(true)
+    setBusyGeneration(generation)
     setError('')
     setStatus('')
     try {
@@ -87,8 +89,8 @@ export function DeviceControls() {
     } catch (failure: unknown) {
       if (connection?.isCurrent()) setError(failure instanceof Error ? failure.message : '操作失败，请核对后重试。')
     } finally {
-      actionPending.current = false
-      setBusy(false)
+      if (actionPending.current === generation) actionPending.current = null
+      setBusyGeneration(owner => owner === generation ? null : owner)
     }
   }
 
@@ -119,7 +121,7 @@ export function DeviceControls() {
             <dl className="grid gap-3 text-xs"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{pair.review.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{pair.review.inviter_subject_id}</dd></div></dl>
             <label className="flex min-h-11 items-start gap-2 text-sm"><input className="mt-1" type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} />我已通过可信渠道核对以上设备信息</label>
             <div className="flex flex-wrap gap-2">
-              <Button type="button" className={button} disabled={busy || !reviewConfirmed} onClick={() => void run(async () => { await device.approvePair(pair.request_id); setReview(null); setReviewConfirmed(false) }, '设备已获授权。')}>确认授权</Button>
+              <Button type="button" className={button} disabled={busy || !reviewConfirmed} onClick={() => void run(async () => { await device.approvePair(pair.request_id); if (ready?.isCurrent()) { setReview(null); setReviewConfirmed(false) } }, '设备已获授权。')}>确认授权</Button>
               <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => { setReview(null); setReviewConfirmed(false) }}>取消</Button>
             </div>
           </div> : <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => { setReview(pair); setReviewConfirmed(false) }}>核对设备信息</Button>}
@@ -142,7 +144,7 @@ export function DeviceControls() {
             {canManage && !member.manage && revokeSubject === member.subject_id && <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
               <p className="break-all text-sm">撤销后，此设备将失去网络访问权限。确认撤销「{member.name || member.subject_id}」？</p>
               <div className="flex flex-wrap gap-2">
-                <Button type="button" variant="destructive" className={button} disabled={busy} onClick={() => void run(async () => { await device.revoke(member.subject_id); setRevokeSubject('') }, '设备授权已撤销。')}>确认撤销</Button>
+                <Button type="button" variant="destructive" className={button} disabled={busy} onClick={() => void run(async () => { await device.revoke(member.subject_id); if (ready?.isCurrent()) setRevokeSubject('') }, '设备授权已撤销。')}>确认撤销</Button>
                 <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => setRevokeSubject('')}>取消</Button>
               </div>
             </div>}

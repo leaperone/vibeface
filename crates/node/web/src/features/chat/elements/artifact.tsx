@@ -10,20 +10,23 @@ export function Artifact({ hash, size }: { hash: string; size: number }) {
   const [nextOffset, setNextOffset] = useState<number | null>(0)
   const [opened, setOpened] = useState(false)
   const cursor = useRef<number | null>(0)
-  const inFlight = useRef(false)
-  const [reading, setReading] = useState(false)
+  const inFlight = useRef<number | null>(null)
+  const [readingGeneration, setReadingGeneration] = useState<number | null>(null)
+  const reading = readingGeneration === workspace.generation
   const readNext = async () => {
-    if (cursor.current === null || inFlight.current) return
-    inFlight.current = true
-    setReading(true)
+    if (cursor.current === null || inFlight.current === workspace.generation) return
+    const generation = workspace.generation
+    inFlight.current = generation
+    setReadingGeneration(generation)
     try {
       const page = await workspace.readArtifact(hash, cursor.current)
+      if (!workspace.isCurrent()) return
       if (page.size !== size) throw new Error('产物大小与消息引用不符，已停止读取。')
       cursor.current = page.next_offset
       setContent((previous) => previous + page.text)
       setNextOffset(page.next_offset)
       setOpened(true)
-    } finally { inFlight.current = false; setReading(false) }
+    } finally { if (inFlight.current === generation) inFlight.current = null; setReadingGeneration(owner => owner === generation ? null : owner) }
   }
   return <Card className="w-full min-w-0 gap-0 py-0">
     <CardContent className="space-y-3 p-3">
@@ -35,6 +38,7 @@ export function Artifact({ hash, size }: { hash: string; size: number }) {
           let offset: number | null = 0
           while (offset !== null) {
             const page = await workspace.readArtifact(hash, offset)
+            if (!workspace.isCurrent()) return
             if (page.size !== size) throw new Error('产物大小与消息引用不符，已停止下载。')
             parts.push(page.text)
             offset = page.next_offset

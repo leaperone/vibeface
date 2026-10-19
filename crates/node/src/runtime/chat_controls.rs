@@ -533,7 +533,7 @@ fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Va
 
 impl Runtime {
     pub(super) async fn conversation_snapshot(
-        &self,
+        self: &Arc<Self>,
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
@@ -953,9 +953,18 @@ impl Runtime {
             .or_else(|| jobs.iter().rev().find(|job| job["manager"].is_object()))
             .map(|job| job["manager"].clone());
         let metadata = remote_manager.unwrap_or_else(||json!({"provider":manager.map(|manager|&manager.provider),"model":manager.map(|manager|&manager.model),"capabilities":capabilities}));
-        Ok(
-            json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":messages,"tasks":tasks,"executions":executions,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations,"facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets}),
-        )
+        let current_roots = store.heads(network, scope)?;
+        let needs_sync = !store
+            .missing_dependencies(network, &current_roots)?
+            .is_complete();
+        let snapshot = json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":messages,"tasks":tasks,"executions":executions,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations,"facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets});
+        drop(store);
+        if needs_sync
+            && let Err(error) = self.request_scope_sync(network, scope, current_roots).await
+        {
+            tracing::debug!(network,scope,%error,"conversation history synchronization deferred");
+        }
+        Ok(snapshot)
     }
 
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {

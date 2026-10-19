@@ -9,6 +9,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/u
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Spinner } from "@/components/ui/spinner"
 import { stateLabel, textOf } from "./labels"
+import { useWorkspace } from "./context"
 
 export function StatusBadge({ value, label }: { value?: string; label?: string }) {
   const text = stateLabel(value, label)
@@ -70,7 +71,9 @@ export function ActionButton({
   disabled?: boolean
   action: () => Promise<void>
 }) {
-  const [busy, setBusy] = useState(false)
+  const workspace = useWorkspace()
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === workspace.generation
   return (
     <Button
       type="button"
@@ -80,8 +83,9 @@ export function ActionButton({
       aria-busy={busy}
       onClick={() => {
         if (busy) return
-        setBusy(true)
-        void action().finally(() => setBusy(false))
+        const generation = workspace.generation
+        setBusyGeneration(generation)
+        void action().finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
       }}
     >
       {busy ? <Spinner /> : null}

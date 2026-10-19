@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { lstat, open, readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createHash, createPrivateKey, sign } from 'node:crypto';
 
 const args = process.argv.slice(2);
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
@@ -21,6 +22,75 @@ function endpoint() {
     try {
       let result = null;
       switch (input.op) {
+        case 'fixture_identity': {
+          let fixture;
+          try {
+            const metadata = await lstat(input.identity_file);
+            assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
+            fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+            fixture = crypto.Identity.generate();
+            try {
+              await writeFile(input.identity_file, JSON.stringify({secret_key_hex:fixture.secretHex()})+'\n', {mode:0o600,flag:'wx'});
+            } catch (error) { fixture.free(); throw error; }
+          }
+          if (input.expected_node_id) {
+            try { assert(fixture.nodeId() === input.expected_node_id, 'fixture identity must retain the pinned target'); }
+            catch (error) { fixture.free(); throw error; }
+          }
+          identity.free(); identity = fixture;
+          result = {public_key:identity.publicKeyHex(),node_id:identity.nodeId()};
+          break;
+        }
+        case 'fixture_reachability': {
+          const metadata = await lstat(input.identity_file);
+          assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
+          const fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
+          try {
+            assert(fixture.nodeId() === input.expected_node_id, 'fixture signer must match the original target');
+            assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
+            assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
+            const issued = Math.floor(Date.now() / 1000);
+            const record = {node_id:fixture.nodeId(),public_key:fixture.publicKeyHex(),direct_urls:[],relay_urls:input.relay_urls,
+              issued_at:issued,expires_at:issued+input.ttl_secs,signature:''};
+            record.signature = fixture.sign('reachability',new TextEncoder().encode(JSON.stringify(record)));
+            result = record;
+          } finally { fixture.free(); }
+          break;
+        }
+        case 'fixture_event':
+        case 'fixture_chain': {
+          const secret = JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex;
+          const key = createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.from(secret,'hex')]),format:'der',type:'pkcs8'});
+          const signed = event => {
+            const canonical_body = JSON.stringify(event);
+            const hash = createHash('sha256').update(canonical_body).digest('hex');
+            return {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v1:${hash}`),key).toString('hex')};
+          };
+          if (input.op === 'fixture_event') { result = signed(input.event); break; }
+          assert(Number.isInteger(input.count) && input.count >= 2 && input.count <= 100001, 'fixture chain count must be between 2 and 100001');
+          const output = await open(input.output_file, 'wx', 0o600);
+          const digest = createHash('sha256');
+          let first_hash, previous = null, page = '';
+          try {
+            for (let index = 0; index < input.count; index++) {
+              const event = {...input.event,sequence:index+1,previous,parents:previous ? [previous] : [],
+                body:index ? {type:'context_checkpoint',summary:'fixture',covered_heads:[]} : {type:'conversation_created',title:'NET-1 continuation fixture'},
+                blobs:index === input.count-1 ? [input.blob] : []};
+              const envelope = signed(event);
+              first_hash ??= envelope.hash;
+              previous = envelope.hash;
+              const line = `${JSON.stringify(envelope)}\n`;
+              digest.update(line); page += line;
+              if ((index+1) % 1024 === 0) { await output.writeFile(page); page = ''; }
+            }
+            if (page) await output.writeFile(page);
+            await output.sync();
+          } finally { await output.close(); }
+          result = {count:input.count,first_hash,head:previous,envelopes_sha256:digest.digest('hex')};
+          break;
+        }
         case 'identity':
           if (input.secret_hex) { identity.free(); identity = crypto.Identity.fromSecretHex(input.secret_hex); }
           result = { public_key: identity.publicKeyHex(), node_id: identity.nodeId() }; break;

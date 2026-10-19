@@ -281,3 +281,42 @@ pub struct IngestOutcome {
     pub status: String,
     pub missing: MissingDependencies,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncState {
+    Complete,
+    Partial,
+    Unreachable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosureSync {
+    pub scope_id: ScopeId,
+    pub target: NodeId,
+    pub state: SyncState,
+    pub missing: MissingDependencies,
+    pub processed: usize,
+    pub changed: bool,
+    pub errors: Vec<String>,
+}
+impl ClosureSync {
+    pub fn require_complete(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state == SyncState::Complete,
+            "history is {:?}: {} events, {} blobs, {} conflicts",
+            self.state,
+            self.missing.events.len(),
+            self.missing.blobs.len(),
+            self.missing.conflicts.len()
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReport {
+    pub state: SyncState,
+    pub scopes: Vec<ClosureSync>,
+    pub unreachable_sources: Vec<NodeId>,
+}

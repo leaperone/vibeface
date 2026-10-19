@@ -10,16 +10,22 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
+mod blob_reader;
+pub(crate) mod blob_transfer;
 pub(crate) mod bots;
 pub(crate) mod followup;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610160001_initial.sql");
 
 pub struct Store {
+    blob_readers: blob_reader::BlobReaders,
     connection: Connection,
+    path: PathBuf,
+    process_lock: Option<Arc<std::fs::File>>,
 }
 #[derive(Clone)]
 struct StoredEvent {
@@ -61,7 +67,12 @@ impl Store {
                 "unsupported database schema version {version}; initialize a fresh Node data directory"
             ),
         }
-        let mut store = Self { connection };
+        let mut store = Self {
+            blob_readers: Default::default(),
+            connection,
+            path: path.to_owned(),
+            process_lock: None,
+        };
         // Reject incompatible membership before recovery changes operations or rebuilds projections.
         for network in store.networks()? {
             store
@@ -103,6 +114,7 @@ impl Store {
         if previous.as_ref() == Some(&encoded) {
             return Ok(false);
         }
+        self.blob_readers.retire_network(network_id);
         tx.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
         for member in merged.historical_nodes()? {
             let old: Option<String> = tx
@@ -118,6 +130,7 @@ impl Store {
             );
             tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,node_id,public_key) VALUES(?,?,?)",params![network_id,member.subject_id,member.public_key])?;
         }
+        rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
         Ok(true)
     }
@@ -176,40 +189,73 @@ impl Store {
         let key = self.public_key(network_id, &event.author)?;
         verify_signed_event(network_id, envelope, &key)
     }
+    pub fn ingest_events(&mut self, network_id: &str, envelopes: &[SignedEvent]) -> Result<usize> {
+        ensure!(envelopes.len() <= 1024, "event batch is too large");
+        ensure!(
+            envelopes
+                .iter()
+                .map(|event| event.canonical_body.len())
+                .sum::<usize>()
+                <= 8 * MAX_EVENT_BYTES,
+            "event batch byte limit exceeded"
+        );
+        let verified = envelopes
+            .iter()
+            .map(|envelope| {
+                Ok((
+                    envelope,
+                    self.verify_event(network_id, envelope)?,
+                    serde_json::to_string(envelope)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut inserted = 0;
+        for (envelope, event, encoded) in verified {
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                    params![network_id, envelope.hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(old) = old {
+                ensure!(old == encoded, "conflicting envelope for event hash");
+                continue;
+            }
+            tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
+            inserted += 1;
+        }
+        if inserted != 0 {
+            rebuild_projections_from(&tx, network_id)?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
     pub fn ingest_event(
         &mut self,
         network_id: &str,
         envelope: &SignedEvent,
     ) -> Result<IngestOutcome> {
-        let event = self.verify_event(network_id, envelope)?;
-        let encoded = serde_json::to_string(envelope)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
-                params![network_id, envelope.hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(old) = old {
-            ensure!(old == encoded, "conflicting envelope for event hash");
-        } else {
-            tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
-        }
-        rebuild_projections_from(&tx, network_id)?;
-        tx.commit()?;
+        self.ingest_events(network_id, std::slice::from_ref(envelope))?;
         let status: String = self.connection.query_row(
             "SELECT status FROM events WHERE network_id=? AND hash=?",
             params![network_id, envelope.hash],
-            |r| r.get(0),
+            |row| row.get(0),
         )?;
         Ok(IngestOutcome {
             hash: envelope.hash.clone(),
             status,
             missing: self.missing_dependencies(network_id, std::slice::from_ref(&envelope.hash))?,
         })
+    }
+    pub fn projection_generation(&self, network_id: &str) -> Result<u64> {
+        Ok(self
+            .local_value(network_id, "net1:v1:projection-generation")?
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0))
     }
     pub fn append_event(
         &mut self,
@@ -1109,6 +1155,45 @@ impl Store {
     pub fn heads(&self, network_id: &str, scope_id: &str) -> Result<Vec<EventHash>> {
         Ok(heads_from_events(&self.load_events(network_id)?, scope_id))
     }
+    pub(crate) fn inventory_heads(&self, network: &str) -> Result<Vec<(ScopeId, Vec<EventHash>)>> {
+        let events = self.load_events(network)?;
+        let mut scopes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (hash, entry) in &events {
+            scopes
+                .entry(entry.event.scope_id.clone())
+                .or_default()
+                .insert(hash.clone());
+        }
+        for entry in events.values() {
+            if let Some(heads) = scopes.get_mut(&entry.event.scope_id) {
+                for parent in dependencies(&entry.event) {
+                    heads.remove(parent);
+                }
+            }
+        }
+        Ok(scopes
+            .into_iter()
+            .map(|(scope, heads)| (scope, heads.into_iter().collect()))
+            .collect())
+    }
+    pub(crate) fn has_known_basis_gap(
+        &self,
+        network_id: &str,
+        heads: &[EventHash],
+    ) -> Result<bool> {
+        let mut query = self
+            .connection
+            .prepare("SELECT status FROM events WHERE network_id=? AND hash=?")?;
+        for hash in heads {
+            let status: Option<String> = query
+                .query_row(params![network_id, hash], |row| row.get(0))
+                .optional()?;
+            if status.as_deref() != Some("ready") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub fn missing_dependencies(
         &self,
         network_id: &str,
@@ -1216,17 +1301,35 @@ impl Store {
         for event in &snapshot.events {
             self.verify_event(network_id, event)?;
         }
-        for event in &snapshot.events {
-            self.ingest_event(network_id, event)?;
-        }
         for hash in &snapshot.heads {
-            if let Some(event) = self.event(network_id, hash)? {
-                let body: Event = serde_json::from_str(&event.canonical_body)?;
+            let envelope = snapshot
+                .events
+                .iter()
+                .find(|event| &event.hash == hash)
+                .cloned()
+                .or(self.event(network_id, hash)?);
+            if let Some(envelope) = envelope {
+                let body: Event = serde_json::from_str(&envelope.canonical_body)?;
                 ensure!(
                     body.scope_id == snapshot.scope_id,
                     "snapshot head scope mismatch"
                 );
             }
+        }
+        let mut start = 0;
+        while start < snapshot.events.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < snapshot.events.len() && end - start < 1024 {
+                let size = snapshot.events[end].canonical_body.len();
+                if bytes + size > 8 * MAX_EVENT_BYTES {
+                    break;
+                }
+                bytes += size;
+                end += 1;
+            }
+            self.ingest_events(network_id, &snapshot.events[start..end])?;
+            start = end;
         }
         self.missing_dependencies(network_id, &snapshot.heads)
     }
@@ -1236,6 +1339,10 @@ impl Store {
             "blob size mismatch or limit exceeded"
         );
         ensure!(digest(content) == expected.hash, "blob hash mismatch");
+        if self.has_blob(network_id, expected)? {
+            return Ok(());
+        }
+        self.blob_readers.retire_blob(network_id, &expected.hash);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1267,6 +1374,105 @@ impl Store {
     pub fn has_blob(&self, network_id: &str, blob: &BlobRef) -> Result<bool> {
         has_blob_from(&self.connection, network_id, blob)
     }
+    pub(crate) fn get_blob_for_ref(
+        &self,
+        network: &str,
+        expected: &BlobRef,
+    ) -> Result<Option<Vec<u8>>> {
+        get_blob_for_ref_from(&self.connection, network, expected)
+    }
+    pub(crate) fn context_blob_ref(
+        &self,
+        network: &str,
+        scope: &str,
+        hash: &str,
+    ) -> Result<BlobRef> {
+        let events = load_events_from(&self.connection, network)?;
+        let reachable = closure_hashes(&events, &heads_from_events(&events, scope));
+        let mut expected: Option<BlobRef> = None;
+        let mut ready = false;
+        for candidate in reachable.iter().filter_map(|hash| events.get(hash)) {
+            if candidate.event.scope_id != scope {
+                continue;
+            }
+            for reference in candidate
+                .event
+                .blobs
+                .iter()
+                .filter(|reference| reference.hash == hash)
+            {
+                ensure!(
+                    expected
+                        .as_ref()
+                        .is_none_or(|expected| expected == reference),
+                    "conflicting blob reference sizes"
+                );
+                expected = Some(reference.clone());
+                if candidate.status == "ready" {
+                    let dependencies: Vec<_> = dependencies(&candidate.event).cloned().collect();
+                    ready |= closure_hashes(&events, &dependencies).iter().all(|hash| {
+                        events
+                            .get(hash)
+                            .is_some_and(|event| event.status == "ready")
+                    });
+                }
+            }
+        }
+        let expected = expected.context("blob outside this conversation")?;
+        ensure!(ready, "blob reference has incomplete causal dependencies");
+        ensure!(
+            blob_metadata_matches(&self.connection, network, &expected)?,
+            "blob not available or metadata mismatch"
+        );
+        Ok(expected)
+    }
+    pub(crate) fn attach_process_lock(&mut self, lock: Arc<std::fs::File>) {
+        self.process_lock = Some(lock);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_durability(&self) -> Result<(String, u32)> {
+        Ok((
+            self.connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
+            self.connection
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))?,
+        ))
+    }
+    pub(crate) fn blob_range(
+        &mut self,
+        network: &str,
+        local_node: &str,
+        origin: &str,
+        hash: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        self.authorize_node(network, local_node, Some(NodeRole::Replica))?;
+        self.authorize_node(network, origin, Some(NodeRole::Replica))?;
+        ensure!((1..=65536).contains(&limit), "invalid blob range limit");
+        let Some(metadata) = blob_reader::metadata(&self.connection, network, hash)? else {
+            return Ok(None);
+        };
+        ensure!(offset <= metadata.size, "invalid blob offset");
+        let offset = usize::try_from(offset)?;
+        let count = limit.min(usize::try_from(metadata.size)? - offset);
+        if count == 0 {
+            return Ok(Some((metadata.size, Vec::new())));
+        }
+        ensure!(
+            self.path != Path::new(":memory:"),
+            "blob ranges require a file database"
+        );
+        let lock = self
+            .process_lock
+            .as_ref()
+            .context("blob reader has no data directory lock")?;
+        let key = blob_reader::ReaderKey::new(network, origin, hash, metadata);
+        let bytes = self
+            .blob_readers
+            .read(&self.path, lock, key, offset, count)?;
+        Ok(Some((metadata.size, bytes)))
+    }
     pub fn rebuild_projections(&mut self, network_id: &str) -> Result<()> {
         let tx = self
             .connection
@@ -1291,6 +1497,13 @@ impl Store {
             });
         }
         Ok(result)
+    }
+    pub(crate) fn has_conversation(&self, network_id: &str, scope_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE network_id=? AND conversation_id=?)",
+            params![network_id, scope_id],
+            |row| row.get(0),
+        )?)
     }
     pub fn messages(&self, network_id: &str, scope_id: &str) -> Result<Vec<Message>> {
         let mut statement=self.connection.prepare("SELECT message_id,role,text,event_hash,created_at_ms FROM messages WHERE network_id=? AND conversation_id=? ORDER BY ordinal")?;
@@ -3089,6 +3302,14 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
             _ => {}
         }
     }
+    let generation: u64 = connection.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM local_values WHERE network_id=? AND key='net1:v1:projection-generation'),0)",
+        [network_id], |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT INTO local_values(network_id,key,value) VALUES(?,'net1:v1:projection-generation',?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",
+        params![network_id, generation.checked_add(1).context("projection generation exhausted")?.to_string()],
+    )?;
     Ok(())
 }
 fn authorize_node_from(
@@ -3479,16 +3700,66 @@ fn load_events_from(
 }
 
 fn has_blob_from(connection: &Connection, network_id: &str, blob: &BlobRef) -> Result<bool> {
+    if blob.size > MAX_BLOB_BYTES as u64 {
+        return Ok(false);
+    }
     let content: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT content FROM blobs WHERE network_id=? AND hash=? AND size=?",
-            params![network_id, blob.hash, blob.size],
+            "SELECT content FROM blobs WHERE network_id=? AND hash=? AND size=? AND length(content)=? AND typeof(content)='blob'",
+            params![network_id, blob.hash, blob.size, blob.size],
             |r| r.get(0),
         )
         .optional()?;
     Ok(content.is_some_and(|c| {
         c.len() as u64 == blob.size && c.len() <= MAX_BLOB_BYTES && digest(&c) == blob.hash
     }))
+}
+
+fn blob_metadata_matches(
+    connection: &Connection,
+    network: &str,
+    expected: &BlobRef,
+) -> Result<bool> {
+    ensure!(
+        expected.size <= MAX_BLOB_BYTES as u64,
+        "blob size limit exceeded"
+    );
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM blobs WHERE network_id=? AND hash=? AND size=? AND length(content)=? AND typeof(content)='blob')",
+        params![network, expected.hash, expected.size, expected.size], |row| row.get(0),
+    )?)
+}
+
+fn get_blob_for_ref_from(
+    connection: &Connection,
+    network: &str,
+    expected: &BlobRef,
+) -> Result<Option<Vec<u8>>> {
+    ensure!(
+        expected.size <= MAX_BLOB_BYTES as u64,
+        "blob size limit exceeded"
+    );
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM blobs WHERE network_id=? AND hash=?)",
+        params![network, expected.hash],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    ensure!(
+        blob_metadata_matches(connection, network, expected)?,
+        "stored blob metadata mismatch"
+    );
+    let bytes: Vec<u8> = connection.query_row(
+        "SELECT content FROM blobs WHERE network_id=? AND hash=? AND size=? AND length(content)=? AND typeof(content)='blob'",
+        params![network, expected.hash, expected.size, expected.size], |row| row.get(0),
+    )?;
+    ensure!(
+        digest(&bytes) == expected.hash,
+        "stored blob failed content verification"
+    );
+    Ok(Some(bytes))
 }
 fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {
     value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
@@ -3599,6 +3870,118 @@ fn validate_day(day: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn blob_ranges_keep_isolated_cursors_and_retire_before_same_length_repairs() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/network-reliability")
+            .join(format!("range-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let lock = Arc::new(crate::config::lock_data_dir(&dir)?);
+        let owner = LocalIdentity::generate();
+        let node = owner.node_id()?;
+        let network = owner.fixture_network_id()?;
+        let mut store = Store::open(dir.join("node.sqlite3"))?;
+        store.attach_process_lock(lock.clone());
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
+        )?;
+        let bytes = vec![42; 256 * 1024];
+        let blob = BlobRef {
+            hash: digest(&bytes),
+            size: bytes.len() as u64,
+        };
+        store.put_blob(&network, &blob, &bytes)?;
+        for offset in (0..bytes.len()).step_by(65536) {
+            let (size, chunk) = store
+                .blob_range(&network, &node, &node, &blob.hash, offset as u64, 65536)?
+                .unwrap();
+            assert_eq!(size, blob.size);
+            assert_eq!(chunk, bytes[offset..offset + 65536]);
+            // Legal writes to the same table must not invalidate this reader's cursor/snapshot.
+            let other_bytes = offset.to_le_bytes();
+            let other = BlobRef {
+                hash: digest(&other_bytes),
+                size: other_bytes.len() as u64,
+            };
+            store.put_blob(&network, &other, &other_bytes)?;
+        }
+        assert_eq!(Arc::strong_count(&lock), 3);
+        let newer = b"object committed after the first readonly snapshot";
+        let second = BlobRef {
+            hash: digest(newer),
+            size: newer.len() as u64,
+        };
+        store.put_blob(&network, &second, newer)?;
+        assert_eq!(
+            store
+                .blob_range(&network, &node, &node, &second.hash, 0, 64)?
+                .unwrap()
+                .1,
+            newer
+        );
+        let third = BlobRef {
+            hash: digest(b"third"),
+            size: 5,
+        };
+        store.put_blob(&network, &third, b"third")?;
+        assert!(
+            store
+                .blob_range(&network, &node, &node, &third.hash, 0, 5)
+                .unwrap_err()
+                .to_string()
+                .contains("busy")
+        );
+        assert!(
+            store
+                .blob_range(&network, &node, "unknown", &blob.hash, 0, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .blob_range(&network, &node, &node, &blob.hash, u64::MAX, 1)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .blob_range(&network, &node, &node, &blob.hash, blob.size, 1)?
+                .unwrap()
+                .1,
+            Vec::<u8>::new()
+        );
+        // External corruption is kept inside this test; put_blob must retire even same-length repairs.
+        store.blob_readers.retire_blob(&network, &blob.hash);
+        store.connection.execute(
+            "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
+            params![vec![13_u8; bytes.len()], network, blob.hash],
+        )?;
+        assert!(store.get_blob(&network, &blob.hash).is_err());
+        assert_eq!(
+            store
+                .blob_range(&network, &node, &node, &blob.hash, 0, 65536)?
+                .unwrap()
+                .1,
+            vec![13_u8; 65536],
+            "the old reader actually owns a corrupt snapshot"
+        );
+        store.put_blob(&network, &blob, &bytes)?;
+        assert_eq!(
+            store
+                .blob_range(&network, &node, &node, &blob.hash, 65536, 65536)?
+                .unwrap()
+                .1,
+            bytes[65536..131072]
+        );
+        drop(store);
+        assert_eq!(
+            Arc::strong_count(&lock),
+            1,
+            "Store drop joins readers and releases their data-dir locks"
+        );
+        drop(lock);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     fn roles() -> Vec<NodeRole> {
         vec![
             NodeRole::Gateway,
@@ -4829,6 +5212,190 @@ mod tests {
             native_session_id: None,
         })
     }
+    #[test]
+    fn net1_grouped_inventory_preserves_pending_forks_and_cross_scope_heads() -> Result<()> {
+        fn equivalent(store: &Store, network: &str) -> Result<()> {
+            let legacy = store
+                .scopes(network)?
+                .into_iter()
+                .map(|scope| Ok((scope.clone(), store.heads(network, &scope)?)))
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(store.inventory_heads(network)?, legacy);
+            Ok(())
+        }
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?;
+        equivalent(&store, &network)?;
+        let root = conversation(&mut store, &owner)?;
+        let blob = BlobRef {
+            hash: digest(b"absent"),
+            size: 6,
+        };
+        let left = message(
+            &owner,
+            &network,
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash.clone()],
+            "left",
+            vec![blob],
+        )?;
+        assert_eq!(store.ingest_event(&network, &left)?.status, "pending");
+        equivalent(&store, &network)?;
+        assert_eq!(
+            store.heads(&network, "conversation")?,
+            vec![left.hash.clone()]
+        );
+        let right = message(
+            &owner,
+            &network,
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash],
+            "right",
+            vec![],
+        )?;
+        assert_eq!(store.ingest_event(&network, &right)?.status, "conflict");
+        let child = message(
+            &owner,
+            &network,
+            3,
+            Some(left.hash.clone()),
+            vec![left.hash],
+            "child",
+            vec![],
+        )?;
+        assert_eq!(store.ingest_event(&network, &child)?.status, "invalid");
+        equivalent(&store, &network)?;
+        let heads = store.heads(&network, "conversation")?;
+        assert_eq!(heads.len(), 2);
+        assert!(heads.contains(&right.hash) && heads.contains(&child.hash));
+        let a = store.append_event(
+            &owner,
+            &network,
+            "a",
+            EventBody::ConversationCreated {
+                title: "cross-scope parent".into(),
+            },
+            vec![],
+            3,
+        )?;
+        let b = owner.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "b".into(),
+            author: owner.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![a.hash.clone()],
+            created_at_ms: 4,
+            body: EventBody::ConversationCreated {
+                title: "cross-scope child".into(),
+            },
+            blobs: vec![],
+        })?;
+        store.ingest_event(&network, &b)?;
+        equivalent(&store, &network)?;
+        assert_eq!(store.heads(&network, "a")?, vec![a.hash]);
+        assert_eq!(store.heads(&network, "b")?, vec![b.hash.clone()]);
+        let mut corrupt = b;
+        corrupt.signature = "00".repeat(64);
+        store.connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            params![serde_json::to_string(&corrupt)?, network, corrupt.hash],
+        )?;
+        assert!(store.inventory_heads(&network).is_err());
+        println!(
+            "NET1_M5 grouped_inventory_legacy_equivalent=true pending_conflict_invalid_retained=true previous_fork_heads=true cross_scope_parent_retained=true corrupted_envelope_rejected=true"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn net1_duplicate_import_does_not_write_projections() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?;
+        let root = conversation(&mut store, &owner)?;
+        store.connection.execute_batch(
+            "CREATE TEMP TABLE projection_writes(count INTEGER NOT NULL);
+             INSERT INTO projection_writes VALUES(0);
+             CREATE TEMP TRIGGER count_conversation_delete AFTER DELETE ON conversations
+             BEGIN UPDATE projection_writes SET count=count+1; END;
+             CREATE TEMP TRIGGER count_conversation_insert AFTER INSERT ON conversations
+             BEGIN UPDATE projection_writes SET count=count+1; END;",
+        )?;
+        store.ingest_event(&network, &root)?;
+        let writes: u64 =
+            store
+                .connection
+                .query_row("SELECT count FROM projection_writes", [], |row| row.get(0))?;
+        assert_eq!(writes, 0);
+        assert_eq!(store.conversations(&network)?.len(), 1);
+        assert!(store.operations(&network)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn net1_batch_and_snapshot_rebuild_once_and_duplicates_keep_generation() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut source = memory(&owner, None)?;
+        let root = conversation(&mut source, &owner)?;
+        let first = message(
+            &owner,
+            &network,
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash.clone()],
+            "one",
+            vec![],
+        )?;
+        let second = message(
+            &owner,
+            &network,
+            3,
+            Some(first.hash.clone()),
+            vec![first.hash.clone()],
+            "two",
+            vec![],
+        )?;
+        let mut replica = memory(&owner, None)?;
+        let generation = replica.projection_generation(&network)?;
+        assert_eq!(
+            replica.ingest_events(&network, &[second.clone(), root.clone(), first.clone()])?,
+            3
+        );
+        assert_eq!(replica.projection_generation(&network)?, generation + 1);
+        assert_eq!(
+            replica
+                .messages(&network, "conversation")?
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        assert_eq!(
+            replica.ingest_events(&network, &[root.clone(), first, second.clone()])?,
+            0
+        );
+        assert_eq!(replica.projection_generation(&network)?, generation + 1);
+        let snapshot = replica.export_snapshot(&network, "conversation")?;
+        let mut target = memory(&owner, None)?;
+        let before = target.projection_generation(&network)?;
+        assert!(target.import_snapshot(&network, &snapshot)?.is_complete());
+        assert_eq!(target.projection_generation(&network)?, before + 1);
+        assert!(target.import_snapshot(&network, &snapshot)?.is_complete());
+        assert_eq!(target.projection_generation(&network)?, before + 1);
+        let mut conflicting = second;
+        conflicting.signature = root.signature;
+        assert!(target.ingest_event(&network, &conflicting).is_err());
+        assert_eq!(target.projection_generation(&network)?, before + 1);
+        assert_eq!(target.messages(&network, "conversation")?.len(), 2);
+        Ok(())
+    }
+
     #[test]
     fn causal_import_waits_for_every_dependency_and_blob_then_converges() -> Result<()> {
         let a = LocalIdentity::generate();

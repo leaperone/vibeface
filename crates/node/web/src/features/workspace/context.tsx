@@ -42,6 +42,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
+  const readConnection = useRef<ReadyConnection | null>(null)
   const readSequence = useRef(0)
   const pendingRef = useRef<PendingOperation[]>([])
   const messagesRef = useRef<PendingMessage[]>([])
@@ -59,7 +60,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const requireContext = (id = activeId.current) => {
     requireCurrent()
     const context = dataRef.current
-    if (!id || id !== activeId.current || context?.conversation?.conversation_id !== id || isIncomplete(context.missing)) throw new Error("先选择并读取上下文完整的对话。")
+    if (readConnection.current !== connection || !id || id !== activeId.current || context?.conversation?.conversation_id !== id || isIncomplete(context.missing)) throw new Error("先选择并读取上下文完整的对话。")
     return context
   }
   const requireBotContext = (id = activeId.current) => {
@@ -126,7 +127,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       if (results.some((result) => result.status === "fulfilled")) scheduleRefresh()
     }
-    if (writer.current && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
+    if (writer.current && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
@@ -192,10 +193,11 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (activeId.current !== (bot?.conversation_id ?? "")) selectConversation(bot?.conversation_id ?? "")
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
+      readConnection.current = connection
       notifyBrowser(nextNotifications)
       refreshNotificationButton()
     } catch (caught) {
-      if (current()) { dataRef.current = null; setData(null) }
+      if (current()) { readConnection.current = null; dataRef.current = null; setData(null) }
       throw caught
     } finally {
       if (refreshingConnection.current === connection) refreshingRef.current = false
@@ -219,6 +221,8 @@ function useWorkspaceState(connection: ReadyConnection) {
 
   useEffect(() => {
     alive.current = true
+    inFlight.current = new Set()
+    setMessageBusy(false); setLiveProgress([]); setError(""); setNoticeText("")
     try {
       const params = new URL(window.location.href).searchParams
       activeId.current = params.get("conversation") ?? ""
@@ -236,6 +240,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     let disposed = false
     let release = () => {}
     writer.current = false
+    setWriteState("checking")
     if (!("locks" in navigator)) { setWriteState("unsupported"); return }
     void navigator.locks.request(scoped("workspace-writer"), { mode: "exclusive", ifAvailable: true }, async (lock) => {
       if (disposed) return
@@ -244,7 +249,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       writer.current = true
       setWriteState("writable")
       await new Promise<void>((resolve) => { release = resolve })
-      writer.current = false
+      if (!disposed) writer.current = false
     }).catch((caught: unknown) => { if (!disposed) { setWriteState("unsupported"); showError(caught) } })
     return () => { disposed = true; writer.current = false; release() }
   }, [connection])
@@ -276,9 +281,11 @@ function useWorkspaceState(connection: ReadyConnection) {
   const withMutation = async <T,>(key: string, work: () => Promise<T>) => {
     requireWriter()
     if (!booted) throw new Error("本地待核对记录尚未读取，已暂停写入。")
-    if (inFlight.current.has(key)) throw new Error("原请求尚未结束，请等待并核对结果。")
-    inFlight.current.add(key)
-    try { return await work() } finally { inFlight.current.delete(key) }
+    if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
+    const mutations = inFlight.current
+    if (mutations.has(key)) throw new Error("原请求尚未结束，请等待并核对结果。")
+    mutations.add(key)
+    try { return await work() } finally { mutations.delete(key) }
   }
   const run = async (action: () => Promise<void>) => {
     if (current()) setError("")
@@ -310,11 +317,12 @@ function useWorkspaceState(connection: ReadyConnection) {
       }
       if (!isQueuedReceipt(receipt, prepared.pending)) {
         if (activeId.current === id) await refreshRef.current().catch(showError)
-        return
+        return false
       }
       replaceMessages(messagesRef.current.filter((item) => item.message_id !== prepared.pending.message_id))
       setNoticeText("")
       if (activeId.current === id) await refreshRef.current().catch(showError)
+      return true
     } catch (caught) {
       if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
         const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
@@ -350,24 +358,24 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选择机器人。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
-    try { await submitMessage(text, reportResults) } finally { if (current()) setMessageBusy(false) }
+    try { return await submitMessage(text, reportResults) } finally { if (current()) setMessageBusy(false) }
   })
   const incomplete = !data || isIncomplete(data.missing)
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
   const chatSlot = { conversationId: conversationId || null, missing: incomplete }
 
   return {
-    info: connection.info, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
+    info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView, nodes, conversationId, data, notifications, pending, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress,
-    writable: writeState === "writable" && current(),
+    writable: writeState === "writable" && current() && readConnection.current === connection,
     writeNotice: writeState === "readonly" ? "另一个页面正在操作此浏览器设备。此页只读，关闭其他页面后重新连接。"
       : writeState === "unsupported" ? "浏览器未能提供跨页面写锁，此页只读。请使用支持 Web Locks 的安全浏览器入口。"
-      : writeState === "checking" ? "正在核对浏览器设备的写入权限。" : "",
+      : writeState === "checking" ? "正在核对浏览器设备的写入权限。" : readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
     syncText: !data ? "发一条消息开始对话。" : incomplete
       ? "对话还在同步。"
       : `此入口已取得已知上下文，共 ${data.heads.length} 个历史位置。其他离线设备可能仍有未同步记录。`,
-    refresh, run, announce: setNoticeText, notificationButton,
+    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
       const name = inputText(input.name, "机器人名称", 512), instructions = input.instructions.trim()
@@ -436,6 +444,15 @@ function useWorkspaceState(connection: ReadyConnection) {
     retryExecutionControl: (operation: PendingOperation) => withMutation(`execution-control:${operation.operation_id}`, async () => {
       const original = pendingRef.current.find((item) => item.operation_id === operation.operation_id)
       if (!original) throw new Error("原控制请求不存在，请先核对持久状态。")
+      const result = parseReconcile(await connection.rpc("reconcile", { target_node: original.target_node, operation_id: original.operation_id }))
+      requireCurrent()
+      const decision = reconcileDecision(result, original)
+      if (decision === "settled") {
+        removePending(original.operation_id)
+        if (activeId.current === original.conversation_id) await refreshRef.current()
+        return
+      }
+      if (decision !== "missing") throw new Error("原操作仍需核对，已保留原请求，不会重新发送。")
       requireBotContext(original.conversation_id)
       await submitPendingControl(original)
     }),

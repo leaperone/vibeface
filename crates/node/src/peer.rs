@@ -3,7 +3,7 @@
 use crate::{
     crypto::{LocalIdentity, digest, verify_payload},
     model::{NetworkId, NodeId, NodeRole, WIRE_VERSION},
-    network::{NetworkHub, NetworkSocket, Service},
+    network::{AuthenticationFailure, NetworkHub, NetworkSocket, Service},
     store::Store,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+#[cfg(test)]
 use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 use uuid::Uuid;
 use vibeface_secure::{Channel, Handshake};
@@ -35,6 +36,49 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_AGE_MS: i64 = 120_000;
 const MAX_FUTURE_MS: i64 = 30_000;
+const PRESENCE_LEASE_MS: i64 = 90_000;
+const MAX_EXPLORATION_NEIGHBORS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestFailure {
+    NoRoute,
+    Busy,
+    Unknown,
+}
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoRoute => "no peer route available; request was not queued",
+            Self::Busy => "peer queue busy; request was not queued",
+            Self::Unknown => "peer response unavailable; execution outcome may be unknown",
+        })
+    }
+}
+impl std::error::Error for RequestFailure {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizationDenied(Arc<anyhow::Error>);
+impl std::fmt::Display for AuthorizationDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer authorization denied: {}", self.0)
+    }
+}
+impl std::error::Error for AuthorizationDenied {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    NoRoute,
+    Busy,
+    Queued(usize),
+}
+impl SendOutcome {
+    fn observed(self, packet: &Packet) -> Self {
+        tracing::debug!(network=%packet.body.network_id, target=?packet.body.target,
+            request_id=%packet.body.request_id, kind=?packet.body.kind, outcome=?self,
+            "peer local send outcome");
+        self
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Inbound {
@@ -59,14 +103,24 @@ pub struct PeerHub {
 struct State {
     links: HashMap<(NetworkId, NodeId), Link>,
     pending: HashMap<(NetworkId, String), Pending>,
-    seen: HashMap<PacketId, (String, Instant)>,
-    reachable: HashMap<(NetworkId, NodeId), Instant>,
+    seen: HashMap<PacketId, SeenPacket>,
+    routes: HashMap<(NetworkId, NodeId, NodeId), PresenceRoute>,
     last_presence: HashMap<NetworkId, Instant>,
 }
 struct Link {
     id: String,
     outbound: bool,
     send: mpsc::Sender<Arc<Queued>>,
+}
+struct PresenceRoute {
+    link_id: String,
+    signed_at_ms: i64,
+    expires_at: Instant,
+}
+struct SeenPacket {
+    hash: String,
+    observed_at: Instant,
+    presence_expires_at: Option<Instant>,
 }
 struct Queued {
     text: String,
@@ -114,7 +168,148 @@ struct Packet {
 }
 type PacketId = (NetworkId, NodeId, String, Kind);
 
+fn packet_id(body: &Body) -> PacketId {
+    (
+        body.network_id.clone(),
+        body.origin.clone(),
+        body.request_id.clone(),
+        body.kind,
+    )
+}
+
+impl State {
+    fn forget_link(&mut self, network: &str, peer: &str, id: &str) {
+        let key = (network.to_owned(), peer.to_owned());
+        if self.links.get(&key).is_some_and(|link| link.id == id) {
+            self.links.remove(&key);
+        }
+        self.routes.retain(|(n, _, neighbor), route| {
+            n != network || neighbor != peer || route.link_id != id
+        });
+    }
+
+    fn remember(&mut self, packet: &Packet, wall_now: i64, now: Instant) -> Result<bool> {
+        let id = packet_id(&packet.body);
+        let hash = digest(&serde_json::to_vec(&packet.body)?);
+        self.seen.retain(|_, entry| {
+            now.duration_since(entry.observed_at)
+                < Duration::from_millis((MAX_AGE_MS + MAX_FUTURE_MS) as u64)
+        });
+        if let Some(previous) = self.seen.get(&id) {
+            ensure!(previous.hash == hash, "conflicting peer packet ID");
+            return Ok(false);
+        }
+        ensure!(self.seen.len() < MAX_SEEN, RequestFailure::Busy);
+        let remaining = packet
+            .body
+            .created_at_ms
+            .saturating_add(PRESENCE_LEASE_MS)
+            .saturating_sub(wall_now)
+            .clamp(0, PRESENCE_LEASE_MS);
+        self.seen.insert(
+            id,
+            SeenPacket {
+                hash,
+                observed_at: now,
+                presence_expires_at: (packet.body.kind == Kind::Presence)
+                    .then_some(now + Duration::from_millis(remaining as u64)),
+            },
+        );
+        Ok(true)
+    }
+
+    fn observe_presence(
+        &mut self,
+        neighbor: &str,
+        link_id: &str,
+        body: &Body,
+        wall_now: i64,
+        now: Instant,
+    ) {
+        let key = (
+            body.network_id.clone(),
+            body.origin.clone(),
+            neighbor.to_owned(),
+        );
+        if self.routes.get(&key).is_some_and(|route| {
+            route.link_id == link_id && route.signed_at_ms >= body.created_at_ms
+        }) {
+            return;
+        }
+        let remaining = body
+            .created_at_ms
+            .saturating_add(PRESENCE_LEASE_MS)
+            .saturating_sub(wall_now)
+            .clamp(0, PRESENCE_LEASE_MS);
+        if remaining == 0 {
+            return;
+        }
+        let expires_at = self
+            .seen
+            .get(&packet_id(body))
+            .and_then(|entry| entry.presence_expires_at)
+            .unwrap_or(now)
+            .min(now + Duration::from_millis(remaining as u64));
+        if expires_at <= now {
+            return;
+        }
+        self.routes.retain(|(network, _, neighbor), route| {
+            route.expires_at > now
+                && self
+                    .links
+                    .get(&(network.clone(), neighbor.clone()))
+                    .is_some_and(|link| link.id == route.link_id)
+        });
+        if !self.routes.contains_key(&key)
+            && self.routes.len() >= MAX_SEEN
+            && let Some(oldest) = self
+                .routes
+                .iter()
+                .min_by_key(|(_, route)| route.expires_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.routes.remove(&oldest);
+        }
+        self.routes.insert(
+            key,
+            PresenceRoute {
+                link_id: link_id.to_owned(),
+                signed_at_ms: body.created_at_ms,
+                expires_at,
+            },
+        );
+        tracing::debug!(network=%body.network_id, target=%body.origin, neighbor, link_id,
+            signed_at_ms=body.created_at_ms, remaining_ms=expires_at.saturating_duration_since(now).as_millis() as u64,
+            "peer presence route observed");
+    }
+}
+
 impl PeerHub {
+    #[cfg(test)]
+    pub(crate) async fn reserve_replay_entries(
+        &self,
+        network: &str,
+        remaining: usize,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        for index in state.seen.len()..MAX_SEEN.saturating_sub(remaining) {
+            state.seen.insert(
+                (
+                    network.to_owned(),
+                    self.identity.node_id()?,
+                    Uuid::from_u128(index as u128).to_string(),
+                    Kind::Presence,
+                ),
+                SeenPacket {
+                    hash: String::new(),
+                    observed_at: Instant::now(),
+                    presence_expires_at: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(
         identity: LocalIdentity,
         store: Arc<Mutex<Store>>,
@@ -150,10 +345,12 @@ impl PeerHub {
             tokio::time::timeout(HANDSHAKE_TIMEOUT, self.server_handshake(&mut socket))
                 .await
                 .context("peer handshake timed out")??;
-        self.connected(socket, network, peer, false, channel).await
+        self.connected(socket, network, peer, false, channel, None)
+            .await
     }
 
     /// Runs until disconnected. Reconnection policy belongs to the runtime.
+    #[cfg(test)]
     pub async fn connect(self: Arc<Self>, network_id: String, url: String) -> Result<()> {
         let _permit = self
             .sockets
@@ -183,7 +380,7 @@ impl PeerHub {
         )
         .await
         .context("peer handshake timed out")??;
-        self.connected(socket, network_id, peer, true, channel)
+        self.connected(socket, network_id, peer, true, channel, None)
             .await
     }
 
@@ -196,16 +393,23 @@ impl PeerHub {
             None,
         )?;
         let key = (network.to_owned(), packet.body.request_id.clone());
+        let blob_range = (packet.body.payload["type"] == "blob").then(|| {
+            (
+                packet.body.payload["hash"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                packet.body.payload["offset"].as_u64(),
+                packet.body.payload["limit"].as_u64(),
+            )
+        });
         let (reply, receive) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
             state
                 .pending
                 .retain(|_, p| !p.reply.is_closed() && p.created.elapsed() < REQUEST_TIMEOUT);
-            ensure!(
-                state.pending.len() < MAX_PENDING,
-                "too many pending peer requests"
-            );
+            ensure!(state.pending.len() < MAX_PENDING, RequestFailure::Busy);
             state.pending.insert(
                 key.clone(),
                 Pending {
@@ -216,15 +420,19 @@ impl PeerHub {
             );
         }
         let result = match self.emit(packet).await {
-            Ok(()) => match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(_)) => Err(anyhow::anyhow!(
-                    "peer request cancelled; execution outcome may be unknown"
-                )),
-                Err(_) => Err(anyhow::anyhow!(
-                    "peer request timed out; execution outcome may be unknown"
-                )),
-            },
+            Ok(()) => {
+                if let Some((hash, offset, limit)) = blob_range {
+                    tracing::trace!(network, target, request_id=%key.1, hash, offset, limit,
+                        "peer blob request queued");
+                }
+                match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::debug!(network, target, request_id=%key.1, "peer request outcome unknown");
+                        Err(RequestFailure::Unknown.into())
+                    }
+                }
+            }
             Err(error) => Err(error),
         };
         self.state.lock().await.pending.remove(&key);
@@ -251,38 +459,99 @@ impl PeerHub {
 
     /// Presence is soft state; an online entry does not guarantee a request will succeed.
     pub async fn online(&self, network: &str) -> Vec<NodeId> {
-        let candidates: BTreeSet<_> = {
+        let (direct, indirect) = {
             let state = self.state.lock().await;
-            let has_route = state.links.keys().any(|(n, _)| n == network);
-            state
+            let direct: BTreeSet<_> = state
                 .links
-                .keys()
-                .filter(|(n, _)| n == network)
-                .map(|(_, n)| n.clone())
-                .chain(
-                    state
-                        .reachable
-                        .iter()
-                        .filter(|((n, _), time)| {
-                            has_route && n == network && time.elapsed() < IDLE_TIMEOUT
-                        })
-                        .map(|((_, n), _)| n.clone()),
-                )
-                .collect()
+                .iter()
+                .filter(|((n, _), link)| n == network && !link.send.is_closed())
+                .map(|((_, n), _)| n.clone())
+                .collect();
+            let indirect: Vec<_> = state
+                .routes
+                .iter()
+                .filter(|((n, _, neighbor), route)| {
+                    n == network
+                        && route.expires_at > Instant::now()
+                        && state
+                            .links
+                            .get(&(n.clone(), neighbor.clone()))
+                            .is_some_and(|link| link.id == route.link_id && !link.send.is_closed())
+                })
+                .map(|((_, target, neighbor), _)| (target.clone(), neighbor.clone()))
+                .collect();
+            (direct, indirect)
         };
-        let store = self.store.lock().await;
-        candidates
+        let (direct, indirect) = {
+            let store = self.store.lock().await;
+            let direct = direct
+                .into_iter()
+                .filter(|node| store.authorize_node(network, node, None).is_ok())
+                .collect::<Vec<_>>();
+            let indirect = indirect
+                .into_iter()
+                .filter(|(target, neighbor)| {
+                    store.authorize_node(network, target, None).is_ok()
+                        && store
+                            .authorize_node(
+                                network,
+                                neighbor,
+                                (target != neighbor).then_some(NodeRole::Relay),
+                            )
+                            .is_ok()
+                })
+                .collect::<Vec<_>>();
+            (direct, indirect)
+        };
+        let state = self.state.lock().await;
+        direct
             .into_iter()
-            .filter(|node| store.authorize_node(network, node, None).is_ok())
+            .filter(|node| {
+                state
+                    .links
+                    .get(&(network.to_owned(), node.clone()))
+                    .is_some_and(|link| !link.send.is_closed())
+            })
+            .chain(indirect.into_iter().filter_map(|(target, neighbor)| {
+                state
+                    .routes
+                    .get(&(network.to_owned(), target.clone(), neighbor.clone()))
+                    .is_some_and(|route| {
+                        route.expires_at > Instant::now()
+                            && state
+                                .links
+                                .get(&(network.to_owned(), neighbor))
+                                .is_some_and(|link| {
+                                    link.id == route.link_id && !link.send.is_closed()
+                                })
+                    })
+                    .then_some(target)
+            }))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
-    async fn authorize(&self, network: &str, node: &str) -> Result<String> {
+    pub(crate) async fn has_route(&self, network: &str, target: &str) -> bool {
+        self.online(network).await.iter().any(|node| node == target)
+    }
+
+    pub(crate) async fn link_matches(&self, network: &str, target: &str, id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .links
+            .get(&(network.to_owned(), target.to_owned()))
+            .is_some_and(|link| link.id == id && !link.send.is_closed())
+    }
+
+    pub(crate) async fn authorize(&self, network: &str, node: &str) -> Result<String> {
         Ok(self
             .store
             .lock()
             .await
-            .authorize_node(network, node, None)?
+            .authorize_node(network, node, None)
+            .map_err(|error| AuthorizationDenied(Arc::new(error)))?
             .public_key)
     }
 
@@ -369,8 +638,8 @@ impl PeerHub {
         let responder: Hello = serde_json::from_slice(
             &receive_secure(socket, &mut channel, MAX_HANDSHAKE_BYTES).await?,
         )?;
-        self.check_hello(&responder, Some(network)).await?;
         ensure!(remote == responder.node_id, "peer Noise identity mismatch");
+        self.check_hello(&responder, Some(network)).await?;
         Ok((responder.node_id, channel))
     }
 
@@ -379,29 +648,47 @@ impl PeerHub {
         network: String,
         target: String,
         transport: Arc<NetworkHub>,
+        ready: Option<oneshot::Sender<String>>,
+        deadline: tokio::time::Instant,
     ) -> Result<()> {
-        let _permit = self
-            .sockets
-            .clone()
-            .try_acquire_owned()
-            .context("too many peer sockets")?;
-        self.authorize(&network, &self.identity.node_id()?).await?;
-        self.authorize(&network, &target).await?;
-        for _ in 0..24 {
-            let mut socket = transport.dial(&target, Service::Peer).await?;
-            match tokio::time::timeout(
-                HANDSHAKE_TIMEOUT,
-                self.client_handshake(&mut socket, &network, Some(target.clone())),
-            )
+        let preparation = async {
+            self.authorize(&network, &self.identity.node_id()?).await?;
+            self.authorize(&network, &target).await?;
+            let winner = transport
+                .dial_authenticated(&target, Service::Peer, |mut socket| {
+                    let hub = self.clone();
+                    let network = network.clone();
+                    let target = target.clone();
+                    async move {
+                        let permit = hub.sockets.clone().try_acquire_owned().map_err(|_| {
+                            AuthenticationFailure::Busy(RequestFailure::Busy.into())
+                        })?;
+                        let result = tokio::time::timeout(
+                            HANDSHAKE_TIMEOUT,
+                            hub.client_handshake(&mut socket, &network, Some(target)),
+                        )
+                        .await
+                        .context("peer handshake timed out")
+                        .and_then(|result| result);
+                        match result {
+                            Ok((peer, channel)) => Ok((socket, (peer, channel, permit))),
+                            Err(error) if error.downcast_ref::<AuthorizationDenied>().is_some() => {
+                                Err(AuthenticationFailure::Terminal(error))
+                            }
+                            Err(error) => Err(AuthenticationFailure::Path(error)),
+                        }
+                    }
+                })
+                .await?;
+            self.authorize(&network, &self.identity.node_id()?).await?;
+            self.authorize(&network, &target).await?;
+            Ok::<_, anyhow::Error>(winner)
+        };
+        let (socket, (peer, channel, _permit)) = tokio::time::timeout_at(deadline, preparation)
             .await
-            {
-                Ok(Ok((peer, channel))) => {
-                    return self.connected(socket, network, peer, true, channel).await;
-                }
-                _ => transport.report_failure(&target, socket.route()).await,
-            }
-        }
-        bail!("no authenticated peer path available")
+            .context("peer route preparation deadline exceeded")??;
+        self.connected(socket, network, peer, true, channel, ready)
+            .await
     }
 
     async fn connected(
@@ -411,6 +698,7 @@ impl PeerHub {
         peer: String,
         outbound: bool,
         channel: Channel,
+        ready: Option<oneshot::Sender<String>>,
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let (send, receive) = mpsc::channel(QUEUE_CAPACITY);
@@ -445,11 +733,19 @@ impl PeerHub {
                 },
             );
         }
-        let result = self.drive(socket, &network, &peer, receive, channel).await;
-        let mut state = self.state.lock().await;
-        if state.links.get(&link_key).is_some_and(|link| link.id == id) {
-            state.links.remove(&link_key);
+        tracing::debug!(network, peer, link_id=%id, outbound, "peer link ready");
+        if let Some(ready) = ready {
+            let _ = ready.send(id.clone());
         }
+        let result = self
+            .drive(socket, &network, &peer, &id, receive, channel)
+            .await;
+        let mut state = self.state.lock().await;
+        let current = state.links.get(&link_key).is_some_and(|link| link.id == id);
+        let routes_before = state.routes.len();
+        state.forget_link(&network, &peer, &id);
+        tracing::debug!(network, peer, link_id=%id, current, removed_routes=routes_before-state.routes.len(),
+            "peer link removed");
         result
     }
 
@@ -458,6 +754,7 @@ impl PeerHub {
         mut socket: NetworkSocket,
         network: &str,
         peer: &str,
+        link_id: &str,
         mut outbound: mpsc::Receiver<Arc<Queued>>,
         mut channel: Channel,
     ) -> Result<()> {
@@ -478,7 +775,7 @@ impl PeerHub {
                                 partial_started = None;
                                 ensure!(plaintext.len() <= MAX_PACKET_BYTES, "peer packet too large");
                                 let packet: Packet = serde_json::from_slice(&plaintext).context("invalid peer packet")?;
-                                self.receive_packet(network, peer, packet).await?;
+                                self.receive_packet(network, peer, link_id, packet).await?;
                             } else {
                                 partial_started.get_or_insert_with(Instant::now);
                             }
@@ -499,7 +796,12 @@ impl PeerHub {
                     self.authorize(network, peer).await?;
                     self.authorize(network, &self.identity.node_id()?).await?;
                     tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(AxumMessage::Ping(Vec::new().into()))).await.context("peer send timed out")??;
-                    self.presence(network).await?;
+                    if let Err(error) = self.presence(network).await {
+                        if error.downcast_ref::<RequestFailure>().is_none() {
+                            return Err(error);
+                        }
+                        tracing::debug!(network, peer, %error, "peer presence rejected locally");
+                    }
                 }
             }
         }
@@ -569,15 +871,25 @@ impl PeerHub {
         if packet.body.target.as_deref() == Some(packet.body.origin.as_str()) {
             return self.deliver(&packet).await;
         }
-        let sent = self.forward(&packet, None).await?;
-        ensure!(
-            packet.body.kind != Kind::Request || sent > 0,
-            "no peer route available"
-        );
-        Ok(())
+        match self.forward(&packet, None).await? {
+            SendOutcome::Queued(_) => Ok(()),
+            SendOutcome::NoRoute
+                if matches!(packet.body.kind, Kind::Broadcast | Kind::Presence) =>
+            {
+                Ok(())
+            }
+            SendOutcome::NoRoute => Err(RequestFailure::NoRoute.into()),
+            SendOutcome::Busy => Err(RequestFailure::Busy.into()),
+        }
     }
 
-    async fn receive_packet(&self, network: &str, peer: &str, packet: Packet) -> Result<()> {
+    async fn receive_packet(
+        &self,
+        network: &str,
+        peer: &str,
+        link_id: &str,
+        packet: Packet,
+    ) -> Result<()> {
         ensure!(
             packet.body.network_id == network,
             "cross-network peer packet"
@@ -603,22 +915,54 @@ impl PeerHub {
             &serde_json::to_vec(&packet.body)?,
             &packet.signature,
         )?;
-        if !self.remember(&packet).await? {
+        let fresh = {
+            let mut state = self.state.lock().await;
+            ensure!(
+                state
+                    .links
+                    .get(&(network.to_owned(), peer.to_owned()))
+                    .is_some_and(|link| link.id == link_id),
+                "stale peer link"
+            );
+            let now = Instant::now();
+            let wall_now = now_ms()?;
+            let fresh = match state.remember(&packet, wall_now, now) {
+                Ok(fresh) => fresh,
+                Err(error)
+                    if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy) =>
+                {
+                    tracing::debug!(network, peer, "peer replay cache rejected busy");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if packet.body.kind == Kind::Presence {
+                state.observe_presence(peer, link_id, &packet.body, wall_now, now);
+            }
+            fresh
+        };
+        if !fresh {
             return Ok(());
         }
         let local = self.identity.node_id()?;
         if packet.body.target.as_deref() == Some(local.as_str()) {
-            return self.deliver(&packet).await;
+            return match self.deliver(&packet).await {
+                Err(error)
+                    if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Busy) =>
+                {
+                    tracing::debug!(network, peer, request_id=%packet.body.request_id, "peer inbound rejected busy");
+                    Ok(())
+                }
+                result => result,
+            };
         }
-        if packet.body.kind == Kind::Presence {
-            let mut state = self.state.lock().await;
-            state.reachable.retain(|_, at| at.elapsed() < IDLE_TIMEOUT);
-            state.reachable.insert(
-                (network.to_owned(), packet.body.origin.clone()),
-                Instant::now(),
-            );
-        } else if packet.body.kind == Kind::Broadcast {
-            self.deliver(&packet).await?;
+        if packet.body.kind == Kind::Broadcast
+            && let Err(error) = self.deliver(&packet).await
+        {
+            if error.downcast_ref::<RequestFailure>() != Some(&RequestFailure::Busy) {
+                return Err(error);
+            }
+            tracing::debug!(network, peer, "peer broadcast inbound rejected busy");
         }
         if self.relay_enabled
             && packet.hops_remaining > 0
@@ -631,30 +975,19 @@ impl PeerHub {
         {
             let mut forwarded = packet;
             forwarded.hops_remaining -= 1;
-            self.forward(&forwarded, Some(peer)).await?;
+            let outcome = self.forward(&forwarded, Some(peer)).await?;
+            if !matches!(outcome, SendOutcome::Queued(_)) {
+                tracing::debug!(network, peer, ?outcome, "peer forward rejected locally");
+            }
         }
         Ok(())
     }
 
     async fn remember(&self, packet: &Packet) -> Result<bool> {
-        let id = (
-            packet.body.network_id.clone(),
-            packet.body.origin.clone(),
-            packet.body.request_id.clone(),
-            packet.body.kind,
-        );
-        let hash = digest(&serde_json::to_vec(&packet.body)?);
-        let mut state = self.state.lock().await;
-        state.seen.retain(|_, (_, at)| {
-            at.elapsed() < Duration::from_millis((MAX_AGE_MS + MAX_FUTURE_MS) as u64)
-        });
-        if let Some((previous, _)) = state.seen.get(&id) {
-            ensure!(previous == &hash, "conflicting peer packet ID");
-            return Ok(false);
-        }
-        ensure!(state.seen.len() < MAX_SEEN, "peer replay cache full");
-        state.seen.insert(id, (hash, Instant::now()));
-        Ok(true)
+        self.state
+            .lock()
+            .await
+            .remember(packet, now_ms()?, Instant::now())
     }
 
     async fn deliver(&self, packet: &Packet) -> Result<()> {
@@ -670,7 +1003,9 @@ impl PeerHub {
                 .is_some_and(|p| p.origin == packet.body.origin)
                 && let Some(pending) = state.pending.remove(&key)
             {
-                let _ = pending.reply.send(packet.body.payload.clone());
+                let delivered = pending.reply.send(packet.body.payload.clone()).is_ok();
+                tracing::debug!(network=%packet.body.network_id, origin=%packet.body.origin,
+                    request_id=%packet.body.request_id, delivered, "peer response matched");
             }
         } else {
             self.inbound
@@ -681,31 +1016,150 @@ impl PeerHub {
                     payload: packet.body.payload.clone(),
                     broadcast: packet.body.kind == Kind::Broadcast,
                 })
-                .context("peer inbound queue unavailable")?;
+                .map_err(|_| RequestFailure::Busy)?;
         }
         Ok(())
     }
 
-    async fn forward(&self, packet: &Packet, except: Option<&str>) -> Result<usize> {
+    async fn forward(&self, packet: &Packet, except: Option<&str>) -> Result<SendOutcome> {
+        let network = &packet.body.network_id;
+        let target = packet.body.target.as_deref();
+        let links = {
+            let mut state = self.state.lock().await;
+            let closed = state
+                .links
+                .iter()
+                .filter(|((n, _), link)| n == network && link.send.is_closed())
+                .map(|((n, peer), link)| (n.clone(), peer.clone(), link.id.clone()))
+                .collect::<Vec<_>>();
+            for (n, peer, id) in closed {
+                state.forget_link(&n, &peer, &id);
+            }
+            state
+                .links
+                .iter()
+                .filter(|((n, peer), link)| {
+                    n == network && except != Some(peer.as_str()) && !link.send.is_closed()
+                })
+                .map(|((_, peer), link)| (peer.clone(), link.id.clone(), link.send.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut links = {
+            let store = self.store.lock().await;
+            links
+                .into_iter()
+                .filter(|(peer, _, _)| {
+                    store
+                        .authorize_node(
+                            network,
+                            peer,
+                            (target.is_some() && target != Some(peer.as_str()))
+                                .then_some(NodeRole::Relay),
+                        )
+                        .is_ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = self.state.lock().await;
+        links.retain(|(peer, id, send)| {
+            !send.is_closed()
+                && state
+                    .links
+                    .get(&(network.clone(), peer.clone()))
+                    .is_some_and(|link| link.id == *id)
+        });
+        let routes = state
+            .routes
+            .iter()
+            .filter(|((n, t, neighbor), route)| {
+                n == network
+                    && Some(t.as_str()) == target
+                    && route.expires_at > Instant::now()
+                    && state
+                        .links
+                        .get(&(n.clone(), neighbor.clone()))
+                        .is_some_and(|link| link.id == route.link_id && !link.send.is_closed())
+            })
+            .map(|((_, _, neighbor), _)| neighbor.clone())
+            .collect::<BTreeSet<_>>();
+        links.sort_by_key(|(peer, _, _)| {
+            (
+                if target == Some(peer.as_str()) {
+                    0
+                } else if routes.contains(peer) {
+                    1
+                } else {
+                    2
+                },
+                peer.clone(),
+            )
+        });
+        if links.is_empty() {
+            return Ok(SendOutcome::NoRoute.observed(packet));
+        }
         let text = serde_json::to_string(packet)?;
         ensure!(text.len() <= MAX_PACKET_BYTES, "peer packet too large");
+        let Ok(permit) = self
+            .queued_bytes
+            .clone()
+            .try_acquire_many_owned(text.len() as u32)
+        else {
+            return Ok(SendOutcome::Busy.observed(packet));
+        };
         let queued = Arc::new(Queued {
-            _permit: self
-                .queued_bytes
-                .clone()
-                .try_acquire_many_owned(text.len() as u32)
-                .context("peer send byte budget full")?,
+            _permit: permit,
             text,
         });
-        let state = self.state.lock().await;
-        Ok(state
-            .links
-            .iter()
-            .filter(|((network, peer), _)| {
-                network == &packet.body.network_id && except != Some(peer.as_str())
-            })
-            .filter(|(_, link)| link.send.try_send(queued.clone()).is_ok())
-            .count())
+        let mut busy = false;
+        let mut sent = 0;
+        let mut explored = 0;
+        for (peer, id, send) in links {
+            if !state
+                .links
+                .get(&(network.clone(), peer.clone()))
+                .is_some_and(|link| link.id == id)
+            {
+                continue;
+            }
+            let exploring =
+                target.is_some() && target != Some(peer.as_str()) && !routes.contains(&peer);
+            if exploring {
+                if explored >= MAX_EXPLORATION_NEIGHBORS {
+                    continue;
+                }
+                explored += 1;
+            }
+            match send.try_send(queued.clone()) {
+                Ok(()) => {
+                    sent += 1;
+                    let route_kind = if target.is_none() {
+                        "broadcast"
+                    } else if target == Some(peer.as_str()) {
+                        "direct"
+                    } else if exploring {
+                        "exploration"
+                    } else {
+                        "presence"
+                    };
+                    tracing::debug!(network, target, request_id=%packet.body.request_id,
+                        kind=?packet.body.kind, next_hop=%peer, link_id=%id, route_kind,
+                        "peer packet queued");
+                    if target.is_some() && !exploring {
+                        break;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => busy = true,
+                Err(mpsc::error::TrySendError::Closed(_)) => state.forget_link(network, &peer, &id),
+            }
+        }
+        Ok((if sent > 0 {
+            SendOutcome::Queued(sent)
+        } else if busy {
+            SendOutcome::Busy
+        } else {
+            SendOutcome::NoRoute
+        })
+        .observed(packet))
     }
 }
 
@@ -843,6 +1297,485 @@ mod tests {
         ))
     }
 
+    async fn test_link(
+        hub: &PeerHub,
+        network: &str,
+        peer: &str,
+        id: &str,
+    ) -> mpsc::Receiver<Arc<Queued>> {
+        let (send, receive) = mpsc::channel(QUEUE_CAPACITY);
+        hub.state.lock().await.links.insert(
+            (network.to_owned(), peer.to_owned()),
+            Link {
+                id: id.to_owned(),
+                outbound: true,
+                send,
+            },
+        );
+        receive
+    }
+
+    #[tokio::test]
+    async fn m4_presence_keeps_duplicate_neighbor_sources_and_drops_only_the_lost_route()
+    -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let c = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let nodes = [&owner, &target, &b, &c];
+        let (receiver, _) = hub(&owner, &owner, &nodes)?;
+        let (sender, _) = hub(&owner, &target, &nodes)?;
+        let _b = test_link(&receiver, &network, &b.node_id()?, "b").await;
+        let _c = test_link(&receiver, &network, &c.node_id()?, "c").await;
+        let packet = sender.packet(&network, None, Kind::Presence, Value::Null, None)?;
+        receiver
+            .receive_packet(&network, &b.node_id()?, "b", packet.clone())
+            .await?;
+        let first_deadline = receiver.state.lock().await.routes
+            [&(network.clone(), target.node_id()?, b.node_id()?)]
+            .expires_at;
+        receiver
+            .receive_packet(&network, &c.node_id()?, "c", packet.clone())
+            .await?;
+        receiver
+            .receive_packet(&network, &b.node_id()?, "b", packet)
+            .await?;
+        {
+            let mut state = receiver.state.lock().await;
+            assert_eq!(state.routes.len(), 2);
+            assert_eq!(
+                state.routes[&(network.clone(), target.node_id()?, b.node_id()?)].expires_at,
+                first_deadline
+            );
+            state.forget_link(&network, &b.node_id()?, "b");
+        }
+        assert!(receiver.online(&network).await.contains(&target.node_id()?));
+        receiver
+            .state
+            .lock()
+            .await
+            .forget_link(&network, &c.node_id()?, "c");
+        let _unrelated = test_link(&receiver, &network, &b.node_id()?, "unrelated").await;
+        assert!(!receiver.online(&network).await.contains(&target.node_id()?));
+        assert!(receiver.online(&network).await.contains(&b.node_id()?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_presence_signed_deadline_survives_replay_clock_rollback_and_eviction() -> Result<()>
+    {
+        let owner = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let c = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let (receiver, _) = hub(&owner, &owner, &[&owner, &target, &b, &c])?;
+        let (sender, _) = hub(&owner, &target, &[&owner, &target, &b, &c])?;
+        let _b = test_link(&receiver, &network, &b.node_id()?, "b").await;
+        let _c = test_link(&receiver, &network, &c.node_id()?, "c").await;
+        let mut packet = sender.packet(&network, None, Kind::Presence, Value::Null, None)?;
+        packet.body.created_at_ms = 1_000_000;
+        let now = Instant::now();
+        let mut state = receiver.state.lock().await;
+        assert!(state.remember(&packet, 1_080_000, now)?);
+        state.observe_presence(&b.node_id()?, "b", &packet.body, 1_080_000, now);
+        let key = (network.clone(), target.node_id()?, b.node_id()?);
+        assert_eq!(state.routes[&key].expires_at, now + Duration::from_secs(10));
+        assert!(!state.remember(&packet, 900_000, now + Duration::from_secs(5))?);
+        state.observe_presence(
+            &b.node_id()?,
+            "b",
+            &packet.body,
+            900_000,
+            now + Duration::from_secs(5),
+        );
+        state.observe_presence(
+            &c.node_id()?,
+            "c",
+            &packet.body,
+            900_000,
+            now + Duration::from_secs(5),
+        );
+        assert!(
+            state
+                .routes
+                .values()
+                .all(|route| route.expires_at == now + Duration::from_secs(10))
+        );
+        state.routes.clear();
+        state.observe_presence(
+            &b.node_id()?,
+            "b",
+            &packet.body,
+            900_000,
+            now + Duration::from_secs(11),
+        );
+        assert!(state.routes.is_empty());
+        let mut future = packet.clone();
+        future.body.request_id = Uuid::new_v4().to_string();
+        future.body.created_at_ms = 2_030_000;
+        assert!(state.remember(&future, 2_000_000, now)?);
+        state.observe_presence(&b.node_id()?, "b", &future.body, 2_000_000, now);
+        assert_eq!(state.routes[&key].expires_at, now + Duration::from_secs(90));
+        let mut conflicting = future.clone();
+        conflicting.body.created_at_ms += 1;
+        assert!(state.remember(&conflicting, 2_000_000, now).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_presence_old_link_tail_and_cleanup_cannot_change_new_generation() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let neighbor = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let (receiver, _) = hub(&owner, &owner, &[&owner, &target, &neighbor])?;
+        let (sender, _) = hub(&owner, &target, &[&owner, &target, &neighbor])?;
+        let _old = test_link(&receiver, &network, &neighbor.node_id()?, "old").await;
+        let packet = sender.packet(&network, None, Kind::Presence, Value::Null, None)?;
+        receiver
+            .receive_packet(&network, &neighbor.node_id()?, "old", packet.clone())
+            .await?;
+        let _new = test_link(&receiver, &network, &neighbor.node_id()?, "new").await;
+        receiver
+            .receive_packet(&network, &neighbor.node_id()?, "new", packet.clone())
+            .await?;
+        assert!(
+            receiver
+                .receive_packet(&network, &neighbor.node_id()?, "old", packet)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale peer link")
+        );
+        receiver
+            .state
+            .lock()
+            .await
+            .forget_link(&network, &neighbor.node_id()?, "old");
+        let key = (network.clone(), target.node_id()?, neighbor.node_id()?);
+        assert_eq!(receiver.state.lock().await.routes[&key].link_id, "new");
+        assert!(receiver.online(&network).await.contains(&target.node_id()?));
+        let mut restricted = neighbor.certificate(roles())?;
+        restricted.roles.retain(|role| role != &NodeRole::Relay);
+        receiver.store.lock().await.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(
+                2,
+                vec![
+                    owner.certificate(roles())?,
+                    target.certificate(roles())?,
+                    restricted,
+                ],
+            )?,
+        )?;
+        assert!(!receiver.online(&network).await.contains(&target.node_id()?));
+        assert!(
+            receiver
+                .online(&network)
+                .await
+                .contains(&neighbor.node_id()?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_directed_packets_choose_direct_then_presence_then_two_explorers() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let neighbors = (0..4)
+            .map(|_| LocalIdentity::generate())
+            .collect::<Vec<_>>();
+        let mut nodes = vec![&owner, &target];
+        nodes.extend(neighbors.iter());
+        let network = owner.fixture_network_id()?;
+        let (sender, _) = hub(&owner, &owner, &nodes)?;
+        let (remote, _) = hub(&owner, &target, &nodes)?;
+        let mut receivers = Vec::new();
+        for node in &neighbors {
+            receivers.push(test_link(&sender, &network, &node.node_id()?, "neighbor").await);
+        }
+        let mut direct = test_link(&sender, &network, &target.node_id()?, "direct").await;
+        let presence = remote.packet(&network, None, Kind::Presence, Value::Null, None)?;
+        sender
+            .receive_packet(&network, &neighbors[0].node_id()?, "neighbor", presence)
+            .await?;
+        while direct.try_recv().is_ok() {}
+        for receive in &mut receivers {
+            while receive.try_recv().is_ok() {}
+        }
+        let packet = sender.packet(
+            &network,
+            Some(target.node_id()?),
+            Kind::Request,
+            json!({"write":"once"}),
+            None,
+        )?;
+        assert_eq!(sender.forward(&packet, None).await?, SendOutcome::Queued(1));
+        let queued: Packet = serde_json::from_str(&direct.try_recv()?.text)?;
+        assert_eq!(
+            serde_json::to_value(&queued.body)?,
+            serde_json::to_value(&packet.body)?
+        );
+        assert!(
+            receivers
+                .iter_mut()
+                .all(|receive| receive.try_recv().is_err())
+        );
+        sender
+            .state
+            .lock()
+            .await
+            .forget_link(&network, &target.node_id()?, "direct");
+        assert_eq!(sender.forward(&packet, None).await?, SendOutcome::Queued(1));
+        assert!(receivers[0].try_recv().is_ok());
+        assert!(
+            receivers[1..]
+                .iter_mut()
+                .all(|receive| receive.try_recv().is_err())
+        );
+        sender.state.lock().await.routes.clear();
+        assert_eq!(
+            sender
+                .forward(&packet, Some(&neighbors[0].node_id()?))
+                .await?,
+            SendOutcome::Queued(2)
+        );
+        assert!(receivers[0].try_recv().is_err());
+        assert_eq!(
+            receivers[1..]
+                .iter_mut()
+                .map(|receive| usize::from(receive.try_recv().is_ok()))
+                .sum::<usize>(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_request_distinguishes_no_route_busy_and_queued_unknown_without_resending()
+    -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let (sender, _) = hub(&owner, &owner, &[&owner, &target])?;
+        let budget = sender
+            .queued_bytes
+            .clone()
+            .acquire_many_owned(32 * 1024 * 1024)
+            .await?;
+        let no_route = sender
+            .request(&network, &target.node_id()?, json!({"id":"once"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            no_route.downcast_ref::<RequestFailure>(),
+            Some(&RequestFailure::NoRoute)
+        );
+        let mut receive = test_link(&sender, &network, &target.node_id()?, "direct").await;
+        let busy = sender
+            .request(&network, &target.node_id()?, json!({"id":"once"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            busy.downcast_ref::<RequestFailure>(),
+            Some(&RequestFailure::Busy)
+        );
+        assert!(receive.try_recv().is_err());
+        assert!(sender.state.lock().await.pending.is_empty());
+        drop(budget);
+        let peer = sender.clone();
+        let scope = network.clone();
+        let destination = target.node_id()?;
+        let request = tokio::spawn(async move {
+            peer.request(&scope, &destination, json!({"id":"once"}))
+                .await
+        });
+        let queued = tokio::time::timeout(Duration::from_secs(2), receive.recv())
+            .await?
+            .context("request not queued")?;
+        let packet: Packet = serde_json::from_str(&queued.text)?;
+        assert_eq!(packet.body.payload, json!({"id":"once"}));
+        sender.state.lock().await.pending.clear();
+        let unknown = request.await?.unwrap_err();
+        assert_eq!(
+            unknown.downcast_ref::<RequestFailure>(),
+            Some(&RequestFailure::Unknown)
+        );
+        assert!(receive.try_recv().is_err());
+        assert!(sender.state.lock().await.pending.is_empty());
+        drop(queued);
+        let packet = sender.packet(
+            &network,
+            Some(target.node_id()?),
+            Kind::Request,
+            Value::Null,
+            None,
+        )?;
+        for _ in 0..QUEUE_CAPACITY {
+            assert_eq!(sender.forward(&packet, None).await?, SendOutcome::Queued(1));
+        }
+        assert_eq!(sender.forward(&packet, None).await?, SendOutcome::Busy);
+        drop(receive);
+        let _budget = sender
+            .queued_bytes
+            .clone()
+            .acquire_many_owned(32 * 1024 * 1024)
+            .await?;
+        assert_eq!(sender.forward(&packet, None).await?, SendOutcome::NoRoute);
+        assert!(
+            !sender
+                .state
+                .lock()
+                .await
+                .links
+                .contains_key(&(network, target.node_id()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_presence_expiring_while_authorization_waits_cannot_suppress_exploration()
+    -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let c = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let nodes = [&owner, &target, &b, &c];
+        let (sender, _) = hub(&owner, &owner, &nodes)?;
+        let (remote, _) = hub(&owner, &target, &nodes)?;
+        let mut via_b = test_link(&sender, &network, &b.node_id()?, "b").await;
+        let mut via_c = test_link(&sender, &network, &c.node_id()?, "c").await;
+        let presence = remote.packet(&network, None, Kind::Presence, Value::Null, None)?;
+        sender
+            .receive_packet(&network, &b.node_id()?, "b", presence)
+            .await?;
+        while via_c.try_recv().is_ok() {}
+        let packet = sender.packet(
+            &network,
+            Some(target.node_id()?),
+            Kind::Request,
+            json!("once"),
+            None,
+        )?;
+        let authorization = sender.store.lock().await;
+        let mut forwarding = Box::pin(sender.forward(&packet, None));
+        assert!(futures_util::poll!(forwarding.as_mut()).is_pending());
+        sender
+            .state
+            .lock()
+            .await
+            .routes
+            .get_mut(&(network.clone(), target.node_id()?, b.node_id()?))
+            .unwrap()
+            .expires_at = Instant::now();
+        drop(authorization);
+        assert_eq!(forwarding.await?, SendOutcome::Queued(2));
+        assert!(via_b.try_recv().is_ok());
+        assert!(via_c.try_recv().is_ok());
+        let route_key = (network.clone(), target.node_id()?, b.node_id()?);
+        sender
+            .state
+            .lock()
+            .await
+            .routes
+            .get_mut(&route_key)
+            .unwrap()
+            .expires_at = Instant::now() + Duration::from_secs(90);
+        let authorization = sender.store.lock().await;
+        let mut online = Box::pin(sender.online(&network));
+        assert!(futures_util::poll!(online.as_mut()).is_pending());
+        sender
+            .state
+            .lock()
+            .await
+            .routes
+            .get_mut(&route_key)
+            .unwrap()
+            .expires_at = Instant::now();
+        drop(authorization);
+        let online = online.await;
+        assert!(!online.contains(&target.node_id()?));
+        assert!(online.contains(&b.node_id()?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m4_local_backpressure_keeps_trusted_link_and_replay_capacity_is_bounded() -> Result<()>
+    {
+        let owner = LocalIdentity::generate();
+        let sender_id = LocalIdentity::generate();
+        let target = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let nodes = [&owner, &sender_id, &target];
+        let (receiver, mut inbound) = hub(&owner, &owner, &nodes)?;
+        let (sender, _) = hub(&owner, &sender_id, &nodes)?;
+        let _input = test_link(&receiver, &network, &sender_id.node_id()?, "input").await;
+        let _target = test_link(&receiver, &network, &target.node_id()?, "target").await;
+        let _budget = receiver
+            .queued_bytes
+            .clone()
+            .acquire_many_owned(32 * 1024 * 1024)
+            .await?;
+        let packet = sender.packet(
+            &network,
+            Some(target.node_id()?),
+            Kind::Request,
+            json!("forward busy"),
+            None,
+        )?;
+        receiver
+            .receive_packet(&network, &sender_id.node_id()?, "input", packet)
+            .await?;
+        for _ in 0..256 {
+            let packet = sender.packet(
+                &network,
+                Some(owner.node_id()?),
+                Kind::Request,
+                json!("fill"),
+                None,
+            )?;
+            receiver
+                .receive_packet(&network, &sender_id.node_id()?, "input", packet)
+                .await?;
+        }
+        let packet = sender.packet(
+            &network,
+            Some(owner.node_id()?),
+            Kind::Request,
+            json!("inbound busy"),
+            None,
+        )?;
+        receiver
+            .receive_packet(&network, &sender_id.node_id()?, "input", packet)
+            .await?;
+        assert_eq!(inbound.len(), 256);
+        receiver.reserve_replay_entries(&network, 0).await?;
+        let packet = sender.packet(
+            &network,
+            Some(owner.node_id()?),
+            Kind::Request,
+            json!("replay busy"),
+            None,
+        )?;
+        receiver
+            .receive_packet(&network, &sender_id.node_id()?, "input", packet)
+            .await?;
+        assert_eq!(receiver.state.lock().await.seen.len(), MAX_SEEN);
+        assert!(
+            receiver
+                .state
+                .lock()
+                .await
+                .links
+                .contains_key(&(network.clone(), sender_id.node_id()?))
+        );
+        assert_eq!(inbound.try_recv()?.payload, json!("fill"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn forwarding_requires_both_enabled_and_certified_relay_role() -> Result<()> {
         let a = LocalIdentity::generate();
@@ -854,7 +1787,9 @@ mod tests {
         let (disabled, mut inbound) =
             PeerHub::new(b.clone(), enabled.store.clone(), &[NodeRole::Replica]);
         let (send, mut receive) = mpsc::channel(4);
+        let mut input_receivers = Vec::new();
         for hub in [&enabled, &disabled] {
+            input_receivers.push(test_link(hub, &network, &a.node_id()?, "input").await);
             hub.state.lock().await.links.insert(
                 (network.clone(), c.node_id()?),
                 Link {
@@ -872,11 +1807,11 @@ mod tests {
             None,
         )?;
         disabled
-            .receive_packet(&network, &a.node_id()?, packet.clone())
+            .receive_packet(&network, &a.node_id()?, "input", packet.clone())
             .await?;
         assert!(receive.try_recv().is_err());
         enabled
-            .receive_packet(&network, &a.node_id()?, packet)
+            .receive_packet(&network, &a.node_id()?, "input", packet)
             .await?;
         let forwarded: Packet = serde_json::from_str(&receive.try_recv()?.text)?;
         assert_eq!(forwarded.hops_remaining, MAX_HOPS - 1);
@@ -888,7 +1823,7 @@ mod tests {
             None,
         )?;
         disabled
-            .receive_packet(&network, &a.node_id()?, packet)
+            .receive_packet(&network, &a.node_id()?, "input", packet)
             .await?;
         assert_eq!(inbound.try_recv()?.payload, json!("local"));
         let mut restricted = b.certificate(roles())?;
@@ -908,7 +1843,7 @@ mod tests {
             None,
         )?;
         enabled
-            .receive_packet(&network, &a.node_id()?, packet)
+            .receive_packet(&network, &a.node_id()?, "input", packet)
             .await?;
         assert!(receive.try_recv().is_err());
         Ok(())
@@ -921,6 +1856,9 @@ mod tests {
         let network = a.fixture_network_id()?;
         let (sender, _) = hub(&a, &a, &[&a, &b])?;
         let (receiver, mut inbound) = hub(&a, &b, &[&a, &b])?;
+        let _input = test_link(&receiver, &network, &a.node_id()?, "input").await;
+        let _wrong_network_input =
+            test_link(&receiver, &b.fixture_network_id()?, &a.node_id()?, "input").await;
         let packet = sender.packet(
             &network,
             Some(b.node_id()?),
@@ -932,22 +1870,27 @@ mod tests {
         tampered.body.payload = json!({"operation_id":"changed"});
         assert!(
             receiver
-                .receive_packet(&network, &a.node_id()?, tampered)
+                .receive_packet(&network, &a.node_id()?, "input", tampered)
                 .await
                 .is_err()
         );
         assert!(inbound.try_recv().is_err());
         assert!(
             receiver
-                .receive_packet(&b.fixture_network_id()?, &a.node_id()?, packet.clone())
+                .receive_packet(
+                    &b.fixture_network_id()?,
+                    &a.node_id()?,
+                    "input",
+                    packet.clone()
+                )
                 .await
                 .is_err()
         );
         receiver
-            .receive_packet(&network, &a.node_id()?, packet.clone())
+            .receive_packet(&network, &a.node_id()?, "input", packet.clone())
             .await?;
         receiver
-            .receive_packet(&network, &a.node_id()?, packet)
+            .receive_packet(&network, &a.node_id()?, "input", packet)
             .await?;
         let received = inbound.try_recv()?;
         assert_eq!(received.origin, a.node_id()?);
@@ -967,7 +1910,7 @@ mod tests {
             None,
         )?;
         receiver
-            .receive_packet(&network, &a.node_id()?, packet)
+            .receive_packet(&network, &a.node_id()?, "input", packet)
             .await?;
         assert!(inbound.try_recv().is_err());
         Ok(())
@@ -998,7 +1941,7 @@ mod tests {
             None,
         )?;
         receiver
-            .receive_packet(&network, &owner.node_id()?, packet)
+            .receive_packet(&network, &owner.node_id()?, "trusted", packet)
             .await?;
         assert!(inbound.try_recv().is_err());
         assert!(
@@ -1021,6 +1964,8 @@ mod tests {
         let (requester, _) = hub(&a, &a, &[&a, &b, &c])?;
         let (expected, _) = hub(&a, &b, &[&a, &b, &c])?;
         let (other, _) = hub(&a, &c, &[&a, &b, &c])?;
+        let _other_input = test_link(&requester, &network, &c.node_id()?, "other").await;
+        let _expected_input = test_link(&requester, &network, &b.node_id()?, "expected").await;
         let request_id = Uuid::new_v4().to_string();
         let (reply, mut receive) = oneshot::channel();
         requester.state.lock().await.pending.insert(
@@ -1039,7 +1984,7 @@ mod tests {
             Some(request_id.clone()),
         )?;
         requester
-            .receive_packet(&network, &c.node_id()?, wrong)
+            .receive_packet(&network, &c.node_id()?, "other", wrong)
             .await?;
         assert!(matches!(
             receive.try_recv(),
@@ -1053,7 +1998,7 @@ mod tests {
             Some(request_id),
         )?;
         requester
-            .receive_packet(&network, &b.node_id()?, correct)
+            .receive_packet(&network, &b.node_id()?, "expected", correct)
             .await?;
         assert_eq!(receive.await?, json!("correct"));
         Ok(())
@@ -1101,6 +2046,16 @@ mod tests {
             )
             .is_err()
         );
+        let payload = json!("x".repeat(MAX_PACKET_BYTES - 1024 - 2));
+        assert_eq!(serde_json::to_vec(&payload)?.len(), MAX_PACKET_BYTES - 1024);
+        let response = hub.packet(
+            &a.fixture_network_id()?,
+            Some(b.node_id()?),
+            Kind::Response,
+            payload,
+            None,
+        )?;
+        assert!(serde_json::to_vec(&response)?.len() <= MAX_PACKET_BYTES);
         Ok(())
     }
 
@@ -1186,13 +2141,11 @@ mod tests {
         });
         wait_link(&server, &network, &target).await?;
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !server
-                .state
-                .lock()
-                .await
-                .reachable
-                .contains_key(&(network.clone(), target.clone()))
-            {
+            while !server.state.lock().await.routes.contains_key(&(
+                network.clone(),
+                target.clone(),
+                target.clone(),
+            )) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

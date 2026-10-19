@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -19,17 +19,21 @@ function fileOf(form: HTMLFormElement) { const element = form.elements.namedItem
 
 export function RecoveryReview() {
   const device = useDevice()
-  const [busy, setBusy] = useState(false)
-  const pending = useRef(false)
+  const generation = device.connectionGeneration()
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === generation
+  const pending = useRef<number | null>(null)
   const [error, setError] = useState('')
   const formRef = useRef<HTMLFormElement>(null)
   const review = device.review
+  useEffect(() => { setError('') }, [generation, review])
   if (!review) return null
   async function run(action: () => Promise<void>) {
-    if (pending.current) return
-    pending.current = true; setBusy(true); setError('')
-    try { await action() } catch (cause) { setError(messageOf(cause)) }
-    finally { pending.current = false; setBusy(false) }
+    if (pending.current === device.connectionGeneration()) return
+    const owner = device.connectionGeneration()
+    pending.current = owner; setBusyGeneration(owner); setError('')
+    try { await action() } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
+    finally { if (pending.current === owner) pending.current = null; setBusyGeneration(active => active === owner ? null : active) }
   }
   return <Card className={panel} aria-labelledby="recovery-review-title">
     <h2 id="recovery-review-title" className="font-semibold">{review.kind === 'bootstrap' ? '先保存加密恢复包' : '确认恢复后的设备授权'}</h2>
@@ -67,15 +71,24 @@ export function RecoveryReview() {
 
 export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) {
   const device = useDevice()
-  const [busy, setBusy] = useState(false)
-  const pending = useRef(false)
+  const generation = device.connectionGeneration()
+  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
+  const busy = busyGeneration === generation
+  const pending = useRef<number | null>(null)
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
+  useEffect(() => { setError(''); setStatus('') }, [generation])
   async function run(action: () => Promise<void>, success = '') {
-    if (pending.current) return
-    pending.current = true; setBusy(true); setError(''); setStatus('')
-    try { await action(); setStatus(success) } catch (cause) { setError(messageOf(cause)) }
-    finally { pending.current = false; setBusy(false) }
+    if (pending.current === device.connectionGeneration()) return
+    let owner = device.connectionGeneration()
+    setError(''); setStatus('')
+    try {
+      const work = action()
+      owner = device.connectionGeneration(); pending.current = owner; setBusyGeneration(owner)
+      await work
+      if (owner === device.connectionGeneration()) setStatus(success)
+    } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
+    finally { if (pending.current === owner) pending.current = null; setBusyGeneration(active => active === owner ? null : active) }
   }
   return <div className="space-y-4">
     {device.ready && device.review && <RecoveryReview />}
@@ -89,10 +102,12 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           <form className="space-y-4" onSubmit={event => {
             event.preventDefault(); const form = event.currentTarget
             void run(async () => {
+              let work: Promise<void>
               try {
                 const relay = form.elements.namedItem('relay')
-                await device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), bootstrap: field(form, 'bootstrap'), entry: parseEntry({ address: field(form, 'address'), node_id: field(form, 'node_id'), relay: relay instanceof HTMLInputElement && relay.checked }) })
+                work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), bootstrap: field(form, 'bootstrap'), entry: parseEntry({ address: field(form, 'address'), node_id: field(form, 'node_id'), relay: relay instanceof HTMLInputElement && relay.checked }) })
               } finally { form.reset() }
+              await work
             })
           }}><fieldset disabled={busy || !!device.review} className="space-y-4">
             <label className="grid gap-2 text-sm">加密恢复包<Input className={`${input} h-auto py-2`} type="file" name="bundle" accept="application/json,.json" required /></label>
@@ -115,8 +130,10 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           <form className="space-y-4" onSubmit={event => {
             event.preventDefault(); const form = event.currentTarget
             void run(async () => {
-              try { await device.reencrypt({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password'), field(form, 'confirmation')) }) }
+              let work: Promise<void>
+              try { work = device.reencrypt({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password'), field(form, 'confirmation')) }) }
               finally { form.reset() }
+              await work
             }, '新的加密恢复包已下载。')
           }}><fieldset disabled={busy || !!device.review} className="space-y-4">
             <label className="grid gap-2 text-sm">加密恢复包<Input className={`${input} h-auto py-2`} type="file" name="bundle" accept="application/json,.json" required /></label>
