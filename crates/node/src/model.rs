@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub type NetworkId = String;
-pub type NodeId = String;
+pub type PeerId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
 pub const WIRE_VERSION: u32 = 1;
@@ -35,7 +35,7 @@ pub enum EventBody {
         role: String,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scheduler_node: Option<NodeId>,
+        scheduler_node: Option<PeerId>,
     },
     TaskCreated {
         task_id: String,
@@ -51,14 +51,14 @@ pub enum EventBody {
     DispatchRecorded {
         operation_id: String,
         task_id: Option<String>,
-        target_node: NodeId,
+        target_node: PeerId,
         session_id: Option<String>,
         action: Value,
     },
     ExecutionObserved {
         operation_id: String,
         task_id: Option<String>,
-        target_node: NodeId,
+        target_node: PeerId,
         session_id: Option<String>,
         status: String,
         detail: Value,
@@ -90,7 +90,7 @@ pub struct Event {
     pub version: u32,
     pub network_id: NetworkId,
     pub scope_id: ScopeId,
-    pub author: NodeId,
+    pub author: PeerId,
     pub sequence: u64,
     pub previous: Option<EventHash>,
     pub parents: Vec<EventHash>,
@@ -142,7 +142,7 @@ pub struct Context {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BotProject {
-    pub target_node: NodeId,
+    pub target_node: PeerId,
     pub cwd: String,
 }
 
@@ -196,7 +196,7 @@ pub struct Task {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerDispatchAuthority {
-    pub scheduler_node: NodeId,
+    pub scheduler_node: PeerId,
     pub trigger: EventHash,
     pub followup_version: u64,
 }
@@ -208,7 +208,7 @@ pub struct OperationRequest {
     pub network_id: NetworkId,
     pub conversation_id: ScopeId,
     pub task_id: Option<String>,
-    pub target_node: NodeId,
+    pub target_node: PeerId,
     pub session_id: Option<String>,
     pub expected_revision: u64,
     pub basis_heads: Vec<EventHash>,
@@ -244,7 +244,7 @@ pub struct OperationRecord {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSession {
     pub network_id: NetworkId,
-    pub target_node: NodeId,
+    pub target_node: PeerId,
     pub session_id: String,
     pub revision: u64,
     pub state: String,
@@ -264,7 +264,7 @@ pub struct Notification {
 pub struct ContinuationClaim {
     pub result_event_hash: EventHash,
     pub policy_version: String,
-    pub scheduler_node: NodeId,
+    pub scheduler_node: PeerId,
     pub state: String,
     pub result: Value,
 }
@@ -293,7 +293,7 @@ pub enum SyncState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosureSync {
     pub scope_id: ScopeId,
-    pub target: NodeId,
+    pub target: PeerId,
     pub state: SyncState,
     pub missing: MissingDependencies,
     pub processed: usize,
@@ -318,5 +318,5 @@ impl ClosureSync {
 pub struct SyncReport {
     pub state: SyncState,
     pub scopes: Vec<ClosureSync>,
-    pub unreachable_sources: Vec<NodeId>,
+    pub unreachable_sources: Vec<PeerId>,
 }

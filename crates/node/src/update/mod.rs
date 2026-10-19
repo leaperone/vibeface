@@ -89,7 +89,8 @@ struct Journal {
     phase: Phase,
     previous: PathBuf,
     candidate: PathBuf,
-    node_id: String,
+
+    peer_id: String,
     backup: PathBuf,
 }
 
@@ -220,7 +221,7 @@ pub async fn run(options: Update) -> Result<()> {
                 "running node does not match current package"
             );
             ensure!(
-                lease.health.node_id == config::identity(&data)?.node_id()?,
+                lease.health.peer_id == config::identity(&data)?.peer_id()?,
                 "running node identity changed"
             );
             let root = fs::canonicalize(&policy.install_root)?;
@@ -241,7 +242,7 @@ pub async fn run(options: Update) -> Result<()> {
                 phase: Phase::Prepared,
                 previous,
                 candidate,
-                node_id: lease.health.node_id.clone(),
+                peer_id: lease.health.peer_id.clone(),
                 backup: backups.join(uuid::Uuid::new_v4().to_string()),
             };
             persist(&data.join("update-pending.json"), &journal)?;
@@ -254,7 +255,7 @@ pub async fn run(options: Update) -> Result<()> {
                         maintenance::commit(&data)
                             .await
                             .context("confirmed update must reopen admission")?;
-                        healthy(&data, &journal.candidate, &journal.node_id).await?;
+                        healthy(&data, &journal.candidate, &journal.peer_id).await?;
                     }
                     Ok(()) => {
                         bail!("update failed; previous program restored, data was kept: {error:#}")
@@ -297,7 +298,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("this package needs a manual bootstrap to the updater-enabled release")?;
     ensure!(
-        manifest.update_protocol == 2 && manifest.data_epoch == 3,
+        manifest.update_protocol == 2 && manifest.data_epoch == 4,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
@@ -384,7 +385,7 @@ async fn activate(
     drop(lock);
     service.start().await?;
     service
-        .healthy(data, &journal.candidate, &journal.node_id)
+        .healthy(data, &journal.candidate, &journal.peer_id)
         .await?;
     // Confirm durably before opening admission; recovery must never undo a committed update.
     journal.phase = Phase::Confirmed;
@@ -436,7 +437,7 @@ async fn recover_with_service(
         manifest(package)?;
     }
     ensure!(
-        journal.node_id == config::identity(data)?.node_id()?,
+        journal.peer_id == config::identity(data)?.peer_id()?,
         "update journal belongs to another node"
     );
     let confirmed = journal.phase == Phase::Confirmed;
@@ -448,7 +449,7 @@ async fn recover_with_service(
     if confirmed
         && installed(&root)? == wanted
         && service
-            .healthy(data, &wanted, &journal.node_id)
+            .healthy(data, &wanted, &journal.peer_id)
             .await
             .is_ok()
     {
@@ -460,7 +461,7 @@ async fn recover_with_service(
     switch(&root, &wanted)?;
     drop(lock);
     service.start().await?;
-    service.healthy(data, &wanted, &journal.node_id).await?;
+    service.healthy(data, &wanted, &journal.peer_id).await?;
     journal.candidate = wanted;
     journal.phase = Phase::Confirmed;
     persist(&pending, &journal)?;
@@ -482,7 +483,7 @@ async fn wait_for_node_lock(data: &Path) -> Result<File> {
     bail!("node did not release its data lock after stopping")
 }
 
-async fn healthy(data: &Path, package: &Path, node_id: &str) -> Result<()> {
+async fn healthy(data: &Path, package: &Path, peer_id: &str) -> Result<()> {
     let version = manifest(package)?.version.to_string();
     let mut listen = config::Config::load(data)?.listen;
     if listen.ip().is_unspecified() {
@@ -510,7 +511,7 @@ async fn healthy(data: &Path, package: &Path, node_id: &str) -> Result<()> {
     let mut last = String::new();
     for _ in 0..150 {
         match maintenance::probe(data).await {
-            Ok(health) if health.node_id == node_id && health.version == version => {
+            Ok(health) if health.peer_id == peer_id && health.version == version => {
                 match client
                     .get(&url)
                     .header(reqwest::header::HOST, &host)
@@ -520,7 +521,9 @@ async fn healthy(data: &Path, package: &Path, node_id: &str) -> Result<()> {
                     Ok(response) if response.status().is_success() => {
                         if let Ok(info) = response.json::<serde_json::Value>().await {
                             ensure!(
-                                info["node_id"] == node_id && info["version"] == version,
+                                info.get("peer_id").and_then(serde_json::Value::as_str)
+                                    == Some(peer_id)
+                                    && info["version"] == version,
                                 "HTTP listener belongs to a different node or version"
                             );
                             return Ok(());
@@ -683,8 +686,8 @@ struct Service {
 trait ServiceControl {
     async fn stop(&self) -> Result<()>;
     async fn start(&self) -> Result<()>;
-    async fn healthy(&self, data: &Path, package: &Path, node_id: &str) -> Result<()> {
-        healthy(data, package, node_id).await
+    async fn healthy(&self, data: &Path, package: &Path, peer_id: &str) -> Result<()> {
+        healthy(data, package, peer_id).await
     }
     async fn commit(&self, data: &Path) -> Result<()> {
         maintenance::commit(data).await
@@ -866,6 +869,16 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn peer_id_journal_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"phase":"prepared","previous":"old","candidate":"new","peer_id":"device","backup":"backup"}"#;
+        let journal: Journal = serde_json::from_str(wire)?;
+        assert_eq!(journal.peer_id, "device");
+        assert_eq!(serde_json::to_string(&journal)?, wire);
+        assert!(serde_json::from_str::<Journal>(&wire.replace("peer_id", "node_id")).is_err());
+        Ok(())
+    }
+
     fn sandbox() -> PathBuf {
         let directory =
             PathBuf::from("/tmp").join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
@@ -880,7 +893,7 @@ mod tests {
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":3}}"#),
+            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":4}}"#),
         )
         .unwrap();
         directory
@@ -919,7 +932,7 @@ mod tests {
         assert!(manifest(&old).is_err());
         fs::write(
             old.join("BUILD-INFO.json"),
-            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":3}"#,
+            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":4}"#,
         )
         .unwrap();
         assert!(manifest(&old).is_err());
@@ -1055,7 +1068,7 @@ mod tests {
             phase: Phase::Prepared,
             previous,
             candidate,
-            node_id: identity.node_id().unwrap(),
+            peer_id: identity.peer_id().unwrap(),
             backup: root.join("backups/fixture"),
         };
         persist(&data.join("update-pending.json"), &journal).unwrap();

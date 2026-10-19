@@ -88,11 +88,11 @@ mod node_display_names_tests {
         state.append(GovernanceEvent::revoke(
             &admin,
             &state.project()?,
-            &node.node_id()?,
+            &node.peer_id()?,
         )?)?;
         let names = node_display_names(&state);
         assert_eq!(
-            names.get(&node.node_id()?).map(String::as_str),
+            names.get(&node.peer_id()?).map(String::as_str),
             Some("Mac Studio")
         );
         Ok(())
@@ -113,7 +113,7 @@ mod tests {
     fn test_owner(node: &Runtime) -> Result<LocalIdentity> {
         Ok(LocalIdentity {
             secret_key_hex: crypto::digest(
-                format!("runtime-test-root:{}", node.identity.node_id()?).as_bytes(),
+                format!("runtime-test-root:{}", node.identity.peer_id()?).as_bytes(),
             ),
         })
     }
@@ -126,7 +126,7 @@ mod tests {
             .join(subdir)
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
         cfg.save(&dir)?;
@@ -181,7 +181,7 @@ mod tests {
         let network = membership.genesis.network_id.clone();
         source.install_membership(membership.clone()).await?;
         target.install_membership(membership).await?;
-        let target_id = target.identity.node_id()?;
+        let target_id = target.identity.peer_id()?;
         let mut tasks = tokio::task::JoinSet::new();
         let router = crate::api::router(target.clone());
         tasks.spawn(async move {
@@ -429,16 +429,16 @@ mod tests {
             }
         })
         .await?;
-        let a = nodes[1].identity.node_id()?;
-        let b = nodes[2].identity.node_id()?;
+        let a = nodes[1].identity.peer_id()?;
+        let b = nodes[2].identity.peer_id()?;
         let sources = vec![
             HistorySource {
-                node_id: a.clone(),
+                peer_id: a.clone(),
                 batch: None,
                 failed: false,
             },
             HistorySource {
-                node_id: b.clone(),
+                peer_id: b.clone(),
                 batch: None,
                 failed: false,
             },
@@ -598,7 +598,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: node.identity.node_id()?,
+            author: node.identity.peer_id()?,
             sequence: 2,
             previous: Some(root.clone()),
             parents: vec![root],
@@ -615,7 +615,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: node.identity.node_id()?,
+            author: node.identity.peer_id()?,
             sequence: 3,
             previous: Some(pending.hash.clone()),
             parents: vec![pending.hash.clone()],
@@ -657,7 +657,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: "chat".into(),
             task_id: None,
-            target_node: node.identity.node_id()?,
+            target_node: node.identity.peer_id()?,
             session_id: Some("pending-session".into()),
             expected_revision: 0,
             basis_heads: vec![pending.hash.clone()],
@@ -737,7 +737,7 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .session(&network, &node.identity.node_id()?, "pending-session")?
+                .session(&network, &node.identity.peer_id()?, "pending-session")?
                 .is_none()
         );
         let dispatches: usize = connection.query_row("SELECT count(*) FROM events WHERE network_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.type')='dispatch_recorded'", [&network], |row| row.get(0))?;
@@ -813,7 +813,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: "chat".into(),
             task_id: None,
-            target_node: node.identity.node_id()?,
+            target_node: node.identity.peer_id()?,
             session_id: None,
             expected_revision: 0,
             basis_heads: node.store.lock().await.heads(&network, "chat")?,
@@ -1019,7 +1019,7 @@ mod tests {
             .ingest_events(&network, std::slice::from_ref(&large))?;
         let mut message = Inbound {
             network_id: network.clone(),
-            origin: node.identity.node_id()?,
+            origin: node.identity.peer_id()?,
             request_id: uuid::Uuid::new_v4().to_string(),
             broadcast: false,
             payload: json!({"type":"history_batch","hash":large.hash,"limit":128,"max_bytes":HISTORY_BATCH_BYTES}),
@@ -1107,7 +1107,7 @@ mod tests {
                 version: 1,
                 network_id: network.clone(),
                 scope_id: "chat".into(),
-                author: source.identity.node_id()?,
+                author: source.identity.peer_id()?,
                 sequence: index + 1,
                 previous,
                 parents: vec![],
@@ -1200,7 +1200,7 @@ mod tests {
                 let _ = serving.hub.respond(&message, value).await;
             }
         });
-        let source_id = source.identity.node_id()?;
+        let source_id = source.identity.peer_id()?;
         tokio::time::timeout(Duration::from_secs(3), async {
             while !receiver.hub.online(&network).await.contains(&source_id) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1328,7 +1328,7 @@ mod tests {
                 let _ = serving.hub.respond(&message, value).await;
             }
         });
-        let backup_id = backup.identity.node_id()?;
+        let backup_id = backup.identity.peer_id()?;
         tokio::time::timeout(Duration::from_secs(3), async {
             while !receiver.hub.online(&network).await.contains(&backup_id) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1368,7 +1368,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: node.identity.node_id()?,
+            author: node.identity.peer_id()?,
             sequence: 2,
             previous: Some(root.clone()),
             parents: vec![root],
@@ -1385,7 +1385,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: node.identity.node_id()?,
+            author: node.identity.peer_id()?,
             sequence: 3,
             previous: Some(parent.hash.clone()),
             parents: vec![parent.hash.clone()],
@@ -1399,7 +1399,7 @@ mod tests {
             blobs: vec![],
         })?;
         node.store.lock().await.ingest_event(&network, &child)?;
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         let first = node
             .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
             .await?;
@@ -1524,7 +1524,7 @@ mod tests {
         let dir = fixture_under("network-reliability")?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         let content = b"one missing blob across advancing heads";
         let blob = BlobRef {
             hash: crypto::digest(content),
@@ -1569,7 +1569,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: other.node_id()?,
+            author: other.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -1677,7 +1677,7 @@ mod tests {
         let dir = fixture_under("network-reliability")?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         let content = b"one object for many real scopes";
         let blob = BlobRef {
             hash: crypto::digest(content),
@@ -1816,7 +1816,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: author.node_id()?,
+            author: author.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -1835,7 +1835,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: author.node_id()?,
+            author: author.peer_id()?,
             sequence: 2,
             previous: Some(root.hash.clone()),
             parents: vec![root.hash.clone()],
@@ -1911,7 +1911,7 @@ mod tests {
                         .hub
                         .online(&network)
                         .await
-                        .contains(&nodes[3].identity.node_id().unwrap())
+                        .contains(&nodes[3].identity.peer_id().unwrap())
                     {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
@@ -1928,7 +1928,7 @@ mod tests {
             }
         })
         .await?;
-        let preferred = nodes[1].identity.node_id()?;
+        let preferred = nodes[1].identity.peer_id()?;
         let partial = nodes[0]
             .fetch_closure_batch(
                 &network,
@@ -2003,7 +2003,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "starvation".into(),
-            author: author.node_id()?,
+            author: author.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -2051,7 +2051,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "proper-root".into(),
-            author: author.node_id()?,
+            author: author.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -2103,7 +2103,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: "chat".into(),
             task_id: None,
-            target_node: nodes[0].identity.node_id()?,
+            target_node: nodes[0].identity.peer_id()?,
             session_id: None,
             expected_revision: 0,
             basis_heads: vec![head.hash.clone()],
@@ -2116,7 +2116,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "chat".into(),
-            author: author.node_id()?,
+            author: author.peer_id()?,
             sequence: 3,
             previous: Some(head.hash.clone()),
             parents: vec![head.hash.clone()],
@@ -2202,12 +2202,12 @@ mod tests {
                     message_id: "revoked-schedule".into(),
                     role: "user".into(),
                     text: "do not run".into(),
-                    scheduler_node: Some(nodes[0].identity.node_id()?),
+                    scheduler_node: Some(nodes[0].identity.peer_id()?),
                 },
                 vec![],
                 2,
-                &schedule_author.node_id()?,
-                &nodes[0].identity.node_id()?,
+                &schedule_author.peer_id()?,
+                &nodes[0].identity.peer_id()?,
                 false,
             )?;
             (trigger, store.heads(&network, "schedule-revocation")?)
@@ -2215,10 +2215,10 @@ mod tests {
         *membership_during_fetch.lock().await = Some(revoked_state(3, true)?);
         let schedule = Inbound {
             network_id: network.clone(),
-            origin: nodes[2].identity.node_id()?,
+            origin: nodes[2].identity.peer_id()?,
             request_id: "revoked-schedule".into(),
             broadcast: false,
-            payload: json!({"type":"schedule","version":1,"target_node":nodes[0].identity.node_id()?,"conversation_id":"schedule-revocation","trigger":trigger.hash,"basis_heads":schedule_basis}),
+            payload: json!({"type":"schedule","version":1,"target_node":nodes[0].identity.peer_id()?,"conversation_id":"schedule-revocation","trigger":trigger.hash,"basis_heads":schedule_basis}),
         };
         let error = nodes[0].handle_peer(&schedule).await.unwrap_err();
         assert_eq!(
@@ -2243,7 +2243,7 @@ mod tests {
                 &network,
                 "schedule-revocation",
                 &trigger.hash,
-                &nodes[0].identity.node_id()?
+                &nodes[0].identity.peer_id()?
             )?,
             None
         );
@@ -2251,7 +2251,7 @@ mod tests {
             let store = nodes[0].store.lock().await;
             store.authorize_node(
                 &network,
-                &schedule_author.node_id()?,
+                &schedule_author.peer_id()?,
                 Some(NodeRole::Gateway),
             )?;
             assert!(
@@ -2275,7 +2275,7 @@ mod tests {
             &network,
             "schedule-revocation",
             &trigger.hash,
-            &nodes[0].identity.node_id()?,
+            &nodes[0].identity.peer_id()?,
         )?;
         assert_eq!(
             admission_control
@@ -2283,7 +2283,7 @@ mod tests {
                     &network,
                     "schedule-revocation",
                     &trigger.hash,
-                    &nodes[0].identity.node_id()?
+                    &nodes[0].identity.peer_id()?
                 )?
                 .unwrap()
                 .state
@@ -2306,7 +2306,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: local_scope.into(),
             task_id: None,
-            target_node: nodes[0].identity.node_id()?,
+            target_node: nodes[0].identity.peer_id()?,
             session_id: None,
             expected_revision: 0,
             basis_heads: vec![local_root.hash.clone()],
@@ -2349,7 +2349,7 @@ mod tests {
         *membership_during_fetch.lock().await = Some(update);
         let execute = Inbound {
             network_id: network.clone(),
-            origin: nodes[3].identity.node_id()?,
+            origin: nodes[3].identity.peer_id()?,
             request_id: "local-role-revoked-dispatch".into(),
             broadcast: false,
             payload: json!({"type":"execute","human":true,"request":local_request,"dispatch_head":local_dispatch.hash}),
@@ -2360,14 +2360,14 @@ mod tests {
         let store = nodes[0].store.lock().await;
         store.authorize_node(
             &network,
-            &nodes[0].identity.node_id()?,
+            &nodes[0].identity.peer_id()?,
             Some(NodeRole::Relay),
         )?;
         assert!(
             store
                 .authorize_node(
                     &network,
-                    &nodes[0].identity.node_id()?,
+                    &nodes[0].identity.peer_id()?,
                     Some(NodeRole::Replica)
                 )
                 .is_err()
@@ -2402,7 +2402,7 @@ mod tests {
         operation: &str,
         action: Value,
     ) -> Result<OperationRequest> {
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         let mut store = node.store.lock().await;
         store.upsert_session(
             network,
@@ -2471,7 +2471,7 @@ mod tests {
                 access,
                 json!({"method":"set_followup","conversation_id":"chat",
                 "task_id":task_id,"mode":"report","expected_version":version,
-                "scheduler_node":node.identity.node_id()?}),
+                "scheduler_node":node.identity.peer_id()?}),
             )
             .await?;
         }
@@ -2481,7 +2481,7 @@ mod tests {
     async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
         let dir = fixture()?;
         let config = std::fs::read(dir.join("config.json"))?;
-        for epoch in [None, Some(1), Some(2), Some(4)] {
+        for epoch in [None, Some(1), Some(2), Some(3), Some(5)] {
             if let Some(epoch) = epoch {
                 config::private_write(
                     &dir.join("data-epoch.json"),
@@ -2545,7 +2545,7 @@ mod tests {
         task(&node, &network, "task", true).await?;
         task(&node, &network, "unapproved", false).await?;
         let executor = LocalIdentity::generate();
-        let origin = executor.node_id()?;
+        let origin = executor.peer_id()?;
         let owner = test_owner(&node)?;
         let mut store = node.store.lock().await;
         let mut nodes = store
@@ -2574,7 +2574,7 @@ mod tests {
             manager_authority: None,
         };
         store.bind_test_operation(&node.identity, &mut request)?;
-        let scheduler = node.identity.node_id()?;
+        let scheduler = node.identity.peer_id()?;
         store.append_event(
             &node.identity,
             &network,
@@ -2624,7 +2624,7 @@ mod tests {
                 message_id: "forged-user".into(),
                 role: "user".into(),
                 text: "wake manager".into(),
-                scheduler_node: Some(node.identity.node_id()?),
+                scheduler_node: Some(node.identity.peer_id()?),
             },
             vec![],
             now_ms(),
@@ -2728,7 +2728,7 @@ mod tests {
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         task(&node, &network, "task", false).await?;
         let mut request = queued(
             &node,
@@ -2977,7 +2977,7 @@ mod tests {
                 network_id: network.clone(),
                 conversation_id: "chat".into(),
                 task_id: Some("task".into()),
-                target_node: node.identity.node_id()?,
+                target_node: node.identity.peer_id()?,
                 session_id: Some(format!("session-{status}")),
                 expected_revision: 0,
                 basis_heads: node.store.lock().await.heads(&network, "chat")?,
@@ -3175,7 +3175,7 @@ mod tests {
         ] {
             let message = Inbound {
                 network_id: network.clone(),
-                origin: origin.node_id()?,
+                origin: origin.peer_id()?,
                 request_id: "approval-origin-test".into(),
                 payload: json!({"type":"execute","human":human,"request":request,"dispatch_head":"f".repeat(64)}),
                 broadcast: false,
@@ -3186,13 +3186,13 @@ mod tests {
             );
         }
         let missing = crypto::digest(b"not present on the receiver");
-        let schedule = json!({"type":"schedule","version":1,"target_node":node.identity.node_id()?,
+        let schedule = json!({"type":"schedule","version":1,"target_node":node.identity.peer_id()?,
             "conversation_id":"chat","trigger":missing,"basis_heads":[missing]});
-        let resolution = json!({"type":"resolve_unknown","target_node":node.identity.node_id()?,"operation_id":request.operation_id,"outcome":"succeeded","evidence":"verified test fixture process stopped"});
+        let resolution = json!({"type":"resolve_unknown","target_node":node.identity.peer_id()?,"operation_id":request.operation_id,"outcome":"succeeded","evidence":"verified test fixture process stopped"});
         for origin in [&replica, &relay] {
             let message = Inbound {
                 network_id: network.clone(),
-                origin: origin.node_id()?,
+                origin: origin.peer_id()?,
                 request_id: "role-test".into(),
                 payload: resolution.clone(),
                 broadcast: false,
@@ -3222,7 +3222,7 @@ mod tests {
         for origin in [&owner, &scheduler] {
             let message = Inbound {
                 network_id: network.clone(),
-                origin: origin.node_id()?,
+                origin: origin.peer_id()?,
                 request_id: "schedule-role-test".into(),
                 payload: schedule.clone(),
                 broadcast: false,
@@ -3234,7 +3234,7 @@ mod tests {
         }
         let message = Inbound {
             network_id: network.clone(),
-            origin: owner.node_id()?,
+            origin: owner.peer_id()?,
             request_id: "gateway-test".into(),
             payload: resolution,
             broadcast: false,
@@ -3244,7 +3244,7 @@ mod tests {
             "succeeded"
         );
         let message = Inbound {
-            origin: replica.node_id()?,
+            origin: replica.peer_id()?,
             payload: json!({"type":"event","hash":event.hash}),
             ..message
         };
@@ -3312,7 +3312,7 @@ mod tests {
             let receipt = call.await??;
             assert_eq!(receipt["state"], "queued");
             assert_eq!(receipt["queued"], true);
-            assert_eq!(receipt["receipt"]["target_node"], node.identity.node_id()?);
+            assert_eq!(receipt["receipt"]["target_node"], node.identity.peer_id()?);
             triggers.insert(receipt["trigger"].as_str().unwrap().to_owned());
         }
         assert_eq!(triggers.len(), 1);
@@ -3323,7 +3323,7 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .scheduler_jobs(&network, "chat", &node.identity.node_id()?)?
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
                 .len(),
             1
         );
@@ -3364,7 +3364,7 @@ mod tests {
             node.store
                 .lock()
                 .await
-                .scheduler_jobs(&network, "chat", &node.identity.node_id()?)?
+                .scheduler_jobs(&network, "chat", &node.identity.peer_id()?)?
                 .len(),
             1
         );
@@ -3377,7 +3377,7 @@ mod tests {
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         for task_id in ["a-old", "b-new"] {
             task(&node, &network, task_id, false).await?;
             let mut store = node.store.lock().await;
@@ -3496,7 +3496,7 @@ mod tests {
             }
         }
         let grant = json!({"method":"set_followup","conversation_id":"chat","task_id":"active",
-            "mode":"report","expected_version":0,"scheduler_node":node.identity.node_id()?});
+            "mode":"report","expected_version":0,"scheduler_node":node.identity.peer_id()?});
         assert_eq!(
             node.rpc(access.clone(), grant.clone()).await?["policy"]["version"],
             1
@@ -3637,7 +3637,7 @@ mod tests {
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        let local = node.identity.node_id()?;
+        let local = node.identity.peer_id()?;
         let result = node.reconcile(&network, &local, "never-received").await?;
         assert_eq!(result["state"], "not_found");
         assert_eq!(result["target_node"], local);
@@ -3685,7 +3685,7 @@ mod tests {
             ],
         )?)
         .await?;
-        request["scheduler_node"] = json!(target.node_id()?);
+        request["scheduler_node"] = json!(target.peer_id()?);
         let first = node.rpc(access.clone(), request.clone()).await?;
         assert_eq!(first["state"], "pending_delivery");
         assert_eq!(first["accepted"], true);
@@ -3693,19 +3693,19 @@ mod tests {
         let retry = node.rpc(access.clone(), request.clone()).await?;
         assert_eq!(retry["receipt"], first["receipt"]);
         assert_eq!(retry["trigger"], first["trigger"]);
-        request["scheduler_node"] = json!(other.node_id()?);
+        request["scheduler_node"] = json!(other.peer_id()?);
         let changed = node.rpc(access.clone(), request).await.unwrap_err();
         assert!(changed.to_string().contains("different content or target"));
         let store = node.store.lock().await;
         assert_eq!(store.messages(&network, "chat")?.len(), 1);
         let pending = store.scheduler_outbox(&network)?;
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].target_node, target.node_id()?);
+        assert_eq!(pending[0].target_node, target.peer_id()?);
         assert_eq!(pending[0].trigger, first["trigger"].as_str().unwrap());
         assert!(!pending[0].delivered);
         drop(store);
         let fresh = node.rpc(access, json!({"method":"message","conversation_id":"chat","message_id":"fresh-message","text":"new request"})).await?;
-        assert_eq!(fresh["scheduler_node"], node.identity.node_id()?);
+        assert_eq!(fresh["scheduler_node"], node.identity.peer_id()?);
         assert_ne!(fresh["scheduler_node"], first["scheduler_node"]);
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -3920,7 +3920,7 @@ mod tests {
             store.local_delete(&network, "completion:local")?;
             let mut remote_request = request;
             remote_request.operation_id = "remote".into();
-            remote_request.target_node = remote.node_id()?;
+            remote_request.target_node = remote.peer_id()?;
             remote_request.resources.clear();
             remote_request.task_id = Some("remote-fixture".into());
             remote_request.binding = None;
@@ -3942,7 +3942,7 @@ const HISTORY_BATCH_EVENTS: usize = 128;
 const HISTORY_BATCH_BYTES: usize = crate::peer::MAX_PACKET_BYTES - 1024;
 
 struct HistorySource {
-    node_id: String,
+    peer_id: String,
     batch: Option<bool>,
     failed: bool,
 }
@@ -4202,8 +4202,8 @@ impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
-            epoch == json!({"data_epoch":3}),
-            "this Node requires an initialized data epoch 3 directory"
+            epoch == json!({"data_epoch":4}),
+            "this Node requires an initialized data epoch 4 directory"
         );
         let mut config = Config::load(dir)?;
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
@@ -4239,7 +4239,7 @@ impl Runtime {
             let view = state.project()?;
             store.install_trust_bundle(&view.network_id, &state)?;
             identities.install_state(state)?;
-            if view.authorize_node(&identity.node_id()?, None).is_ok() {
+            if view.authorize_node(&identity.peer_id()?, None).is_ok() {
                 store.save_local_identity(&view.network_id, &identity)?;
             }
         }
@@ -4251,7 +4251,7 @@ impl Runtime {
         let managed_socket = config.codex_socket.is_none();
         if managed_socket {
             let socket_dir =
-                PathBuf::from("/tmp").join(format!("vibeface-{}", &identity.node_id()?[..32]));
+                PathBuf::from("/tmp").join(format!("vibeface-{}", &identity.peer_id()?[..32]));
             match std::fs::create_dir(&socket_dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -4364,7 +4364,7 @@ impl Runtime {
         let view = state.project()?;
         self.identities.install_state(state.clone())?;
         store.install_trust_bundle(&view.network_id, &state)?;
-        if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
+        if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
             store.save_local_identity(&view.network_id, &self.identity)?;
         }
         Ok(view)
@@ -4413,14 +4413,14 @@ impl Runtime {
             self.identities.install_state(merged.clone())?;
             store.install_trust_bundle(&merged.genesis.network_id, &merged)?;
             let view = merged.project()?;
-            if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
+            if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
                 store.save_local_identity(&view.network_id, &self.identity)?;
             }
         }
         Ok(merged)
     }
     pub fn info(&self) -> Value {
-        json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
+        json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         self.start_schedule_delivery();
@@ -4520,7 +4520,7 @@ impl Runtime {
                 for member in view.members.into_iter().filter(|member| {
                     member.kind == IdentityKind::Node && !view.revoked.contains(&member.subject_id)
                 }) {
-                    if member.subject_id == node.identity.node_id().unwrap_or_default()
+                    if member.subject_id == node.identity.peer_id().unwrap_or_default()
                         || online.contains(&member.subject_id)
                     {
                         continue;
@@ -4591,7 +4591,7 @@ impl Runtime {
         Ok(())
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let store = self.store.lock().await;
         for network in store.networks()? {
             for operation in store.operations(&network)? {
@@ -4686,7 +4686,7 @@ impl Runtime {
         let store = self.store.lock().await;
         let waited = waiting.elapsed();
         let held = Instant::now();
-        store.authorize_node(&access.network_id, &self.identity.node_id()?, None)?;
+        store.authorize_node(&access.network_id, &self.identity.peer_id()?, None)?;
         ensure!(
             store.has_conversation(&access.network_id, scope)?,
             "conversation not found"
@@ -4708,7 +4708,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, &self.identity.node_id()?, Some(role))?;
+            .authorize_node(network, &self.identity.peer_id()?, Some(role))?;
         Ok(())
     }
     async fn route_flight(
@@ -4786,7 +4786,7 @@ impl Runtime {
     }
 
     async fn raw_peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         self.hub.authorize(network, &local).await?;
         self.hub.authorize(network, target).await?;
         if target != local && !self.hub.has_route(network, target).await {
@@ -4866,7 +4866,7 @@ impl Runtime {
         network: &str,
         preferred: &[String],
     ) -> Result<Vec<HistorySource>> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let mut sources = preferred.to_vec();
         sources.extend(self.hub.online(network).await);
         let mut seen = BTreeSet::new();
@@ -4880,8 +4880,8 @@ impl Runtime {
         });
         Ok(sources
             .into_iter()
-            .map(|node_id| HistorySource {
-                node_id,
+            .map(|peer_id| HistorySource {
+                peer_id,
                 batch: None,
                 failed: false,
             })
@@ -4905,7 +4905,7 @@ impl Runtime {
             if budget.events == 0 || budget.bytes == 0 {
                 break;
             }
-            let target = source.node_id.clone();
+            let target = source.peer_id.clone();
             let before = budget.events;
             let result = async {
                 let batch = match source.batch {
@@ -5171,7 +5171,7 @@ impl Runtime {
                 let mut store = self.store.lock().await;
                 store.authorize_node(
                     network,
-                    &self.identity.node_id()?,
+                    &self.identity.peer_id()?,
                     Some(NodeRole::Replica),
                 )?;
                 inserted += store.ingest_events(network, &page.events)?;
@@ -5186,7 +5186,7 @@ impl Runtime {
         };
         {
             let mut store = self.store.lock().await;
-            store.authorize_node(network, &self.identity.node_id()?, Some(NodeRole::Replica))?;
+            store.authorize_node(network, &self.identity.peer_id()?, Some(NodeRole::Replica))?;
             progress.advance(&missing);
             save_sync_progress(&mut store, network, &key, &progress, persist)?;
         }
@@ -5349,7 +5349,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, &self.identity.node_id()?, None)?;
+            .authorize_node(network, &self.identity.peer_id()?, None)?;
         let method = field(&input, "method")?;
         if !access.human {
             ensure!(
@@ -5372,7 +5372,7 @@ impl Runtime {
                     .trust_bundle(network)?
                     .context("unknown network")?;
                 let online = self.hub.online(network).await;
-                let local = self.identity.node_id()?;
+                let local = self.identity.peer_id()?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
                 let revoked_ids = view.revoked.clone();
@@ -5383,9 +5383,9 @@ impl Runtime {
                     .filter(|member| member.kind == IdentityKind::Node)
                 {
                     let mut cert = member.certificate()?;
-                    cert.revoked = view.revoked.contains(&cert.node_id);
-                    let here = cert.node_id == local;
-                    let live = here || online.contains(&cert.node_id);
+                    cert.revoked = view.revoked.contains(&cert.peer_id);
+                    let here = cert.peer_id == local;
+                    let live = here || online.contains(&cert.peer_id);
                     let capabilities = if here {
                         self.capabilities()
                     } else if live && !cert.revoked {
@@ -5393,7 +5393,7 @@ impl Runtime {
                             Duration::from_secs(3),
                             self.peer_request(
                                 network,
-                                &cert.node_id,
+                                &cert.peer_id,
                                 json!({"type":"capabilities"}),
                             ),
                         )
@@ -5404,16 +5404,16 @@ impl Runtime {
                     } else {
                         Value::Null
                     };
-                    nodes.push(json!({"node_id":cert.node_id,"name":member.name,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
+                    nodes.push(json!({"peer_id":cert.peer_id,"name":member.name,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
                 }
                 let history = bundle.historical_nodes()?;
                 for revoked in revoked_ids {
-                    if nodes.iter().any(|node| node["node_id"] == revoked) {
+                    if nodes.iter().any(|node| node["peer_id"] == revoked) {
                         continue;
                     }
                     if history.iter().any(|node| node.subject_id == revoked) {
                         let name = display_names.get(&revoked).cloned().unwrap_or_default();
-                        nodes.push(json!({"node_id":revoked,"name":name,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
+                        nodes.push(json!({"peer_id":revoked,"name":name,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
                     }
                 }
                 Ok(json!({"nodes":nodes}))
@@ -5554,7 +5554,7 @@ impl Runtime {
             "operation" => {
                 let target = field(&input, "target_node")?;
                 let op = field(&input, "operation_id")?;
-                if target == self.identity.node_id()? {
+                if target == self.identity.peer_id()? {
                     Ok(json!({"operation":self.store.lock().await.operation(network,op)?}))
                 } else {
                     self.peer_request(
@@ -5658,7 +5658,7 @@ impl Runtime {
         self: &Arc<Self>,
         binding: crate::binding::TaskBinding,
     ) -> Result<crate::binding::SignedBinding> {
-        let proof = if binding.authority_node == self.identity.node_id()? {
+        let proof = if binding.authority_node == self.identity.peer_id()? {
             self.store
                 .lock()
                 .await
@@ -5733,7 +5733,7 @@ impl Runtime {
             .lock()
             .await
             .task_binding(&request.network_id, &creation.hash)?;
-        if event.author != self.identity.node_id()?
+        if event.author != self.identity.peer_id()?
             && existing.as_ref().is_none_or(|proof| {
                 proof.binding.target_node != request.target_node
                     || Some(proof.binding.session_id.as_str()) != request.session_id.as_deref()
@@ -5819,7 +5819,7 @@ impl Runtime {
             .task_binding(&access.network_id, &creation.hash)?
             .context("task has no confirmed execution binding")?;
         let old = &previous.binding;
-        let seal = if old.target_node == self.identity.node_id()? {
+        let seal = if old.target_node == self.identity.peer_id()? {
             self.store
                 .lock()
                 .await
@@ -5999,7 +5999,7 @@ impl Runtime {
             self.publish_changed(&access.network_id, &request.conversation_id, &event.hash);
             event.hash
         };
-        if request.target_node == self.identity.node_id()? {
+        if request.target_node == self.identity.peer_id()? {
             self.admit_operation_checked(request, access.human, Some(&access), None)
                 .await
         } else {
@@ -6032,7 +6032,7 @@ impl Runtime {
         self.require_role(&request.network_id, NodeRole::Executor)
             .await?;
         ensure!(
-            request.target_node == self.identity.node_id()?,
+            request.target_node == self.identity.peer_id()?,
             "wrong execution target"
         );
         let kind = field(&request.action, "type")?;
@@ -6566,7 +6566,7 @@ impl Runtime {
         Ok(())
     }
     async fn session_fact(&self, network: &str, target: &str, session_id: &str) -> Result<Value> {
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             return self
                 .read_peer(
                     network,
@@ -6665,7 +6665,7 @@ impl Runtime {
             match tokio::time::timeout(Duration::from_secs(3),self.session_fact(network,&target,&session)).await {Ok(Ok(value))=>{sessions.push(value["session"].clone());facts.push(value);},_=>facts.push(json!({"target_node":target,"session_id":session,"state":"unreachable","freshness":"unknown"}))}
         }
         for (target, op) in operations {
-            if target == self.identity.node_id()? {
+            if target == self.identity.peer_id()? {
                 if let Some(record) = self.store.lock().await.operation(network, &op)? {
                     records.push(json!(record));
                 }
@@ -6806,11 +6806,11 @@ impl Runtime {
                 let mut store = self.store.lock().await;
                 let view = self.identities.public_state()?.project()?;
                 ensure!(view.network_id == *network, "wrong personal network");
-                view.authorize_node(&self.identity.node_id()?, Some(NodeRole::Replica))?;
+                view.authorize_node(&self.identity.peer_id()?, Some(NodeRole::Replica))?;
                 let (size, bytes) = store
                     .blob_range(
                         network,
-                        &self.identity.node_id()?,
+                        &self.identity.peer_id()?,
                         &message.origin,
                         field(input, "hash")?,
                         offset,
@@ -6930,7 +6930,7 @@ impl Runtime {
             "session" => {
                 self.session_fact(
                     network,
-                    &self.identity.node_id()?,
+                    &self.identity.peer_id()?,
                     field(input, "session_id")?,
                 )
                 .await
@@ -7006,7 +7006,7 @@ impl Runtime {
             "reconcile" => {
                 self.reconcile(
                     network,
-                    &self.identity.node_id()?,
+                    &self.identity.peer_id()?,
                     field(input, "operation_id")?,
                 )
                 .await
@@ -7094,7 +7094,7 @@ impl Runtime {
                     "task_id":request.task_id,"task_ref":request.binding.as_ref().map(|proof| &proof.binding.task_ref),
                     "target_node":request.target_node,"session_id":request.session_id,"operation_id":request.operation_id,
                     "turn_id":turn.as_ref().and_then(|value|value["turn"]["id"].as_str()),
-                    "source":self.identity.node_id()?,"source_node":self.identity.node_id()?,"sequence":sequence,"progress":observation::execution_progress(&event)}));
+                    "source":self.identity.peer_id()?,"source_node":self.identity.peer_id()?,"sequence":sequence,"progress":observation::execution_progress(&event)}));
                 if method == "turn/completed" {
                     let turn = field(&event["params"]["turn"], "id")?;
                     let known = self
@@ -7196,7 +7196,7 @@ impl Runtime {
         target: &str,
         operation_id: &str,
     ) -> Result<Value> {
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             return self
                 .peer_request(
                     network,
@@ -7259,7 +7259,7 @@ impl Runtime {
     }
     async fn resolve_unknown(self: &Arc<Self>, network: &str, input: &Value) -> Result<Value> {
         let target = field(input, "target_node")?;
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             let mut value = input.clone();
             value["type"] = json!("resolve_unknown");
             return self.peer_request(network, target, value).await;

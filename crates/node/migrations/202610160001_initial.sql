@@ -5,16 +5,16 @@ CREATE TABLE networks (
 );
 CREATE TABLE node_certificates (
   network_id TEXT NOT NULL,
-  node_id TEXT NOT NULL,
+  peer_id TEXT NOT NULL,
   public_key TEXT NOT NULL,
-  PRIMARY KEY(network_id,node_id),
+  PRIMARY KEY(network_id,peer_id),
   FOREIGN KEY(network_id) REFERENCES networks(network_id)
 );
 CREATE TABLE local_identities (
   network_id TEXT NOT NULL,
-  node_id TEXT NOT NULL,
+  peer_id TEXT NOT NULL,
   identity TEXT NOT NULL,
-  PRIMARY KEY(network_id,node_id),
+  PRIMARY KEY(network_id,peer_id),
   FOREIGN KEY(network_id) REFERENCES networks(network_id)
 );
 CREATE TABLE events (
@@ -122,7 +122,7 @@ CREATE TABLE budget_days (
   used INTEGER NOT NULL,
   PRIMARY KEY(network_id,day)
 );
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 CREATE TABLE local_values (
   network_id TEXT NOT NULL,
   key TEXT NOT NULL,

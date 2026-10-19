@@ -132,14 +132,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     let verified: ReturnType<typeof verifyAuthentication>
     try {
       verified = verifyAuthentication(authValue, own, expected)
-      const pinnedNetwork = load(`network-for.${active.entry.node_id}`)
+      const pinnedNetwork = load(`network-for.${active.entry.peer_id}`)
       if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
     await request('subscribe')
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    store(`network-for.${active.entry.node_id}`, principal.network_id)
+    store(`network-for.${active.entry.peer_id}`, principal.network_id)
     saveEntry(active.entry)
     store('last-authenticated', { entry: active.entry, networkId: principal.network_id } satisfies AuthenticatedEntry)
     store('waiting-pair', null)
@@ -210,7 +210,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       let details: EntryInfo
       try {
         details = parseInfo(infoValue)
-        if (details.node_id !== parsed.node_id || details.public_key !== channel.publicKey) throw new Error('入口报告的设备与已核验指纹不一致。')
+        if (details.peer_id !== parsed.peer_id || details.public_key !== channel.publicKey) throw new Error('入口报告的设备与已核验设备编号不一致。')
       } catch (cause) { channel.close(); throw new AuthenticationError(messageOf(cause)) }
       const active = { channel, entry: parsed, info: details, generation: version }
       session.current = active; setInfo(details); if (!resuming) setPhase('unpaired'); return active
@@ -229,7 +229,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const active = await open(candidate)
     const request = scoped(active)
     let auth: unknown
-    try { auth = await request('authenticate', { network_id: load(`network-for.${active.entry.node_id}`) ?? '' }) }
+    try { auth = await request('authenticate', { network_id: load(`network-for.${active.entry.peer_id}`) ?? '' }) }
     catch (cause) { if (session.current !== active || active.generation !== generation.current) throw changed(); if (isResponseError(cause)) { setError('此浏览器尚未获得设备授权。请使用邀请配对，或导入恢复包。'); return }; throw cause }
     await authenticate(auth, active)
   }
@@ -250,13 +250,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler', 'executor'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入、调度和执行同时需要同步权限。')
     const prepared = record(await request('prepare_invite', { kind, node_roles: requestedRoles, request_id: crypto.randomUUID() }))
     const invite = record(prepared.invite); const payload = record(invite.payload)
-    if (payload.new_kind !== kind || !same(payload.node_roles, requestedRoles) || payload.manage !== false || payload.inviter_subject_id !== identityRef.current.nodeId || payload.network_id !== ready.principal.network_id || payload.epoch !== ready.principal.epoch || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请模板与所选权限不一致。')
+    if (payload.new_kind !== kind || !same(payload.node_roles, requestedRoles) || payload.manage !== false || payload.inviter_subject_id !== identityRef.current.peerId || payload.network_id !== ready.principal.network_id || payload.epoch !== ready.principal.epoch || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请模板与所选权限不一致。')
     const capabilityHash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text(prepared.capability))))].map(byte => byte.toString(16).padStart(2, '0')).join('')
     if (payload.capability_hash !== capabilityHash) throw new Error('邀请密钥与签名模板不一致。')
     invite.inviter_signature = sign(prepared.signing, 'identity-invite', payload)
     const result = record(await request('commit_invite', { invite, capability: prepared.capability }))
     if (!same(result.invite, invite) || result.capability !== prepared.capability) throw new Error('保存后的邀请与已签名内容不一致。')
-    return JSON.stringify({ url: ready.entry.address, node_id: ready.entry.node_id, relay: ready.entry.relay, invite: result })
+    return JSON.stringify({ url: ready.entry.address, peer_id: ready.entry.peer_id, relay: ready.entry.relay, invite: result })
   }
   async function approvePair(requestId: string) {
     if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
@@ -265,7 +265,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!pending || !pending.new_subject_signature || pending.review.expires_at_ms <= Date.now()) throw new Error('新设备尚未确认，或请求已过期。请刷新后核对。')
     const proposal = record(await request('prepare_pair', { request_id: requestId }))
     const event = record(proposal.event)
-    const expected = { version: 1, network_id: ready.principal.network_id, epoch: ready.principal.epoch, parents: pending.review.parents, issuer: identityRef.current.nodeId, action: { type: 'grant', member: pending.review.new_member }, signature: '' }
+    const expected = { version: 1, network_id: ready.principal.network_id, epoch: ready.principal.epoch, parents: pending.review.parents, issuer: identityRef.current.peerId, action: { type: 'grant', member: pending.review.new_member }, signature: '' }
     if (!same(proposal.review, pending.review) || !same(event, expected)) throw new Error('配对设备或权限发生变化。请刷新后核对。')
     const inviter_signature = sign(proposal.review_signing, 'identity-pair-review', pending.review)
     event.signature = sign(proposal.signing, 'identity-governance', expected)
@@ -278,7 +278,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!member || member.manage) throw new Error('管理客户端的变更需要根恢复确认。')
     const prepared = record(await request('prepare_revoke', { subject_id: subjectId }))
     const event = record(prepared.event)
-    const expected = { version: 1, network_id: ready.principal.network_id, epoch: ready.principal.epoch, parents: directory.heads, issuer: identityRef.current.nodeId, action: { type: 'revoke', subject_id: subjectId }, signature: '' }
+    const expected = { version: 1, network_id: ready.principal.network_id, epoch: ready.principal.epoch, parents: directory.heads, issuer: identityRef.current.peerId, action: { type: 'revoke', subject_id: subjectId }, signature: '' }
     if (!same(event, expected)) throw new Error('撤销模板与当前选择不一致。请刷新目录后重试。')
     event.signature = sign(prepared.signing, 'identity-governance', expected)
     await request('revoke', { event }); await refreshDirectory()
@@ -298,13 +298,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       let prepared: Record<string, unknown>
       let networkId: string
       try {
-        networkId = root.nodeId()
+        networkId = root.peerId()
         prepared = record(await request('prepare_genesis', { owner_public_key: root.publicKeyHex(), client_name: name }))
         const state = record(prepared.state); const genesis = record(state.genesis)
         const members = array(genesis.initial_members).map(parseMember)
         const expectedMembers = [
-          { subject_id: own.nodeId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true },
-          { subject_id: active.entry.node_id, public_key: active.info.public_key, kind: 'node', name: 'This device', node_roles: [...active.info.roles].sort(), manage: false },
+          { subject_id: own.peerId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true },
+          { subject_id: active.entry.peer_id, public_key: active.info.public_key, kind: 'node', name: 'This device', node_roles: [...active.info.roles].sort(), manage: false },
         ] satisfies Member[]
         expectedMembers.sort((a, b) => a.subject_id.localeCompare(b.subject_id))
         if (genesis.version !== 1 || genesis.network_id !== networkId || genesis.owner_public_key !== root.publicKeyHex() || genesis.signature !== '' || state.checkpoint !== null || !same(state.events, []) || !same(members, expectedMembers)) throw new Error('首台设备的授权模板与当前设备不一致。')
@@ -335,7 +335,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
     const prepared = record(await request('prepare_pair_request', { invite: invitation.invite, capability: invitation.capability, name }))
     const pairRequest = record(prepared.request)
-    const member: Member = { subject_id: own.nodeId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: false }
+    const member: Member = { subject_id: own.peerId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: false }
     if (!same(pairRequest.member, member) || pairRequest.invite_id !== invitation.payload.invite_id || pairRequest.capability !== invitation.capability) throw new Error('配对请求与此浏览器身份不一致。')
     const expectedProposal = [text(pairRequest.request_id), text(pairRequest.invite_id), text(pairRequest.capability), member, text(pairRequest.nonce)]
     pairRequest.proof = sign(prepared.signing, 'identity-pair', expectedProposal)
@@ -351,7 +351,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function acceptPair() {
     const request = scoped()
     const pending = waitingRef.current
-    if (!pending || pending.review.new_member.subject_id !== identityRef.current?.nodeId || pending.review.expires_at_ms <= Date.now()) throw new Error('配对信息失效。请重新取得邀请。')
+    if (!pending || pending.review.new_member.subject_id !== identityRef.current?.peerId || pending.review.expires_at_ms <= Date.now()) throw new Error('配对信息失效。请重新取得邀请。')
     await request('pair_accept', { request_id: pending.request_id, signature: sign(pending.signing, 'identity-pair-review', pending.review) })
     if (waitingRef.current !== pending) return
     const next = { ...pending, accepted: true }; waitingRef.current = next; store('waiting-pair', next); setWaiting(next)
@@ -390,7 +390,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (!own) throw new Error('浏览器密钥尚未初始化。')
       const challengeResult = record(await request('recovery_challenge', { network_id: opened.networkId, owner_public_key: opened.root.publicKeyHex(), genesis: opened.payload.genesis }))
       const challenge = record(challengeResult.challenge)
-      if (challenge.network_id !== opened.networkId || challenge.owner_public_key !== opened.root.publicKeyHex() || challenge.subject_id !== own.nodeId || challenge.target_node_id !== active.entry.node_id || challenge.challenge_id !== challengeResult.challenge_id || challenge.genesis_hash !== await digest(opened.payload.genesis) || integer(challenge.expires_at_ms) <= Date.now() || integer(challenge.expires_at_ms) > Date.now() + 120000 || !/^[a-f0-9]{64}$/.test(text(challenge.nonce))) throw new Error('恢复挑战与当前设备或恢复包不一致。')
+      if (challenge.network_id !== opened.networkId || challenge.owner_public_key !== opened.root.publicKeyHex() || challenge.subject_id !== own.peerId || challenge.target_peer_id !== active.entry.peer_id || challenge.challenge_id !== challengeResult.challenge_id || challenge.genesis_hash !== await digest(opened.payload.genesis) || integer(challenge.expires_at_ms) <= Date.now() || integer(challenge.expires_at_ms) > Date.now() + 120000 || !/^[a-f0-9]{64}$/.test(text(challenge.nonce))) throw new Error('恢复挑战与当前设备或恢复包不一致。')
       const proof = opened.root.sign('identity-recovery-access', new TextEncoder().encode(signingPayload(challengeResult.signing, 'identity-recovery-access', challenge)))
       const result = record(await request('recovery_context', { challenge_id: challenge.challenge_id, signature: proof, recovery_epoch: opened.epoch, ...(!active.info.initialized ? { state: { genesis: opened.payload.genesis, checkpoint: null, events: [] }, capability } : {}) }))
       if (session.current !== active || active.generation !== generation.current) throw changed()
@@ -398,9 +398,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       verified = verifyState(result.state, opened.networkId, opened.root.publicKeyHex())
       const view = parseView(JSON.parse(verified.viewJson()))
       if (!same(result.view, view)) throw new Error('恢复目录与已签名的成员记录不一致。')
-      const members = view.members.filter(member => !view.revoked.includes(member.subject_id) && member.subject_id !== own.nodeId)
-      if (!members.some(member => member.subject_id === active.entry.node_id)) members.push({ subject_id: active.entry.node_id, public_key: active.info.public_key, kind: 'node', name: `恢复入口 ${active.entry.node_id.slice(0, 10)}`, node_roles: [...active.info.roles].sort(), manage: false })
-      const newManager: Member = { subject_id: own.nodeId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true }
+      const members = view.members.filter(member => !view.revoked.includes(member.subject_id) && member.subject_id !== own.peerId)
+      if (!members.some(member => member.subject_id === active.entry.peer_id)) members.push({ subject_id: active.entry.peer_id, public_key: active.info.public_key, kind: 'node', name: `恢复入口 ${active.entry.peer_id.slice(0, 10)}`, node_roles: [...active.info.roles].sort(), manage: false })
+      const newManager: Member = { subject_id: own.peerId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true }
       const allowed = new Map(members.map(member => [member.subject_id, member]))
       const flow: Sensitive = {
         cancel: release,
@@ -411,7 +411,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             if (!original || !same({ ...member, manage: original.manage }, original) || member.kind === 'node' && member.manage) throw new Error('所选成员与已验证目录不一致。')
             return member
           })
-          if (!selected.some(member => member.subject_id === active.entry.node_id) || new Set(selected.map(member => member.subject_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
+          if (!selected.some(member => member.subject_id === active.entry.peer_id) || new Set(selected.map(member => member.subject_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
           selected.push(newManager); selected.sort((a, b) => a.subject_id.localeCompare(b.subject_id))
           try {
             const prepared = await request('prepare_recovery', { challenge_id: challenge.challenge_id, members: selected })
@@ -428,7 +428,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         },
       }
       sensitive.current = flow
-      setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.node_id })
+      setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.peer_id })
     } catch (cause) { release(); throw cause }
   }
   async function reencrypt(input: { file: File; oldPassword: string; password: string }) {
@@ -456,7 +456,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (version !== generation.current) return
       setPhase('disconnected')
       const pending = invitation ? null : loadWaiting()
-      if (pending && pending.review.new_member.subject_id === own.nodeId) {
+      if (pending && pending.review.new_member.subject_id === own.peerId) {
         const opening = open(pending.entry); version = generation.current
         const active = await opening
         if (!mounted || session.current !== active) return

@@ -231,7 +231,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &identity.node_id()?, Some(NodeRole::Gateway))?;
+        authorize_node_from(&tx, network, &identity.peer_id()?, Some(NodeRole::Gateway))?;
         let membership_role_proof: NetworkState = serde_json::from_str(&tx.query_row(
             "SELECT bundle FROM networks WHERE network_id=?",
             [network],
@@ -407,7 +407,7 @@ mod tests {
             version: WIRE_VERSION,
             network_id: network.clone(),
             scope_id: "attacker-history".into(),
-            author: owner.node_id()?,
+            author: owner.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![invalid.hash],
@@ -481,7 +481,7 @@ mod tests {
         let network = owner.fixture_network_id()?;
         let mut store = memory(&owner)?;
         let project = Some(BotProject {
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             cwd: "/project".into(),
         });
         let first = store.create_bot(
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(source.bots(&network)?[0].event_hash, original.event_hash);
         assert!(
             source
-                .authorize_node(&network, &owner.node_id()?, Some(NodeRole::Gateway))
+                .authorize_node(&network, &owner.peer_id()?, Some(NodeRole::Gateway))
                 .is_err()
         );
         let mut imported = Store::open(":memory:")?;
@@ -760,7 +760,7 @@ mod tests {
         assert!(store.conversations(&network)?.is_empty());
         let proof = store.trust_bundle(&network)?.unwrap();
         assert!(
-            validate_gateway_proof_from(&store.connection, &network, &replica.node_id()?, &proof)
+            validate_gateway_proof_from(&store.connection, &network, &replica.peer_id()?, &proof)
                 .is_err()
         );
         Ok(())

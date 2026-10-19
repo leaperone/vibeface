@@ -67,7 +67,7 @@ export function ConnectionScreen() {
     event.preventDefault()
     const form = event.currentTarget
     const relay = form.elements.namedItem('relay')
-    void run(() => device.connect(parseEntry({ address: value(form, 'address'), node_id: value(form, 'node_id'), relay: relay instanceof HTMLInputElement && relay.checked })))
+    void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id'), relay: relay instanceof HTMLInputElement && relay.checked })))
   }
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -80,7 +80,7 @@ export function ConnectionScreen() {
     : device.waiting ? '核对后等待确认。'
     : active === 'saved' && device.entries.length === 1 && ['connecting', 'reconnecting'].includes(device.phase) ? '正在连接。'
     : active === 'saved' ? '选一个入口。'
-    : active === 'manual' ? '填写地址和指纹。'
+    : active === 'manual' ? '填写地址和设备编号。'
     : active === 'recovery' ? '用恢复包恢复。'
     : active === 'passphrase' ? '只更换口令，不连接。'
     : purpose === 'bootstrap' ? '设置口令后连接。'
@@ -108,17 +108,17 @@ export function ConnectionScreen() {
       {device.review && <RecoveryReview />}
       {device.waiting && <Card className={panel} aria-labelledby="pair-review-title">
         <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入网络'}</h2>
-        <p className="text-sm text-muted-foreground">{device.waiting.accepted ? '等待对方确认。' : '核对指纹后确认。'}</p>
+        <p className="text-sm text-muted-foreground">{device.waiting.accepted ? '等待对方确认。' : '核对设备编号后确认。'}</p>
         <dl className="grid gap-3 text-sm"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono text-xs">{device.waiting.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono text-xs">{device.waiting.review.inviter_subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">此浏览器</dt><dd className="break-all font-mono text-xs">{device.waiting.review.new_member.subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">设备名称</dt><dd className="break-all">{device.waiting.review.new_member.name}</dd></div></dl>
-        {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对个人网络及双方设备指纹</label>}
+        {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对个人网络及双方设备编号</label>}
         <div className="flex flex-wrap gap-2"><Button className={button} type="button" disabled={busy || !device.waiting.accepted && !confirmed} onClick={() => void run(device.waiting?.accepted ? device.checkPair : device.acceptPair)}>{device.waiting.accepted ? '检查配对进度' : '确认加入'}</Button><Button variant="outline" className={button} type="button" onClick={() => { device.cancelPair(); setConfirmed(false) }}>取消本地配对</Button></div>
         <p className="text-xs text-muted-foreground">只取消本机记录。</p>
       </Card>}
       {!focused && active === 'saved' && <Card className={panel} aria-labelledby="saved-entries-title">
         <h2 id="saved-entries-title" className="font-semibold">{device.entries.length === 1 ? '已保存的入口' : '选择已保存的入口'}</h2>
-        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.node_id}:${entry.relay}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
+        <ul className="space-y-3">{device.entries.map(entry => <li key={`${entry.address}:${entry.peer_id}:${entry.relay}`} className="space-y-2 rounded-lg bg-muted/50 p-3">
           <div className="flex flex-wrap items-center justify-between gap-3"><p className="min-w-0 break-all text-sm">{entry.address}<span className="ml-2 text-xs text-muted-foreground">{entry.relay ? '中继' : '直连'}</span></p><Button className={button} type="button" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>{device.entries.length === 1 && device.phase === 'connecting' ? '正在连接' : '连接'}</Button></div>
-          <p className="break-all font-mono text-xs text-muted-foreground">{entry.node_id}</p>
+          <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
         </li>)}</ul>
         {device.entry && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.disconnect}>取消并断开</Button>}
       </Card>}
@@ -144,7 +144,7 @@ export function ConnectionScreen() {
         <form className="space-y-4" onSubmit={connect}>
           <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
             <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} placeholder="http://192.168.0.99:4790" /></label>
-            <label className="grid gap-2 text-sm">目标节点完整指纹<Input className={`${input} font-mono`} name="node_id" required pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备指纹" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
+            <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="peer_id" required pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} /></label>
             <label className="flex min-h-11 items-center gap-2 text-sm"><input className={check} type="checkbox" name="relay" />通过入口中继到目标节点</label>
             <Button className={button} type="submit">连接</Button>
           </fieldset>
@@ -164,8 +164,8 @@ export function ConnectionScreen() {
         </div>
       </div>}
       {device.identity && <Collapsible className="px-1">
-        <CollapsibleTrigger asChild><Button variant="ghost" className="min-h-11 w-full justify-between text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">此浏览器的设备指纹<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
-        <CollapsibleContent forceMount className="px-3 pb-3 data-[state=closed]:hidden"><p className="break-all font-mono text-xs text-muted-foreground">{device.identity.nodeId}</p></CollapsibleContent>
+        <CollapsibleTrigger asChild><Button variant="ghost" className="min-h-11 w-full justify-between text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">此浏览器的设备编号<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
+        <CollapsibleContent forceMount className="px-3 pb-3 data-[state=closed]:hidden"><p className="break-all font-mono text-xs text-muted-foreground">{device.identity.peerId}</p></CollapsibleContent>
       </Collapsible>}
     </div>
   </main>

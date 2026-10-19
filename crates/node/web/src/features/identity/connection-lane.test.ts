@@ -21,7 +21,7 @@ test('one saved entry connects itself, and several entries stay listed', () => {
 })
 
 const target = 'a'.repeat(64), network = 'b'.repeat(64), subject = 'c'.repeat(64), publicKey = 'd'.repeat(64)
-const entry: ConnectionEntry = { address: 'https://node.example', node_id: target, relay: true }
+const entry: ConnectionEntry = { address: 'https://node.example', peer_id: target, relay: true }
 const genesis = { version: 1, network_id: network, owner_public_key: publicKey }
 const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1 }
 const canonical = (value: unknown): string => value && typeof value === 'object'
@@ -61,18 +61,18 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false } = {
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
-    initClient: async () => ({ nodeId: subject, publicKey }), readInvitation: JSON.parse, signClient: () => 'signature',
+    initClient: async () => ({ peerId: subject, publicKey }), readInvitation: JSON.parse, signClient: () => 'signature',
     async connectDevice(candidate: ConnectionEntry, options: { onClose(cause: Error): void; signal: AbortSignal }) {
-      calls.push(`open:${candidate.node_id}`)
+      calls.push(`open:${candidate.peer_id}`)
       let closed = false
       const close = () => { if (closed) return; closed = true; options.onClose(new Error('connection lost')) }
       sockets.push({ entry: candidate, close, drop: close })
       options.signal.addEventListener('abort', close)
       if (holds.has('open')) await holds.get('open')?.promise
-      return { nodeId: candidate.node_id, publicKey, close, async request(method: string) {
+      return { peerId: candidate.peer_id, publicKey, close, async request(method: string) {
         calls.push(method)
         if (holds.has(method)) return holds.get(method)?.promise
-        if (method === 'info') return { node_id: candidate.node_id, public_key: publicKey, version: 'test', roles: ['relay'], initialized: !bootstrap }
+        if (method === 'info') return { peer_id: candidate.peer_id, public_key: publicKey, version: 'test', roles: ['relay'], initialized: !bootstrap }
         if (method === 'pair_status') return { status: 'granted' }
         if (method === 'prepare_genesis') {
           const genesis = { version: 1, network_id: network, owner_public_key: publicKey, signature: '', initial_members: [{ subject_id: target, public_key: publicKey, kind: 'node', name: 'This device', node_roles: ['relay'], manage: false }, { ...review.new_member, manage: true }] }
@@ -87,7 +87,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false } = {
     verifyAuthentication: () => { verifications++; return { principal: { network_id: network, subject_id: subject, epoch: 1, can_manage: false }, view: membership } },
     verifiedView: () => membership,
     openPackage: async () => ({ networkId: network, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
-    Identity: { generate: () => ({ nodeId: () => network, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
+    Identity: { generate: () => ({ peerId: () => network, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {}, verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
@@ -150,7 +150,7 @@ for (const stage of ['bootstrap', 'subscribe']) test(`cancelSensitive during ${s
   const app = deviceHarness({ bootstrap: true })
   try {
     app.render(); await settle()
-    await app.render().pair(JSON.stringify({ url: entry.address, node_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
+    await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
     app.render().downloadBackup()
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
@@ -173,7 +173,7 @@ for (const flow of ['pair', 'sensitive']) test(`cancelling ${flow} after subscri
   try {
     app.render(); await settle(); app.render()
     if (flow === 'sensitive') {
-      await app.render().pair(JSON.stringify({ url: entry.address, node_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
+      await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
       app.render().downloadBackup()
     }
     const hold = deferred(); app.holds.set('subscribe', hold)
@@ -200,7 +200,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     let work: Promise<void>
     if (flow === 'directory') work = app.render().refreshDirectory()
     else {
-      const challenge = { network_id: network, owner_public_key: publicKey, subject_id: subject, target_node_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+      const challenge = { network_id: network, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
       const challengeHold = deferred(); app.holds.set('recovery_challenge', challengeHold)
       challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
       work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })
@@ -224,7 +224,7 @@ test('granted pairing restores only verified authentication and subscription, an
   try {
     app.render(); await settle(); app.render()
     await app.render().checkPair()
-    assert.equal(app.render().ready?.entry.node_id, target)
+    assert.equal(app.render().ready?.entry.peer_id, target)
     assert.equal(app.verifications(), 1)
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'pair_status', 'authenticate', 'subscribe'])
     app.sockets[0].drop(); app.render()
@@ -243,7 +243,7 @@ test('unexpected closure reconnects the same target with fresh authentication an
     app.sockets[0].drop()
     const [id, retry] = [...app.timers.entries()][0]
     app.timers.delete(id); retry(); await settle()
-    assert.equal(app.render().ready?.entry.node_id, target)
+    assert.equal(app.render().ready?.entry.peer_id, target)
     assert.notEqual(app.render().ready?.generation, previous)
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.verifications(), 2)
@@ -274,10 +274,10 @@ test('successful bootstrap releases local material without disconnecting the aut
   const app = deviceHarness({ bootstrap: true })
   try {
     app.render(); await settle()
-    await app.render().pair(JSON.stringify({ url: entry.address, node_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
+    await app.render().pair(JSON.stringify({ url: entry.address, peer_id: target, relay: true, capability: 'local-test-capability' }), 'browser', 'test-only-passphrase')
     app.render().downloadBackup()
     await app.render().confirmBootstrap(true)
-    assert.equal(app.render().ready?.entry.node_id, target)
+    assert.equal(app.render().ready?.entry.peer_id, target)
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.render().review, null)
     assert.equal(app.calls.filter(call => call === 'bootstrap').length, 1)
@@ -296,11 +296,11 @@ for (const original of ['auto-authenticate', 'pair-poll', 'waiting-info']) test(
     assert.ok(app.calls.includes(method))
     app.render().disconnect()
     app.holds.delete(method)
-    const replacement = { ...entry, node_id: 'f'.repeat(64) }
+    const replacement = { ...entry, peer_id: 'f'.repeat(64) }
     await app.render().connect(replacement)
     hold.reject(Object.assign(new Error('old permission rejected'), { responded: true }))
     await settle()
-    assert.equal(app.render().ready?.entry.node_id, replacement.node_id)
+    assert.equal(app.render().ready?.entry.peer_id, replacement.peer_id)
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.render().phase, 'ready')
     assert.equal(app.render().error, '')
@@ -311,7 +311,7 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
   const app = deviceHarness({ saved: true })
   try {
     app.render(); await settle(); app.render()
-    assert.equal(app.render().ready?.entry.node_id, target)
+    assert.equal(app.render().ready?.entry.peer_id, target)
     app.sockets[0].drop(); app.sockets[0].drop()
     assert.equal(app.timers.size, 1)
     const hold = deferred(); app.holds.set(stage, hold)
@@ -321,11 +321,11 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
     assert.equal(app.calls.filter(call => call === `open:${target}`).length, 2)
     app.render().disconnect()
     app.holds.delete(stage)
-    const replacement = { ...entry, node_id: 'f'.repeat(64) }
+    const replacement = { ...entry, peer_id: 'f'.repeat(64) }
     await app.render().connect(replacement)
     hold.resolve({})
     await settle()
-    assert.equal(app.render().ready?.entry.node_id, replacement.node_id)
+    assert.equal(app.render().ready?.entry.peer_id, replacement.peer_id)
     assert.equal(app.render().phase, 'ready')
     assert.equal(app.render().error, '')
     assert.equal(app.timers.size, 0)

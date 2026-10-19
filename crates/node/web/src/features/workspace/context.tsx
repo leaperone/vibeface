@@ -283,7 +283,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const submitMessage = async (text: string) => {
     const context = requireContext(), id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults: true })
+    const prepared = prepareSend({ conversationId: id, text, schedulerPeerId: null, entryNode: connection.entry.peer_id, pending: prior, heads: context.heads, reportResults: true })
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {
@@ -305,7 +305,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     } catch (caught) {
       if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
         const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
-        if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.entry.node_id } } : item))
+        if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.entry.peer_id } } : item))
       }
       throw caught
     }
@@ -316,7 +316,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     botCreationRef.current = null; setPendingBot(null)
   }
   const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
-    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.node_id) throw new Error("请回原入口核对机器人创建结果，原配置仍已保留。")
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.peer_id) throw new Error("请回原入口核对机器人创建结果，原配置仍已保留。")
     const known = parseBots(await connection.rpc("bots"))
     requireCurrent()
     const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
@@ -365,7 +365,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         if (known) { await selectBot(known); return }
         throw new Error("已确认机器人没有创建，可以修改配置后重新提交。")
       }
-      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.node_id } }
+      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.peer_id } }
       const request: CreateBotRequest = parseCreateBot(pending)
       writeStorage(scoped("pending-bot"), pending, true)
       botCreationRef.current = pending; setPendingBot(pending)
@@ -373,7 +373,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       try { response = await connection.rpc("create_bot", request) }
       catch (caught) {
         if (!prior && current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
-          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.node_id } }
+          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.peer_id } }
           writeStorage(scoped("pending-bot"), rejected, true)
           botCreationRef.current = rejected; setPendingBot(rejected)
           const known = await checkRejectedBot(rejected)
@@ -468,7 +468,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
       if (!original) throw new Error("原消息请求尚未结束，请先核对。")
-      if (original.entry_node !== connection.entry.node_id || original.rejected?.entry_node !== connection.entry.node_id) throw new Error("需要原入口明确返回错误，再在同一连接核对完整对话。超时或断线后不能据此解除，请原样重试并核对。")
+      if (original.entry_node !== connection.entry.peer_id || original.rejected?.entry_node !== connection.entry.peer_id) throw new Error("需要原入口明确返回错误，再在同一连接核对完整对话。超时或断线后不能据此解除，请原样重试并核对。")
       const complete = await readConversation(id)
       requireContext(id)
       if (messagesRef.current.find((item) => item.conversation_id === id) !== original || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("已找到原消息或待核对记录变化，请保留原记录并核对处理结果。")
@@ -490,7 +490,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const operation = pendingRef.current.find((item) => item.operation_id === operationId)
       if (!operation || operation.conversation_id !== activeId.current) throw new Error("请先回到原操作的对话。")
       return withMutation(`operate:${operation.target_node}:${operation.session_id}`, async () => {
-        if (connection.entry.node_id !== operation.target_node) throw new Error("请连接原执行设备，再读取完整对话并核对原操作。")
+        if (connection.entry.peer_id !== operation.target_node) throw new Error("请连接原执行设备，再读取完整对话并核对原操作。")
         const result = parseReconcile(await connection.rpc("reconcile", { target_node: operation.target_node, operation_id: operation.operation_id }))
         requireCurrent()
         if (reconcileDecision(result, operation) !== "missing") throw new Error("原执行设备没有确认该操作缺失，已保留待核对记录。")

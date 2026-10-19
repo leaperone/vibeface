@@ -5,7 +5,7 @@ async fn running_manager() -> Result<(PathBuf, Arc<Runtime>, Access, watch::Rece
     let dir = tests::fixture()?;
     let node = Arc::new(Runtime::open(&dir).await?);
     let network = tests::conversation(&node).await?;
-    let target = node.identity.node_id()?;
+    let target = node.identity.peer_id()?;
     let (trigger, attempt) = {
         let mut store = node.store.lock().await;
         let (message, _) = store.accept_message(
@@ -87,7 +87,7 @@ async fn sdk_multiline_call_id_runs_command_once_and_can_be_looked_up() -> Resul
     let args = json!({
         "command": "printf x >> count; cat count",
         "cwd": dir.canonicalize()?,
-        "target_node": node.identity.node_id()?,
+        "target_node": node.identity.peer_id()?,
         "timeout_secs": 10,
     });
     let first = node

@@ -996,7 +996,7 @@ impl Runtime {
             .history_sources(network, &[])
             .await?
             .into_iter()
-            .map(|source| source.node_id)
+            .map(|source| source.peer_id)
             .collect::<Vec<_>>();
         if !sources.is_empty() {
             self.enqueue_scope(network, scope, sources, roots, false, 1024)?;
@@ -1014,8 +1014,8 @@ impl Runtime {
         }
         for source in sources.into_iter().take(4) {
             let _ = self.submit_sync(
-                SyncKey::Inventory(network.into(), source.node_id.clone()),
-                vec![source.node_id],
+                SyncKey::Inventory(network.into(), source.peer_id.clone()),
+                vec![source.peer_id],
                 vec![],
                 1024,
                 true,
@@ -1032,9 +1032,9 @@ impl Runtime {
         let mut scopes = Vec::new();
         let mut unreachable_sources = Vec::new();
         for source in sources {
-            match self.sync_from(network, &source.node_id).await {
+            match self.sync_from(network, &source.peer_id).await {
                 Ok(reports) => scopes.extend(reports),
-                Err(_) => unreachable_sources.push(source.node_id),
+                Err(_) => unreachable_sources.push(source.peer_id),
             }
         }
         let state = if count == 0 || unreachable_sources.len() == count {
@@ -1418,7 +1418,7 @@ mod tests {
         let network = membership.genesis.network_id.clone();
         source.install_membership(membership.clone()).await?;
         receiver.install_membership(membership).await?;
-        let source_id = source.identity.node_id()?;
+        let source_id = source.identity.peer_id()?;
         let content = vec![0x43; 640 * 1024];
         let blob = BlobRef {
             hash: crypto::digest(&content),

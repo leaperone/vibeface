@@ -260,7 +260,7 @@ pub(super) fn append_report_intent_from(
     report_results: bool,
     at: i64,
 ) -> Result<Option<String>> {
-    let author = identity.node_id()?;
+    let author = identity.peer_id()?;
     authorize_node_from(connection, network, &author, Some(NodeRole::Gateway))?;
     authorize_node_from(connection, network, target, Some(NodeRole::Scheduler))?;
     let events = load_events_from(connection, network)?;
@@ -555,7 +555,7 @@ fn validate_task_result_from(
             "follow-up dispatch task binding mismatch"
         );
         let key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+            "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
             params![network, binding.binding.authority_node],
             |row| row.get(0),
         )?;
@@ -950,7 +950,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &identity.node_id()?, Some(NodeRole::Gateway))?;
+        authorize_node_from(&tx, network, &identity.peer_id()?, Some(NodeRole::Gateway))?;
         let current = policy_from(&tx, network, scope, task, mode != FollowupMode::Off)?;
         ensure!(
             current.version == expected_version,
@@ -1016,7 +1016,7 @@ impl Store {
             ensure!(previous.event.body == body, "task ID reused with different content");
             return Ok(previous.envelope.clone());
         }
-        let scheduler = identity.node_id()?;
+        let scheduler = identity.peer_id()?;
         let verified_origin = if let Some((trigger, attempt_id)) = origin {
             authorize_node_from(&tx, network, &scheduler, Some(NodeRole::Scheduler))?;
             let session = load_scheduler_session(&tx, network, scope, &scheduler)?;
@@ -1104,7 +1104,7 @@ mod tests {
     fn fixture() -> Result<(Store, LocalIdentity, String, String)> {
         let identity = LocalIdentity::generate();
         let network = identity.fixture_network_id()?;
-        let node = identity.node_id()?;
+        let node = identity.peer_id()?;
         let mut store = Store::open(":memory:")?;
         let roles = vec![
             NodeRole::Gateway,
@@ -1500,7 +1500,7 @@ mod tests {
             )?,
         )?;
         let mut borrowed = ordinary_request(&store, &network, &node, &message, "borrowed-manager")?;
-        borrowed.target_node = other.node_id()?;
+        borrowed.target_node = other.peer_id()?;
         let forged = ordinary_result(&mut store, &other, &borrowed, None)?;
         assert!(
             store

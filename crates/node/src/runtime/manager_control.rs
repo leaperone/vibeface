@@ -38,7 +38,7 @@ impl Runtime {
         if let Some(active) = controls.get(attempt_id) {
             return Ok(active.cancel.subscribe());
         }
-        let target = self.identity.node_id()?;
+        let target = self.identity.peer_id()?;
         let scope = access
             .conversation_id
             .as_deref()
@@ -192,7 +192,7 @@ impl Runtime {
     }
 
     async fn manager_target(&self, network: &str, scope: &str, trigger: &str) -> Result<String> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let store = self.store.lock().await;
         if store
             .scheduler_job(network, scope, trigger, &local)?
@@ -233,7 +233,7 @@ impl Runtime {
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
         let target = self.manager_target(network, scope, trigger).await?;
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             self.require_role(network, NodeRole::Gateway).await?;
             return self.peer_request(network, &target, json!({"type":"cancel_manager","conversation_id":scope,"trigger":trigger,"human":true})).await;
         }
@@ -273,7 +273,7 @@ impl Runtime {
         let evidence = super::field(input, "evidence")?;
         self.require_scope(access, scope).await?;
         let target = self.manager_target(network, scope, trigger).await?;
-        if target != self.identity.node_id()? {
+        if target != self.identity.peer_id()? {
             self.require_role(network, NodeRole::Gateway).await?;
             return self.peer_request(network, &target, json!({"type":"resolve_manager_unknown","conversation_id":scope,"trigger":trigger,"evidence":evidence,"human":true})).await;
         }
@@ -324,7 +324,7 @@ impl Runtime {
                     _ => None,
                 })
                 .transpose()?;
-            let record: Option<OperationRecord> = if executor == self.identity.node_id()? {
+            let record: Option<OperationRecord> = if executor == self.identity.peer_id()? {
                 self.store.lock().await.operation(network, operation)?
             } else {
                 serde_json::from_value(

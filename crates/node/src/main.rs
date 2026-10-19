@@ -59,7 +59,7 @@ enum Action {
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
-    /// Join a personal network using its invite and pinned fingerprint.
+    /// Join a personal network using its invite and pinned Peer ID.
     Pair(Pair),
     /// Call a node tool from a locally managed SDK process.
     Tool {
@@ -162,7 +162,8 @@ struct Pair {
 #[serde(deny_unknown_fields)]
 struct Invitation {
     url: String,
-    node_id: String,
+
+    peer_id: String,
     relay: bool,
     invite: InviteSecret,
 }
@@ -178,7 +179,8 @@ struct InviteSecret {
 #[serde(deny_unknown_fields)]
 struct PendingPair {
     url: String,
-    node_id: String,
+
+    peer_id: String,
     relay: bool,
     invite_id: String,
     request_id: String,
@@ -251,10 +253,10 @@ async fn status(options: Access) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
-    let node_id = config::identity(&data)?.node_id()?;
+    let peer_id = config::identity(&data)?.peer_id()?;
     let health = maintenance::probe(&data).await.and_then(|health| {
         ensure!(
-            health.node_id == node_id,
+            health.peer_id == peer_id,
             "running node identity does not match this data directory"
         );
         Ok(health)
@@ -278,7 +280,7 @@ async fn status(options: Access) -> Result<()> {
         println!(
             "{}",
             json!({
-                "status":state, "node_id":node_id, "data_dir":data,
+                "status":state, "peer_id":peer_id, "data_dir":data,
                 "listen":configuration.listen, "roles":configuration.roles,
                 "version":health.as_ref().ok().map(|health| &health.version),
                 "cli_version":env!("CARGO_PKG_VERSION"), "error":error,
@@ -286,7 +288,7 @@ async fn status(options: Access) -> Result<()> {
         );
     } else {
         println!(
-            "Node: {node_id}\nStatus: {state}\nListen: {}\nData: {}",
+            "Peer ID: {peer_id}\nStatus: {state}\nListen: {}\nData: {}",
             configuration.listen,
             data.display()
         );
@@ -387,8 +389,8 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
-    println!("Initialized node {}", identity.node_id()?);
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+    println!("Initialized device with Peer ID {}", identity.peer_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
 }
@@ -462,7 +464,7 @@ fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":3}),
+        epoch == json!({"data_epoch":4}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
@@ -493,7 +495,7 @@ fn access(options: Access) -> Result<()> {
         };
         url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
-    let entry = json!({"url":url.origin().ascii_serialization(),"node_id":identity.node_id()?,"capability":capability});
+    let entry = json!({"url":url.origin().ascii_serialization(),"peer_id":identity.peer_id()?,"capability":capability});
     if options.json {
         println!("{}", serde_json::to_string(&entry)?);
     } else {
@@ -530,7 +532,7 @@ fn invitation(options: &Pair) -> Result<Invitation> {
     let invitation: Invitation =
         serde_json::from_slice(&bytes).context("invalid invitation file")?;
     ensure!(
-        invitation.node_id.len() == 64 && hex::decode(&invitation.node_id).is_ok(),
+        invitation.peer_id.len() == 64 && hex::decode(&invitation.peer_id).is_ok(),
         "invitation requires a pinned Node identity"
     );
     ensure!(
@@ -595,7 +597,7 @@ async fn pair(options: Pair) -> Result<()> {
         let pending: PendingPair = serde_json::from_slice(&read_bounded(&pending_path, 8192)?)?;
         ensure!(
             pending.url == url
-                && pending.node_id == invitation.node_id
+                && pending.peer_id == invitation.peer_id
                 && pending.relay == invitation.relay
                 && pending.invite_id == payload.invite_id
                 && pending.name == options.name,
@@ -605,7 +607,7 @@ async fn pair(options: Pair) -> Result<()> {
     } else {
         let pending = PendingPair {
             url: url.clone(),
-            node_id: invitation.node_id.clone(),
+            peer_id: invitation.peer_id.clone(),
             relay: invitation.relay,
             invite_id: payload.invite_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -615,7 +617,7 @@ async fn pair(options: Pair) -> Result<()> {
         create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
         pending
     };
-    let mut client = Client::connect(&url, identity, &invitation.node_id, invitation.relay).await?;
+    let mut client = Client::connect(&url, identity, &invitation.peer_id, invitation.relay).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
     let mut accepted = false;
     loop {
@@ -643,7 +645,7 @@ async fn pair(options: Pair) -> Result<()> {
                     view.network_id == payload.network_id,
                     "paired network does not match the invitation"
                 );
-                let authorized = view.authorize_node(&identity.node_id()?, None)?;
+                let authorized = view.authorize_node(&identity.peer_id()?, None)?;
                 ensure!(
                     authorized == member
                         && authorized
@@ -653,7 +655,7 @@ async fn pair(options: Pair) -> Result<()> {
                     "paired network grants unexpected local permissions"
                 );
                 let installed = runtime.install_membership(state).await?;
-                let current = installed.authorize_node(&identity.node_id()?, None)?;
+                let current = installed.authorize_node(&identity.peer_id()?, None)?;
                 ensure!(
                     current == member,
                     "installed network no longer grants the requested local membership"
@@ -666,7 +668,7 @@ async fn pair(options: Pair) -> Result<()> {
                 fs::remove_file(pending_path)?;
                 println!(
                     "Paired node {} with network {}",
-                    identity.node_id()?,
+                    identity.peer_id()?,
                     payload.network_id
                 );
                 println!("Start the Node to connect to its personal network.");
@@ -847,6 +849,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_id_pending_pair_uses_only_the_current_field() {
+        let wire = json!({"url":"http://localhost:4790", "peer_id":"device", "relay":false,
+            "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
+        let pending: PendingPair = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(pending.peer_id, "device");
+        assert_eq!(serde_json::to_value(pending).unwrap(), wire);
+        let mut old = wire;
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("peer_id");
+        fields.insert("node_id".into(), json!("device"));
+        assert!(serde_json::from_value::<PendingPair>(old).is_err());
+    }
+
+    #[test]
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
         assert!(default.command.is_none() && default.data_dir.is_none());
@@ -898,12 +914,12 @@ mod tests {
             configuration.save(&dir).unwrap();
             let identity = fs::read(dir.join("identity.json")).unwrap();
             let config = fs::read(dir.join("config.json")).unwrap();
-            let node_id = config::identity(&dir).unwrap().node_id().unwrap();
+            let peer_id = config::identity(&dir).unwrap().peer_id().unwrap();
             prepare_start(&dir).unwrap();
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
             let runtime = Runtime::open(&dir).await.unwrap();
-            assert_eq!(runtime.identity.node_id().unwrap(), node_id);
+            assert_eq!(runtime.identity.peer_id().unwrap(), peer_id);
             assert_eq!(runtime.config.timeout_secs, 1234);
             drop(runtime);
             fs::write(dir.join("config.json"), b"invalid configuration").unwrap();
@@ -1082,7 +1098,7 @@ mod tests {
         for relay in [false, true] {
             let mut envelope = json!({
                 "url":"ws://127.0.0.1:4790/api/network/ws",
-                "node_id":device.node_id().unwrap(),
+                "peer_id":device.peer_id().unwrap(),
                 "relay":relay,
                 "invite":{"invite":&invite,"capability":"fixture capability"}
             });
@@ -1095,6 +1111,13 @@ mod tests {
                 name: "Build Node".into(),
             };
             assert_eq!(super::invitation(&options).unwrap().relay, relay);
+            let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
+            assert_eq!(parsed.peer_id, device.peer_id().unwrap());
+            let mut old = envelope.clone();
+            let fields = old.as_object_mut().unwrap();
+            let peer_id = fields.remove("peer_id").unwrap();
+            fields.insert("node_id".into(), peer_id);
+            assert!(serde_json::from_value::<Invitation>(old).is_err());
             envelope.as_object_mut().unwrap().remove("relay");
             options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
             assert!(super::invitation(&options).is_err());

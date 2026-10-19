@@ -13,12 +13,12 @@ pub trait MembershipSigner {
     fn public_key_hex(&self) -> Result<String>;
     fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String>;
 
-    fn node_id(&self) -> Result<String> {
+    fn peer_id(&self) -> Result<String> {
         fingerprint(&self.public_key_hex()?)
     }
 
     fn network_id(&self) -> Result<String> {
-        self.node_id()
+        self.peer_id()
     }
 }
 
@@ -71,7 +71,7 @@ pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeCertificate {
-    pub node_id: String,
+    pub peer_id: String,
     pub public_key: String,
     pub roles: Vec<NodeRole>,
     pub revoked: bool,
@@ -125,7 +125,7 @@ impl Member {
     ) -> Result<Self> {
         node_roles.sort_by_key(role_key);
         let member = Self {
-            subject_id: identity.node_id()?,
+            subject_id: identity.peer_id()?,
             public_key: identity.public_key_hex()?,
             kind,
             name: name.to_owned(),
@@ -140,7 +140,7 @@ impl Member {
         validate_id(&self.public_key)?;
         ensure!(
             self.subject_id == fingerprint(&self.public_key)?,
-            "member fingerprint mismatch"
+            "member Peer ID mismatch"
         );
         ensure!(
             !self.name.is_empty()
@@ -172,7 +172,7 @@ impl Member {
     pub fn certificate(&self) -> Result<NodeCertificate> {
         ensure!(self.kind == IdentityKind::Node, "member is not a Node");
         Ok(NodeCertificate {
-            node_id: self.subject_id.clone(),
+            peer_id: self.subject_id.clone(),
             public_key: self.public_key.clone(),
             roles: self.node_roles.clone(),
             revoked: false,
@@ -235,7 +235,7 @@ impl Genesis {
         );
         ensure!(
             self.network_id == fingerprint(&self.owner_public_key)?,
-            "personal-network root fingerprint mismatch"
+            "network ID mismatch"
         );
         validate_members(&self.initial_members)
     }
@@ -263,7 +263,7 @@ impl HistoricalNode {
         validate_id(&self.public_key)?;
         ensure!(
             self.subject_id == fingerprint(&self.public_key)?,
-            "historical Node fingerprint mismatch"
+            "historical Peer ID mismatch"
         );
         Ok(())
     }
@@ -509,7 +509,7 @@ impl GovernanceEvent {
         view: &AuthorizationView,
         action: GovernanceAction,
     ) -> Result<Self> {
-        let issuer = admin.node_id()?;
+        let issuer = admin.peer_id()?;
         ensure!(
             view.authorize_client(&issuer)?.manage,
             "management permission required"
@@ -1022,7 +1022,7 @@ pub fn verify_membership(
         validate_id(owner_public_key)?;
         ensure!(
             fingerprint(owner_public_key)? == expected_network,
-            "personal-network root fingerprint mismatch"
+            "network ID mismatch"
         );
         let state: NetworkState = serde_json::from_str(state_json)?;
         ensure!(
@@ -1142,6 +1142,22 @@ impl VerifiedMembership {
 mod tests {
     use super::*;
 
+    #[test]
+    fn peer_id_certificate_uses_only_the_current_field() -> Result<()> {
+        let device = Identity::from_secret_hex(&"01".repeat(32)).map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            device.peer_id(),
+            "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+        );
+        assert_eq!(MembershipSigner::peer_id(&device)?, device.peer_id());
+        let wire = serde_json::json!({"peer_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
+        let certificate: NodeCertificate = serde_json::from_value(wire.clone())?;
+        assert_eq!(serde_json::to_value(certificate)?, wire);
+        let old = serde_json::json!({"node_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
+        assert!(serde_json::from_value::<NodeCertificate>(old).is_err());
+        Ok(())
+    }
+
     fn identity() -> Identity {
         Identity::generate().expect("test identity randomness")
     }
@@ -1169,7 +1185,7 @@ mod tests {
             &state.project()?,
             Member::client(&ordinary, "ordinary", false)?,
         )?)?;
-        assert!(!state.project()?.principal(&ordinary.node_id())?.can_manage);
+        assert!(!state.project()?.principal(&ordinary.peer_id())?.can_manage);
         assert!(
             GovernanceEvent::grant(
                 &ordinary,
@@ -1179,9 +1195,9 @@ mod tests {
             .is_err()
         );
         assert!(
-            GovernanceEvent::revoke(&ordinary, &state.project()?, &ordinary.node_id()).is_err()
+            GovernanceEvent::revoke(&ordinary, &state.project()?, &ordinary.peer_id()).is_err()
         );
-        let mut forged = GovernanceEvent::revoke(&a, &state.project()?, &ordinary.node_id())?;
+        let mut forged = GovernanceEvent::revoke(&a, &state.project()?, &ordinary.peer_id())?;
         forged.signature =
             ordinary.sign_payload("identity-governance", &forged.signing_bytes()?)?;
         assert!(state.append(forged).is_err());
@@ -1213,25 +1229,25 @@ mod tests {
         revoked.append(GovernanceEvent::revoke(
             &a,
             &revoked.project()?,
-            &c.node_id(),
+            &c.peer_id(),
         )?)?;
         let mut merged = revoked.merge(&fork)?;
-        assert!(merged.project()?.authorize_client(&c.node_id()).is_err());
-        assert!(merged.project()?.authorize_client(&d.node_id()).is_ok());
+        assert!(merged.project()?.authorize_client(&c.peer_id()).is_err());
+        assert!(merged.project()?.authorize_client(&d.peer_id()).is_ok());
         assert_eq!(merged.project()?, fork.merge(&revoked)?.project()?);
         merged.append(GovernanceEvent::grant(
             &a,
             &merged.project()?,
             Member::client(&c, "rejoin", false)?,
         )?)?;
-        assert!(merged.project()?.authorize_client(&c.node_id()).is_err());
+        assert!(merged.project()?.authorize_client(&c.peer_id()).is_err());
         let fresh = identity();
         merged.append(GovernanceEvent::grant(
             &a,
             &merged.project()?,
             Member::client(&fresh, "fresh", false)?,
         )?)?;
-        assert!(merged.project()?.authorize_client(&fresh.node_id()).is_ok());
+        assert!(merged.project()?.authorize_client(&fresh.peer_id()).is_ok());
         Ok(())
     }
 
@@ -1254,7 +1270,7 @@ mod tests {
         assert_eq!(
             left.merge(&right)?
                 .project()?
-                .authorize_node(&c.node_id(), None)?
+                .authorize_node(&c.peer_id(), None)?
                 .node_roles,
             vec![NodeRole::Replica]
         );
@@ -1281,13 +1297,13 @@ mod tests {
             )
             .is_err()
         );
-        assert!(GovernanceEvent::revoke(&a, &state.project()?, &b.node_id()).is_err());
+        assert!(GovernanceEvent::revoke(&a, &state.project()?, &b.peer_id()).is_err());
         let mut forged = GovernanceEvent {
             version: 1,
             network_id: state.genesis.network_id.clone(),
             epoch: 1,
             parents: vec![],
-            issuer: a.node_id(),
+            issuer: a.peer_id(),
             action: GovernanceAction::Grant {
                 member: Member::client(&newcomer, "newadmin", true)?,
             },
@@ -1300,9 +1316,9 @@ mod tests {
             network_id: state.genesis.network_id.clone(),
             epoch: 1,
             parents: vec![],
-            issuer: a.node_id(),
+            issuer: a.peer_id(),
             action: GovernanceAction::Revoke {
-                subject_id: b.node_id(),
+                subject_id: b.peer_id(),
             },
             signature: String::new(),
         };
@@ -1323,8 +1339,8 @@ mod tests {
         )?;
         state.recover(checkpoint.clone())?;
         assert_eq!(state.project()?.network_id, original.genesis.network_id);
-        assert!(state.project()?.principal(&recovered.node_id())?.can_manage);
-        assert!(state.project()?.authorize_client(&a.node_id()).is_err());
+        assert!(state.project()?.principal(&recovered.peer_id())?.can_manage);
+        assert!(state.project()?.authorize_client(&a.peer_id()).is_err());
         assert!(state.merge(&original).is_err());
         state.recover(checkpoint)?;
         let mut conflict = original.clone();
@@ -1351,7 +1367,7 @@ mod tests {
     fn missing_parents_wrong_epoch_and_tampering_fail_closed() -> Result<()> {
         let (_, a, _, mut state) = setup()?;
         let ordinary = identity();
-        let valid = GovernanceEvent::revoke(&a, &state.project()?, &ordinary.node_id())?;
+        let valid = GovernanceEvent::revoke(&a, &state.project()?, &ordinary.peer_id())?;
         let mut missing = valid.clone();
         missing.parents = vec!["0".repeat(64)];
         assert!(state.append(missing).is_err());
@@ -1441,7 +1457,7 @@ mod tests {
         assert!(
             validate_history(&vec![
                 HistoricalNode {
-                    subject_id: node.node_id(),
+                    subject_id: node.peer_id(),
                     public_key: node.public_key_hex()
                 };
                 MAX_HISTORICAL_NODES + 1

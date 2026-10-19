@@ -23,7 +23,7 @@ export function ExecutionActivity({ execution, conversationId, compact = false }
   const deviceName = nodeName(execution.target_node, { nodes: workspace.nodes, directory }, "执行设备")
   const [steerGeneration, setSteerGeneration] = useState<number | null>(null)
   const steerBusy = steerGeneration === workspace.generation
-  const targetOnline = workspace.nodes.some((node) => node.node_id === execution.target_node && node.online && !node.revoked)
+  const targetOnline = workspace.nodes.some((node) => node.peer_id === execution.target_node && node.online && !node.revoked)
   const pending = workspace.pending.filter((item) => item.conversation_id === conversationId && (item.execution_control?.expected_operation_id === execution.operation_id || item.target_node === execution.target_node && execution.session_id !== null && item.session_id === execution.session_id))
   const canControl = workspace.writable && Boolean(workspace.selectedBot) && targetOnline && execution.state !== "unknown" && execution.session_state !== "unknown" && execution.freshness !== "unknown" && pending.length === 0
   const followupMode = execution.goal?.followup_mode
@@ -89,7 +89,7 @@ export function PendingExecutionControl({ operation }: { operation: PendingOpera
   const workspace = useWorkspace()
   const [result, setResult] = useState<{ generation: number; text: string; missing: boolean } | null>(null)
   const currentResult = result?.generation === workspace.generation ? result : null
-  const online = workspace.nodes.some((node) => node.node_id === operation.target_node && node.online && !node.revoked)
+  const online = workspace.nodes.some((node) => node.peer_id === operation.target_node && node.online && !node.revoked)
   return <section className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" aria-label="操作待核对">
     <h3 className="text-sm font-semibold">操作结果待核对</h3>
     <p className="text-sm">已保留原请求，不会自动重发。</p>

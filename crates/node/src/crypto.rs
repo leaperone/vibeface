@@ -29,15 +29,15 @@ impl LocalIdentity {
     pub fn public_key_hex(&self) -> Result<String> {
         Ok(hex::encode(self.key()?.verifying_key().as_bytes()))
     }
-    pub fn node_id(&self) -> Result<NodeId> {
+    pub fn peer_id(&self) -> Result<PeerId> {
         fingerprint(&self.public_key_hex()?)
     }
     pub fn network_id(&self) -> Result<NetworkId> {
-        self.node_id()
+        self.peer_id()
     }
     pub fn certificate(&self, roles: Vec<NodeRole>) -> Result<NodeCertificate> {
         Ok(NodeCertificate {
-            node_id: self.node_id()?,
+            peer_id: self.peer_id()?,
             public_key: self.public_key_hex()?,
             roles,
             revoked: false,
@@ -49,7 +49,7 @@ impl LocalIdentity {
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
-            event.author == self.node_id()?,
+            event.author == self.peer_id()?,
             "event author does not match local identity"
         );
         event.parents.sort();
@@ -105,13 +105,13 @@ impl LocalIdentity {
         let history = nodes
             .iter()
             .map(|node| HistoricalNode {
-                subject_id: node.node_id.clone(),
+                subject_id: node.peer_id.clone(),
                 public_key: node.public_key.clone(),
             })
             .collect();
         let mut members = vec![admin_member];
         for certificate in nodes.into_iter().filter(|certificate| !certificate.revoked) {
-            let node_id = certificate.node_id;
+            let peer_id = certificate.peer_id;
             let public_key = certificate.public_key;
             let mut roles = certificate.roles;
             if roles.iter().any(|role| {
@@ -125,10 +125,10 @@ impl LocalIdentity {
             }
             roles.sort_by_key(node_role_key);
             let member = Member {
-                subject_id: node_id.clone(),
+                subject_id: peer_id.clone(),
                 public_key,
                 kind: IdentityKind::Node,
-                name: format!("node-{node_id}"),
+                name: format!("node-{peer_id}"),
                 node_roles: roles,
                 manage: false,
             };
@@ -210,7 +210,7 @@ pub fn verify_signed_event(
     );
     ensure!(
         body.author == fingerprint(public_key)?,
-        "author fingerprint mismatch"
+        "author Peer ID mismatch"
     );
     validate_event_shape(&body)?;
     verify(
@@ -287,6 +287,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
@@ -304,10 +305,10 @@ mod tests {
         let view = state.project()?;
         assert_eq!(view.network_id, owner.fixture_network_id()?);
         assert!(
-            view.authorize_node(&owner.node_id()?, Some(NodeRole::Replica))
+            view.authorize_node(&owner.peer_id()?, Some(NodeRole::Replica))
                 .is_ok()
         );
-        assert!(view.authorize_node(&revoked.node_id()?, None).is_err());
+        assert!(view.authorize_node(&revoked.peer_id()?, None).is_err());
         let all = owner.sign_network_fixture(
             1,
             vec![owner.certificate(vec![
@@ -319,7 +320,7 @@ mod tests {
         )?;
         assert!(
             all.project()?
-                .authorize_node(&owner.node_id()?, Some(NodeRole::Executor))
+                .authorize_node(&owner.peer_id()?, Some(NodeRole::Executor))
                 .is_ok()
         );
         let later = owner.sign_network_fixture(2, vec![])?;
@@ -345,7 +346,7 @@ mod tests {
             version: 1,
             network_id: owner.fixture_network_id()?,
             scope_id: "c".into(),
-            author: owner.node_id()?,
+            author: owner.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],

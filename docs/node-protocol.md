@@ -4,7 +4,7 @@
 
 ## 身份与数据范围
 
-`network_id` 是个人网络根公钥原始字节的 SHA256，`node_id` 是设备公钥原始字节的 SHA256，均编码为 64 个小写十六进制字符。地址不参与身份计算。
+`network_id` 是个人网络根公钥原始字节的 SHA256，`peer_id` 是设备公钥原始字节的 SHA256，均编码为 64 个小写十六进制字符。地址不参与身份计算。
 
 个人网络使用 `NetworkState { genesis, checkpoint, events }`。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
 
@@ -15,6 +15,12 @@
 管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`。签名目录验证因果授权，不能通过并发事件自行扩大权限，已知撤销优先。管理恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
 
 所有共享会话、事件、附件、执行账本及通知按 `network_id` 分区。公网发现目录不发布私人网络成员关系、项目或会话。一个物理 Node 可运行自己的调度执行，同时为其他网络转发密文。
+
+## Peer ID 术语
+
+内部类型使用 `PeerId`，身份方法使用 `peer_id()`，浏览器 SDK 使用 `peerId()`。JSON、RPC、邀请、连接记录、Peer 握手、发现记录、中转签名、维护响应和更新日志统一使用 `peer_id`。mDNS 只广告和读取 `peer_id`。
+
+恢复挑战使用 `target_peer_id`，blob 下载清单使用 `source_peer_id`。`network_id` 是网络编号，`subject_id` 仍是签名成员编号。不保留旧名别名、双读或双写。当前数据目录格式为 epoch 4，旧目录不自动迁移。见 [Peer ID 命名与数据目录](peer-id-migration.md)。
 
 ## 本机配置
 
@@ -71,7 +77,7 @@
 
 网站不提供用户名密码注册、登录 cookie 或明文业务 RPC。网页的密钥存储需要安全上下文。localhost 或可信 HTTPS 页面可启动客户端，普通 LAN HTTP 页面不能降级为无密钥认证。
 
-WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"NODE_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。客户端钉住目标 NodeID，服务端在加密通道内验证客户端个人网络授权。
+WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"PEER_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。客户端钉住目标 Peer ID，服务端在加密通道内验证客户端个人网络授权。
 
 握手后的应用消息均为二进制加密记录。文本应用消息、身份错配、篡改及重放关闭通道。大消息通过 `sealMessage` 和 `openRecord` 分片重组，不能直接把一个超长 JSON 塞入单个 Noise record。
 
@@ -110,7 +116,7 @@ WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"d
 
 恢复流程先验证根签 challenge，再返回可核对的设备目录。客户端明确选择保留成员，生成新的独立管理客户端，并使用本地解锁的根身份签署 checkpoint。已初始化 Node 只能恢复该个人网络。新 Node 另需本机 capability，持有其他网络的根私钥不能抢占公共主机。业务正文和项目文件不在根恢复包中。
 
-本机 `access --json` 输出含 NodeID 与一次性高熵 capability。capability 不放入服务日志、公共目录或 DAG。知道 Node 地址或公开身份不能抢占初始化，也不能取得私人网络权限。
+本机 `access --json` 输出含 Peer ID 与一次性高熵 capability。capability 不放入服务日志、公共目录或 DAG。知道 Node 地址或公开身份不能抢占初始化，也不能取得私人网络权限。
 
 `/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不是供外部 Bot 保存的长期身份，不能添加或撤销设备、回答审批或验收工单。管理 SDK 使用独立随机端口的回环 listener，不依赖公网或 LAN 地址。
 
@@ -179,7 +185,7 @@ Node 的 manager 配置保存本机 SDK adapter 和凭证，Bot 定义保存职�
 	"network_id": "NETWORK_FINGERPRINT",
 	"conversation_id": "conversation-id",
 	"trigger": "SIGNED_EVENT_HASH",
-	"target_node": "SCHEDULER_NODE_ID",
+	"target_node": "SCHEDULER_PEER_ID",
 	"state": "queued"
 }
 ```
@@ -206,7 +212,7 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 	"network_id": "NETWORK_FINGERPRINT",
 	"conversation_id": "conversation-id",
 	"task_id": "task-id",
-	"target_node": "TARGET_NODE_ID",
+	"target_node": "TARGET_PEER_ID",
 	"session_id": "logical-session-id",
 	"expected_revision": 0,
 	"basis_heads": [],
@@ -251,7 +257,7 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 
 macOS 使用系统 `sandbox-exec`。Linux 要求支持 Landlock ABI 6 的内核及 seccomp，旧内核明确拒绝该工具；还会拒绝无法按目录约束的文件元数据修改。受限短命令不是完整开发环境，依赖受限进程操作的复杂工具需使用已有编码执行器。
 
-Bot 事件和可空 `session_id` 使用当前版本结构，不提供旧版本兼容。业务数据库直接使用 `user_version=3` 的最终初始 schema，不执行旧库升级。重新部署使用新数据目录及同版本节点，同版本重启仍保留执行账本并核对未知结果，不重放副作用。
+Bot 事件和可空 `session_id` 使用当前版本结构，不提供旧版本兼容。业务数据库直接使用 `user_version=4` 的最终初始 schema，不执行旧库升级。重新部署使用新数据目录及同版本节点，同版本重启仍保留执行账本并核对未知结果，不重放副作用。
 
 操作状态如下：
 
@@ -337,7 +343,7 @@ mDNS 按完整服务实例名保存来源，最多 256 个实例，每个实例�
 
 固定 IP 监听只宣告该 IP，回环监听只发现其他设备而不宣告自身。wildcard 监听的宣告与发现都限制在对应地址族，不使用没有接口范围的 IPv6 link-local 候选。接口变化不会自动重绑固定监听地址，也不提供 NAT 打洞。实例冲突后的撤销依赖实际缓存复核，不保证即时生效。
 
-`Reachability` 包含 `node_id`、`public_key`、`direct_urls`、`relay_urls`、`issued_at`、`expires_at` 和 `signature`。设备使用 Ed25519 的 `reachability` domain 签名。记录有效期受限，只按已知 NodeID 查询，不提供全网枚举。签名证明设备声明该路径，不证明设备属于本人或路径此刻可达。
+`Reachability` 包含 `peer_id`、`public_key`、`direct_urls`、`relay_urls`、`issued_at`、`expires_at` 和 `signature`。设备使用 Ed25519 的 `reachability` domain 签名。记录有效期受限，只按已知 Peer ID 查询，不提供全网枚举。签名证明设备声明该路径，不证明设备属于本人或路径此刻可达。
 
 目录结果逐项验签并核对目标身份，过期或非法记录只影响对应来源。候选交付及拨号前再次检查有效期，健康来源不必等待其他目录全部返回。公共发布目录最多保存 2048 个身份，本机解析缓存另有 256 个名额；缓存满时仍可使用本次有效候选，公共查询不读取该私有缓存。
 
