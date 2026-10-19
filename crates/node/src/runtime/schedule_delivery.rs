@@ -782,9 +782,14 @@ impl Runtime {
                 .iter()
                 .any(|message| message.message_id == message_id && message.role == "user")
             {
+                let basis = heads(input)?;
+                ensure!(
+                    !store.has_known_basis_gap(network, &basis)?,
+                    "context is incomplete; wait for synchronization"
+                );
                 ensure!(
                     store
-                        .context(network, &scope, &heads(input)?)?
+                        .context(network, &scope, &basis)?
                         .missing
                         .is_complete(),
                     "context is incomplete; wait for synchronization"

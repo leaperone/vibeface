@@ -416,6 +416,16 @@ mod tests {
     };
 
     #[test]
+    fn peer_id_health_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"peer_id":"device","version":"version"}"#;
+        let health: Health = serde_json::from_str(wire)?;
+        assert_eq!(health.peer_id, "device");
+        assert_eq!(serde_json::to_string(&health)?, wire);
+        assert!(serde_json::from_str::<Health>(&wire.replace("peer_id", "node_id")).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn confirmed_unlink_sync_failure_does_not_leave_unrecoverable_maintenance() -> Result<()> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
@@ -457,7 +467,7 @@ mod tests {
             .join(format!("maintenance-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         config.codex_socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;

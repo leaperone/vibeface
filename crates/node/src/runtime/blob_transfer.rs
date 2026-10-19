@@ -713,7 +713,7 @@ impl Runtime {
         };
         let TransferPhase::Receiving {
             committed_offset,
-            source_node_id,
+            source_peer_id,
         } = transfer.phase.clone()
         else {
             bail!("invalid receiving state");
@@ -729,14 +729,15 @@ impl Runtime {
                             .is_ok()
                     })
                     .map(|source| source.peer_id.as_str())
-                    .unwrap_or(&source_node_id)
+                    .unwrap_or(&source_peer_id)
             };
+
             transfer = self
                 .commit_blob_progress(network, &transfer, source, offset, part_length)
                 .await?;
         }
         let bound_source = match &transfer.phase {
-            TransferPhase::Receiving { source_node_id, .. } => source_node_id.clone(),
+            TransferPhase::Receiving { source_peer_id, .. } => source_peer_id.clone(),
             _ => unreachable!(),
         };
         tracing::debug!(network,hash=%blob.hash,size=blob.size,source=%bound_source,committed_offset=offset,part_length,"history blob opened");
@@ -840,7 +841,7 @@ impl Runtime {
             bail!("blob hash mismatch; prefix reset for another authorized source");
         }
         let mut source = match &transfer.phase {
-            TransferPhase::Receiving { source_node_id, .. } => source_node_id.clone(),
+            TransferPhase::Receiving { source_peer_id, .. } => source_peer_id.clone(),
             _ => unreachable!(),
         };
         let source_current = self
@@ -1010,7 +1011,7 @@ mod tests {
             let phase = if index % 2 == 0 {
                 TransferPhase::Receiving {
                     committed_offset: 0,
-                    source_node_id: source.clone(),
+                    source_peer_id: source.clone(),
                 }
             } else {
                 TransferPhase::Cleanup
@@ -1060,7 +1061,7 @@ mod tests {
                     &existing,
                     TransferPhase::Receiving {
                         committed_offset: 0,
-                        source_node_id: node.identity.peer_id()?,
+                        source_peer_id: node.identity.peer_id()?,
                     },
                 )
                 .await?;
@@ -1117,7 +1118,7 @@ mod tests {
                     &reserved,
                     TransferPhase::Receiving {
                         committed_offset: 0,
-                        source_node_id: node.identity.peer_id()?,
+                        source_peer_id: node.identity.peer_id()?,
                     },
                 )
                 .await?;
@@ -1548,8 +1549,8 @@ mod tests {
             assert!(!store.has_blob(&network, &blob)?);
             assert!(
                 matches!(store.blob_transfer(&network, &blob)?.unwrap().phase,
-                TransferPhase::Receiving { committed_offset, source_node_id }
-                if committed_offset == blob.size && source_node_id == retired_id)
+                TransferPhase::Receiving { committed_offset, source_peer_id }
+                if committed_offset == blob.size && source_peer_id == retired_id)
             );
         }
         assert!(updates.try_recv().is_err());
@@ -1963,7 +1964,7 @@ mod tests {
 
     fn manifest_source(manifest: &BlobTransfer) -> String {
         match &manifest.phase {
-            TransferPhase::Receiving { source_node_id, .. } => source_node_id.clone(),
+            TransferPhase::Receiving { source_peer_id, .. } => source_peer_id.clone(),
             _ => unreachable!(),
         }
     }

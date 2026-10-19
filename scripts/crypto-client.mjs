@@ -35,8 +35,8 @@ function endpoint() {
               await writeFile(input.identity_file, JSON.stringify({secret_key_hex:fixture.secretHex()})+'\n', {mode:0o600,flag:'wx'});
             } catch (error) { fixture.free(); throw error; }
           }
-          if (input.expected_node_id) {
-            try { assert(fixture.peerId() === input.expected_node_id, 'fixture identity must retain the pinned target'); }
+          if (input.expected_peer_id) {
+            try { assert(fixture.peerId() === input.expected_peer_id, 'fixture identity must retain the pinned target'); }
             catch (error) { fixture.free(); throw error; }
           }
           identity.free(); identity = fixture;
@@ -48,7 +48,7 @@ function endpoint() {
           assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
           const fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
           try {
-            assert(fixture.peerId() === input.expected_node_id, 'fixture signer must match the original target');
+            assert(fixture.peerId() === input.expected_peer_id, 'fixture signer must match the original target');
             assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
             assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
             const issued = Math.floor(Date.now() / 1000);

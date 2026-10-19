@@ -259,7 +259,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const submitMessage = async (text: string) => {
     const context = requireContext(), id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.entry.peer_id, pending: prior, heads: context.heads, reportResults: true })
+    const prepared = prepareSend({ conversationId: id, text, schedulerPeerId: null, entryNode: connection.entry.peer_id, pending: prior, heads: context.heads, reportResults: true })
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {

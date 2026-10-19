@@ -154,8 +154,13 @@ impl Store {
                 "unsupported database schema version {version}; initialize a fresh Node data directory"
             ),
         }
-        let mut store = Self { blob_readers: Default::default(), connection, path: path.to_owned(), process_lock: None };
-        // Reject incompatible membership before recovery changes operations or rebuilds projections.
+        let mut store = Self {
+            blob_readers: Default::default(),
+            connection,
+            path: path.to_owned(),
+            process_lock: None,
+        };
+        // Reject incompatible membership before recovery changes jobs or projections.
         for network in store.networks()? {
             store
                 .trust_bundle(&network)?
@@ -171,21 +176,39 @@ impl Store {
         Ok(store)
     }
     pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = install_trust_bundle_in(&tx, network_id, state)?;
         tx.commit()?;
-        if changed { self.blob_readers.retire_network(network_id); }
+        if changed {
+            self.blob_readers.retire_network(network_id);
+        }
         Ok(changed)
     }
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let metadata = std::fs::symlink_metadata(path)?;
-        ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "database must be a regular file");
-        let connection = Connection::open_with_flags(path.canonicalize()?, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "database must be a regular file"
+        );
+        let connection = Connection::open_with_flags(
+            path.canonicalize()?,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure!(version == 5, "unsupported database schema version {version}");
-        Ok(Self { blob_readers: Default::default(), connection, path: path.to_owned(), process_lock: None })
+        ensure!(
+            version == 5,
+            "unsupported database schema version {version}"
+        );
+        Ok(Self {
+            blob_readers: Default::default(),
+            connection,
+            path: path.to_owned(),
+            process_lock: None,
+        })
     }
     pub(crate) fn retire_identity_readers(&mut self, network: &str) {
         self.blob_readers.retire_network(network);
@@ -632,7 +655,9 @@ impl Store {
                 matches!(job.state, JobState::Queued),
                 "pending scheduler job is not queued"
             );
-            if session.unresolved.is_empty() || matches!(job.kind, TriggerKind::Human | TriggerKind::AgentResult) {
+            if session.unresolved.is_empty()
+                || matches!(job.kind, TriggerKind::Human | TriggerKind::AgentResult)
+            {
                 queued.push(job);
             }
         }
@@ -641,22 +666,32 @@ impl Store {
         for mut candidate in queued {
             if candidate.kind == TriggerKind::AgentResult
                 && agent_messages::result_consumed_by_parent(
-                    &tx, network, conversation, &candidate.trigger, target,
+                    &tx,
+                    network,
+                    conversation,
+                    &candidate.trigger,
+                    target,
                 )?
             {
                 candidate.state = JobState::Cancelled {
                     attempt: None,
                     evidence: "result consumed by parent task; no separate report needed".into(),
                 };
-                session.pending.retain(|pending| pending != &candidate.trigger);
+                session
+                    .pending
+                    .retain(|pending| pending != &candidate.trigger);
                 scheduler_save(
-                    &tx, network,
+                    &tx,
+                    network,
                     &scheduler_key("job", conversation, target, &candidate.trigger),
                     &candidate,
                 )?;
                 continue;
             }
-            let policy = if matches!(candidate.kind, TriggerKind::Autonomous | TriggerKind::AgentResult) {
+            let policy = if matches!(
+                candidate.kind,
+                TriggerKind::Autonomous | TriggerKind::AgentResult
+            ) {
                 match followup::validate_followup_result_from(
                     &tx,
                     network,
@@ -1220,6 +1255,24 @@ impl Store {
             .map(|(scope, heads)| (scope, heads.into_iter().collect()))
             .collect())
     }
+    pub(crate) fn has_known_basis_gap(
+        &self,
+        network_id: &str,
+        heads: &[EventHash],
+    ) -> Result<bool> {
+        let mut query = self
+            .connection
+            .prepare("SELECT status FROM events WHERE network_id=? AND hash=?")?;
+        for hash in heads {
+            let status: Option<String> = query
+                .query_row(params![network_id, hash], |row| row.get(0))
+                .optional()?;
+            if status.as_deref() != Some("ready") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub fn missing_dependencies(
         &self,
         network_id: &str,
@@ -1599,17 +1652,6 @@ impl Store {
             .context("task creation envelope is missing")
     }
 
-
-
-
-
-
-
-
-
-
-
-
     pub fn queue_notification(
         &mut self,
         network_id: &str,
@@ -1853,8 +1895,15 @@ fn publish_scheduler_terminal_from(
         );
     }
     if let Some(hash) = agent_messages::publish_agent_result_from(
-        connection, identity, network, &job, &marker.outcome, marker.created_at_ms,
-    )? { event_hashes.push(hash); }
+        connection,
+        identity,
+        network,
+        &job,
+        &marker.outcome,
+        marker.created_at_ms,
+    )? {
+        event_hashes.push(hash);
+    }
     job.state = match marker.outcome {
         JobOutcome::Completed => JobState::Completed { attempt },
         JobOutcome::Failed(detail) => JobState::Failed { attempt, detail },
@@ -2013,9 +2062,9 @@ fn validated_scheduler_trigger(
             );
             Ok(TriggerKind::Human)
         }
-        EventBody::AgentMessage { message } => {
-            agent_messages::validate_agent_trigger_from(connection, network, &event, message, target)
-        }
+        EventBody::AgentMessage { message } => agent_messages::validate_agent_trigger_from(
+            connection, network, &event, message, target,
+        ),
         _ => bail!("invalid scheduler trigger"),
     }
 }
@@ -2095,7 +2144,6 @@ fn admit_scheduler_from(
     save_scheduler_session(connection, network, &session)?;
     Ok(job.receipt(network))
 }
-
 
 fn recover_scheduler_session(
     connection: &Connection,
@@ -2382,9 +2430,6 @@ fn authorize_node_from(
     );
     view.authorize_node(peer_id, role)?.certificate()
 }
-
-
-
 
 fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
     let mut heads: BTreeSet<String> = events
@@ -2688,11 +2733,7 @@ mod tests {
         Ok(())
     }
     fn roles() -> Vec<NodeRole> {
-        vec![
-            NodeRole::Gateway,
-            NodeRole::Replica,
-            NodeRole::Scheduler,
-        ]
+        vec![NodeRole::Gateway, NodeRole::Replica, NodeRole::Scheduler]
     }
     fn memory(owner: &LocalIdentity, other: Option<&LocalIdentity>) -> Result<Store> {
         let mut store = Store::open(":memory:")?;
@@ -3859,7 +3900,11 @@ mod tests {
                 .query_row("SELECT count FROM projection_writes", [], |row| row.get(0))?;
         assert_eq!(writes, 0);
         assert_eq!(store.conversations(&network)?.len(), 1);
-        assert!(store.scheduler_jobs(&network, "conversation", &owner.peer_id()?)?.is_empty());
+        assert!(
+            store
+                .scheduler_jobs(&network, "conversation", &owner.peer_id()?)?
+                .is_empty()
+        );
         assert!(store.scheduler_outbox_all(&network)?.is_empty());
         Ok(())
     }
@@ -3988,8 +4033,16 @@ mod tests {
             source.messages(&network, "conversation")?,
             replica.messages(&network, "conversation")?
         );
-        assert!(replica.scheduler_jobs(&network, "conversation", &a.peer_id()?)?.is_empty());
-        assert!(replica.scheduler_jobs(&network, "conversation", &b.peer_id()?)?.is_empty());
+        assert!(
+            replica
+                .scheduler_jobs(&network, "conversation", &a.peer_id()?)?
+                .is_empty()
+        );
+        assert!(
+            replica
+                .scheduler_jobs(&network, "conversation", &b.peer_id()?)?
+                .is_empty()
+        );
         assert!(replica.scheduler_outbox_all(&network)?.is_empty());
         let context = replica.context(&network, "conversation", &snapshot.heads)?;
         assert!(context.missing.is_complete());
@@ -4201,8 +4254,6 @@ mod tests {
         Ok(())
     }
 
-
-
     #[test]
     fn root_recovery_preserves_revoked_authors_without_restoring_authority() -> Result<()> {
         use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, RootCheckpoint};
@@ -4347,8 +4398,16 @@ mod tests {
         );
         assert_eq!(store.scheduler_jobs(&na, "conversation", &target)?.len(), 1);
         assert_eq!(store.scheduler_jobs(&nb, "conversation", &target)?.len(), 1);
-        assert!(store.scheduler_job(&na, "conversation", &mb.hash, &target)?.is_none());
-        assert!(store.scheduler_job(&nb, "conversation", &ma.hash, &target)?.is_none());
+        assert!(
+            store
+                .scheduler_job(&na, "conversation", &mb.hash, &target)?
+                .is_none()
+        );
+        assert!(
+            store
+                .scheduler_job(&nb, "conversation", &ma.hash, &target)?
+                .is_none()
+        );
         store.local_set(&na, "auth", &json!("a"))?;
         store.local_set(&nb, "auth", &json!("b"))?;
         assert_eq!(store.local_value(&na, "auth")?, Some(json!("a")));
@@ -4422,8 +4481,17 @@ mod tests {
         assert!(store.pending_notifications(&network, "phone")?.is_empty());
         assert_eq!(store.pending_notifications(&network, "laptop")?.len(), 1);
         assert_eq!(store.budget_usage(&network, "2026-10-16", 3)?.used, 2);
-        assert_eq!(store.scheduler_jobs(&network, "conversation", &a.peer_id()?)?.len(), 1);
-        assert!(store.scheduler_job(&network, "conversation", &result.hash, &a.peer_id()?)?.is_none());
+        assert_eq!(
+            store
+                .scheduler_jobs(&network, "conversation", &a.peer_id()?)?
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .scheduler_job(&network, "conversation", &result.hash, &a.peer_id()?)?
+                .is_none()
+        );
         Ok(())
     }
     #[test]
@@ -4463,7 +4531,11 @@ mod tests {
         assert_eq!(target.pending_notifications(&network, "laptop")?.len(), 1);
         target.rebuild_projections(&network)?;
         assert!(target.pending_notifications(&network, "phone")?.is_empty());
-        assert!(target.scheduler_jobs(&network, "conversation", &a.peer_id()?)?.is_empty());
+        assert!(
+            target
+                .scheduler_jobs(&network, "conversation", &a.peer_id()?)?
+                .is_empty()
+        );
         assert!(target.scheduler_outbox_all(&network)?.is_empty());
         Ok(())
     }
@@ -4509,11 +4581,10 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(state, expected);
-        let writes: u64 = connection.query_row(
-            "SELECT count FROM preflight_projection_writes",
-            [],
-            |r| r.get(0),
-        )?;
+        let writes: u64 =
+            connection.query_row("SELECT count FROM preflight_projection_writes", [], |r| {
+                r.get(0)
+            })?;
         assert_eq!(writes, 0);
         let conversations: u64 =
             connection.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
@@ -4524,7 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_preserves_conversations_and_rejects_future_schema() -> Result<()> {
+    fn reopening_preserves_conversations_and_rejects_other_schemas() -> Result<()> {
         let root = std::env::temp_dir().join(format!("vibeface-core-{}", uuid::Uuid::new_v4()));
         let db = root.join("node.sqlite3");
         let a = LocalIdentity::generate();
@@ -4541,10 +4612,12 @@ mod tests {
             let store = Store::open(&db)?;
             assert_eq!(store.conversations(&network)?.len(), 1);
         }
-        let connection = Connection::open(&db)?;
-        connection.execute_batch("PRAGMA user_version=6;")?;
-        drop(connection);
-        assert!(Store::open(&db).is_err());
+        for version in [3, 4, 6] {
+            let connection = Connection::open(&db)?;
+            connection.execute_batch(&format!("PRAGMA user_version={version};"))?;
+            drop(connection);
+            assert!(Store::open(&db).is_err());
+        }
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -114,12 +114,10 @@ impl LocalIdentity {
             let peer_id = certificate.peer_id;
             let public_key = certificate.public_key;
             let mut roles = certificate.roles;
-            if roles.iter().any(|role| {
-                matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler
-                )
-            }) && !roles.contains(&NodeRole::Replica)
+            if roles
+                .iter()
+                .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler))
+                && !roles.contains(&NodeRole::Replica)
             {
                 roles.push(NodeRole::Replica);
             }
@@ -209,7 +207,7 @@ pub fn verify_signed_event(
     );
     ensure!(
         body.author == fingerprint(public_key)?,
-        "author fingerprint mismatch"
+        "author Peer ID mismatch"
     );
     validate_event_shape(&body)?;
     verify(
@@ -295,9 +293,15 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 "agent task requires text and cannot reply to another task"
             );
         } else {
-            let reference = message.in_reply_to.as_ref().context("agent reply has no task reference")?;
+            let reference = message
+                .in_reply_to
+                .as_ref()
+                .context("agent reply has no task reference")?;
             decode32(reference)?;
-            ensure!(event.parents.contains(reference), "agent task reference must be a parent");
+            ensure!(
+                event.parents.contains(reference),
+                "agent task reference must be a parent"
+            );
         }
     }
     Ok(())
@@ -305,6 +309,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
@@ -411,15 +416,21 @@ mod tests {
         };
         let signed = identity.sign_event(event.clone())?;
         verify_signed_event(&event.network_id, &signed, &identity.public_key_hex()?)?;
-        let EventBody::AgentMessage { message } = &mut event.body else { unreachable!() };
+        let EventBody::AgentMessage { message } = &mut event.body else {
+            unreachable!()
+        };
         message.kind = AgentMessageKind::Completed;
         assert!(identity.sign_event(event.clone()).is_err());
-        let EventBody::AgentMessage { message } = &mut event.body else { unreachable!() };
+        let EventBody::AgentMessage { message } = &mut event.body else {
+            unreachable!()
+        };
         message.in_reply_to = Some(task.clone());
         assert!(identity.sign_event(event.clone()).is_err());
         event.parents.push(task);
         assert!(identity.sign_event(event.clone()).is_ok());
-        let EventBody::AgentMessage { message } = &mut event.body else { unreachable!() };
+        let EventBody::AgentMessage { message } = &mut event.body else {
+            unreachable!()
+        };
         message.target_node = "not-a-device-key".into();
         assert!(identity.sign_event(event).is_err());
         Ok(())

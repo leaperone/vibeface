@@ -180,6 +180,7 @@ enum Control {
 #[derive(Serialize)]
 struct ReservationProof<'a> {
     nonce: &'a str,
+
     peer_id: &'a str,
 }
 #[derive(Serialize)]
@@ -4960,6 +4961,38 @@ mod tests {
     }
 
     #[test]
+    fn peer_id_uses_canonical_signed_bytes() -> Result<()> {
+        let identity = LocalIdentity {
+            secret_key_hex: "01".repeat(32),
+        };
+        let peer_id = identity.peer_id()?;
+        let public_key = identity.public_key_hex()?;
+        let unsigned = format!(
+            r#"{{"peer_id":"{peer_id}","public_key":"{public_key}","direct_urls":[],"relay_urls":[],"issued_at":1000,"expires_at":1180,"signature":""}}"#
+        );
+        let mut record: Reachability = serde_json::from_str(&unsigned)?;
+        assert_eq!(record.unsigned()?, unsigned.as_bytes());
+        record.signature = identity.sign_payload("reachability", unsigned.as_bytes())?;
+        record.verify(1001)?;
+        let wire = serde_json::to_string(&record)?;
+        assert!(serde_json::from_str::<Reachability>(&wire.replace("peer_id", "node_id")).is_err());
+        assert_eq!(
+            serde_json::to_string(&ReservationProof {
+                nonce: "ticket",
+                peer_id: &peer_id
+            })?,
+            format!(r#"{{"nonce":"ticket","peer_id":"{peer_id}"}}"#)
+        );
+        let input = format!(
+            r#"{{"type":"reserve","peer_id":"{peer_id}","public_key":"{public_key}","signature":"signature"}}"#
+        );
+        let control: Control = serde_json::from_str(&input)?;
+        assert_eq!(serde_json::to_value(control)?["peer_id"], peer_id);
+        assert!(serde_json::from_str::<Control>(&input.replace("peer_id", "node_id")).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn mdns_uses_valid_dns_labels_and_retains_the_full_identity() -> Result<()> {
         let peer_id = LocalIdentity::generate().peer_id()?;
         let service = mdns_service(&peer_id, "0.0.0.0:4790".parse()?)?
@@ -4974,6 +5007,7 @@ mod tests {
             service.get_property_val_str("peer_id"),
             Some(peer_id.as_str())
         );
+        assert!(service.get_property_val_str("node_id").is_none());
         assert_eq!(service.get_port(), 4790);
         Ok(())
     }

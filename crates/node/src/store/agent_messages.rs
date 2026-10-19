@@ -110,7 +110,10 @@ pub(super) fn result_consumed_by_parent(
 }
 
 impl Store {
-    #[expect(clippy::too_many_arguments, reason = "cancellation binds the original signed task and its authenticated source")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cancellation binds the original signed task and its authenticated source"
+    )]
     pub fn cancel_agent_task(
         &mut self,
         identity: &LocalIdentity,
@@ -121,16 +124,23 @@ impl Store {
         at: i64,
     ) -> Result<Option<SchedulerJob>> {
         let local = identity.peer_id()?;
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = event_from(&tx, network, scope, task_ref)?;
         let EventBody::AgentMessage { message } = &task.body else {
             bail!("cancellation must reference an agent task");
         };
-        ensure!(message.kind == AgentMessageKind::Task && task.author == source_node && message.target_node == local,
-            "cancellation does not match the original source and target");
+        ensure!(
+            message.kind == AgentMessageKind::Task
+                && task.author == source_node
+                && message.target_node == local,
+            "cancellation does not match the original source and target"
+        );
         admit_scheduler_from(&tx, network, scope, task_ref, &local, &local)?;
         let key = scheduler_key("job", scope, &local, task_ref);
-        let mut job: SchedulerJob = scheduler_load(&tx, network, &key)?.context("agent task admission is missing")?;
+        let mut job: SchedulerJob =
+            scheduler_load(&tx, network, &key)?.context("agent task admission is missing")?;
         if scheduler_publication_from(&tx, network, &job)?.is_some() {
             return Ok(Some(job));
         }
@@ -138,14 +148,32 @@ impl Store {
         match &job.state {
             JobState::Queued => {
                 let evidence = "task cancelled before its agent started".to_owned();
-                job.state = JobState::Cancelled { attempt: None, evidence: evidence.clone() };
+                job.state = JobState::Cancelled {
+                    attempt: None,
+                    evidence: evidence.clone(),
+                };
                 session.pending.retain(|pending| pending != task_ref);
-                publish_agent_result_from(&tx, identity, network, &job, &JobOutcome::Cancelled(evidence), at)?;
+                publish_agent_result_from(
+                    &tx,
+                    identity,
+                    network,
+                    &job,
+                    &JobOutcome::Cancelled(evidence),
+                    at,
+                )?;
             }
             JobState::Claimed { attempt } | JobState::Running { attempt } => {
-                ensure!(session.active.as_deref() == Some(task_ref), "agent task is no longer active");
-                job.state = JobState::Cancelling { attempt: attempt.clone() };
-                session.permission_version = session.permission_version.checked_add(1).context("scheduler permission version overflow")?;
+                ensure!(
+                    session.active.as_deref() == Some(task_ref),
+                    "agent task is no longer active"
+                );
+                job.state = JobState::Cancelling {
+                    attempt: attempt.clone(),
+                };
+                session.permission_version = session
+                    .permission_version
+                    .checked_add(1)
+                    .context("scheduler permission version overflow")?;
             }
             _ => {}
         }
@@ -155,7 +183,10 @@ impl Store {
         Ok(Some(job))
     }
 
-    #[expect(clippy::too_many_arguments, reason = "reconciliation binds the exact fenced attempt and its terminal publication")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reconciliation binds the exact fenced attempt and its terminal publication"
+    )]
     pub(crate) fn reconcile_native_job(
         &mut self,
         identity: &LocalIdentity,
@@ -168,21 +199,51 @@ impl Store {
         events: Vec<(EventBody, Vec<BlobRef>)>,
         at: i64,
     ) -> Result<SchedulerPublication> {
-        ensure!(identity.peer_id()? == target, "native reconciliation belongs to another device");
-        ensure!(!matches!(outcome, JobOutcome::Unknown(_)), "native outcome is still unknown");
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            identity.peer_id()? == target,
+            "native reconciliation belongs to another device"
+        );
+        ensure!(
+            !matches!(outcome, JobOutcome::Unknown(_)),
+            "native outcome is still unknown"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = scheduler_key("job", scope, target, trigger);
-        let mut job: SchedulerJob = scheduler_load(&tx, network, &key)?.context("native job is missing")?;
-        ensure!(job.state.attempt().is_some_and(|attempt| attempt.id == attempt_id), "native reconciliation attempt changed");
-        if matches!(job.state, JobState::Completed { .. } | JobState::Failed { .. } | JobState::Cancelled { .. }) {
-            return Ok(SchedulerPublication { job, event_hashes: Vec::new() });
+        let mut job: SchedulerJob =
+            scheduler_load(&tx, network, &key)?.context("native job is missing")?;
+        ensure!(
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == attempt_id),
+            "native reconciliation attempt changed"
+        );
+        if matches!(
+            job.state,
+            JobState::Completed { .. } | JobState::Failed { .. } | JobState::Cancelled { .. }
+        ) {
+            return Ok(SchedulerPublication {
+                job,
+                event_hashes: Vec::new(),
+            });
         }
         let mut attempt = match &job.state {
-            JobState::Unknown { attempt, fenced: true, .. } => attempt.clone(),
+            JobState::Unknown {
+                attempt,
+                fenced: true,
+                ..
+            } => attempt.clone(),
             _ => bail!("native reconciliation requires a fenced unknown attempt"),
         };
         let mut session = load_scheduler_session(&tx, network, scope, target)?;
-        ensure!(session.active.as_deref().is_none_or(|active| active == trigger), "another scheduler invocation is active");
+        ensure!(
+            session
+                .active
+                .as_deref()
+                .is_none_or(|active| active == trigger),
+            "another scheduler invocation is active"
+        );
         attempt.read_only = true;
         attempt.permission_version = session.permission_version;
         job.state = JobState::Running { attempt };
@@ -191,8 +252,18 @@ impl Store {
         validate_scheduler_terminal(&job, &outcome, &events)?;
         scheduler_save(&tx, network, &key, &job)?;
         save_scheduler_session(&tx, network, &session)?;
-        scheduler_save(&tx, network, &scheduler_key("publication", scope, target, trigger),
-            &SchedulerTerminalPublication { version: SCHEDULING_VERSION, job: job.clone(), outcome, events, created_at_ms: at })?;
+        scheduler_save(
+            &tx,
+            network,
+            &scheduler_key("publication", scope, target, trigger),
+            &SchedulerTerminalPublication {
+                version: SCHEDULING_VERSION,
+                job: job.clone(),
+                outcome,
+                events,
+                created_at_ms: at,
+            },
+        )?;
         let publication = publish_scheduler_terminal_from(&tx, identity, network, &job)?;
         tx.commit()?;
         Ok(publication)

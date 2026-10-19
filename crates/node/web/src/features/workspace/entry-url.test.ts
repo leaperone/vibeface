@@ -665,3 +665,22 @@ test("an outstanding clipboard permission cannot keep new device controls busy o
     assert.equal(render().some(({ props }) => props.children === '邀请已生成，请通过可信渠道发送。'), true)
   } finally { app.close() }
 })
+
+test("Peer ID boundaries require the peer_id field", () => {
+  const id = "ab".repeat(32), other = "cd".repeat(32)
+  const transportSource = readFileSync(new URL("../../../transport.js", import.meta.url), "utf8")
+    .replace(/^import[^\n]+\n/, "").replace(/\bexport /g, "")
+  const transport = new Script(`${transportSource}\n({validEndpoint, validTarget})`).runInNewContext({ TextEncoder, TextDecoder, URL, location: { protocol: "https:" } })
+  const source = readFileSync(new URL("../../lib/node.ts", import.meta.url), "utf8")
+  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
+  const parsers = new Script(`(function(require, exports) { ${compiled}\nreturn exports })`).runInNewContext()(() => transport, {})
+  assert.equal(parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: id }).peer_id, id)
+  assert.equal(parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, peer_id: id }).peer_id, id)
+  assert.equal(parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", peer_id: id }).entry.peer_id, id)
+  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], peer_id: id }] })[0].peer_id, id)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, node_id: id }), /64 位/)
+  assert.throws(() => parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, node_id: id }), /64 位/)
+  assert.throws(() => parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", node_id: id }), /64 位/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: "invalid" }), /64 位/)
+  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /文本字段/)
+})

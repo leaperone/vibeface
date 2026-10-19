@@ -62,7 +62,7 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 4，数据库 `user_version` 为 5。不注册网站账号，也不保存个人根私钥。`serve` 和 `pair` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 5，数据库 `user_version` 为 5。不注册网站账号，也不保存个人根私钥。`serve` 和 `pair` 用目录锁独占该目录。
 
 ```sh
 ./target/release/vibeface access --data-dir "$HOME/.vibeface"

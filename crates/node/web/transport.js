@@ -2,13 +2,13 @@ import init, { Identity, Handshake } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const nodePattern = /^[a-f0-9]{64}$/;
+const peerPattern = /^[a-f0-9]{64}$/;
 const lostKeyMessage = "此浏览器的设备密钥已被清除。请使用另一台管理设备重新配对，或导入恢复包。原任务不会因此重新执行。";
 let identity;
 let initializing;
 
 export function validTarget(value) {
-  if (typeof value !== "string" || !nodePattern.test(value)) throw new Error("填写完整的 64 位设备指纹。请从本机终端或可信邀请中取得，不要使用中继提供的替代指纹。");
+  if (typeof value !== "string" || !peerPattern.test(value)) throw new Error("填写完整的 64 位设备编号。请从本机终端或可信邀请中取得，不要使用中继提供的替代编号。");
   return value;
 }
 
@@ -16,7 +16,7 @@ export function validEndpoint(value) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || !["", "/"].includes(url.pathname)) throw new Error("填写 HTTP 或 HTTPS 入口地址，不包含路径、账号或密钥。");
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (location.protocol === "https:" && url.protocol === "http:" && !local) throw new Error("HTTPS 客户端需要 HTTPS 入口。请为目标或中继启用 HTTPS，再保留相同设备指纹连接。");
+  if (location.protocol === "https:" && url.protocol === "http:" && !local) throw new Error("HTTPS 客户端需要 HTTPS 入口。请为目标或中继启用 HTTPS，再保留相同设备编号连接。");
   return url.origin;
 }
 
@@ -159,7 +159,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   });
   socket.addEventListener("close", () => fail(disconnected()));
   socket.addEventListener("error", () => fail(new Error("无法连接设备。请检查地址、HTTPS 和设备在线状态。")));
-  const handshakeTimer = setTimeout(() => fail(new Error("连接设备超时。请核对设备指纹、地址或中继是否在线。")), 20000);
+  const handshakeTimer = setTimeout(() => fail(new Error("连接设备超时。请核对设备编号、地址或中继是否在线。")), 20000);
   async function control(expected) {
     const frame = await receive();
     if (typeof frame !== "string" || frame.length > 8192) throw new Error("中继握手格式无效。");
@@ -188,9 +188,9 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     if (!(response instanceof ArrayBuffer)) throw new Error("设备未返回加密握手。");
     if (handshake.read(new Uint8Array(response)).length) throw new Error("设备握手包含未预期的数据。");
     socket.send(handshake.write(new Uint8Array()));
-    if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与已保存指纹不符，已拒绝连接。");
+    if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与已保存设备编号不符，已拒绝连接。");
     publicKey = handshake.remotePublicKey();
-    if (typeof publicKey !== "string" || !nodePattern.test(publicKey)) throw new Error("设备未提供有效的认证公钥。");
+    if (typeof publicKey !== "string" || !peerPattern.test(publicKey)) throw new Error("设备未提供有效的认证公钥。");
     channel = handshake.finish();
     clearTimeout(handshakeTimer);
   } catch (error) { clearTimeout(handshakeTimer); fail(error); throw error; }

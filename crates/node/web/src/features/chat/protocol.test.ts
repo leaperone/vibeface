@@ -13,10 +13,10 @@ test('send waits for complete conversation context while the server selects the 
   assert.equal(composerHint(ready), '')
 })
 test('an explicit retry preserves the complete original message request', () => {
-  const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: null, heads: ['head-1'] })
+  const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', schedulerPeerId: 'node-a', entryNode: 'entry-a', pending: null, heads: ['head-1'] })
   assert.equal(first.ok, true)
   if (!first.ok) return
-  const retry = prepareSend({ conversationId: 'chat', text: '继续', schedulerNodeId: 'node-b', entryNode: 'entry-a', pending: first.pending, heads: ['new-head'] })
+  const retry = prepareSend({ conversationId: 'chat', text: '继续', schedulerPeerId: 'node-b', entryNode: 'entry-a', pending: first.pending, heads: ['new-head'] })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.deepEqual(retry.body, first.body)
@@ -24,9 +24,9 @@ test('an explicit retry preserves the complete original message request', () => 
   assert.equal(retry.body.entry_node, 'entry-a')
   assert.equal(retry.body.text, '继续')
   assert.deepEqual(retry.body.basis_heads, ['head-1'])
-  assert.equal(prepareSend({ conversationId: 'chat', text: '另一句', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: first.pending, heads: [] }).ok, false)
-  assert.equal(prepareSend({ conversationId: 'other-chat', text: '继续', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: first.pending, heads: [] }).ok, false)
-  assert.equal(prepareSend({ conversationId: 'chat', text: '继续', schedulerNodeId: 'node-a', entryNode: 'entry-b', pending: first.pending, heads: [] }).ok, false)
+  assert.equal(prepareSend({ conversationId: 'chat', text: '另一句', schedulerPeerId: 'node-a', entryNode: 'entry-a', pending: first.pending, heads: [] }).ok, false)
+  assert.equal(prepareSend({ conversationId: 'other-chat', text: '继续', schedulerPeerId: 'node-a', entryNode: 'entry-a', pending: first.pending, heads: [] }).ok, false)
+  assert.equal(prepareSend({ conversationId: 'chat', text: '继续', schedulerPeerId: 'node-a', entryNode: 'entry-b', pending: first.pending, heads: [] }).ok, false)
 })
 
 test('Enter submits only after IME composition finishes and Shift Enter remains a newline', () => {
@@ -38,16 +38,16 @@ test('Enter submits only after IME composition finishes and Shift Enter remains 
   assert.equal(isSubmitKey({ ...enter, key: 'a' }), false)
 })
 test('invalid message content is rejected before a durable request is created', () => {
-  const input = { conversationId: 'chat', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: null, heads: [] }
+  const input = { conversationId: 'chat', schedulerPeerId: 'node-a', entryNode: 'entry-a', pending: null, heads: [] }
   assert.equal(prepareSend({ ...input, text: '  ' }).ok, false)
   assert.equal(prepareSend({ ...input, text: '中'.repeat(21846) }).ok, false)
   assert.equal(prepareSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
 })
 test('report results default on and survive retries; only the exact durable queue receipt settles a message', () => {
-  const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerNodeId: 'scheduler', entryNode: 'entry', heads: [], pending: null, reportResults: true })
+  const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerPeerId: 'scheduler', entryNode: 'entry', heads: [], pending: null, reportResults: true })
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
-  const retry = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerNodeId: 'other', entryNode: 'entry', heads: ['new'], pending: prepared.pending, reportResults: false })
+  const retry = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerPeerId: 'other', entryNode: 'entry', heads: ['new'], pending: prepared.pending, reportResults: false })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.deepEqual(retry.body, prepared.body)
@@ -58,7 +58,7 @@ test('report results default on and survive retries; only the exact durable queu
 })
 
 test('an automatically routed message settles only after the server confirms its message identity and route', () => {
-  const prepared = prepareSend({ conversationId: 'chat', text: '查询进展', schedulerNodeId: null, entryNode: 'entry', pending: null, heads: [] })
+  const prepared = prepareSend({ conversationId: 'chat', text: '查询进展', schedulerPeerId: null, entryNode: 'entry', pending: null, heads: [] })
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
   assert.equal(prepared.body.scheduler_node, null)

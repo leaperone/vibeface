@@ -2,7 +2,7 @@
 
 use crate::{
     crypto::{LocalIdentity, digest, verify_payload},
-    model::{NetworkId, PeerId, NodeRole, WIRE_VERSION},
+    model::{NetworkId, NodeRole, PeerId, WIRE_VERSION},
     network::{AuthenticationFailure, NetworkHub, NetworkSocket, Service},
     store::Store,
 };
@@ -137,6 +137,7 @@ struct Pending {
 struct Hello {
     version: u32,
     network_id: NetworkId,
+
     peer_id: PeerId,
 }
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -1268,6 +1269,16 @@ mod tests {
     };
     use serde_json::json;
     use tokio::{net::TcpListener, task::JoinHandle};
+
+    #[test]
+    fn peer_id_hello_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"version":1,"network_id":"network","peer_id":"device"}"#;
+        let hello: Hello = serde_json::from_str(wire)?;
+        assert_eq!(hello.peer_id, "device");
+        assert_eq!(serde_json::to_string(&hello)?, wire);
+        assert!(serde_json::from_str::<Hello>(&wire.replace("peer_id", "node_id")).is_err());
+        Ok(())
+    }
 
     fn roles() -> Vec<NodeRole> {
         vec![

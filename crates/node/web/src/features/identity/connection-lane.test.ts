@@ -314,7 +314,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     let work: Promise<void>
     if (flow === 'directory') work = app.render().refreshDirectory()
     else {
-      const challenge = { network_id: network, owner_public_key: publicKey, subject_id: subject, target_node_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+      const challenge = { network_id: network, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
       const challengeHold = deferred(); app.holds.set('recovery_challenge', challengeHold)
       challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
       work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })

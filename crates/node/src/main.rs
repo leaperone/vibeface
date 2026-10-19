@@ -61,7 +61,7 @@ enum Action {
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
-    /// Join a personal network using its invite and pinned fingerprint.
+    /// Join a personal network using its invite and pinned Peer ID.
     Pair(Pair),
     /// Send a native Codex App Server method without retrying writes.
     Codex {
@@ -325,7 +325,7 @@ async fn status(options: Access) -> Result<()> {
         );
     } else {
         println!(
-            "Node: {peer_id}\nStatus: {state}\nListen: {}\nData: {}",
+            "Peer ID: {peer_id}\nStatus: {state}\nListen: {}\nData: {}",
             configuration.listen,
             data.display()
         );
@@ -432,8 +432,8 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
-    println!("Initialized node {}", identity.peer_id()?);
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+    println!("Initialized device with Peer ID {}", identity.peer_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
 }
@@ -507,7 +507,7 @@ async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":4}),
+        epoch == json!({"data_epoch":5}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
@@ -951,6 +951,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_id_pending_pair_uses_only_the_current_field() {
+        let wire = json!({"url":"http://localhost:4790", "peer_id":"device", "relay":false,
+            "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
+        let pending: PendingPair = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(pending.peer_id, "device");
+        assert_eq!(serde_json::to_value(pending).unwrap(), wire);
+        let mut old = wire;
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("peer_id");
+        fields.insert("node_id".into(), json!("device"));
+        assert!(serde_json::from_value::<PendingPair>(old).is_err());
+    }
+
+    #[test]
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
         assert!(default.command.is_none() && default.data_dir.is_none());
@@ -1251,6 +1265,13 @@ mod tests {
                 name: "Build Node".into(),
             };
             assert_eq!(super::invitation(&options).unwrap().relay, relay);
+            let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
+            assert_eq!(parsed.peer_id, device.peer_id().unwrap());
+            let mut old = envelope.clone();
+            let fields = old.as_object_mut().unwrap();
+            let peer_id = fields.remove("peer_id").unwrap();
+            fields.insert("node_id".into(), peer_id);
+            assert!(serde_json::from_value::<Invitation>(old).is_err());
             envelope.as_object_mut().unwrap().remove("relay");
             options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
             assert!(super::invitation(&options).is_err());

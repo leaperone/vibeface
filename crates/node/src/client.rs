@@ -49,7 +49,8 @@ struct RecoveryChallenge {
     network_id: String,
     owner_public_key: String,
     subject_id: String,
-    target_node_id: String,
+
+    target_peer_id: String,
     genesis_hash: String,
     nonce: String,
     expires_at_ms: i64,
@@ -971,7 +972,7 @@ async fn recovery_challenge(
     let owner_public_key = text(params, "owner_public_key")?.to_owned();
     ensure!(
         crypto::fingerprint(&owner_public_key)? == network_id,
-        "recovery root fingerprint mismatch"
+        "recovery network ID mismatch"
     );
     let genesis = if node.has_membership().await? {
         node.membership_state().await?.genesis
@@ -988,7 +989,7 @@ async fn recovery_challenge(
         network_id,
         owner_public_key,
         subject_id: session.subject_id.clone(),
-        target_node_id: node.identity.peer_id()?,
+        target_peer_id: node.identity.peer_id()?,
         genesis_hash: crypto::digest(&identity::canonical_json(&genesis)?),
         nonce: random_hex(),
         expires_at_ms: crate::runtime::now_ms() + 90_000,
@@ -1237,7 +1238,7 @@ mod tests {
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
-        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let manager = LocalIdentity::generate();

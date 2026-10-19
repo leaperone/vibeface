@@ -136,7 +136,7 @@ impl Member {
         validate_id(&self.public_key)?;
         ensure!(
             self.subject_id == fingerprint(&self.public_key)?,
-            "member fingerprint mismatch"
+            "member Peer ID mismatch"
         );
         ensure!(
             !self.name.is_empty()
@@ -230,7 +230,7 @@ impl Genesis {
         );
         ensure!(
             self.network_id == fingerprint(&self.owner_public_key)?,
-            "personal-network root fingerprint mismatch"
+            "network ID mismatch"
         );
         validate_members(&self.initial_members)
     }
@@ -258,7 +258,7 @@ impl HistoricalNode {
         validate_id(&self.public_key)?;
         ensure!(
             self.subject_id == fingerprint(&self.public_key)?,
-            "historical Node fingerprint mismatch"
+            "historical Peer ID mismatch"
         );
         Ok(())
     }
@@ -1017,7 +1017,7 @@ pub fn verify_membership(
         validate_id(owner_public_key)?;
         ensure!(
             fingerprint(owner_public_key)? == expected_network,
-            "personal-network root fingerprint mismatch"
+            "network ID mismatch"
         );
         let state: NetworkState = serde_json::from_str(state_json)?;
         ensure!(
@@ -1136,6 +1136,22 @@ impl VerifiedMembership {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_id_certificate_uses_only_the_current_field() -> Result<()> {
+        let device = Identity::from_secret_hex(&"01".repeat(32)).map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            device.peer_id(),
+            "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+        );
+        assert_eq!(MembershipSigner::peer_id(&device)?, device.peer_id());
+        let wire = serde_json::json!({"peer_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
+        let certificate: NodeCertificate = serde_json::from_value(wire.clone())?;
+        assert_eq!(serde_json::to_value(certificate)?, wire);
+        let old = serde_json::json!({"node_id": device.peer_id(), "public_key": device.public_key_hex(), "roles": ["replica"], "revoked": false});
+        assert!(serde_json::from_value::<NodeCertificate>(old).is_err());
+        Ok(())
+    }
 
     fn identity() -> Identity {
         Identity::generate().expect("test identity randomness")

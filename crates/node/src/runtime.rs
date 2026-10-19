@@ -123,7 +123,7 @@ mod tests {
             .join(subdir)
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":4}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
         cfg.save(&dir)?;
@@ -2340,7 +2340,7 @@ mod tests {
     async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
         let dir = fixture()?;
         let config = std::fs::read(dir.join("config.json"))?;
-        for epoch in [None, Some(1), Some(2), Some(3)] {
+        for epoch in [None, Some(1), Some(2), Some(3), Some(4), Some(6)] {
             if let Some(epoch) = epoch {
                 config::private_write(
                     &dir.join("data-epoch.json"),
@@ -3048,8 +3048,8 @@ impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
-            epoch == json!({"data_epoch":4}),
-            "this Node requires an initialized data epoch 4 directory"
+            epoch == json!({"data_epoch":5}),
+            "this Node requires an initialized data epoch 5 directory"
         );
         let mut config = Config::load(dir)?;
         let process_lock = Arc::new(config::lock_data_dir(dir)?);

@@ -462,9 +462,6 @@ fn policy_from(
     Ok(policy)
 }
 
-
-
-
 pub(super) fn validate_followup_result_from(
     connection: &Connection,
     network: &str,
@@ -478,15 +475,22 @@ pub(super) fn validate_followup_result_from(
         bail!("follow-up requires an agent result");
     };
     ensure!(
-        agent_messages::validate_agent_trigger_from(connection, network, &result.event, message, scheduler)?
-            == TriggerKind::AgentResult,
+        agent_messages::validate_agent_trigger_from(
+            connection,
+            network,
+            &result.event,
+            message,
+            scheduler
+        )? == TriggerKind::AgentResult,
         "follow-up requires a terminal agent result"
     );
     let mut source = message.origin_trigger.as_str();
     let mut visited = BTreeSet::new();
     loop {
         ensure!(visited.insert(source), "cyclic agent origin");
-        let origin = events.get(source).context("agent result origin is missing")?;
+        let origin = events
+            .get(source)
+            .context("agent result origin is missing")?;
         match &origin.event.body {
             EventBody::MessagePosted { role, .. } if role == "user" => break,
             EventBody::AgentMessage { message } => source = &message.origin_trigger,
@@ -495,7 +499,9 @@ pub(super) fn validate_followup_result_from(
     }
     let intent = intent_from(connection, network, scope, &events, source, true)?;
     ensure!(
-        intent.as_ref().is_none_or(|(_, intent)| intent.mode != FollowupMode::Off),
+        intent
+            .as_ref()
+            .is_none_or(|(_, intent)| intent.mode != FollowupMode::Off),
         "result reporting is disabled"
     );
     Ok(ResultFollowupPolicy {
@@ -548,14 +554,23 @@ impl Store {
     }
 
     pub fn agent_result_policy(
-        &self, network: &str, scope: &str, trigger: &str,
+        &self,
+        network: &str,
+        scope: &str,
+        trigger: &str,
     ) -> Result<ResultFollowupPolicy> {
         let events = scope_events(&self.connection, network, scope)?;
         let result = events.get(trigger).context("agent result is missing")?;
         let EventBody::AgentMessage { message } = &result.event.body else {
             bail!("follow-up requires an agent result");
         };
-        validate_followup_result_from(&self.connection, network, scope, trigger, &message.target_node)
+        validate_followup_result_from(
+            &self.connection,
+            network,
+            scope,
+            trigger,
+            &message.target_node,
+        )
     }
 
     pub fn original_message_route(
@@ -592,7 +607,6 @@ impl Store {
         }
         Ok(found)
     }
-
 
     pub fn validate_latest_manager_policy(
         &self,
@@ -848,8 +862,17 @@ mod tests {
         let claimed = store
             .claim_next(network, "chat", node, "test", "sdk")?
             .context("human invocation missing")?;
-        ensure!(claimed.job.trigger == message.hash, "another invocation was claimed");
-        let attempt = claimed.job.state.attempt().context("attempt missing")?.id.clone();
+        ensure!(
+            claimed.job.trigger == message.hash,
+            "another invocation was claimed"
+        );
+        let attempt = claimed
+            .job
+            .state
+            .attempt()
+            .context("attempt missing")?
+            .id
+            .clone();
         store.mark_started(network, "chat", node, &message.hash, &attempt)?;
         Ok(attempt)
     }
@@ -945,30 +968,61 @@ mod tests {
             6,
         )?;
         let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
-        assert_eq!((policy.task_id, policy.mode, policy.version), (None, FollowupMode::Report, 1));
+        assert_eq!(
+            (policy.task_id, policy.mode, policy.version),
+            (None, FollowupMode::Report, 1)
+        );
         assert_eq!(policy.target_node, node);
         let first = store.enqueue_trigger(&network, "chat", &completion.hash, &node)?;
-        assert_eq!(store.enqueue_trigger(&network, "chat", &completion.hash, &node)?, first);
+        assert_eq!(
+            store.enqueue_trigger(&network, "chat", &completion.hash, &node)?,
+            first
+        );
         let followup = store
             .claim_next(&network, "chat", &node, "test", "sdk")?
             .context("result report missing")?;
         assert_eq!(followup.job.trigger, completion.hash);
         assert_eq!(followup.job.kind, TriggerKind::AgentResult);
-        let report = followup.job.state.attempt().context("report attempt missing")?;
+        let report = followup
+            .job
+            .state
+            .attempt()
+            .context("report attempt missing")?;
         assert!(report.read_only);
         assert_eq!(report.followup_version, Some(1));
         assert!(followup.previous_native_id.is_none());
-        assert!(store.claim_next(&network, "chat", &node, "test", "sdk")?.is_none());
+        assert!(
+            store
+                .claim_next(&network, "chat", &node, "test", "sdk")?
+                .is_none()
+        );
         assert!(store.tasks(&network, "chat")?.is_empty());
         store.validate_latest_manager_policy(&network, "chat", &completion.hash, &node, 1, None)?;
-        assert!(store.validate_latest_manager_policy(
-            &network, "chat", &completion.hash, &node, 1, Some("anything")
-        ).is_err());
+        assert!(
+            store
+                .validate_latest_manager_policy(
+                    &network,
+                    "chat",
+                    &completion.hash,
+                    &node,
+                    1,
+                    Some("anything")
+                )
+                .is_err()
+        );
         let report_attempt = report.id.clone();
-        assert!(store.create_task_with_origin(
-            &identity, &network, "chat", task_body("forbidden"),
-            Some((&completion.hash, &report_attempt)), 7
-        ).is_err());
+        assert!(
+            store
+                .create_task_with_origin(
+                    &identity,
+                    &network,
+                    "chat",
+                    task_body("forbidden"),
+                    Some((&completion.hash, &report_attempt)),
+                    7
+                )
+                .is_err()
+        );
         assert!(store.tasks(&network, "chat")?.is_empty());
         Ok(())
     }
@@ -995,17 +1049,62 @@ mod tests {
         ] {
             let completion = result(&mut store, &peer, &network, &node, &task, kind)?;
             let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
-            assert_eq!((policy.mode, policy.version, policy.task_id), (FollowupMode::Report, 1, None));
+            assert_eq!(
+                (policy.mode, policy.version, policy.task_id),
+                (FollowupMode::Report, 1, None)
+            );
             assert_eq!(policy.target_node, node);
             assert_eq!(policy.proof_heads[0], completion.hash);
         }
         for (index, author, target, origin, reply, kind) in [
-            (0, &identity, &node, &message.hash, Some(task.hash.clone()), AgentMessageKind::Completed),
-            (1, &peer, &peer_node, &message.hash, Some(task.hash.clone()), AgentMessageKind::Completed),
-            (2, &peer, &node, &another.hash, Some(task.hash.clone()), AgentMessageKind::Completed),
-            (3, &peer, &node, &message.hash, Some(message.hash.clone()), AgentMessageKind::Completed),
-            (4, &peer, &node, &message.hash, None, AgentMessageKind::Completed),
-            (5, &peer, &node, &message.hash, Some(task.hash.clone()), AgentMessageKind::Progress),
+            (
+                0,
+                &identity,
+                &node,
+                &message.hash,
+                Some(task.hash.clone()),
+                AgentMessageKind::Completed,
+            ),
+            (
+                1,
+                &peer,
+                &peer_node,
+                &message.hash,
+                Some(task.hash.clone()),
+                AgentMessageKind::Completed,
+            ),
+            (
+                2,
+                &peer,
+                &node,
+                &another.hash,
+                Some(task.hash.clone()),
+                AgentMessageKind::Completed,
+            ),
+            (
+                3,
+                &peer,
+                &node,
+                &message.hash,
+                Some(message.hash.clone()),
+                AgentMessageKind::Completed,
+            ),
+            (
+                4,
+                &peer,
+                &node,
+                &message.hash,
+                None,
+                AgentMessageKind::Completed,
+            ),
+            (
+                5,
+                &peer,
+                &node,
+                &message.hash,
+                Some(task.hash.clone()),
+                AgentMessageKind::Progress,
+            ),
         ] {
             let forged = store.append_event(
                 author,
@@ -1025,11 +1124,17 @@ mod tests {
                 6,
             )?;
             assert!(
-                store.validate_followup_result(&network, "chat", &forged.hash, &node).is_err(),
+                store
+                    .validate_followup_result(&network, "chat", &forged.hash, &node)
+                    .is_err(),
                 "forged terminal case {index} was accepted"
             );
         }
-        assert!(store.validate_followup_result(&network, "other-chat", &task.hash, &node).is_err());
+        assert!(
+            store
+                .validate_followup_result(&network, "other-chat", &task.hash, &node)
+                .is_err()
+        );
         assert!(store.tasks(&network, "chat")?.is_empty());
         Ok(())
     }
@@ -1052,7 +1157,12 @@ mod tests {
         )?;
         let task = agent_task(&mut store, &identity, &network, &node, &default)?;
         let completion = result(
-            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+            &mut store,
+            &identity,
+            &network,
+            &node,
+            &task,
+            AgentMessageKind::Completed,
         )?;
         let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Report, 1));
@@ -1065,8 +1175,11 @@ mod tests {
         ] {
             let disabled = result(&mut store, &identity, &network, &node, &task, kind)?;
             assert!(
-                store.agent_result_policy(&network, "chat", &disabled.hash)
-                    .unwrap_err().to_string().contains("result reporting is disabled")
+                store
+                    .agent_result_policy(&network, "chat", &disabled.hash)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("result reporting is disabled")
             );
         }
         Ok(())
@@ -1085,8 +1198,14 @@ mod tests {
             store.original_message_route(&network, "chat", "off")?,
             Some((node, false))
         );
-        assert_eq!(store.original_message_route(&network, "chat", "missing")?, None);
-        assert_eq!(store.original_message_route(&network, "another-chat", "report")?, None);
+        assert_eq!(
+            store.original_message_route(&network, "chat", "missing")?,
+            None
+        );
+        assert_eq!(
+            store.original_message_route(&network, "another-chat", "report")?,
+            None
+        );
         Ok(())
     }
 
@@ -1095,31 +1214,79 @@ mod tests {
         let (mut store, identity, network, node) = fixture()?;
         let message = intent(&mut store, &identity, &network, &node, "request", true)?;
         let before = store.heads(&network, "chat")?;
-        assert!(append_report_intent_from(
-            &store.connection, &identity, &network, "chat", &message, &node, false, 3
-        ).is_err());
+        assert!(
+            append_report_intent_from(
+                &store.connection,
+                &identity,
+                &network,
+                "chat",
+                &message,
+                &node,
+                false,
+                3
+            )
+            .is_err()
+        );
         assert_eq!(store.heads(&network, "chat")?, before);
-        assert!(store.create_task_with_origin(
-            &identity, &network, "chat", task_body("task"),
-            Some((&message.hash, "not-claimed")), 3
-        ).is_err());
+        assert!(
+            store
+                .create_task_with_origin(
+                    &identity,
+                    &network,
+                    "chat",
+                    task_body("task"),
+                    Some((&message.hash, "not-claimed")),
+                    3
+                )
+                .is_err()
+        );
         let attempt = claim(&mut store, &network, &node, &message)?;
         store.create_task_with_origin(
-            &identity, &network, "chat", task_body("task"), Some((&message.hash, &attempt)), 3
+            &identity,
+            &network,
+            "chat",
+            task_body("task"),
+            Some((&message.hash, &attempt)),
+            3,
         )?;
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Report, 1));
         let task = agent_task(&mut store, &identity, &network, &node, &message)?;
         let completion = result(
-            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+            &mut store,
+            &identity,
+            &network,
+            &node,
+            &task,
+            AgentMessageKind::Completed,
         )?;
         store.validate_latest_manager_policy(&network, "chat", &completion.hash, &node, 1, None)?;
-        assert!(store.validate_latest_manager_policy(
-            &network, "chat", &completion.hash, &node, 1, Some("task")
-        ).is_err());
-        assert!(store.set_task_followup(
-            &identity, &network, "chat", "missing", FollowupMode::Continue, 0, Some(&node), 6
-        ).is_err());
+        assert!(
+            store
+                .validate_latest_manager_policy(
+                    &network,
+                    "chat",
+                    &completion.hash,
+                    &node,
+                    1,
+                    Some("task")
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .set_task_followup(
+                    &identity,
+                    &network,
+                    "chat",
+                    "missing",
+                    FollowupMode::Continue,
+                    0,
+                    Some(&node),
+                    6
+                )
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1129,35 +1296,60 @@ mod tests {
         let first = intent(&mut store, &identity, &network, &node, "first", false)?;
         let first_attempt = claim(&mut store, &network, &node, &first)?;
         let creation = store.create_task_with_origin(
-            &identity, &network, "chat", task_body("task"),
-            Some((&first.hash, &first_attempt)), 3
+            &identity,
+            &network,
+            "chat",
+            task_body("task"),
+            Some((&first.hash, &first_attempt)),
+            3,
         )?;
         store.finish_job(
-            &identity, &network, "chat", &node, &first.hash, &first_attempt,
-            JobOutcome::Failed("fixture source has returned".into()), vec![], 3
+            &identity,
+            &network,
+            "chat",
+            &node,
+            &first.hash,
+            &first_attempt,
+            JobOutcome::Failed("fixture source has returned".into()),
+            vec![],
+            3,
         )?;
         let second = intent(&mut store, &identity, &network, &node, "second", true)?;
         let second_attempt = claim(&mut store, &network, &node, &second)?;
         assert_eq!(
-            store.create_task_with_origin(
-                &identity, &network, "chat", task_body("task"),
-                Some((&second.hash, &second_attempt)), 4
-            )?.hash,
+            store
+                .create_task_with_origin(
+                    &identity,
+                    &network,
+                    "chat",
+                    task_body("task"),
+                    Some((&second.hash, &second_attempt)),
+                    4
+                )?
+                .hash,
             creation.hash
         );
-        assert!(store.create_task_with_origin(
-            &identity, &network, "chat",
-            EventBody::TaskCreated {
-                task_id: "task".into(),
-                title: "changed".into(),
-                goal: "goal".into(),
-                acceptance: "result".into(),
-            },
-            Some((&second.hash, &second_attempt)), 4
-        ).is_err());
+        assert!(
+            store
+                .create_task_with_origin(
+                    &identity,
+                    &network,
+                    "chat",
+                    EventBody::TaskCreated {
+                        task_id: "task".into(),
+                        title: "changed".into(),
+                        goal: "goal".into(),
+                        acceptance: "result".into(),
+                    },
+                    Some((&second.hash, &second_attempt)),
+                    4
+                )
+                .is_err()
+        );
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 1));
-        let second_intent = report_intent_head_from(&store.connection, &network, "chat", &second.hash)?;
+        let second_intent =
+            report_intent_head_from(&store.connection, &network, "chat", &second.hash)?;
         store.append_event(
             &identity,
             &network,
@@ -1175,8 +1367,13 @@ mod tests {
             vec![],
             5,
         )?;
-        assert!(store.followup_policy(&network, "chat", "task")
-            .unwrap_err().to_string().contains("task origin is not its scheduler's user invocation"));
+        assert!(
+            store
+                .followup_policy(&network, "chat", "task")
+                .unwrap_err()
+                .to_string()
+                .contains("task origin is not its scheduler's user invocation")
+        );
         Ok(())
     }
 
@@ -1187,41 +1384,102 @@ mod tests {
         let initial = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((initial.mode, initial.version), (FollowupMode::Off, 0));
         store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Report, 0, Some(&node), 3
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Report,
+            0,
+            Some(&node),
+            3,
         )?;
         store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Off, 1, None, 4
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Off,
+            1,
+            None,
+            4,
         )?;
         let revoked = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((revoked.mode, revoked.version), (FollowupMode::Off, 2));
         let before = store.heads(&network, "chat")?;
-        assert!(store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Continue, 1, None, 5
-        ).is_err());
+        assert!(
+            store
+                .set_task_followup(
+                    &identity,
+                    &network,
+                    "chat",
+                    "task",
+                    FollowupMode::Continue,
+                    1,
+                    None,
+                    5
+                )
+                .is_err()
+        );
         assert_eq!(store.heads(&network, "chat")?, before);
         store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Continue, 2, None, 5
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Continue,
+            2,
+            None,
+            5,
         )?;
         let granted = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((granted.mode, granted.version), (FollowupMode::Continue, 3));
         assert_eq!(granted.target_node, node);
-        assert!(store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Report, 3,
-            Some(&LocalIdentity::generate().peer_id()?), 6
-        ).is_err());
+        assert!(
+            store
+                .set_task_followup(
+                    &identity,
+                    &network,
+                    "chat",
+                    "task",
+                    FollowupMode::Report,
+                    3,
+                    Some(&LocalIdentity::generate().peer_id()?),
+                    6
+                )
+                .is_err()
+        );
         let message = intent(&mut store, &identity, &network, &node, "request", true)?;
         let task = agent_task(&mut store, &identity, &network, &node, &message)?;
         let completion = result(
-            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+            &mut store,
+            &identity,
+            &network,
+            &node,
+            &task,
+            AgentMessageKind::Completed,
         )?;
         let policy = store.agent_result_policy(&network, "chat", &completion.hash)?;
-        assert_eq!((policy.mode, policy.version, policy.task_id), (FollowupMode::Report, 1, None));
-        assert!(store.validate_latest_manager_policy(
-            &network, "chat", &completion.hash, &node, 1, Some("task")
-        ).is_err());
-        assert!(store.validate_latest_manager_policy(
-            &network, "chat", &completion.hash, &node, 3, None
-        ).is_err());
+        assert_eq!(
+            (policy.mode, policy.version, policy.task_id),
+            (FollowupMode::Report, 1, None)
+        );
+        assert!(
+            store
+                .validate_latest_manager_policy(
+                    &network,
+                    "chat",
+                    &completion.hash,
+                    &node,
+                    1,
+                    Some("task")
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .validate_latest_manager_policy(&network, "chat", &completion.hash, &node, 3, None)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1232,15 +1490,30 @@ mod tests {
         store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
         let task = agent_task(&mut store, &identity, &network, &node, &message)?;
         let completion = result(
-            &mut store, &identity, &network, &node, &task, AgentMessageKind::Completed
+            &mut store,
+            &identity,
+            &network,
+            &node,
+            &task,
+            AgentMessageKind::Completed,
         )?;
         assert_eq!(
-            store.agent_result_policy(&network, "chat", &completion.hash)?.mode,
+            store
+                .agent_result_policy(&network, "chat", &completion.hash)?
+                .mode,
             FollowupMode::Report
         );
         let wrong_network = LocalIdentity::generate().fixture_network_id()?;
-        assert!(store.followup_policy(&wrong_network, "chat", "task").is_err());
-        assert!(store.agent_result_policy(&wrong_network, "chat", &completion.hash).is_err());
+        assert!(
+            store
+                .followup_policy(&wrong_network, "chat", "task")
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_result_policy(&wrong_network, "chat", &completion.hash)
+                .is_err()
+        );
         let mut corrupt = completion;
         corrupt.signature = "00".repeat(64);
         assert!(store.verify_event(&network, &corrupt).is_err());
@@ -1248,7 +1521,11 @@ mod tests {
             "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
             params![serde_json::to_string(&corrupt)?, network, corrupt.hash],
         )?;
-        assert!(store.agent_result_policy(&network, "chat", &corrupt.hash).is_err());
+        assert!(
+            store
+                .agent_result_policy(&network, "chat", &corrupt.hash)
+                .is_err()
+        );
         assert!(store.followup_policy(&network, "chat", "task").is_err());
         Ok(())
     }
@@ -1258,7 +1535,14 @@ mod tests {
         let (mut store, identity, network, node) = fixture()?;
         store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
         store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Off, 0, Some(&node), 3
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Off,
+            0,
+            Some(&node),
+            3,
         )?;
         let next_gateway = LocalIdentity::generate();
         store.install_trust_bundle(
@@ -1272,9 +1556,20 @@ mod tests {
             )?,
         )?;
         let before = store.heads(&network, "chat")?;
-        assert!(store.set_task_followup(
-            &next_gateway, &network, "chat", "task", FollowupMode::Continue, 1, None, 4
-        ).is_err());
+        assert!(
+            store
+                .set_task_followup(
+                    &next_gateway,
+                    &network,
+                    "chat",
+                    "task",
+                    FollowupMode::Continue,
+                    1,
+                    None,
+                    4
+                )
+                .is_err()
+        );
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 1));
         assert_eq!(store.heads(&network, "chat")?, before);
@@ -1286,7 +1581,14 @@ mod tests {
         let (mut store, identity, network, node) = fixture()?;
         store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
         store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Report, 0, Some(&node), 3
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Report,
+            0,
+            Some(&node),
+            3,
         )?;
         store.install_trust_bundle(
             &network,
@@ -1297,7 +1599,14 @@ mod tests {
         )?;
         assert!(store.followup_policy(&network, "chat", "task").is_err());
         store.set_task_followup(
-            &identity, &network, "chat", "task", FollowupMode::Off, 1, None, 4
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Off,
+            1,
+            None,
+            4,
         )?;
         let policy = store.followup_policy(&network, "chat", "task")?;
         assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 2));
