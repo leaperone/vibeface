@@ -1,30 +1,15 @@
 "use client"
 
 import { useState, type ReactNode } from "react"
-import { ChevronDownIcon } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { Spinner } from "@/components/ui/spinner"
-import { stateLabel, textOf } from "./labels"
+import { stateLabel } from "./labels"
 import { useWorkspace } from "./context"
 
 export function StatusBadge({ value, label }: { value?: string; label?: string }) {
   const text = stateLabel(value, label)
   return <Badge variant={value === "failed" || value === "rejected" ? "destructive" : "secondary"}>{text}</Badge>
-}
-
-export function EmptyState({ title, detail }: { title: string; detail: string }) {
-  return (
-    <Empty>
-      <EmptyHeader>
-        <EmptyTitle>{title}</EmptyTitle>
-        <EmptyDescription>{detail}</EmptyDescription>
-      </EmptyHeader>
-    </Empty>
-  )
 }
 
 export function DetailList({ pairs }: { pairs: Array<[string, string | undefined]> }) {
@@ -37,24 +22,6 @@ export function DetailList({ pairs }: { pairs: Array<[string, string | undefined
         </div>
       ))}
     </dl>
-  )
-}
-
-export function RawDetails({ title, value, defaultOpen = false }: { title: string; value: unknown; defaultOpen?: boolean }) {
-  return (
-    <Collapsible defaultOpen={defaultOpen}>
-      <CollapsibleTrigger asChild>
-        <Button variant="ghost" size="sm" className="group -ms-2 h-auto min-h-8 whitespace-normal text-start">
-          {title}
-          <ChevronDownIcon aria-hidden="true" className="shrink-0 group-data-[state=open]:rotate-180" />
-        </Button>
-      </CollapsibleTrigger>
-      <CollapsibleContent className="pt-3">
-        <ScrollArea>
-          <pre>{textOf(value)}</pre>
-        </ScrollArea>
-      </CollapsibleContent>
-    </Collapsible>
   )
 }
 
