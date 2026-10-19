@@ -12,8 +12,10 @@ export type NodeInfo = {
 export type ConversationSummary = { conversation_id: string; title: string }
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
 export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
-export type AgentTaskState = "pending_delivery" | "queued" | "claimed" | "accepted" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted" | "unknown"
-export type NativeSessionState = "running" | "waiting" | "interrupting" | "completed" | "failed" | "interrupted" | "unknown"
+export const agentTaskStates = ["pending_delivery", "queued", "claimed", "accepted", "running", "cancelling", "completed", "failed", "cancelled", "interrupted", "unknown"] as const
+export type AgentTaskState = typeof agentTaskStates[number]
+export const nativeSessionStates = ["running", "waiting", "interrupting", "completed", "failed", "interrupted", "unknown"] as const
+export type NativeSessionState = typeof nativeSessionStates[number]
 export type AgentTaskRecord = {
   task_ref: string
   source_node: string

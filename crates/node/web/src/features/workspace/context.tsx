@@ -10,7 +10,7 @@ import { isIncomplete, mergeBasis } from "./labels"
 import {
   frontierMap, inputText, parseConversation, parseNodes, parseNotifications,
   parsePendingMessages, parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, hasQueuedMessage,
+  parseArtifactPage, hasQueuedMessage, isSettledManagerState,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
@@ -105,7 +105,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     setLiveProgress((previous) => previous.filter((progress) => {
       if (progress.kind === "native") return next.native_sessions.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.thread_id === progress.thread_id && item.turn_id === (progress.turn_id ?? null))
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
-      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "unknown", "rejected"].includes(job.state)
+      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !isSettledManagerState(job.state)
     }))
     if (current() && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)

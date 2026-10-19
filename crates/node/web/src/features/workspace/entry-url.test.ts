@@ -9,7 +9,7 @@ import type { ReadyConnection } from "../../lib/node.ts"
 import type { NativeSessionRecord } from "./types.ts"
 import { conversationHref } from "./entry-url.ts"
 import { isIncomplete, mergeBasis, nodeName } from "./labels.ts"
-import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parseCreateBot, parseBot } from "./model.ts"
+import { hasQueuedMessage, isSettledManagerState, inputText, parseArtifactPage, parseConversation, parseNodes, parseCreateBot, parseBot } from "./model.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
@@ -48,11 +48,15 @@ test("only the original scheduler durable job settles a pending human message", 
   const pending = { message_id: "human-message", conversation_id: "chat", text: "work", scheduler_node: "scheduler", entry_node: "gateway", basis_heads: [] }
   const job = { trigger: "message:event", kind: "human", state: "queued", sequence: 0, message_id: pending.message_id, reply_message_id: "assistant-message", target_node: pending.scheduler_node }
   for (const state of ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), true)
-  for (const state of ["pending_delivery", "delivered", "rejected"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), false)
+  for (const state of ["pending_delivery", "delivered", "rejected", "accepted", "toString", "__proto__", ""]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), false)
   assert.equal(hasQueuedMessage(null, pending), false)
   assert.equal(hasQueuedMessage({ jobs: [{ ...job, target_node: "other-scheduler" }] }, pending), false)
   assert.equal(hasQueuedMessage({ jobs: [{ ...job, target_node: undefined }] }, pending), false)
   assert.equal(hasQueuedMessage({ jobs: [{ ...job, message_id: "assistant-message" }] }, pending), false)
+})
+test("manager progress settlement preserves unknown results and delivery distinctions", () => {
+  for (const state of ["completed", "failed", "cancelled", "unknown", "rejected"]) assert.equal(isSettledManagerState(state), true)
+  for (const state of ["queued", "claimed", "running", "cancelling", "pending_delivery", "delivered", "accepted", "toString", ""]) assert.equal(isSettledManagerState(state), false)
 })
 test("agent tasks and native sessions keep terminal states and explicit human requests", () => {
   const task = { task_ref: "task", source_node: "source", target_node: "worker", origin_trigger: "message:one", state: "running", text: "检查项目", detail: "已接收" }
@@ -73,6 +77,16 @@ test("agent tasks and native sessions keep terminal states and explicit human re
     const result = parseConversation({ ...context, agent_tasks: [{ ...task, state }], native_sessions: [{ ...session, state }] })
     assert.equal(result.agent_tasks[0].state, state)
     assert.equal(result.native_sessions[0].state, state)
+  }
+  for (const state of ["pending_delivery", "queued", "claimed", "accepted", "running", "cancelling", "completed", "failed", "cancelled", "interrupted", "unknown"]) {
+    assert.equal(parseConversation({ ...context, agent_tasks: [{ ...task, state }] }).agent_tasks[0].state, state)
+  }
+  for (const state of ["running", "waiting", "interrupting", "completed", "failed", "interrupted", "unknown"]) {
+    assert.equal(parseConversation({ ...context, native_sessions: [{ ...session, state }] }).native_sessions[0].state, state)
+  }
+  for (const state of [null, 1, {}, "toString", "__proto__", ""]) {
+    assert.throws(() => parseConversation({ ...context, agent_tasks: [{ ...task, state }] }))
+    assert.throws(() => parseConversation({ ...context, native_sessions: [{ ...session, state }] }))
   }
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], sequence: -1 }] } }))
   assert.throws(() => parseConversation({ ...context, agent_tasks: [{ ...task, state: "waiting" }] }))

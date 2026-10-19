@@ -28,32 +28,52 @@ pub struct ManagerAttempt {
     pub followup_version: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum JobState {
-    Queued,
-    Claimed {
+macro_rules! job_states {
+    ($($variant:ident => $name:literal $({ $($fields:tt)* })?),* $(,)?) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "state")]
+        pub enum JobState {
+            $(#[serde(rename = $name)] $variant $({ $($fields)* })?),*
+        }
+
+        impl JobState {
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $name),*
+                }
+            }
+
+            pub fn is_name(value: &str) -> bool {
+                matches!(value, $($name)|*)
+            }
+        }
+    };
+}
+
+job_states! {
+    Queued => "queued",
+    Claimed => "claimed" {
         attempt: ManagerAttempt,
     },
-    Running {
+    Running => "running" {
         attempt: ManagerAttempt,
     },
-    Cancelling {
+    Cancelling => "cancelling" {
         attempt: ManagerAttempt,
     },
-    Completed {
+    Completed => "completed" {
         attempt: ManagerAttempt,
     },
-    Failed {
+    Failed => "failed" {
         attempt: ManagerAttempt,
         detail: String,
     },
-    Cancelled {
+    Cancelled => "cancelled" {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt: Option<ManagerAttempt>,
         evidence: String,
     },
-    Unknown {
+    Unknown => "unknown" {
         attempt: ManagerAttempt,
         detail: String,
         fenced: bool,
@@ -61,18 +81,6 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Claimed { .. } => "claimed",
-            Self::Running { .. } => "running",
-            Self::Cancelling { .. } => "cancelling",
-            Self::Completed { .. } => "completed",
-            Self::Failed { .. } => "failed",
-            Self::Cancelled { .. } => "cancelled",
-            Self::Unknown { .. } => "unknown",
-        }
-    }
     pub fn attempt(&self) -> Option<&ManagerAttempt> {
         match self {
             Self::Queued => None,

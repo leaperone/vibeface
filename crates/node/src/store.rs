@@ -575,17 +575,7 @@ impl Store {
             "incompatible scheduling acknowledgement"
         );
         ensure!(
-            matches!(
-                receipt.state.as_str(),
-                "queued"
-                    | "claimed"
-                    | "running"
-                    | "cancelling"
-                    | "completed"
-                    | "failed"
-                    | "cancelled"
-                    | "unknown"
-            ),
+            JobState::is_name(&receipt.state),
             "acknowledgement does not prove durable admission"
         );
         let tx = self
@@ -3664,9 +3654,40 @@ mod tests {
         let mut forged = receipt.clone();
         forged.version = 0;
         assert!(source.acknowledge_outbox(&network, &forged).is_err());
-        forged = receipt.clone();
-        forged.state = "accepted".into();
-        assert!(source.acknowledge_outbox(&network, &forged).is_err());
+        for state in [
+            "accepted",
+            "pending_delivery",
+            "delivered",
+            "rejected",
+            "",
+            "Queued",
+        ] {
+            forged = receipt.clone();
+            forged.state = state.into();
+            assert!(source.acknowledge_outbox(&network, &forged).is_err());
+            assert_eq!(source.scheduler_outbox(&network)?.len(), 1);
+        }
+        for state in [
+            "queued",
+            "claimed",
+            "running",
+            "cancelling",
+            "completed",
+            "failed",
+            "cancelled",
+            "unknown",
+        ] {
+            let parsed: JobState = serde_json::from_value(serde_json::json!({
+                "state": state,
+                "attempt": {"id":"attempt", "boot":"boot", "read_only":false, "permission_version":1},
+                "detail":"detail", "evidence":"evidence", "fenced":false
+            }))?;
+            assert_eq!(parsed.name(), state);
+            assert_eq!(serde_json::to_value(&parsed)?["state"], state);
+            forged = receipt.clone();
+            forged.state = parsed.name().into();
+            source.acknowledge_outbox(&network, &forged)?;
+        }
         source.acknowledge_outbox(&network, &receipt)?;
         source.acknowledge_outbox(&network, &receipt)?;
         assert!(source.scheduler_outbox(&network)?.is_empty());
