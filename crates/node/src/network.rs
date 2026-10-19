@@ -1533,7 +1533,6 @@ impl NetworkHub {
             tokio::pin!(deadline);
             let mut heartbeat = tokio::time::interval(HEARTBEAT);
             let mut last_received = Instant::now();
-            let mut rate = ControlRate::default();
             loop {
                 tokio::select! {
                     _ = &mut deadline => bail!("relay reservation expired"),
@@ -1546,15 +1545,6 @@ impl NetworkHub {
                         let frame = frame.context("reservation closed")??;
                         last_received = Instant::now();
                         match frame {
-                            Message::Text(text) => {
-                                rate.charge(30)?;
-                                ensure!(text.len() <= MAX_CONTROL_BYTES, "network control too large");
-                                let Control::Publish { record } = serde_json::from_str(&text)? else { bail!("invalid reservation control"); };
-                                ensure!(record.peer_id == peer_id, "reservation may publish only its own record");
-                                if self.publish(record).await? == PublishOutcome::Full {
-                                    tracing::debug!(target = %peer_id, "reservation publication directory full");
-                                }
-                            }
                             Message::Ping(_) | Message::Pong(_) => {},
                             _ => bail!("invalid reservation frame"),
                         }
@@ -3251,7 +3241,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a2_new_challenge_cancels_blocked_publish_and_preserves_ready_circuit() -> Result<()> {
+    async fn a2_new_challenge_preserves_ready_circuit_during_blocked_directory_publication()
+    -> Result<()> {
         let mut tasks = JoinSet::new();
         let (relay, _) = NetworkHub::new(
             LocalIdentity::generate(),
@@ -3288,8 +3279,10 @@ mod tests {
         let (started, publish_started) = oneshot::channel();
         relay.test_hooks.lock().unwrap().publish_started = Some(started);
         let held_directory = relay.state.lock().await;
+        let (mut publication, _) = open_control(&url).await?;
+        let publication_task = accepts.recv().await.context("missing publication task")?;
         send_control(
-            &mut old,
+            &mut publication,
             &Control::Publish {
                 record: signed_record(&identity, now_secs()?)?,
             },
@@ -3320,6 +3313,11 @@ mod tests {
         assert_socket_closed(&mut stale).await?;
         assert!(!held_directory.records.contains_key(&target));
         drop(held_directory);
+        assert!(matches!(
+            receive_control(&mut publication).await?,
+            Control::Published
+        ));
+        assert!(publication_task.done.await?.is_ok());
         let caller_identity = LocalIdentity::generate();
         noise_round_trip(
             &caller_identity,
@@ -3362,7 +3360,7 @@ mod tests {
         assert_admission_empty(&relay);
         assert!(relay_lock(&relay.relay).reservations.is_empty());
         eprintln!(
-            "NET1_A2 blocked_publish_cancelled=true old_pending_rejected=true old_ready_noise=true new_generation_noise=true all_active=0"
+            "NET1_A2 independent_publish_completed=true old_pending_rejected=true old_ready_noise=true new_generation_noise=true all_active=0"
         );
         Ok(())
     }
@@ -6244,8 +6242,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_reservation_publish_full_keeps_reservation_but_invalid_record_closes_it()
-    -> Result<()> {
+    async fn reservation_rejects_publish_and_public_full_publish_is_not_acknowledged() -> Result<()>
+    {
         let mut tasks = JoinSet::new();
         let (relay, _) = NetworkHub::new(
             LocalIdentity::generate(),
@@ -6269,28 +6267,6 @@ mod tests {
             },
         )
         .await?;
-        send_frame(
-            &mut socket,
-            Message::Ping(b"after-full-publish".to_vec().into()),
-        )
-        .await?;
-        tokio::time::timeout(CONNECT_TIMEOUT, async {
-            while let Some(frame) = socket.next().await {
-                if let Message::Pong(bytes) = frame?
-                    && bytes == b"after-full-publish"[..]
-                {
-                    return Ok::<_, anyhow::Error>(());
-                }
-            }
-            bail!("full legacy publication closed reservation");
-        })
-        .await??;
-        assert!(
-            relay_lock(&relay.relay)
-                .reservations
-                .contains_key(&record.peer_id)
-        );
-        assert!(relay.lookup_local(&record.peer_id).await?.is_none());
         let (mut public, _) = open_control(&url).await?;
         send_control(
             &mut public,
@@ -6303,15 +6279,12 @@ mod tests {
             receive_control(&mut public).await.is_err(),
             "full public Publish must not ACK success"
         );
-        let mut invalid = record.clone();
-        invalid.signature = "0".repeat(invalid.signature.len());
-        send_control(&mut socket, &Control::Publish { record: invalid }).await?;
         tokio::time::timeout(CONNECT_TIMEOUT, async {
             while let Some(frame) = socket.next().await {
                 match frame {
                     Err(_) | Ok(Message::Close(_)) => break,
                     Ok(Message::Ping(_) | Message::Pong(_)) => {}
-                    _ => bail!("unexpected legacy reservation response"),
+                    _ => bail!("unexpected reservation response"),
                 }
             }
             Ok::<_, anyhow::Error>(())
@@ -6322,9 +6295,7 @@ mod tests {
                 .reservations
                 .contains_key(&record.peer_id)
         );
-        eprintln!(
-            "NET1_D2 public_full_ack=false legacy_full_keeps_reservation=true legacy_invalid_closes=true"
-        );
+        eprintln!("NET1_D2 public_full_ack=false reservation_publish_rejected=true");
         Ok(())
     }
 

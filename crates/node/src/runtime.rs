@@ -3458,25 +3458,6 @@ impl Runtime {
             payload: json!({"type":"changed","conversation_id":scope,"event_hash":event_hash}),
         });
     }
-    pub async fn raise_notification(
-        &self,
-        cluster: &str,
-        scope: &str,
-        kind: &str,
-        text: &str,
-    ) -> Result<()> {
-        self.append(
-            cluster,
-            scope,
-            EventBody::NotificationRaised {
-                notification_id: uuid::Uuid::new_v4().to_string(),
-                kind: kind.into(),
-                text: text.chars().take(8192).collect(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
         let state = self.membership_state().await?;
         ensure!(
@@ -4399,12 +4380,6 @@ impl Runtime {
         );
         ensure!(path.is_dir(), "execution path must be a directory");
         Ok(path)
-    }
-    pub async fn current_facts(&self, cluster: &str, scope: &str) -> Result<Value> {
-        Ok(
-            json!({"agent_tasks":self.agent_task_projections(cluster, scope).await?,
-            "native_sessions":self.native_session_projections(cluster, scope).await?,"freshness":"locally_known"}),
-        )
     }
     async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
         self.membership_state().await?;
