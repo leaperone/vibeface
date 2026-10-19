@@ -240,7 +240,7 @@ vibeface serve --data-dir "$HOME/.vibeface-relay"
 - **停止后台工作**作用于选中的 Agent 任务或已登记的原生 turn，按原任务、设备和会话关联发出取消或中断。请求发出后仍需核对实际终态。
 - **停止后续**在聊天输入框上方把“收到结果后”设为停止后续，作用于整个机器人聊天。撤销权限阻止新的自主派发，不证明当前外部进程已停止。
 
-Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex CLI 退出仍不能证明已分离的工具进程全部退出，当前真实适配器将这种取消保留为 `unknown`。
+Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 在停止时记录 CLI 进程树中的全部子进程及其进程组，逐组终止并确认这些进程都已退出后才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已发起的原生 turn，停止原生 turn 是单独操作。
 
 Agent 通过 Node 的 `codex` 工具发送原生请求，例如 `vibeface tool codex --json '{"method":"turn/start","params":{...}}' --call-ref REF`。可用方法只有 `thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`、`thread/read`、`thread/turns/list` 和 `thread/loaded/list`，每个方法只接受固定字段。`approvalPolicy`、`approvalsReviewer`、`sandbox`、`sandboxPolicy` 和 `config` 由 Node 设置，Agent 传入即被拒绝。`thread/start`、`thread/resume` 和 `turn/start` 必须提供授权 `roots` 内的 `cwd`，Node 固定为 `approvalPolicy=on-request`、`approvalsReviewer=user`，并把沙箱限定为该目录的 workspace-write、关闭网络。Agent 没有回复原生请求的入口，审批只能由本人在网页通过 `native_respond` 回答。写请求不自动重发，结果未知时先读取原线程核对。
 
@@ -258,15 +258,15 @@ Agent 启动原生工作后，使用 `observe_session` 登记准确的 thread �
 
 从另一台入口打开原会话，可只读观察原管理节点和执行节点的临时进度。重连后读取持久状态，缺失的临时文字不会触发重做。缓存状态会标明新鲜度，离线时不能据此确认远端仍在运行。长文本结果可在聊天中展开或下载；尚未同步的附件需等待原副本可达，只有哈希不能补回正文。
 
-## 核对未知结果
+## 待核对
 
-网络断开或进程中断后，工作可能已经执行，但回执未保存。Node 将这种情况保留为 `unknown`，不自动重新调用 SDK 或向其他设备重复派发。
+网络断开或进程中断后，工作可能已经执行，但回执未保存。Node 不自动重新调用 SDK 或向其他设备重复派发，而是把无法确认的工作列入聊天中的同一个待核对列表。
 
 管理 SDK 已返回明确结果时，Node 先将最终结果保存到本机。历史依赖暂未补齐或最终事件暂时写入失败时，只补发最终记录，不重新调用 SDK。
 
-管理轮重启后也可能变为 `unknown`。原轮保留未知，不重跑原触发。Node 隔离旧工具权限并核对在途请求后，新的本人消息可进入独立的只读会话查询状态。恢复写入须由本人核对原操作并附证据确认；管理未知确认不会把执行未知改成成功，旧只读权限也不会自动升级。
+管理轮重启或 SDK 进程退出无法确认时，原轮进入终态 `interrupted`，不重跑原触发，也不冻结会话。管理 SDK 有 shell 和网络权限，未确认退出的进程可能仍在产生副作用，因此登记一条管理进程待核对，关联它的进程组、原生 turn 和 Agent 任务。原生 turn 结果未知时登记原生待核对。
 
-在原机器人的聊天中查看原任务和原生会话的状态。若仍无法判断，检查实际进程、项目产物和外部副作用，再为未知管理轮提供核对证据。确认只解除对应管理写冻结，不把未确认的原生工作改成成功，也不重放原任务。失联不能证明远端进程已停止。
+每条待核对记录有两个动作：「复查原目标」只读查询原设备，管理进程项只确认进程组是否已退出，原生项补查原 turn；「确认已核对」由本人检查实际进程、项目产物和外部副作用后附证据提交。shell 和网络副作用只能由本人确认。模型不能结清待核对，确认也不重放原任务。失联不能证明远端进程已停止。
 
 A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，再核对 B 的实际执行状态。缺失历史、执行器不可达和结果未知分别显示，不能通过创建同名新任务代替恢复。
 
@@ -331,7 +331,7 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 "$HOME/.local/share/vibeface/current/vibeface" update apply --data-dir "$HOME/.vibeface"
 ```
 
-`check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。待投递消息、排队与活动管理轮、活动任务和结果未知的记录都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
+`check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。待投递消息、排队与活动管理轮、活动任务和待核对记录都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
 
 开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`vibeface service status` 同时展示 Node 与更新服务的真实状态。
 
