@@ -1,7 +1,9 @@
 import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
+import { useEffect } from 'react'
 import { Toaster } from '@/components/app/kit'
 import { DeviceProvider } from '@/features/identity/context'
 import { ViewportHeight } from '@/components/viewport-height'
+import { registerShell } from '@/lib/offline'
 import { themeScript } from '@/lib/theme'
 
 import appCss from '../styles.css?url'
@@ -26,6 +28,8 @@ export const Route = createRootRoute({
         rel: 'stylesheet',
         href: appCss,
       },
+      { rel: 'manifest', href: '/manifest.webmanifest' },
+      { rel: 'icon', href: '/icon.svg', type: 'image/svg+xml' },
     ],
   }),
   shellComponent: RootDocument,
@@ -38,6 +42,7 @@ function RootLayout() {
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
+  useEffect(registerShell, [])
   return (
     <html lang="zh-CN">
       <head>

@@ -93,6 +93,7 @@ fn content_type(path: &Path) -> &'static str {
         Some("woff2") => "font/woff2",
         Some("woff") => "font/woff",
         Some("json" | "map") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("txt") => "text/plain; charset=utf-8",
