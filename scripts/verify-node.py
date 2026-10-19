@@ -4245,7 +4245,7 @@ def network_reliability_reservation(run, binary, workspace, fixture, helper, mod
         require(time.monotonic() < held_started + 10, "recovered Noise and canary complete while the other pending requests remain unexpired")
         require(not trace("relay reservation removed", target=owner.peer_id, generation=current_generation), "current reservation was not torn down by rejected Dial")
         core = network_core_evidence(evidence_dir, "a1", ["full_data_capacity_refuses_only_the_incoming_and_recovers_on_the_same_reservation"])
-        generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_cancels_blocked_publish_and_preserves_ready_circuit",
+        generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_preserves_ready_circuit_during_blocked_directory_publication",
             "a2_outer_abort_drops_an_attached_socket_waiting_in_the_receiver", "a2_real_full_source_and_global_handoff_uses_a_full_logical_table_fixture"])
         case.update({"status": "passed", "target_peer_id": owner.peer_id, "old_generation": old_generation, "new_generation": generation,
                      "old_ready": old_ready, "new_installed": installed, "previous_socket_closed": previous_closed,

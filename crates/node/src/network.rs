@@ -3077,7 +3077,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a2_new_challenge_cancels_blocked_publish_and_preserves_ready_circuit() -> Result<()> {
+    async fn a2_new_challenge_preserves_ready_circuit_during_blocked_directory_publication()
+    -> Result<()> {
         let mut tasks = JoinSet::new();
         let (relay, _) = NetworkHub::new(
             LocalIdentity::generate(),
@@ -3114,8 +3115,10 @@ mod tests {
         let (started, publish_started) = oneshot::channel();
         relay.test_hooks.lock().unwrap().publish_started = Some(started);
         let held_directory = relay.state.lock().await;
+        let (mut publication, _) = open_control(&url).await?;
+        let publication_task = accepts.recv().await.context("missing publication task")?;
         send_control(
-            &mut old,
+            &mut publication,
             &Control::Publish {
                 record: signed_record(&identity, now_secs()?)?,
             },
@@ -3146,6 +3149,11 @@ mod tests {
         assert_socket_closed(&mut stale).await?;
         assert!(!held_directory.records.contains_key(&target));
         drop(held_directory);
+        assert!(matches!(
+            receive_control(&mut publication).await?,
+            Control::Published
+        ));
+        assert!(publication_task.done.await?.is_ok());
         let caller_identity = LocalIdentity::generate();
         noise_round_trip(
             &caller_identity,
@@ -3188,7 +3196,7 @@ mod tests {
         assert_admission_empty(&relay);
         assert!(relay_lock(&relay.relay).reservations.is_empty());
         eprintln!(
-            "NET1_A2 blocked_publish_cancelled=true old_pending_rejected=true old_ready_noise=true new_generation_noise=true all_active=0"
+            "NET1_A2 independent_publish_completed=true old_pending_rejected=true old_ready_noise=true new_generation_noise=true all_active=0"
         );
         Ok(())
     }
