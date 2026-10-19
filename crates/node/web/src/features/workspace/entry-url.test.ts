@@ -15,7 +15,7 @@ import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test" }, messages: [], autonomy: { mode: "report", version: 0, scheduler_node: "" }, heads: ["head"],
-  missing: { events: [], blobs: [], conflicts: [] }, agent_tasks: [], native_sessions: [], observation_targets: [],
+  missing: { events: [], blobs: [], conflicts: [] }, agent_tasks: [], native_sessions: [], observation_targets: [], pending_checks: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
   assert.equal(conversationHref("https://node.example/app?capability=secret&basis=%5B%5D#token", "next"), "/app?conversation=next")
@@ -50,7 +50,7 @@ test("capabilities parse the actual provider name and reject malformed node list
 test("only the original scheduler durable job settles a pending human message", () => {
   const pending = { message_id: "human-message", conversation_id: "chat", text: "work", scheduler_node: "scheduler", entry_node: "gateway", basis_heads: [] }
   const job = { trigger: "message:event", kind: "human", state: "queued", sequence: 0, message_id: pending.message_id, reply_message_id: "assistant-message", target_node: pending.scheduler_node }
-  for (const state of ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), true)
+  for (const state of ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "interrupted"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), true)
   for (const state of ["pending_delivery", "delivered", "rejected"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), false)
   assert.equal(hasQueuedMessage(null, pending), false)
   assert.equal(hasQueuedMessage({ jobs: [{ ...job, target_node: "other-scheduler" }] }, pending), false)
@@ -60,7 +60,7 @@ test("only the original scheduler durable job settles a pending human message", 
 test("agent tasks and native sessions keep terminal states and explicit human requests", () => {
   const task = { task_ref: "task", source_node: "source", target_node: "worker", origin_trigger: "message:one", state: "running", text: "检查项目", detail: "已接收" }
   const session = { work_id: "work", task_ref: "task", target_node: "worker", thread_id: "thread", turn_id: "turn", state: "waiting", freshness: "observed", can_control: true, detail: "等待决定", pending_requests: [{ request_id: 1, kind: "approval", text: "write file", choices: [{ label: "拒绝", response: { decision: "decline" } }] }] }
-  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", kind: "message", sequence: 0, message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false }, write_frozen: true }
+  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", kind: "message", sequence: 0, message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false } }
   const message = { message_id: "one", event_hash: "event", role: "assistant", text: "summary", created_at_ms: 1, blobs: [{ hash: "result", size: 20 }] }
   const parsed = parseConversation({ ...context, agent_tasks: [task], native_sessions: [session], observation_targets: ["worker"], scheduler, messages: [message] })
   assert.deepEqual(parsed.native_sessions[0].pending_requests[0].choices?.[0].response, { decision: "decline" })
@@ -72,11 +72,18 @@ test("agent tasks and native sessions keep terminal states and explicit human re
   assert.equal(parsed.scheduler?.jobs[0].read_only, true)
   assert.deepEqual(parsed.messages[0].blobs, [{ hash: "result", size: 20 }])
   assert.equal(parseConversation(context).scheduler, null)
-  for (const state of ["completed", "failed", "interrupted", "unknown"]) {
+  for (const state of ["completed", "failed", "interrupted"]) {
     const result = parseConversation({ ...context, agent_tasks: [{ ...task, state }], native_sessions: [{ ...session, state }] })
     assert.equal(result.agent_tasks[0].state, state)
     assert.equal(result.native_sessions[0].state, state)
   }
+  assert.equal(parseConversation({ ...context, agent_tasks: [{ ...task, state: "pending_check" }] }).agent_tasks[0].state, "pending_check")
+  assert.throws(() => parseConversation({ ...context, agent_tasks: [{ ...task, state: "unknown" }] }))
+  const check = { check_id: "manager:attempt", kind: "manager_process", target_node: "worker", trigger: "message:one", detail: "进程退出未确认", freshness: "observed", process_groups: [42] }
+  assert.deepEqual(parseConversation({ ...context, pending_checks: [check] }).pending_checks, [check])
+  assert.deepEqual(parseConversation({ ...context, pending_checks: [{ ...check, kind: "native_turn", process_groups: undefined }] }).pending_checks[0].process_groups, [])
+  assert.deepEqual(parseConversation(context).pending_checks, [])
+  for (const invalid of [{ kind: "operation" }, { freshness: "live" }]) assert.throws(() => parseConversation({ ...context, pending_checks: [{ ...check, ...invalid }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], sequence: -1 }] } }))
   assert.throws(() => parseConversation({ ...context, agent_tasks: [{ ...task, state: "waiting" }] }))
   assert.throws(() => parseConversation({ ...context, native_sessions: [{ ...session, state: "accepted" }] }))

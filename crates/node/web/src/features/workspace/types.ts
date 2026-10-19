@@ -12,7 +12,7 @@ export type NodeInfo = {
 export type ConversationSummary = { conversation_id: string; title: string }
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
 export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
-export type AgentTaskState = "pending_delivery" | "queued" | "claimed" | "accepted" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted" | "unknown"
+export type AgentTaskState = "pending_delivery" | "queued" | "claimed" | "accepted" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted" | "pending_check"
 export type NativeSessionState = "running" | "waiting" | "interrupting" | "completed" | "failed" | "interrupted" | "unknown"
 export type AgentTaskRecord = {
   task_ref: string
@@ -46,13 +46,23 @@ export type ManagerJob = {
   read_only?: boolean
   error?: string
   delivery_error?: string
+  pending_check?: boolean
 }
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
   provider?: string
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
-  write_frozen?: boolean
+}
+/** One record per started work whose outcome only its original Node can settle; nothing is resent. */
+export type PendingCheck = {
+  check_id: string
+  kind: "manager_process" | "native_turn"
+  target_node: string
+  trigger: string
+  detail: string
+  freshness: "observed" | "cached"
+  process_groups: number[]
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type MissingContext = { events: string[]; blobs: unknown[]; conflicts: string[] }
@@ -68,6 +78,7 @@ export type ConversationPayload = {
   native_sessions: NativeSessionRecord[]
   observation_targets: string[]
   scheduler: SchedulerSnapshot | null
+  pending_checks: PendingCheck[]
 }
 export type WorkspaceView = "chat" | "settings"
 export type { PendingMessage }

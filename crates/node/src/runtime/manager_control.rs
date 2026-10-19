@@ -306,7 +306,10 @@ impl Runtime {
         let scope = super::field(input, "conversation_id")?;
         let check_id = super::field(input, "check_id")?;
         let evidence = super::field(input, "evidence")?;
-        ensure!(evidence.len() <= 4096, "evidence is too long");
+        ensure!(
+            (12..=4096).contains(&evidence.trim().len()),
+            "evidence must be 12 to 4096 bytes"
+        );
         if let Some(work_id) = check_id.strip_prefix("native:") {
             let state = match super::field(input, "outcome")? {
                 "completed" => NativeState::Completed,

@@ -19,6 +19,7 @@ export const stateNames: Record<string, string> = {
   interrupting: "正在核对停止结果",
   interrupted: "已中断",
   unknown: "结果未知",
+  pending_check: "待核对",
   succeeded: "操作完成",
   failed: "失败",
   rejected: "已拒绝",

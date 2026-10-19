@@ -1,7 +1,7 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
   AgentTaskRecord, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
-  HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot,
+  HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
 } from "./types"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -72,15 +72,15 @@ function humanRequest(value: unknown): HumanRequest {
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), target_node: optionalText(job.target_node), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), delivery_error: optionalText(job.delivery_error) } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined, write_frozen: data.write_frozen == null ? undefined : flag(data.write_frozen) }
+  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), target_node: optionalText(job.target_node), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), delivery_error: optionalText(job.delivery_error), pending_check: job.pending_check === true } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
 }
 export function hasQueuedMessage(scheduler: SchedulerSnapshot | null, pending: PendingMessage): boolean {
-  return scheduler?.jobs.some((job) => job.message_id === pending.message_id && typeof job.target_node === "string" && job.target_node.length > 0 && (pending.scheduler_node === null || job.target_node === pending.scheduler_node) && ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown"].includes(job.state)) ?? false
+  return scheduler?.jobs.some((job) => job.message_id === pending.message_id && typeof job.target_node === "string" && job.target_node.length > 0 && (pending.scheduler_node === null || job.target_node === pending.scheduler_node) && ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "interrupted"].includes(job.state)) ?? false
 }
 function agentTaskState(value: unknown): AgentTaskState {
   switch (value) {
     case "pending_delivery": case "queued": case "claimed": case "accepted": case "running": case "cancelling":
-    case "completed": case "failed": case "cancelled": case "interrupted": case "unknown": return value
+    case "completed": case "failed": case "cancelled": case "interrupted": case "pending_check": return value
     default: throw new Error("未知的任务状态。")
   }
 }
@@ -108,6 +108,12 @@ function nativeSession(value: unknown): NativeSessionRecord {
     detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
   }
 }
+function pendingCheck(value: unknown): PendingCheck {
+  const data = record(value), kind = data.kind, freshness = data.freshness
+  if (kind !== "manager_process" && kind !== "native_turn") throw new Error("未知的待核对类型。")
+  if (freshness !== "observed" && freshness !== "cached") throw new Error("未知的待核对读取来源。")
+  return { check_id: text(data.check_id), kind, target_node: text(data.target_node), trigger: text(data.trigger), detail: text(data.detail), freshness, process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number) }
+}
 function autonomyMode(value: unknown): AutonomyMode {
   switch (value) {
     case "off": case "report": case "continue": return value
@@ -132,6 +138,7 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     native_sessions: list(data.native_sessions).map(nativeSession),
     observation_targets: texts(data.observation_targets),
     scheduler: schedulerSnapshot(data.scheduler),
+    pending_checks: list(data.pending_checks).map(pendingCheck),
   }
 }
 export function parsePendingMessages(value: unknown): PendingMessage[] {
