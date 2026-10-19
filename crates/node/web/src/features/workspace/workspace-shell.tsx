@@ -106,9 +106,11 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </Button>
         </header>
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
-        <div className="conversation-view" hidden={!chatRoute}><ConversationScreen /></div>
+        <div className="flex min-h-0 min-w-0 flex-1" hidden={!chatRoute}>
+          <div className="conversation-view"><ConversationScreen /></div>
+          {chatRoute ? children : null}
+        </div>
         {chatRoute ? null : <div className="workspace-screen">{children}</div>}
-        {chatRoute ? children : null}
       </SidebarInset>
       <BotForm open={creatingBot} onOpenChange={setCreatingBot} restoreFocus={() => {
         const target = creatorTrigger.current

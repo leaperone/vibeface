@@ -17,6 +17,8 @@ import type {
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck,
 } from "./types"
 
+export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
+
 function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}) {
   const networkId = connection.principal.network_id
   const clientId = connection.principal.subject_id
@@ -34,6 +36,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [refreshing, setRefreshing] = useState(false)
   const [messageBusy, setMessageBusy] = useState(false)
   const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
+  const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
+  const liveRef = useRef<LiveProgress[]>([])
+  liveRef.current = liveProgress
   const [notificationButton, setNotificationButton] = useState({ label: "开启浏览器提醒", disabled: false })
   const alive = useRef(true)
   const activeId = useRef("")
@@ -83,6 +88,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     setConversationId(id)
     setData(null)
     setLiveProgress([])
+    setInterrupted([])
   }
   const readConversation = async (id: string) => {
     const sequence = ++readSequence.current
@@ -100,6 +106,16 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (current() && readConnection.current === connection && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
       replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
     }
+    // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
+    const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && ["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
+    const kept = readStorage<InterruptedReply[]>(scoped("interrupted"), []).filter((item) => item.conversation_id !== id || next.scheduler?.jobs.some((job) => job.trigger === item.trigger && ended(job)))
+    for (const progress of liveRef.current) {
+      if (progress.kind !== "manager" || !progress.text || progress.conversation_id !== id || kept.some((item) => item.trigger === progress.trigger)) continue
+      const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
+      if (ended(job)) kept.push({ trigger: progress.trigger, conversation_id: id, after: job?.message_id, text: progress.text })
+    }
+    writeStorage(scoped("interrupted"), kept.slice(-50))
+    setInterrupted(kept.filter((item) => item.conversation_id === id))
     setLiveProgress((previous) => previous.filter((progress) => {
       if (progress.kind === "native") return next.native_sessions.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.thread_id === progress.thread_id && item.turn_id === (progress.turn_id ?? null))
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
@@ -321,7 +337,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, bots, selectedBot, pendingBot,
-    refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress,
+    refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     writable: booted && current() && readConnection.current === connection,
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
     syncText: !data ? "发一条消息开始对话。" : incomplete

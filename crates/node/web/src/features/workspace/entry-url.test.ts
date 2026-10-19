@@ -593,11 +593,11 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ peer_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ peer_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { peer_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, './protocol': { canSend, composerHint } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -719,16 +719,16 @@ test("conversation blocks sending until an online node can run the manager Agent
   let sent = 0
   const workspace = (nodes: unknown[]) => ({
     generation: 1, isCurrent: () => true, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { peer_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ peer_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, './protocol': { canSend, composerHint } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
     assert.equal(composer()?.disabled, true)
-    assert.match(String(composer()?.hint), /设置/)
+    assert.match(String(composer()?.hint), /运行助手/)
     assert.equal(sent, 0)
     currentWorkspace = workspace([{ peer_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }])
     assert.equal(composer()?.disabled, false)

@@ -89,3 +89,11 @@ export function addressName(address: string) {
   if (isLoopback(address)) return "这台电脑"
   try { return new URL(address).hostname } catch { return address }
 }
+
+const taskStates: Record<string, string> = {
+  pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
+  cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
+  pending_check: "需要确认", unknown: "需要确认",
+}
+export const taskLabel = (state: string) => taskStates[state] ?? state
+export const taskActive = (state: string) => ["pending_delivery", "queued", "claimed", "accepted", "running", "waiting", "cancelling", "interrupting"].includes(state)

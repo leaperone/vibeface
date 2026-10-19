@@ -1,10 +1,4 @@
 import {
-  Empty,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyTitle,
-} from '@/components/ui/empty'
-import {
   MessageScroller,
   MessageScrollerButton,
   MessageScrollerContent,
@@ -14,33 +8,20 @@ import {
 } from '@/components/ui/message-scroller'
 
 import { messageKey } from '../protocol.ts'
-import type { TranscriptMessage } from '../types.ts'
-import { Message } from './message.tsx'
+import { Message, type ChatMessage } from './message.tsx'
 import { Children, type ReactNode } from 'react'
 
 export function Chat({
   messages,
-  emptyTitle,
-  emptyDetail,
-  emptyMark,
+  empty,
   children,
 }: {
-  messages: TranscriptMessage[]
-  emptyTitle: string
-  emptyDetail: string
-  emptyMark?: ReactNode
+  messages: ChatMessage[]
+  empty: ReactNode
   children?: ReactNode
 }) {
   if (messages.length === 0 && Children.toArray(children).length === 0) {
-    return (
-      <Empty className="min-h-0 overflow-y-auto px-4">
-        <EmptyHeader>
-          {emptyMark}
-          <EmptyTitle>{emptyTitle}</EmptyTitle>
-          <EmptyDescription>{emptyDetail}</EmptyDescription>
-        </EmptyHeader>
-      </Empty>
-    )
+    return <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{empty}</div>
   }
 
   return (

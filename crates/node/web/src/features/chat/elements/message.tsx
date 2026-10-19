@@ -1,34 +1,27 @@
-import { Bubble, BubbleContent } from '@/components/ui/bubble'
-import { Message as MessageRoot, MessageContent, MessageHeader } from '@/components/ui/message'
-
-import { messageKey, roleLabel } from '../protocol.ts'
+import { CirclePause, LoaderCircle } from 'lucide-react'
+import { Markdown, PlainText } from '@/components/app/markdown'
+import { messageKey } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
 import { Artifact } from './artifact'
 
-export function Message({ message }: { message: TranscriptMessage }) {
+export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' }
+
+export function Message({ message }: { message: ChatMessage }) {
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
-  return (
-    <MessageRoot align={user ? 'end' : undefined} data-message-id={messageKey(message)}>
-      <MessageContent className="gap-2">
-        <MessageHeader className="gap-2 px-0 text-xs font-normal">
-          <span>{roleLabel(message.role)}</span>
-          {when ? (
-            <time dateTime={when.toISOString()}>
-              {when.toLocaleString('zh-CN', {
-                month: 'numeric',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
-            </time>
-          ) : null}
-        </MessageHeader>
-        <Bubble align={user ? 'end' : 'start'} variant={user ? 'muted' : 'ghost'}>
-          <BubbleContent>{message.text}</BubbleContent>
-        </Bubble>
-        {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
-      </MessageContent>
-    </MessageRoot>
-  )
+  const time = when ? <time className="sr-only" dateTime={when.toISOString()}>{when.toLocaleString('zh-CN')}</time> : null
+  if (user) return <div className="flex justify-end" data-message-id={messageKey(message)}>
+    <div className="grid max-w-[85%] gap-2">
+      <div className="rounded-2xl bg-muted px-4 py-2.5"><span className="sr-only">你：</span><PlainText text={message.text} />{time}</div>
+      {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
+    </div>
+  </div>
+  return <div className="grid min-w-0 gap-2" data-message-id={messageKey(message)}>
+    <span className="sr-only">助手：</span>
+    <Markdown text={message.text} />
+    {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className="size-4 animate-spin text-muted-foreground" /> : null}
+    {message.state === 'interrupted' ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />已中断</span> : null}
+    {time}
+    {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
+  </div>
 }

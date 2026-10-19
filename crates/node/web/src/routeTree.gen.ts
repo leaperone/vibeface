@@ -17,6 +17,7 @@ import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
+import { Route as AppBBotIdWorkWorkIdRouteImport } from './routes/_app/b.$botId.work.$workId'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -57,6 +58,11 @@ const AppDevicesIndexRoute = AppDevicesIndexRouteImport.update({
   path: '/devices/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppBBotIdWorkWorkIdRoute = AppBBotIdWorkWorkIdRouteImport.update({
+  id: '/work/$workId',
+  path: '/work/$workId',
+  getParentRoute: () => AppBBotIdRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
@@ -64,8 +70,9 @@ export interface FileRoutesByFullPath {
   '/setup': typeof SetupRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
-  '/b/$botId': typeof AppBBotIdRoute
+  '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/': typeof AppDevicesIndexRoute
+  '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesByTo {
   '/join': typeof JoinRoute
@@ -73,8 +80,9 @@ export interface FileRoutesByTo {
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/': typeof AppIndexRoute
-  '/b/$botId': typeof AppBBotIdRoute
+  '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices': typeof AppDevicesIndexRoute
+  '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -84,8 +92,9 @@ export interface FileRoutesById {
   '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/': typeof AppIndexRoute
-  '/_app/b/$botId': typeof AppBBotIdRoute
+  '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/devices/': typeof AppDevicesIndexRoute
+  '/_app/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -97,9 +106,17 @@ export interface FileRouteTypes {
     | '/settings'
     | '/b/$botId'
     | '/devices/'
+    | '/b/$botId/work/$workId'
   fileRoutesByTo: FileRoutesByTo
   to:
-    '/join' | '/setup' | '/inbox' | '/settings' | '/' | '/b/$botId' | '/devices'
+    | '/join'
+    | '/setup'
+    | '/inbox'
+    | '/settings'
+    | '/'
+    | '/b/$botId'
+    | '/devices'
+    | '/b/$botId/work/$workId'
   id:
     | '__root__'
     | '/_app'
@@ -110,6 +127,7 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/b/$botId'
     | '/_app/devices/'
+    | '/_app/b/$botId/work/$workId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -176,14 +194,33 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDevicesIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/b/$botId/work/$workId': {
+      id: '/_app/b/$botId/work/$workId'
+      path: '/work/$workId'
+      fullPath: '/b/$botId/work/$workId'
+      preLoaderRoute: typeof AppBBotIdWorkWorkIdRouteImport
+      parentRoute: typeof AppBBotIdRoute
+    }
   }
 }
+
+interface AppBBotIdRouteChildren {
+  AppBBotIdWorkWorkIdRoute: typeof AppBBotIdWorkWorkIdRoute
+}
+
+const AppBBotIdRouteChildren: AppBBotIdRouteChildren = {
+  AppBBotIdWorkWorkIdRoute: AppBBotIdWorkWorkIdRoute,
+}
+
+const AppBBotIdRouteWithChildren = AppBBotIdRoute._addFileChildren(
+  AppBBotIdRouteChildren,
+)
 
 interface AppRouteChildren {
   AppInboxRoute: typeof AppInboxRoute
   AppSettingsRoute: typeof AppSettingsRoute
   AppIndexRoute: typeof AppIndexRoute
-  AppBBotIdRoute: typeof AppBBotIdRoute
+  AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
   AppDevicesIndexRoute: typeof AppDevicesIndexRoute
 }
 
@@ -191,7 +228,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppInboxRoute: AppInboxRoute,
   AppSettingsRoute: AppSettingsRoute,
   AppIndexRoute: AppIndexRoute,
-  AppBBotIdRoute: AppBBotIdRoute,
+  AppBBotIdRoute: AppBBotIdRouteWithChildren,
   AppDevicesIndexRoute: AppDevicesIndexRoute,
 }
 
