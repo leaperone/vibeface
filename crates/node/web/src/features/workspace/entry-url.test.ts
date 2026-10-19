@@ -7,7 +7,6 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import type { NativeSessionRecord } from "./types.ts"
-import { conversationHref } from "./entry-url.ts"
 import { isIncomplete, mergeBasis, nodeName } from "./labels.ts"
 import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parseCreateBot, parseBot } from "./model.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
@@ -18,7 +17,6 @@ const context = {
   missing: { events: [], blobs: [], conflicts: [] }, agent_tasks: [], native_sessions: [], observation_targets: [], pending_checks: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
-  assert.equal(conversationHref("https://node.example/app?capability=secret&basis=%5B%5D#token", "next"), "/app?conversation=next")
   assert.deepEqual(mergeBasis(["a"], JSON.stringify(["b", "a"])), ["a", "b"])
   assert.deepEqual(mergeBasis(["a"], JSON.stringify(["ok", 1])), ["a"])
 })
@@ -238,11 +236,11 @@ test("workspace preserves bot and message requests while routing native decision
   const reload = async () => {
     for (const effect of effects.values()) effect.cleanup?.()
     effects.clear(); values.length = 0; afterRender.length = 0
-    render(); render()
+    render(); render().setView("chat"); render()
     await new Promise(setImmediate)
   }
   try {
-    render(); render()
+    render(); render().setView("chat"); render()
     await new Promise(setImmediate)
     let state = render()
     assert.equal(state.writable, true)
@@ -557,7 +555,7 @@ test("cached native progress preserves requests and terminal state while control
 
 test("bot projects use online manager capabilities and preserve device names", () => {
   const node = { peer_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, roles: ['scheduler'], capabilities: { manager: 'codex', roots: ['/project'] } }
-  const app = componentHarness('./bot-form.tsx', { './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, peer_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName } })
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, peer_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
     assert.equal(projects.length, 1)
@@ -570,7 +568,7 @@ test("bot drafts survive a new connection while old create completion cannot clo
   const closed: boolean[] = []
   const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, nodes: [], pendingBot: null, writable: true, createBot: () => work.promise } }
   let currentWorkspace = workspace()
-  const app = componentHarness('./bot-form.tsx', { './context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
   const render = () => app.render('BotForm', { open: true, onOpenChange: (open: boolean) => closed.push(open), restoreFocus() {} })
   try {
     render(); let elements = render()

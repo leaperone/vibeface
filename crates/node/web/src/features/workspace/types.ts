@@ -80,7 +80,8 @@ export type ConversationPayload = {
   scheduler: SchedulerSnapshot | null
   pending_checks: PendingCheck[]
 }
-export type WorkspaceView = "chat" | "settings"
+/** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
+export type WorkspaceView = "chat" | "other"
 export type { PendingMessage }
 
 export type BotProject = { target_node: string; cwd: string }

@@ -5,7 +5,6 @@ import type { ReadyConnection } from "@/lib/node"
 import { messageOf } from "@/lib/node"
 import { mergeProgress, type LiveProgress } from "@/lib/progress"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol"
-import { conversationHref } from "./entry-url"
 import { isIncomplete, mergeBasis } from "./labels"
 import {
   frontierMap, inputText, parseConversation, parseNodes, parseNotifications,
@@ -18,13 +17,13 @@ import type {
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck,
 } from "./types"
 
-function useWorkspaceState(connection: ReadyConnection) {
+function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}) {
   const networkId = connection.principal.network_id
   const clientId = connection.principal.subject_id
   const [booted, setBooted] = useState(false)
   const [error, setError] = useState("")
   const [noticeText, setNoticeText] = useState("")
-  const [view, setView] = useState<WorkspaceView>("chat")
+  const [view, setView] = useState<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
@@ -84,7 +83,6 @@ function useWorkspaceState(connection: ReadyConnection) {
     setConversationId(id)
     setData(null)
     setLiveProgress([])
-    window.history.replaceState(null, "", conversationHref(window.location.href, id))
   }
   const readConversation = async (id: string) => {
     const sequence = ++readSequence.current
@@ -138,8 +136,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         const popup = new Notification("Vibeface · 进展", { body: item.text, tag: item.notification_id })
         popup.onclick = () => {
           if (!current()) { popup.close(); return }
-          window.focus(); selectConversation(item.conversation_id); setView("chat")
-          void refreshRef.current().catch(showError)
+          window.focus(); openConversation(item.conversation_id)
           popup.close()
         }
       } catch { /* The persisted inbox remains available when browser notifications fail. */ }
@@ -202,8 +199,10 @@ function useWorkspaceState(connection: ReadyConnection) {
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(""); setNoticeText("")
     try {
-      const params = new URL(window.location.href).searchParams
-      activeId.current = params.get("conversation") ?? ""
+      const url = new URL(window.location.href), params = url.searchParams
+      const routeBot = /^\/b\/([^/]+)/.exec(url.pathname)?.[1]
+      if (routeBot) writeStorage(scoped("selected-bot"), decodeURIComponent(routeBot))
+      activeId.current = ""
       loadPending()
       setConversationId(activeId.current)
       const frontiers = readFrontiers(), heads = frontiers[activeId.current] ?? []
@@ -307,7 +306,6 @@ function useWorkspaceState(connection: ReadyConnection) {
     requireCurrent()
     writeStorage(scoped("selected-bot"), bot.bot_id)
     selectConversation(bot.conversation_id)
-    setView("chat")
     await refreshRef.current()
   }
   const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
@@ -339,7 +337,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("机器人创建结果尚未确认，请保留原配置重试。")
       if (prior?.submission?.state === "rejected") {
         const known = await checkRejectedBot(prior)
-        if (known) { await selectBot(known); return }
+        if (known) { await selectBot(known); return known }
         throw new Error("已确认机器人没有创建，可以修改配置后重新提交。")
       }
       const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.peer_id } }
@@ -354,7 +352,7 @@ function useWorkspaceState(connection: ReadyConnection) {
           writeStorage(scoped("pending-bot"), rejected, true)
           botCreationRef.current = rejected; setPendingBot(rejected)
           const known = await checkRejectedBot(rejected)
-          if (known) { await selectBot(known); return }
+          if (known) { await selectBot(known); return known }
           throw new Error(`${messageOf(caught)} 已确认没有创建，可以修改配置后重新提交。`)
         }
         throw caught
@@ -364,6 +362,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("机器人创建回执与原配置不符，请核对原请求。")
       clearPendingBot()
       await selectBot(bot)
+      return bot
     }),
     sendMessage,
     cancelManager: (trigger: string) => withMutation(`cancel-manager:${trigger}`, async () => {
@@ -480,7 +479,7 @@ export function useWorkspace() {
   if (!value) throw new Error("工作空间屏幕需要放在 WorkspaceProvider 中。")
   return value
 }
-export function WorkspaceProvider({ connection, children }: { connection: ReadyConnection; children: ReactNode }) {
-  const value = useWorkspaceState(connection)
+export function WorkspaceProvider({ connection, openConversation, children }: { connection: ReadyConnection; openConversation: (conversationId: string) => void; children: ReactNode }) {
+  const value = useWorkspaceState(connection, openConversation)
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

@@ -1,4 +1,6 @@
-import { HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'
+import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
+import { Toaster } from '@/components/app/kit'
+import { DeviceProvider } from '@/features/identity/context'
 import { ViewportHeight } from '@/components/viewport-height'
 import { themeScript } from '@/lib/theme'
 
@@ -27,7 +29,13 @@ export const Route = createRootRoute({
     ],
   }),
   shellComponent: RootDocument,
+  component: RootLayout,
 })
+
+/** DeviceProvider reads and clears invitation hashes on mount, so it wraps every route including /join. */
+function RootLayout() {
+  return <DeviceProvider><Outlet /><Toaster /></DeviceProvider>
+}
 
 function RootDocument({ children }: { children: React.ReactNode }) {
   return (

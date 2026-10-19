@@ -79,3 +79,13 @@ export function mergeBasis(current: readonly string[], basisText: string | null)
     return current
   }
 }
+
+export function isLoopback(address: string) {
+  try { return ["localhost", "127.0.0.1", "[::1]"].includes(new URL(address).hostname) } catch { return false }
+}
+
+/** Short display name for an access address. */
+export function addressName(address: string) {
+  if (isLoopback(address)) return "这台电脑"
+  try { return new URL(address).hostname } catch { return address }
+}

@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState, type FormEvent } from "react"
+import { useNavigate } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
@@ -24,6 +25,7 @@ const projectKey = (project: BotProject) => JSON.stringify([project.target_node,
 
 export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const workspace = useWorkspace()
+  const navigate = useNavigate()
   const { directory } = useDevice()
   const pending = workspace.pendingBot
   const rejected = pending?.submission?.state === "rejected"
@@ -68,12 +70,12 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
     }
     submitting.current = true; setBusy(true); setError("")
     try {
-      await workspace.createBot(pending ? {
+      const bot = await workspace.createBot(pending ? {
         name: pending.name, instructions: pending.instructions, project: pending.project,
       } : {
         name, instructions, project: selected?.project,
       })
-      if (workspace.isCurrent()) onOpenChange(false)
+      if (workspace.isCurrent()) { onOpenChange(false); if (bot) void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) }
     } catch (cause) { if (workspace.isCurrent()) setError(messageOf(cause)) }
     finally { if (workspace.isCurrent()) { submitting.current = false; setBusy(false) } }
   }

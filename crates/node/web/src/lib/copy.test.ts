@@ -61,7 +61,7 @@ const pending = new Set([
   "components/status-orb.tsx", "features/chat/conversation-screen.tsx", "features/chat/elements/manager-status.tsx", "features/chat/protocol.ts",
   "features/identity/connection-screen.tsx", "features/identity/context.tsx", "features/identity/device-controls.tsx", "features/identity/recovery-controls.tsx",
   "features/workspace/bot-form.tsx", "features/workspace/context.tsx", "features/workspace/labels.ts", "features/workspace/model.ts",
-  "features/workspace/node-settings.tsx", "features/workspace/storage.ts", "features/workspace/task-activity.tsx", "features/workspace/workspace-shell.tsx",
+  "features/workspace/node-settings.tsx", "features/workspace/storage.ts", "features/workspace/task-activity.tsx",
   "lib/local-access.ts", "lib/node.ts", "lib/secure.ts",
 ])
 
