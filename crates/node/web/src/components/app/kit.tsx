@@ -75,8 +75,8 @@ export function SafetyCode({ code, label = "核对码" }: { code: string; label?
 }
 
 /** Collapsed by default. Jargon from docs/design/web-ux.md section 6 may only appear in here. */
-export function Details({ children, label = "详细信息", className }: { children: ReactNode; label?: string; className?: string }) {
-  return <details className={cn("details text-meta", className)}>
+export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
+  return <details open={open} className={cn("details text-meta", className)}>
     <summary className="inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
       <ChevronRight aria-hidden="true" className="size-4 transition-transform" />{label}
     </summary>

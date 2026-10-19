@@ -17,30 +17,30 @@ export function verifyAuthentication(value: unknown, own: PublicIdentity, expect
   const auth = record(value)
   const principal = parsePrincipal(auth.principal)
   const state = record(auth.state)
-  if (principal.subject_id !== own.peerId || expected && principal.network_id !== expected.networkId) throw new Error('认证返回的个人网络或浏览器身份不一致。')
+  if (principal.subject_id !== own.peerId || expected && principal.network_id !== expected.networkId) throw new Error('设备返回的身份和这个浏览器对不上。')
   if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
   const owner = expected?.kind === 'root' ? expected.ownerPublicKey : text(record(state.genesis).owner_public_key)
   const view = verifiedView(state, expected?.networkId ?? principal.network_id, owner)
-  if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('认证目录与已签名的成员记录不一致。')
+  if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('设备列表没通过校验。')
   if (principal.source === 'local_session') {
     const node = expected?.kind === 'local' ? view.members.find(member => member.subject_id === expected.peerId) : undefined
-    if (expected?.kind !== 'local' || !node || node.kind !== 'node' || node.public_key !== expected.nodePublicKey || view.revoked.includes(node.subject_id) || principal.can_manage) throw new Error('本机会话未绑定当前已验证的 Node。')
+    if (expected?.kind !== 'local' || !node || node.kind !== 'node' || node.public_key !== expected.nodePublicKey || view.revoked.includes(node.subject_id) || principal.can_manage) throw new Error('本机连接和这台电脑对不上。')
     return { auth, principal, view }
   }
   const member = view.members.find(item => item.subject_id === own.peerId)
-  if (!member || view.revoked.includes(own.peerId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
+  if (!member || view.revoked.includes(own.peerId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备权限没通过校验。')
   return { auth, principal, view }
 }
 export function verifyRecoveryResult(value: unknown, expected: { networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint: unknown; manager: Member }) {
   const epoch = integer(record(expected.checkpoint).epoch)
   const { auth, principal, view } = verifyAuthentication(value, { peerId: expected.manager.subject_id, publicKey: expected.manager.public_key }, { kind: 'root', ...expected })
   const manager = view.members.find(member => member.subject_id === expected.manager.subject_id)
-  if (principal.epoch !== epoch || !principal.can_manage || !manager || !same(manager, expected.manager)) throw new Error('恢复响应的管理身份或授权版本不一致，未生成新的恢复包。')
+  if (principal.epoch !== epoch || !principal.can_manage || !manager || !same(manager, expected.manager)) throw new Error('恢复结果没通过校验，没有生成新的恢复文件。')
   return { auth, epoch }
 }
 export function passphrase(password: string, confirmation: string): string {
-  if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复包口令需要至少 12 个字符，且不超过 1024 字节。')
-  if (password !== confirmation) throw new Error('两次口令不一致。')
+  if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 12 个字符。')
+  if (password !== confirmation) throw new Error('两次密码不一样。')
   return password
 }
 export function sealPackage(payload: Record<string, unknown>, password: string): Uint8Array {
@@ -51,20 +51,20 @@ export function sealPackage(payload: Record<string, unknown>, password: string):
   } finally { cleartext.fill(0) }
 }
 export async function openPackage(file: File, password: string) {
-  if (!file.size || file.size > 256 * 1024) throw new Error('选择不超过 256 KiB 的加密恢复包。')
-  const bundle = record(JSON.parse(await file.text()), '恢复包')
-  if (bundle.version !== 1) throw new Error('恢复包版本无效。')
+  if (!file.size || file.size > 256 * 1024) throw new Error('恢复文件不能超过 256 KiB。')
+  const bundle = record(JSON.parse(await file.text()), '恢复文件')
+  if (bundle.version !== 1) throw new Error('恢复文件版本不对。')
   const epoch = integer(bundle.recovery_epoch)
   const networkId = text(bundle.network_id)
   let cleartext: Uint8Array
   try { cleartext = recoveryOpen(encoder.encode(JSON.stringify(record(bundle.envelope))), password) }
-  catch { throw new Error('无法解锁恢复包。请核对口令，并使用未修改的原始文件。') }
+  catch { throw new Error('打不开恢复文件。请检查密码，并使用原始文件。') }
   let payload: Record<string, unknown>
   try { payload = record(JSON.parse(decoder.decode(cleartext)), '恢复内容') } finally { cleartext.fill(0) }
   let root: Identity | undefined
   try {
     root = Identity.fromSecretHex(text(payload.root_secret_key))
-    if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.peerId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复包身份与加密内容不一致。')
+    if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.peerId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复文件内容对不上。')
     const state = { genesis: record(payload.genesis), checkpoint: null, events: [] }
     const verified = verifyState(state, networkId, root.publicKeyHex())
     verified.free()

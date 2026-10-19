@@ -56,14 +56,7 @@ test("copy check flags jargon outside Details only", () => {
   assert.equal(violations(`rpc("node_settings")`).length, 0)
 })
 
-// ponytail: files still on the old copy; each rollout step removes its files. Must end empty.
-const pending = new Set([
-  "components/status-orb.tsx",
-  "features/identity/connection-screen.tsx", "features/identity/context.tsx", "features/identity/device-controls.tsx", "features/identity/recovery-controls.tsx",
-  "features/workspace/labels.ts", "features/workspace/model.ts",
-  "features/workspace/storage.ts",
-  "lib/local-access.ts", "lib/node.ts", "lib/secure.ts",
-])
+const pending = new Set<string>([])
 
 test("user-facing copy avoids jargon outside Details", () => {
   const root = fileURLToPath(new URL("..", import.meta.url))

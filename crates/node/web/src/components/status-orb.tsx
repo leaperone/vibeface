@@ -5,7 +5,7 @@ const labels: Record<OrbPlace, string> = {
   connection: "正在连接",
   wait: "稍等",
   refresh: "正在查找",
-  reconcile: "正在核对",
+  reconcile: "正在确认",
   "idle-chat": "等你发消息",
   "idle-link": "已连接",
   trace: "多步进行中",

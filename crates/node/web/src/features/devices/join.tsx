@@ -1,8 +1,7 @@
-import { useEffect, useState } from "react"
 import { ActionCard, Details, DetailRow, InlineError, SafetyCode, Skeleton, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
-import { checkCode } from "@/lib/check-code"
+import { useCheckCode } from "@/lib/check-code"
 import type { PairReceipt } from "@/lib/node"
 import { deviceIcon } from "./devices"
 import { ignorePair, useIgnoredPairs } from "./ignored"
@@ -22,14 +21,9 @@ export function JoinRequests() {
 export function JoinCard({ pair }: { pair: PairReceipt }) {
   const device = useDevice()
   const action = useAction()
-  const [code, setCode] = useState("")
   const member = pair.review.new_member
   const signed = Boolean(pair.new_subject_signature)
-  useEffect(() => {
-    let current = true
-    void checkCode(pair.review.network_id, pair.review.inviter_subject_id, member.subject_id).then((value) => { if (current) setCode(value) })
-    return () => { current = false }
-  }, [pair.review.network_id, pair.review.inviter_subject_id, member.subject_id])
+  const code = useCheckCode(pair.review.network_id, pair.review.inviter_subject_id, member.subject_id)
   return <ActionCard
     icon={deviceIcon({ kind: member.kind, name: member.name, entry: false })}
     tone="info"

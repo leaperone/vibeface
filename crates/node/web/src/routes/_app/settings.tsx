@@ -1,8 +1,10 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { Bell, LogOut, Palette } from 'lucide-react'
+import { ArchiveRestore, Bell, Globe, LogOut, Palette } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
+import { ConnectionSettings } from '@/features/identity/device-controls'
+import { RecoveryControls } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@/features/workspace/context'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -25,6 +27,14 @@ function SettingsPage() {
         {themes.map(([value, label]) => <Button key={value} type="button" role="radio" aria-checked={theme === value} variant={theme === value ? 'outline' : 'ghost'} onClick={() => { setTheme(value); setThemeState(value) }}>{label}</Button>)}
       </div>
     </section>
+    <section className="grid gap-3">
+      <h2 className="flex items-center gap-2 text-heading font-semibold"><Globe aria-hidden="true" className="size-5" />连接</h2>
+      <ConnectionSettings />
+    </section>
+    {device.ready?.principal.can_manage ? <section className="grid gap-3">
+      <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5" />恢复</h2>
+      <RecoveryControls />
+    </section> : null}
     <section className="border-t pt-6">
       <Button type="button" variant="ghost" className="text-muted-foreground" onClick={() => device.disconnect()}><LogOut aria-hidden="true" />断开这个浏览器</Button>
     </section>

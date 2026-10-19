@@ -655,7 +655,7 @@ test("connection form keeps current errors and busy ownership when an earlier co
     identity: { peerId: 'browser' }, phase: 'disconnected', error: '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
+  const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message }, '@/features/workspace/labels': { addressName: (address: string) => address } })
   const render = () => app.render('ConnectionScreen')
   const connect = () => render().find(({ props }) => props.children === '连接')?.props
   try {
@@ -666,11 +666,11 @@ test("connection form keeps current errors and busy ownership when an earlier co
     work = pendingResult(); connect()?.onClick?.()
     old.reject(new Error('stale connection error')); await settleComponent()
     assert.equal(connect()?.disabled, true)
-    assert.equal(render().some(({ props }) => props.role === 'alert'), false)
+    assert.equal(render().some(({ props }) => props.error), false)
     work.resolve(undefined); await settleComponent()
     assert.equal(connect()?.disabled, false)
     synchronousFailure = true; connect()?.onClick?.(); await settleComponent()
-    assert.equal(render().find(({ props }) => props.role === 'alert')?.props.children, 'current invalid input')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, 'current invalid input')
   } finally { app.close() }
 })
 
@@ -706,7 +706,7 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
     beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
   const app = componentHarness('../identity/recovery-controls.tsx', {
     './context': { useDevice: () => device }, '@/lib/node': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
-    '@/lib/secure': { passphrase: (value: string) => value },
+    '@/lib/secure': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
   }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
   const render = () => app.render('RecoveryControls', { only: mode })
   const submit = () => render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {}, currentTarget: form })
@@ -719,14 +719,14 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
     old.reject(new Error('stale package failure')); await settleComponent()
     assert.equal(password.value, 'replacement test-only-value')
     assert.equal(resets, 1)
-    assert.equal(render().some(({ props }) => props.role === 'alert'), false)
+    assert.equal(render().some(({ props }) => props.error), false)
     work = pendingResult(); submit(); assert.equal(resets, 2)
     work.resolve(undefined); await settleComponent()
     assert.equal(render().find(({ type }) => type === 'fieldset')?.props.disabled, false)
     const bundle = fields.get('bundle'); assert.ok(bundle); bundle.files = []
     submit(); await settleComponent()
     assert.equal(resets, 3)
-    assert.equal(render().find(({ props }) => props.role === 'alert')?.props.children, '请选择加密恢复包。')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '请选择恢复文件。')
   } finally { app.close() }
 })
 
@@ -752,30 +752,31 @@ test("conversation blocks sending until an online node can run the manager Agent
   } finally { app.close() }
 })
 
-test("an outstanding clipboard permission cannot keep new device controls busy or release another action", async () => {
+test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
   const clipboard = pendingResult()
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', peer_id: 'target' } } }
-  const device = { connectionGeneration: () => generation, ready: ready(), identity: null, entries: [], directory: null, pairs: [], refreshDirectory: async () => {}, createInvitation: () => creation.promise }
-  const app = componentHarness('../identity/device-controls.tsx', { './context': { useDevice: () => device } }, { navigator: { clipboard: { writeText: () => clipboard.promise } } })
-  const render = () => app.render('DeviceControls')
-  const generate = () => render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {} })
-  const button = () => render().find(({ props }) => props.children === '生成邀请')?.props
+  const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: () => creation.promise }
+  const app = componentHarness('../devices/add-device.tsx', {
+    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false },
+    '@/lib/node': { messageOf: (cause: Error) => cause.message, record: (value: unknown) => value, text: (value: unknown) => value },
+    '@/lib/enrollment-reference': { invitationLink: () => 'https://node.example/#invite=test' }, cn: { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+  }, { navigator: { clipboard: { writeText: () => clipboard.promise } } })
+  const render = () => app.render('AddDevice')
+  const labelled = (label: string) => render().find(({ props }) => [props.children].flat().includes(label))?.props
   try {
-    render(); render().find(({ props }) => props.name === 'invite-kind' && props.value === 'node')?.props.onChange?.({})
-    generate(); creation.resolve('test-only-invitation'); await settleComponent()
-    const copy = render().find(({ props }) => props.children === '复制连接信息')
-    assert.ok(copy?.props.onClick); copy.props.onClick()
-    assert.equal(button()?.disabled, true)
+    render(); render().find(({ props }) => props.role === 'radio' && props['aria-checked'] === false)?.props.onClick?.()
+    labelled('生成链接')?.onClick?.(); creation.resolve('{}'); await settleComponent()
+    labelled('复制链接')?.onClick?.()
+    assert.equal(labelled('下载文件')?.disabled, true)
     generation++; device.ready = ready(); render(); render()
-    assert.equal(button()?.disabled, false)
-    creation = pendingResult(); generate()
+    assert.equal(labelled('生成链接')?.disabled, false)
+    creation = pendingResult(); labelled('生成链接')?.onClick?.()
     clipboard.resolve(undefined); await settleComponent()
-    assert.equal(button()?.disabled, true)
-    assert.equal(render().some(({ props }) => props.children === '连接信息已复制。'), false)
-    creation.resolve('new-test-only-invitation'); await settleComponent()
-    assert.equal(button()?.disabled, false)
-    assert.equal(render().some(({ props }) => props.children === '邀请已生成，请通过可信渠道发送。'), true)
+    assert.equal(labelled('生成链接')?.disabled, true)
+    assert.equal(render().some(({ props }) => props.children === '已复制'), false)
+    creation.resolve('{}'); await settleComponent()
+    assert.equal(labelled('复制链接')?.disabled, false)
   } finally { app.close() }
 })
 
@@ -800,5 +801,5 @@ test("Peer ID boundaries require the peer_id field", () => {
   assert.throws(() => parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, node_id: id }), /64 位/)
   assert.throws(() => parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", node_id: id }), /64 位/)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", peer_id: "invalid" }), /64 位/)
-  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /文本字段/)
+  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /缺少文字/)
 })

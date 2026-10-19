@@ -1,11 +1,12 @@
 "use client"
 
 import { useEffect, useRef, useState, type ReactNode } from "react"
-import { Link, useRouterState } from "@tanstack/react-router"
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
 import { Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
 import { Skeleton, toast } from "@/components/app/kit"
+import { useIgnoredPairs } from "@/features/devices/ignored"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Button } from "@/components/ui/button"
@@ -35,9 +36,20 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
   const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? "我的设备" : "")
-  const devicesAttention = (device.ready?.principal.can_manage === true && device.pairs.length > 0) || workspace.nodes.some((node) => !node.revoked && !node.online)
+  const ignored = useIgnoredPairs()
+  const navigate = useNavigate()
+  const joins = device.ready?.principal.can_manage === true ? device.pairs.filter((pair) => !ignored.includes(pair.request_id)) : []
+  const announced = useRef(new Set<string>())
+  const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
 
   useEffect(() => { setOpenMobile(false) }, [pathname, setOpenMobile])
+  useEffect(() => {
+    for (const pair of joins) {
+      if (announced.current.has(pair.request_id)) continue
+      announced.current.add(pair.request_id)
+      toast(`${pair.review.new_member.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } })
+    }
+  }, [joins.map((pair) => pair.request_id).join()])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
   useEffect(() => { if (workspace.error) toast(workspace.error, { tone: "danger" }) }, [workspace.error])
 

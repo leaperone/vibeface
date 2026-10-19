@@ -2,10 +2,10 @@ import type { MembershipView } from "@/lib/node"
 import type { HumanRequest, NodeInfo } from "./types"
 
 export const roleNames: Record<string, string> = {
-  gateway: "接入",
-  relay: "中继",
-  replica: "同步",
-  scheduler: "调度",
+  gateway: "对外访问",
+  relay: "转发",
+  replica: "保存副本",
+  scheduler: "安排任务",
 }
 
 export const stateNames: Record<string, string> = {
@@ -14,12 +14,12 @@ export const stateNames: Record<string, string> = {
   queued: "等待处理",
   claimed: "正在准备",
   running: "执行中",
-  waiting: "等待本人决定",
-  cancelling: "正在核对取消结果",
-  interrupting: "正在核对停止结果",
+  waiting: "等你决定",
+  cancelling: "正在确认是否已取消",
+  interrupting: "正在确认是否已停止",
   interrupted: "已中断",
   unknown: "结果未知",
-  pending_check: "待核对",
+  pending_check: "需要确认",
   succeeded: "操作完成",
   failed: "失败",
   rejected: "已拒绝",
