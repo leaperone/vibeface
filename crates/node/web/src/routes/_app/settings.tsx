@@ -16,6 +16,7 @@ function SettingsPage() {
   const workspace = useWorkspace()
   const device = useDevice()
   const [theme, setThemeState] = useState(readTheme)
+  const [leaving, setLeaving] = useState(false)
   return <div className="mx-auto grid max-w-2xl gap-6">
     <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><Bell aria-hidden="true" className="size-5" />提醒</h2>
@@ -35,8 +36,14 @@ function SettingsPage() {
       <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5" />恢复</h2>
       <RecoveryControls />
     </section> : null}
-    <section className="border-t pt-6">
-      <Button type="button" variant="ghost" className="text-muted-foreground" onClick={() => device.disconnect()}><LogOut aria-hidden="true" />断开这个浏览器</Button>
+    <section className="grid gap-3 border-t pt-6">
+      {leaving ? <>
+        <p>断开后，要重新打开本机页面或用加入链接才能回来。</p>
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
+          <Button type="button" variant="destructive" onClick={() => device.disconnect()}><LogOut aria-hidden="true" />断开</Button>
+        </div>
+      </> : <Button type="button" variant="ghost" className="w-fit text-muted-foreground" onClick={() => setLeaving(true)}><LogOut aria-hidden="true" />断开这个浏览器</Button>}
     </section>
   </div>
 }

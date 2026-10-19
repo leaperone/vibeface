@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "@/features/workspace/context"
 import { isLoopback, roleNames } from "@/features/workspace/labels"
+import { docs } from "./assistant-settings"
 import type { NodeInfo } from "@/features/workspace/types"
 import type { Member } from "@/lib/node"
 import { AssistantSettings } from "./assistant-settings"
@@ -52,7 +53,13 @@ function Online({ online }: { online: boolean }) {
 
 function useEntryLabel() {
   const { ready } = useDevice()
-  return ready && isLoopback(ready.entry.address) ? "这台电脑" : "正在连接"
+  const { connectionOnline } = useWorkspace()
+  if (ready && isLoopback(ready.entry.address)) return "这台电脑"
+  return connectionOnline ? "当前连接" : "重连中"
+}
+
+function Hint({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
+  return <span title={label} className="flex shrink-0"><Icon aria-hidden="true" className="size-4 text-muted-foreground" /><span className="sr-only">{label}</span></span>
 }
 
 export function DevicesPage({ actions }: { actions?: ReactNode }) {
@@ -71,8 +78,8 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="flex min-h-14 items-center gap-3 px-4 py-2 hover:bg-muted/50">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
           <span className="flex min-w-0 flex-1 items-center gap-2"><span className="truncate font-medium">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
-          {row.assistant ? <Bot role="img" aria-label="能运行助手" className="size-4 shrink-0 text-muted-foreground"><title>能运行助手</title></Bot> : null}
-          {row.admin ? <Crown role="img" aria-label="管理员" className="size-4 shrink-0 text-muted-foreground"><title>管理员</title></Crown> : null}
+          {row.assistant ? <Hint icon={Bot} label="能运行助手" /> : null}
+          {row.admin ? <Hint icon={Crown} label="管理员" /> : null}
           {row.online !== undefined ? <Online online={row.online} /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
@@ -106,30 +113,29 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     <header className="flex items-center gap-4">
       <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-muted"><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">
-        <h2 className="truncate text-title font-semibold">{row.name}</h2>
+        <h2 className="truncate text-title font-semibold" title={row.name}>{row.name}</h2>
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
           {row.admin ? <StatusPill icon={Crown}>管理员</StatusPill> : null}
         </div>
+        {row.online === false ? <p className="text-meta text-muted-foreground">确认它开着，并且和这台设备网络互通</p> : null}
       </div>
     </header>
 
     {row.kind === "node" ? <Section icon={Bot} title="助手">
       {row.entry && (canManage || localSession) ? <AssistantSettings /> : <div className="grid gap-1">
         <p>{row.assistant ? "能运行助手" : "还没配置助手"}</p>
-        <p className="text-meta text-muted-foreground">连到这台设备后才能修改</p>
+        <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
       </div>}
     </Section> : null}
 
     {row.entry ? <Section icon={Globe} title="访问地址">
       <p className="break-all font-mono text-meta">{address}</p>
-      {isLoopback(address) ? <div className="grid gap-1">
-        <p className="flex items-center gap-1.5 text-meta text-warning"><TriangleAlert aria-hidden="true" className="size-4" />手机和其他电脑连不上</p>
-        <Details label="怎么设置">
-          <span>把数据目录里 config.json 的 public_url 改成其他设备能打开的地址，比如局域网 IP 或 HTTPS 域名，然后重启 vibeface。</span>
-        </Details>
-      </div> : null}
+      {isLoopback(address) ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
+        <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />手机和其他电脑连不上</span>
+        <a className="font-medium underline underline-offset-4" href={`${docs}node.md#%E5%BC%80%E6%94%BE%E5%B1%80%E5%9F%9F%E7%BD%91%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
+      </p> : null}
       {canManage || localSession ? <label className="flex min-h-11 items-center justify-between gap-3 border-t pt-3">
         <span className="grid"><span>本机免确认打开</span><span className="text-meta text-muted-foreground">在这台电脑上打开时直接进入</span></span>
         <input type="checkbox" role="switch" className="switch" checked={device.localAutoAccess === true}

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef, useState, type ReactNode } from "react"
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
 import { Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { Popover } from "radix-ui"
@@ -21,8 +21,18 @@ import { addressName } from "./labels"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
+  useEffect(() => {
+    const wide = window.matchMedia("(min-width: 1024px)")
+    const follow = () => { if (wide.matches) setSidebarOpen(true) }
+    wide.addEventListener("change", follow)
+    return () => wide.removeEventListener("change", follow)
+  }, [])
   return <SidebarProvider className="workspace-shell" open={sidebarOpen} onOpenChange={setSidebarOpen}><WorkspaceLayout>{children}</WorkspaceLayout></SidebarProvider>
 }
+
+const CreateBot = createContext<() => void>(() => {})
+/** Opens the new-assistant form from anywhere inside the workspace. */
+export const useCreateBot = () => useContext(CreateBot)
 
 const titles: Record<string, string> = { "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置" }
 
@@ -66,8 +76,10 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     setCreatingBot(true); setOpenMobile(false)
   }
 
+  const waitingHere = Boolean(workspace.data?.native_sessions.some((session) => session.pending_requests.length))
+
   return (
-    <>
+    <CreateBot.Provider value={openCreator}>
       <a className="skip-link" href="#main">跳到主要内容</a>
       <Sidebar aria-label="导航">
         <SidebarHeader className="shrink-0 px-4 pt-4 pb-2">
@@ -88,7 +100,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
               <SidebarMenu>
                 {workspace.bots.map((bot) => {
                   const active = chatRoute && bot.bot_id === workspace.selectedBot?.bot_id
-                  const marked = workspace.notifications.some((item) => item.conversation_id === bot.conversation_id)
+                  const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id) || bot.bot_id === workspace.selectedBot?.bot_id && waitingHere)
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
@@ -126,7 +138,8 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </Button>
         </header>
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
-        <div className="flex min-h-0 min-w-0 flex-1" hidden={!chatRoute}>
+        {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
+        <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
           <div className="conversation-view"><ConversationScreen /></div>
           {chatRoute ? children : null}
         </div>
@@ -137,7 +150,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         if (target?.isConnected && target.getClientRects().length) target.focus()
         else document.getElementById("main")?.focus()
       }} />
-    </>
+    </CreateBot.Provider>
   )
 }
 
