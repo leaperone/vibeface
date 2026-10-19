@@ -1,7 +1,7 @@
 import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
 
-export type ConnectionEntry = { address: string; peer_id: string; relay: boolean; local?: boolean }
+export type ConnectionEntry = { address: string; peer_id: string; local?: boolean }
 export type PublicIdentity = { peerId: string; publicKey: string }
 export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
@@ -42,14 +42,14 @@ export function roles(value: unknown): NodeRole[] {
 }
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '连接入口')
-  const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id), relay: boolean(v.relay) }
+  const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id) }
   if (v.local === true) {
-    if (entry.relay || entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
+    if (v.relay === true || entry.address !== location.origin) throw new Error('本机会话只能连接当前本机入口。')
     return { ...entry, local: true }
   }
   return entry
 }
-export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.relay}:${entry.local === true}`
+export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.local === true}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
   return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized), ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }) }
@@ -89,7 +89,7 @@ export function parsePairReceipt(value: unknown): PairReceipt {
 }
 export function parseInvitation(value: unknown): Invitation {
   const v = record(value, '邀请')
-  const entry = parseEntry({ address: v.url, peer_id: v.peer_id, relay: v.relay ?? false })
+  const entry = parseEntry({ address: v.url, peer_id: v.peer_id })
   if (typeof v.capability === 'string' && !v.invite && !v.payload) return { kind: 'bootstrap', entry, capability: text(v.capability) }
   const envelope = record(v.invite, '配对邀请')
   const invite = record(envelope.invite, '配对授权')

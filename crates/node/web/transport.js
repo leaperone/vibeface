@@ -1,4 +1,4 @@
-import init, { Identity, Handshake } from "/generated/vibeface_secure.js";
+import init, { Identity, Handshake, verify } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -114,73 +114,199 @@ export function signClient(domain, payload) {
   return identity.sign(domain, encoder.encode(payload));
 }
 
+function networkUrl(value) {
+  const url = new URL(value);
+  if (value.length > 2048 || !["ws:", "wss:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) throw new Error("设备提供的连接地址无效或不安全。");
+  return url.href;
+}
+
+function openSocket(url, signal, onClose) {
+  const socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
+  const incoming = [], waiting = [];
+  let failure;
+  const timer = setTimeout(() => close(new Error("此路径连接超时。")), 10000);
+  function close(error = new Error("此路径无法接通指定设备。")) {
+    if (failure) return;
+    failure = error;
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    for (const item of waiting.splice(0)) item.reject(error);
+    socket.close();
+    onClose?.(error);
+  }
+  function abort() { close(new Error("设备连接已取消。")); }
+  signal?.addEventListener("abort", abort, { once: true });
+  socket.addEventListener("message", (event) => {
+    if ((typeof event.data === "string" && encoder.encode(event.data).byteLength > 16384) || (event.data instanceof ArrayBuffer && event.data.byteLength > 65535)) { close(new Error("设备消息超过通道大小限制。")); return; }
+    const item = waiting.shift();
+    if (item) item.resolve(event.data);
+    else if (incoming.length < 512) incoming.push(event.data);
+    else close(new Error("入口发送的数据过多，已关闭连接。"));
+  });
+  socket.addEventListener("close", () => close());
+  socket.addEventListener("error", () => close(new Error("无法连接此路径，请检查地址和设备在线状态。")));
+  if (signal?.aborted) abort();
+  function receive() {
+    if (incoming.length) return Promise.resolve(incoming.shift());
+    if (failure) return Promise.reject(failure);
+    return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+  }
+  async function control(expected) {
+    const frame = await receive();
+    if (typeof frame !== "string") throw new Error("入口连接响应格式无效。");
+    const message = JSON.parse(frame);
+    if (!message || typeof message !== "object" || Array.isArray(message) || message.type !== expected) throw new Error("入口未能建立指定设备的通道。");
+    return message;
+  }
+  return {
+    socket, receive, control, close, ready() { clearTimeout(timer); },
+    opened() {
+      if (failure) return Promise.reject(failure);
+      if (socket.readyState === WebSocket.OPEN) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        socket.addEventListener("open", resolve, { once: true });
+        socket.addEventListener("close", () => reject(failure || new Error("本机连接已断开。")), { once: true });
+        socket.addEventListener("error", () => reject(failure || new Error("无法连接本机入口。")), { once: true });
+      });
+    },
+  };
+}
+
+async function lookupPaths(url, target, signal) {
+  const wire = openSocket(url, signal);
+  try {
+    await wire.control("welcome");
+    wire.socket.send(JSON.stringify({ type: "lookup", target }));
+    const { record } = await wire.control("record");
+    if (record === null) return [];
+    const fields = ["peer_id", "public_key", "direct_urls", "relay_urls", "issued_at", "expires_at", "signature"];
+    const now = Math.floor(Date.now() / 1000);
+    if (!record || typeof record !== "object" || Array.isArray(record) || Object.keys(record).length !== fields.length || fields.some(key => !Object.hasOwn(record, key)) || record.peer_id !== target || !peerPattern.test(record.public_key) || !/^[a-f0-9]{128}$/.test(record.signature) || !Number.isSafeInteger(record.issued_at) || !Number.isSafeInteger(record.expires_at) || record.issued_at > now + 30 || record.expires_at <= now || record.expires_at <= record.issued_at || record.expires_at > record.issued_at + 180) throw new Error("入口提供的设备地址记录无效或已过期。");
+    for (const urls of [record.direct_urls, record.relay_urls]) {
+      if (!Array.isArray(urls) || urls.length > 8 || urls.some(value => typeof value !== "string")) throw new Error("设备地址记录超出限制。");
+      for (const value of urls) networkUrl(value);
+    }
+    const publicBytes = Uint8Array.from(record.public_key.match(/../g), value => parseInt(value, 16));
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", publicBytes));
+    if ([...digest].map(value => value.toString(16).padStart(2, "0")).join("") !== target) throw new Error("设备地址记录与目标 Peer ID 不符。");
+    const unsigned = Object.fromEntries(fields.map(key => [key, key === "signature" ? "" : record[key]]));
+    verify(record.public_key, "reachability", encoder.encode(JSON.stringify(unsigned)), record.signature);
+    return [
+      ...record.direct_urls.map(value => ({ url: networkUrl(value), relay: false, expires: record.expires_at })),
+      ...record.relay_urls.map(value => ({ url: networkUrl(value), relay: true, expires: record.expires_at })),
+    ].filter(candidate => {
+      const url = new URL(candidate.url);
+      return location.protocol !== "https:" || url.protocol === "wss:" || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    });
+  } finally { wire.close(); }
+}
+
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
   if (!identity) await initClient();
   const target = validTarget(entry.peer_id);
   const endpoint = validEndpoint(entry.address);
-  if (entry.local === true && (entry.relay || endpoint !== location.origin)) throw new Error("本机会话只能连接当前本机入口。");
-  const url = new URL(entry.local === true ? "/api/local/ws" : "/api/network/ws", endpoint);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(url);
-  socket.binaryType = "arraybuffer";
-  const incoming = [];
-  const waiting = [];
-  const pending = new Map();
-  let channel;
-  let publicKey;
-  let closed = false;
-  let nextId = 0;
-  const disconnected = () => new Error("加密连接已断开，操作结果尚未确认。重新连接后先核对原操作，不要重复派发。");
-  function fail(error) {
-    if (closed) return;
-    closed = true;
-    for (const item of waiting.splice(0)) item.reject(error);
-    for (const item of pending.values()) { clearTimeout(item.timer); item.reject(error); }
-    pending.clear();
-    signal?.removeEventListener("abort", abort);
-    socket.close();
-    onClose?.(error);
+  if (entry.local === true) {
+    if (entry.relay === true || endpoint !== location.origin) throw new Error("本机会话只能连接当前本机入口。");
+    const local = new URL("/api/local/ws", endpoint);
+    local.protocol = local.protocol === "https:" ? "wss:" : "ws:";
+    return connectPath(local.href, target, null, { onEvent, onClose, signal });
   }
-  function abort() { fail(new Error("设备连接已取消。")); }
-  signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted) abort();
-  function receive() {
-    if (incoming.length) return Promise.resolve(incoming.shift());
-    if (closed) return Promise.reject(disconnected());
-    return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
-  }
-  socket.addEventListener("message", (event) => {
-    if ((typeof event.data === "string" && event.data.length > 8192) || (event.data instanceof ArrayBuffer && event.data.byteLength > 65535)) { fail(new Error("设备消息超过通道大小限制。")); return; }
-    const item = waiting.shift();
-    if (item) item.resolve(event.data);
-    else if (incoming.length < 512) incoming.push(event.data);
-    else fail(new Error("入口发送的数据过多，已关闭连接。请重新连接可信设备。"));
+  const initial = new URL("/api/network/ws", endpoint);
+  initial.protocol = initial.protocol === "https:" ? "wss:" : "ws:";
+  const entryUrl = initial.href;
+  return new Promise((resolve, reject) => {
+    const queue = [], active = new Map(), seen = new Set();
+    const lookup = new AbortController();
+    let winner, finished = false, looking = true, lastError, direct = 0, relay = 0;
+    const timer = setTimeout(() => stop(new Error("无法连接指定设备，请检查设备是否在线及入口地址。")), 15000);
+    function cleanup() { clearTimeout(timer); signal?.removeEventListener("abort", abort); lookup.abort(); }
+    function stop(error) {
+      cleanup();
+      if (winner) { winner.controller.abort(); return; }
+      if (finished) return;
+      finished = true;
+      for (const attempt of active.values()) attempt.controller.abort();
+      reject(error);
+    }
+    function abort() { stop(new Error("设备连接已取消。")); }
+    signal?.addEventListener("abort", abort, { once: true });
+    function add(candidate) {
+      const key = `${candidate.relay}:${candidate.url}`;
+      if (seen.has(key)) return;
+      if (candidate.relay ? relay >= 8 : direct >= 16) return;
+      seen.add(key);
+      if (candidate.relay) relay++; else direct++;
+      queue.push(candidate);
+    }
+    function pump() {
+      if (finished) return;
+      while (active.size < 2 && queue.length) {
+        const needRelay = active.size && ![...active.values()].some(item => item.relay);
+        const preferred = queue.findIndex(item => item.relay === Boolean(needRelay));
+        const candidate = queue.splice(preferred < 0 ? 0 : preferred, 1)[0];
+        if (candidate.expires && candidate.expires <= Math.floor(Date.now() / 1000)) continue;
+        const attempt = { ...candidate, controller: new AbortController() };
+        active.set(attempt, attempt);
+        connectPath(candidate.url, target, candidate.relay, {
+          signal: attempt.controller.signal,
+          onEvent: event => { if (winner === attempt) onEvent?.(event); },
+          onClose: error => { if (winner === attempt) { cleanup(); onClose?.(error); } },
+        }).then(channel => {
+          active.delete(attempt);
+          if (finished) { channel.close(); return; }
+          winner = attempt; finished = true; clearTimeout(timer); lookup.abort();
+          for (const other of active.values()) other.controller.abort();
+          resolve(channel);
+        }, error => {
+          active.delete(attempt);
+          if (finished) return;
+          lastError = error;
+          if (candidate.url === entryUrl && candidate.relay) add({ url: entryUrl, relay: false });
+          pump();
+        });
+      }
+      if (!active.size && !queue.length && !looking) stop(lastError || new Error("没有找到此设备的可达路径。"));
+    }
+    add({ url: entryUrl, relay: true });
+    pump();
+    lookupPaths(entryUrl, target, lookup.signal).then(candidates => {
+      looking = false;
+      if (finished) return;
+      for (const candidate of candidates) {
+        if (candidate.url !== entryUrl || candidate.relay) add(candidate);
+      }
+      pump();
+    }, error => {
+      looking = false;
+      lastError ??= error;
+      pump();
+    });
+    if (signal?.aborted) abort();
   });
-  socket.addEventListener("close", () => fail(disconnected()));
-  socket.addEventListener("error", () => fail(new Error("无法连接设备。请检查地址、HTTPS 和设备在线状态。")));
-  const handshakeTimer = setTimeout(() => fail(new Error("连接设备超时。请核对设备编号、地址或中继是否在线。")), 20000);
-  async function control(expected) {
-    const frame = await receive();
-    if (typeof frame !== "string" || frame.length > 8192) throw new Error("中继握手格式无效。");
-    const message = JSON.parse(frame);
-    if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("中继握手格式无效。");
-    if (message.type !== expected) throw new Error(typeof message.message === "string" ? message.message : "入口未能建立指定设备的通道。");
-    return message;
-  }
+}
+
+async function connectPath(url, target, relay, { onEvent, onClose, signal }) {
+  const pending = new Map();
+  let channel, closed = false, nextId = 0, publicKey;
+  const disconnected = () => new Error("加密连接已断开，操作结果尚未确认。重新连接后先核对原操作，不要重复派发。");
+  const wire = openSocket(url, signal, error => {
+    closed = true;
+    const reason = channel ? disconnected() : error;
+    for (const item of pending.values()) { clearTimeout(item.timer); item.reject(reason); }
+    pending.clear();
+    onClose?.(reason);
+  });
+  const { socket, receive } = wire;
+  const fail = error => wire.close(error);
   let handshake;
   try {
-    if (entry.local === true) {
-      await new Promise((resolve, reject) => {
-        if (socket.readyState === WebSocket.OPEN) { resolve(); return; }
-        socket.addEventListener("open", resolve, { once: true });
-        socket.addEventListener("close", () => reject(disconnected()), { once: true });
-        socket.addEventListener("error", () => reject(disconnected()), { once: true });
-      });
-    } else {
-      await control("welcome");
-      socket.send(JSON.stringify(entry.relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
-      await control("ready");
+    if (relay === null) await wire.opened();
+    else {
+      await wire.control("welcome");
+      socket.send(JSON.stringify(relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
+      await wire.control("ready");
     }
     handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
     socket.send(handshake.write(new Uint8Array()));
@@ -188,12 +314,12 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     if (!(response instanceof ArrayBuffer)) throw new Error("设备未返回加密握手。");
     if (handshake.read(new Uint8Array(response)).length) throw new Error("设备握手包含未预期的数据。");
     socket.send(handshake.write(new Uint8Array()));
-    if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与已保存设备编号不符，已拒绝连接。");
+    if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与目标 Peer ID 不符，已拒绝连接。");
     publicKey = handshake.remotePublicKey();
     if (typeof publicKey !== "string" || !peerPattern.test(publicKey)) throw new Error("设备未提供有效的认证公钥。");
     channel = handshake.finish();
-    clearTimeout(handshakeTimer);
-  } catch (error) { clearTimeout(handshakeTimer); fail(error); throw error; }
+    wire.ready();
+  } catch (error) { fail(error); throw error; }
   finally { handshake?.free(); }
   (async () => {
     try {

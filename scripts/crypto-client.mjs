@@ -51,8 +51,14 @@ function endpoint() {
             assert(fixture.peerId() === input.expected_peer_id, 'fixture signer must match the original target');
             assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
             assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
+            const direct = input.direct_urls || [];
+            assert(Array.isArray(direct) && direct.length <= 8, 'fixture direct list must be bounded');
+            for (const value of [...direct,...input.relay_urls]) {
+              const url = new URL(value);
+              assert(value.length <= 2048 && ['ws:','wss:'].includes(url.protocol) && url.hostname && !url.username && !url.password && !url.search && !url.hash, 'fixture URL must be a bounded network endpoint');
+            }
             const issued = Math.floor(Date.now() / 1000);
-            const record = {peer_id:fixture.peerId(),public_key:fixture.publicKeyHex(),direct_urls:[],relay_urls:input.relay_urls,
+            const record = {peer_id:fixture.peerId(),public_key:fixture.publicKeyHex(),direct_urls:direct,relay_urls:input.relay_urls,
               issued_at:issued,expires_at:issued+input.ttl_secs,signature:''};
             record.signature = fixture.sign('reachability',new TextEncoder().encode(JSON.stringify(record)));
             result = record;

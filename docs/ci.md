@@ -68,17 +68,20 @@ MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 
 binary=/absolute/path/to/package/vibeface
 crypto=/absolute/path/to/package/web/vibeface_secure.js
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-node --skip-codex
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-auto-route --auto-route
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-queue --phase1
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-net --network-reliability --net1-lane 7
 ```
 
-队列、follow-up 和调度持久化改动跑 `--phase1`；工具调用、取消和启动恢复改动跑 `--chat-agent`；网络改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
+Peer ID 自动选路和入口切换改动跑 `--auto-route`，覆盖本机、同入口、跨入口、签名与目标校验、邀请与恢复、撤销、取消及未知写入不重放。
+
+队列、follow-up 和调度持久化改动跑 `--phase1`；工具调用、取消和启动恢复改动跑 `--chat-agent`；其他网络协议、同步历史与附件传输改动按 `verify-node.py` 中场景选择 `--net1-lane 1` 到 `7`。省略 lane 是 NET-1 基线采集，不代表七个专项通过。lane 1 必须额外提供 `--evidence-dir`，其中包含 `status=observed`、`mode=network-reliability-m0` 的 `m0-baseline.json`，且其源码提交是当前 HEAD 的祖先。部分 lane 会构建插桩程序，应先阅读对应模式要求。
 
 默认模式省略 `--skip-codex` 时还需要本机安装的 Codex，`--codex-bin` 可指定路径；它检查真实会话协议，不发起模型生成。真正模型调用、浏览器渲染、实体设备授权、实际公网与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
 ## 合并门禁
 
-`ci-gate` 要求选中的任务成功，失败、取消、缺失或意外跳过均拒绝通过，并重新计算计划以防弱化覆盖。只编辑 PR 标题或描述时使用独立检查名和并发组，不取消代码检查。PR base 调整与后续代码提交重新选择范围。
+`ci-gate` 要求选中的任务成功，失败、取消、缺失或意外跳过均拒绝通过，并重新计算计划以防弱化覆盖。每次运行都使用固定名称汇总结果。编辑 PR 标题、描述或 base 时也重新检查本次受影响范围，避免全跳过的运行缺少必需门禁。相同 PR 的新运行替代旧运行，核心与扩展检查的分层保持不变。
 
 GitHub 仓库须将 `ci-gate` 设置为必需检查，并要求更新到最新 base 或使用 merge queue，才能强制阻止未通过的合并。扩展检查已移出普通 PR；每日绿色不能替代本次 PR 核心检查，核心绿色也不能当作跨平台或完整进程验收通过。
