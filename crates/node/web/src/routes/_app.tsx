@@ -17,7 +17,7 @@ function AppLayout() {
   const onboarding = useOnboarding()
   if (!ready && (phase === 'initializing' || phase === 'connecting' && entries.length > 0 && !initialInvitation)) return <ShellSkeleton />
   if (!ready) return <Suspense fallback={<ShellSkeleton />}><ConnectionScreen /></Suspense>
-  const key = `${ready.principal.network_id}:${ready.principal.subject_id}`
+  const key = `${ready.principal.network_id}:${ready.principal.device_id}`
   return <WorkspaceProvider key={key} connection={ready} openConversation={(id) => { void navigate({ to: '/', search: { conversation: id } }) }}>
     {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>

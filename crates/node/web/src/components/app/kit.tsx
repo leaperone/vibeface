@@ -62,8 +62,8 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, ch
   </section>
 }
 
-export function SafetyCode({ code, label = "核对码" }: { code: string; label?: string }) {
-  const groups = code.match(/.{1,4}/g) ?? []
+export function SafetyCode({ code, label = "安全码" }: { code: string; label?: string }) {
+  const groups = code.match(code.length === 6 ? /.{3}/g : /.{1,4}/g) ?? []
   const [copied, setCopied] = useState(false)
   return <div className="flex flex-wrap items-center gap-3">
     <span className="sr-only">{label}</span>

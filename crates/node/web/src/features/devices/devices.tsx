@@ -23,14 +23,14 @@ export function useDeviceRows(): DeviceRow[] {
   const { directory, ready, identity } = useDevice()
   const { nodes } = useWorkspace()
   const members = directory?.members ?? []
-  const ids = [...new Set([...members.map((member) => member.subject_id), ...nodes.filter((node) => !node.revoked).map((node) => node.peer_id)])]
+  const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])]
   const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : 3
   return ids.map((id): DeviceRow => {
-    const member = members.find((item) => item.subject_id === id), node = nodes.find((item) => item.peer_id === id)
+    const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
     const kind = member?.kind ?? "node"
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
-      entry: id === ready?.entry.peer_id, browser: id === identity?.peerId,
+      entry: id === ready?.entry.device_id, browser: id === identity?.deviceId,
       online: kind === "node" ? node?.online ?? false : undefined, assistant: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
@@ -84,7 +84,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
-    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>{device.directory.revoked.map((id) => <span key={id} className="font-mono">{id}</span>)}</Details> : null}
+    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>{device.directory.revoked.map((item) => <span key={item.device_id} className="font-mono">{item.device_id}</span>)}</Details> : null}
   </div>
 }
 
@@ -147,8 +147,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     <Details>
       <DetailRow label="设备编号" value={row.id} mono />
-      {row.member ? <DetailRow label="公钥" value={row.member.public_key} mono /> : null}
-      {row.member?.node_roles.length ? <DetailRow label="设备能力" value={row.member.node_roles.map((role) => roleNames[role] ?? role).join("、")} /> : null}
+      {row.node?.roles?.length ? <DetailRow label="设备能力" value={row.node.roles.map((role) => roleNames[role] ?? role).join("、")} /> : null}
     </Details>
 
     {canManage && row.member && !row.admin && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">

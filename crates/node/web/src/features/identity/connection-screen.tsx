@@ -1,15 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { ArchiveRestore, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, ShieldAlert, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
-import { Details, DetailRow, EmptyState, FilePicker, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
+import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { useCheckCode } from '@/lib/check-code'
 import { addressName } from '@/features/workspace/labels'
-import { readInvitation } from '../../../transport.js'
-import { messageOf, parseEntry, parseInvitation } from '@/lib/node'
-import { readConnectionFile } from '@/lib/connection-file'
+import { messageOf, parseEntry } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
@@ -18,12 +15,12 @@ import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
-type Purpose = 'empty' | 'bootstrap' | 'pair' | 'node' | 'invalid'
+type Purpose = 'empty' | 'link' | 'invalid'
 const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
 
 function purposeOf(invitation: string): Purpose {
   if (!invitation.trim()) return 'empty'
-  try { return parseInvitation(readInvitation(invitation.trim())).kind } catch { return 'invalid' }
+  try { const url = new URL(invitation.trim()); return url.pathname === '/join' && url.hash.startsWith('#vibeface1') ? 'link' : 'invalid' } catch { return 'invalid' }
 }
 
 
@@ -62,7 +59,6 @@ export function ConnectionScreen() {
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
   useEffect(() => { if (device.initialInvitation) setInvitation((current) => current.trim() ? current : device.initialInvitation) }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
-  useEffect(() => { if (device.localJoin?.kind === 'joined') setLane('local') }, [device.localJoin])
 
   function chooseLane(next: Lane) {
     if (!device.entry || next !== 'recovery') device.disconnect()
@@ -82,22 +78,13 @@ export function ConnectionScreen() {
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    void run(() => purpose === 'bootstrap' ? device.pair(invitation, value(form, 'name'), passphrase(value(form, 'password'), value(form, 'confirmation')), value(form, 'computer')) : device.pair(invitation, value(form, 'name')))
-  }
-  async function importFile(file: File) {
-    const owner = device.connectionGeneration()
-    const content = await readConnectionFile(file)
-    if (owner !== device.connectionGeneration()) return
-    const parsed = readInvitation(content)
-    parseInvitation(parsed)
-    setInvitation(JSON.stringify(parsed))
+    void run(() => device.join(invitation, value(form, 'name')))
   }
 
   // Not being a member yet is the normal state on this screen, so it reads as a hint rather than an error.
   const alert = error || device.error && !['reconnecting', 'unpaired'].includes(device.phase) ? <InlineError error={error || device.error} />
     : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p> : null
-  const joining = device.localJoin && device.localJoin.kind !== 'idle' && device.localJoin.kind !== 'joined'
-  const focused = Boolean(device.review || device.waiting || joining)
+  const focused = Boolean(device.review || device.joining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
     <p className="text-meta text-muted-foreground">其他方式</p>
@@ -117,43 +104,37 @@ export function ConnectionScreen() {
   </Panel>
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
-  else if (joining && device.localJoin) body = <NodeJoin busy={busy} run={run} />
-  else if (device.waiting) body = <BrowserJoin busy={busy} run={run} />
+  else if (device.joining) body = <BrowserJoin />
   else if (active === 'local' && setup && !names) body = <NamesStep onNext={setNames} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => setNames(null)} run={run} />
-  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localJoin?.kind === 'joined' ? '这台电脑已加入' : '这台电脑'}>
+  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title="这台电脑">
     {device.localSetup.kind === 'initialized'
-      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>{device.localJoin?.kind === 'joined' ? '打开这台电脑' : '重新打开这台电脑'}</Button>
+      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开这台电脑</Button>
       : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
-    <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.peer_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
+    <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
       <span className="min-w-0 flex-1 truncate" title={entry.address}>{addressName(entry.address)}</span>
       <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
-  else body = <Panel icon={Link2} title={purpose === 'node' ? '把这台电脑加入' : '加入我的设备'}>
+  else body = <Panel icon={Link2} title="加入我的设备">
     <form className="grid gap-4" onSubmit={submitInvitation}>
       <fieldset disabled={linking || !usable} className="grid gap-4">
         {purpose === 'empty' || purpose === 'invalid' ? <>
           <Field label="加入链接"><Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
           {purpose === 'invalid' ? <p role="alert" className="text-meta text-danger">这不是有效的加入链接</p> : null}
-          <FilePicker label="导入文件" accept=".json,application/json,text/plain" onFile={(file) => void run(() => importFile(file))} />
         </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
           <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
           <span className="min-w-0 flex-1 truncate">已读取加入链接</span>
           <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
         </p>}
-        <Field label={purpose === 'node' ? '这台电脑叫什么？' : '这个浏览器叫什么？'}><Input name="name" required maxLength={128} autoComplete="off" defaultValue={purpose === 'node' ? defaultComputerName() : defaultBrowserName()} key={purpose === 'node' ? 'node' : 'browser'} /></Field>
-        {purpose === 'bootstrap' ? <>
-          <Field label="电脑叫什么？"><Input name="computer" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
-          <Field label="恢复密码"><Input type="password" name="password" autoComplete="new-password" minLength={12} required /></Field>
-          <Field label="再输一次"><Input type="password" name="confirmation" autoComplete="new-password" minLength={12} required /></Field>
-        </> : null}
+        <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
         <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button>
       </fieldset>
     </form>
+    <p className="text-meta text-muted-foreground">加入一台电脑：在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p>
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
@@ -167,12 +148,12 @@ export function ConnectionScreen() {
       {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
       {other}
       {device.identity && !focused ? <Details>
-        <DetailRow label="这个浏览器的设备编号" value={device.identity.peerId} mono />
-        {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), peer_id: value(form, 'peer_id') }))) }}>
+        <DetailRow label="这个浏览器的设备编号" value={device.identity.deviceId} mono />
+        {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
           <fieldset disabled={linking} className="grid gap-3">
             <legend className="mb-3 text-foreground">手填访问地址</legend>
             <Field label="访问地址"><Input type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="peer_id" required pattern="[a-f0-9]{64}" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <Field label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>
         </form> : null}
@@ -240,48 +221,18 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   </Panel>
 }
 
-/** A browser joining through a link: its request is already out; the admin compares the code and allows. */
-function BrowserJoin({ busy, run }: { busy: boolean; run: Run }) {
+/** A browser joining through a link: it shows the safety code and waits for an admin to allow it. */
+function BrowserJoin() {
   const device = useDevice()
-  const waiting = device.waiting!
-  const code = useCheckCode(waiting.network_id, waiting.review.inviter_subject_id, waiting.review.new_member.subject_id)
+  const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
-    <p className="text-muted-foreground">在已有设备上看到同样的码再点允许</p>
-    {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
+    <p className="text-muted-foreground">在管理设备上比对安全码</p>
+    {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
-    <div className="flex flex-wrap justify-between gap-2">
-      <Button type="button" variant="ghost" onClick={() => device.cancelPair()}>取消</Button>
-      {waiting.accepted ? null : <Button type="button" variant="outline" disabled={busy || !code || device.phase === 'reconnecting'} onClick={() => void run(device.acceptPair)}>重试</Button>}
-    </div>
+    <Button type="button" variant="ghost" className="w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details>
-      <DetailRow label="这个浏览器" value={waiting.review.new_member.subject_id} mono />
-      <DetailRow label="邀请方" value={waiting.review.inviter_subject_id} mono />
-      <DetailRow label="个人网络" value={waiting.network_id} mono />
+      <DetailRow label="这个浏览器" value={device.identity?.deviceId ?? ''} mono />
+      <DetailRow label="加入请求" value={joining.join_id} mono />
     </Details>
-  </Panel>
-}
-
-/** A computer joining through a link opened on its own local page. */
-function NodeJoin({ busy, run }: { busy: boolean; run: Run }) {
-  const device = useDevice()
-  const join = device.localJoin!
-  const review = join.kind === 'review' || join.kind === 'pending' ? join.review : null
-  const code = useCheckCode(review?.network_id ?? '', review?.inviter_subject_id ?? '', review?.new_member.subject_id ?? '')
-  return <Panel icon={join.kind === 'uncertain' ? Laptop : Hourglass} title={join.kind === 'uncertain' ? '还不确定是否已加入' : '等待批准'}>
-    {review ? <>
-      <p className="text-muted-foreground">在已有设备上点允许后，这里会自动进入</p>
-      {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-56" />}
-    </> : <p className="text-muted-foreground">再查一次，不会重复提交。</p>}
-    <div className="flex flex-wrap justify-between gap-2">
-      <Button type="button" variant="ghost" disabled={busy} onClick={device.useAnotherNodeInvitation}>换一个链接</Button>
-      {join.kind === 'review'
-        ? <Button type="button" variant="outline" disabled={busy || !code || join.review.expires_at_ms <= Date.now()} onClick={() => void run(device.acceptLocalJoin)}>重试</Button>
-        : join.kind === 'uncertain' ? <Button type="button" variant="outline" disabled={busy} onClick={() => void run(device.refreshLocalJoin)}>再查一次</Button> : null}
-    </div>
-    {review ? <Details>
-      <DetailRow label="这台电脑" value={review.new_member.subject_id} mono />
-      <DetailRow label="邀请方" value={review.inviter_subject_id} mono />
-      <DetailRow label="个人网络" value={review.network_id} mono />
-    </Details> : null}
   </Panel>
 }

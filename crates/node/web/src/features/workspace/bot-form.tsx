@@ -39,9 +39,9 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
   const projects = workspace.nodes.flatMap((node, index) => {
     if (node.revoked || !node.online || !node.capabilities?.manager) return []
-    const deviceName = nodeName(node.peer_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
+    const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
     return (node.capabilities?.roots ?? []).map((cwd) => {
-      const project = { target_node: node.peer_id, cwd }
+      const project = { target_node: node.device_id, cwd }
       return { key: projectKey(project), project, label: `${deviceName} · ${cwd}` }
     })
   })

@@ -16,7 +16,7 @@ export const terms = {
   encrypted: { label: "已加密", icon: ShieldCheck },
   joinLink: { label: "加入链接", icon: Link },
   qr: { label: "二维码", icon: QrCode },
-  safetyCode: { label: "核对码", icon: ShieldCheck },
+  safetyCode: { label: "安全码", icon: ShieldCheck },
   admin: { label: "管理员", icon: Crown },
   remove: { label: "移除设备", icon: Ban },
   recoveryFile: { label: "恢复文件", icon: FileKey },

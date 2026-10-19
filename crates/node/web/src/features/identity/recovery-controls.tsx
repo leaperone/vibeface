@@ -3,7 +3,6 @@ import { ArchiveRestore, KeyRound, Laptop, Monitor } from 'lucide-react'
 import { BusyIcon, Details, DetailRow, FilePicker, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
 import type { Member } from '@/lib/node'
 import { messageOf, parseEntry } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
@@ -46,23 +45,23 @@ export function RecoveryReview() {
   const [lost, setLost] = useState<string[]>([])
   const [admins, setAdmins] = useState<string[] | null>(null)
   if (review?.kind !== 'recovery') return null
-  const managers = admins ?? review.members.filter((member) => member.manage).map((member) => member.subject_id)
+  const managers = admins ?? review.members.filter((member) => member.manage).map((member) => member.device_id)
   const toggle = (list: string[], id: string, on: boolean) => on ? [...list, id] : list.filter((item) => item !== id)
   return <section className="grid gap-4 rounded-xl border bg-card p-5">
     <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />哪台设备丢了？</h2>
     <p className="text-muted-foreground">勾上丢了的设备，其余的都会保留。</p>
     <fieldset disabled={busy} className="grid gap-2">
       {review.members.map((member) => {
-        const required = member.subject_id === review.requiredNode
+        const required = member.device_id === review.requiredNode
         const Icon = member.kind === 'node' ? Laptop : Monitor
-        return <div key={member.subject_id} className="grid gap-1 rounded-lg bg-muted/60 px-3 py-2">
+        return <div key={member.device_id} className="grid gap-1 rounded-lg bg-muted/60 px-3 py-2">
           <div className="flex min-h-9 items-center gap-2">
             <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             <span className="min-w-0 flex-1 truncate">{member.name}</span>
             {required ? <span className="text-meta text-muted-foreground">正在连接</span>
-              : <label className="flex items-center gap-1.5 text-meta"><input type="checkbox" checked={lost.includes(member.subject_id)} onChange={(event) => setLost(toggle(lost, member.subject_id, event.target.checked))} />丢了</label>}
+              : <label className="flex items-center gap-1.5 text-meta"><input type="checkbox" checked={lost.includes(member.device_id)} onChange={(event) => setLost(toggle(lost, member.device_id, event.target.checked))} />丢了</label>}
           </div>
-          {member.kind === 'client' && !lost.includes(member.subject_id) ? <label className="flex items-center gap-1.5 ps-6 text-meta text-muted-foreground"><input type="checkbox" checked={managers.includes(member.subject_id)} onChange={(event) => setAdmins(toggle(managers, member.subject_id, event.target.checked))} />管理员</label> : null}
+          {member.kind === 'client' && !lost.includes(member.device_id) ? <label className="flex items-center gap-1.5 ps-6 text-meta text-muted-foreground"><input type="checkbox" checked={managers.includes(member.device_id)} onChange={(event) => setAdmins(toggle(managers, member.device_id, event.target.checked))} />管理员</label> : null}
         </div>
       })}
     </fieldset>
@@ -71,8 +70,8 @@ export function RecoveryReview() {
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" onClick={device.cancelSensitive}>取消</Button>
       <Button type="button" disabled={busy} onClick={() => void run(() => device.confirmRecovery(review.members
-        .filter((member) => member.subject_id === review.requiredNode || !lost.includes(member.subject_id))
-        .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.subject_id) }))))}><BusyIcon busy={busy} />恢复</Button>
+        .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
+        .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) }))))}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}
     <Details><DetailRow label="个人网络" value={review.networkId} mono /></Details>
@@ -82,7 +81,7 @@ export function RecoveryReview() {
 /** Find devices again with the recovery file, or re-seal that file with a new password. */
 export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) {
   const device = useDevice()
-  const localEntry = device.localSetup?.kind === 'uninitialized' ? device.localSetup.invitation.entry : device.localSetup?.entry
+  const localEntry = device.localSetup?.entry
   const target = device.ready?.entry || device.entry || localEntry
   const { busy, error, status, run } = useGenerationRun()
   const [open, setOpen] = useState(only)
@@ -99,7 +98,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           let work: Promise<void>
-          try { work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), bootstrap: field(form, 'bootstrap'), entry: parseEntry({ address: field(form, 'address'), peer_id: field(form, 'peer_id') }) }) }
+          try { work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) }) }
           finally { form.reset() }
           await work
         })
@@ -109,8 +108,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
         <Details label="连接到哪台电脑" open={!target}>
           <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>
-          <Label label="设备编号"><Input className="font-mono" name="peer_id" required pattern="[a-f0-9]{64}" defaultValue={target?.peer_id || ''} autoComplete="off" spellCheck={false} /></Label>
-          <Label label="新电脑的本机初始化邀请（可选）"><Textarea className="min-h-20 font-mono text-meta" name="bootstrap" autoComplete="off" spellCheck={false} /></Label>
+          <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
         <div className="flex flex-wrap gap-2"><Button type="submit"><BusyIcon busy={busy} />下一步</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>

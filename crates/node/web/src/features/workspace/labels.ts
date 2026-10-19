@@ -52,9 +52,9 @@ export function nodeName(
   fallback?: string,
 ) {
   if (!id) return "未知设备"
-  const node = lookup?.nodes?.find((item) => item.peer_id === id)
+  const node = lookup?.nodes?.find((item) => item.device_id === id)
   if (node?.name) return node.name
-  const member = lookup?.directory?.members.find((item) => item.subject_id === id)
+  const member = lookup?.directory?.members.find((item) => item.device_id === id)
   if (member?.name) return member.name
   if (node?.local) return "本机"
   if (fallback) return fallback

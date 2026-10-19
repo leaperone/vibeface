@@ -24,7 +24,7 @@ export function ApprovalCard({ work, request, meta, stoppable = true }: { work: 
   const id = useId()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === workspace.generation || request.answering === true
-  const node = workspace.nodes.find((item) => item.peer_id === work.target_node)
+  const node = workspace.nodes.find((item) => item.device_id === work.target_node)
   const form = request.form
   // Answer forms exist only where the work runs; the answer is signed by this browser's device key.
   const active = work.state === "running" || work.state === "waiting_approval"

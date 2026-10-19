@@ -20,7 +20,7 @@ export type InterruptedReply = { trigger: string; conversation_id: string; after
 
 function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}) {
   const networkId = connection.principal.network_id
-  const clientId = connection.principal.subject_id
+  const clientId = connection.principal.device_id
   const [booted, setBooted] = useState(false)
   const [error, setError] = useState("")
   const [noticeText, setNoticeText] = useState("")
@@ -267,7 +267,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     requireContext()
     const id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, entryNode: connection.entry.peer_id, pending: prior, reportResults: true })
+    const prepared = prepareSend({ conversationId: id, text, entryNode: connection.entry.device_id, pending: prior, reportResults: true })
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {
@@ -284,7 +284,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     } catch (caught) {
       if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
         const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
-        if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.entry.peer_id } } : item))
+        if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.entry.device_id } } : item))
       }
       throw caught
     }
@@ -295,7 +295,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     botCreationRef.current = null; setPendingBot(null)
   }
   const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
-    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.peer_id) throw new Error("请回到原来的设备确认助手是否建好，内容已保留。")
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.device_id) throw new Error("请回到原来的设备确认助手是否建好，内容已保留。")
     const known = parseBots(await connection.rpc("bots"))
     requireCurrent()
     const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
@@ -341,7 +341,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
         if (known) { await selectBot(known); return known }
         throw new Error("确认没建成，可以修改后再试。")
       }
-      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.peer_id } }
+      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.device_id } }
       const request: CreateBotRequest = parseCreateBot(pending)
       writeStorage(scoped("pending-bot"), pending, true)
       botCreationRef.current = pending; setPendingBot(pending)
@@ -349,7 +349,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       try { response = await connection.rpc("create_bot", request) }
       catch (caught) {
         if (!prior && current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
-          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.peer_id } }
+          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.device_id } }
           writeStorage(scoped("pending-bot"), rejected, true)
           botCreationRef.current = rejected; setPendingBot(rejected)
           const known = await checkRejectedBot(rejected)
@@ -445,7 +445,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
       if (!original) throw new Error("原消息还在发送，请稍等。")
-      if (original.entry_node !== connection.entry.peer_id || original.rejected?.entry_node !== connection.entry.peer_id) throw new Error("只有原来的设备明确返回失败后才能放弃。断线或超时请重新发送或再查一次。")
+      if (original.entry_node !== connection.entry.device_id || original.rejected?.entry_node !== connection.entry.device_id) throw new Error("只有原来的设备明确返回失败后才能放弃。断线或超时请重新发送或再查一次。")
       const complete = await readConversation(id)
       requireContext(id)
       if (messagesRef.current.find((item) => item.conversation_id === id) !== original || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("原消息状态有变化，请再查一次。")

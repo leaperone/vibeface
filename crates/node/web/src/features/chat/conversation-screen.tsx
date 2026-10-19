@@ -30,7 +30,7 @@ export function ConversationScreen() {
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
-  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.peer_id
+  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.device_id
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const pendingChecks = data?.pending_checks ?? []

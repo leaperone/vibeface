@@ -10,7 +10,7 @@ import { useWorkspace } from '@/features/workspace/context'
 import { useDevice } from './context'
 
 const hostOf = (address: string) => { try { return new URL(address).host } catch { return '' } }
-const keyOf = (entry: ConnectionEntry) => `${entry.address}|${entry.peer_id}|${entry.local === true}`
+const keyOf = (entry: ConnectionEntry) => `${entry.address}|${entry.device_id}|${entry.local === true}`
 
 /** Settings → 连接: where this browser connects, other saved addresses and the raw ids. */
 export function ConnectionSettings() {
@@ -35,17 +35,16 @@ export function ConnectionSettings() {
     <Details>
       <DetailRow label="个人网络" value={directory?.network_id || ready?.principal.network_id || ''} mono />
       {directory ? <DetailRow label="授权版本" value={directory.epoch} /> : null}
-      <DetailRow label="这个浏览器的设备编号" value={identity?.peerId ?? ''} mono />
-      <DetailRow label="这个浏览器的公钥" value={identity?.publicKey ?? ''} mono />
-      {ready ? <DetailRow label="当前连接的设备编号" value={ready.entry.peer_id} mono /> : null}
+      <DetailRow label="这个浏览器的设备编号" value={identity?.deviceId ?? ''} mono />
+      {ready ? <DetailRow label="当前连接的设备编号" value={ready.entry.device_id} mono /> : null}
       <form className="grid gap-2 border-t pt-3" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         const field = (name: string) => (form.elements.namedItem(name) as HTMLInputElement).value.trim()
-        try { device.saveEntry({ address: field('address'), peer_id: field('peer_id') }); form.reset(); setError(null) } catch (cause) { setError(cause) }
+        try { device.saveEntry({ address: field('address'), device_id: field('device_id') }); form.reset(); setError(null) } catch (cause) { setError(cause) }
       }}>
         <span className="text-foreground">手动添加地址</span>
         <Input type="url" name="address" required aria-label="访问地址" placeholder="https://" />
-        <Input className="font-mono" name="peer_id" required pattern="[a-f0-9]{64}" aria-label="设备编号" placeholder="设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} />
+        <Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" aria-label="设备编号" placeholder="设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} />
         <Button type="submit" variant="outline" className="w-fit">保存</Button>
       </form>
     </Details>

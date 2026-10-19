@@ -29,16 +29,16 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
 })
 test("nodeName prefers rpc and directory names over truncated peer ids", () => {
   const id = "a".repeat(64)
-  assert.equal(nodeName(id, { nodes: [{ peer_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
-  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ subject_id: id, public_key: id, kind: "node", name: "工作机", node_roles: [], manage: false }], revoked: [] } }), "工作机")
+  assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
+  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [] } }), "工作机")
   assert.equal(nodeName(id), `${id.slice(0, 10)}…`)
 })
 
 test("capabilities parse the actual provider name and reject malformed node lists", () => {
-  const nodes = parseNodes({ nodes: [{ peer_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", roots: ["/project"] } }] })
+  const nodes = parseNodes({ nodes: [{ device_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", roots: ["/project"] } }] })
   assert.equal(nodes[0]?.name, "本机")
   assert.equal(nodes[0]?.capabilities?.manager, "cursor_agent")
-  assert.throws(() => parseNodes({ nodes: [{ peer_id: "n" }] }))
+  assert.throws(() => parseNodes({ nodes: [{ device_id: "n" }] }))
 })
 test("works, approvals with decline, reply status and pending checks keep their exact shape", () => {
   const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", prompt: "检查项目", state: "waiting_approval", summary: "等待决定", outcome: null, result_text: "", failure_reason: null,
@@ -168,9 +168,9 @@ test("workspace preserves bot and message requests while routing native decision
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
-    generation: 1, entry: { peer_id: "gateway", address: "https://node.example" },
-    principal: { network_id: "network", subject_id: "client", epoch: 1, can_manage: true, source: "membership" },
-    info: { peer_id: "gateway", public_key: "key", version: "test", roles: ["gateway"], initialized: true },
+    generation: 1, entry: { device_id: "gateway", address: "https://node.example" },
+    principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
+    info: { device_id: "gateway", name: "gateway", version: "test", roles: ["gateway"], initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async () => { throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: [] }
@@ -228,9 +228,9 @@ test("workspace preserves bot and message requests while routing native decision
     const pending = JSON.parse(JSON.stringify(state.messagePending))
     assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", report_results: true })
     await assert.rejects(render().sendMessage("different work"), /上一条消息/)
-    connection.entry.peer_id = "other-gateway"
+    connection.entry.device_id = "other-gateway"
     await assert.rejects(render().sendMessage("work"), /原来的设备/)
-    connection.entry.peer_id = "gateway"
+    connection.entry.device_id = "gateway"
     failMessage = false
     await render().sendMessage("work")
     assert.deepEqual(messages[1], messages[0])
@@ -427,7 +427,7 @@ test("approvals submit only the person's selected response and keep sensitive in
   const responses: unknown[][] = []
   const request = { request_id: "approval", kind: "item/commandExecution/requestApproval", summary: "运行命令", form: { command: "npm test", choices: [{ label: "批准一次", response: { decision: "accept" } }, { label: "拒绝", response: { decision: "decline" } }] } }
   const work = { work_id: "work", target_node: "worker", state: "waiting_approval" }
-  const workspace = { generation: 1, writable: true, nodes: [{ peer_id: 'worker', online: true, revoked: false }], run: (action: () => Promise<void>) => action(), answerApproval: async (...args: unknown[]) => { responses.push(args) } }
+  const workspace = { generation: 1, writable: true, nodes: [{ device_id: 'worker', online: true, revoked: false }], run: (action: () => Promise<void>) => action(), answerApproval: async (...args: unknown[]) => { responses.push(args) } }
   class Answers { get(name: string) { return name === 'answer-0' ? '当前目录' : name === 'answer-1' ? '是' : null } }
   const app = componentHarness('./task-activity.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', approvalRisk, approvalKind } }, { FormData: Answers })
   try {
@@ -491,8 +491,8 @@ test("only the executing device stops a running task", async () => {
 })
 
 test("bot projects use online manager capabilities and preserve device names", () => {
-  const node = { peer_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, roles: ['scheduler'], capabilities: { manager: 'codex', roots: ['/project'] } }
-  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, peer_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName } })
+  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, roles: ['scheduler'], capabilities: { manager: 'codex', roots: ['/project'] } }
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
     assert.equal(projects.length, 1)
@@ -530,8 +530,8 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ peer_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
-    info: { peer_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint } })
@@ -573,8 +573,8 @@ test("an old action completion cannot clear a new generation's busy state", asyn
 test("connection form keeps current errors and busy ownership when an earlier connection is cancelled", async () => {
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
-    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', peer_id: 'target' }], initialInvitation: '',
-    identity: { peerId: 'browser' }, phase: 'disconnected', error: '',
+    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
+    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
   const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message }, '@/features/workspace/labels': { addressName: (address: string) => address } })
@@ -622,7 +622,7 @@ test("artifact reads retain their offset while old responses cannot append or un
 for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted fields before waiting and preserves replacement fields`, async () => {
   let generation = 1, work = pendingResult(), resets = 0
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
-  const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'peer_id', 'relay'].map(name => [name, new Input()]))
+  const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'device_id', 'relay'].map(name => [name, new Input()]))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, reset() { resets++; for (const field of fields.values()) field.value = '' } }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
     beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
@@ -657,9 +657,9 @@ test("conversation blocks sending until an online node can run the manager Agent
   const workspace = (nodes: unknown[]) => ({
     generation: 1, isCurrent: () => true, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
     chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
-    info: { peer_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
+    info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
-  let currentWorkspace = workspace([{ peer_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
+  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
@@ -667,7 +667,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     assert.equal(composer()?.disabled, true)
     assert.match(String(composer()?.hint), /运行助手/)
     assert.equal(sent, 0)
-    currentWorkspace = workspace([{ peer_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }])
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }])
     assert.equal(composer()?.disabled, false)
     composer()?.onSubmit?.()
     assert.equal(sent, 1)
@@ -676,33 +676,33 @@ test("conversation blocks sending until an online node can run the manager Agent
 
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
+  const invitation = { link: 'https://node.example/join#vibeface1test', publicEntry: true, expiresAt: Date.now() + 600_000 }
   const clipboard = pendingResult()
-  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', peer_id: 'target' } } }
-  const device = { connectionGeneration: () => generation, ready: ready(), pairs: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
+  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', device_id: 'target' } } }
+  const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
-    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false }, './ignored': { useIgnoredPairs: () => [] },
-    '@/lib/node': { messageOf: (cause: Error) => cause.message, record: (value: unknown) => value, text: (value: unknown) => value },
-    '@/lib/enrollment-reference': { invitationLink: () => 'https://node.example/#invite=test' }, cn: { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+    '@/lib/node': { messageOf: (cause: Error) => cause.message },
   }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })
   const render = () => app.render('AddDevice')
   const labelled = (label: string) => render().find(({ props }) => [props.children].flat().includes(label))?.props
   try {
-    render(); render().find(({ props }) => props.role === 'radio' && props['aria-checked'] === false)?.props.onClick?.()
-    labelled('生成链接')?.onClick?.(); creation.resolve('{}'); await settleComponent()
+    render()
+    labelled('生成链接')?.onClick?.(); creation.resolve(invitation); await settleComponent()
     labelled('复制链接')?.onClick?.()
-    assert.equal(labelled('下载文件')?.disabled, true)
+    assert.equal(labelled('复制链接')?.disabled, true)
     generation++; device.ready = ready(); render(); render()
     assert.equal(labelled('生成链接')?.disabled, false)
     creation = pendingResult(); labelled('生成链接')?.onClick?.()
     clipboard.resolve(undefined); await settleComponent()
     assert.equal(labelled('生成链接')?.disabled, true)
     assert.equal(render().some(({ props }) => props.children === '已复制'), false)
-    creation.resolve('{}'); await settleComponent()
+    creation.resolve(invitation); await settleComponent()
     assert.equal(labelled('复制链接')?.disabled, false)
   } finally { app.close() }
 })
 
-test("Peer ID boundaries require the peer_id field", () => {
+test("device id boundaries require the device_id field", () => {
   const id = "ab".repeat(32), other = "cd".repeat(32)
   const transportSource = readFileSync(new URL("../../../transport.js", import.meta.url), "utf8")
     .replace(/^import[^\n]+\n/, "").replace(/\bexport /g, "")
@@ -710,18 +710,16 @@ test("Peer ID boundaries require the peer_id field", () => {
   const source = readFileSync(new URL("../../lib/node.ts", import.meta.url), "utf8")
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
   const parsers = new Script(`(function(require, exports) { ${compiled}\nreturn exports })`).runInNewContext()(() => transport, {})
-  assert.equal(parsers.parseEntry({ address: "https://node.example", peer_id: id }).peer_id, id)
+  assert.equal(parsers.parseEntry({ address: "https://node.example", device_id: id }).device_id, id)
   for (const relay of [false, true]) {
-    const entry = parsers.parseEntry({ address: "https://node.example", peer_id: id, relay })
-    assert.equal(entry.peer_id, id)
+    const entry = parsers.parseEntry({ address: "https://node.example", device_id: id, relay })
+    assert.equal(entry.device_id, id)
     assert.equal(Object.hasOwn(entry, "relay"), false)
   }
-  assert.equal(parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, peer_id: id }).peer_id, id)
-  assert.equal(parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", peer_id: id }).entry.peer_id, id)
-  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], peer_id: id }] })[0].peer_id, id)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /64 位/)
-  assert.throws(() => parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, node_id: id }), /64 位/)
-  assert.throws(() => parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", node_id: id }), /64 位/)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", peer_id: "invalid" }), /64 位/)
+  assert.equal(parsers.parseInfo({ name: "node", version: "1", roles: ["replica"], initialized: true, network_id: other, device_id: id }).device_id, id)
+  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], device_id: id }] })[0].device_id, id)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备编号无效/)
+  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", roles: ["replica"], initialized: true, network_id: other, node_id: id }), /设备编号无效/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备编号无效/)
   assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /缺少文字/)
 })
