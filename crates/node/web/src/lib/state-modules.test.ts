@@ -58,7 +58,7 @@ test('the outbox confirms recorded writes, resubmits the rest unchanged, and sto
   assert.deepEqual(again, { confirmed: ['m4'], resubmitted: [], rejected: [], unknown: null }, 'a refused write is not retried')
 })
 
-test('one tab leads and the next takes over when it closes', async () => {
+test('one tab leads and the next takes over when it closes', { skip: !globalThis.navigator?.locks && 'Web Locks need Node 24 or later' }, async () => {
   const name = `vibeface-test-${Math.random()}`
   const events: string[] = []
   const settle = () => new Promise(resolve => setTimeout(resolve, 20))

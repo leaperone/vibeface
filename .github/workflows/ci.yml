@@ -135,7 +135,7 @@ jobs:
           version: 11.9.0
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: pnpm
           cache-dependency-path: crates/node/web/pnpm-lock.yaml
       - name: Build and typecheck the static web client
