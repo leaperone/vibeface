@@ -62,17 +62,6 @@ enum Action {
     Update(Update),
     /// Join a personal network using its invite and pinned Peer ID.
     Pair(Pair),
-    /// Send a native Codex App Server method without retrying writes.
-    Codex {
-        method: String,
-        #[arg(long, default_value = "{}")]
-        json: String,
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        /// Keep reading notifications and accept manual JSON responses on stdin.
-        #[arg(long)]
-        watch: bool,
-    },
     /// Call a node tool from a locally managed SDK process.
     Tool {
         name: String,
@@ -250,22 +239,6 @@ async fn main() -> Result<()> {
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
         Action::Pair(options) => pair(options).await,
-        Action::Codex {
-            method,
-            json,
-            socket,
-            watch,
-        } => {
-            let socket = socket
-                .or_else(|| std::env::var_os("VIBEFACE_CODEX_SOCKET").map(PathBuf::from))
-                .context("--socket or VIBEFACE_CODEX_SOCKET is required")?;
-            let params: Value = serde_json::from_str(&json).context("--json must be valid JSON")?;
-            ensure!(
-                !method.is_empty() && method.len() <= 256 && params.is_object(),
-                "Codex method must be nonempty and --json must be an object"
-            );
-            vibeface_bridge::app_server::call(&socket, &method, params, watch).await
-        }
         Action::Tool {
             name,
             json,
@@ -1073,7 +1046,8 @@ mod tests {
                 "/tmp/codex.sock",
                 "--watch"
             ])
-            .is_ok()
+            .is_err(),
+            "no CLI holds the native Socket or answers native requests for an Agent"
         );
     }
 

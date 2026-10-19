@@ -147,7 +147,7 @@ impl NativeCall {
     }
 }
 
-pub(crate) fn validate_request(method: &str, params: &Value) -> Result<(), CodexError> {
+fn validate_request(method: &str, params: &Value) -> Result<(), CodexError> {
     if method.is_empty() || method.len() > 256 || method.chars().any(char::is_control) {
         return Err(rejected("invalid native method"));
     }
