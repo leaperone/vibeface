@@ -1,10 +1,14 @@
-import { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, recoveryOpen, recoverySeal, shortCode, ticketEncode, verifyMembership } from '../../generated/vibeface_secure.js'
+import { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, recoveryOpen, recoverySeal, shortCode, ticketEncode, verify, verifyMembership } from '../../generated/vibeface_secure.js'
 import { integer, parsePrincipal, parseView, record, same, text } from './node'
 import type { ClientPrincipal, MembershipView, PublicIdentity } from './node'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
 export { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, shortCode, ticketEncode }
+/** An entrance record counts only when its own Node signed these exact bytes. */
+export function verifyAddress(deviceId: string, payload: string, signature: string): boolean {
+  try { verify(deviceId, 'address', encoder.encode(payload), signature); return true } catch { return false }
+}
 export function verifyState(state: unknown, networkId: string) { return verifyMembership(JSON.stringify(state), networkId) }
 export function verifiedView(state: unknown, networkId: string): MembershipView {
   const verified = verifyState(state, networkId)

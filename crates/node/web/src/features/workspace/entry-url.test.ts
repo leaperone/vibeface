@@ -123,10 +123,16 @@ test("workspace preserves bot and message requests while routing native decision
   }
   const sandbox = createContext({
     window: browser, URL, TextEncoder, Error, crypto: globalThis.crypto,
-    navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
+    structuredClone, navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
   const signed: string[] = [], attestation = { device_id: "client", signature: "signature" }
+  const outboxItems = new Map<string, { key: string }>()
+  const memoryOutbox = {
+    all: async () => [...outboxItems.values()].map((item) => structuredClone(item)),
+    put: async (item: { key: string }) => { outboxItems.set(item.key, structuredClone(item)) },
+    delete: async (key: string) => { outboxItems.delete(key) },
+  }
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL("../../", import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
@@ -141,6 +147,7 @@ test("workspace preserves bot and message requests while routing native decision
       if (specifier === "@/lib/node") return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
       if (specifier === "react/jsx-runtime") return { jsx: () => null }
       if (specifier.endsWith("/generated/vibeface_secure.js")) return { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` }
+      if (specifier === "@/lib/outbox") return { ...load(resolve(sourceRoot, "lib/outbox.ts")), indexedOutbox: () => memoryOutbox }
       if (specifier.endsWith("/transport.js")) return { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } }
       const path = specifier.startsWith("@/") ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
       return load(extname(path) ? path : `${path}.ts`)
@@ -214,10 +221,14 @@ test("workspace preserves bot and message requests while routing native decision
     for (const effect of effects.values()) effect.cleanup?.()
     effects.clear(); values.length = 0; afterRender.length = 0
     render(); render().setView("chat"); render()
+    // The outbox read that unlocks writing is asynchronous; the next render starts the first refresh.
+    await new Promise(setImmediate); render()
     await new Promise(setImmediate)
   }
   try {
     render(); render().setView("chat"); render()
+    // The outbox read that unlocks writing is asynchronous; the next render starts the first refresh.
+    await new Promise(setImmediate); render()
     await new Promise(setImmediate)
     let state = render()
     assert.equal(state.writable, true)
@@ -232,12 +243,11 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", report_results: true, attestation })
     assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "message_posted", message_id: pending.message_id, role: "user", text: "work", report_results: true })}`)
     await assert.rejects(render().sendMessage("different work"), /上一条消息/)
-    connection.entry.device_id = "other-gateway"
-    await assert.rejects(render().sendMessage("work"), /原来的设备/)
-    connection.entry.device_id = "gateway"
     failMessage = false
+    connection.entry.device_id = "other-gateway"
     await render().sendMessage("work")
-    assert.deepEqual(messages[1], messages[0])
+    assert.deepEqual(messages[1], messages[0], "another entrance receives the same signed request")
+    connection.entry.device_id = "gateway"
     assert.equal(render().messagePending, null)
     await render().interruptWork("work")
     await render().answerApproval("work", "req", { decision: "decline" })
@@ -345,8 +355,15 @@ test("workspace preserves bot and message requests while routing native decision
         await rejected
         assert.equal(render().messageBusy, false)
         assert.equal(render().error, "")
-        assert.deepEqual(JSON.parse(JSON.stringify(render().messagePending)), original)
-        assert.equal(messages.length, before + 1)
+        if (outcome === "success") {
+          await new Promise(setImmediate)
+          assert.equal(messages.length, before + 2, "the new entry's first complete read resubmits the unconfirmed message once")
+          assert.deepEqual(messages.at(-1), messages.at(-2), "byte for byte, without a new signature")
+          assert.equal(render().messagePending, null)
+        } else {
+          assert.deepEqual(JSON.parse(JSON.stringify(render().messagePending)), original)
+          assert.equal(messages.length, before + 1, "a failed read resubmits nothing")
+        }
       }
       messageHold = null
       const original = render().messagePending

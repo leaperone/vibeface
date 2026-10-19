@@ -30,7 +30,6 @@ export function ConversationScreen() {
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
-  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.device_id
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const pendingChecks = data?.pending_checks ?? []
@@ -82,7 +81,7 @@ export function ConversationScreen() {
     messagePending && !messageBusy ? <ActionCard key="undelivered" icon={MessageSquareWarning} title="消息可能没送达" actions={<>
       <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
       <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
-      <ActionButton variant="default" disabled={!workspace.writable || !originalEntry || workspace.incomplete} action={async () => {
+      <ActionButton variant="default" disabled={!workspace.writable || workspace.incomplete} action={async () => {
         if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
       }}>重新发送</ActionButton>
     </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
@@ -94,7 +93,7 @@ export function ConversationScreen() {
   const managerOffline = workspace.nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager)
   const hint = !workspace.connectionOnline ? '离线，恢复后可发送'
     : workspace.writeNotice ? '同步中，稍后可发送'
-    : messagePending ? (!originalEntry ? '这条消息要回到原来的设备上处理' : '上一条消息还没确认送达')
+    : messagePending ? '上一条消息还没确认送达'
     : needsConfirm ? '先处理上面这件事'
     : bot && !agentReady ? (managerOffline ? '能运行助手的设备离线了' : '暂时没有能运行助手的设备')
     : bot ? composerHint(gate) : ''

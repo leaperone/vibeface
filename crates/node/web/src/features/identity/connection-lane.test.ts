@@ -629,7 +629,7 @@ test('an approved join restores only verified authentication and subscription, a
     app.render(); await settle(); app.render()
     assert.equal(app.render().ready?.entry.device_id, target)
     assert.equal(app.verifications(), 1)
-    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status', 'join_status', 'authenticate', 'subscribe'])
+    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status', 'join_status', 'authenticate', 'subscribe', 'entrances'])
     app.sockets[0].drop(); app.render()
     assert.equal(app.timers.size, 1)
     app.render().disconnect()
@@ -650,7 +650,7 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.notEqual(app.render().ready?.generation, previous)
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.verifications(), 2)
-    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'subscribe', `open:${target}`, 'info', 'authenticate', 'subscribe'])
+    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'subscribe', 'entrances'])
     assert.equal(app.timers.size, 0)
   } finally { app.close() }
 })

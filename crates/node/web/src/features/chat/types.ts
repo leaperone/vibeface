@@ -13,8 +13,8 @@ export type PendingMessage = {
   message_id: string
   conversation_id: string
   text: string
-  entry_node: string
   report_results?: boolean
-  rejected?: { entry_node: string }
+  /** The entry's refusal, kept so the person can drop it; a lost answer leaves this unset. */
+  rejected?: string
 }
 export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "report_results">

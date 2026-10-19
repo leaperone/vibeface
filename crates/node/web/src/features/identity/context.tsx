@@ -9,7 +9,12 @@ import { localBrowserEntry } from '@/lib/local-access'
 import { parseChanged } from '@/lib/progress'
 import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
-import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAuthentication, verifyState } from '@/lib/secure'
+import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyState } from '@/lib/secure'
+import { nextLink } from '@/lib/link'
+import type { Link, LinkEvent } from '@/lib/link'
+import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@/lib/entrances'
+import type { Entrance } from '@/lib/entrances'
+import { joinTabs } from '@/lib/tabs'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
@@ -21,8 +26,12 @@ type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; code?: string; reason?: string | null }
 /** A fresh invitation; without a public HTTPS entry the link only works on this computer. */
 export type Invitation = { link: string; publicEntry: boolean; expiresAt: number }
+/** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
+export type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
+export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
 type DeviceContextValue = {
   connectionGeneration(): number
+  link: Link; entrances: Entrance[]; tabs: Tabs
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
@@ -78,7 +87,18 @@ async function discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | nul
   if (!response.ok) throw new Error('无法读取这台电脑的本机设置。请检查本机地址并刷新页面。')
   return parseLocalSetup(await response.json(), url.origin)
 }
-const loopback = (address: string) => ['localhost', '127.0.0.1', '[::1]'].includes(new URL(address).hostname)
+type Vector = Record<string, number>
+const loadEntrances = (networkId: string): Entrance[] => { const value = load(`entrances.${networkId}`); return Array.isArray(value) ? value as Entrance[] : [] }
+/** Whether `seen` holds an event the entry's `vector` does not, so the page shows 同步中. */
+function behind(seen: Vector, vector: unknown): boolean {
+  if (!vector || typeof vector !== 'object') return false
+  const have = vector as Vector
+  return Object.entries(seen).some(([author, seq]) => !(typeof have[author] === 'number' && have[author] >= seq))
+}
+function absorb(seen: Vector, vector: unknown) {
+  if (!vector || typeof vector !== 'object') return
+  for (const [author, seq] of Object.entries(vector as Vector)) if (typeof seq === 'number' && !(seen[author] >= seq)) seen[author] = seq
+}
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
@@ -104,7 +124,24 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const identityRef = useRef<PublicIdentity | null>(null)
   const joiningRef = useRef<Joining | null>(null)
+  const [link, setLinkState] = useState<Link>({ kind: 'booting' })
+  const linkRef = useRef<Link>({ kind: 'booting' })
+  const [entrances, setEntrances] = useState<Entrance[]>([])
+  const seen = useRef<Vector>({})
+  const switching = useRef(false)
+  const leaderRef = useRef(true)
+  const tabChannel = useRef<{ post(message: TabMessage): void; close(): void } | null>(null)
+  const tabListeners = useRef(new Set<(message: TabMessage) => void>())
 
+  function step(...events: LinkEvent[]) {
+    const next = events.reduce(nextLink, linkRef.current)
+    linkRef.current = next; setLinkState(next)
+  }
+  const tabs: Tabs = {
+    leader: () => leaderRef.current,
+    post(message) { tabChannel.current?.post(message) },
+    listen(listener) { tabListeners.current.add(listener); return () => { tabListeners.current.delete(listener) } },
+  }
   const releaseSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
   const setJoin = useCallback((next: Joining | null) => {
     joiningRef.current = next; setJoining(next)
@@ -121,6 +158,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setJoins([]); setInfo(null); setEntry(null); setLocalAutoAccessState(null)
     joiningRef.current = null; setJoining(null); setPhase('disconnected'); setError('')
+    step({ type: 'left' })
   }, [releaseSensitive])
   const disconnect = useCallback(() => {
     resetConnection()
@@ -165,8 +203,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
-    await request('subscribe')
+    const subscribed = record(await request('subscribe', { vector: { ...seen.current } }))
     if (session.current !== active || active.generation !== generation.current) throw changed()
+    const lagging = behind(seen.current, subscribed.vector)
+    absorb(seen.current, subscribed.vector)
     if (principal.source === 'membership' && active.entry.local) active.entry = { ...active.entry, local: false }
     setLocalAutoAccessState(typeof verified.auth.local_auto_access === 'boolean' ? verified.auth.local_auto_access : null)
     store(`network-for.${active.entry.device_id}`, principal.network_id)
@@ -181,50 +221,86 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       rpc: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request('rpc', { method, ...params }) },
       subscribe(listener) { if (session.current !== active || active.generation !== generation.current) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && generation.current === active.generation,
+      catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
     setDirectory(view); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry } : local)
+    step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
+    if (principal.source === 'membership') void refreshEntrances(active, view)
   }
+  /** Signed entrance records, checked against the verified directory, merged into this origin's list. */
+  async function refreshEntrances(active: Session, view: MembershipView) {
+    try {
+      const fresh = verifiedEntrances(record(await callSession(active, 'entrances')).entrances, view, verifyAddress)
+      const merged = markReached(mergeEntrances(loadEntrances(view.network_id), fresh, view), active.entry)
+      store(`entrances.${view.network_id}`, merged); setEntrances(merged)
+    } catch { /* the saved list stays usable; the next connection refreshes it */ }
+  }
+  /** While the entry catches up with what this page already showed, ask again until it has. */
+  async function checkCaughtUp(active: Session) {
+    const subscribed = record(await callSession(active, 'subscribe', { vector: { ...seen.current } }))
+    if (!behind(seen.current, subscribed.vector)) { absorb(seen.current, subscribed.vector); step({ type: 'caught-up' }) }
+  }
+  /** Tries the entry that dropped, then the other entrances by last success; backs off when all fail. */
   function scheduleReconnect(immediate = false) {
     const target = reconnect.current
-    if (!target || reconnectTimer.current !== null) return
+    if (!target || reconnectTimer.current !== null || switching.current) return
+    const delay = immediate ? 0 : linkRef.current.kind === 'offline' ? linkRef.current.retryInMs : 1000
     reconnectTimer.current = setTimeout(async () => {
       reconnectTimer.current = null
       if (reconnect.current !== target) return
+      switching.current = true
+      step({ type: 'connect' })
+      let done = false
+      try { done = await reconnectThrough(target) } finally { switching.current = false }
+      if (done || reconnect.current !== target) return
+      step({ type: 'lost', reason: '所有访问地址都连不上。' })
+      setPhase('reconnecting'); scheduleReconnect()
+    }, delay)
+  }
+  async function reconnectThrough(target: Reconnect): Promise<boolean> {
+    if (target.entry.local) {
+      const local = identityRef.current && await localBrowserEntry(identityRef.current, null)
+      if (reconnect.current !== target) return true
+      if (!local || entryKey(local) !== entryKey(target.entry)) {
+        resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用邀请加入。')
+        return true
+      }
+    }
+    const list = target.entry.local ? [target.entry] : candidates(loadEntrances(target.networkId), target.entry)
+    for (const candidate of list) {
       let active: Session | null = null
       try {
-        if (target.entry.local) {
-          const local = identityRef.current && await localBrowserEntry(identityRef.current, null)
-          if (reconnect.current !== target) return
-          if (!local || entryKey(local) !== entryKey(target.entry)) {
-            resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用邀请加入。')
-            return
-          }
-        }
-        active = await open(target.entry, true)
-        const auth = await callSession(active, 'authenticate', { network_id: target.networkId })
-        if (record(auth).principal === null) throw new AuthenticationError(record(auth).revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
+        active = await open(candidate, true, list.length > 1 ? 5000 : 10000)
+        const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
+        if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
+        if (auth.principal === null) throw new Error('这个访问地址还没同步到这个浏览器。')
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
+        if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
+        return true
       } catch (cause) {
-        if (reconnect.current !== target) return
-        if (isResponseError(cause) || cause instanceof AuthenticationError) {
+        if (reconnect.current !== target) return true
+        if (candidate === target.entry && (isResponseError(cause) || cause instanceof AuthenticationError)) {
           resetConnection(); setPhase('unpaired')
           let detail = messageOf(cause)
           try { store('last-authenticated', null) } catch (storageError) { detail += ` ${messageOf(storageError)}` }
           setError(cause instanceof AuthenticationError ? detail : `无法恢复原来的连接。请检查设备后重新连接，或用加入链接加入。${detail}`)
-        } else if (active && session.current === active) active.channel.close()
-        else scheduleReconnect()
+          return true
+        }
+        // An entrance that cannot serve this browser yet is skipped; the next one gets its turn.
+        if (active && session.current === active) { generation.current += 1; session.current = null; active.channel.close() }
       }
-    }, immediate ? 0 : Math.min(1000 * 2 ** target.attempt++, 10000))
+    }
+    return false
   }
-  async function open(entryValue: ConnectionEntry, resuming = false) {
+  async function open(entryValue: ConnectionEntry, resuming = false, timeoutMs = 10000) {
     const parsed = parseEntry(entryValue)
     if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     try {
       const channel = await connectDevice(parsed, {
-        signal: controller.signal,
+        signal: controller.signal, timeoutMs,
         onEvent(value) {
           if (version !== generation.current || session.current?.generation !== version || !session.current.networkId) return
           if (!value || typeof value !== 'object' || Array.isArray(value)) return
@@ -237,7 +313,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           if (version !== generation.current) return
           generation.current += 1; session.current = null; releaseSensitive(); listeners.current.clear()
           if (reconnect.current) {
-            setPhase('reconnecting'); setError('连接已断开，正在重连。没确认的操作会保留，不会自动重发。')
+            if (!switching.current) step({ type: 'lost', reason: messageOf(reason) })
+            setPhase('reconnecting'); setError('连接已断开，正在重连。没确认的操作会保留，恢复后先确认结果再提交。')
             scheduleReconnect()
           } else {
             setReady(null); setDirectory(null); setJoins([]); setPhase('disconnected'); setError(messageOf(reason))
@@ -309,10 +386,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const entryId = validTarget(result.entry_id)
     if (entryId !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
     const route = connection.info.connection_entry ?? connection.entry
-    const origin = route.device_id === entryId ? route.address : connection.entry.address
-    const link = `${origin}/join#${ticketEncode(entryId, hex(secret))}`
+    // Any member Gateway forwards the join to this Node, so a public entrance beats the address in use.
+    const reachable = loadEntrances(connection.principal.network_id).filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0]
+    const origin = reachable?.gateway_url ?? (route.device_id === entryId ? route.address : connection.entry.address)
+    const entry = result.entry && typeof result.entry === 'object' ? record(result.entry) : {}
+    const relay = typeof entry.relay_url === 'string' ? entry.relay_url : undefined
+    const direct = array(entry.direct_addrs).filter((value): value is string => typeof value === 'string')
+    const link = `${origin}/join#${ticketEncode(entryId, hex(secret), relay, direct)}`
     secret.fill(0)
-    return { link, publicEntry: new URL(origin).protocol === 'https:' && !loopback(origin), expiresAt }
+    return { link, publicEntry: isPublicUrl(origin), expiresAt }
   }
   async function startApproval(joinId: string) {
     managing()
@@ -561,6 +643,31 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return () => { mounted = false; setupController.abort(); generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
+    // One tab per origin settles the outbox; a follower takes the leader's new entrance right away.
+    if (typeof BroadcastChannel === 'undefined' || !globalThis.navigator?.locks) return
+    leaderRef.current = false
+    const channel = joinTabs<TabMessage>('vibeface-tabs', {
+      lead() { leaderRef.current = true; return () => { leaderRef.current = false } },
+      message(message) {
+        for (const listener of tabListeners.current) listener(message)
+        const target = reconnect.current
+        if (message.type !== 'entrance' || !target || session.current || target.networkId !== message.networkId) return
+        if (reconnectTimer.current !== null) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null }
+        reconnect.current = { ...target, entry: message.entry }
+        scheduleReconnect(true)
+      },
+    })
+    tabChannel.current = channel
+    return () => { tabChannel.current = null; leaderRef.current = true; channel.close() }
+  }, [])
+  useEffect(() => {
+    if (link.kind !== 'online' || !link.catchingUp || !ready) return
+    const active = session.current
+    if (!active) return
+    const timer = setInterval(() => { void checkCaughtUp(active).catch(() => {}) }, 2000)
+    return () => clearInterval(timer)
+  }, [link, ready])
+  useEffect(() => {
     if (!joining || joining.status === 'joined') return
     const pending = joining, version = generation.current
     const timer = setInterval(() => { checkJoin().catch(cause => { if (joiningRef.current === pending && version === generation.current) setError(messageOf(cause)) }) }, 2000)
@@ -577,7 +684,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return () => { clearTimeout(timer); stop() }
   }, [ready])
   const value: DeviceContextValue = {
-    connectionGeneration: () => generation.current,
+    connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     connect, disconnect, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,

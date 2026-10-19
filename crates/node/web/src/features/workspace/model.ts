@@ -1,4 +1,4 @@
-import type { PendingMessage, TranscriptMessage } from "../chat/types"
+import type { TranscriptMessage } from "../chat/types"
 import type { ReplyStatus } from "../chat/types"
 import type {
   AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
@@ -140,12 +140,6 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     pending_checks: list(data.pending_checks).map(pendingCheck),
     local_node: text(data.local_node),
   }
-}
-export function parsePendingMessages(value: unknown): PendingMessage[] {
-  return list(value).map((item) => {
-    const data = record(item)
-    return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), entry_node: text(data.entry_node), report_results: data.report_results == null ? undefined : flag(data.report_results), rejected: data.rejected == null ? undefined : { entry_node: text(record(data.rejected).entry_node) } }
-  })
 }
 export function parseArtifactPage(value: unknown, hash: string, offset: number) {
   const data = record(value)

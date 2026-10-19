@@ -2,7 +2,8 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
 import { Skeleton, toast } from "@/components/app/kit"
@@ -170,13 +171,16 @@ function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; ic
 function ConnectionCapsule() {
   const workspace = useWorkspace()
   const device = useDevice()
+  const { link, entrances } = device
   const address = device.ready?.entry.address ?? ""
   const name = addressName(address)
-  const state: { label: string; icon: LucideIcon; tone: string } = !workspace.connectionOnline
-    ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
-    : workspace.writeNotice || workspace.data && workspace.incomplete
-      ? { label: "同步中", icon: RefreshCw, tone: "text-info" }
-      : { label: "在线", icon: Wifi, tone: "text-success" }
+  const state: { label: string; icon: LucideIcon; tone: string } = link.kind === "connecting"
+    ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
+    : !workspace.connectionOnline || link.kind === "offline"
+      ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
+      : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.data && workspace.incomplete
+        ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
+        : { label: "在线", icon: Wifi, tone: "text-success" }
   return <Popover.Root>
     <Popover.Trigger asChild>
       <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
@@ -186,10 +190,18 @@ function ConnectionCapsule() {
       </button>
     </Popover.Trigger>
     <Popover.Portal>
-      <Popover.Content side="top" align="start" sideOffset={6} className="z-50 grid w-64 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
+      <Popover.Content side="top" align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
         <p className="font-medium">访问地址</p>
         <p className="break-all text-muted-foreground">{address}</p>
-        <p className="flex items-center gap-1.5 text-success"><ShieldCheck aria-hidden="true" className="size-4" />端到端加密，已验证设备</p>
+        {link.kind === "offline" ? <p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
+          : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><ShieldCheck aria-hidden="true" className="size-4" />端到端加密，已验证设备</p> : null}
+        {entrances.length > 1 ? <>
+          <p className="mt-1 font-medium">可切换的访问地址</p>
+          <ul className="grid gap-1" aria-label="可切换的访问地址">{entrances.map((item) => <li key={item.device_id} className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 flex-1 truncate" title={item.gateway_url}>{addressName(item.gateway_url)}</span>
+            <span className="shrink-0 text-muted-foreground">{item.device_id === device.ready?.entry.device_id ? "当前" : item.public ? "公网" : "仅本机或局域网"}</span>
+          </li>)}</ul>
+        </> : null}
       </Popover.Content>
     </Popover.Portal>
   </Popover.Root>

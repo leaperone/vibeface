@@ -23,7 +23,6 @@ export function composerHint(input: Omit<SendGate, 'busy'>): string {
 export function prepareSend(input: {
   conversationId: string
   text: string
-  entryNode: string
   pending: PendingMessage | null
   reportResults?: boolean
 }): { ok: true; pending: PendingMessage; body: MessageRequest } | { ok: false; error: string } {
@@ -33,12 +32,9 @@ export function prepareSend(input: {
   if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId)) {
     return { ok: false, error: '上一条消息还没确认送达，先处理它再发新的。' }
   }
-  if (input.pending && input.pending.entry_node !== input.entryNode) {
-    return { ok: false, error: '上一条消息还没确认，要回到原来的设备上处理。' }
-  }
   const pending = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,
-    entry_node: input.entryNode, report_results: input.reportResults ?? true,
+    report_results: input.reportResults ?? true,
   }
   return { ok: true, pending, body: {
     conversation_id: pending.conversation_id, message_id: pending.message_id, text: pending.text,

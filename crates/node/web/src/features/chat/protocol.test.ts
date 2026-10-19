@@ -11,18 +11,17 @@ test('send waits for a loaded conversation', () => {
   assert.equal(composerHint(ready), '')
 })
 test('an explicit retry preserves the complete original message request', () => {
-  const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', entryNode: 'entry-a', pending: null })
+  const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', pending: null })
   assert.equal(first.ok, true)
   if (!first.ok) return
-  const retry = prepareSend({ conversationId: 'chat', text: '继续', entryNode: 'entry-a', pending: first.pending })
+  const retry = prepareSend({ conversationId: 'chat', text: '继续', pending: first.pending })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.deepEqual(retry.body, first.body)
-  assert.equal(retry.pending.entry_node, 'entry-a')
   assert.equal(retry.body.text, '继续')
-  assert.equal(prepareSend({ conversationId: 'chat', text: '另一句', entryNode: 'entry-a', pending: first.pending }).ok, false)
-  assert.equal(prepareSend({ conversationId: 'other-chat', text: '继续', entryNode: 'entry-a', pending: first.pending }).ok, false)
-  assert.equal(prepareSend({ conversationId: 'chat', text: '继续', entryNode: 'entry-b', pending: first.pending }).ok, false)
+  assert.equal(prepareSend({ conversationId: 'chat', text: '另一句', pending: first.pending }).ok, false)
+  assert.equal(prepareSend({ conversationId: 'other-chat', text: '继续', pending: first.pending }).ok, false)
+  assert.equal(prepareSend({ conversationId: 'chat', text: '继续', pending: first.pending }).ok, true, 'another entrance resends the same request')
 })
 
 test('Enter submits only after IME composition finishes and Shift Enter remains a newline', () => {
@@ -34,16 +33,16 @@ test('Enter submits only after IME composition finishes and Shift Enter remains 
   assert.equal(isSubmitKey({ ...enter, key: 'a' }), false)
 })
 test('invalid message content is rejected before a durable request is created', () => {
-  const input = { conversationId: 'chat', entryNode: 'entry-a', pending: null }
+  const input = { conversationId: 'chat', pending: null }
   assert.equal(prepareSend({ ...input, text: '  ' }).ok, false)
   assert.equal(prepareSend({ ...input, text: '中'.repeat(21846) }).ok, false)
   assert.equal(prepareSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
 })
 test('report results default on and survive retries; only the exact admission receipt settles a message', () => {
-  const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', entryNode: 'entry', pending: null, reportResults: true })
+  const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', pending: null, reportResults: true })
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
-  const retry = prepareSend({ conversationId: 'chat', text: '后台处理', entryNode: 'entry', pending: prepared.pending, reportResults: false })
+  const retry = prepareSend({ conversationId: 'chat', text: '后台处理', pending: prepared.pending, reportResults: false })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.deepEqual(retry.body, prepared.body)
