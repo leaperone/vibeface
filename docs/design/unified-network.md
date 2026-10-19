@@ -645,8 +645,12 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - `Attestation` 落在 `MessagePosted(user)`、`BotCreated`、`ApprovalAnswered`、`AutonomySet` 和 `NotificationAcked`。`WorkFinished` 的本人结清和 `ConversationOwner` 的本人签名推迟到第四期，与跨设备工作和调度切换一起做。
 - `/api/client` 只接通本 Node；目标是其他设备时回文本错误帧。跨入口转发随 iroh 在第三期实现，`verify-node.py --auto-route` 中的跨入口用例同期恢复。`network.rs` 和 `peer.rs` 保留到第三期。
 - 本机会话端口被占用时的提示为“端口 X 被占用，可用 --local-listen 更换”，公开端口为 `--listen`。
-- 链接状态机、IndexedDB outbox 和 Web Locks 主标签页模块已实现并有单元测试，第二步接入页面。service worker 与 manifest 已注册；未带哈希的外壳文件以 `no-cache` 提供。
-- 公网入口指引写在 `docs/node.md` 的“配置公网入口”，界面入口、二维码和“只能本机打开”提示在第二步接入页面。
+- service worker 与 manifest 已注册；未带哈希的外壳文件以 `no-cache` 提供。第一步写的链接状态机、IndexedDB outbox 和 Web Locks 主标签页模块没有接入页面，已删除：页面沿用原有的重连退避和“同一 `message_id` 先对账再原样重发”的待确认机制。多标签主从和通用 outbox 随第三期多入口切换再做。
+- 公网入口指引写在 `docs/node.md` 的“配置公网入口”。邀请没有公网 HTTPS 地址时不出二维码，提示“只能本机打开”并给“设置访问地址”；设备详情的访问地址项链接到该指引。
+- 页面按 `docs/design/web-ux.md` 4.2 节最终形态实现：新设备只确认名字，随后显示 6 位安全码和“等待批准”；管理端卡片显示“X 想加入”、安全码、“设为管理员”（仅浏览器）、“拒绝”和“一致，允许”。加入链接原文只在“详细信息”里。开始核对会把请求锁定给该管理员，所以只有发出链接的“添加设备”面板自动开始，其他管理页面需点“显示安全码”。Node 不经本机网页加入，改用 `vibeface join <链接>`，界面给出这条命令。
+- 已回答的审批从 Work 投影的 `answered_approvals` 读取（请求编号、类型、摘要和决定），替代 #64 的本机显示记录。审批表单带结构化的 `command`、`cwd`、`reason` 和 `files`。
+- Node 重启后本机会话的 cookie 失效，origin 不变；本机页面点“打开这台电脑”重新兑换。
+- 浏览器端到端验收用 Playwright 驱动真实 Chromium 和真实 Node 进程（夹具，无模型调用），覆盖建网、加入并授予管理、拒绝作废、撤销、根恢复、私钥不可导出、错误目标关闭连接、本机 origin 重启不变、Gateway 停止后从 service worker 打开且设备编号不变，以及 `/api/client` 跨源规则。承诺不匹配由 `verify-node.py --auto-route` 覆盖，网页无法构造。脚本未入库。
 
 **第三期：iroh 传输与版本向量同步。** 接入 `iroh` Endpoint、`Router`、5 个 ALPN 和 relay 访问控制，实现 `Hello`、`Pull`、`Have`、附件续传和 `vibeface/client/1` 密文转发。实现签名地址簿、`entrances`、按地址簿放行成员 Gateway 的 Origin，以及浏览器入口列表和自动切换（4.5 节）。入口切换依赖地址簿和多 Node 同步，所以放在本期。Node 经 `vibeface/join/1` 加入。删除 `network.rs`、`network/admission.rs`、`peer.rs` 和 `mdns-sd`。验收标准如下：
 
