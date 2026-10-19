@@ -275,7 +275,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function open(sourceValue: ConnectionSource, resuming = false) {
     const source = parseSource(sourceValue)
     const parsed = sourceEntry(source)
-    if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
+    if (!resuming) {
+      if (source.kind === 'peer') store('cluster-target', null)
+      resetConnection(); setPhase('connecting'); setEntry(parsed)
+    }
     else if (source.kind === 'cluster') setEntry(parsed)
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
@@ -324,7 +327,6 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
   }
   async function connect(candidate: ConnectionEntry) {
-    store('cluster-target', null)
     const active = await open({ kind: 'peer', entry: candidate })
     const request = scoped(active)
     let auth: unknown

@@ -157,7 +157,9 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
     verifiedView: () => signed.view,
     openPackage: async () => ({ clusterId: cluster, epoch: 1, payload: { genesis }, root: { publicKeyHex: () => publicKey, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ peerId: () => cluster, publicKeyHex: () => publicKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
-    sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {}, verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership) }),
+    sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {},
+    verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), createRecoveryCheckpoint: () => canonical({ epoch: 2 }) }),
+    verifyRecoveryResult: (auth: unknown) => ({ auth, epoch: 2 }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
@@ -460,6 +462,79 @@ test('Cluster candidates continue after a false Noise key and an unsynchronized 
 })
 
 const gatewayMember = (subject_id: string): Member => ({ subject_id, public_key: publicKey, kind: 'node', name: subject_id, node_roles: ['gateway', 'replica'], manage: false })
+
+for (const flow of ['pair', 'recovery']) for (const succeeds of [true, false]) test(`${succeeds ? 'successful' : 'failed'} ${flow} selection replaces the explicit Cluster target and preserves the authenticated refresh source`, async () => {
+  const app = deviceHarness(), restored = deviceHarness()
+  const previousEntry = { address: 'https://previous.example', peer_id: 'f'.repeat(64) }
+  const previousTarget = { kind: 'cluster', clusterId: 'e'.repeat(64), directories: ['wss://previous.example/socket'] } satisfies ClusterTarget
+  const previousRecent = { kind: 'cluster', target: previousTarget, path: { address: previousTarget.directories[0], peer_id: previousEntry.peer_id, mode: 'relay' }, clusterId: previousTarget.clusterId }
+  const request = { request_id: 'pair', invite_id: 'invite', capability: 'pair-capability', member: { subject_id: subject, public_key: publicKey, kind: 'client', name: 'browser', node_roles: [], manage: false }, nonce: 'nonce', proof: '' }
+  const payload = { version: 2, cluster_id: cluster, new_kind: 'client', manage: false, node_roles: [], expires_at_ms: Date.now() + 60000, invite_id: request.invite_id, inviter_subject_id: target, epoch: 1 }
+  const invitation = JSON.stringify({ url: entry.address, peer_id: target, invite: { invite: { payload }, capability: request.capability } })
+  try {
+    app.render(); await settle()
+    app.stored.set('vibeface.connections', JSON.stringify([previousEntry]))
+    app.stored.set('vibeface.cluster-target', JSON.stringify(previousTarget))
+    app.stored.set('vibeface.last-authenticated', JSON.stringify(previousRecent))
+    const pending = deferred(), heldMethod = flow === 'pair' ? 'prepare_pair_request' : 'recovery_context'
+    app.holds.set(heldMethod, pending)
+    if (flow === 'pair') {
+      const proposal = [request.request_id, request.invite_id, request.capability, request.member, request.nonce]
+      const review = { version: 2, invite_id: request.invite_id, cluster_id: cluster, inviter_subject_id: target, new_member: request.member, proposal_hash: createHash('sha256').update(canonical(proposal)).digest('hex'), parents: [], epoch: 1, expires_at_ms: payload.expires_at_ms }
+      const receipt = deferred(); app.holds.set('pair_request', receipt)
+      receipt.resolve({ request_id: request.request_id, review, signing: { domain: 'identity-pair-review', payload: canonical(review) } })
+      if (succeeds) pending.resolve({ request, signing: { domain: 'identity-pair', payload: canonical(proposal) } })
+    } else {
+      const challenge = { cluster_id: cluster, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+      const challengeResponse = deferred(); app.holds.set('recovery_challenge', challengeResponse)
+      challengeResponse.resolve({ challenge_id: challenge.challenge_id, challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
+      const recovered = deferred(); app.holds.set('recover', recovered)
+      recovered.resolve({ principal: { cluster_id: cluster }, state: { genesis } })
+      if (succeeds) pending.resolve({ state: { genesis }, view: membership })
+    }
+    const work = flow === 'pair'
+      ? app.render().pair(invitation, 'browser')
+      : app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })
+    if (succeeds) {
+      await work
+      assert.equal(app.stored.get('vibeface.cluster-target'), 'null')
+      assert.deepEqual(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? '{}'), previousRecent)
+      if (flow === 'pair') {
+        assert.equal(app.render().waiting?.entry.peer_id, target)
+        await app.render().acceptPair()
+      } else {
+        const review = app.render().review
+        assert.ok(review?.kind === 'recovery')
+        await app.render().confirmRecovery(review.members)
+      }
+      assert.equal(app.render().ready?.entry.peer_id, target)
+      assert.deepEqual(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? '{}'), { kind: 'peer', entry, clusterId: cluster })
+    } else {
+      const rejected = assert.rejects(work, /fixture unavailable/)
+      for (let tries = 0; tries < 100 && !app.calls.includes(heldMethod); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+      assert.ok(app.calls.includes(heldMethod))
+      pending.reject(new Error('fixture unavailable'))
+      await rejected
+      assert.equal(app.stored.get('vibeface.cluster-target'), 'null')
+      assert.deepEqual(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? '{}'), previousRecent)
+      assert.equal(app.render().ready, null)
+      assert.equal(app.calls.includes('subscribe'), false)
+    }
+    for (const [key, value] of app.stored) restored.stored.set(key, value)
+    restored.render(); await settle()
+    if (succeeds) {
+      assert.equal(restored.calls.includes('discover'), false)
+      assert.equal(restored.sockets.length, 0)
+      assert.deepEqual(JSON.parse(JSON.stringify(restored.render().entries)), [previousEntry, entry])
+      assert.equal(restored.stored.get('vibeface.cluster-target'), 'null')
+    } else {
+      assert.deepEqual(JSON.parse(restored.stored.get('vibeface.cluster-target') ?? '{}'), previousTarget)
+      assert.deepEqual(JSON.parse(restored.stored.get('vibeface.last-authenticated') ?? '{}'), previousRecent)
+      assert.equal(restored.calls.includes('discover'), true)
+      assert.equal(restored.sockets.length, 0)
+    }
+  } finally { app.close(); restored.close() }
+})
 
 test('a persisted Cluster source refreshes through its exact mode before discovery', async () => {
   const first = deviceHarness(), restored = deviceHarness()

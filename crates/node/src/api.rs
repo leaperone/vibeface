@@ -357,7 +357,7 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"cluster_id":cluster_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"cluster_id":cluster_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true}}),
     ))
 }
 
@@ -404,7 +404,7 @@ async fn local_exchange(
             &input.public_key,
         )
         .map_err(|_| ApiError::auth())?;
-    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true},"cluster_id":state.genesis.cluster_id})).into_response();
+    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true},"cluster_id":state.genesis.cluster_id})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(

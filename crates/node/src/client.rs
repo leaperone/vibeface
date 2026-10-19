@@ -834,7 +834,7 @@ fn connection_entry(node: &Runtime) -> Result<Value> {
     } else {
         url.origin().ascii_serialization()
     };
-    Ok(json!({"address":address,"peer_id":node.identity.peer_id()?,"relay":relay.is_some()}))
+    Ok(json!({"address":address,"peer_id":node.identity.peer_id()?}))
 }
 async fn current_principal(node: &Runtime, session: &Session) -> Result<BrowserPrincipal> {
     match &session.source {
@@ -1253,11 +1253,14 @@ mod tests {
         let mut node = Runtime::open(&dir).await?;
         node.config.network.bootstrap_urls = vec!["wss://relay.example/custom/ws".into()];
         assert_eq!(
-            connection_entry(&node)?["address"],
-            "wss://relay.example/custom/ws"
+            connection_entry(&node)?,
+            json!({"address":"wss://relay.example/custom/ws","peer_id":node.identity.peer_id()?})
         );
         node.config.network.bootstrap_urls.clear();
-        assert_eq!(connection_entry(&node)?["address"], node.config.public_url);
+        assert_eq!(
+            connection_entry(&node)?,
+            json!({"address":node.config.public_url,"peer_id":node.identity.peer_id()?})
+        );
         let admin = LocalIdentity::generate();
         let mut state = ClusterState::new(Genesis::create(
             &LocalIdentity::generate(),
@@ -1365,6 +1368,7 @@ mod tests {
             assert_eq!(http.get(format!("http://{listen}/api/local/info")).header("Forwarded", "for=127.0.0.1;host=localhost").send().await?.status(), 404);
             let info: Value = http.get(format!("{}/api/local/info", launcher.origin)).send().await?.error_for_status()?.json().await?;
             assert_eq!(info["has_session"], false);
+            assert_eq!(info["entry"], json!({"address":launcher.origin,"peer_id":launcher.peer_id,"local":true}));
             let denied = http.post(format!("{}/api/local/launch", launcher.origin)).header("Origin", &launcher.origin).header("X-Forwarded-For", "127.0.0.1").json(&json!({})).send().await?;
             assert_eq!(denied.status(), 401);
             assert!(!denied.headers().contains_key("set-cookie"));
@@ -1378,6 +1382,8 @@ mod tests {
                 let cookie = exchanged.headers().get("set-cookie").context("session cookie missing")?.to_str()?;
                 assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict") && cookie.contains("Path=/api/local"));
                 cookies.push(cookie.split(';').next().context("session cookie missing")?.to_owned());
+                let exchanged: Value = exchanged.json().await?;
+                assert_eq!(exchanged["entry"], json!({"address":launcher.origin,"peer_id":launcher.peer_id,"local":true}));
                 assert_eq!(http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.status(), 401);
             }
             let second_dir = dir.join("second");
@@ -1397,9 +1403,11 @@ mod tests {
             let exchanged = http.post(format!("{}/api/local/exchange", second_launcher.origin)).header("Origin", &second_launcher.origin).json(&input).send().await?.error_for_status()?;
             let second_cookie = exchanged.headers().get("set-cookie").context("second session cookie missing")?.to_str()?;
             assert!(second_cookie.contains("HttpOnly") && second_cookie.contains("SameSite=Strict") && second_cookie.contains("Path=/api/local"));
-            let second_cookie = second_cookie.split(';').next().context("second session cookie missing")?;
+            let second_cookie = second_cookie.split(';').next().context("second session cookie missing")?.to_owned();
+            let exchanged: Value = exchanged.json().await?;
+            assert_eq!(exchanged["entry"], json!({"address":second_launcher.origin,"peer_id":second_launcher.peer_id,"local":true}));
             let mut jar = std::collections::BTreeMap::new();
-            for cookie in [cookies[0].as_str(), second_cookie] {
+            for cookie in [cookies[0].as_str(), second_cookie.as_str()] {
                 let (name, value) = cookie.split_once('=').context("invalid session cookie")?;
                 jar.insert(name, value);
             }
@@ -1419,6 +1427,7 @@ mod tests {
             let mut second_local = connect_local(&second_launcher.origin, &second_launcher.peer_id, &shared_cookies, &browser).await?;
             assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
             let mut local = connect_local(&launcher.origin, &launcher.peer_id, &shared_cookies, &browser).await?;
+            assert_eq!(local.call("info", json!({})).await?["connection_entry"], json!({"address":node.config.public_url,"peer_id":launcher.peer_id}));
             let auth = local.call("authenticate", json!({})).await?;
             assert_eq!(auth["principal"]["source"], "local_session");
             assert_eq!(auth["principal"]["can_manage"], false);
