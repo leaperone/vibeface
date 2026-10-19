@@ -2597,6 +2597,8 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
 
     name = "chat-native-interrupt"
     directory, task, native, running = start(name)
+    wait_for("third entry receives the original task before interrupt", lambda:
+        agent_task_snapshot(c.client, name, task["task_ref"]))
     reply = c.client.rpc("native_interrupt", conversation_id=name, work_id=native["work_id"], target_node=b.peer_id)
     require(reply["interrupt_requested"] and not reply["confirmed"], "interrupt admission is distinct from native terminal confirmation")
     wait_for("native interrupted event confirms the exact original turn", lambda:
