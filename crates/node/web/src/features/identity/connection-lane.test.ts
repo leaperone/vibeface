@@ -84,7 +84,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = new Map<string, string>(), calls: string[] = []
   const discovery: { records: { peerId: string; publicKey: string; expiresAt: number; entries: ConnectionEntry[] }[]; signals: AbortSignal[]; rejected: Set<string> } = { records: [], signals: [], rejected: new Set() }
-  const signed = { view: membership }
+  const signed: { view: MembershipView; mergeError?: Error } = { view: membership }
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
   const localEntry = { address: 'https://node.example', peer_id: target, relay: false, local: true }
@@ -142,7 +142,7 @@ function deviceHarness({ pairing = false, bootstrap = false, saved = false, loca
   }
   let verifications = 0, released = 0
   const secure = {
-    mergeMembership: (state: unknown) => ({ state: state ?? { genesis }, view: signed.view }),
+    mergeMembership: (state: unknown) => { if (signed.mergeError) throw signed.mergeError; return { state: state ?? { genesis }, view: signed.view } },
     authorizeMembership: () => { if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); return { manage: false } },
     MembershipRevokedError: class extends Error {},
     verifyAuthentication: () => { verifications++; if (signed.view.revoked.includes(subject)) throw new secure.MembershipRevokedError('signed revocation'); return { auth: { local_auto_access: true }, principal: { source: local ? 'local_session' : 'membership', cluster_id: cluster, subject_id: subject, epoch: 1, can_manage: false }, view: signed.view } },
@@ -356,6 +356,26 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
   } finally { app.close() }
 })
 
+for (const reason of ['recovery epoch rollback rejected', 'conflicting recovery checkpoint']) test(`recovery stops before confirmation when known membership rejects ${reason}`, async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    const known = JSON.stringify({ genesis, checkpoint: { epoch: 3 } })
+    app.stored.set(`vibeface.cluster-state.${cluster}`, known)
+    app.signed.mergeError = new Error(reason)
+    const challenge = { cluster_id: cluster, owner_public_key: publicKey, subject_id: subject, target_peer_id: target, challenge_id: 'challenge', genesis_hash: createHash('sha256').update(canonical(genesis)).digest('hex'), expires_at_ms: Date.now() + 60000, nonce: 'e'.repeat(64) }
+    const challengeHold = deferred(); app.holds.set('recovery_challenge', challengeHold)
+    challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
+    const context = deferred(); app.holds.set('recovery_context', context)
+    context.resolve({ state: { genesis }, view: membership })
+    await assert.rejects(app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry }), new RegExp(reason))
+    assert.equal(app.render().review, null)
+    assert.equal(app.stored.get(`vibeface.cluster-state.${cluster}`), known)
+    assert.equal(app.calls.filter(method => ['prepare_recovery', 'recover', 'subscribe'].includes(method)).length, 0)
+    assert.equal(app.released(), 1)
+  } finally { app.close() }
+})
+
 test('granted pairing restores only verified authentication and subscription, and disconnect cancels retry', async () => {
   const app = deviceHarness({ pairing: true })
   try {
@@ -536,13 +556,22 @@ test('Cluster discovery verifies signed records and limits source and path budge
   const repeatedPeer = createHash('sha256').update(Buffer.from(repeatedKey, 'hex')).digest('hex')
   const issued = Math.floor(Date.now() / 1000)
   for (const [index, ttl] of [30, 120].entries()) {
-    const record = { peer_id: repeatedPeer, public_key: repeatedKey, cluster: { cluster_id: cluster, services: ['peer', 'client'] }, direct_urls: [], relay_urls: [], issued_at: issued, expires_at: issued + ttl, signature: '' }
+    const record = { peer_id: repeatedPeer, public_key: repeatedKey, cluster: { cluster_id: cluster, services: ['peer', 'client'] }, direct_urls: ['wss://direct0.example/socket', 'wss://direct1.example/socket', 'wss://direct2.example/socket'], relay_urls: [], issued_at: issued, expires_at: issued + ttl, signature: '' }
     const hash = createHash('sha256').update(canonical(record)).digest('hex')
     record.signature = signBytes(null, Buffer.from(`vibeface:message:v1:reachability-v2:${hash}`), repeated.privateKey).toString('hex')
     pages[index][0] = record
   }
   const merged = await transport.discoverCluster({ ...target, directories: sources.slice(0, 2) })
   assert.equal(merged.find((record: { peerId: string }) => record.peerId === repeatedPeer)?.expiresAt, issued + 30)
+  const visited = new Set<string>()
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const round = await transport.discoverCluster({ ...target, directories: sources.slice(0, 2) }, { trustedPeers: [repeatedPeer], attempt })
+    const candidate = round.find((record: { peerId: string }) => record.peerId === repeatedPeer)
+    assert.ok(candidate)
+    assert.ok(candidate.entries.length <= 2)
+    for (const entry of candidate.entries) visited.add(entry.address)
+  }
+  assert.deepEqual([...visited].sort(), [...sources.slice(0, 2), ...pages[0][0].direct_urls].sort())
   assert.equal(transport.validEndpoint(sources[0]), sources[0])
   const record = pages[0][0]
   await assert.rejects(transport.clusterRecord(record, 'e'.repeat(64)), /集群/)

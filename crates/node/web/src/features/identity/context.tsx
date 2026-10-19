@@ -4,7 +4,7 @@ import { connectDevice, discoverCluster, initClient, readInvitation, signClient,
 import type { DeviceChannel } from '../../../transport.js'
 import {
   array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
-  parseClusterTarget, parseMember, parsePairReceipt, parseReview, parseSigning, parseView, record, same, signingPayload, text,
+  parseClusterTarget, parseMember, parsePairReceipt, parseReview, parseSigning, record, same, signingPayload, text,
 } from '@/lib/node'
 import type { ClientPrincipal, ClusterTarget, ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
 import { shouldAutoConnect } from './connection-lane'
@@ -366,7 +366,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (recent && gateway && await candidate(recent.entry, gateway.public_key)) return
       if (reconnect.current !== attempt) throw changed()
       connecting.current = controller
-      const records = await discoverCluster(target, { signal: controller.signal, trustedPeers: gateways.map(member => member.subject_id) })
+      const records = await discoverCluster(target, { signal: controller.signal, trustedPeers: gateways.map(member => member.subject_id), attempt: attempt.attempt })
       for (const record of records) for (const entry of record.entries) {
         if (await candidate(entry, record.publicKey, record.expiresAt)) return
       }
@@ -548,9 +548,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const result = record(await request('recovery_context', { challenge_id: challenge.challenge_id, signature: proof, recovery_epoch: opened.epoch, ...(!active.info.initialized ? { state: { genesis: opened.payload.genesis, checkpoint: null, events: [] }, capability } : {}) }))
       if (session.current !== active || active.generation !== generation.current) throw changed()
       if (!same(record(result.state).genesis, opened.payload.genesis)) throw new Error('恢复目标的创世授权与恢复包不一致。')
-      verified = verifyState(result.state, opened.clusterId, opened.root.publicKeyHex())
-      const view = parseView(JSON.parse(verified.viewJson()))
-      if (!same(result.view, view)) throw new Error('恢复目录与已签名的成员记录不一致。')
+      const reported = verifiedView(result.state, opened.clusterId, opened.root.publicKeyHex())
+      if (!same(result.view, reported)) throw new Error('恢复目录与已签名的成员记录不一致。')
+      const merged = rememberMembership(result.state, opened.clusterId)
+      verified = verifyState(merged.state, opened.clusterId, opened.root.publicKeyHex())
+      const view = merged.view
       const members = view.members.filter(member => !view.revoked.includes(member.subject_id) && member.subject_id !== own.peerId)
       if (!members.some(member => member.subject_id === active.entry.peer_id)) members.push({ subject_id: active.entry.peer_id, public_key: active.info.public_key, kind: 'node', name: `恢复入口 ${active.entry.peer_id.slice(0, 10)}`, node_roles: [...active.info.roles].sort(), manage: false })
       const newManager: Member = { subject_id: own.peerId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true }
@@ -570,6 +572,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             const prepared = await request('prepare_recovery', { challenge_id: challenge.challenge_id, members: selected })
             if (released || !verified) throw changed()
             const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, JSON.stringify(selected), opened.epoch, JSON.stringify(prepared)))
+            mergeMembership({ genesis: opened.payload.genesis, checkpoint, events: [] }, opened.clusterId, load(`cluster-state.${opened.clusterId}`))
             const authValue = await request('recover', { challenge_id: challenge.challenge_id, checkpoint, ...(!active.info.initialized ? { state: result.state, capability } : {}) })
             if (released) throw new Error('恢复授权已提交，但本地恢复已取消。请重新连接核对授权，并使用原恢复包。')
             const { auth, epoch } = verifyRecoveryResult(authValue, { clusterId: opened.clusterId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint, manager: newManager })

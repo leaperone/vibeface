@@ -1102,7 +1102,7 @@ fn client_endpoint(value: &str) -> Result<String> {
         websocket || matches!(url.path(), "/" | "/api/network/ws"),
         "client URL must be a node base URL or cluster endpoint"
     );
-    if !websocket || url.path() == "/" {
+    if !websocket {
         url.set_path("/api/network/ws");
     }
     Ok(url.into())
@@ -1211,6 +1211,21 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_urls_preserve_websocket_endpoints() {
+        for endpoint in [
+            "ws://relay.test/",
+            "wss://relay.test/",
+            "wss://relay.test/custom/ws",
+        ] {
+            assert_eq!(client_endpoint(endpoint).unwrap(), endpoint);
+        }
+        assert_eq!(
+            client_endpoint("https://relay.test/").unwrap(),
+            "wss://relay.test/api/network/ws"
+        );
+    }
 
     #[tokio::test]
     async fn gateway_membership_and_configuration_are_required_for_browser_access() -> Result<()> {

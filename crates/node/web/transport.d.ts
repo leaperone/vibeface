@@ -16,7 +16,7 @@ export type ClusterCandidate = {
   expiresAt: number
   entries: { address: string; peer_id: string; relay: boolean }[]
 }
-export function discoverCluster(target: { clusterId: string; directories: string[] }, options?: { signal?: AbortSignal; trustedPeers?: string[] }): Promise<ClusterCandidate[]>
+export function discoverCluster(target: { clusterId: string; directories: string[] }, options?: { signal?: AbortSignal; trustedPeers?: string[]; attempt?: number }): Promise<ClusterCandidate[]>
 export function validTarget(value: unknown): string
 export function validEndpoint(value: string): string
 export function readInvitation(value: string): unknown

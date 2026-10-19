@@ -79,7 +79,7 @@ function queryCluster(address, clusterId, signal) {
   });
 }
 
-export async function discoverCluster(target, { signal, trustedPeers = [] } = {}) {
+export async function discoverCluster(target, { signal, trustedPeers = [], attempt = 0 } = {}) {
   const clusterId = validTarget(target.clusterId);
   if (!Array.isArray(target.directories) || !target.directories.length || target.directories.length > 8) throw new Error("填写 1 至 8 个已知发现服务。");
   const sources = [...new Set(target.directories.map(validEndpoint))];
@@ -110,9 +110,12 @@ export async function discoverCluster(target, { signal, trustedPeers = [] } = {}
     candidate.expiresAt = Math.min(candidate.expiresAt, record.expiresAt);
     const paths = [{ address: sources[source], peer_id: record.peerId, relay: true }];
     if (trustedPeers.includes(record.peerId)) paths.push(...record.direct.map(address => ({ address, peer_id: record.peerId, relay: false })));
-    for (const entry of paths) if (candidate.entries.length < 2 && !candidate.entries.some(item => item.address === entry.address && item.relay === entry.relay)) candidate.entries.push(entry);
+    for (const entry of paths) if (!candidate.entries.some(item => item.address === entry.address && item.relay === entry.relay)) candidate.entries.push(entry);
   }
-  return [...peers.values()];
+  return [...peers.values()].map(candidate => {
+    const start = attempt % candidate.entries.length;
+    return { ...candidate, entries: [...candidate.entries.slice(start), ...candidate.entries.slice(0, start)].slice(0, 2) };
+  });
 }
 
 export function readInvitation(value) {

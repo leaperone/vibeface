@@ -533,7 +533,7 @@ fn network_url(value: &str) -> Result<String> {
     };
     url.set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
-    if !websocket || url.path() == "/" {
+    if !websocket {
         url.set_path("/api/network/ws");
     }
     Ok(url.to_string())
@@ -1407,6 +1407,11 @@ mod tests {
 
     #[test]
     fn network_urls_normalize_without_accepting_credentials() {
+        assert_eq!(
+            network_url("wss://relay.test/").unwrap(),
+            "wss://relay.test/"
+        );
+        assert_eq!(network_url("ws://relay.test/").unwrap(), "ws://relay.test/");
         assert_eq!(
             network_url("wss://relay.test/custom/ws").unwrap(),
             "wss://relay.test/custom/ws"
