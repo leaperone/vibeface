@@ -1663,6 +1663,10 @@ impl NetworkHub {
         }
     }
 
+    pub(crate) async fn bootstrap_url(&self) -> Option<String> {
+        self.state.lock().await.bootstrap_urls.first().cloned()
+    }
+
     pub(crate) async fn validate_bootstrap(&self, url: &str) -> Result<()> {
         self.state.lock().await.check_bootstrap(url).map(|_| ())
     }

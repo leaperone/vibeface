@@ -101,6 +101,7 @@ pub async fn run(
         _ => anyhow::bail!("unknown management SDK"),
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
+    let manager_settings = serde_json::to_value(&settings)?;
     let network = access.network_id.clone();
     let target = node.identity.peer_id()?;
     let claimed = {
@@ -194,7 +195,7 @@ pub async fn run(
         node.seal_manager_tools(&attempt.id).await?;
         tools_fenced = true;
         node.store.lock().await.local_set(&network, &format!("sdk-returned:v1:{}",attempt.id),
-            &json!({"sdk_returned":true,"output":result.output,"session_id":result.session_id,"finalization_started":false}))?;
+            &json!({"sdk_returned":true,"output":result.output,"session_id":result.session_id,"manager":manager_settings,"finalization_started":false}))?;
         let works = node.wait_native_work(&network,&conversation,&trigger,&attempt.id).await?;
         let children = if job.kind == TriggerKind::AgentTask { node.child_agent_tasks(&network,&conversation,&trigger).await? } else { Vec::new() };
         let terminal = coordinated_outcome(&works,&children);
@@ -680,11 +681,18 @@ async fn summarize_work(
     }).await
 }
 
+fn recovery_settings(
+    marker: &Value,
+    fallback: Option<&crate::config::ManagerSettings>,
+) -> Result<Option<crate::config::ManagerSettings>> {
+    match marker.get("manager") {
+        Some(settings) => Ok(Some(serde_json::from_value(settings.clone())?)),
+        None => Ok(fallback.cloned()),
+    }
+}
+
 pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
     let local_settings = node.settings_snapshot();
-    let Some(settings) = local_settings.manager.as_ref() else {
-        return Ok(());
-    };
     let target = node.identity.peer_id()?;
     let networks = node.store.lock().await.networks()?;
     for network in networks {
@@ -733,7 +741,10 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 let Some(session) = marker["session_id"].as_str() else {
                     continue;
                 };
-                mark_finalization_started(&node, &network, &attempt.id).await?;
+                let Some(settings) = recovery_settings(&marker, local_settings.manager.as_ref())?
+                else {
+                    continue;
+                };
                 let config = ManagerConfig {
                     kind: match settings.provider.as_str() {
                         "codex_sdk" => ManagerKind::CodexSdk,
@@ -750,6 +761,7 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                     codex_sdk_script: settings.codex_sdk_script.clone(),
                     ..ManagerConfig::default()
                 };
+                mark_finalization_started(&node, &network, &attempt.id).await?;
                 let (_cancel, receiver) = tokio::sync::watch::channel(false);
                 let result = summarize_work(
                     &node,
@@ -794,6 +806,32 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::model::{Event, MissingDependencies, WIRE_VERSION};
+
+    #[test]
+    fn recovery_keeps_attempt_settings_after_manager_changes_or_disabling() -> Result<()> {
+        let original = json!({
+            "provider":"codex_sdk", "workspace":"/original/workspace", "model":"original-model",
+            "cursor_sdk_bin":"original-cursor", "node_bin":"original-node", "codex_sdk_script":"original-script"
+        });
+        let marker = json!({"manager":original,"session_id":"original-session"});
+        let changed: crate::config::ManagerSettings = serde_json::from_value(json!({
+            "provider":"cursor_sdk", "workspace":"/new/workspace", "model":"new-model",
+            "cursor_sdk_bin":"new-cursor", "node_bin":"new-node", "codex_sdk_script":"new-script"
+        }))?;
+        for fallback in [Some(&changed), None] {
+            assert_eq!(
+                serde_json::to_value(recovery_settings(&marker, fallback)?)?,
+                original
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(recovery_settings(&json!({}), Some(&changed))?)?,
+            serde_json::to_value(&changed)?
+        );
+        assert!(recovery_settings(&json!({}), None)?.is_none());
+        assert!(recovery_settings(&json!({"manager":null}), Some(&changed)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn recovery_waits_for_pending_children_even_after_a_native_failure() {

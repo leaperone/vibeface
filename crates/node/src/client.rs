@@ -330,7 +330,7 @@ async fn dispatch(
     };
     match method {
         "info" => Ok(
-            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node)?}),
+            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
         ),
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
@@ -855,9 +855,9 @@ async fn current_view(node: &Runtime, session: &Session) -> Result<Authorization
     );
     Ok(view)
 }
-fn connection_entry(node: &Runtime) -> Result<Value> {
-    let relay = node.config.network.bootstrap_urls.first();
-    let mut url = reqwest::Url::parse(relay.unwrap_or(&node.config.public_url))?;
+async fn connection_entry(node: &Runtime) -> Result<Value> {
+    let entry = node.network.bootstrap_url().await;
+    let mut url = reqwest::Url::parse(entry.as_deref().unwrap_or(&node.config.public_url))?;
     let scheme = match url.scheme() {
         "ws" => "http",
         "wss" => "https",
@@ -1319,6 +1319,18 @@ mod tests {
             );
         }
         let mut manager_session = session(&admin)?;
+        assert_eq!(
+            dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
+            json!({"address":"http://127.0.0.1:4790","peer_id":node.identity.peer_id()?})
+        );
+        node.network
+            .add_bootstrap("wss://relay.example/custom-route")
+            .await?;
+        assert!(node.config.network.bootstrap_urls.is_empty());
+        assert_eq!(
+            dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
+            json!({"address":"https://relay.example","peer_id":node.identity.peer_id()?})
+        );
         let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
         assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
         let before = std::fs::read(dir.join("config.json"))?;

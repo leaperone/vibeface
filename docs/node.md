@@ -172,7 +172,7 @@ Node 可启用局域网发现，从候选地址找到已知 Peer ID。公网发�
 ./vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
 ```
 
-参数可重复，最多指定 8 个入口。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点。URL 不接受凭证、查询参数、片段或其他路径，程序没有内置的公共入口。
+参数可重复，最多指定 8 个入口。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点。URL 不接受凭证、查询参数或片段。HTTP(S) 仅接受根路径或 `/api/network/ws`，WS(S) 保留显式的非根路径，程序没有内置的公共入口。
 
 首次直接启动或显式 `init` 会保存传入的 URL。已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写原配置与身份；省略参数时沿用配置。`serve` 始终要求已初始化的数据目录。使用子命令时，将 `--bootstrap-url` 写在子命令后。入口提供路由和中继预约，设备仍须获得个人网络授权。
 

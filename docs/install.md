@@ -117,7 +117,7 @@ vibeface serve --bootstrap-url wss://relay.example/api/network/ws
 vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
 ```
 
-这三种命令分别使用，可重复 `--bootstrap-url` 指定多个入口，最多 8 个。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点，URL 不接受凭证、查询参数、片段或其他路径。程序不内置公共入口。首次直接启动和显式 `init` 将传入的 URL 保存到配置；已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写配置或身份。省略该参数时使用原配置。更多说明见[发现与公共中继](node.md#发现与公共中继)。
+这三种命令分别使用，可重复 `--bootstrap-url` 指定多个入口，最多 8 个。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点，URL 不接受凭证、查询参数或片段。HTTP(S) 仅接受根路径或 `/api/network/ws`，WS(S) 保留显式的非根路径。程序不内置公共入口。首次直接启动和显式 `init` 将传入的 URL 保存到配置；已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写配置或身份。省略该参数时使用原配置。更多说明见[发现与公共中继](node.md#发现与公共中继)。
 
 ## 用 CLI 管理后台服务
 

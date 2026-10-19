@@ -84,7 +84,7 @@
 
 `/api/local/setup` 要求正文为 JSON 空对象 `{}`。全部本机设置及加入路径要求实际 TCP 来源为 loopback、Host 为允许的字面 localhost 或 loopback 地址，且 Origin 与该入口完整一致。不接受 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP` 请求头，`0.0.0.0`、`::` 和公网入口不能使用。响应禁止缓存，初始化材料不进入公开的 `/api/info`。
 
-未初始化时返回 `{ kind: "uninitialized", invitation: { url, peer_id, capability } }`，其中一次性能力仍由原有签名建网或恢复协议消耗。已有网络时返回 `{ kind: "initialized", entry: { address, peer_id, relay: false }, local_launch?: { url, peer_id, token } }`。先尝试原入口的签名身份；可选启动凭据仅用于本人明确选择本机自动访问时导航到独立回环入口，不自动切换浏览器来源。该响应不授予永久成员资格，也不重建个人网络。
+未初始化时返回 `{ kind: "uninitialized", invitation: { url, peer_id, capability } }`，其中一次性能力仍由原有签名建网或恢复协议消耗。已有网络时返回 `{ kind: "initialized", entry: { address, peer_id }, local_launch?: { url, peer_id, token } }`。先尝试原入口的签名身份；可选启动凭据仅用于本人明确选择本机自动访问时导航到独立回环入口，不自动切换浏览器来源。该响应不授予永久成员资格，也不重建个人网络。
 
 节点加入的响应状态为 `idle`、`review`、`pending`、`joined` 或 `uncertain`。`review` 与 `pending` 带 `request_id`、现有 `PairReview` 及其 canonical JSON 的 SHA256 `review_hash`。接受需要明确提交同一编号与 hash，原网络的管理客户端仍须批准。`joined` 只表示 Node 入网，不授予浏览器客户端权限。未知结果先查 `status`，不重新创建请求身份。
 
