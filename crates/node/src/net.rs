@@ -6,13 +6,13 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::memory::MemoryLookup,
-    endpoint::{Connection, ReadExactError, RecvStream, SendStream, presets},
+    endpoint::{BindOpts, Connection, ReadExactError, RecvStream, SendStream, presets},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -219,15 +219,22 @@ impl Net {
             .alpns(ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
-        if config.relay_paths_only {
-            builder = builder.clear_ip_transports();
-        } else {
-            let bind = config.bind.unwrap_or_else(|| {
-                SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), listen_port)
-            });
-            builder = builder
-                .bind_addr(bind)
-                .map_err(|error| anyhow!("invalid QUIC bind address: {error}"))?;
+        // iroh starts with wildcard sockets on random ports; replace them so a configured
+        // address is the only one, and the default uses the listen port.
+        builder = builder.clear_ip_transports();
+        if !config.relay_paths_only {
+            let invalid = |error| anyhow!("invalid QUIC bind address: {error}");
+            builder = match config.bind {
+                Some(bind) => builder.bind_addr(bind).map_err(invalid)?,
+                None => builder
+                    .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listen_port))
+                    .map_err(invalid)?
+                    .bind_addr_with_opts(
+                        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), listen_port),
+                        BindOpts::default().set_is_required(false),
+                    )
+                    .map_err(invalid)?,
+            };
         }
         let endpoint = builder
             .bind()
