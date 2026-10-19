@@ -312,6 +312,68 @@ mod tests {
 
     use super::*;
     #[test]
+    fn fixed_identity_preserves_disk_payload_and_event_bytes() -> Result<()> {
+        let identity: LocalIdentity = serde_json::from_value(
+            serde_json::json!({"secret_key_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"}),
+        )?;
+        assert_eq!(
+            serde_json::to_value(&identity)?,
+            serde_json::json!({"secret_key_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"})
+        );
+        assert_eq!(
+            identity.public_key_hex()?,
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        );
+        assert_eq!(
+            identity.peer_id()?,
+            "21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9"
+        );
+        assert_eq!(
+            identity.sign_payload("peer-request", b"challenge")?,
+            "1487b46cad694787ae3aaaa79f68e8f3932a5ed18a360c888b9ad63a39b275010eff517681ca97832b0ebc37ace5c272fac9061bc8044775b1c9cc55a5e66b00"
+        );
+        let event = identity.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: "11".repeat(32),
+            scope_id: "golden".into(),
+            author: identity.peer_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 42,
+            body: EventBody::ConversationCreated {
+                title: "golden".into(),
+            },
+            blobs: vec![],
+        })?;
+        assert_eq!(
+            event.canonical_body,
+            "{\"version\":1,\"network_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"scope_id\":\"golden\",\"author\":\"21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9\",\"sequence\":1,\"previous\":null,\"parents\":[],\"created_at_ms\":42,\"body\":{\"type\":\"conversation_created\",\"title\":\"golden\"},\"blobs\":[]}"
+        );
+        assert_eq!(
+            event.hash,
+            "59d582d9fc925aad678e08bf02312591c0093382b53638199ef2f179d6d59b88"
+        );
+        assert_eq!(
+            event.signature,
+            "fb0798a8f33e317e97c33435f3ae31f76489a1a25855650408886dcef2e5522bd1455f9cc7e1e3f455d9cb956547d1898b9ee9bff0e7c0017d8b67c7a72c4506"
+        );
+        verify_signed_event(
+            &"11".repeat(32),
+            &event,
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        )?;
+        verify_payload(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "peer-request",
+            b"challenge",
+            "1487b46cad694787ae3aaaa79f68e8f3932a5ed18a360c888b9ad63a39b275010eff517681ca97832b0ebc37ace5c272fac9061bc8044775b1c9cc55a5e66b00",
+        )?;
+        assert!(verify_payload("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "peer-request", b"tampered", "1487b46cad694787ae3aaaa79f68e8f3932a5ed18a360c888b9ad63a39b275010eff517681ca97832b0ebc37ace5c272fac9061bc8044775b1c9cc55a5e66b00").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
         let owner = LocalIdentity::generate();
         let revoked = LocalIdentity::generate();

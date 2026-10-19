@@ -1569,6 +1569,17 @@ mod tests {
             redacted,
             json!({"text": "prefix [redacted] [redacted]", "items": ["[redacted]"]})
         );
+        assert_eq!(
+            redact_progress(
+                json!({"abc": ["abcdef 密钥", null, true, 7]}),
+                &["", "abc", "abcdef", "密钥"]
+            ),
+            json!({"abc": ["[redacted]def [redacted]", null, true, 7]})
+        );
+        assert_eq!(
+            redact_progress(json!("abcdef"), &["abcdef", "abc"]),
+            json!("[redacted]")
+        );
     }
 
     #[test]
@@ -1648,10 +1659,14 @@ mod tests {
 
     #[test]
     fn text_delta_redaction_holds_partial_secrets_across_frames() {
-        for (secret, fragments) in [
-            ("sk-secret", vec!["prefix sk-", "sec", "ret suffix"]),
-            ("aba", vec!["a", "b", "a"]),
-            ("密钥", vec!["密", "钥"]),
+        for (secret, fragments, expected) in [
+            (
+                "sk-secret",
+                vec!["prefix sk-", "sec", "ret suffix"],
+                "prefix [redacted] suffix",
+            ),
+            ("aba", vec!["a", "b", "a"], "[redacted]"),
+            ("密钥", vec!["密", "钥"], "[redacted]"),
         ] {
             let mut pending = BTreeMap::new();
             let output: String = fragments
@@ -1667,8 +1682,7 @@ mod tests {
                         .to_owned()
                 })
                 .collect();
-            assert!(!output.contains(secret));
-            assert!(output.contains("[redacted]"));
+            assert_eq!(output, expected);
         }
     }
 
