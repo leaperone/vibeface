@@ -286,24 +286,23 @@ pub async fn run(
                 JobOutcome::Interrupted { .. }
             );
             // Stopping a reply ends only the management turn; native turns and Agent tasks keep their own tracking.
-            let terminal =
-                if (cancellation || cancelled_before_start) && tools_fenced {
-                    JobOutcome::Cancelled(
-                        if cancelled_before_start {
-                            "cancelled before the SDK start boundary"
-                        } else {
-                            "SDK confirmed cancellation; Node tools are fenced"
-                        }
-                        .into(),
-                    )
-                } else if uncertain || !tools_fenced || !work_confirmed {
-                    JobOutcome::Interrupted {
-                        detail: error.to_string(),
-                        process_unconfirmed: uncertain || !tools_fenced,
+            let terminal = if (cancellation || cancelled_before_start) && tools_fenced {
+                JobOutcome::Cancelled(
+                    if cancelled_before_start {
+                        "cancelled before the SDK start boundary"
+                    } else {
+                        "SDK confirmed cancellation; Node tools are fenced"
                     }
-                } else {
-                    JobOutcome::Failed(error.to_string())
-                };
+                    .into(),
+                )
+            } else if uncertain || !tools_fenced || !work_confirmed {
+                JobOutcome::Interrupted {
+                    detail: error.to_string(),
+                    process_unconfirmed: uncertain || !tools_fenced,
+                }
+            } else {
+                JobOutcome::Failed(error.to_string())
+            };
             let text = match terminal {
                 JobOutcome::Interrupted {
                     process_unconfirmed: true,
@@ -345,7 +344,11 @@ pub async fn run(
     final_result
 }
 
-fn process_recorder(node: &Arc<Runtime>, network: &str, attempt: &str) -> vibeface_bridge::agent::ProcessStarted {
+fn process_recorder(
+    node: &Arc<Runtime>,
+    network: &str,
+    attempt: &str,
+) -> vibeface_bridge::agent::ProcessStarted {
     let node = node.clone();
     let network = network.to_owned();
     let attempt = attempt.to_owned();
@@ -775,11 +778,14 @@ pub(crate) async fn settle_interrupted_jobs(node: Arc<Runtime>) -> Result<()> {
                     Some(marker) => recovery_settings(marker, local_settings.manager.as_ref())?,
                     None => None,
                 };
-                let kind = settings.as_ref().and_then(|settings| match settings.provider.as_str() {
-                    "codex_sdk" => Some(ManagerKind::CodexSdk),
-                    "cursor_sdk" => Some(ManagerKind::CursorSdk),
-                    _ => None,
-                });
+                let kind =
+                    settings
+                        .as_ref()
+                        .and_then(|settings| match settings.provider.as_str() {
+                            "codex_sdk" => Some(ManagerKind::CodexSdk),
+                            "cursor_sdk" => Some(ManagerKind::CursorSdk),
+                            _ => None,
+                        });
                 let (Some(session), Some(settings), Some(kind), false) = (
                     session,
                     settings,

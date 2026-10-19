@@ -493,8 +493,21 @@ impl Runtime {
                 };
                 for (scope, trigger, attempt) in abandoned {
                     self.fence_manager_attempt(&attempt).await?;
-                    self.store.lock().await.finish_job(&self.identity,&network,&scope,&local,&trigger,&attempt,
-                        JobOutcome::Interrupted { detail: "management consumer ended before a durable terminal outcome".into(), process_unconfirmed: true },vec![],now_ms())?;
+                    self.store.lock().await.finish_job(
+                        &self.identity,
+                        &network,
+                        &scope,
+                        &local,
+                        &trigger,
+                        &attempt,
+                        JobOutcome::Interrupted {
+                            detail: "management consumer ended before a durable terminal outcome"
+                                .into(),
+                            process_unconfirmed: true,
+                        },
+                        vec![],
+                        now_ms(),
+                    )?;
                     self.finish_manager_attempt(&attempt).await;
                     self.publish_changed(&network, &scope, &trigger);
                 }
@@ -1088,9 +1101,11 @@ impl Runtime {
             .context("scheduler omitted its pending checks")?;
         ensure!(
             checks.len() <= MAX_STATUS_JOBS
-                && checks.iter().all(|check| check.version == SCHEDULING_VERSION
-                    && check.conversation_id == entry.conversation_id
-                    && check.target_node == entry.target_node),
+                && checks
+                    .iter()
+                    .all(|check| check.version == SCHEDULING_VERSION
+                        && check.conversation_id == entry.conversation_id
+                        && check.target_node == entry.target_node),
             "scheduler pending checks do not match this conversation and target"
         );
         {

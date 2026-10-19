@@ -1201,11 +1201,14 @@ impl Store {
             &scheduler_key("job", &job.conversation_id, &job.target_node, &job.trigger),
         )?
         .context("interrupted task job is missing")?;
-        ensure!(current == *job, "interrupted task changed before publication");
+        ensure!(
+            current == *job,
+            "interrupted task changed before publication"
+        );
         if agent_messages::agent_result_published_from(&tx, network, job)?
-            || pending_checks_from(&tx, network)?
-                .iter()
-                .any(|check| check.trigger == job.trigger && check.conversation_id == job.conversation_id)
+            || pending_checks_from(&tx, network)?.iter().any(|check| {
+                check.trigger == job.trigger && check.conversation_id == job.conversation_id
+            })
         {
             return Ok(None);
         }
@@ -1975,7 +1978,14 @@ fn publish_scheduler_terminal_from(
         } => {
             interrupt_session(&mut session)?;
             if process_unconfirmed {
-                save_pending_check(connection, network, &job, &attempt, &detail, marker.created_at_ms)?;
+                save_pending_check(
+                    connection,
+                    network,
+                    &job,
+                    &attempt,
+                    &detail,
+                    marker.created_at_ms,
+                )?;
             }
             JobState::Interrupted { attempt, detail }
         }
@@ -2258,7 +2268,14 @@ fn recover_scheduler_session(
         }
         JobState::Running { .. } | JobState::Cancelling { .. } => {
             let detail = "Node restarted after the SDK start boundary; this call was not replayed";
-            save_pending_check(connection, network, &job, &attempt, detail, crate::runtime::now_ms())?;
+            save_pending_check(
+                connection,
+                network,
+                &job,
+                &attempt,
+                detail,
+                crate::runtime::now_ms(),
+            )?;
             job.state = JobState::Interrupted {
                 attempt,
                 detail: detail.into(),
@@ -2317,7 +2334,12 @@ fn save_pending_check(
     scheduler_save(
         connection,
         network,
-        &scheduler_key("pending", &job.conversation_id, &job.target_node, &job.trigger),
+        &scheduler_key(
+            "pending",
+            &job.conversation_id,
+            &job.target_node,
+            &job.trigger,
+        ),
         &PendingCheck {
             version: SCHEDULING_VERSION,
             check_id: PendingCheck::id(&attempt.id),
@@ -3103,7 +3125,10 @@ mod tests {
                     &target,
                     &first.hash,
                     &attempt,
-                    JobOutcome::Interrupted { detail: "cleanup must not erase the known reply".into(), process_unconfirmed: true },
+                    JobOutcome::Interrupted {
+                        detail: "cleanup must not erase the known reply".into(),
+                        process_unconfirmed: true
+                    },
                     vec![],
                     4
                 )
@@ -3258,7 +3283,10 @@ mod tests {
                     &target,
                     &message.hash,
                     &attempt,
-                    JobOutcome::Interrupted { detail: "failed cleanup".into(), process_unconfirmed: true },
+                    JobOutcome::Interrupted {
+                        detail: "failed cleanup".into(),
+                        process_unconfirmed: true
+                    },
                     vec![],
                     6
                 )
@@ -3586,8 +3614,8 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_recovery_interrupts_started_attempts_and_registers_one_pending_check()
-    -> Result<()> {
+    fn scheduler_recovery_interrupts_started_attempts_and_registers_one_pending_check() -> Result<()>
+    {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
         let target = owner.peer_id()?;

@@ -868,9 +868,11 @@ impl Runtime {
                 || matches!(job.state, JobState::Interrupted { .. })
             {
                 return Err(crate::manager::ManagerError {
-                    kind: crate::manager::ManagerFailure::Unknown, session_id: None,
+                    kind: crate::manager::ManagerFailure::Unknown,
+                    session_id: None,
                     message: "started work awaits reconciliation; nothing was replayed".into(),
-                }.into());
+                }
+                .into());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -1072,13 +1074,21 @@ impl Runtime {
         Ok(json!({"work_id":work.work_id,"interrupt_requested":true,"confirmed":false}))
     }
 
-    fn local_native_work(store: &Store, network: &str, scope: &str, work_id: &str) -> Result<NativeWork> {
+    fn local_native_work(
+        store: &Store,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+    ) -> Result<NativeWork> {
         let work: NativeWork = serde_json::from_value(
             store
                 .local_value(network, &key(work_id))?
                 .context("native work not found")?,
         )?;
-        ensure!(work.conversation_id == scope, "native work belongs to another conversation");
+        ensure!(
+            work.conversation_id == scope,
+            "native work belongs to another conversation"
+        );
         Ok(work)
     }
 
@@ -1117,7 +1127,10 @@ impl Runtime {
         state: NativeState,
         evidence: &str,
     ) -> Result<NativeWork> {
-        ensure!(state.terminal(), "a confirmed native outcome must be terminal");
+        ensure!(
+            state.terminal(),
+            "a confirmed native outcome must be terminal"
+        );
         let mut store = self.store.lock().await;
         let mut work = Self::local_native_work(&store, network, scope, work_id)?;
         ensure!(
@@ -1125,7 +1138,10 @@ impl Runtime {
             "only an unknown native turn needs confirmation"
         );
         work.state = state;
-        work.detail = format!("用户核对确认：{evidence}").chars().take(65536).collect();
+        work.detail = format!("用户核对确认：{evidence}")
+            .chars()
+            .take(65536)
+            .collect();
         work.sequence = work
             .sequence
             .checked_add(1)

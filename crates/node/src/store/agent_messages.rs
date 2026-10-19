@@ -1613,7 +1613,13 @@ mod tests {
         let mut store = Store::open(path)?;
         assert!(
             store
-                .reopen_interrupted_job(&network, "chat", &target_node, &task.hash, "another-attempt")
+                .reopen_interrupted_job(
+                    &network,
+                    "chat",
+                    &target_node,
+                    &task.hash,
+                    "another-attempt"
+                )
                 .is_err()
         );
         assert!(store.reopen_interrupted_job(

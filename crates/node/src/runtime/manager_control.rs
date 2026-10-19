@@ -1,5 +1,5 @@
-use super::{Access, Runtime};
 use super::native_observation::NativeState;
+use super::{Access, Runtime};
 use crate::{
     model::*,
     scheduling::{JobState, PendingCheck},
@@ -287,7 +287,9 @@ impl Runtime {
         if let Some(work_id) = check_id.strip_prefix("native:") {
             let work = self.reconcile_native_work(network, scope, work_id).await?;
             self.publish_changed(network, scope, &work.origin_trigger);
-            return Ok(json!({"check_id":check_id,"pending":work.state == NativeState::Unknown,"native_session":work}));
+            return Ok(
+                json!({"check_id":check_id,"pending":work.state == NativeState::Unknown,"native_session":work}),
+            );
         }
         let check = self.local_pending_check(network, scope, check_id).await?;
         let processes = process_groups(&check.process_groups).await;
@@ -297,9 +299,11 @@ impl Runtime {
         let tasks = self
             .child_agent_tasks(network, scope, &check.trigger)
             .await?;
-        Ok(json!({"check_id":check_id,"pending":true,"check":check,"process_groups":processes,
+        Ok(
+            json!({"check_id":check_id,"pending":true,"check":check,"process_groups":processes,
             "native_sessions":native,"agent_tasks":tasks,
-            "note":"Exited process groups do not prove that detached tools or external side effects stopped."}))
+            "note":"Exited process groups do not prove that detached tools or external side effects stopped."}),
+        )
     }
 
     pub(super) async fn resolve_local(&self, network: &str, input: &Value) -> Result<Value> {
@@ -342,10 +346,12 @@ impl Runtime {
             "confirm the native turns this invocation started before confirming the invocation"
         );
         self.fence_manager_attempt(&check.attempt_id).await?;
-        self.store
-            .lock()
-            .await
-            .resolve_pending_check(network, check_id, evidence, super::now_ms())?;
+        self.store.lock().await.resolve_pending_check(
+            network,
+            check_id,
+            evidence,
+            super::now_ms(),
+        )?;
         self.publish_changed(network, scope, &check.trigger);
         Ok(json!({"check_id":check_id,"resolved":true}))
     }

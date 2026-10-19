@@ -252,6 +252,8 @@ pub(crate) fn scheduler_key(kind: &str, conversation: &str, target: &str, trigge
 pub(crate) fn remote_job_key(conversation: &str, target: &str, trigger: &str) -> String {
     format!(
         "scheduler:v1:remote:{}",
-        digest(&serde_json::to_vec(&(conversation, target, trigger)).expect("string tuple serializes"))
+        digest(
+            &serde_json::to_vec(&(conversation, target, trigger)).expect("string tuple serializes")
+        )
     )
 }
