@@ -2,7 +2,7 @@
 //! projections are updated incrementally by the reducer as each event is stored.
 use crate::{
     crypto::{LocalIdentity, digest},
-    identity::NetworkState,
+    identity::{AuthorizationView, Member, NetworkState},
     model::*,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -58,23 +58,6 @@ pub(crate) fn install_trust_bundle_in(
         return Ok(false);
     }
     connection.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
-    for member in merged.historical_nodes()? {
-        let old: Option<String> = connection
-            .query_row(
-                "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
-                params![network_id, member.subject_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(
-            old.as_ref().is_none_or(|key| key == &member.public_key),
-            "historical Node identity key changed"
-        );
-        connection.execute(
-            "INSERT OR IGNORE INTO node_certificates(network_id,peer_id,public_key) VALUES(?,?,?)",
-            params![network_id, member.subject_id, member.public_key],
-        )?;
-    }
     Ok(true)
 }
 
@@ -223,30 +206,30 @@ impl Store {
                 .optional()?,
         )
     }
-    pub fn authorize_node(
-        &self,
-        network_id: &str,
-        peer_id: &str,
-        role: Option<NodeRole>,
-    ) -> Result<NodeCertificate> {
-        authorize_node_from(&self.connection, network_id, peer_id, role)
+    /// The member record of a current, unrevoked Node.
+    pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
+        authorize_node_from(&self.connection, network_id, device_id)
     }
     pub fn save_local_identity(
         &mut self,
         network_id: &str,
         identity: &LocalIdentity,
     ) -> Result<()> {
-        let peer_id = identity.peer_id()?;
-        self.authorize_node(network_id, &peer_id, None)?;
-        self.connection.execute("INSERT INTO local_identities(network_id,peer_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,peer_id) DO UPDATE SET identity=excluded.identity",params![network_id,peer_id,serde_json::to_string(identity)?])?;
+        let device_id = identity.device_id()?;
+        self.authorize_node(network_id, &device_id)?;
+        self.connection.execute("INSERT INTO local_identities(network_id,device_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,device_id) DO UPDATE SET identity=excluded.identity",params![network_id,device_id,serde_json::to_string(identity)?])?;
         Ok(())
     }
-    pub fn local_identity(&self, network_id: &str, peer_id: &str) -> Result<Option<LocalIdentity>> {
+    pub fn local_identity(
+        &self,
+        network_id: &str,
+        device_id: &str,
+    ) -> Result<Option<LocalIdentity>> {
         optional_json(
             self.connection
                 .query_row(
-                    "SELECT identity FROM local_identities WHERE network_id=? AND peer_id=?",
-                    params![network_id, peer_id],
+                    "SELECT identity FROM local_identities WHERE network_id=? AND device_id=?",
+                    params![network_id, device_id],
                     |r| r.get(0),
                 )
                 .optional()?,
@@ -265,9 +248,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = crate::runtime::now_ms();
+        let view = membership_from(&tx, network_id)?;
         let statuses = envelopes
             .iter()
-            .map(|envelope| log::ingest_from(&tx, network_id, envelope, now))
+            .map(|envelope| log::ingest_from(&tx, &view, envelope, now))
             .collect::<Result<Vec<_>>>()?;
         tx.commit()?;
         Ok(statuses)
@@ -675,7 +659,7 @@ pub(crate) fn create_conversation_from(
         network,
         scope,
         EventBody::ConversationOwner {
-            scheduler_node: identity.peer_id()?,
+            scheduler_node: identity.device_id()?,
             epoch: 1,
         },
         vec![],
@@ -820,12 +804,10 @@ pub(crate) fn local_prefix<T: DeserializeOwned>(
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
-pub(crate) fn authorize_node_from(
+pub(crate) fn membership_from(
     connection: &Connection,
     network_id: &str,
-    peer_id: &str,
-    role: Option<NodeRole>,
-) -> Result<NodeCertificate> {
+) -> Result<AuthorizationView> {
     let encoded: String = connection
         .query_row(
             "SELECT bundle FROM networks WHERE network_id=?",
@@ -834,13 +816,20 @@ pub(crate) fn authorize_node_from(
         )
         .optional()?
         .context("unknown network")?;
-    let state: NetworkState = serde_json::from_str(&encoded)?;
-    let view = state.project()?;
+    let view = serde_json::from_str::<NetworkState>(&encoded)?.project()?;
     ensure!(
         view.network_id == network_id,
         "stored membership network mismatch"
     );
-    view.authorize_node(peer_id, role)?.certificate()
+    Ok(view)
+}
+
+pub(crate) fn authorize_node_from(
+    connection: &Connection,
+    network_id: &str,
+    device_id: &str,
+) -> Result<Member> {
+    membership_from(connection, network_id)?.node(device_id)
 }
 
 fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {

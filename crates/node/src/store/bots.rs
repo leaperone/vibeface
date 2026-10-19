@@ -106,7 +106,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &identity.peer_id()?, Some(NodeRole::Gateway))?;
+        authorize_node_from(&tx, network, &identity.device_id()?)?;
         if let Some(existing) = bots_where(&tx, network, "AND bot_id=?2", &spec.bot_id)?.pop() {
             ensure!(
                 existing.conversation_id == conversation

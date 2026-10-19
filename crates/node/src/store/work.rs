@@ -25,7 +25,7 @@ impl Store {
         at: i64,
     ) -> Result<(WorkRecord, bool)> {
         ensure!(
-            spec.target == identity.peer_id()?,
+            spec.target == identity.device_id()?,
             "work targets another Node"
         );
         let tx = self
@@ -90,7 +90,7 @@ impl Store {
                 receipt = scheduler::admit_work_result_from(
                     &tx,
                     network,
-                    &identity.peer_id()?,
+                    &identity.device_id()?,
                     &record.spec.conversation,
                     work_id,
                     &record.spec.trigger,

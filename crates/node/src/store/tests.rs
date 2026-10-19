@@ -14,11 +14,7 @@ struct Net {
 fn net() -> Result<Net> {
     let a = LocalIdentity::generate();
     let b = LocalIdentity::generate();
-    let roles = vec![NodeRole::Gateway, NodeRole::Scheduler, NodeRole::Replica];
-    let state = a.sign_network_fixture(
-        1,
-        vec![a.certificate(roles.clone())?, b.certificate(roles)?],
-    )?;
+    let state = a.sign_network_fixture(1, vec![a.device_id()?, b.device_id()?])?;
     Ok(Net {
         network: a.fixture_network_id()?,
         a,
@@ -175,7 +171,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
     let foreign = stranger.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
-        author: stranger.peer_id()?,
+        author: stranger.device_id()?,
         seq: 1,
         prev: None,
         deps: vec![],
@@ -190,7 +186,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
     let mut tampered = net.b.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
-        author: net.b.peer_id()?,
+        author: net.b.device_id()?,
         seq: 1,
         prev: None,
         deps: vec![],
@@ -227,7 +223,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
     let fork = net.a.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
-        author: net.a.peer_id()?,
+        author: net.a.device_id()?,
         seq: 2,
         prev: Some(created.hash.clone()),
         deps: vec![],
@@ -239,7 +235,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
     let after_fork = net.a.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
-        author: net.a.peer_id()?,
+        author: net.a.device_id()?,
         seq: 3,
         prev: Some(fork.hash.clone()),
         deps: vec![],
@@ -381,8 +377,8 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         conversation: "c".into(),
         trigger: trigger.clone(),
         attempt: "attempt".into(),
-        target: net.a.peer_id()?,
-        dispatcher: net.a.peer_id()?,
+        target: net.a.device_id()?,
+        dispatcher: net.a.device_id()?,
         call_ref: "call-1".into(),
         executor: Executor::Codex,
         cwd: "/tmp".into(),
@@ -443,7 +439,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
 fn append_path_uses_indexes_only() -> Result<()> {
     let net = net()?;
     let store = store(&net)?;
-    let author = net.a.peer_id()?;
+    let author = net.a.device_id()?;
     let statements = [
         "SELECT max_seq,head_hash FROM log_heads WHERE network_id=?1 AND author=?2",
         "SELECT author FROM log_heads WHERE network_id=?1 AND author<>?2",

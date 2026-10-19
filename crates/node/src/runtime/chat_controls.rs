@@ -104,7 +104,7 @@ impl Runtime {
             "works":works,
             "autonomy":store.autonomy(network, scope)?,
             "pending_checks":pending_checks,
-            "local_node":self.identity.peer_id()?,
+            "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
                 "capabilities":manager.and_then(|m| match m.provider.as_str() {
                     "codex_sdk"=>Some(crate::manager::ManagerKind::CodexSdk.capabilities()),

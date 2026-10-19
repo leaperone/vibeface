@@ -4,7 +4,7 @@
 use crate::{
     crypto::digest,
     manager::{self, ManagerConfig, ManagerError, ManagerKind},
-    model::{Context, EventBody, NodeRole, Role},
+    model::{Context, EventBody, Role},
     runtime::{Access, Runtime, Update},
     scheduling::{JobOutcome, JobState, SchedulerJob, TriggerKind},
     store::Store,
@@ -141,11 +141,7 @@ pub async fn run(
     let network = access.network_id.clone();
     let claimed = {
         let mut store = node.store.lock().await;
-        store.authorize_node(
-            &network,
-            &node.identity.peer_id()?,
-            Some(NodeRole::Scheduler),
-        )?;
+        store.authorize_node(&network, &node.identity.device_id()?)?;
         match store.claim_next(
             &node.identity,
             &network,
@@ -254,7 +250,7 @@ pub async fn run(
                 progress_node.publish_progress(&progress_network, json!({
                     "type":"manager_progress", "conversation_id":progress_conversation,
                     "trigger":progress_trigger, "invocation_id":progress_attempt,
-                    "source_node":progress_node.identity.peer_id().ok(), "sequence":sequence, "progress":progress,
+                    "source_node":progress_node.identity.device_id().ok(), "sequence":sequence, "progress":progress,
                 }));
                 async { Ok(()) }
             },

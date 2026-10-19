@@ -3,6 +3,7 @@
 use super::{rank, reduce};
 use crate::{
     crypto::{LocalIdentity, check_event, verify_event_signature},
+    identity::AuthorizationView,
     model::*,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -67,10 +68,11 @@ fn head(connection: &Connection, network: &str, author: &str) -> Result<Option<(
 /// Verifies once, then places; events waiting on this one are placed without re-verifying.
 pub(crate) fn ingest_from(
     connection: &Connection,
-    network: &str,
+    view: &AuthorizationView,
     envelope: &SignedEvent,
     now: i64,
 ) -> Result<IngestStatus> {
+    let network = view.network_id.as_str();
     let event = match check_event(network, envelope) {
         Ok(event) => event,
         Err(error) => return Ok(IngestStatus::Rejected(error.to_string())),
@@ -80,17 +82,10 @@ pub(crate) fn ingest_from(
             return Ok(IngestStatus::Duplicate);
         }
     }
-    let key: Option<String> = connection
-        .query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND peer_id=?",
-            params![network, event.author],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(key) = key else {
-        return Ok(IngestStatus::Rejected("unknown author".into()));
-    };
-    if let Err(error) = verify_event_signature(envelope, &key) {
+    if let Err(error) = authorize_author(view, &event.author, event.seq) {
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
+    if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
     let status = place(connection, network, envelope, &event, now)?;
@@ -98,6 +93,17 @@ pub(crate) fn ingest_from(
         cascade(connection, network, &envelope.hash, now)?;
     }
     Ok(status)
+}
+
+/// A current member Node, or a revoked one up to the `cutoff_seq` its revoker had seen.
+fn authorize_author(view: &AuthorizationView, author: &str, seq: u64) -> Result<()> {
+    match view.cutoff(author) {
+        Some(cutoff) => ensure!(seq <= cutoff, "author was revoked before this event"),
+        None => {
+            view.node(author).context("unknown author")?;
+        }
+    }
+    Ok(())
 }
 
 fn cascade(connection: &Connection, network: &str, hash: &str, now: i64) -> Result<()> {
@@ -264,8 +270,8 @@ pub(crate) fn append_from(
     blobs: Vec<BlobRef>,
     created_at_ms: i64,
 ) -> Result<SignedEvent> {
-    let author = identity.peer_id()?;
-    super::authorize_node_from(connection, network, &author, None)?;
+    let author = identity.device_id()?;
+    super::authorize_node_from(connection, network, &author)?;
     for blob in &blobs {
         ensure!(
             blob_file_matches(&blob_path(blob_dir, &blob.hash), blob),

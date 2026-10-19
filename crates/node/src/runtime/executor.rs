@@ -309,7 +309,8 @@ fn kill_group(group: i32) {
 
 fn socket_dir(identity: &LocalIdentity, data_dir: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let directory = PathBuf::from("/tmp").join(format!("vibeface-{}", &identity.peer_id()?[..32]));
+    let directory =
+        PathBuf::from("/tmp").join(format!("vibeface-{}", &identity.device_id()?[..32]));
     match std::fs::create_dir(&directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

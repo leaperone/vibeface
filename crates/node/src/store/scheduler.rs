@@ -359,11 +359,11 @@ impl Store {
         report_results: bool,
         created_at_ms: i64,
     ) -> Result<(Message, AdmissionReceipt)> {
-        let local = identity.peer_id()?;
+        let local = identity.device_id()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &local, Some(NodeRole::Gateway))?;
+        authorize_node_from(&tx, network, &local)?;
         let owner = conversation_from(&tx, network, conversation)?
             .context("conversation not found")?
             .owner

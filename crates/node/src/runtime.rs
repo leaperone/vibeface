@@ -34,7 +34,7 @@ pub use settings::NodeSettings;
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    for member in bundle.genesis.initial_members.iter().chain(
+    for member in bundle.genesis.members().iter().chain(
         bundle
             .checkpoint
             .as_ref()
@@ -42,14 +42,14 @@ fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
             .unwrap_or(&[]),
     ) {
         if member.kind == IdentityKind::Node {
-            names.insert(member.subject_id.clone(), member.name.clone());
+            names.insert(member.device_id.clone(), member.name.clone());
         }
     }
     for event in &bundle.events {
         if let GovernanceAction::Grant { member } = &event.action
             && member.kind == IdentityKind::Node
         {
-            names.insert(member.subject_id.clone(), member.name.clone());
+            names.insert(member.device_id.clone(), member.name.clone());
         }
     }
     names
@@ -59,7 +59,7 @@ fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
 mod node_display_names_tests {
     use super::node_display_names;
     use crate::crypto::LocalIdentity;
-    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, NodeRole};
+    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState};
     use anyhow::Result;
 
     #[test]
@@ -67,27 +67,26 @@ mod node_display_names_tests {
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
         let node = LocalIdentity::generate();
+        let first = LocalIdentity::generate();
         let mut state = NetworkState::new(Genesis::create(
             &root,
-            vec![Member::client(&admin, "admin", true)?],
+            Member::client(&admin, "admin", true)?,
+            Member::node(&first, "first")?,
         )?)?;
         state.append(GovernanceEvent::grant(
             &admin,
             &state.project()?,
-            Member::node(
-                &node,
-                "Mac Studio",
-                vec![NodeRole::Replica, NodeRole::Scheduler],
-            )?,
+            Member::node(&node, "Mac Studio")?,
         )?)?;
         state.append(GovernanceEvent::revoke(
             &admin,
             &state.project()?,
-            &node.peer_id()?,
+            &node.device_id()?,
+            0,
         )?)?;
         let names = node_display_names(&state);
         assert_eq!(
-            names.get(&node.peer_id()?).map(String::as_str),
+            names.get(&node.device_id()?).map(String::as_str),
             Some("Mac Studio")
         );
         Ok(())
@@ -213,11 +212,7 @@ impl Runtime {
         store.attach_process_lock(process_lock.clone());
         if store.has_network()? {
             let state = store.public_state()?;
-            if state
-                .project()?
-                .authorize_node(&identity.peer_id()?, None)
-                .is_ok()
-            {
+            if state.project()?.node(&identity.device_id()?).is_ok() {
                 store.save_local_identity(&state.genesis.network_id, &identity)?;
             }
         }
@@ -272,7 +267,7 @@ impl Runtime {
         }
         let view = state.project()?;
         store.install_state(state)?;
-        if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
+        if view.node(&self.identity.device_id()?).is_ok() {
             store.save_local_identity(&view.network_id, &self.identity)?;
         }
         Ok(view)
@@ -288,7 +283,7 @@ impl Runtime {
     pub fn info(&self) -> Value {
         let manager_available = self.config.roles.contains(&NodeRole::Scheduler)
             && self.settings_snapshot().manager.is_some();
-        json!({"peer_id":self.identity.peer_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available})
+        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self
@@ -368,18 +363,18 @@ impl Runtime {
                 };
                 let Ok(view) = state.project() else { continue };
                 let online = node.hub.online(&view.network_id).await;
-                for member in view.members.into_iter().filter(|member| {
-                    member.kind == IdentityKind::Node && !view.revoked.contains(&member.subject_id)
+                for member in view.members.clone().into_iter().filter(|member| {
+                    member.kind == IdentityKind::Node && view.cutoff(&member.device_id).is_none()
                 }) {
-                    if member.subject_id == node.identity.peer_id().unwrap_or_default()
-                        || online.contains(&member.subject_id)
+                    if member.device_id == node.identity.device_id().unwrap_or_default()
+                        || online.contains(&member.device_id)
                     {
                         continue;
                     }
                     if let Err(error) = node
                         .route_flight(
                             &view.network_id,
-                            &member.subject_id,
+                            &member.device_id,
                             "background",
                             None,
                             None,
@@ -452,7 +447,7 @@ impl Runtime {
         let store = self.store.lock().await;
         let waited = waiting.elapsed();
         let held = Instant::now();
-        store.authorize_node(&access.network_id, &self.identity.peer_id()?, None)?;
+        store.authorize_node(&access.network_id, &self.identity.device_id()?)?;
         ensure!(
             store.has_conversation(&access.network_id, scope)?,
             "conversation not found"
@@ -474,7 +469,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, &self.identity.peer_id()?, Some(role))?;
+            .authorize_node(network, &self.identity.device_id()?)?;
         Ok(())
     }
     async fn route_flight(
@@ -552,7 +547,7 @@ impl Runtime {
     }
 
     async fn raw_peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
-        let local = self.identity.peer_id()?;
+        let local = self.identity.device_id()?;
         self.hub.authorize(network, &local).await?;
         self.hub.authorize(network, target).await?;
         if target != local && !self.hub.has_route(network, target).await {
@@ -608,7 +603,7 @@ impl Runtime {
                     "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk),
                     _ => None,
                 });
-        json!({"roots":settings.roots,
+        json!({"roots":settings.roots,"roles":self.config.roles,
             "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
             "manager_capabilities":manager.map(|kind|kind.capabilities()),
             "executor":self.executor.executor.capability().await})
@@ -633,7 +628,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, &self.identity.peer_id()?, None)?;
+            .authorize_node(network, &self.identity.device_id()?)?;
         let method = field(&input, "method")?;
         if !access.human {
             ensure!(method == "nodes", "method unavailable to Agent tokens");
@@ -653,28 +648,26 @@ impl Runtime {
                     .trust_bundle(network)?
                     .context("unknown network")?;
                 let online = self.hub.online(network).await;
-                let local = self.identity.peer_id()?;
+                let local = self.identity.device_id()?;
+                let max_seq = self.store.lock().await.version_vector(network)?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
-                let revoked_ids = view.revoked.clone();
                 let display_names = node_display_names(&bundle);
                 for member in view
                     .members
                     .into_iter()
                     .filter(|member| member.kind == IdentityKind::Node)
                 {
-                    let mut cert = member.certificate()?;
-                    cert.revoked = view.revoked.contains(&cert.peer_id);
-                    let here = cert.peer_id == local;
-                    let live = here || online.contains(&cert.peer_id);
+                    let here = member.device_id == local;
+                    let live = here || online.contains(&member.device_id);
                     let capabilities = if here {
                         self.capabilities().await
-                    } else if live && !cert.revoked {
+                    } else if live {
                         tokio::time::timeout(
                             Duration::from_secs(3),
                             self.peer_request(
                                 network,
-                                &cert.peer_id,
+                                &member.device_id,
                                 json!({"type":"capabilities"}),
                             ),
                         )
@@ -685,16 +678,13 @@ impl Runtime {
                     } else {
                         Value::Null
                     };
-                    nodes.push(json!({"peer_id":cert.peer_id,"name":member.name,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
+                    let roles = capabilities.get("roles").cloned().unwrap_or(json!([]));
+                    let seq = max_seq.get(&member.device_id).copied().unwrap_or(0);
+                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"roles":roles,"revoked":false,"local":here,"online":live,"max_seq":seq,"capabilities":capabilities}));
                 }
-                let history = bundle.historical_nodes()?;
-                for revoked in revoked_ids {
-                    if nodes.iter().any(|node| node["peer_id"] == revoked) {
-                        continue;
-                    }
-                    if history.iter().any(|node| node.subject_id == revoked) {
-                        let name = display_names.get(&revoked).cloned().unwrap_or_default();
-                        nodes.push(json!({"peer_id":revoked,"name":name,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
+                for revoked in view.revoked {
+                    if let Some(name) = display_names.get(&revoked.device_id) {
+                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"roles":[],"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"capabilities":Value::Null}));
                     }
                 }
                 Ok(json!({"nodes":nodes}))
@@ -817,7 +807,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, &message.origin, None)?;
+            .authorize_node(network, &message.origin)?;
         let kind = field(input, "type")?;
         let _work = (!matches!(kind, "capabilities" | "progress_read"))
             .then(|| self.maintenance.enter())
@@ -849,11 +839,10 @@ impl Runtime {
                 self.read_progress(network, &message.origin, input).await
             }
             "cancel_manager" | "reconcile" | "resolve" => {
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Gateway),
-                )?;
+                self.store
+                    .lock()
+                    .await
+                    .authorize_node(network, &message.origin)?;
                 ensure!(
                     input["human"] == true,
                     "management control requires the user"

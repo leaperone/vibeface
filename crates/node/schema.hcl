@@ -16,37 +16,13 @@ table "networks" {
     columns = [column.network_id]
   }
 }
-table "node_certificates" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "peer_id" {
-    null = false
-    type = text
-  }
-  column "public_key" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.peer_id]
-  }
-  foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
-    on_update   = NO_ACTION
-    on_delete   = NO_ACTION
-  }
-}
 table "local_identities" {
   schema = schema.main
   column "network_id" {
     null = false
     type = text
   }
-  column "peer_id" {
+  column "device_id" {
     null = false
     type = text
   }
@@ -55,7 +31,7 @@ table "local_identities" {
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.peer_id]
+    columns = [column.network_id, column.device_id]
   }
   foreign_key "0" {
     columns     = [column.network_id]
@@ -600,63 +576,17 @@ table "identity_meta" {
     columns = [column.key]
   }
 }
-table "identity_requests" {
+table "invites" {
   schema = schema.main
-  column "request_id" {
-    null = true
-    type = text
-  }
-  column "subject_id" {
+  column "join_id" {
     null = false
     type = text
   }
-  column "kind" {
+  column "invite_hash" {
     null = false
     type = text
   }
-  column "response" {
-    null = false
-    type = text
-  }
-  column "created_at_ms" {
-    null = false
-    type = integer
-  }
-  primary_key {
-    columns = [column.request_id]
-  }
-}
-table "identity_invites" {
-  schema = schema.main
-  column "invite_id" {
-    null = true
-    type = text
-  }
-  column "request_id" {
-    null = false
-    type = text
-  }
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "inviter_subject_id" {
-    null = false
-    type = text
-  }
-  column "payload" {
-    null = false
-    type = text
-  }
-  column "payload_hash" {
-    null = false
-    type = text
-  }
-  column "capability_hash" {
-    null = false
-    type = text
-  }
-  column "inviter_signature" {
+  column "issuer" {
     null = false
     type = text
   }
@@ -668,82 +598,56 @@ table "identity_invites" {
     null = false
     type = integer
   }
-  column "used" {
-    null    = false
-    type    = integer
-    default = 0
+  column "record" {
+    null = false
+    type = text
   }
-  primary_key {
-    columns = [column.invite_id]
-  }
-  index "identity_invites_request_id" {
-    unique  = true
-    columns = [column.request_id]
-  }
-}
-table "identity_pair_reviews" {
-  schema = schema.main
-  column "invite_id" {
+  column "device_id" {
     null = true
     type = text
   }
-  column "review" {
-    null = false
-    type = text
-  }
-  column "review_hash" {
-    null = false
-    type = text
-  }
-  column "inviter_signature" {
-    null = false
-    type = text
-  }
-  column "new_subject_signature" {
-    null = false
-    type = text
-  }
-  column "created_at_ms" {
-    null = false
-    type = integer
-  }
-  primary_key {
-    columns = [column.invite_id]
-  }
-}
-table "identity_pair_requests" {
-  schema = schema.main
-  column "request_id" {
+  column "kind" {
     null = true
     type = text
   }
-  column "invite_id" {
-    null = false
+  column "name" {
+    null = true
     type = text
   }
-  column "subject_id" {
-    null = false
+  column "commit_hash" {
+    null = true
     type = text
   }
-  column "review" {
-    null = false
+  column "status" {
+    null = true
     type = text
   }
-  column "review_hash" {
-    null = false
+  column "admin_id" {
+    null = true
     type = text
   }
-  column "new_subject_signature" {
-    null    = false
-    type    = text
-    default = ""
+  column "admin_nonce" {
+    null = true
+    type = text
+  }
+  column "joiner_nonce" {
+    null = true
+    type = text
+  }
+  column "reason" {
+    null = true
+    type = text
+  }
+  column "grant_hash" {
+    null = true
+    type = text
   }
   primary_key {
-    columns = [column.request_id]
+    columns = [column.join_id]
   }
-  index "identity_pair_requests_invite_id" {
+  index "invites_invite_hash" {
     unique  = true
-    columns = [column.invite_id]
+    columns = [column.invite_hash]
   }
 }
 schema "main" {

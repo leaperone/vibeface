@@ -13,8 +13,8 @@ pub struct WorkSpec {
     pub trigger: String,
     /// The coordination attempt that dispatched it; only that attempt may retry the call.
     pub attempt: String,
-    pub target: PeerId,
-    pub dispatcher: PeerId,
+    pub target: DeviceId,
+    pub dispatcher: DeviceId,
     pub call_ref: String,
     pub executor: Executor,
     pub cwd: String,

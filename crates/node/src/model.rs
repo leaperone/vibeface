@@ -2,12 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub type NetworkId = String;
-pub type PeerId = String;
+pub type DeviceId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
 /// `{author: max_seq}`: the exact set of events a store holds, because every stored event's
 /// `prev` and `deps` are stored too.
-pub type VersionVector = BTreeMap<PeerId, u64>;
+pub type VersionVector = BTreeMap<DeviceId, u64>;
 pub const WIRE_VERSION: u32 = 1;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -97,7 +97,7 @@ pub enum EventBody {
     },
     /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller hash.
     ConversationOwner {
-        scheduler_node: PeerId,
+        scheduler_node: DeviceId,
         epoch: u64,
     },
     BotCreated {
@@ -123,7 +123,7 @@ pub enum EventBody {
     WorkDispatched {
         work_id: String,
         trigger: String,
-        dispatcher: PeerId,
+        dispatcher: DeviceId,
         call_ref: String,
         executor: Executor,
         cwd: String,
@@ -196,7 +196,7 @@ impl EventBody {
 pub struct Event {
     pub version: u32,
     pub network_id: NetworkId,
-    pub author: PeerId,
+    pub author: DeviceId,
     pub seq: u64,
     pub prev: Option<EventHash>,
     pub deps: Vec<EventHash>,
@@ -214,7 +214,26 @@ pub struct SignedEvent {
     pub signature: String,
 }
 
-pub use vibeface_secure::membership::{NodeCertificate, NodeRole, validate_role_dependencies};
+/// A capability this Node declares in its own `config.json`; membership never carries roles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    Gateway,
+    Relay,
+    Replica,
+    Scheduler,
+}
+
+pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        roles.contains(&NodeRole::Replica)
+            || !roles
+                .iter()
+                .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler)),
+        "gateway and scheduler roles require replica"
+    );
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HashedEvent {
@@ -235,7 +254,7 @@ pub struct Context {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BotProject {
-    pub target_node: PeerId,
+    pub target_node: DeviceId,
     pub cwd: String,
 }
 
@@ -264,7 +283,7 @@ pub struct Bot {
 pub struct Conversation {
     pub conversation_id: ScopeId,
     pub title: String,
-    pub owner: Option<PeerId>,
+    pub owner: Option<DeviceId>,
     pub owner_epoch: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -273,7 +292,7 @@ pub struct Message {
     pub role: Role,
     pub text: String,
     pub event_hash: EventHash,
-    pub author: PeerId,
+    pub author: DeviceId,
     pub created_at_ms: i64,
     pub in_reply_to: Option<String>,
     pub status: Option<ReplyStatus>,
@@ -293,9 +312,9 @@ pub struct Notification {
 pub struct WorkProjection {
     pub work_id: String,
     pub conversation_id: ScopeId,
-    pub target_node: PeerId,
+    pub target_node: DeviceId,
     pub trigger: String,
-    pub dispatcher: PeerId,
+    pub dispatcher: DeviceId,
     pub executor: Executor,
     pub cwd: String,
     pub prompt: String,

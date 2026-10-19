@@ -13,8 +13,8 @@ use tokio::sync::watch;
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 pub const SESSION_SECONDS: u64 = 86400;
 
-pub fn cookie_name(peer_id: &str) -> String {
-    format!("vibeface_local_{peer_id}")
+pub fn cookie_name(node_id: &str) -> String {
+    format!("vibeface_local_{node_id}")
 }
 
 pub struct LocalAccess {
@@ -33,17 +33,16 @@ struct State {
 }
 
 struct Pending {
-    peer_id: String,
+    node_id: String,
     network_id: String,
     expires: Instant,
 }
 
 #[derive(Clone)]
 pub struct LocalSession {
-    pub peer_id: String,
+    pub node_id: String,
     pub network_id: String,
-    pub subject_id: String,
-    pub public_key: String,
+    pub device_id: String,
     generation: u64,
     expires: Instant,
 }
@@ -52,7 +51,7 @@ pub struct LocalSession {
 #[serde(deny_unknown_fields)]
 pub struct Launcher {
     pub origin: String,
-    pub peer_id: String,
+    pub node_id: String,
     pub capability: String,
 }
 
@@ -86,7 +85,7 @@ impl LocalAccess {
         })
     }
 
-    pub fn publish_listener(&self, origin: String, peer_id: String) -> Result<()> {
+    pub fn publish_listener(&self, origin: String, node_id: String) -> Result<()> {
         let url = reqwest::Url::parse(&origin)?;
         ensure!(
             url.scheme() == "http"
@@ -101,7 +100,7 @@ impl LocalAccess {
         );
         let launcher = Launcher {
             origin: origin.clone(),
-            peer_id,
+            node_id,
             capability: random_secret(),
         };
         let mut state = self
@@ -134,7 +133,7 @@ impl LocalAccess {
         self.changes.subscribe()
     }
 
-    pub fn issue(&self, capability: &str, peer_id: &str, network_id: &str) -> Result<String> {
+    pub fn issue(&self, capability: &str, node_id: &str, network_id: &str) -> Result<String> {
         let mut state = self
             .state
             .lock()
@@ -145,10 +144,10 @@ impl LocalAccess {
                 && crypto::digest(capability.as_bytes()) == state.launcher_hash,
             "local access launcher credential is invalid or disabled"
         );
-        Self::issue_pending(&mut state, peer_id, network_id)
+        Self::issue_pending(&mut state, node_id, network_id)
     }
 
-    pub(crate) fn issue_from_local_setup(&self, peer_id: &str, network_id: &str) -> Result<String> {
+    pub(crate) fn issue_from_local_setup(&self, node_id: &str, network_id: &str) -> Result<String> {
         let mut state = self
             .state
             .lock()
@@ -157,10 +156,10 @@ impl LocalAccess {
             state.enabled && state.origin.is_some(),
             "local access is unavailable"
         );
-        Self::issue_pending(&mut state, peer_id, network_id)
+        Self::issue_pending(&mut state, node_id, network_id)
     }
 
-    fn issue_pending(state: &mut State, peer_id: &str, network_id: &str) -> Result<String> {
+    fn issue_pending(state: &mut State, node_id: &str, network_id: &str) -> Result<String> {
         state
             .tokens
             .retain(|_, pending| pending.expires > Instant::now());
@@ -172,7 +171,7 @@ impl LocalAccess {
         state.tokens.insert(
             crypto::digest(token.as_bytes()),
             Pending {
-                peer_id: peer_id.to_owned(),
+                node_id: node_id.to_owned(),
                 network_id: network_id.to_owned(),
                 expires: Instant::now() + TOKEN_LIFETIME,
             },
@@ -183,15 +182,10 @@ impl LocalAccess {
     pub fn exchange(
         &self,
         token: &str,
-        peer_id: &str,
+        node_id: &str,
         network_id: &str,
-        subject_id: &str,
-        public_key: &str,
+        device_id: &str,
     ) -> Result<String> {
-        ensure!(
-            crypto::fingerprint(public_key)? == subject_id,
-            "browser identity does not match its public key"
-        );
         let mut state = self
             .state
             .lock()
@@ -206,7 +200,7 @@ impl LocalAccess {
             .context("local entry was already used or expired")?;
         ensure!(
             pending.expires > Instant::now()
-                && pending.peer_id == peer_id
+                && pending.node_id == node_id
                 && pending.network_id == network_id,
             "local entry belongs to another node or personal network"
         );
@@ -222,10 +216,9 @@ impl LocalAccess {
         state.sessions.insert(
             crypto::digest(cookie.as_bytes()),
             LocalSession {
-                peer_id: peer_id.to_owned(),
+                node_id: node_id.to_owned(),
                 network_id: network_id.to_owned(),
-                subject_id: subject_id.to_owned(),
-                public_key: public_key.to_owned(),
+                device_id: device_id.to_owned(),
                 generation,
                 expires: Instant::now() + Duration::from_secs(SESSION_SECONDS),
             },
@@ -233,7 +226,7 @@ impl LocalAccess {
         Ok(cookie)
     }
 
-    pub fn session(&self, cookie: &str, peer_id: &str, network_id: &str) -> Result<LocalSession> {
+    pub fn session(&self, cookie: &str, node_id: &str, network_id: &str) -> Result<LocalSession> {
         let state = self
             .state
             .lock()
@@ -249,7 +242,7 @@ impl LocalAccess {
         ensure!(
             session.expires > Instant::now()
                 && session.generation == state.generation
-                && session.peer_id == peer_id
+                && session.node_id == node_id
                 && session.network_id == network_id,
             "local browser session no longer matches this node and personal network"
         );
@@ -303,27 +296,15 @@ mod tests {
                 .is_err()
         );
         let token = local.issue(&launcher.capability, "node", "network")?;
-        let cookie = local.exchange(
-            &token,
-            "node",
-            "network",
-            &browser.peer_id()?,
-            &browser.public_key_hex()?,
-        )?;
+        let cookie = local.exchange(&token, "node", "network", &browser.device_id()?)?;
         assert!(
             local
-                .exchange(
-                    &token,
-                    "node",
-                    "network",
-                    &browser.peer_id()?,
-                    &browser.public_key_hex()?
-                )
+                .exchange(&token, "node", "network", &browser.device_id()?)
                 .is_err()
         );
         assert_eq!(
-            local.session(&cookie, "node", "network")?.subject_id,
-            browser.peer_id()?
+            local.session(&cookie, "node", "network")?.device_id,
+            browser.device_id()?
         );
         assert!(local.session(&cookie, "other-node", "network").is_err());
         assert!(local.session(&cookie, "node", "other-network").is_err());
@@ -341,13 +322,7 @@ mod tests {
         local.set_enabled(true)?;
         assert!(
             local
-                .exchange(
-                    &pending,
-                    "node",
-                    "network",
-                    &browser.peer_id()?,
-                    &browser.public_key_hex()?
-                )
+                .exchange(&pending, "node", "network", &browser.device_id()?)
                 .is_err()
         );
         assert!(local.session(&cookie, "node", "network").is_err());

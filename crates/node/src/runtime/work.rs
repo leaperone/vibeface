@@ -85,7 +85,7 @@ impl Runtime {
         spec: WorkSpec,
     ) -> Result<WorkRecord> {
         ensure!(
-            spec.target == self.identity.peer_id()?,
+            spec.target == self.identity.device_id()?,
             "dispatching to another device arrives with cross-device delivery"
         );
         self.allowed_path(&spec.cwd)?;
@@ -415,7 +415,7 @@ impl Runtime {
         self.publish_progress(
             network,
             json!({"type":"native_progress","conversation_id":record.spec.conversation,"work_id":work_id,
-                "target_node":self.identity.peer_id()?,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                "target_node":self.identity.device_id()?,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 "progress":observation::native_progress(&event)}),
         );
         let signal = match method {

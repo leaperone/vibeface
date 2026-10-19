@@ -165,7 +165,7 @@ impl Drop for MaintenanceGuard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
-    pub peer_id: String,
+    pub device_id: String,
     pub version: String,
 }
 #[derive(Debug)]
@@ -237,8 +237,8 @@ async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Resul
 }
 pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let peer_id = crate::config::identity(data_dir)?.peer_id()?;
-    let socket_dir = PathBuf::from("/tmp").join(format!("vibeface-{}", &peer_id[..32]));
+    let device_id = crate::config::identity(data_dir)?.device_id()?;
+    let socket_dir = PathBuf::from("/tmp").join(format!("vibeface-{}", &device_id[..32]));
     match std::fs::create_dir(&socket_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -353,7 +353,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
         "unsupported maintenance protocol"
     );
     let health = Health {
-        peer_id: runtime.identity.peer_id()?,
+        device_id: runtime.identity.device_id()?,
         version: env!("CARGO_PKG_VERSION").into(),
     };
     let mut response = Response {
@@ -416,12 +416,12 @@ mod tests {
     };
 
     #[test]
-    fn peer_id_health_uses_only_the_current_field() -> Result<()> {
-        let wire = r#"{"peer_id":"device","version":"version"}"#;
+    fn device_id_health_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"device_id":"device","version":"version"}"#;
         let health: Health = serde_json::from_str(wire)?;
-        assert_eq!(health.peer_id, "device");
+        assert_eq!(health.device_id, "device");
         assert_eq!(serde_json::to_string(&health)?, wire);
-        assert!(serde_json::from_str::<Health>(&wire.replace("peer_id", "node_id")).is_err());
+        assert!(serde_json::from_str::<Health>(&wire.replace("device_id", "node_id")).is_err());
         Ok(())
     }
 
@@ -487,7 +487,7 @@ mod tests {
             }
             assert!(node.maintenance.enter().is_err());
             let health = probe(&dir).await?;
-            assert_eq!(health.peer_id, node.identity.peer_id()?);
+            assert_eq!(health.device_id, node.identity.device_id()?);
             assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
             assert!(commit(&dir).await.is_err());
             config::private_write(
@@ -506,7 +506,7 @@ mod tests {
             );
             drop(work);
             let lease = acquire(&dir).await?;
-            assert_eq!(lease.health.peer_id, health.peer_id);
+            assert_eq!(lease.health.device_id, health.device_id);
             assert!(node.maintenance.enter().is_err());
             assert!(
                 crate::scheduler::status(&node, "test", "chat", "trigger")
@@ -532,7 +532,7 @@ mod tests {
             })
             .await?;
             assert!(node.maintenance.enter().is_err());
-            assert_eq!(probe(&dir).await?.peer_id, health.peer_id);
+            assert_eq!(probe(&dir).await?.device_id, health.device_id);
             config::private_write(
                 &dir.join("update-pending.json"),
                 br#"{"phase":"confirmed"}"#,

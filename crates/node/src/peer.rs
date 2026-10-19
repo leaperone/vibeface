@@ -2,7 +2,7 @@
 
 use crate::{
     crypto::{LocalIdentity, digest, verify_payload},
-    model::{NetworkId, NodeRole, PeerId, WIRE_VERSION},
+    model::{DeviceId, NetworkId, NodeRole, WIRE_VERSION},
     network::{AuthenticationFailure, NetworkHub, NetworkSocket, Service},
     store::Store,
 };
@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 #[cfg(test)]
 use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 use uuid::Uuid;
-use vibeface_secure::{Channel, Handshake};
+use vibeface_secure::Channel;
 
 pub const MAX_PACKET_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
@@ -83,7 +83,7 @@ impl SendOutcome {
 #[derive(Debug, Clone)]
 pub struct Inbound {
     pub network_id: NetworkId,
-    pub origin: PeerId,
+    pub origin: DeviceId,
     pub request_id: String,
     pub payload: Value,
     pub broadcast: bool,
@@ -101,10 +101,10 @@ pub struct PeerHub {
 
 #[derive(Default)]
 struct State {
-    links: HashMap<(NetworkId, PeerId), Link>,
+    links: HashMap<(NetworkId, DeviceId), Link>,
     pending: HashMap<(NetworkId, String), Pending>,
     seen: HashMap<PacketId, SeenPacket>,
-    routes: HashMap<(NetworkId, PeerId, PeerId), PresenceRoute>,
+    routes: HashMap<(NetworkId, DeviceId, DeviceId), PresenceRoute>,
     last_presence: HashMap<NetworkId, Instant>,
 }
 struct Link {
@@ -127,7 +127,7 @@ struct Queued {
     _permit: OwnedSemaphorePermit,
 }
 struct Pending {
-    origin: PeerId,
+    origin: DeviceId,
     created: Instant,
     reply: oneshot::Sender<Value>,
 }
@@ -138,7 +138,7 @@ struct Hello {
     version: u32,
     network_id: NetworkId,
 
-    peer_id: PeerId,
+    device_id: DeviceId,
 }
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -153,8 +153,8 @@ enum Kind {
 struct Body {
     version: u32,
     network_id: NetworkId,
-    origin: PeerId,
-    target: Option<PeerId>,
+    origin: DeviceId,
+    target: Option<DeviceId>,
     request_id: String,
     created_at_ms: i64,
     kind: Kind,
@@ -167,7 +167,7 @@ struct Packet {
     signature: String,
     hops_remaining: u8,
 }
-type PacketId = (NetworkId, PeerId, String, Kind);
+type PacketId = (NetworkId, DeviceId, String, Kind);
 
 fn packet_id(body: &Body) -> PacketId {
     (
@@ -297,7 +297,7 @@ impl PeerHub {
             state.seen.insert(
                 (
                     network.to_owned(),
-                    self.identity.peer_id()?,
+                    self.identity.device_id()?,
                     Uuid::from_u128(index as u128).to_string(),
                     Kind::Presence,
                 ),
@@ -358,7 +358,7 @@ impl PeerHub {
             .clone()
             .try_acquire_owned()
             .context("too many peer sockets")?;
-        self.authorize(&network_id, &self.identity.peer_id()?)
+        self.authorize(&network_id, &self.identity.device_id()?)
             .await?;
         ensure!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -459,7 +459,7 @@ impl PeerHub {
     }
 
     /// Presence is soft state; an online entry does not guarantee a request will succeed.
-    pub async fn online(&self, network: &str) -> Vec<PeerId> {
+    pub async fn online(&self, network: &str) -> Vec<DeviceId> {
         let (direct, indirect) = {
             let state = self.state.lock().await;
             let direct: BTreeSet<_> = state
@@ -487,19 +487,13 @@ impl PeerHub {
             let store = self.store.lock().await;
             let direct = direct
                 .into_iter()
-                .filter(|node| store.authorize_node(network, node, None).is_ok())
+                .filter(|node| store.authorize_node(network, node).is_ok())
                 .collect::<Vec<_>>();
             let indirect = indirect
                 .into_iter()
                 .filter(|(target, neighbor)| {
-                    store.authorize_node(network, target, None).is_ok()
-                        && store
-                            .authorize_node(
-                                network,
-                                neighbor,
-                                (target != neighbor).then_some(NodeRole::Relay),
-                            )
-                            .is_ok()
+                    store.authorize_node(network, target).is_ok()
+                        && store.authorize_node(network, neighbor).is_ok()
                 })
                 .collect::<Vec<_>>();
             (direct, indirect)
@@ -551,43 +545,38 @@ impl PeerHub {
             .store
             .lock()
             .await
-            .authorize_node(network, node, None)
+            .authorize_node(network, node)
             .map_err(|error| AuthorizationDenied(Arc::new(error)))?
-            .public_key)
+            .device_id)
     }
 
     fn hello(&self, network: &str) -> Result<Hello> {
         Ok(Hello {
             version: WIRE_VERSION,
             network_id: network.to_owned(),
-            peer_id: self.identity.peer_id()?,
+            device_id: self.identity.device_id()?,
         })
     }
 
     async fn check_hello(&self, hello: &Hello, network: Option<&str>) -> Result<String> {
         ensure!(hello.version == WIRE_VERSION, "unsupported peer version");
         check_hex_id(&hello.network_id)?;
-        check_hex_id(&hello.peer_id)?;
+        check_hex_id(&hello.device_id)?;
         ensure!(
             network.is_none_or(|n| n == hello.network_id),
             "peer belongs to another network"
         );
-        let local = self.identity.peer_id()?;
-        ensure!(hello.peer_id != local, "cannot connect a node to itself");
+        let local = self.identity.device_id()?;
+        ensure!(hello.device_id != local, "cannot connect a node to itself");
         self.authorize(&hello.network_id, &local).await?;
-        self.authorize(&hello.network_id, &hello.peer_id).await
+        self.authorize(&hello.network_id, &hello.device_id).await
     }
 
     async fn server_handshake(
         &self,
         socket: &mut NetworkSocket,
     ) -> Result<(String, String, Channel)> {
-        let mut handshake = secure(Handshake::new(
-            false,
-            &self.identity.secret_key_hex,
-            None,
-            b"vibeface:peer:v1",
-        ))?;
+        let mut handshake = secure(self.identity.handshake(false, None, b"vibeface:peer:v1"))?;
         let first = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
         ensure!(
             secure(handshake.read(&first))?.is_empty(),
@@ -600,13 +589,13 @@ impl PeerHub {
         let initiator: Hello = serde_json::from_slice(&plaintext)?;
         self.check_hello(&initiator, None).await?;
         ensure!(
-            handshake.remote_id().as_deref() == Some(&initiator.peer_id),
+            handshake.remote_id().as_deref() == Some(&initiator.device_id),
             "peer Noise identity mismatch"
         );
         let mut channel = secure(handshake.finish())?;
         let responder = self.hello(&initiator.network_id)?;
         send_secure(socket, &mut channel, &serde_json::to_vec(&responder)?).await?;
-        Ok((initiator.network_id, initiator.peer_id, channel))
+        Ok((initiator.network_id, initiator.device_id, channel))
     }
 
     async fn client_handshake(
@@ -614,13 +603,8 @@ impl PeerHub {
         socket: &mut NetworkSocket,
         network: &str,
         target: Option<String>,
-    ) -> Result<(PeerId, Channel)> {
-        let mut handshake = secure(Handshake::new(
-            true,
-            &self.identity.secret_key_hex,
-            target,
-            b"vibeface:peer:v1",
-        ))?;
+    ) -> Result<(DeviceId, Channel)> {
+        let mut handshake = secure(self.identity.handshake(true, target, b"vibeface:peer:v1"))?;
         send_binary(socket, secure(handshake.write(&[]))?).await?;
         let second = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
         ensure!(
@@ -639,9 +623,12 @@ impl PeerHub {
         let responder: Hello = serde_json::from_slice(
             &receive_secure(socket, &mut channel, MAX_HANDSHAKE_BYTES).await?,
         )?;
-        ensure!(remote == responder.peer_id, "peer Noise identity mismatch");
+        ensure!(
+            remote == responder.device_id,
+            "peer Noise identity mismatch"
+        );
         self.check_hello(&responder, Some(network)).await?;
-        Ok((responder.peer_id, channel))
+        Ok((responder.device_id, channel))
     }
 
     pub async fn connect_target(
@@ -653,7 +640,8 @@ impl PeerHub {
         deadline: tokio::time::Instant,
     ) -> Result<()> {
         let preparation = async {
-            self.authorize(&network, &self.identity.peer_id()?).await?;
+            self.authorize(&network, &self.identity.device_id()?)
+                .await?;
             self.authorize(&network, &target).await?;
             let winner = transport
                 .dial_authenticated(&target, Service::Peer, None, |mut socket| {
@@ -681,7 +669,8 @@ impl PeerHub {
                     }
                 })
                 .await?;
-            self.authorize(&network, &self.identity.peer_id()?).await?;
+            self.authorize(&network, &self.identity.device_id()?)
+                .await?;
             self.authorize(&network, &target).await?;
             Ok::<_, anyhow::Error>(winner)
         };
@@ -705,7 +694,7 @@ impl PeerHub {
         let (send, receive) = mpsc::channel(QUEUE_CAPACITY);
         let link_key = (network.clone(), peer.clone());
         {
-            let local = self.identity.peer_id()?;
+            let local = self.identity.device_id()?;
             let mut state = self.state.lock().await;
             if let Some(previous) = state.links.get(&link_key) {
                 // Both ends choose the same direction if they connect simultaneously.
@@ -768,7 +757,7 @@ impl PeerHub {
                 frame = socket.next() => {
                     let frame = frame.context("peer disconnected")??;
                     self.authorize(network, peer).await?;
-                    self.authorize(network, &self.identity.peer_id()?).await?;
+                    self.authorize(network, &self.identity.device_id()?).await?;
                     received = Instant::now();
                     match frame {
                         AxumMessage::Binary(bytes) => {
@@ -788,14 +777,14 @@ impl PeerHub {
                 queued = outbound.recv() => {
                     let text = queued.context("peer connection replaced")?;
                     self.authorize(network, peer).await?;
-                    self.authorize(network, &self.identity.peer_id()?).await?;
+                    self.authorize(network, &self.identity.device_id()?).await?;
                     send_secure(&mut socket, &mut channel, text.text.as_bytes()).await?;
                 }
                 _ = heartbeat.tick() => {
                     ensure!(received.elapsed() < IDLE_TIMEOUT, "peer heartbeat timed out");
                     ensure!(partial_started.is_none_or(|start| start.elapsed() < IDLE_TIMEOUT), "peer fragmented message timed out");
                     self.authorize(network, peer).await?;
-                    self.authorize(network, &self.identity.peer_id()?).await?;
+                    self.authorize(network, &self.identity.device_id()?).await?;
                     tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(AxumMessage::Ping(Vec::new().into()))).await.context("peer send timed out")??;
                     if let Err(error) = self.presence(network).await {
                         if error.downcast_ref::<RequestFailure>().is_none() {
@@ -819,7 +808,7 @@ impl PeerHub {
         let body = Body {
             version: WIRE_VERSION,
             network_id: network.to_owned(),
-            origin: self.identity.peer_id()?,
+            origin: self.identity.device_id()?,
             target,
             request_id: request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             created_at_ms: now_ms()?,
@@ -945,7 +934,7 @@ impl PeerHub {
         if !fresh {
             return Ok(());
         }
-        let local = self.identity.peer_id()?;
+        let local = self.identity.device_id()?;
         if packet.body.target.as_deref() == Some(local.as_str()) {
             return match self.deliver(&packet).await {
                 Err(error)
@@ -971,7 +960,7 @@ impl PeerHub {
                 .store
                 .lock()
                 .await
-                .authorize_node(network, &local, Some(NodeRole::Relay))
+                .authorize_node(network, &local)
                 .is_ok()
         {
             let mut forwarded = packet;
@@ -1049,16 +1038,7 @@ impl PeerHub {
             let store = self.store.lock().await;
             links
                 .into_iter()
-                .filter(|(peer, _, _)| {
-                    store
-                        .authorize_node(
-                            network,
-                            peer,
-                            (target.is_some() && target != Some(peer.as_str()))
-                                .then_some(NodeRole::Relay),
-                        )
-                        .is_ok()
-                })
+                .filter(|(peer, _, _)| store.authorize_node(network, peer).is_ok())
                 .collect::<Vec<_>>()
         };
         let mut state = self.state.lock().await;
@@ -1271,12 +1251,12 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     #[test]
-    fn peer_id_hello_uses_only_the_current_field() -> Result<()> {
-        let wire = r#"{"version":1,"network_id":"network","peer_id":"device"}"#;
+    fn device_id_hello_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"version":1,"network_id":"network","device_id":"device"}"#;
         let hello: Hello = serde_json::from_str(wire)?;
-        assert_eq!(hello.peer_id, "device");
+        assert_eq!(hello.device_id, "device");
         assert_eq!(serde_json::to_string(&hello)?, wire);
-        assert!(serde_json::from_str::<Hello>(&wire.replace("peer_id", "node_id")).is_err());
+        assert!(serde_json::from_str::<Hello>(&wire.replace("device_id", "node_id")).is_err());
         Ok(())
     }
 
@@ -1297,7 +1277,7 @@ mod tests {
         let mut store = Store::open(":memory:")?;
         let certificates = nodes
             .iter()
-            .map(|node| node.certificate(roles()))
+            .map(|node| node.device_id())
             .collect::<Result<Vec<_>>>()?;
         store.install_trust_bundle(&network, &owner.sign_network_fixture(1, certificates)?)?;
         Ok(PeerHub::new(
@@ -1336,39 +1316,49 @@ mod tests {
         let nodes = [&owner, &target, &b, &c];
         let (receiver, _) = hub(&owner, &owner, &nodes)?;
         let (sender, _) = hub(&owner, &target, &nodes)?;
-        let _b = test_link(&receiver, &network, &b.peer_id()?, "b").await;
-        let _c = test_link(&receiver, &network, &c.peer_id()?, "c").await;
+        let _b = test_link(&receiver, &network, &b.device_id()?, "b").await;
+        let _c = test_link(&receiver, &network, &c.device_id()?, "c").await;
         let packet = sender.packet(&network, None, Kind::Presence, Value::Null, None)?;
         receiver
-            .receive_packet(&network, &b.peer_id()?, "b", packet.clone())
+            .receive_packet(&network, &b.device_id()?, "b", packet.clone())
             .await?;
         let first_deadline = receiver.state.lock().await.routes
-            [&(network.clone(), target.peer_id()?, b.peer_id()?)]
+            [&(network.clone(), target.device_id()?, b.device_id()?)]
             .expires_at;
         receiver
-            .receive_packet(&network, &c.peer_id()?, "c", packet.clone())
+            .receive_packet(&network, &c.device_id()?, "c", packet.clone())
             .await?;
         receiver
-            .receive_packet(&network, &b.peer_id()?, "b", packet)
+            .receive_packet(&network, &b.device_id()?, "b", packet)
             .await?;
         {
             let mut state = receiver.state.lock().await;
             assert_eq!(state.routes.len(), 2);
             assert_eq!(
-                state.routes[&(network.clone(), target.peer_id()?, b.peer_id()?)].expires_at,
+                state.routes[&(network.clone(), target.device_id()?, b.device_id()?)].expires_at,
                 first_deadline
             );
-            state.forget_link(&network, &b.peer_id()?, "b");
+            state.forget_link(&network, &b.device_id()?, "b");
         }
-        assert!(receiver.online(&network).await.contains(&target.peer_id()?));
+        assert!(
+            receiver
+                .online(&network)
+                .await
+                .contains(&target.device_id()?)
+        );
         receiver
             .state
             .lock()
             .await
-            .forget_link(&network, &c.peer_id()?, "c");
-        let _unrelated = test_link(&receiver, &network, &b.peer_id()?, "unrelated").await;
-        assert!(!receiver.online(&network).await.contains(&target.peer_id()?));
-        assert!(receiver.online(&network).await.contains(&b.peer_id()?));
+            .forget_link(&network, &c.device_id()?, "c");
+        let _unrelated = test_link(&receiver, &network, &b.device_id()?, "unrelated").await;
+        assert!(
+            !receiver
+                .online(&network)
+                .await
+                .contains(&target.device_id()?)
+        );
+        assert!(receiver.online(&network).await.contains(&b.device_id()?));
         Ok(())
     }
 
@@ -1382,26 +1372,26 @@ mod tests {
         let network = owner.fixture_network_id()?;
         let (receiver, _) = hub(&owner, &owner, &[&owner, &target, &b, &c])?;
         let (sender, _) = hub(&owner, &target, &[&owner, &target, &b, &c])?;
-        let _b = test_link(&receiver, &network, &b.peer_id()?, "b").await;
-        let _c = test_link(&receiver, &network, &c.peer_id()?, "c").await;
+        let _b = test_link(&receiver, &network, &b.device_id()?, "b").await;
+        let _c = test_link(&receiver, &network, &c.device_id()?, "c").await;
         let mut packet = sender.packet(&network, None, Kind::Presence, Value::Null, None)?;
         packet.body.created_at_ms = 1_000_000;
         let now = Instant::now();
         let mut state = receiver.state.lock().await;
         assert!(state.remember(&packet, 1_080_000, now)?);
-        state.observe_presence(&b.peer_id()?, "b", &packet.body, 1_080_000, now);
-        let key = (network.clone(), target.peer_id()?, b.peer_id()?);
+        state.observe_presence(&b.device_id()?, "b", &packet.body, 1_080_000, now);
+        let key = (network.clone(), target.device_id()?, b.device_id()?);
         assert_eq!(state.routes[&key].expires_at, now + Duration::from_secs(10));
         assert!(!state.remember(&packet, 900_000, now + Duration::from_secs(5))?);
         state.observe_presence(
-            &b.peer_id()?,
+            &b.device_id()?,
             "b",
             &packet.body,
             900_000,
             now + Duration::from_secs(5),
         );
         state.observe_presence(
-            &c.peer_id()?,
+            &c.device_id()?,
             "c",
             &packet.body,
             900_000,
@@ -1415,7 +1405,7 @@ mod tests {
         );
         state.routes.clear();
         state.observe_presence(
-            &b.peer_id()?,
+            &b.device_id()?,
             "b",
             &packet.body,
             900_000,
@@ -1426,7 +1416,7 @@ mod tests {
         future.body.request_id = Uuid::new_v4().to_string();
         future.body.created_at_ms = 2_030_000;
         assert!(state.remember(&future, 2_000_000, now)?);
-        state.observe_presence(&b.peer_id()?, "b", &future.body, 2_000_000, now);
+        state.observe_presence(&b.device_id()?, "b", &future.body, 2_000_000, now);
         assert_eq!(state.routes[&key].expires_at, now + Duration::from_secs(90));
         let mut conflicting = future.clone();
         conflicting.body.created_at_ms += 1;
@@ -1442,18 +1432,18 @@ mod tests {
         let network = owner.fixture_network_id()?;
         let (receiver, _) = hub(&owner, &owner, &[&owner, &target, &neighbor])?;
         let (sender, _) = hub(&owner, &target, &[&owner, &target, &neighbor])?;
-        let _old = test_link(&receiver, &network, &neighbor.peer_id()?, "old").await;
+        let _old = test_link(&receiver, &network, &neighbor.device_id()?, "old").await;
         let packet = sender.packet(&network, None, Kind::Presence, Value::Null, None)?;
         receiver
-            .receive_packet(&network, &neighbor.peer_id()?, "old", packet.clone())
+            .receive_packet(&network, &neighbor.device_id()?, "old", packet.clone())
             .await?;
-        let _new = test_link(&receiver, &network, &neighbor.peer_id()?, "new").await;
+        let _new = test_link(&receiver, &network, &neighbor.device_id()?, "new").await;
         receiver
-            .receive_packet(&network, &neighbor.peer_id()?, "new", packet.clone())
+            .receive_packet(&network, &neighbor.device_id()?, "new", packet.clone())
             .await?;
         assert!(
             receiver
-                .receive_packet(&network, &neighbor.peer_id()?, "old", packet)
+                .receive_packet(&network, &neighbor.device_id()?, "old", packet)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1463,29 +1453,14 @@ mod tests {
             .state
             .lock()
             .await
-            .forget_link(&network, &neighbor.peer_id()?, "old");
-        let key = (network.clone(), target.peer_id()?, neighbor.peer_id()?);
+            .forget_link(&network, &neighbor.device_id()?, "old");
+        let key = (network.clone(), target.device_id()?, neighbor.device_id()?);
         assert_eq!(receiver.state.lock().await.routes[&key].link_id, "new");
-        assert!(receiver.online(&network).await.contains(&target.peer_id()?));
-        let mut restricted = neighbor.certificate(roles())?;
-        restricted.roles.retain(|role| role != &NodeRole::Relay);
-        receiver.store.lock().await.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(
-                2,
-                vec![
-                    owner.certificate(roles())?,
-                    target.certificate(roles())?,
-                    restricted,
-                ],
-            )?,
-        )?;
-        assert!(!receiver.online(&network).await.contains(&target.peer_id()?));
         assert!(
             receiver
                 .online(&network)
                 .await
-                .contains(&neighbor.peer_id()?)
+                .contains(&target.device_id()?)
         );
         Ok(())
     }
@@ -1504,12 +1479,12 @@ mod tests {
         let (remote, _) = hub(&owner, &target, &nodes)?;
         let mut receivers = Vec::new();
         for node in &neighbors {
-            receivers.push(test_link(&sender, &network, &node.peer_id()?, "neighbor").await);
+            receivers.push(test_link(&sender, &network, &node.device_id()?, "neighbor").await);
         }
-        let mut direct = test_link(&sender, &network, &target.peer_id()?, "direct").await;
+        let mut direct = test_link(&sender, &network, &target.device_id()?, "direct").await;
         let presence = remote.packet(&network, None, Kind::Presence, Value::Null, None)?;
         sender
-            .receive_packet(&network, &neighbors[0].peer_id()?, "neighbor", presence)
+            .receive_packet(&network, &neighbors[0].device_id()?, "neighbor", presence)
             .await?;
         while direct.try_recv().is_ok() {}
         for receive in &mut receivers {
@@ -1517,7 +1492,7 @@ mod tests {
         }
         let packet = sender.packet(
             &network,
-            Some(target.peer_id()?),
+            Some(target.device_id()?),
             Kind::Request,
             json!({"write":"once"}),
             None,
@@ -1537,7 +1512,7 @@ mod tests {
             .state
             .lock()
             .await
-            .forget_link(&network, &target.peer_id()?, "direct");
+            .forget_link(&network, &target.device_id()?, "direct");
         assert_eq!(sender.forward(&packet, None).await?, SendOutcome::Queued(1));
         assert!(receivers[0].try_recv().is_ok());
         assert!(
@@ -1548,7 +1523,7 @@ mod tests {
         sender.state.lock().await.routes.clear();
         assert_eq!(
             sender
-                .forward(&packet, Some(&neighbors[0].peer_id()?))
+                .forward(&packet, Some(&neighbors[0].device_id()?))
                 .await?,
             SendOutcome::Queued(2)
         );
@@ -1576,16 +1551,16 @@ mod tests {
             .acquire_many_owned(32 * 1024 * 1024)
             .await?;
         let no_route = sender
-            .request(&network, &target.peer_id()?, json!({"id":"once"}))
+            .request(&network, &target.device_id()?, json!({"id":"once"}))
             .await
             .unwrap_err();
         assert_eq!(
             no_route.downcast_ref::<RequestFailure>(),
             Some(&RequestFailure::NoRoute)
         );
-        let mut receive = test_link(&sender, &network, &target.peer_id()?, "direct").await;
+        let mut receive = test_link(&sender, &network, &target.device_id()?, "direct").await;
         let busy = sender
-            .request(&network, &target.peer_id()?, json!({"id":"once"}))
+            .request(&network, &target.device_id()?, json!({"id":"once"}))
             .await
             .unwrap_err();
         assert_eq!(
@@ -1597,7 +1572,7 @@ mod tests {
         drop(budget);
         let peer = sender.clone();
         let scope = network.clone();
-        let destination = target.peer_id()?;
+        let destination = target.device_id()?;
         let request = tokio::spawn(async move {
             peer.request(&scope, &destination, json!({"id":"once"}))
                 .await
@@ -1618,7 +1593,7 @@ mod tests {
         drop(queued);
         let packet = sender.packet(
             &network,
-            Some(target.peer_id()?),
+            Some(target.device_id()?),
             Kind::Request,
             Value::Null,
             None,
@@ -1640,7 +1615,7 @@ mod tests {
                 .lock()
                 .await
                 .links
-                .contains_key(&(network, target.peer_id()?))
+                .contains_key(&(network, target.device_id()?))
         );
         Ok(())
     }
@@ -1656,16 +1631,16 @@ mod tests {
         let nodes = [&owner, &target, &b, &c];
         let (sender, _) = hub(&owner, &owner, &nodes)?;
         let (remote, _) = hub(&owner, &target, &nodes)?;
-        let mut via_b = test_link(&sender, &network, &b.peer_id()?, "b").await;
-        let mut via_c = test_link(&sender, &network, &c.peer_id()?, "c").await;
+        let mut via_b = test_link(&sender, &network, &b.device_id()?, "b").await;
+        let mut via_c = test_link(&sender, &network, &c.device_id()?, "c").await;
         let presence = remote.packet(&network, None, Kind::Presence, Value::Null, None)?;
         sender
-            .receive_packet(&network, &b.peer_id()?, "b", presence)
+            .receive_packet(&network, &b.device_id()?, "b", presence)
             .await?;
         while via_c.try_recv().is_ok() {}
         let packet = sender.packet(
             &network,
-            Some(target.peer_id()?),
+            Some(target.device_id()?),
             Kind::Request,
             json!("once"),
             None,
@@ -1678,14 +1653,14 @@ mod tests {
             .lock()
             .await
             .routes
-            .get_mut(&(network.clone(), target.peer_id()?, b.peer_id()?))
+            .get_mut(&(network.clone(), target.device_id()?, b.device_id()?))
             .unwrap()
             .expires_at = Instant::now();
         drop(authorization);
         assert_eq!(forwarding.await?, SendOutcome::Queued(2));
         assert!(via_b.try_recv().is_ok());
         assert!(via_c.try_recv().is_ok());
-        let route_key = (network.clone(), target.peer_id()?, b.peer_id()?);
+        let route_key = (network.clone(), target.device_id()?, b.device_id()?);
         sender
             .state
             .lock()
@@ -1707,8 +1682,8 @@ mod tests {
             .expires_at = Instant::now();
         drop(authorization);
         let online = online.await;
-        assert!(!online.contains(&target.peer_id()?));
-        assert!(online.contains(&b.peer_id()?));
+        assert!(!online.contains(&target.device_id()?));
+        assert!(online.contains(&b.device_id()?));
         Ok(())
     }
 
@@ -1722,8 +1697,8 @@ mod tests {
         let nodes = [&owner, &sender_id, &target];
         let (receiver, mut inbound) = hub(&owner, &owner, &nodes)?;
         let (sender, _) = hub(&owner, &sender_id, &nodes)?;
-        let _input = test_link(&receiver, &network, &sender_id.peer_id()?, "input").await;
-        let _target = test_link(&receiver, &network, &target.peer_id()?, "target").await;
+        let _input = test_link(&receiver, &network, &sender_id.device_id()?, "input").await;
+        let _target = test_link(&receiver, &network, &target.device_id()?, "target").await;
         let _budget = receiver
             .queued_bytes
             .clone()
@@ -1731,47 +1706,47 @@ mod tests {
             .await?;
         let packet = sender.packet(
             &network,
-            Some(target.peer_id()?),
+            Some(target.device_id()?),
             Kind::Request,
             json!("forward busy"),
             None,
         )?;
         receiver
-            .receive_packet(&network, &sender_id.peer_id()?, "input", packet)
+            .receive_packet(&network, &sender_id.device_id()?, "input", packet)
             .await?;
         for _ in 0..256 {
             let packet = sender.packet(
                 &network,
-                Some(owner.peer_id()?),
+                Some(owner.device_id()?),
                 Kind::Request,
                 json!("fill"),
                 None,
             )?;
             receiver
-                .receive_packet(&network, &sender_id.peer_id()?, "input", packet)
+                .receive_packet(&network, &sender_id.device_id()?, "input", packet)
                 .await?;
         }
         let packet = sender.packet(
             &network,
-            Some(owner.peer_id()?),
+            Some(owner.device_id()?),
             Kind::Request,
             json!("inbound busy"),
             None,
         )?;
         receiver
-            .receive_packet(&network, &sender_id.peer_id()?, "input", packet)
+            .receive_packet(&network, &sender_id.device_id()?, "input", packet)
             .await?;
         assert_eq!(inbound.len(), 256);
         receiver.reserve_replay_entries(&network, 0).await?;
         let packet = sender.packet(
             &network,
-            Some(owner.peer_id()?),
+            Some(owner.device_id()?),
             Kind::Request,
             json!("replay busy"),
             None,
         )?;
         receiver
-            .receive_packet(&network, &sender_id.peer_id()?, "input", packet)
+            .receive_packet(&network, &sender_id.device_id()?, "input", packet)
             .await?;
         assert_eq!(receiver.state.lock().await.seen.len(), MAX_SEEN);
         assert!(
@@ -1780,7 +1755,7 @@ mod tests {
                 .lock()
                 .await
                 .links
-                .contains_key(&(network.clone(), sender_id.peer_id()?))
+                .contains_key(&(network.clone(), sender_id.device_id()?))
         );
         assert_eq!(inbound.try_recv()?.payload, json!("fill"));
         Ok(())
@@ -1799,9 +1774,9 @@ mod tests {
         let (send, mut receive) = mpsc::channel(4);
         let mut input_receivers = Vec::new();
         for hub in [&enabled, &disabled] {
-            input_receivers.push(test_link(hub, &network, &a.peer_id()?, "input").await);
+            input_receivers.push(test_link(hub, &network, &a.device_id()?, "input").await);
             hub.state.lock().await.links.insert(
-                (network.clone(), c.peer_id()?),
+                (network.clone(), c.device_id()?),
                 Link {
                     id: "test".into(),
                     outbound: true,
@@ -1811,51 +1786,31 @@ mod tests {
         }
         let packet = sender.packet(
             &network,
-            Some(c.peer_id()?),
+            Some(c.device_id()?),
             Kind::Request,
             json!("relay"),
             None,
         )?;
         disabled
-            .receive_packet(&network, &a.peer_id()?, "input", packet.clone())
+            .receive_packet(&network, &a.device_id()?, "input", packet.clone())
             .await?;
         assert!(receive.try_recv().is_err());
         enabled
-            .receive_packet(&network, &a.peer_id()?, "input", packet)
+            .receive_packet(&network, &a.device_id()?, "input", packet)
             .await?;
         let forwarded: Packet = serde_json::from_str(&receive.try_recv()?.text)?;
         assert_eq!(forwarded.hops_remaining, MAX_HOPS - 1);
         let packet = sender.packet(
             &network,
-            Some(b.peer_id()?),
+            Some(b.device_id()?),
             Kind::Request,
             json!("local"),
             None,
         )?;
         disabled
-            .receive_packet(&network, &a.peer_id()?, "input", packet)
+            .receive_packet(&network, &a.device_id()?, "input", packet)
             .await?;
         assert_eq!(inbound.try_recv()?.payload, json!("local"));
-        let mut restricted = b.certificate(roles())?;
-        restricted.roles.retain(|r| r != &NodeRole::Relay);
-        enabled.store.lock().await.install_trust_bundle(
-            &network,
-            &a.sign_network_fixture(
-                2,
-                vec![a.certificate(roles())?, restricted, c.certificate(roles())?],
-            )?,
-        )?;
-        let packet = sender.packet(
-            &network,
-            Some(c.peer_id()?),
-            Kind::Request,
-            json!("no certificate"),
-            None,
-        )?;
-        enabled
-            .receive_packet(&network, &a.peer_id()?, "input", packet)
-            .await?;
-        assert!(receive.try_recv().is_err());
         Ok(())
     }
 
@@ -1866,12 +1821,17 @@ mod tests {
         let network = a.fixture_network_id()?;
         let (sender, _) = hub(&a, &a, &[&a, &b])?;
         let (receiver, mut inbound) = hub(&a, &b, &[&a, &b])?;
-        let _input = test_link(&receiver, &network, &a.peer_id()?, "input").await;
-        let _wrong_network_input =
-            test_link(&receiver, &b.fixture_network_id()?, &a.peer_id()?, "input").await;
+        let _input = test_link(&receiver, &network, &a.device_id()?, "input").await;
+        let _wrong_network_input = test_link(
+            &receiver,
+            &b.fixture_network_id()?,
+            &a.device_id()?,
+            "input",
+        )
+        .await;
         let packet = sender.packet(
             &network,
-            Some(b.peer_id()?),
+            Some(b.device_id()?),
             Kind::Request,
             json!({"operation_id":"once"}),
             None,
@@ -1880,7 +1840,7 @@ mod tests {
         tampered.body.payload = json!({"operation_id":"changed"});
         assert!(
             receiver
-                .receive_packet(&network, &a.peer_id()?, "input", tampered)
+                .receive_packet(&network, &a.device_id()?, "input", tampered)
                 .await
                 .is_err()
         );
@@ -1889,7 +1849,7 @@ mod tests {
             receiver
                 .receive_packet(
                     &b.fixture_network_id()?,
-                    &a.peer_id()?,
+                    &a.device_id()?,
                     "input",
                     packet.clone()
                 )
@@ -1897,30 +1857,29 @@ mod tests {
                 .is_err()
         );
         receiver
-            .receive_packet(&network, &a.peer_id()?, "input", packet.clone())
+            .receive_packet(&network, &a.device_id()?, "input", packet.clone())
             .await?;
         receiver
-            .receive_packet(&network, &a.peer_id()?, "input", packet)
+            .receive_packet(&network, &a.device_id()?, "input", packet)
             .await?;
         let received = inbound.try_recv()?;
-        assert_eq!(received.origin, a.peer_id()?);
+        assert_eq!(received.origin, a.device_id()?);
         assert_eq!(received.payload, json!({"operation_id":"once"}));
         assert!(inbound.try_recv().is_err());
-        let mut revoked = a.certificate(roles())?;
-        revoked.revoked = true;
-        receiver.store.lock().await.install_trust_bundle(
-            &network,
-            &a.sign_network_fixture(2, vec![revoked, b.certificate(roles())?])?,
-        )?;
+        receiver
+            .store
+            .lock()
+            .await
+            .install_trust_bundle(&network, &a.sign_network_fixture(2, vec![b.device_id()?])?)?;
         let packet = sender.packet(
             &network,
-            Some(b.peer_id()?),
+            Some(b.device_id()?),
             Kind::Request,
             Value::Null,
             None,
         )?;
         receiver
-            .receive_packet(&network, &a.peer_id()?, "input", packet)
+            .receive_packet(&network, &a.device_id()?, "input", packet)
             .await?;
         assert!(inbound.try_recv().is_err());
         Ok(())
@@ -1936,7 +1895,7 @@ mod tests {
         let (sender, _) = hub(&owner, &unknown, &[&owner, &known, &unknown])?;
         let (send, _) = mpsc::channel(1);
         receiver.state.lock().await.links.insert(
-            (network.clone(), owner.peer_id()?),
+            (network.clone(), owner.device_id()?),
             Link {
                 id: "trusted".into(),
                 outbound: true,
@@ -1945,13 +1904,13 @@ mod tests {
         );
         let packet = sender.packet(
             &network,
-            Some(known.peer_id()?),
+            Some(known.device_id()?),
             Kind::Request,
             json!({"unknown":true}),
             None,
         )?;
         receiver
-            .receive_packet(&network, &owner.peer_id()?, "trusted", packet)
+            .receive_packet(&network, &owner.device_id()?, "trusted", packet)
             .await?;
         assert!(inbound.try_recv().is_err());
         assert!(
@@ -1960,7 +1919,7 @@ mod tests {
                 .lock()
                 .await
                 .links
-                .contains_key(&(network, owner.peer_id()?))
+                .contains_key(&(network, owner.device_id()?))
         );
         Ok(())
     }
@@ -1974,27 +1933,27 @@ mod tests {
         let (requester, _) = hub(&a, &a, &[&a, &b, &c])?;
         let (expected, _) = hub(&a, &b, &[&a, &b, &c])?;
         let (other, _) = hub(&a, &c, &[&a, &b, &c])?;
-        let _other_input = test_link(&requester, &network, &c.peer_id()?, "other").await;
-        let _expected_input = test_link(&requester, &network, &b.peer_id()?, "expected").await;
+        let _other_input = test_link(&requester, &network, &c.device_id()?, "other").await;
+        let _expected_input = test_link(&requester, &network, &b.device_id()?, "expected").await;
         let request_id = Uuid::new_v4().to_string();
         let (reply, mut receive) = oneshot::channel();
         requester.state.lock().await.pending.insert(
             (network.clone(), request_id.clone()),
             Pending {
-                origin: b.peer_id()?,
+                origin: b.device_id()?,
                 created: Instant::now(),
                 reply,
             },
         );
         let wrong = other.packet(
             &network,
-            Some(a.peer_id()?),
+            Some(a.device_id()?),
             Kind::Response,
             json!("wrong"),
             Some(request_id.clone()),
         )?;
         requester
-            .receive_packet(&network, &c.peer_id()?, "other", wrong)
+            .receive_packet(&network, &c.device_id()?, "other", wrong)
             .await?;
         assert!(matches!(
             receive.try_recv(),
@@ -2002,13 +1961,13 @@ mod tests {
         ));
         let correct = expected.packet(
             &network,
-            Some(a.peer_id()?),
+            Some(a.device_id()?),
             Kind::Response,
             json!("correct"),
             Some(request_id),
         )?;
         requester
-            .receive_packet(&network, &b.peer_id()?, "expected", correct)
+            .receive_packet(&network, &b.device_id()?, "expected", correct)
             .await?;
         assert_eq!(receive.await?, json!("correct"));
         Ok(())
@@ -2021,7 +1980,7 @@ mod tests {
         let (hub, _) = hub(&a, &a, &[&a, &b])?;
         let packet = hub.packet(
             &a.fixture_network_id()?,
-            Some(b.peer_id()?),
+            Some(b.device_id()?),
             Kind::Request,
             json!("ok"),
             None,
@@ -2036,10 +1995,10 @@ mod tests {
         body.target = None;
         assert!(validate_body(&body, now).is_err());
         body = packet.body.clone();
-        body.target = Some(a.peer_id()?);
+        body.target = Some(a.device_id()?);
         assert!(
             verify_payload(
-                &a.public_key_hex()?,
+                &a.device_id()?,
                 "peer-packet",
                 &serde_json::to_vec(&body)?,
                 &packet.signature
@@ -2049,7 +2008,7 @@ mod tests {
         assert!(
             hub.packet(
                 &a.fixture_network_id()?,
-                Some(b.peer_id()?),
+                Some(b.device_id()?),
                 Kind::Request,
                 json!("x".repeat(MAX_PACKET_BYTES)),
                 None
@@ -2060,7 +2019,7 @@ mod tests {
         assert_eq!(serde_json::to_vec(&payload)?.len(), MAX_PACKET_BYTES - 1024);
         let response = hub.packet(
             &a.fixture_network_id()?,
-            Some(b.peer_id()?),
+            Some(b.device_id()?),
             Kind::Response,
             payload,
             None,
@@ -2138,7 +2097,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let network = a.fixture_network_id()?;
-        let target = b.peer_id()?;
+        let target = b.device_id()?;
         let (server, _) = hub(&a, &a, &[&a, &b])?;
         let (client, _) = hub(&a, &b, &[&a, &b])?;
         let mut tasks = Tasks(Vec::new());
@@ -2232,23 +2191,23 @@ mod tests {
         tasks.0.push(tokio::spawn(async move {
             let _ = h.connect(n, url).await;
         }));
-        wait_link(&ha, &network, &b.peer_id()?).await?;
+        wait_link(&ha, &network, &b.device_id()?).await?;
         let h = hc.clone();
         let n = network.clone();
         tasks.0.push(tokio::spawn(async move {
             let _ = h.connect(n, url_b).await;
         }));
-        wait_link(&hb, &network, &c.peer_id()?).await?;
+        wait_link(&hb, &network, &c.device_id()?).await?;
         let h = ha.clone();
         let n = network.clone();
-        let target = c.peer_id()?;
+        let target = c.device_id()?;
         let request =
             tokio::spawn(async move { h.request(&n, &target, json!({"query":"status"})).await });
         // C has no listening socket: its outbound connection carries requests back in.
         let received = tokio::time::timeout(Duration::from_secs(5), rc.recv())
             .await?
             .context("missing relayed request")?;
-        assert_eq!(received.origin, a.peer_id()?);
+        assert_eq!(received.origin, a.device_id()?);
         assert_eq!(received.payload, json!({"query":"status"}));
         hc.respond(&received, json!({"status":"running"})).await?;
         assert_eq!(
@@ -2263,7 +2222,7 @@ mod tests {
         tasks.0.push(tokio::spawn(async move {
             let _ = h.connect(n, url_a).await;
         }));
-        wait_link(&ha, &network, &c.peer_id()?).await?;
+        wait_link(&ha, &network, &c.device_id()?).await?;
         hc.broadcast(&network, json!({"event":"one"})).await?;
         let at_a = tokio::time::timeout(Duration::from_secs(5), ra.recv())
             .await?
@@ -2272,7 +2231,7 @@ mod tests {
             .await?
             .context("missing B broadcast")?;
         assert!(at_a.broadcast && at_b.broadcast);
-        assert_eq!(at_a.origin, c.peer_id()?);
+        assert_eq!(at_a.origin, c.device_id()?);
         assert_eq!(at_a.request_id, at_b.request_id);
         assert_eq!(at_a.payload, json!({"event":"one"}));
         assert!(

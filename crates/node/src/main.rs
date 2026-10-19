@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::Url;
 use serde_json::{Value, json};
 use std::{
@@ -18,8 +18,7 @@ use vibeface::{
     identity::local::BootstrapCapability,
     local_access::Launcher,
     maintenance,
-    network::NetworkConfig,
-    pairing::{Invitation, JoinState, NodePairing, network_url},
+    network::{NetworkConfig, network_url},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -60,8 +59,8 @@ enum Action {
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
-    /// Join a personal network using its invite and pinned Peer ID.
-    Pair(Pair),
+    /// Join a personal network with an invite link from a management device.
+    Join(Join),
     /// Call a node tool from a locally managed SDK process.
     Tool {
         name: String,
@@ -111,6 +110,9 @@ struct Init {
     data: DataDir,
     #[arg(long, default_value_t = DEFAULT_LISTEN)]
     listen: SocketAddr,
+    /// Loopback address of this device's own browser session.
+    #[arg(long, default_value_t = config::DEFAULT_LOCAL_LISTEN)]
+    local_listen: SocketAddr,
     #[arg(long)]
     public_url: Option<String>,
     /// Additional browser origins allowed to reach this node. May be repeated.
@@ -165,17 +167,14 @@ struct Access {
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("invitation").required(true).args(["invite_file", "invite"])))]
-struct Pair {
+struct Join {
+    /// Invite link, `https://<gateway>/join#vibeface1…`.
+    link: String,
     #[command(flatten)]
     data: DataDir,
+    /// Device name shown to the network; defaults to this machine's host name.
     #[arg(long)]
-    invite_file: Option<PathBuf>,
-    /// Base64url encoded invitation copied from a trusted management client.
-    #[arg(long)]
-    invite: Option<String>,
-    #[arg(long, default_value = "Node")]
-    name: String,
+    name: Option<String>,
 }
 
 impl Cli {
@@ -205,6 +204,9 @@ async fn main() -> Result<()> {
         Some(command) => command,
         None => {
             let data_dir = cli.data_dir.unwrap_or_else(config::default_dir);
+            if !data_dir.join("config.json").exists() {
+                check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
+            }
             prepare_start(&data_dir, &cli.bootstrap_urls)?;
             Action::Serve(Serve {
                 data: DataDir { data_dir },
@@ -213,7 +215,10 @@ async fn main() -> Result<()> {
         }
     };
     match command {
-        Action::Init(options) => init(*options),
+        Action::Init(options) => {
+            check_ports(options.listen, options.local_listen)?;
+            init(*options)
+        }
         Action::Serve(options) => {
             let runtime = Arc::new(
                 Runtime::open_with_bootstrap_urls(&options.data.data_dir, &options.bootstrap_urls)
@@ -245,13 +250,22 @@ async fn main() -> Result<()> {
         Action::Status(options) => status(options).await,
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
-        Action::Pair(options) => pair(options).await,
+        Action::Join(options) => join(options).await,
         Action::Tool {
             name,
             json,
             call_ref,
         } => call_tool(name, json, call_ref).await,
     }
+}
+
+/// Fails before any file is written, so a busy port never leaves a half-made data directory.
+fn check_ports(listen: SocketAddr, local_listen: SocketAddr) -> Result<()> {
+    for (address, flag) in [(listen, "--listen"), (local_listen, "--local-listen")] {
+        std::net::TcpListener::bind(address)
+            .with_context(|| format!("端口 {} 被占用，可用 {flag} 更换", address.port()))?;
+    }
+    Ok(())
 }
 
 fn prepare_start(dir: &Path, bootstrap_urls: &[String]) -> Result<()> {
@@ -278,10 +292,10 @@ async fn status(options: Access) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
-    let peer_id = config::identity(&data)?.peer_id()?;
+    let device_id = config::identity(&data)?.device_id()?;
     let health = maintenance::probe(&data).await.and_then(|health| {
         ensure!(
-            health.peer_id == peer_id,
+            health.device_id == device_id,
             "running node identity does not match this data directory"
         );
         Ok(health)
@@ -305,7 +319,7 @@ async fn status(options: Access) -> Result<()> {
         println!(
             "{}",
             json!({
-                "status":state, "peer_id":peer_id, "data_dir":data,
+                "status":state, "device_id":device_id, "data_dir":data,
                 "listen":configuration.listen, "roles":configuration.roles,
                 "version":health.as_ref().ok().map(|health| &health.version),
                 "cli_version":env!("CARGO_PKG_VERSION"), "error":error,
@@ -313,7 +327,7 @@ async fn status(options: Access) -> Result<()> {
         );
     } else {
         println!(
-            "Peer ID: {peer_id}\nStatus: {state}\nListen: {}\nData: {}",
+            "Peer ID: {device_id}\nStatus: {state}\nListen: {}\nData: {}",
             configuration.listen,
             data.display()
         );
@@ -337,6 +351,7 @@ fn init(options: Init) -> Result<()> {
         .map(|root| root.canonicalize().context("resolve project root"))
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
+    configuration.local_listen = options.local_listen;
     configuration.local_auto_access = !options.no_local_auto_access && !options.relay_only;
     configuration.codex_socket = options.codex_socket;
     configuration.codex_bin = options.codex_bin;
@@ -418,7 +433,7 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &serde_json::to_vec(&capability)?,
     )?;
     create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
-    println!("Initialized device with Peer ID {}", identity.peer_id()?);
+    println!("Initialized device with Peer ID {}", identity.device_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
 }
@@ -509,7 +524,7 @@ async fn access(options: Access) -> Result<()> {
         ensure!(
             url.scheme() == "http"
                 && url.host_str() == Some("127.0.0.1")
-                && launcher.peer_id == identity.peer_id()?
+                && launcher.node_id == identity.device_id()?
                 && launcher.capability.len() == 64
                 && hex::decode(&launcher.capability).is_ok(),
             "local launcher does not match this node"
@@ -532,14 +547,14 @@ async fn access(options: Access) -> Result<()> {
             .filter(|token| token.len() == 64 && hex::decode(token).is_ok())
             .context("invalid local browser entry")?;
         ensure!(
-            entry["peer_id"] == launcher.peer_id && entry["url"] == launcher.origin,
+            entry["device_id"] == launcher.node_id && entry["url"] == launcher.origin,
             "local browser entry does not match this node"
         );
-        url.set_fragment(Some(&format!("local={token}&node={}", launcher.peer_id)));
+        url.set_fragment(Some(&format!("local={token}&node={}", launcher.node_id)));
         if options.json {
             println!(
                 "{}",
-                json!({"url":url.to_string(),"peer_id":launcher.peer_id,"local":true})
+                json!({"url":url.to_string(),"device_id":launcher.node_id,"local":true})
             );
         } else {
             println!("{url}");
@@ -559,7 +574,7 @@ async fn access(options: Access) -> Result<()> {
         };
         url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
-    let entry = json!({"url":url.origin().ascii_serialization(),"peer_id":identity.peer_id()?,"capability":capability});
+    let entry = json!({"url":url.origin().ascii_serialization(),"device_id":identity.device_id()?,"capability":capability});
     if options.json {
         println!("{}", serde_json::to_string(&entry)?);
     } else {
@@ -583,52 +598,15 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn invitation(options: &Pair) -> Result<Invitation> {
-    if let Some(path) = &options.invite_file {
-        Invitation::from_bytes(&read_bounded(path, 128 * 1024)?)
-    } else {
-        Invitation::parse(options.invite.as_deref().context("invitation required")?)
-    }
-}
-
-async fn pair(options: Pair) -> Result<()> {
-    let invitation = invitation(&options)?;
-    let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
-    let pairing = NodePairing::new(runtime);
-    let mut status = pairing.request(invitation, &options.name).await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
-    loop {
-        match status {
-            JoinState::Joined {
-                peer_id,
-                network_id,
-            } => {
-                println!("Paired node {peer_id} with network {network_id}");
-                println!("Start the Node to connect to its personal network.");
-                return Ok(());
-            }
-            JoinState::Review {
-                request_id,
-                review_hash,
-                ..
-            } => {
-                status = pairing.accept(&request_id, &review_hash).await?;
-                println!(
-                    "Pairing request submitted. Confirm this device in the management client."
-                );
-            }
-            JoinState::Pending { .. } => {
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "pairing is still pending; run the same command again to resume"
-                );
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                status = pairing.status().await?;
-            }
-            JoinState::Uncertain { message, .. } => bail!("{message}"),
-            JoinState::Idle => bail!("pairing request is missing; pending receipt was preserved"),
-        }
-    }
+async fn join(options: Join) -> Result<()> {
+    let name = options.name.unwrap_or_else(config::hostname);
+    let state =
+        vibeface::client::join_network(&options.data.data_dir, &options.link, &name).await?;
+    println!(
+        "已加入个人网络 {}。启动 Node 后即可连接。",
+        state.genesis.network_id
+    );
+    Ok(())
 }
 
 async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
@@ -924,12 +902,12 @@ mod tests {
             configuration.save(&dir).unwrap();
             let identity = fs::read(dir.join("identity.json")).unwrap();
             let config = fs::read(dir.join("config.json")).unwrap();
-            let peer_id = config::identity(&dir).unwrap().peer_id().unwrap();
+            let device_id = config::identity(&dir).unwrap().device_id().unwrap();
             prepare_start(&dir, &[]).unwrap();
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
             let runtime = Runtime::open(&dir).await.unwrap();
-            assert_eq!(runtime.identity.peer_id().unwrap(), peer_id);
+            assert_eq!(runtime.identity.device_id().unwrap(), device_id);
             assert_eq!(runtime.config.timeout_secs, 1234);
             drop(runtime);
             fs::write(dir.join("config.json"), b"invalid configuration").unwrap();
@@ -965,25 +943,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_requires_one_invitation_and_supports_accountless_flags() {
-        assert!(Cli::try_parse_from(["vibeface", "pair"]).is_err());
+    fn cli_requires_one_invite_link_and_supports_accountless_flags() {
+        assert!(Cli::try_parse_from(["vibeface", "join"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "pair", "--invite", "abc"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "vibeface",
-                "pair",
-                "--invite",
-                "abc",
-                "--invite-file",
-                "invite.json"
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "vibeface",
-                "pair",
-                "--invite",
-                "abc",
+                "join",
+                "https://node.example/join#vibeface1abc",
                 "--name",
                 "Build Node"
             ])

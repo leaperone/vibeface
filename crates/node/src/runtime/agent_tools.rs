@@ -67,7 +67,7 @@ impl Runtime {
                     .context("dispatch requires an agent invocation")?;
                 let call_ref = field(&args, "call_ref")?;
                 vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
-                let local = self.identity.peer_id()?;
+                let local = self.identity.device_id()?;
                 let optional = |key: &str| args[key].as_str().map(String::from);
                 let spec = WorkSpec {
                     work_id: WorkSpec::id(&scope, &manager.trigger, call_ref),

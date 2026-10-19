@@ -1,9 +1,7 @@
 -- Create "networks" table
 CREATE TABLE `networks` (`network_id` text NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
--- Create "node_certificates" table
-CREATE TABLE `node_certificates` (`network_id` text NOT NULL, `peer_id` text NOT NULL, `public_key` text NOT NULL, PRIMARY KEY (`network_id`, `peer_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create "local_identities" table
-CREATE TABLE `local_identities` (`network_id` text NOT NULL, `peer_id` text NOT NULL, `identity` text NOT NULL, PRIMARY KEY (`network_id`, `peer_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+CREATE TABLE `local_identities` (`network_id` text NOT NULL, `device_id` text NOT NULL, `identity` text NOT NULL, PRIMARY KEY (`network_id`, `device_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create "events" table
 CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, PRIMARY KEY (`network_id`, `author`, `seq`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create index "events_hash" to table: "events"
@@ -54,17 +52,10 @@ CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `us
 CREATE TABLE `local_values` (`network_id` text NOT NULL, `key` text NOT NULL, `value` text NOT NULL, PRIMARY KEY (`network_id`, `key`));
 -- Create "identity_meta" table
 CREATE TABLE `identity_meta` (`key` text NULL, `value` text NOT NULL, PRIMARY KEY (`key`));
--- Create "identity_requests" table
-CREATE TABLE `identity_requests` (`request_id` text NULL, `subject_id` text NOT NULL, `kind` text NOT NULL, `response` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`request_id`));
--- Create "identity_invites" table
-CREATE TABLE `identity_invites` (`invite_id` text NULL, `request_id` text NOT NULL, `network_id` text NOT NULL, `inviter_subject_id` text NOT NULL, `payload` text NOT NULL, `payload_hash` text NOT NULL, `capability_hash` text NOT NULL, `inviter_signature` text NOT NULL, `epoch` integer NOT NULL, `expires_at_ms` integer NOT NULL, `used` integer NOT NULL DEFAULT 0, PRIMARY KEY (`invite_id`));
--- Create index "identity_invites_request_id" to table: "identity_invites"
-CREATE UNIQUE INDEX `identity_invites_request_id` ON `identity_invites` (`request_id`);
--- Create "identity_pair_reviews" table
-CREATE TABLE `identity_pair_reviews` (`invite_id` text NULL, `review` text NOT NULL, `review_hash` text NOT NULL, `inviter_signature` text NOT NULL, `new_subject_signature` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`invite_id`));
--- Create "identity_pair_requests" table
-CREATE TABLE `identity_pair_requests` (`request_id` text NULL, `invite_id` text NOT NULL, `subject_id` text NOT NULL, `review` text NOT NULL, `review_hash` text NOT NULL, `new_subject_signature` text NOT NULL DEFAULT '', PRIMARY KEY (`request_id`));
--- Create index "identity_pair_requests_invite_id" to table: "identity_pair_requests"
-CREATE UNIQUE INDEX `identity_pair_requests_invite_id` ON `identity_pair_requests` (`invite_id`);
+
+-- Create "invites" table
+CREATE TABLE `invites` (`join_id` text NOT NULL, `invite_hash` text NOT NULL, `issuer` text NOT NULL, `epoch` integer NOT NULL, `expires_at_ms` integer NOT NULL, `record` text NOT NULL, `device_id` text NULL, `kind` text NULL, `name` text NULL, `commit_hash` text NULL, `status` text NULL, `admin_id` text NULL, `admin_nonce` text NULL, `joiner_nonce` text NULL, `reason` text NULL, `grant_hash` text NULL, PRIMARY KEY (`join_id`));
+-- Create index "invites_invite_hash" to table: "invites"
+CREATE UNIQUE INDEX `invites_invite_hash` ON `invites` (`invite_hash`);
 
 PRAGMA user_version = 6;

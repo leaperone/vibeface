@@ -9,10 +9,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
+
+/// This machine's name, the default device name shown when creating or joining a network.
+pub fn hostname() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is writable for its full length and gethostname NUL-terminates within it.
+    let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    let name = String::from_utf8_lossy(&buffer[..end]);
+    let name = name.trim().trim_end_matches(".local");
+    if ok && !name.is_empty() {
+        name.chars().take(128).collect()
+    } else {
+        "Node".into()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+    /// Loopback-only local session listener; fixed so its origin and browser storage persist.
+    pub local_listen: SocketAddr,
     pub public_url: String,
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
@@ -40,6 +60,7 @@ impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
         Self {
             listen,
+            local_listen: DEFAULT_LOCAL_LISTEN,
             public_url: format!("http://{listen}"),
             allowed_origins: vec![],
             allow_insecure_lan,
@@ -81,6 +102,10 @@ impl Config {
             "HTTP on a LAN requires --allow-insecure-lan; public endpoints require HTTPS"
         );
         self.browser_origins()?;
+        ensure!(
+            self.local_listen.ip().is_loopback() && self.local_listen != self.listen,
+            "local_listen must be a loopback address different from listen"
+        );
         ensure!(
             self.timeout_secs > 0 && self.timeout_secs <= 86400,
             "invalid SDK timeout"
