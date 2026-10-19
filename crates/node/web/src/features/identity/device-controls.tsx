@@ -1,13 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, Plus } from 'lucide-react'
 import qrcode from 'qrcode-generator'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import type { ConnectionEntry, Member, NodeRole, PairReceipt } from '@/lib/node'
+import type { ConnectionEntry, NodeRole } from '@/lib/node'
 import { record, text } from '@/lib/node'
 import { invitationLink } from '@/lib/enrollment-reference'
 import { downloadConnectionFile } from '@/lib/connection-file'
@@ -16,7 +15,6 @@ import { RecoveryControls } from './recovery-controls'
 
 const button = 'min-h-10'
 const input = 'min-h-10'
-const panel = 'gap-4 p-5'
 const disclosure = 'h-auto min-h-14 w-full justify-between gap-3 rounded-none px-5 py-4 text-left whitespace-normal [&[data-state=open]>svg]:rotate-180'
 const roleLabels: Record<NodeRole, string> = {
   gateway: '接入', relay: '中继', replica: '同步', scheduler: '调度',
@@ -28,29 +26,9 @@ function entryKey(entry: ConnectionEntry) {
   return `${entry.address}|${entry.peer_id}|${entry.local === true}`
 }
 
-function MemberDetails({ member, compact = false, current = false }: { member: Member; compact?: boolean; current?: boolean }) {
-  const fingerprints = <dl className="grid gap-3 text-xs">
-    <div className="space-y-1"><dt className="text-muted-foreground">完整设备编号</dt><dd className="break-all font-mono">{member.subject_id}</dd></div>
-    <div className="space-y-1"><dt className="text-muted-foreground">公钥</dt><dd className="break-all font-mono">{member.public_key}</dd></div>
-  </dl>
-  return <div className="min-w-0 space-y-3">
-    <div className="flex flex-wrap items-center gap-2">
-      <h3 className="break-all text-sm font-medium">{member.name || '未命名设备'}</h3>
-      <Badge variant="secondary">{member.kind === 'node' ? '节点' : '客户端'}</Badge>
-      {member.manage && <Badge variant="outline">可管理设备</Badge>}
-      {current && <Badge variant="outline">当前入口</Badge>}
-    </div>
-    {member.kind === 'node' && <p className="text-xs text-muted-foreground">角色：{member.node_roles.map((role) => roleLabels[role]).join('、') || '无'}</p>}
-    {compact ? <Collapsible>
-      <CollapsibleTrigger asChild><Button variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-xs text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">设备编号与公钥<ChevronDown className="size-3 transition-transform" /></Button></CollapsibleTrigger>
-      <CollapsibleContent className="pt-2">{fingerprints}</CollapsibleContent>
-    </Collapsible> : fingerprints}
-  </div>
-}
-
 export function DeviceControls({ active }: { active: boolean }) {
   const device = useDevice()
-  const { ready, identity, entries, directory, pairs } = device
+  const { ready, identity, entries, directory } = device
   const generation = device.connectionGeneration()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
@@ -62,15 +40,9 @@ export function DeviceControls({ active }: { active: boolean }) {
   const [inviteKind, setInviteKind] = useState<'client' | 'node'>('client')
   const [roles, setRoles] = useState<NodeRole[]>(['relay'])
   const [invitation, setInvitation] = useState<InvitationShare | null>(null)
-  const [review, setReview] = useState<PairReceipt | null>(null)
-  const [reviewConfirmed, setReviewConfirmed] = useState(false)
-  const [revokeSubject, setRevokeSubject] = useState('')
 
   useEffect(() => {
     setInvitation(null)
-    setReview(null)
-    setReviewConfirmed(false)
-    setRevokeSubject('')
     setError('')
     setStatus('')
   }, [ready])
@@ -114,68 +86,12 @@ export function DeviceControls({ active }: { active: boolean }) {
   }
 
   const canManage = ready?.principal.can_manage === true
-  const localSession = ready?.principal.source === 'local_session'
   const localInvitation = invitation?.kind === 'client' && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(invitation.link).hostname)
   const needsReplica = roles.some((role) => role === 'gateway' || role === 'scheduler')
-  const currentReview = review && pairs.find((pair) => pair.request_id === review.request_id && JSON.stringify(pair) === JSON.stringify(review))
 
   return <div className="space-y-5">
     {(busy || status) && <p role="status" className="text-sm text-muted-foreground">{busy ? '正在处理…' : status}</p>}
     {error && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error}</p>}
-
-    {(localSession || canManage) && <Card className={panel} aria-labelledby="local-auto-access-title">
-      <h2 id="local-auto-access-title" className="font-semibold">本机自动访问</h2>
-      <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={device.localAutoAccess === true} disabled={busy || device.localAutoAccess === null || localSession && !device.localAutoAccess} onChange={event => void run(() => device.setLocalAutoAccess(event.target.checked), '本机自动访问设置已保存。')} />从本机启动器打开网页时自动连接</label>
-      {device.localAutoAccess === null && <p role="status" className="text-sm text-muted-foreground">正在读取设置…</p>}
-      <p className="text-xs text-muted-foreground">关闭会断开通过本机入口连接的网页。使用管理设备可重新开启。</p>
-    </Card>}
-
-    {canManage && pairs.length > 0 && <Card className={panel} aria-labelledby="pair-requests-title">
-      <div className="flex flex-wrap items-center gap-2"><h2 id="pair-requests-title" className="font-semibold">待确认配对</h2><Badge variant="secondary">{pairs.length}</Badge></div>
-      <ul className="space-y-5">
-        {pairs.map((pair) => <li key={pair.request_id} className="space-y-4 rounded-lg bg-muted/40 p-4">
-          <MemberDetails member={pair.review.new_member} />
-          {!pair.new_subject_signature ? <p role="status" className="text-sm text-muted-foreground">等待新设备核对并确认。</p> : currentReview?.request_id === pair.request_id ? <div className="space-y-3">
-            <p className="text-sm">请与新设备核对完整设备编号、类型和角色。</p>
-            <dl className="grid gap-3 text-xs"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{pair.review.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{pair.review.inviter_subject_id}</dd></div></dl>
-            <label className="flex min-h-11 items-start gap-2 text-sm"><input className="mt-1" type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} />我已通过可信渠道核对以上设备信息</label>
-            <div className="flex flex-wrap gap-2">
-              <Button type="button" className={button} disabled={busy || !reviewConfirmed} onClick={() => void run(async () => { await device.approvePair(pair.request_id); if (ready?.isCurrent()) { setReview(null); setReviewConfirmed(false); setInvitation(null) } }, '设备已获授权。')}>确认授权</Button>
-              <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => { setReview(null); setReviewConfirmed(false) }}>取消</Button>
-            </div>
-          </div> : <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => { setReview(pair); setReviewConfirmed(false) }}>核对设备信息</Button>}
-        </li>)}
-      </ul>
-    </Card>}
-
-    <Card className={panel} aria-labelledby="authorized-devices-title">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2"><h2 id="authorized-devices-title" className="font-semibold">已授权设备</h2>{directory && <Badge variant="secondary">{directory.members.length}</Badge>}</div>
-        <Button type="button" variant="outline" className={button} disabled={busy || !ready} onClick={() => void run(() => device.refreshDirectory(), '设备目录已刷新。')}>刷新</Button>
-      </div>
-      {directory ? <>
-        <ul className="divide-y divide-border">
-          {directory.members.map((member) => <li key={member.subject_id} className="space-y-3 py-4 first:pt-0 last:pb-0">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <MemberDetails member={member} compact current={member.subject_id === ready?.entry.peer_id} />
-              {canManage && !member.manage && member.subject_id !== ready?.entry.peer_id && revokeSubject !== member.subject_id && <Button type="button" variant="ghost" className={`${button} text-destructive`} disabled={busy} onClick={() => setRevokeSubject(member.subject_id)}>撤销授权</Button>}
-            </div>
-            {canManage && !member.manage && revokeSubject === member.subject_id && <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
-              <p className="break-all text-sm">撤销后，此设备将失去网络访问权限。确认撤销「{member.name || member.subject_id}」？</p>
-              <div className="flex flex-wrap gap-2">
-                <Button type="button" variant="destructive" className={button} disabled={busy} onClick={() => void run(async () => { await device.revoke(member.subject_id); if (ready?.isCurrent()) setRevokeSubject('') }, '设备授权已撤销。')}>确认撤销</Button>
-                <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => setRevokeSubject('')}>取消</Button>
-              </div>
-            </div>}
-          </li>)}
-        </ul>
-        {directory.members.some((member) => member.manage) && <p className="text-xs text-muted-foreground">变更管理设备需使用恢复包。</p>}
-        {directory.revoked.length > 0 && <Collapsible>
-          <CollapsibleTrigger asChild><Button type="button" variant="ghost" className="min-h-10 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">已撤销的设备（{directory.revoked.length}）<ChevronDown className="size-4 transition-transform" /></Button></CollapsibleTrigger>
-          <CollapsibleContent><ul className="space-y-2 pt-2">{directory.revoked.map((subject) => <li key={subject} className="break-all font-mono text-xs text-muted-foreground">{subject}</li>)}</ul></CollapsibleContent>
-        </Collapsible>}
-      </> : <p className="text-sm text-muted-foreground">尚未读取设备目录。</p>}
-    </Card>
 
     {canManage && <Card className="gap-0 py-0">
       <Collapsible>

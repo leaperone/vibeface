@@ -220,3 +220,11 @@ svg.lucide { stroke-width: 1.75; }
   *, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; }
   .skeleton { animation: skeleton-in 0s 300ms forwards; }
 }
+
+/* Native checkbox drawn as a switch: <input type="checkbox" role="switch" class="switch"> */
+.switch { appearance: none; position: relative; width: 2.25rem; height: 1.25rem; flex-shrink: 0; border-radius: 9999px; background: var(--muted-foreground); opacity: .5; transition: background .15s, opacity .15s; cursor: pointer; }
+.switch::before { content: ""; position: absolute; top: .125rem; left: .125rem; width: 1rem; height: 1rem; border-radius: 9999px; background: var(--background); transition: transform .15s; }
+.switch:checked { background: var(--success); opacity: 1; }
+.switch:checked::before { transform: translateX(1rem); }
+.switch:disabled { cursor: not-allowed; opacity: .35; }
+.switch:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
