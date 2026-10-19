@@ -2,7 +2,7 @@ use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
     engine::{Engine, EngineAction, ExecutorConfig, ExecutorKind, ExecutorSession},
-    identity::{AuthorizationView, IdentityKind, IdentityStore, NetworkState},
+    identity::{AuthorizationView, GovernanceAction, IdentityKind, IdentityStore, NetworkState},
     maintenance::{Busy, Gate},
     model::*,
     network::{IncomingSocket, NetworkHub, Service},
@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -36,6 +36,68 @@ mod sync;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::ObservationGuard;
 use sync::{HistoryPage, HistoryReply, ReadClass, SyncCoordinator};
+
+fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    for member in bundle.genesis.initial_members.iter().chain(
+        bundle
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.members.as_slice())
+            .unwrap_or(&[]),
+    ) {
+        if member.kind == IdentityKind::Node {
+            names.insert(member.subject_id.clone(), member.name.clone());
+        }
+    }
+    for event in &bundle.events {
+        if let GovernanceAction::Grant { member } = &event.action
+            && member.kind == IdentityKind::Node
+        {
+            names.insert(member.subject_id.clone(), member.name.clone());
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod node_display_names_tests {
+    use super::node_display_names;
+    use crate::crypto::LocalIdentity;
+    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, NodeRole};
+    use anyhow::Result;
+
+    #[test]
+    fn revoked_node_keeps_last_granted_name() -> Result<()> {
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let node = LocalIdentity::generate();
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            vec![Member::client(&admin, "admin", true)?],
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(
+                &node,
+                "Mac Studio",
+                vec![NodeRole::Replica, NodeRole::Executor],
+            )?,
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &admin,
+            &state.project()?,
+            &node.node_id()?,
+        )?)?;
+        let names = node_display_names(&state);
+        assert_eq!(
+            names.get(&node.node_id()?).map(String::as_str),
+            Some("Mac Studio")
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct Access {
@@ -5314,6 +5376,7 @@ impl Runtime {
                 let mut nodes = vec![];
                 let view = bundle.project()?;
                 let revoked_ids = view.revoked.clone();
+                let display_names = node_display_names(&bundle);
                 for member in view
                     .members
                     .into_iter()
@@ -5341,7 +5404,7 @@ impl Runtime {
                     } else {
                         Value::Null
                     };
-                    nodes.push(json!({"node_id":cert.node_id,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
+                    nodes.push(json!({"node_id":cert.node_id,"name":member.name,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
                 }
                 let history = bundle.historical_nodes()?;
                 for revoked in revoked_ids {
@@ -5349,7 +5412,8 @@ impl Runtime {
                         continue;
                     }
                     if history.iter().any(|node| node.subject_id == revoked) {
-                        nodes.push(json!({"node_id":revoked,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
+                        let name = display_names.get(&revoked).cloned().unwrap_or_default();
+                        nodes.push(json!({"node_id":revoked,"name":name,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
                     }
                 }
                 Ok(json!({"nodes":nodes}))

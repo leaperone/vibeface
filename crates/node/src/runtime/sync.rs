@@ -14,6 +14,19 @@ const METADATA_BYTES: usize = 64 * 1024 * 1024;
 const BACKGROUND_METADATA_BYTES: usize = 48 * 1024 * 1024;
 const RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+fn try_reserve(counter: &AtomicUsize, bytes: usize, limit: usize) -> Result<(), ()> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(bytes).filter(|next| *next <= limit) else {
+            return Err(());
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReadClass {
     Background,
@@ -57,21 +70,10 @@ impl Drop for MetadataCharge {
 impl MetadataPool {
     fn charge(self: &Arc<Self>, bytes: usize, class: ReadClass) -> Result<MetadataCharge> {
         if class == ReadClass::Background {
-            self.background
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    used.checked_add(bytes)
-                        .filter(|next| *next <= BACKGROUND_METADATA_BYTES)
-                })
+            try_reserve(&self.background, bytes, BACKGROUND_METADATA_BYTES)
                 .map_err(|_| RequestFailure::Busy)?;
         }
-        if self
-            .total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= METADATA_BYTES)
-            })
-            .is_err()
-        {
+        if try_reserve(&self.total, bytes, METADATA_BYTES).is_err() {
             if class == ReadClass::Background {
                 self.background.fetch_sub(bytes, Ordering::AcqRel);
             }
