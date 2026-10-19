@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
@@ -14,16 +13,13 @@ use std::{
 };
 use vibeface::{
     api,
-    client::Client,
     config::{self, Config, ManagerSettings},
-    crypto::{LocalIdentity, digest},
-    identity::{
-        IdentityKind, Member, NetworkState,
-        local::{BootstrapCapability, InviteEnvelope, PairRequest, PairReview},
-    },
+    crypto::LocalIdentity,
+    identity::local::BootstrapCapability,
     local_access::Launcher,
     maintenance,
     network::NetworkConfig,
+    pairing::{Invitation, JoinState, NodePairing, network_url},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -193,37 +189,6 @@ struct Pair {
     name: String,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Invitation {
-    url: String,
-    peer_id: String,
-    #[serde(default, rename = "relay", skip_serializing)]
-    _legacy_relay: Option<bool>,
-    invite: InviteSecret,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct InviteSecret {
-    invite: InviteEnvelope,
-    capability: String,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PendingPair {
-    url: String,
-    peer_id: String,
-    #[serde(default, rename = "relay", skip_serializing)]
-    _legacy_relay: Option<bool>,
-    invite_id: String,
-    request_id: String,
-    name: String,
-    #[serde(default)]
-    request_hash: Option<String>,
-}
-
 impl Cli {
     fn normalize_bootstrap_urls(&mut self) -> Result<()> {
         let urls = match &mut self.command {
@@ -266,10 +231,15 @@ async fn main() -> Result<()> {
                     .await?,
             );
             runtime.start().await?;
-            eprintln!(
-                "Web: {}\nRun vibeface access with the same --data-dir for the trusted browser entry.",
-                runtime.config.public_url
-            );
+            eprintln!("Web: {}", runtime.config.public_url);
+            if runtime.config.listen.ip().is_loopback()
+                || runtime.config.listen.ip().is_unspecified()
+            {
+                eprintln!(
+                    "Local setup: http://localhost:{}",
+                    runtime.config.listen.port()
+                );
+            }
             tokio::select! {
                 result = api::serve(runtime.clone()) => result,
                 result = maintenance::serve(runtime, options.data.data_dir) => result,
@@ -515,32 +485,6 @@ fn is_loopback(url: &Url) -> bool {
     })
 }
 
-fn network_url(value: &str) -> Result<String> {
-    ensure!(value.len() <= 2048, "network URL is too long");
-    let mut url = Url::parse(value).context("invalid network URL")?;
-    let network_endpoint = matches!(url.scheme(), "ws" | "wss");
-    ensure!(
-        url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && (network_endpoint || matches!(url.path(), "/" | "/api/network/ws")),
-        "network URL must identify the Node WebSocket endpoint without credentials"
-    );
-    let scheme = match url.scheme() {
-        "https" | "wss" => "wss",
-        "http" | "ws" => "ws",
-        _ => bail!("unsupported network URL scheme"),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
-    if !network_endpoint || url.path() == "/" {
-        url.set_path("/api/network/ws");
-    }
-    Ok(url.to_string())
-}
-
 async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
@@ -660,254 +604,49 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 fn invitation(options: &Pair) -> Result<Invitation> {
-    let bytes = if let Some(path) = &options.invite_file {
-        read_bounded(path, 128 * 1024)?
+    if let Some(path) = &options.invite_file {
+        Invitation::from_bytes(&read_bounded(path, 128 * 1024)?)
     } else {
-        let encoded = options.invite.as_deref().context("invitation required")?;
-        ensure!(encoded.len() <= 192 * 1024, "invitation is too large");
-        URL_SAFE_NO_PAD
-            .decode(encoded)
-            .context("invalid base64url invitation")?
-    };
-    let invitation: Invitation =
-        serde_json::from_slice(&bytes).context("invalid invitation file")?;
-    ensure!(
-        invitation.peer_id.len() == 64 && hex::decode(&invitation.peer_id).is_ok(),
-        "invitation requires a pinned Node identity"
-    );
-    ensure!(
-        invitation.invite.invite.payload.new_kind == IdentityKind::Node,
-        "invitation must authorize a Node"
-    );
-    ensure!(
-        digest(invitation.invite.capability.as_bytes())
-            == invitation.invite.invite.payload.capability_hash,
-        "invitation capability mismatch"
-    );
-    network_url(&invitation.url)?;
-    Ok(invitation)
-}
-
-fn verify_review(
-    review: &PairReview,
-    invite: &InviteEnvelope,
-    member: &Member,
-    request_hash: &str,
-) -> Result<()> {
-    let payload = &invite.payload;
-    ensure!(
-        review.version == payload.version
-            && review.invite_id == payload.invite_id
-            && review.network_id == payload.network_id
-            && review.inviter_subject_id == payload.inviter_subject_id
-            && review.epoch == payload.epoch
-            && review.expires_at_ms == payload.expires_at_ms
-            && review.proposal_hash == request_hash
-            && review.new_member == *member,
-        "pairing review does not match the invitation and local device"
-    );
-    Ok(())
+        Invitation::parse(options.invite.as_deref().context("invitation required")?)
+    }
 }
 
 async fn pair(options: Pair) -> Result<()> {
     let invitation = invitation(&options)?;
-    let url = network_url(&invitation.url)?;
-    let runtime = Runtime::open(&options.data.data_dir).await?;
-    let mut configuration = Config::load(&options.data.data_dir)?;
-    let identity = &runtime.identity;
-    let payload = &invitation.invite.invite.payload;
-    let pending_path = options.data.data_dir.join("pairing.pending.json");
-    if runtime.has_membership().await? {
-        ensure!(
-            pending_path.exists()
-                && runtime.membership_state().await?.genesis.network_id == payload.network_id,
-            "this Node already belongs to a personal network; existing membership was preserved"
-        );
-    }
-    ensure!(
-        !payload.manage
-            && payload
-                .node_roles
-                .iter()
-                .all(|role| configuration.roles.contains(role)),
-        "invitation exceeds this Node's configured capabilities"
-    );
-    let member = Member::node(identity, &options.name, payload.node_roles.clone())?;
-    let mut pending = if pending_path.exists() {
-        let pending: PendingPair = serde_json::from_slice(&read_bounded(&pending_path, 8192)?)?;
-        ensure!(
-            pending.url == url
-                && pending.peer_id == invitation.peer_id
-                && pending.invite_id == payload.invite_id
-                && pending.name == options.name,
-            "finish the pending pairing with its original invitation and device name"
-        );
-        pending
-    } else {
-        let pending = PendingPair {
-            url: url.clone(),
-            peer_id: invitation.peer_id.clone(),
-            _legacy_relay: None,
-            invite_id: payload.invite_id.clone(),
-            request_id: uuid::Uuid::new_v4().to_string(),
-            name: options.name.clone(),
-            request_hash: None,
-        };
-        create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
-        pending
-    };
-    let mut client = Client::connect(&url, identity, &invitation.peer_id).await?;
+    let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
+    let pairing = NodePairing::new(runtime);
+    let mut status = pairing.request(invitation, &options.name).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
-    let mut accepted = false;
     loop {
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "pairing is still pending; run the same command again to resume"
-        );
-        let status = client
-            .call("pair_status", json!({"request_id":pending.request_id}))
-            .await?;
-        match status
-            .get("status")
-            .and_then(Value::as_str)
-            .context("invalid pairing status")?
-        {
-            "granted" => {
-                let state: NetworkState = serde_json::from_value(
-                    status
-                        .get("state")
-                        .context("paired network state is missing")?
-                        .clone(),
-                )?;
-                let view = state.project()?;
-                ensure!(
-                    view.network_id == payload.network_id,
-                    "paired network does not match the invitation"
-                );
-                let authorized = view.authorize_node(&identity.peer_id()?, None)?;
-                ensure!(
-                    authorized == member
-                        && authorized
-                            .node_roles
-                            .iter()
-                            .all(|role| configuration.roles.contains(role)),
-                    "paired network grants unexpected local permissions"
-                );
-                let installed = runtime.install_membership(state).await?;
-                let current = installed.authorize_node(&identity.peer_id()?, None)?;
-                ensure!(
-                    current == member,
-                    "installed network no longer grants the requested local membership"
-                );
-                configuration.roles = current.node_roles;
-                if !configuration.network.bootstrap_urls.contains(&url) {
-                    configuration.network.bootstrap_urls.push(url.clone());
-                }
-                configuration.save(&options.data.data_dir)?;
-                fs::remove_file(pending_path)?;
-                println!(
-                    "Paired node {} with network {}",
-                    identity.peer_id()?,
-                    payload.network_id
-                );
+        match status {
+            JoinState::Joined {
+                peer_id,
+                network_id,
+            } => {
+                println!("Paired node {peer_id} with network {network_id}");
                 println!("Start the Node to connect to its personal network.");
                 return Ok(());
             }
-            "not_found" => {
-                ensure!(
-                    !accepted,
-                    "pairing request disappeared; pending receipt was preserved"
-                );
-                let prepared = client.call("prepare_pair_request", json!({"invite":invitation.invite.invite,"capability":invitation.invite.capability,"name":options.name,"request_id":pending.request_id})).await?;
-                let mut request: PairRequest = serde_json::from_value(
-                    prepared
-                        .get("request")
-                        .context("pairing request template missing")?
-                        .clone(),
-                )?;
-                ensure!(
-                    request.request_id == pending.request_id
-                        && request.invite_id == payload.invite_id
-                        && request.capability == invitation.invite.capability
-                        && request.member == member,
-                    "pairing request does not match this device and invitation"
-                );
-                let signing_bytes = request.signing_bytes()?;
-                let request_hash = digest(&signing_bytes);
-                ensure!(
-                    pending
-                        .request_hash
-                        .as_ref()
-                        .is_none_or(|previous| previous == &request_hash),
-                    "pairing request template changed; original pending receipt was preserved"
-                );
-                pending.request_hash = Some(request_hash);
-                config::private_write(&pending_path, &serde_json::to_vec(&pending)?)?;
-                request.proof = identity.sign_payload("identity-pair", &signing_bytes)?;
-                let result = client
-                    .call("pair_request", json!({"request":request}))
-                    .await?;
-                let review: PairReview = serde_json::from_value(
-                    result
-                        .get("review")
-                        .context("pairing review missing")?
-                        .clone(),
-                )?;
-                verify_review(
-                    &review,
-                    &invitation.invite.invite,
-                    &member,
-                    pending
-                        .request_hash
-                        .as_deref()
-                        .context("pending request hash is missing")?,
-                )?;
-                let signature =
-                    identity.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
-                client
-                    .call(
-                        "pair_accept",
-                        json!({"request_id":pending.request_id,"signature":signature}),
-                    )
-                    .await?;
-                accepted = true;
+            JoinState::Review {
+                request_id,
+                review_hash,
+                ..
+            } => {
+                status = pairing.accept(&request_id, &review_hash).await?;
                 println!(
                     "Pairing request submitted. Confirm this device in the management client."
                 );
             }
-            "pending" => {
-                if !accepted {
-                    let review: PairReview = serde_json::from_value(
-                        status
-                            .get("review")
-                            .context("pending review missing")?
-                            .clone(),
-                    )?;
-                    verify_review(
-                        &review,
-                        &invitation.invite.invite,
-                        &member,
-                        pending
-                            .request_hash
-                            .as_deref()
-                            .context("pending request hash is missing")?,
-                    )?;
-                    let signature =
-                        identity.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
-                    client
-                        .call(
-                            "pair_accept",
-                            json!({"request_id":pending.request_id,"signature":signature}),
-                        )
-                        .await?;
-                    accepted = true;
-                    println!(
-                        "Pairing request resumed. Confirm this device in the management client."
-                    );
-                }
+            JoinState::Pending { .. } => {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "pairing is still pending; run the same command again to resume"
+                );
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                status = pairing.status().await?;
             }
-            _ => bail!("unsupported pairing status; pending receipt was preserved"),
+            JoinState::Uncertain { message, .. } => bail!("{message}"),
+            JoinState::Idle => bail!("pairing request is missing; pending receipt was preserved"),
         }
     }
 }
@@ -986,22 +725,6 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn peer_id_pending_pair_uses_only_the_current_field() {
-        let wire = json!({"url":"http://localhost:4790", "peer_id":"device", "relay":false,
-            "invite_id":"invite", "request_id":"request", "name":"device", "request_hash":null});
-        let pending: PendingPair = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(pending.peer_id, "device");
-        let mut normalized = wire.clone();
-        normalized.as_object_mut().unwrap().remove("relay");
-        assert_eq!(serde_json::to_value(pending).unwrap(), normalized);
-        let mut old = wire;
-        let fields = old.as_object_mut().unwrap();
-        fields.remove("peer_id");
-        fields.insert("node_id".into(), json!("device"));
-        assert!(serde_json::from_value::<PendingPair>(old).is_err());
-    }
 
     #[test]
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
@@ -1434,86 +1157,6 @@ mod tests {
         ] {
             assert!(network_url(value).is_err());
         }
-    }
-
-    #[test]
-    fn pairing_review_binds_the_exact_local_request() {
-        use vibeface::{identity::local::InvitePayload, model::NodeRole};
-        let device = LocalIdentity::generate();
-        let member = Member::node(&device, "Build Node", vec![NodeRole::Replica]).unwrap();
-        let invite = InviteEnvelope {
-            payload: InvitePayload {
-                version: 1,
-                invite_id: "invite".into(),
-                request_id: "invite-request".into(),
-                network_id: "ab".repeat(32),
-                inviter_subject_id: "cd".repeat(32),
-                capability_hash: digest(b"fixture capability"),
-                new_kind: IdentityKind::Node,
-                node_roles: vec![NodeRole::Replica],
-                manage: false,
-                epoch: 1,
-                expires_at_ms: 42,
-                nonce: "invite nonce".into(),
-            },
-            inviter_signature: String::new(),
-        };
-        let request = PairRequest {
-            request_id: "request".into(),
-            invite_id: "invite".into(),
-            capability: "fixture capability".into(),
-            member: member.clone(),
-            nonce: "request nonce".into(),
-            proof: String::new(),
-        };
-        for relay in [false, true] {
-            let mut envelope = json!({
-                "url":"ws://127.0.0.1:4790/api/network/ws",
-                "peer_id":device.peer_id().unwrap(),
-                "relay":relay,
-                "invite":{"invite":&invite,"capability":"fixture capability"}
-            });
-            let mut options = Pair {
-                data: DataDir {
-                    data_dir: PathBuf::new(),
-                },
-                invite_file: None,
-                invite: Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())),
-                name: "Build Node".into(),
-            };
-            assert_eq!(
-                super::invitation(&options).unwrap().peer_id,
-                device.peer_id().unwrap()
-            );
-            let parsed: Invitation = serde_json::from_value(envelope.clone()).unwrap();
-            assert_eq!(parsed.peer_id, device.peer_id().unwrap());
-            let mut old = envelope.clone();
-            let fields = old.as_object_mut().unwrap();
-            let peer_id = fields.remove("peer_id").unwrap();
-            fields.insert("node_id".into(), peer_id);
-            assert!(serde_json::from_value::<Invitation>(old).is_err());
-            envelope.as_object_mut().unwrap().remove("relay");
-            options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
-            assert!(super::invitation(&options).is_ok());
-        }
-        let request_hash = digest(&request.signing_bytes().unwrap());
-        let mut review = PairReview {
-            version: 1,
-            invite_id: "invite".into(),
-            network_id: "ab".repeat(32),
-            inviter_subject_id: "cd".repeat(32),
-            new_member: member.clone(),
-            proposal_hash: request_hash.clone(),
-            parents: vec![],
-            epoch: 1,
-            expires_at_ms: 42,
-        };
-        verify_review(&review, &invite, &member, &request_hash).unwrap();
-        review.proposal_hash = invite.payload.hash().unwrap();
-        assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
-        review.proposal_hash = request_hash.clone();
-        review.new_member.name = "Another Node".into();
-        assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
     }
 
     #[test]

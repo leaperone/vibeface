@@ -362,7 +362,8 @@ impl Runtime {
         }
         targets.retain(|target| store.authorize_node(network, target, None).is_ok());
         let frozen = jobs.iter().any(|job| job["write_frozen"] == true);
-        let manager = self.config.manager.as_ref();
+        let settings = self.settings_snapshot();
+        let manager = settings.manager.as_ref();
         let remote_manager = jobs
             .iter()
             .rev()

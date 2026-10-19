@@ -316,6 +316,7 @@ pub struct NetworkHub {
     incoming: mpsc::Sender<IncomingSocket>,
     admission: Arc<Admission>,
     relay_changes: watch::Sender<u64>,
+    bootstrap_changes: watch::Sender<u64>,
     #[cfg(test)]
     test_hooks: StdMutex<TestHooks>,
 }
@@ -350,7 +351,20 @@ struct State {
     records: HashMap<String, Reachability>,
     resolved: HashMap<String, Reachability>,
     active_relays: HashSet<String>,
+    bootstrap_urls: Vec<String>,
     paths: HashMap<(String, String), PathHistory>,
+}
+
+impl State {
+    fn check_bootstrap(&self, url: &str) -> Result<bool> {
+        validate_url(url)?;
+        let missing = !self.bootstrap_urls.iter().any(|known| known == url);
+        ensure!(
+            !missing || self.bootstrap_urls.len() < MAX_URLS,
+            "too many network URLs"
+        );
+        Ok(missing)
+    }
 }
 
 #[derive(Clone)]
@@ -757,16 +771,21 @@ impl NetworkHub {
         config: NetworkConfig,
     ) -> (Arc<Self>, mpsc::Receiver<IncomingSocket>) {
         let (incoming, receive) = mpsc::channel(32);
+        let state = State {
+            bootstrap_urls: config.bootstrap_urls.clone(),
+            ..State::default()
+        };
         (
             Arc::new(Self {
                 identity,
                 config,
-                state: Mutex::new(State::default()),
+                state: Mutex::new(state),
                 relay: Arc::new(StdMutex::new(RelayState::default())),
                 mdns: Arc::new(StdMutex::new(MdnsSources::default())),
                 incoming,
                 admission: Arc::new(Admission::default()),
                 relay_changes: watch::channel(0).0,
+                bootstrap_changes: watch::channel(0).0,
                 #[cfg(test)]
                 test_hooks: StdMutex::new(TestHooks::default()),
             }),
@@ -1035,17 +1054,16 @@ impl NetworkHub {
         check_id(target)?;
         let known = self.known_records(target).await?;
         let mut sources = HashSet::new();
-        let queries: FuturesUnordered<_> = self
-            .config
-            .bootstrap_urls
-            .iter()
-            .filter(|url| sources.insert((*url).clone()))
+        let bootstrap_urls = self.state.lock().await.bootstrap_urls.clone();
+        let queries: FuturesUnordered<_> = bootstrap_urls
+            .into_iter()
+            .filter(|url| sources.insert(url.clone()))
             .take(MAX_URLS)
             .map(|url| {
                 let target = target.to_owned();
                 async move {
                     let result = tokio::time::timeout(CONNECT_TIMEOUT, async {
-                        let mut socket = self.open(url, SocketClass::Control).await?.0;
+                        let mut socket = self.open(&url, SocketClass::Control).await?.0;
                         send_control(
                             &mut socket,
                             &Control::Lookup {
@@ -1608,30 +1626,8 @@ impl NetworkHub {
     pub async fn run(self: Arc<Self>, listen: SocketAddr) -> Result<()> {
         self.config.validate()?;
         let mut tasks = tokio::task::JoinSet::new();
-        let mut entries = HashSet::new();
-        for url in self
-            .config
-            .bootstrap_urls
-            .iter()
-            .filter(|url| entries.insert((*url).clone()))
-        {
-            let hub = self.clone();
-            let publish_url = url.clone();
-            tasks.spawn(async move {
-                hub.maintain_publication(&publish_url).await;
-            });
-            let hub = self.clone();
-            let url = url.clone();
-            tasks.spawn(async move {
-                loop {
-                    if let Err(error) = hub.clone().maintain_relay(&url).await {
-                        tracing::debug!(directory = %url, %error, "rendezvous reconnect pending");
-                    }
-                    hub.set_relay_active(&url, false).await;
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            });
-        }
+        let mut changes = self.bootstrap_changes.subscribe();
+        let mut started = HashSet::new();
         if self.config.mdns {
             let hub = self.clone();
             tasks.spawn(async move {
@@ -1640,7 +1636,50 @@ impl NetworkHub {
                 }
             });
         }
-        futures_util::future::pending().await
+        loop {
+            let _version = *changes.borrow_and_update();
+            let urls = self.state.lock().await.bootstrap_urls.clone();
+            for url in urls.into_iter().filter(|url| started.insert(url.clone())) {
+                let hub = self.clone();
+                let publish_url = url.clone();
+                tasks.spawn(async move {
+                    hub.maintain_publication(&publish_url).await;
+                });
+                let hub = self.clone();
+                tasks.spawn(async move {
+                    loop {
+                        if let Err(error) = hub.clone().maintain_relay(&url).await {
+                            tracing::debug!(directory = %url, %error, "rendezvous reconnect pending");
+                        }
+                        hub.set_relay_active(&url, false).await;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                });
+            }
+            changes
+                .changed()
+                .await
+                .context("rendezvous configuration closed")?;
+        }
+    }
+
+    pub(crate) async fn bootstrap_url(&self) -> Option<String> {
+        self.state.lock().await.bootstrap_urls.first().cloned()
+    }
+
+    pub(crate) async fn validate_bootstrap(&self, url: &str) -> Result<()> {
+        self.state.lock().await.check_bootstrap(url).map(|_| ())
+    }
+
+    pub async fn add_bootstrap(&self, url: &str) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.check_bootstrap(url)? {
+            return Ok(());
+        }
+        state.bootstrap_urls.push(url.to_owned());
+        self.bootstrap_changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+        Ok(())
     }
 
     async fn set_relay_active(&self, url: &str, active: bool) {
@@ -3923,8 +3962,7 @@ mod tests {
             loop {
                 tokio::select! {
                     result = &mut circuit.done => return Ok::<_, anyhow::Error>(result?.unwrap_err()),
-                    observation = flows.recv() => {
-                        let observation = observation.context("duplex observations ended")?;
+                    Some(observation) = flows.recv() => {
                         assert_forward_bounds(&observation);
                         accepted = accepted.max(observation.accepted_bytes);
                         if observation.event == "rate_wait" {
@@ -5396,6 +5434,60 @@ mod tests {
         eprintln!(
             "NET1_M4 real_mdns_initial_resolved={initial} verify_rounds=3 verify_timeout_ms=2000 refresh_resolved=0 healthy_source_retained=true publisher_stop_then_verify_exact_removed=true actual_native_exit_ack=true"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_bootstrap_resolves_publishes_and_reserves_without_restart() -> Result<()> {
+        let (directory, _) = NetworkHub::new(
+            LocalIdentity::generate(),
+            NetworkConfig {
+                relay_enabled: true,
+                ..NetworkConfig::default()
+            },
+        );
+        let mut tasks = JoinSet::new();
+        let url = serve(directory.clone(), &mut tasks).await?;
+        let (target, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let record = target.local_record().await?;
+        directory.publish(record.clone()).await?;
+        let (hub, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let running = tokio::spawn(hub.clone().run("127.0.0.1:4790".parse()?));
+        tokio::task::yield_now().await;
+        hub.add_bootstrap(&url).await?;
+        hub.add_bootstrap(&url).await?;
+        assert_eq!(hub.state.lock().await.bootstrap_urls, vec![url.clone()]);
+        assert!(hub.config.bootstrap_urls.is_empty());
+        let records: Vec<_> = hub
+            .resolve(&target.identity.peer_id()?)
+            .await?
+            .collect()
+            .await;
+        assert!(
+            records
+                .iter()
+                .any(|found| found.signature == record.signature)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = directory.lookup_local(&hub.identity.peer_id()?).await?
+                    && record.relay_urls.contains(&url)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        assert!(
+            hub.add_bootstrap("ws://user:secret@example.com")
+                .await
+                .is_err()
+        );
+        running.abort();
+        let _ = running.await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
         Ok(())
     }
 

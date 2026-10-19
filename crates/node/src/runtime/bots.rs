@@ -96,7 +96,8 @@ impl Runtime {
         );
         if project.target_node == self.identity.peer_id()? {
             ensure!(
-                self.config.roles.contains(&NodeRole::Scheduler) && self.config.manager.is_some(),
+                self.config.roles.contains(&NodeRole::Scheduler)
+                    && self.settings_snapshot().manager.is_some(),
                 "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;

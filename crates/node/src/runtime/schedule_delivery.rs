@@ -293,7 +293,8 @@ fn proof_heads(input: &Value, trigger: &str) -> Result<Vec<String>> {
 
 impl Runtime {
     fn scheduler_manager_metadata(&self) -> Value {
-        let Some(manager) = &self.config.manager else {
+        let settings = self.settings_snapshot();
+        let Some(manager) = &settings.manager else {
             return Value::Null;
         };
         let kind = match manager.provider.as_str() {
@@ -523,7 +524,7 @@ impl Runtime {
                         .fence_manager_unknown(&network, &scope, &local, &trigger, &attempt)?;
                     self.finish_manager_attempt(&attempt).await;
                 }
-                if self.config.manager.is_some() {
+                if self.settings_snapshot().manager.is_some() {
                     let scopes = self
                         .store
                         .lock()
@@ -663,7 +664,7 @@ impl Runtime {
                     } if role == "user" => Some(target.clone()),
                     _ => None,
                 });
-            let local_available = self.config.manager.is_some()
+            let local_available = self.settings_snapshot().manager.is_some()
                 && self.config.roles.contains(&NodeRole::Scheduler)
                 && store
                     .authorize_node(network, &local, Some(NodeRole::Scheduler))
@@ -767,7 +768,7 @@ impl Runtime {
         if target == local && previous.is_none() {
             self.require_role(network, NodeRole::Scheduler).await?;
             ensure!(
-                self.config.manager.is_some(),
+                self.settings_snapshot().manager.is_some(),
                 "this Node has no configured management SDK"
             );
         }
@@ -839,7 +840,7 @@ impl Runtime {
         );
         self.require_role(network, NodeRole::Scheduler).await?;
         ensure!(
-            self.config.manager.is_some(),
+            self.settings_snapshot().manager.is_some(),
             "this Node has no configured management SDK"
         );
         let sender = self

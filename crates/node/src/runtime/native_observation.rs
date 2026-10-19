@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 const INDEX: &str = "native-observation:v1:index";
 const MAX_NATIVE_WORK: usize = 256;
 
+pub(super) struct NativeRuntime {
+    socket: PathBuf,
+    client: vibeface_bridge::codex::CodexClient,
+    _process: Option<tokio::process::Child>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeState {
@@ -288,9 +294,86 @@ pub(crate) fn outcome(works: &[NativeWork]) -> Option<JobOutcome> {
 }
 
 impl Runtime {
+    pub(super) async fn ensure_native_client(&self) -> Result<()> {
+        self.native
+            .get_or_try_init(|| async {
+                ensure!(
+                    self.config.roles.contains(&NodeRole::Scheduler),
+                    "native Codex requires the Scheduler role"
+                );
+                let managed = self.config.codex_socket.is_none();
+                let socket = if let Some(socket) = &self.config.codex_socket {
+                    socket.clone()
+                } else {
+                    let directory = PathBuf::from("/tmp")
+                        .join(format!("vibeface-{}", &self.identity.peer_id()?[..32]));
+                    match std::fs::create_dir(&directory) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                        let metadata = std::fs::symlink_metadata(&directory)?;
+                        ensure!(
+                            metadata.is_dir()
+                                && !metadata.file_type().is_symlink()
+                                && metadata.uid() == std::fs::metadata(&self.data_dir)?.uid(),
+                            "private socket directory has unexpected ownership"
+                        );
+                        std::fs::set_permissions(
+                            &directory,
+                            std::fs::Permissions::from_mode(0o700),
+                        )?;
+                    }
+                    directory.join("codex.sock")
+                };
+                let mut process = None;
+                if managed && tokio::net::UnixStream::connect(&socket).await.is_err() {
+                    if socket.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::FileTypeExt;
+                            ensure!(
+                                std::fs::symlink_metadata(&socket)?.file_type().is_socket(),
+                                "private Codex socket path is occupied by another file"
+                            );
+                        }
+                        std::fs::remove_file(&socket)?;
+                    }
+                    process = Some(
+                        tokio::process::Command::new(&self.config.codex_bin)
+                            .args(["app-server", "--listen"])
+                            .arg(format!("unix://{}", socket.display()))
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .kill_on_drop(true)
+                            .spawn()?,
+                    );
+                }
+                Ok::<_, anyhow::Error>(NativeRuntime {
+                    client: vibeface_bridge::codex::CodexClient::start(
+                        socket.clone(),
+                        self.native_events.clone(),
+                    ),
+                    socket,
+                    _process: process,
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) fn native_socket(&self) -> Option<&Path> {
+        self.native.get().map(|native| native.socket.as_path())
+    }
+
     fn native_client(&self) -> Result<&vibeface_bridge::codex::CodexClient> {
-        self.codex
-            .as_ref()
+        self.native
+            .get()
+            .map(|native| &native.client)
             .context("this Node has no native Codex Socket configured")
     }
 
@@ -494,7 +577,7 @@ impl Runtime {
             loop {
                 tick.tick().await;
                 let _work = node.maintenance.enter_when_open().await;
-                if node.codex.is_some()
+                if node.native.get().is_some()
                     && let Err(error) = node.refresh_native_subscriptions().await
                 {
                     tracing::debug!(%error, "native observation recovery is pending");
@@ -751,8 +834,8 @@ impl Runtime {
     }
 
     pub(super) async fn native_status(&self, network: &str, scope: &str) -> Result<Value> {
-        let snapshot = match &self.codex {
-            Some(client) => client.snapshot().await,
+        let snapshot = match self.native.get() {
+            Some(native) => native.client.snapshot().await,
             None => Value::Null,
         };
         let store = self.store.lock().await;
@@ -1214,12 +1297,20 @@ mod tests {
                 }
                 Ok::<_, anyhow::Error>(())
             });
-            let mut node = Runtime::open(&dir).await?;
+            let node = Runtime::open(&dir).await?;
             let (events, _receiver) = mpsc::unbounded_channel();
-            node.codex = Some(vibeface_bridge::codex::CodexClient::start(
-                socket_path,
-                events,
-            ));
+            assert!(
+                node.native
+                    .set(NativeRuntime {
+                        client: vibeface_bridge::codex::CodexClient::start(
+                            socket_path.clone(),
+                            events
+                        ),
+                        socket: socket_path,
+                        _process: None,
+                    })
+                    .is_ok()
+            );
             let node = Arc::new(node);
             let network = crate::runtime::tests::conversation(&node).await?;
             let observed = work();

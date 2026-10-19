@@ -1,4 +1,8 @@
-use crate::runtime::{Access, Runtime};
+use crate::{
+    identity::local::BootstrapCapability,
+    pairing::{Invitation, JoinState, NodePairing},
+    runtime::{Access, Runtime},
+};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -8,9 +12,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
@@ -23,6 +28,7 @@ const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
+    pairing: Arc<NodePairing>,
 }
 
 #[derive(Clone)]
@@ -30,6 +36,7 @@ struct Site {
     origin: String,
     authority: String,
     secure: bool,
+    loopback: bool,
 }
 
 impl Site {
@@ -55,6 +62,13 @@ impl Site {
             .to_owned();
         ensure!(!authority.is_empty(), "public_url requires a host");
         Ok(Self {
+            loopback: url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }),
             origin,
             authority,
             secure: url.scheme() == "https",
@@ -102,7 +116,13 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
     let local_url = format!("http://{}", local_listener.local_addr()?);
     node.local_access
         .publish_listener(local_url.clone(), node.identity.peer_id()?)?;
-    let local = browser_router(node.clone(), vec![Site::parse(&local_url)?], true);
+    let pairing = Arc::new(NodePairing::new(node.clone()));
+    let local = browser_router(
+        node.clone(),
+        vec![Site::parse(&local_url)?],
+        true,
+        pairing.clone(),
+    );
     let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let tool_url = format!("http://{}", tools.local_addr()?);
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
@@ -113,7 +133,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         async {
             axum::serve(
                 listener,
-                router_with_sites(node.clone(), sites)
+                browser_router(node.clone(), sites, false, pairing)
                     .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -138,6 +158,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App {
+        pairing: Arc::new(NodePairing::new(node.clone())),
         node,
         sites: vec![site],
     };
@@ -169,16 +190,30 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    browser_router(node, sites, false)
+    let pairing = Arc::new(NodePairing::new(node.clone()));
+    browser_router(node, sites, false, pairing)
 }
 
-fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
-    let app = App { sites, node };
+fn browser_router(
+    node: Arc<Runtime>,
+    sites: Vec<Site>,
+    local: bool,
+    pairing: Arc<NodePairing>,
+) -> Router {
+    let app = App {
+        sites,
+        node,
+        pairing,
+    };
     let mut routes = Router::new()
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
         .route("/api/info", get(info))
+        .route("/api/local/setup", post(local_setup))
+        .route("/api/local/join/request", post(local_join_request))
+        .route("/api/local/join/accept", post(local_join_accept))
+        .route("/api/local/join/status", post(local_join_status))
         .route("/peer", get(peer))
         .route("/api/network/ws", get(network))
         .fallback(frontend);
@@ -269,6 +304,9 @@ async fn check_boundary(
     if !http_site_allowed(site, app.node.config.allow_insecure_lan, ip) {
         return Err(ApiError::forbidden());
     }
+    if path == "/api/local/setup" || path.starts_with("/api/local/join/") {
+        check_local_setup(site, headers, ip)?;
+    }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     if unsafe_method {
         let content_type = one_header(headers, header::CONTENT_TYPE.as_str())
@@ -309,6 +347,19 @@ fn check_site<'a>(sites: &'a [Site], headers: &HeaderMap) -> ApiResult<&'a Site>
 
 fn http_site_allowed(site: &Site, allow_insecure_lan: bool, peer: IpAddr) -> bool {
     site.secure || allow_insecure_lan || peer.is_loopback()
+}
+
+fn check_local_setup(site: &Site, headers: &HeaderMap, peer: IpAddr) -> ApiResult<()> {
+    if !peer.is_loopback()
+        || !site.loopback
+        || one_header(headers, header::ORIGIN.as_str()) != Some(site.origin.as_str())
+        || headers.keys().any(|name| {
+            name == "forwarded" || name == "x-real-ip" || name.as_str().starts_with("x-forwarded-")
+        })
+    {
+        return Err(ApiError::forbidden());
+    }
+    Ok(())
 }
 
 fn one_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -357,7 +408,7 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true}}),
     ))
 }
 
@@ -404,7 +455,7 @@ async fn local_exchange(
             &input.public_key,
         )
         .map_err(|_| ApiError::auth())?;
-    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"relay":false,"local":true},"network_id":state.genesis.network_id})).into_response();
+    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true},"network_id":state.genesis.network_id})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
@@ -455,6 +506,163 @@ async fn local_websocket(
                 tracing::debug!(%error, "local browser connection closed");
             }
         }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalSetupRequest {}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LocalSetup {
+    Uninitialized {
+        invitation: BootstrapInvitation,
+    },
+    Initialized {
+        entry: LocalEntry,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_launch: Option<LocalLaunch>,
+    },
+}
+
+#[derive(Serialize)]
+struct LocalLaunch {
+    url: String,
+    peer_id: String,
+    token: String,
+}
+
+#[derive(Serialize)]
+struct LocalEntry {
+    address: String,
+    peer_id: String,
+}
+
+#[derive(Serialize)]
+struct BootstrapInvitation {
+    url: String,
+    peer_id: String,
+    capability: String,
+}
+
+async fn local_setup(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(_): Json<LocalSetupRequest>,
+) -> ApiResult<Json<LocalSetup>> {
+    let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
+    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    if app.node.has_membership().await.map_err(ApiError::bad)? {
+        let local_launch = if app.node.local_access.enabled() {
+            match app.node.local_access.origin() {
+                Ok(url) => {
+                    let network_id = app
+                        .node
+                        .membership_state()
+                        .await
+                        .map_err(ApiError::bad)?
+                        .genesis
+                        .network_id;
+                    let token = app
+                        .node
+                        .local_access
+                        .issue_from_local_setup(&peer_id, &network_id)
+                        .map_err(ApiError::bad)?;
+                    Some(LocalLaunch {
+                        url,
+                        peer_id: peer_id.clone(),
+                        token,
+                    })
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        return Ok(Json(LocalSetup::Initialized {
+            entry: LocalEntry {
+                address: origin.into(),
+                peer_id,
+            },
+            local_launch,
+        }));
+    }
+    let capability = async {
+        let mut bytes = Vec::new();
+        std::fs::File::open(app.node.data_dir.join("bootstrap.json"))?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 4096,
+            "local bootstrap capability exceeds size limit"
+        );
+        let capability: BootstrapCapability = serde_json::from_slice(&bytes)?;
+        app.node
+            .store
+            .lock()
+            .await
+            .verify_bootstrap_capability(&capability.capability)?;
+        Ok::<_, anyhow::Error>(capability)
+    }
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "local setup is unavailable; verify this Node's initialization before continuing"
+                .into(),
+        )
+    })?;
+    Ok(Json(LocalSetup::Uninitialized {
+        invitation: BootstrapInvitation {
+            url: origin.into(),
+            peer_id,
+            capability: capability.capability,
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalJoinRequest {
+    invitation: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalJoinAccept {
+    request_id: String,
+    review_hash: String,
+}
+
+async fn local_join_request(
+    State(app): State<App>,
+    Json(input): Json<LocalJoinRequest>,
+) -> ApiResult<Json<JoinState>> {
+    let invitation = Invitation::parse(&input.invitation).map_err(ApiError::bad)?;
+    app.pairing
+        .request(invitation, &input.name)
+        .await
+        .map(Json)
+        .map_err(ApiError::bad)
+}
+
+async fn local_join_accept(
+    State(app): State<App>,
+    Json(input): Json<LocalJoinAccept>,
+) -> ApiResult<Json<JoinState>> {
+    app.pairing
+        .accept(&input.request_id, &input.review_hash)
+        .await
+        .map(Json)
+        .map_err(ApiError::bad)
+}
+
+async fn local_join_status(
+    State(app): State<App>,
+    Json(_): Json<LocalSetupRequest>,
+) -> ApiResult<Json<JoinState>> {
+    app.pairing.status().await.map(Json).map_err(ApiError::bad)
 }
 
 #[derive(Deserialize)]
@@ -699,6 +907,181 @@ mod tests {
             false,
             "192.168.0.50".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn local_setup_requires_a_literal_loopback_site_peer_and_exact_origin_without_forwarding() {
+        let sites = [
+            "http://localhost:4790",
+            "http://127.0.0.1:4790",
+            "http://[::1]:4790",
+        ]
+        .into_iter()
+        .map(|origin| Site::parse(origin).unwrap())
+        .collect::<Vec<_>>();
+        let allowed = |headers: &HeaderMap, peer| {
+            check_site(&sites, headers)
+                .and_then(|site| check_local_setup(site, headers, peer))
+                .is_ok()
+        };
+        for site in &sites {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, site.authority.parse().unwrap());
+            headers.insert(header::ORIGIN, site.origin.parse().unwrap());
+            assert!(allowed(&headers, "127.0.0.1".parse().unwrap()));
+            assert!(allowed(&headers, "::1".parse().unwrap()));
+            assert!(!allowed(&headers, "192.168.0.10".parse().unwrap()));
+            assert!(!allowed(&headers, "203.0.113.10".parse().unwrap()));
+            for name in [
+                "forwarded",
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-proto",
+                "x-real-ip",
+            ] {
+                headers.insert(name, "127.0.0.1".parse().unwrap());
+                assert!(!allowed(&headers, "127.0.0.1".parse().unwrap()));
+                headers.remove(name);
+            }
+            headers.insert(header::ORIGIN, "http://LOCALHOST:4790".parse().unwrap());
+            assert!(!allowed(&headers, "127.0.0.1".parse().unwrap()));
+            headers.insert(header::ORIGIN, "https://hostile.invalid".parse().unwrap());
+            assert!(!allowed(&headers, "127.0.0.1".parse().unwrap()));
+            headers.remove(header::ORIGIN);
+            assert!(!allowed(&headers, "127.0.0.1".parse().unwrap()));
+            headers.insert(header::ORIGIN, site.origin.parse().unwrap());
+            headers.insert(header::HOST, "hostile.invalid:4790".parse().unwrap());
+            assert!(!allowed(&headers, "127.0.0.1".parse().unwrap()));
+        }
+        for origin in [
+            "http://0.0.0.0:4790",
+            "http://[::]:4790",
+            "https://node.example",
+            "http://localhost.example:4790",
+            "http://localhost.:4790",
+        ] {
+            let site = Site::parse(origin).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, site.authority.parse().unwrap());
+            headers.insert(header::ORIGIN, site.origin.parse().unwrap());
+            assert!(check_local_setup(&site, &headers, "127.0.0.1".parse().unwrap()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_setup_endpoint_reuses_one_time_capability_and_stops_after_initialization()
+    -> Result<()> {
+        use crate::{
+            config::{self, Config},
+            crypto::LocalIdentity,
+            identity::{Genesis, Member, NetworkState, NodeRole},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let origin = format!("http://{address}");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("local-setup-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local(address, vec![], false);
+        config.roles = vec![NodeRole::Relay];
+        config.save(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let store = crate::store::Store::open(dir.join("node.sqlite3"))?;
+        let capability = store.bootstrap_capability()?;
+        config::private_write(
+            &dir.join("bootstrap.json"),
+            &serde_json::to_vec(&capability)?,
+        )?;
+        drop(store);
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let app = router(node.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let endpoint = format!("{origin}/api/local/setup");
+        let result = async {
+            let request = || client.post(&endpoint).header(header::ORIGIN, &origin).json(&json!({}));
+            let response = request().send().await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let first: Value = response.json().await?;
+            assert_eq!(first["kind"], "uninitialized");
+            assert_eq!(first["invitation"]["url"], origin);
+            assert_eq!(first["invitation"]["peer_id"], node.identity.peer_id()?);
+            assert_eq!(first["invitation"]["capability"], capability.capability);
+            assert_eq!(request().send().await?.json::<Value>().await?, first);
+            assert_eq!(client.get(&endpoint).header(header::ORIGIN, &origin).send().await?.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header(header::CONTENT_TYPE, "text/plain").body("{}").send().await?.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(client.post(&endpoint).json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
+            assert_eq!(request().header("x-forwarded-for", "127.0.0.1").send().await?.status(), StatusCode::FORBIDDEN);
+            assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
+            for (path, input) in [
+                ("status", json!({})),
+                ("request", json!({"invitation":"invalid","name":"Mac mini"})),
+                ("accept", json!({"request_id":"request","review_hash":"00"})),
+            ] {
+                let endpoint = format!("{origin}/api/local/join/{path}");
+                assert_eq!(client.post(&endpoint).json(&input).send().await?.status(), StatusCode::FORBIDDEN);
+                assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header("x-forwarded-for", "127.0.0.1").json(&input).send().await?.status(), StatusCode::FORBIDDEN);
+                assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&input).send().await?.status(), StatusCode::FORBIDDEN);
+                assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header(header::CONTENT_TYPE, "text/plain").body("{}").send().await?.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                let response = client.post(&endpoint).header(header::ORIGIN, &origin).json(&input).send().await?;
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                if path == "status" { assert_eq!(response.json::<Value>().await?, json!({"kind":"idle"})); }
+                else { assert_eq!(response.status(), StatusCode::BAD_REQUEST); }
+            }
+            let public_info: Value = client.get(format!("{origin}/api/info")).send().await?.json().await?;
+            assert!(!public_info.to_string().contains(&capability.capability));
+            assert!(public_info.get("invitation").is_none());
+            let root = LocalIdentity::generate();
+            let admin = LocalIdentity::generate();
+            let state = NetworkState::new(Genesis::create(&root, vec![
+                Member::client(&admin, "browser", true)?,
+                Member::node(&node.identity, "node", node.config.roles.clone())?,
+            ])?)?;
+            node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.peer_id()?)?;
+            let initialized: Value = request().send().await?.json().await?;
+            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"peer_id":node.identity.peer_id()?}}));
+            assert!(!initialized.to_string().contains(&capability.capability));
+            assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
+            let local_origin = "http://127.0.0.1:4791";
+            node.local_access.publish_listener(local_origin.into(), node.identity.peer_id()?)?;
+            let launched: Value = request().send().await?.json().await?;
+            assert_eq!(launched["entry"], initialized["entry"]);
+            assert_eq!(launched["local_launch"]["url"], local_origin);
+            assert_eq!(launched["local_launch"]["peer_id"], node.identity.peer_id()?);
+            let token = launched["local_launch"]["token"].as_str().context("local token missing")?;
+            assert!(token.len() == 64 && hex::decode(token).is_ok());
+            let browser = LocalIdentity::generate();
+            let network_id = node.membership_state().await?.genesis.network_id;
+            let cookie = node.local_access.exchange(token, &node.identity.peer_id()?, &network_id, &browser.peer_id()?, &browser.public_key_hex()?)?;
+            assert_eq!(node.local_access.session(&cookie, &node.identity.peer_id()?, &network_id)?.subject_id, browser.peer_id()?);
+            assert!(node.local_access.exchange(token, &node.identity.peer_id()?, &network_id, &browser.peer_id()?, &browser.public_key_hex()?).is_err());
+            node.local_access.set_enabled(false)?;
+            assert_eq!(request().send().await?.json::<Value>().await?, initialized);
+            assert!(node.local_access.session(&cookie, &node.identity.peer_id()?, &network_id).is_err());
+            let joined: Value = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?.json().await?;
+            assert_eq!(joined["kind"], "joined");
+            assert_eq!(joined["peer_id"], node.identity.peer_id()?);
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        server.abort();
+        let _ = server.await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     #[test]

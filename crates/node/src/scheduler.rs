@@ -91,10 +91,9 @@ pub async fn run(
             .is_none_or(|id| id == &conversation),
         "conversation access denied"
     );
-    let settings = node
-        .config
+    let local_settings = node.settings_snapshot();
+    let settings = local_settings
         .manager
-        .clone()
         .context("this Node has no configured management SDK")?;
     let kind = match settings.provider.as_str() {
         "cursor_sdk" => ManagerKind::CursorSdk,
@@ -102,6 +101,7 @@ pub async fn run(
         _ => anyhow::bail!("unknown management SDK"),
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
+    let manager_settings = serde_json::to_value(&settings)?;
     let network = access.network_id.clone();
     let target = node.identity.peer_id()?;
     let claimed = {
@@ -145,7 +145,7 @@ pub async fn run(
             (context,tasks,facts,targets)
         };
         ensure!(context.missing.is_complete(), "conversation has missing or conflicting history; synchronize it before scheduling");
-        let mut prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
+        let mut prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &local_settings.roots)?;
         if attempt.read_only { prompt.push_str("\nThis management call is read-only. Read status and summarize existing results for the human; no write tool is authorized.\n"); }
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         let custom_tools = if attempt.read_only { tools().into_iter().filter(|(name,_)| matches!(name.as_str(),"context"|"nodes"|"task_status"|"call_lookup")).collect() } else { tools() };
@@ -160,7 +160,7 @@ pub async fn run(
                 ("VIBEFACE_NODE_URL".into(), local_url), ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()), ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
                 ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()), ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
-                ("VIBEFACE_CODEX_SOCKET".into(), node.config.codex_socket.as_ref().map(|socket| socket.to_string_lossy().into_owned()).unwrap_or_default()),
+                ("VIBEFACE_CODEX_SOCKET".into(), node.native_socket().map(|socket| socket.to_string_lossy().into_owned()).unwrap_or_default()),
             ]),
         };
         if matches!(job.kind, TriggerKind::Autonomous | TriggerKind::AgentResult) {
@@ -195,7 +195,7 @@ pub async fn run(
         node.seal_manager_tools(&attempt.id).await?;
         tools_fenced = true;
         node.store.lock().await.local_set(&network, &format!("sdk-returned:v1:{}",attempt.id),
-            &json!({"sdk_returned":true,"output":result.output,"session_id":result.session_id,"finalization_started":false}))?;
+            &json!({"sdk_returned":true,"output":result.output,"session_id":result.session_id,"manager":manager_settings,"finalization_started":false}))?;
         let works = node.wait_native_work(&network,&conversation,&trigger,&attempt.id).await?;
         let children = if job.kind == TriggerKind::AgentTask { node.child_agent_tasks(&network,&conversation,&trigger).await? } else { Vec::new() };
         let terminal = coordinated_outcome(&works,&children);
@@ -681,10 +681,18 @@ async fn summarize_work(
     }).await
 }
 
+fn recovery_settings(
+    marker: &Value,
+    fallback: Option<&crate::config::ManagerSettings>,
+) -> Result<Option<crate::config::ManagerSettings>> {
+    match marker.get("manager") {
+        Some(settings) => Ok(Some(serde_json::from_value(settings.clone())?)),
+        None => Ok(fallback.cloned()),
+    }
+}
+
 pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
-    let Some(settings) = node.config.manager.as_ref() else {
-        return Ok(());
-    };
+    let local_settings = node.settings_snapshot();
     let target = node.identity.peer_id()?;
     let networks = node.store.lock().await.networks()?;
     for network in networks {
@@ -733,7 +741,10 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                 let Some(session) = marker["session_id"].as_str() else {
                     continue;
                 };
-                mark_finalization_started(&node, &network, &attempt.id).await?;
+                let Some(settings) = recovery_settings(&marker, local_settings.manager.as_ref())?
+                else {
+                    continue;
+                };
                 let config = ManagerConfig {
                     kind: match settings.provider.as_str() {
                         "codex_sdk" => ManagerKind::CodexSdk,
@@ -750,6 +761,7 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
                     codex_sdk_script: settings.codex_sdk_script.clone(),
                     ..ManagerConfig::default()
                 };
+                mark_finalization_started(&node, &network, &attempt.id).await?;
                 let (_cancel, receiver) = tokio::sync::watch::channel(false);
                 let result = summarize_work(
                     &node,
@@ -794,6 +806,32 @@ pub(crate) async fn recover_native_results(node: Arc<Runtime>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::model::{Event, MissingDependencies, WIRE_VERSION};
+
+    #[test]
+    fn recovery_keeps_attempt_settings_after_manager_changes_or_disabling() -> Result<()> {
+        let original = json!({
+            "provider":"codex_sdk", "workspace":"/original/workspace", "model":"original-model",
+            "cursor_sdk_bin":"original-cursor", "node_bin":"original-node", "codex_sdk_script":"original-script"
+        });
+        let marker = json!({"manager":original,"session_id":"original-session"});
+        let changed: crate::config::ManagerSettings = serde_json::from_value(json!({
+            "provider":"cursor_sdk", "workspace":"/new/workspace", "model":"new-model",
+            "cursor_sdk_bin":"new-cursor", "node_bin":"new-node", "codex_sdk_script":"new-script"
+        }))?;
+        for fallback in [Some(&changed), None] {
+            assert_eq!(
+                serde_json::to_value(recovery_settings(&marker, fallback)?)?,
+                original
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(recovery_settings(&json!({}), Some(&changed))?)?,
+            serde_json::to_value(&changed)?
+        );
+        assert!(recovery_settings(&json!({}), None)?.is_none());
+        assert!(recovery_settings(&json!({"manager":null}), Some(&changed)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn recovery_waits_for_pending_children_even_after_a_native_failure() {
