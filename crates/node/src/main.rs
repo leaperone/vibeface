@@ -1062,7 +1062,24 @@ mod tests {
             assert_eq!(fs::read(dir.join("config.json"))?, saved);
             assert_eq!(fs::read(dir.join("identity.json"))?, identity);
             drop(runtime);
-            let runtime = Runtime::open(&dir).await?;
+            let runtime = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match Runtime::open(&dir).await {
+                        Ok(runtime) => break Ok(runtime),
+                        Err(error)
+                            if matches!(
+                                error.downcast_ref::<std::fs::TryLockError>(),
+                                Some(std::fs::TryLockError::WouldBlock)
+                            ) =>
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+            })
+            .await
+            .context("data directory lock was not released after dropping Runtime")??;
             assert_eq!(
                 runtime.config.network.bootstrap_urls,
                 [
