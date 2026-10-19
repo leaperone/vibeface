@@ -16,7 +16,7 @@ import {
 import { messageKey } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
 import { Message } from './message.tsx'
-import type { ReactNode } from 'react'
+import { Children, type ReactNode } from 'react'
 
 export function Chat({
   messages,
@@ -31,7 +31,7 @@ export function Chat({
   emptyMark?: ReactNode
   children?: ReactNode
 }) {
-  if (messages.length === 0 && !children) {
+  if (messages.length === 0 && Children.toArray(children).length === 0) {
     return (
       <Empty className="min-h-0 overflow-y-auto px-4">
         <EmptyHeader>

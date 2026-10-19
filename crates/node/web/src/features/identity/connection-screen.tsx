@@ -76,15 +76,13 @@ export function ConnectionScreen() {
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    const password = value(form, 'password')
-    void run(() => device.pair(invitation, value(form, 'name'), purpose === 'bootstrap' ? passphrase(password, password) : undefined))
+    void run(() => device.pair(invitation, value(form, 'name'), purpose === 'bootstrap' ? passphrase(value(form, 'password'), value(form, 'confirmation')) : undefined))
   }
   function createLocalNetwork(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
     void run(async () => {
-      const password = value(form, 'password')
-      try { await device.createLocalNetwork(value(form, 'name'), passphrase(password, password)) }
+      try { await device.createLocalNetwork(value(form, 'name'), passphrase(value(form, 'password'), value(form, 'confirmation'))) }
       finally { form.reset() }
     })
   }
@@ -129,7 +127,7 @@ export function ConnectionScreen() {
         <p className="text-sm text-muted-foreground">{subtitle}</p>
       </header>
       {showConnectOrb ? <div className="flex items-center gap-3"><StatusOrb place="connection" size={64} /><p role="status" className="text-sm text-muted-foreground">{device.phase === 'reconnecting' ? '正在重连…' : '正在连接…'}</p></div> : null}
-      {device.phase === 'unpaired' && !showConnectOrb ? <p role="status" className="text-sm text-muted-foreground">还没授权。</p> : null}
+      {device.phase === 'unpaired' && !showConnectOrb && !focused ? <p role="status" className="text-sm text-muted-foreground">还没授权。</p> : null}
       {(error || device.error && device.phase !== 'reconnecting') && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
       {device.phase === 'blocked' && <Card className={panel} aria-labelledby="secure-page-title"><h2 id="secure-page-title" className="font-semibold">需要安全页面</h2><p className="text-sm text-muted-foreground">请用本机或 HTTPS 打开。</p></Card>}
       {device.phase === 'key_lost' && <Card className={panel} aria-labelledby="lost-key-title"><h2 id="lost-key-title" className="font-semibold">密钥已丢失</h2><p className="text-sm text-muted-foreground">新密钥需要重新配对。</p><Button variant="outline" className={`${button} self-start`} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新密钥</Button></Card>}
@@ -164,14 +162,14 @@ export function ConnectionScreen() {
             <fieldset disabled={linking || !usable} className="space-y-4 disabled:opacity-70">
               <label className="grid gap-2 text-sm">此浏览器名称<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
               <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} required aria-describedby="local-passphrase-hint" aria-invalid={error.includes('口令') || undefined} /></label>
+              <label className="grid gap-2 text-sm">再次填写口令<Input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
               <p id="local-passphrase-hint" className="text-xs text-muted-foreground">至少 12 个字符。请独立保存口令，丢失后无法解锁恢复包。</p>
               <Button className={button} type="submit">准备创建网络</Button>
             </fieldset>
           </form>
-          <p className="text-xs text-muted-foreground">已有个人网络时，使用节点邀请加入，或导入恢复包。</p>
-          <Button variant="outline" className={`${button} self-start`} type="button" onClick={() => chooseLane('invite')}>使用节点邀请加入</Button>
+          <p className="text-xs text-muted-foreground">已有个人网络时，在下方选择「使用邀请」或「恢复管理权限」。</p>
         </> : <>
-          <p className="text-sm text-muted-foreground">{device.localSetup.local_launch ? '此节点已加入个人网络。先核验此浏览器的成员授权，也可打开本机访问配置此节点。' : '此节点已加入个人网络。请使用原有成员的邀请或加密恢复包授权此浏览器。'}</p>
+          <p className="text-sm text-muted-foreground">{device.localSetup.local_launch ? '此节点已加入个人网络。先核验此浏览器的成员授权，也可打开本机访问配置此节点。' : '此节点已加入个人网络。已授权的浏览器可直接连接；新浏览器需要原有成员的邀请或加密恢复包。'}</p>
           <p className="break-all text-sm text-muted-foreground">{device.localSetup.entry.address}</p>
           <Button className={`${button} self-start`} type="button" disabled={linking || !usable} onClick={() => { const setup = device.localSetup; if (setup?.kind === 'initialized') void run(() => device.connect(setup.entry)) }}>连接此节点</Button>
           {device.localSetup.local_launch && <>
@@ -204,7 +202,8 @@ export function ConnectionScreen() {
             <label className="grid gap-2 text-sm">{purpose === 'node' ? '此节点名称' : '此浏览器名称'}<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
             {purpose === 'bootstrap' && <>
               <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
-              <p className="text-xs text-muted-foreground">只填一次，请自行保存。</p>
+              <label className="grid gap-2 text-sm">再次填写口令<Input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} required aria-invalid={error.includes('口令') || undefined} /></label>
+              <p className="text-xs text-muted-foreground">请独立保存口令，丢失后无法解锁恢复包。</p>
             </>}
             <Button className={button} type="submit">{inviteAction}</Button>
             {inviteDetail ? <p className="text-xs text-muted-foreground">{inviteDetail}</p> : null}

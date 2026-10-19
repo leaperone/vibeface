@@ -20,7 +20,7 @@ export function DevicesScreen() {
           </Button>
         </CardContent>
       </Card>
-      <DeviceControls />
+      <DeviceControls active={workspace.view === "settings"} />
     </section>
   )
 }
