@@ -65,36 +65,36 @@ The sidecar uses the official TypeScript SDK, which wraps `codex exec
 --experimental-json`. The SDK has no native custom-tool callback. `tool_cli` is
 therefore available through the Codex shell tool with the `vibeface_manager`
 permissions profile. Code mode, its host, and unified exec are enabled so the
-model can call that CLI. Normal invocations have host filesystem write access,
-network access, and explicit access to `VIBEFACE_CODEX_SOCKET`. They can work in
-the configured directory with shell and file tools. `read_only=true` keeps
-filesystem writes disabled, retains the limited network profile, and exposes
-only the scoped read tools supplied by the Node. There is no shell command
+model can call that CLI. Every invocation has a read-only host filesystem and a
+network profile limited to `127.0.0.1` and `localhost`, with no Unix socket
+grants. The manager changes code on this host only through native Codex work
+started with the Node `codex` tool. `read_only=true` additionally exposes only
+the scoped read tools supplied by the Node. There is no shell command
 allow-list. Prompt instructions and scoped CLI credentials do not isolate an
 untrusted model or plugin.
 
 The Codex child process and its shell use explicit environment-variable lists.
-Normal calls pass every supplied `tool_env` entry to the child and shell, including
-`VIBEFACE_CODEX_SOCKET`, `VIBEFACE_NODE_TRIGGER`, and
-`VIBEFACE_MANAGER_ATTEMPT`. Provider credential variables stay outside the shell
+Calls pass every supplied `tool_env` entry to the child and shell, including
+`VIBEFACE_NODE_TRIGGER` and `VIBEFACE_MANAGER_ATTEMPT`. The Node never supplies
+the native Codex socket. Provider credential variables stay outside the shell
 list. Cursor SDK receives the same tool environment in its actual bridge
 process. Normal Cursor calls use its default host toolset. Read-only Cursor
 calls keep the MCP-only tool selection.
-Read-only calls omit `VIBEFACE_CODEX_SOCKET`; use the scoped Node status tools
-to observe existing work. The Codex read-only profile enforces filesystem
-restrictions, but does not isolate arbitrary Unix socket access on macOS.
-The sidecar disables child-agent features, web search, apps, plugins, and host
-skill discovery. Native App Server requests retain their own approval policy.
-Neither the sidecar nor the native client answers those approvals automatically.
+The Codex profile enforces filesystem restrictions, but on macOS it does not
+block a same-user process from connecting to a Unix socket whose path it finds.
+The sidecar disables child-agent features, web search, apps, plugins, apply
+patch, and host skill discovery.
 
-`vibeface codex METHOD --json 'JSON_OBJECT' --socket /absolute/codex.sock`
-sends the native method and parameters without translating them into Node
-commands. `--socket` can be omitted when `VIBEFACE_CODEX_SOCKET` is set. `--watch`
-keeps the connection open and prints native notifications as JSON lines.
-To answer a pending native request, provide an explicit stdin line such as
-`{"id":27,"result":{"decision":"decline"}}`. The response must match a request
-on that connection. Closing the watcher does not interrupt background work.
-The CLI does not retry a method after disconnect or an uncertain result.
+`vibeface tool codex --json '{"method":"turn/start","params":{...}}' --call-ref REF`
+asks the Node to send one native request. The Node allows only `thread/start`,
+`thread/resume`, `turn/start`, `turn/interrupt`, `thread/read`,
+`thread/turns/list`, and `thread/loaded/list`, each with a fixed field list. It
+rejects `approvalPolicy`, `approvalsReviewer`, `sandbox`, `sandboxPolicy`, and
+`config`, requires `cwd` inside an authorized root for the three start methods,
+and sets `approvalPolicy=on-request`, `approvalsReviewer=user`, and a
+workspace-write sandbox in that `cwd` without network. The tool cannot answer
+native requests; only the user answers approvals through `native_respond`. The
+Node does not retry a method after disconnect or an uncertain result.
 
 After starting native work, call the Node `observe_session` tool with its exact
 thread and turn IDs. The coordinating SDK's final response does not mark that

@@ -162,7 +162,7 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | `ack` | `notification_id`、`client_id` | 记录该客户端已读 |
 | `export` | `conversation_id` | 导出包含签名事件的快照 |
 
-`bot_id`、`message_id`、`conversation_id`、`task_ref` 和 `call_ref` 标识业务写入及原调用。重试保留原身份、内容和目标；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`send_task`、`task_status`、`call_lookup`、`cancel_task` 和 `observe_session`。只读结果回调只得到查询工具，本机 Shell 和文件工作使用宿主 SDK 工具。
+`bot_id`、`message_id`、`conversation_id`、`task_ref` 和 `call_ref` 标识业务写入及原调用。重试保留原身份、内容和目标；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`send_task`、`task_status`、`call_lookup`、`cancel_task`、`observe_session` 和 `codex`。只读结果回调只得到查询工具。宿主 SDK 工具只读取本机，本机修改通过 `codex` 工具启动的原生工作完成。
 
 Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入或重建同版本定义不启动模型。
 
@@ -231,7 +231,7 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 
 任务内继续委派时，若目标在同一聊天中已有未结束的 Agent 任务，目标在接纳事务中回传未启动的 `interrupted` 结果，避免两个 Agent 互相等待。本人发起的任务仍可正常排队。
 
-协调 Agent 直接使用宿主 SDK 的 Shell 和文件工具，也可用 `vibeface codex METHOD --json 'JSON_OBJECT' --socket /absolute/codex.sock` 调用 App Server 原生方法。参数不翻译成 Operation。`--watch` 持续输出通知，stdin 可接收本人明确提供的 `{ "id": ..., "result": ... }` 响应。不自动批准、不自动重试写请求。
+协调 Agent 用宿主 SDK 的 Shell 和文件工具只读访问本机，不持有 App Server Socket。原生请求经 `codex` 工具 `{"method":...,"params":{...}}` 由 Node 转发，参数不翻译成 Operation。方法白名单为 `thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`、`thread/read`、`thread/turns/list`、`thread/loaded/list`，各方法只接受固定字段，其余方法和字段拒绝。审批、审阅者、沙箱及 `config` 字段只能由 Node 设置。启动类方法要求 `cwd` 位于授权 `roots` 内，Node 写入 `approvalPolicy=on-request`、`approvalsReviewer=user`，`thread/start` 与 `thread/resume` 使用 `sandbox=workspace-write`，`turn/start` 使用 `sandboxPolicy={type:workspaceWrite, writableRoots:[cwd], networkAccess:false}`。工具不能回复原生请求，审批只经本人的 `native_respond`。不自动批准、不自动重试写请求。
 
 原生工作启动后，用 `observe_session` 登记准确的 `thread_id` 和 `turn_id`。Node 保存所属会话、来源 trigger、管理 attempt 和可选任务引用，观察进度、审批和终态。它只订阅当前 Socket 已加载的线程；历史补查不能把其他 stdio 进程的线程视为已接管。无有效控制端点的会话保持不可确认。
 

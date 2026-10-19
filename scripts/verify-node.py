@@ -1886,7 +1886,7 @@ def fixture_manager(arguments):
     schemas = initial.get("custom_tools", {})
     expected_tools = {"nodes", "context", "task_status", "call_lookup"}
     if not read_only:
-        expected_tools.update({"send_task", "cancel_task", "observe_session"})
+        expected_tools.update({"send_task", "cancel_task", "observe_session", "codex"})
     require(set(schemas) == expected_tools, "sidecar receives the authoritative scoped high-level tool catalog")
     fixture_record(run, "manager-tool-catalog.jsonl", {"trigger": trigger, "tools": schemas})
 
@@ -1966,10 +1966,13 @@ def fixture_manager(arguments):
              expected=False)
     if directive.get("native"):
         spec = directive["native"]
-        with CodexSocket(initial["tool_env"]["VIBEFACE_CODEX_SOCKET"]) as codex:
-            thread = codex.request("thread/start", {"cwd": spec["cwd"], "approvalPolicy": "untrusted"})["thread"]
-            turn = codex.request("turn/start", {"threadId": thread["id"],
-                                 "input": [{"type": "text", "text": json.dumps(spec)}]})["turn"]
+        require("VIBEFACE_CODEX_SOCKET" not in initial["tool_env"], "Agents never receive the native Socket")
+        tool("codex", {"method": "thread/start", "params": {"cwd": spec["cwd"], "approvalPolicy": "never"}},
+             expected=False, rejection="not available to Agents", call_ref="native-bypass-" + label)
+        thread = tool("codex", {"method": "thread/start", "params": {"cwd": spec["cwd"]}},
+                      call_ref="native-thread-" + label)["thread"]
+        turn = tool("codex", {"method": "turn/start", "params": {"threadId": thread["id"], "cwd": spec["cwd"],
+                    "input": [{"type": "text", "text": json.dumps(spec)}]}}, call_ref="native-turn-" + label)["turn"]
         work = tool("observe_session", {"thread_id": thread["id"], "turn_id": turn["id"]})
         fixture_record(run, "manager-native-work.jsonl", {"trigger": trigger, "label": label,
                        "work_id": work["work_id"], "thread_id": thread["id"], "turn_id": turn["id"]})
@@ -2589,6 +2592,12 @@ def startup_subscription_checks(run, workspace, a, b, c, network, passed):
     require(task["task_ref"] in ancestors, "native approval retains the original Agent task as a causal ancestor")
     require(not any(row["message"].get("id") == request_id and "method" not in row["message"]
                     for row in fixture_records(run, "codex-rpc.jsonl")), "native observation never approves automatically")
+    require(all(row["message"]["params"].get("approvalPolicy") == "on-request"
+                and row["message"]["params"].get("approvalsReviewer") == "user"
+                and (row["message"]["params"].get("sandbox") == "workspace-write"
+                     or row["message"]["params"].get("sandboxPolicy", {}).get("type") == "workspaceWrite")
+                for row in rpc("thread/start") + rpc("turn/start")),
+            "the Node pins every Agent native start to user approval in a workspace sandbox")
     sdk_calls_before_restart = len(fixture_records(run))
     for node in (a, b, c):
         node.client.command("close")

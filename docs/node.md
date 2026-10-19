@@ -64,7 +64,7 @@ bash scripts/build-web.sh
 
 ## 配置管理 Agent
 
-协调 Agent 理解用户指令，使用宿主 SDK 的 Shell 和文件工具完成本机工作，也能直接访问配置的 Codex App Server Socket。跨设备时，它发送任务给目标设备的协调 Agent，由目标设备本机执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
+协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `codex` 工具启动原生 Codex 工作来修改本机代码，不持有 Codex App Server Socket。跨设备时，它发送任务给目标设备的协调 Agent，由目标设备本机执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
 
 通过 `manager.model` 选择账户实际可用的快模型。`auto` 或默认模型不是速度保证。2026-10-18 的独立 SDK 两轮对话测得首个模型输出约 7 至 10 秒，只验证了对应环境的模型对话与本机原生会话延续，不代表整个 Node、网页和后台任务的响应时间。
 
@@ -108,7 +108,7 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。源码运行时先在 `crates/node/sdk/` 安装依赖，将 `--codex-sdk-script` 指向该目录的入口。
 
-这个适配器通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具。普通工作开放宿主 Shell、文件写入和配置的 Codex Socket；只读结果汇报限制文件写入，并且不注入 Socket 地址。Codex 子进程环境按变量名筛选，Provider 凭证不放进 Shell 环境。macOS 的只读 profile 不隔离任意 Unix Socket，不能把它当作隔离不可信模型或插件的边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺相同的系统隔离。
+这个适配器通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具。所有调用的宿主 Shell 都是只读文件系统，网络只放行 `127.0.0.1` 和 `localhost`，不注入也不放行 Codex Socket。Codex 子进程环境按变量名筛选，Provider 凭证不放进 Shell 环境。macOS 的 Codex 沙箱不拦截 Unix Socket 连接，同一用户的进程若自行找到 Socket 路径仍可连接，不能把它当作隔离不可信模型或插件的边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺相同的系统隔离。
 
 ## 添加自己的设备
 
@@ -242,7 +242,7 @@ vibeface serve --data-dir "$HOME/.vibeface-relay"
 
 Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex CLI 退出仍不能证明已分离的工具进程全部退出，当前真实适配器将这种取消保留为 `unknown`。
 
-Agent 可通过 `vibeface codex METHOD --json 'JSON_OBJECT' --socket /absolute/codex.sock` 调用 App Server 原生方法。省略 `--socket` 时使用 SDK 环境提供的 `VIBEFACE_CODEX_SOCKET`。`--watch` 输出原生事件，并接受本人明确提供的请求响应。连接中断后不会自动重发写方法；关闭观察连接不会停止后台工作。
+Agent 通过 Node 的 `codex` 工具发送原生请求，例如 `vibeface tool codex --json '{"method":"turn/start","params":{...}}' --call-ref REF`。可用方法只有 `thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`、`thread/read`、`thread/turns/list` 和 `thread/loaded/list`，每个方法只接受固定字段。`approvalPolicy`、`approvalsReviewer`、`sandbox`、`sandboxPolicy` 和 `config` 由 Node 设置，Agent 传入即被拒绝。`thread/start`、`thread/resume` 和 `turn/start` 必须提供授权 `roots` 内的 `cwd`，Node 固定为 `approvalPolicy=on-request`、`approvalsReviewer=user`，并把沙箱限定为该目录的 workspace-write、关闭网络。Agent 没有回复原生请求的入口，审批只能由本人在网页通过 `native_respond` 回答。写请求不自动重发，结果未知时先读取原线程核对。
 
 启用 Agent 的 Node 可以启动与本机身份关联的私有 `codex app-server`，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。要连接已有实例，在 `config.json` 设置 `codex_socket`，`codex_bin` 指向 Codex 程序。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中后台工作的实际状态。
 
