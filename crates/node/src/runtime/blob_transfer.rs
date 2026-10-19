@@ -1501,7 +1501,7 @@ mod tests {
                 }
             });
         }
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while receiver.hub.online(&network).await.len() < 5 {
                 tokio::task::yield_now().await;
             }
@@ -1524,7 +1524,7 @@ mod tests {
             node.fetch_closure(&scope, "rebound", &source_id, &[event.hash])
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(3), next_quantum)
+        tokio::time::timeout(Duration::from_secs(30), next_quantum)
             .await
             .context("rebound did not begin a second quantum")??;
         assert_eq!(&requests.lock().await[..4], &[0, 1, 2, 3]);

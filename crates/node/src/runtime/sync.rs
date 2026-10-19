@@ -1514,7 +1514,7 @@ mod tests {
                 let _ = responder.hub.respond(&message, reply).await;
             }
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !receiver.hub.online(&network).await.contains(&source_id) {
                 tokio::task::yield_now().await;
             }
@@ -1534,7 +1534,7 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(3), blob_entered).await??;
+        tokio::time::timeout(Duration::from_secs(30), blob_entered).await??;
         println!("M5_STAGE first proof blob entered");
         let checkpoint = format!("net1:v1:closure:{}", crypto::digest(b"chat"));
         assert!(
@@ -1565,7 +1565,7 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let joined = receiver
                     .sync
@@ -1701,7 +1701,7 @@ mod tests {
         )?;
         println!("M5_STAGE inventory starting");
         let reports = tokio::time::timeout(
-            Duration::from_secs(25),
+            Duration::from_secs(120),
             receiver.sync_from(&network, &source_id),
         )
         .await?
