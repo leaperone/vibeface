@@ -72,7 +72,7 @@ export function AddDevice() {
           {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} />生成链接</Button> : null}
           {result ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用新设备扫码打开" /> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
-              <p className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />{local ? "手机连不上本机地址" : "手机需要 HTTPS 访问地址"}</p>
+              <p className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />{local ? "手机连不上本机地址，只能本机打开" : "没有 HTTPS 访问地址，只能本机打开"}</p>
               <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置访问地址</Link></Button>
             </div>}
             <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button>
