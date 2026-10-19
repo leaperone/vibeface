@@ -175,8 +175,20 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body_json: &str) ->
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(js_name = ticketEncode)]
-pub fn ticket_encode(entry_id: &str, secret_hex: &str) -> Result<String> {
-    Ticket::new(entry_id, decode32(secret_hex)?)?.encode()
+pub fn ticket_encode(
+    entry_id: &str,
+    secret_hex: &str,
+    relay_url: Option<String>,
+    direct_addrs: Vec<String>,
+) -> Result<String> {
+    let mut ticket = Ticket::new(entry_id, decode32(secret_hex)?)?;
+    ticket.entry.relay_url = relay_url.filter(|url| url.len() <= 512);
+    ticket.entry.direct_addrs = direct_addrs
+        .iter()
+        .filter_map(|addr| addr.parse().ok())
+        .take(8)
+        .collect();
+    ticket.encode()
 }
 
 /// `{entry_id, invite_hash, invite_id}`; the secret stays out of JSON the page logs.
