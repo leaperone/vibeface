@@ -201,7 +201,8 @@ pub fn verify_signed_event(
         &domain_message(EVENT_DOMAIN, &event.hash),
         &event.signature,
     )
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::msg)
+    .context("invalid signature")?;
     Ok(body)
 }
 pub fn verify_payload(
