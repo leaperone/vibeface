@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 mod agent_tools;
 mod bots;
 mod chat_controls;
+mod decision;
 mod executor;
 mod followup;
 mod manager_control;
@@ -26,10 +27,12 @@ mod observation;
 mod peers;
 mod schedule_delivery;
 mod settings;
+mod triage;
 mod work;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::ObservationGuard;
 pub use settings::NodeSettings;
+pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
@@ -143,6 +146,7 @@ pub struct Runtime {
     pub(crate) membership: tokio::sync::watch::Sender<u64>,
     _process_lock: Arc<std::fs::File>,
     executor_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    pub(crate) triage: triage::TriageState,
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -206,6 +210,7 @@ impl Runtime {
             dir,
             config.local_auto_access,
         )?);
+        let triage = triage::TriageState::new(config.triage.clone());
         let node = Self {
             data_dir: dir.to_owned(),
             settings: std::sync::Mutex::new(NodeSettings {
@@ -242,6 +247,7 @@ impl Runtime {
             membership: tokio::sync::watch::Sender::new(0),
             _process_lock: process_lock,
             executor_rx: Mutex::new(Some(rx)),
+            triage,
         };
         Ok(node)
     }
@@ -310,6 +316,7 @@ impl Runtime {
         self.start_executor(events);
         self.start_schedule_delivery();
         self.start_observation_worker();
+        self.start_triage();
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         let store = self.store.lock().await;
@@ -418,7 +425,7 @@ impl Runtime {
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let write = !matches!(
             input["method"].as_str(),
-            Some("nodes" | "conversation" | "conversations" | "bots" | "notifications")
+            Some("nodes" | "conversation" | "conversations" | "bots" | "notifications" | "alerts")
         );
         let _lease = self.manager_tool_lease(&access, write).await?;
         self.rpc_inner(access, input).await
@@ -551,6 +558,8 @@ impl Runtime {
                 }
             }
             "bots" => self.bots(&access).await,
+            "alerts" => self.alerts(&access).await,
+            "resolve_alert" => self.resolve_alert(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reconcile" | "resolve" => self.pending_check_control(&access, &input, method).await,

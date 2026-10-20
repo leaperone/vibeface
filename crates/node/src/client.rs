@@ -316,25 +316,27 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     relay_frames(socket, forwarded).await
 }
 
+/// A public entry holds no address book: the target must be on this entry's relay, which only
+/// token holders reach.
+pub(crate) async fn reach_through_entry(node: &Runtime, target: &str) -> Result<()> {
+    let relay = node
+        .config
+        .network
+        .own_relay()?
+        .context("a public entry runs a relay")?;
+    let addr = EndpointAddr::from_parts(net::endpoint_id(target)?, [TransportAddr::Relay(relay)]);
+    node.net()?.learn(&addr).await;
+    Ok(())
+}
+
 async fn open_forward(
     node: &Runtime,
     target: &str,
 ) -> std::result::Result<ClientSocket, (&'static str, anyhow::Error)> {
     if node.config.public_entry {
-        // It holds no address book: the target must be on this entry's relay, which only
-        // token holders reach.
-        let reach = async {
-            let relay = node
-                .config
-                .network
-                .own_relay()?
-                .context("a public entry runs a relay")?;
-            let addr =
-                EndpointAddr::from_parts(net::endpoint_id(target)?, [TransportAddr::Relay(relay)]);
-            node.net()?.learn(&addr).await;
-            Ok::<_, anyhow::Error>(())
-        };
-        reach.await.map_err(|error| ("target_unreachable", error))?;
+        reach_through_entry(node, target)
+            .await
+            .map_err(|error| ("target_unreachable", error))?;
     } else {
         let member = async {
             let network = node.membership_state().await?.genesis.network_id;
@@ -621,6 +623,27 @@ async fn dispatch(
             };
             node.configure_node(settings, &session.device_id, cookie)
                 .await
+        }
+        "triage_settings" => {
+            node_operator(node, session).await?;
+            node.triage_settings().await
+        }
+        "configure_triage" => {
+            node_operator(node, session).await?;
+            node.configure_triage(params).await
+        }
+        "test_webhook" => {
+            node_operator(node, session).await?;
+            node.test_webhook().await
+        }
+        "create_decision_token" => {
+            node_operator(node, session).await?;
+            node.create_decision_token(params["label"].as_str().unwrap_or_default())
+                .await
+        }
+        "revoke_decision_token" => {
+            node_operator(node, session).await?;
+            node.revoke_decision_token(text(&params, "token_id")?).await
         }
         "subscribe" => {
             // The browser sends the vector it has already shown; a lagging entry asks its peers now.

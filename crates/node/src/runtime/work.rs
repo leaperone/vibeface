@@ -836,6 +836,7 @@ impl Runtime {
         let node = self.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                node.triage_app_server(&event);
                 let networks = node.store.lock().await.networks().unwrap_or_default();
                 for network in networks {
                     if let Err(error) = node.route_executor_event(&network, event.clone()).await {

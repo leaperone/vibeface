@@ -1,4 +1,4 @@
-//! Node-to-Node transport: one iroh `Endpoint` per Node, five ALPNs, and an optional relay.
+//! Node-to-Node transport: one iroh `Endpoint` per Node, six ALPNs, and an optional relay.
 //!
 //! Every request is one QUIC bidirectional stream carrying length-prefixed JSON frames. The
 //! remote `EndpointId` is the peer's `DeviceId`, proven by the QUIC TLS handshake.
@@ -24,7 +24,9 @@ pub const BLOB: &[u8] = b"vibeface/blob/1";
 pub const RPC: &[u8] = b"vibeface/rpc/1";
 pub const CLIENT: &[u8] = b"vibeface/client/1";
 pub const JOIN: &[u8] = b"vibeface/join/1";
-pub const ALPNS: [&[u8]; 5] = [SYNC, BLOB, RPC, CLIENT, JOIN];
+/// A decision sent to a session through another device; the target checks its token.
+pub const DECISION: &[u8] = b"vibeface/decision/1";
+pub const ALPNS: [&[u8]; 6] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION];
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;

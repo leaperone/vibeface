@@ -47,6 +47,9 @@ pub struct Config {
     pub codex_bin: PathBuf,
     pub timeout_secs: u64,
     pub daily_decision_limit: u64,
+    /// Where triaged local sessions go; the webhook secret is a separate private file.
+    #[serde(default)]
+    pub triage: crate::triage::TriageConfig,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +84,7 @@ impl Config {
             codex_bin: "codex".into(),
             timeout_secs: 600,
             daily_decision_limit: 20,
+            triage: Default::default(),
         }
     }
     pub fn load(dir: &Path) -> Result<Self> {
@@ -129,6 +133,7 @@ impl Config {
                 "a public entry runs a relay and nothing else"
             );
         }
+        self.triage.validate()?;
         if let Some(m) = &self.manager {
             ensure!(
                 matches!(m.provider.as_str(), "cursor_sdk" | "codex_sdk"),

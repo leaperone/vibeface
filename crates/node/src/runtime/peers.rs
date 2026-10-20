@@ -210,6 +210,9 @@ impl Runtime {
         if alpn == net::CLIENT {
             return crate::client::serve_forwarded(self, connection).await;
         }
+        if alpn == net::DECISION {
+            return self.serve_decisions(connection).await;
+        }
         let network = match self.member_node(&remote).await {
             Ok(network) => network,
             Err(error) => {
