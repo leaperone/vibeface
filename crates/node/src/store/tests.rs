@@ -1,7 +1,9 @@
 use super::{assistant::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
-    scheduling::{JobOutcome, JobState, TriggerKind, message_trigger, work_trigger},
+    scheduling::{
+        JobOutcome, JobState, TriggerKind, message_trigger, routine_trigger, work_trigger,
+    },
     work::{Signal, WorkSpec},
 };
 
@@ -1251,6 +1253,108 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
     b_first.ingest_events(&net.network, &b_events)?;
     assert_eq!(assistant_projection(&a_first, &net)?, expected);
     assert_eq!(assistant_projection(&b_first, &net)?, expected);
+    Ok(())
+}
+
+/// The owner runs a routine's latest due time once, skips the times it missed and drops a
+/// queued run once the routine is paused.
+#[test]
+fn a_routine_runs_its_latest_time_once() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+    let (saved, _) = store.change_assistant(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_routine(None, "Digest", 5),
+        3,
+    )?;
+    let AssistantChange::Routine { routine_id, .. } = saved.change else {
+        panic!("routine change")
+    };
+    let every = 5 * 60_000;
+    assert!(
+        store
+            .admit_due_routines(&net.a, &net.network, 999)?
+            .is_empty()
+    );
+    let due = store.admit_due_routines(&net.a, &net.network, 1_000 + 3 * every + 10)?;
+    let trigger = routine_trigger(&routine_id, 1_000 + 3 * every);
+    assert_eq!(due, vec![("c".to_owned(), trigger.clone())]);
+    assert!(
+        store
+            .admit_due_routines(&net.a, &net.network, 1_000 + 3 * every + 20)?
+            .is_empty()
+    );
+    // The next time waits while this run is still queued.
+    assert!(
+        store
+            .admit_due_routines(&net.a, &net.network, 1_000 + 4 * every)?
+            .is_empty()
+    );
+
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("routine job")?;
+    assert_eq!(
+        (claimed.job.kind, claimed.job.trigger.as_str()),
+        (TriggerKind::Routine, trigger.as_str())
+    );
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        4,
+    )?;
+    let reply = store
+        .message(&net.network, "c", &claimed.job.message_id)?
+        .context("reply")?;
+    assert_eq!(reply.in_reply_to.as_deref(), Some(trigger.as_str()));
+
+    let next = store.admit_due_routines(&net.a, &net.network, 1_000 + 5 * every)?;
+    assert_eq!(next.len(), 1);
+    store.change_assistant(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r2",
+        ChangeRequest::SaveRoutine {
+            routine_id: Some(routine_id),
+            name: "Digest".into(),
+            prompt: "Summarize yesterday's commits; say so if there are none.".into(),
+            first_run_at_ms: 1_000,
+            every_minutes: 5,
+            enabled: Some(false),
+        },
+        5,
+    )?;
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(matches!(
+        store
+            .scheduler_job(&net.network, "c", &next[0].1)?
+            .context("job")?
+            .state,
+        JobState::Cancelled { .. }
+    ));
+    assert!(
+        store
+            .admit_due_routines(&net.a, &net.network, 1_000 + 9 * every)?
+            .is_empty()
+    );
     Ok(())
 }
 
