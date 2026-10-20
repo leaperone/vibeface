@@ -107,7 +107,7 @@ impl InviteRecord {
     pub fn signing_payload(&self) -> Result<Vec<u8>> {
         let mut unsigned = self.clone();
         unsigned.signature.clear();
-        canonical_json(&unsigned).map_err(|error| error.to_string())
+        Ok(canonical_json(&unsigned)?)
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -170,7 +170,7 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body_json: &str) ->
         "scope_id": scope_id,
         "body": body,
     }))
-    .map_err(|error| error.to_string())
+    .map_err(Into::into)
 }
 
 #[cfg(target_arch = "wasm32")]

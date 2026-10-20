@@ -254,22 +254,6 @@ impl Store {
         self.connection.execute("INSERT INTO local_identities(network_id,device_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,device_id) DO UPDATE SET identity=excluded.identity",params![network_id,device_id,serde_json::to_string(identity)?])?;
         Ok(())
     }
-    pub fn local_identity(
-        &self,
-        network_id: &str,
-        device_id: &str,
-    ) -> Result<Option<LocalIdentity>> {
-        optional_json(
-            self.connection
-                .query_row(
-                    "SELECT identity FROM local_identities WHERE network_id=? AND device_id=?",
-                    params![network_id, device_id],
-                    |r| r.get(0),
-                )
-                .optional()?,
-        )
-    }
-
     /// Stores each event or reports why not; one bad event never aborts the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards.
     pub fn ingest_events(

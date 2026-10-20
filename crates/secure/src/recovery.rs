@@ -166,6 +166,7 @@ mod tests {
         assert!(
             recovery_open(&serde_json::to_vec(&package).unwrap(), password)
                 .unwrap_err()
+                .to_string()
                 .contains("KDF")
         );
     }

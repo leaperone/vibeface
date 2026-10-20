@@ -48,10 +48,9 @@ fn invite(fixture: &Fixture, secret: [u8; 32]) -> Result<String> {
         expires_at_ms: now_ms() + 60_000,
         signature: String::new(),
     };
-    record.signature = fixture.admin.sign_payload(
-        INVITE_DOMAIN,
-        &record.signing_payload().map_err(anyhow::Error::msg)?,
-    )?;
+    record.signature = fixture
+        .admin
+        .sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
     let id = fixture.store.register_invite(&record, &record.issuer)?;
     assert_eq!(fixture.store.register_invite(&record, &record.issuer)?, id);
     Ok(id)
@@ -63,7 +62,7 @@ fn request(device: &LocalIdentity, secret: [u8; 32], nonce: &str) -> Result<Join
         public_key: device.device_id()?,
         kind: IdentityKind::Client,
         name: "phone".into(),
-        commit: join_commit(&device.device_id()?, nonce).map_err(anyhow::Error::msg)?,
+        commit: join_commit(&device.device_id()?, nonce)?,
     })
 }
 

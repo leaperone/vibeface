@@ -214,8 +214,7 @@ impl SignedAddress {
             ADDRESS_DOMAIN,
             self.payload.as_bytes(),
             &self.signature,
-        )
-        .map_err(anyhow::Error::msg)?;
+        )?;
         Ok(record)
     }
 }

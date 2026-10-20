@@ -17,7 +17,49 @@ pub mod membership;
 mod recovery;
 pub use recovery::{recovery_open, recovery_seal};
 
-type Result<T> = std::result::Result<T, String>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error(String);
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<&str> for Error {
+    fn from(message: &str) -> Self {
+        Self(message.into())
+    }
+}
+
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(error: anyhow::Error) -> Self {
+        Self(format!("{error:#}"))
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl From<Error> for JsValue {
+    fn from(error: Error) -> Self {
+        JsValue::from_str(&error.0)
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
 const NOISE: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_MESSAGE: usize = 65_535;
 const MAX_CONTEXT: usize = 4_096;
@@ -99,7 +141,7 @@ pub fn verify_message(device_id: &str, message: &[u8], signature: &str) -> Resul
     let bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
     let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature size")?;
     key.verify_strict(message, &signature)
-        .map_err(|_| "invalid device signature".to_owned())
+        .map_err(|_| "invalid device signature".into())
 }
 
 /// A `DeviceId` is 64 lowercase hexadecimal characters of a valid, non-small-order Ed25519 public key.

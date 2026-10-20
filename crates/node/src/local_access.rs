@@ -1,6 +1,5 @@
 use crate::{config, crypto};
 use anyhow::{Context, Result, ensure};
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -111,7 +110,7 @@ impl LocalAccess {
         let launcher = Launcher {
             origin: origin.clone(),
             node_id,
-            capability: random_secret(),
+            capability: crate::crypto::random_hex(32),
         };
         let mut state = self
             .state
@@ -177,7 +176,7 @@ impl LocalAccess {
             state.tokens.len() < 64,
             "too many pending local access entries"
         );
-        let token = random_secret();
+        let token = crate::crypto::random_hex(32);
         state.tokens.insert(
             crypto::digest(token.as_bytes()),
             Pending {
@@ -221,7 +220,7 @@ impl LocalAccess {
             state.sessions.len() < 256,
             "too many local browser sessions"
         );
-        let cookie = random_secret();
+        let cookie = crate::crypto::random_hex(32);
         state.sessions.insert(
             crypto::digest(cookie.as_bytes()),
             LocalSession {
@@ -287,12 +286,6 @@ impl LocalAccess {
 
 fn now_ms() -> i64 {
     crate::runtime::now_ms()
-}
-
-fn random_secret() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 #[cfg(test)]

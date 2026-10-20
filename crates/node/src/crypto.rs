@@ -1,7 +1,7 @@
 use crate::model::*;
 use anyhow::{Context as _, Result, ensure};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -36,13 +36,20 @@ impl LocalIdentity {
         initiator: bool,
         expected_device_id: Option<String>,
         context: &[u8],
-    ) -> std::result::Result<vibeface_secure::Handshake, String> {
+    ) -> Result<vibeface_secure::Handshake> {
         let identity = vibeface_secure::Identity::from_secret_hex(&self.secret_key_hex)?;
-        vibeface_secure::Handshake::signed(initiator, &identity, expected_device_id, context)
+        Ok(vibeface_secure::Handshake::signed(
+            initiator,
+            &identity,
+            expected_device_id,
+            context,
+        )?)
     }
     pub fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        let message = payload_message(domain, payload)?;
-        Ok(hex::encode(self.key()?.sign(&message).to_bytes()))
+        Ok(
+            vibeface_secure::Identity::from_secret_hex(&self.secret_key_hex)?
+                .sign(domain, payload)?,
+        )
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
@@ -171,6 +178,12 @@ impl vibeface_secure::membership::MembershipSigner for LocalIdentity {
     }
 }
 
+pub fn random_hex(bytes: usize) -> String {
+    let mut data = vec![0_u8; bytes];
+    OsRng.fill_bytes(&mut data);
+    hex::encode(data)
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -230,18 +243,9 @@ pub fn verify_payload(
     payload: &[u8],
     signature: &str,
 ) -> Result<()> {
-    verify(public_key, signature, &payload_message(domain, payload)?)
-}
-fn payload_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
-    ensure!(
-        !domain.is_empty()
-            && domain.len() <= 64
-            && domain
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-        "invalid signing domain"
-    );
-    Ok(format!("vibeface:message:v1:{domain}:{}", digest(payload)).into_bytes())
+    Ok(vibeface_secure::verify(
+        public_key, domain, payload, signature,
+    )?)
 }
 /// What a client signs for `body` (its `attestation` left out) in one conversation.
 pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -> Result<Vec<u8>> {
@@ -249,8 +253,11 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -
     if let Some(object) = value.as_object_mut() {
         object.remove("attestation");
     }
-    vibeface_secure::join::attestation_payload(network_id, scope_id, &value.to_string())
-        .map_err(anyhow::Error::msg)
+    Ok(vibeface_secure::join::attestation_payload(
+        network_id,
+        scope_id,
+        &value.to_string(),
+    )?)
 }
 
 /// The user's own writes must carry their device signature; nothing else may carry one.

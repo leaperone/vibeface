@@ -91,7 +91,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_role_dependencies(&self.roles)?;
         self.network.validate()?;
-        let url = browser_origin(&self.public_url)?;
+        let url = http_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
             h == "localhost"
                 || h.trim_matches(['[', ']'])
@@ -143,7 +143,7 @@ impl Config {
         let mut origins = Vec::new();
         let mut authorities = std::collections::HashMap::new();
         for value in std::iter::once(&self.public_url).chain(&self.allowed_origins) {
-            let url = browser_origin(value)?;
+            let url = http_origin(value)?;
             let local = url.host_str().is_some_and(|host| {
                 host == "localhost"
                     || host
@@ -188,7 +188,7 @@ impl Config {
     }
 }
 
-fn browser_origin(value: &str) -> Result<reqwest::Url> {
+pub fn http_origin(value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value)?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
@@ -198,7 +198,7 @@ fn browser_origin(value: &str) -> Result<reqwest::Url> {
             && url.query().is_none()
             && url.fragment().is_none()
             && url.path() == "/",
-        "browser origin must use HTTP or HTTPS without credentials, a path, query or fragment"
+        "URL must be an HTTP(S) origin without credentials, a path, query, or fragment"
     );
     Ok(url)
 }

@@ -28,7 +28,7 @@ impl MembershipSigner for Identity {
     }
 
     fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        self.sign(domain, payload).map_err(anyhow::Error::msg)
+        Ok(self.sign(domain, payload)?)
     }
 }
 
@@ -37,11 +37,11 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn verify_payload(device_id: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
-    crate::verify(device_id, domain, payload, signature).map_err(anyhow::Error::msg)
+    Ok(crate::verify(device_id, domain, payload, signature)?)
 }
 
 fn device_id(value: &str) -> Result<()> {
-    validate_device_id(value).map_err(anyhow::Error::msg)
+    Ok(validate_device_id(value)?)
 }
 
 pub const IDENTITY_VERSION: u32 = 1;
@@ -762,7 +762,7 @@ pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 fn js<T>(result: Result<T>) -> crate::Result<T> {
-    result.map_err(|error| format!("{error:#}"))
+    Ok(result?)
 }
 
 /// Builds a genesis with the unlocked recovery root; the browser then seals that root.
@@ -820,12 +820,12 @@ pub fn verify_membership(
 impl VerifiedMembership {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = viewJson))]
     pub fn view_json(&self) -> crate::Result<String> {
-        serde_json::to_string(&self.view).map_err(|error| error.to_string())
+        Ok(serde_json::to_string(&self.view)?)
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = stateJson))]
     pub fn state_json(&self) -> crate::Result<String> {
-        serde_json::to_string(&self.state).map_err(|error| error.to_string())
+        Ok(serde_json::to_string(&self.state)?)
     }
 
     /// An unsigned `GovernanceEvent` for `{"type":"grant",...}` or `{"type":"revoke",...}`.
@@ -1154,34 +1154,29 @@ mod tests {
     fn browser_helpers_verify_before_building_or_signing() -> Result<()> {
         let (root, a, node, state) = setup()?;
         let state_json = serde_json::to_string(&state)?;
-        let verified = verify_membership(&state_json, &id(&root)).map_err(anyhow::Error::msg)?;
+        let verified = verify_membership(&state_json, &id(&root))?;
         assert!(verify_membership(&state_json, &id(&a)).is_err());
         let mut forged = state.clone();
         forged.genesis.signature = "00".repeat(64);
         assert!(verify_membership(&serde_json::to_string(&forged)?, &id(&root)).is_err());
 
         let action = serde_json::json!({"type":"revoke","device_id":id(&node),"cutoff_seq":4});
-        let template = verified
-            .governance_template(&id(&a), &action.to_string())
-            .map_err(anyhow::Error::msg)?;
+        let template = verified.governance_template(&id(&a), &action.to_string())?;
         assert!(
             verified
                 .governance_template(&id(&node), &action.to_string())
                 .is_err()
         );
         let mut event: GovernanceEvent = serde_json::from_str(&template)?;
-        let payload = governance_payload(&template).map_err(anyhow::Error::msg)?;
-        let message =
-            crate::signing_message(GOVERNANCE_DOMAIN, &payload).map_err(anyhow::Error::msg)?;
+        let payload = governance_payload(&template)?;
+        let message = crate::signing_message(GOVERNANCE_DOMAIN, &payload)?;
         event.signature = a.sign_message(&message);
         let mut next = state.clone();
         next.append(event)?;
         assert_eq!(next.project()?.cutoff(&id(&node)), Some(4));
 
         let members = serde_json::to_string(&vec![Member::client(&a, "a", true)?])?;
-        let signed = verified
-            .create_recovery_checkpoint(&root, &members, 4.0)
-            .map_err(anyhow::Error::msg)?;
+        let signed = verified.create_recovery_checkpoint(&root, &members, 4.0)?;
         let checkpoint: RootCheckpoint = serde_json::from_str(&signed)?;
         checkpoint.verify(&state.genesis)?;
         assert_eq!(checkpoint.epoch, 5);
@@ -1199,8 +1194,7 @@ mod tests {
             &root,
             &serde_json::to_string(&Member::client(&a, "a", true)?)?,
             &serde_json::to_string(&Member::node(&node, "n")?)?,
-        )
-        .map_err(anyhow::Error::msg)?;
+        )?;
         serde_json::from_str::<Genesis>(&genesis)?.verify()?;
         Ok(())
     }

@@ -84,7 +84,7 @@ fn membership_digest(state: &NetworkState) -> Result<String> {
     let mut hashes = state
         .events
         .iter()
-        .map(|event| event.hash().map_err(anyhow::Error::msg))
+        .map(|event| event.hash())
         .collect::<Result<Vec<_>>>()?;
     hashes.sort();
     Ok(crate::crypto::digest(

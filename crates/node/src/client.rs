@@ -244,16 +244,15 @@ impl Client {
         target: &str,
     ) -> Result<Self> {
         let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            let mut handshake =
-                secure(identity.handshake(true, Some(target.to_owned()), PROLOGUE))?;
-            send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
+            let mut handshake = identity.handshake(true, Some(target.to_owned()), PROLOGUE)?;
+            send_frame(&mut socket, handshake.write(&[])?).await?;
             let second = next_binary(&mut socket).await?;
             ensure!(
-                secure(handshake.read(&second))?.is_empty(),
+                handshake.read(&second)?.is_empty(),
                 "unexpected client handshake payload"
             );
-            send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
-            secure(handshake.finish())
+            send_frame(&mut socket, handshake.write(&[])?).await?;
+            Ok(handshake.finish()?)
         })
         .await
         .context("client handshake timed out")??;
@@ -420,18 +419,18 @@ async fn serve_session(
 ) -> Result<()> {
     let mut local_changes = node.local_access.subscribe();
     let (mut channel, device_id) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let mut handshake = secure(node.identity.handshake(false, None, PROLOGUE))?;
+        let mut handshake = node.identity.handshake(false, None, PROLOGUE)?;
         ensure!(
-            secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
+            handshake.read(&next_binary(&mut socket).await?)?.is_empty(),
             "unexpected first client payload"
         );
-        send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
+        send_frame(&mut socket, handshake.write(&[])?).await?;
         ensure!(
-            secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
+            handshake.read(&next_binary(&mut socket).await?)?.is_empty(),
             "unexpected final client payload"
         );
         let device_id = handshake.remote_id().context("client identity missing")?;
-        Ok::<_, anyhow::Error>((secure(handshake.finish())?, device_id))
+        Ok::<_, anyhow::Error>((handshake.finish()?, device_id))
     })
     .await
     .context("client handshake timed out")??;
@@ -475,7 +474,7 @@ async fn serve_session(
                 received = Instant::now();
                 match frame.context("client disconnected")?? {
                     Message::Binary(bytes) => {
-                        if let Some(plaintext) = secure(channel.open_record(&bytes))? {
+                        if let Some(plaintext) = channel.open_record(&bytes)? {
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
@@ -808,7 +807,6 @@ async fn dispatch(
                 payload.as_bytes(),
                 text(&params, "signature")?,
             )
-            .map_err(anyhow::Error::msg)
             .context("recovery key does not own this personal network")?;
             Ok(json!({"state":state}))
         }
@@ -1031,8 +1029,7 @@ pub fn parse_join_link(link: &str) -> Result<(String, Ticket)> {
         matches!(url.scheme(), "http" | "https") && url.path() == "/join",
         "invite link must look like https://host/join#vibeface1…"
     );
-    let ticket = Ticket::decode(url.fragment().context("invite link has no ticket")?)
-        .map_err(anyhow::Error::msg)?;
+    let ticket = Ticket::decode(url.fragment().context("invite link has no ticket")?)?;
     Ok((url.origin().ascii_serialization(), ticket))
 }
 
@@ -1122,7 +1119,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingJoin {
             link: link.trim().to_owned(),
             name: name.to_owned(),
-            nonce: crate::identity::local::random_hex(32),
+            nonce: crate::crypto::random_hex(32),
             pinned: None,
         },
         Err(error) => return Err(error.into()),
@@ -1138,11 +1135,11 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
         client
             .call(
                 "join",
-                json!({"secret":hex::encode(ticket.secret),"public_key":device,"kind":IdentityKind::Node,"name":name,"commit":join_commit(&device, &pending.nonce).map_err(anyhow::Error::msg)?}),
+                json!({"secret":hex::encode(ticket.secret),"public_key":device,"kind":IdentityKind::Node,"name":name,"commit":join_commit(&device, &pending.nonce)?}),
             )
             .await?,
     )?;
-    let invite = invite_id(&ticket.invite_hash()).map_err(anyhow::Error::msg)?;
+    let invite = invite_id(&ticket.invite_hash())?;
     ensure!(
         request.invite_id == invite,
         "entry answered for another invite"
@@ -1210,8 +1207,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
                     admin,
                     admin_nonce,
                     &pending.nonce,
-                )
-                .map_err(anyhow::Error::msg)?;
+                )?;
                 println!("短码：{code}。请在管理设备上核对相同后批准。");
                 client
                     .call(
@@ -1244,9 +1240,6 @@ fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Resul
             .with_context(|| format!("{key} is required"))?,
     )
     .with_context(|| format!("invalid {key}"))
-}
-fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
-    result.map_err(anyhow::Error::msg)
 }
 fn validate_request(request: &Request) -> Result<()> {
     ensure!(
@@ -1292,14 +1285,14 @@ async fn send_value<T: Serialize>(
     value: &T,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    for record in secure(channel.seal_message(&bytes))? {
+    for record in channel.seal_message(&bytes)? {
         send_frame(socket, record).await?;
     }
     Ok(())
 }
 async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Result<Vec<u8>> {
     loop {
-        if let Some(value) = secure(channel.open_record(&next_binary(socket).await?))? {
+        if let Some(value) = channel.open_record(&next_binary(socket).await?)? {
             return Ok(value);
         }
     }
@@ -1802,16 +1795,15 @@ mod tests {
                     expires_at_ms: crate::runtime::now_ms() + 60_000,
                     signature: String::new(),
                 };
-                record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload().map_err(anyhow::Error::msg)?)?;
+                record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
                 Ok(json!({"record":record}))
             };
             let join = |device: &LocalIdentity, secret: [u8; 32], nonce: &str| -> Result<Value> {
-                Ok(json!({"secret":hex::encode(secret),"public_key":device.device_id()?,"kind":"client","name":"phone","commit":join_commit(&device.device_id()?, nonce).map_err(anyhow::Error::msg)?}))
+                Ok(json!({"secret":hex::encode(secret),"public_key":device.device_id()?,"kind":"client","name":"phone","commit":join_commit(&device.device_id()?, nonce)?}))
             };
             let code = |request: &Value, nonce: &str| -> Result<String> {
-                short_code(&network, request["invite_id"].as_str().context("invite_id")?, request["device_id"].as_str().context("device")?,
-                    request["admin_id"].as_str().context("admin")?, request["admin_nonce"].as_str().context("admin nonce")?, nonce)
-                    .map_err(anyhow::Error::msg)
+                Ok(short_code(&network, request["invite_id"].as_str().context("invite_id")?, request["device_id"].as_str().context("device")?,
+                    request["admin_id"].as_str().context("admin")?, request["admin_nonce"].as_str().context("admin nonce")?, nonce)?)
             };
 
             // A new browser joins and is granted management.

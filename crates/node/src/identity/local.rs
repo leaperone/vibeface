@@ -6,11 +6,10 @@
 use super::{AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, NetworkState};
 use crate::crypto;
 use crate::store::Store;
+use crate::{crypto::random_hex, runtime::now_ms};
 use anyhow::{Context, Result, bail, ensure};
-use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 use vibeface_secure::join::{InviteRecord, TICKET_LIFETIME_MS, invite_id, join_commit};
 
 const MAX_PENDING_INVITES: i64 = 32;
@@ -169,7 +168,7 @@ impl Store {
 
     /// Registers a manager-signed invite; registering the same record again is a no-op.
     pub fn register_invite(&self, record: &InviteRecord, issuer: &str) -> Result<String> {
-        record.verify().map_err(anyhow::Error::msg)?;
+        record.verify()?;
         ensure!(
             record.issuer == issuer,
             "invite signer differs from this session"
@@ -180,7 +179,7 @@ impl Store {
                 && record.expires_at_ms <= now + TICKET_LIFETIME_MS + CLOCK_SKEW_MS,
             "invalid invite expiry"
         );
-        let join_id = invite_id(&record.invite_hash).map_err(anyhow::Error::msg)?;
+        let join_id = invite_id(&record.invite_hash)?;
         self.transaction(|tx| {
             let view = load_state(tx)?.project()?;
             ensure!(record.network_id == view.network_id, "invite belongs to another network");
@@ -530,18 +529,6 @@ fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
         "invalid bootstrap capability"
     );
     Ok(())
-}
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
-pub fn random_hex(bytes: usize) -> String {
-    let mut data = vec![0_u8; bytes];
-    OsRng.fill_bytes(&mut data);
-    hex::encode(data)
 }
 
 #[cfg(test)]
