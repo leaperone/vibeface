@@ -1069,7 +1069,8 @@ def fixture_manager(arguments):
     initial = json.loads(sys.stdin.readline())
     require(initial["type"] == "init", "fixture receives sidecar initialization")
     prompt = initial["prompt"]
-    require("VIBEFACE_CODEX_SOCKET" in initial["tool_env"], "the coordination Agent's Shell reaches the App Server socket")
+    require({"VIBEFACE_CODEX_SOCKET", "VIBEFACE_DATA_DIR"} <= set(initial["tool_env"]),
+            "the coordination Agent's Shell reaches the App Server socket and the Node's send log")
     emit = lambda value: print(json.dumps(value), flush=True)
     native = initial.get("session_id") or "fixture-native-" + uuid.uuid4().hex
     emit({"type": "ready", "session_id": initial.get("session_id")})
@@ -1474,6 +1475,7 @@ def node_cli(node, *arguments, socket=None, check=True, timeout=60, stdin=None):
     if socket:
         environment["VIBEFACE_CODEX_SOCKET"] = str(socket)
     environment["VIBEFACE_TRIAGE_URL"] = f"http://127.0.0.1:{node.local_port}"
+    environment["VIBEFACE_DATA_DIR"] = str(node.directory)
     completed = subprocess.run([str(node.binary), *arguments], capture_output=True, text=True, timeout=timeout,
                                env=environment, input=stdin)
     require(not check or completed.returncode == 0, "vibeface " + " ".join(arguments[:2]) + " succeeds: " + completed.stderr[-400:])
@@ -1587,9 +1589,11 @@ def work_checks(run, workspace, a, network, passed):
                                 socket=socket_path).stdout)
     steers = [row for row in rpc("turn/steer") if row["message"]["params"]["threadId"] == running["thread_id"]]
     require(sent["delivery"]["status"] == "delivered" and sent["delivery"]["mode"] == "steer"
-            and again["delivery"] == {"status": "delivered", "mode": "existing", "turn_id": running["turn_id"]}
+            and again["delivery"] == sent["delivery"]
+            and "different message" in node_cli(a, "codex", "send", running["thread_id"], "换个说法", "--id", "steer-1",
+                                                socket=socket_path, check=False).stderr
             and len(steers) == 1 and steers[0]["message"]["params"]["expectedTurnId"] == running["turn_id"],
-            "codex send steers the running turn once; the same --id only reads back")
+            "codex send steers the running turn once; the same --id never sends again")
     listed = json.loads(node_cli(a, "codex", "call", "thread/list", "{}", socket=socket_path).stdout)
     models = json.loads(node_cli(a, "codex", "call", "model/list", socket=socket_path).stdout)
     renamed = node_cli(a, "codex", "call", "thread/name/set", json.dumps({"threadId": running["thread_id"], "name": "steered"}),
