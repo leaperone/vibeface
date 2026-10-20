@@ -12,6 +12,7 @@ import { ConfirmCard } from '@/features/workspace/task-activity'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
 import type { AssistantChangeRecord, ManagerJob, WorkRecord } from '@/features/workspace/types'
 import { placeChanges, routineName, routineTrigger } from '@/features/workspace/assistant'
+import { pendingChecks } from '@/features/workspace/model'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import { Message, type ChatMessage } from './elements/message'
@@ -35,7 +36,7 @@ export function ConversationScreen() {
   const text = drafts.get(conversationId) ?? ''
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
-  const pendingChecks = data?.pending_checks ?? []
+  const checks = pendingChecks(data)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
@@ -88,7 +89,7 @@ export function ConversationScreen() {
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
-  const needsConfirm = pendingChecks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
+  const needsConfirm = checks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p> })
 
@@ -104,7 +105,7 @@ export function ConversationScreen() {
     ownerAway && owner ? <ActionCard key="owner" icon={ArrowRightLeft} title={`${nodeName(owner, lookup)} 离线了，这个对话在等它`} actions={
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
     }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
-    ...pendingChecks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
+    ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
@@ -184,7 +185,7 @@ type TaskRow = { id: string; state: string; device: string; summary: string; tri
 
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string; device: string; open: boolean }) {
-  const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'rejected'
+  const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'rejected' || task.state === 'dispatch_rejected'
   const result = (task.work.result_text || task.work.failure_reason || '').split('\n')[0]
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.

@@ -73,7 +73,7 @@ const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "需要确认", unknown: "需要确认", starting: "准备中", finished: "已完成", unverified: "需要确认",
-  abandoned: "已放弃、未执行", waiting_for_device: "等设备接收", rejected: "未接收", stop_waiting: "已请求、等待设备确认", stop_unconfirmed: "设备没有确认停止",
+  abandoned: "已放弃、未执行", dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", stop_waiting: "已请求、等待设备确认", stop_timed_out: "设备没有确认停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 
@@ -86,5 +86,5 @@ export const progressLabel = (status: string) => progressStates[status] ?? (/[\u
 
 /** A finished work reads as its outcome; a stop sent to an unreachable device reads as that request. */
 export const shownState = (work: Pick<WorkRecord, "state" | "outcome" | "stop">) =>
-  work.outcome ?? (work.stop ? work.stop.timed_out ? "stop_unconfirmed" : "stop_waiting" : work.state ?? "accepted")
-export const taskActive = (state: string) => ["accepted", "starting", "running", "interrupting", "waiting_for_device", "stop_waiting", "stop_unconfirmed"].includes(state)
+  work.outcome ?? work.stop ?? work.state
+export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)

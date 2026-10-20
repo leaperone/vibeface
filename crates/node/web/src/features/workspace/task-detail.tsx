@@ -7,7 +7,7 @@ import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "./context"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "./labels"
 
-const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["unverified", "stop_unconfirmed"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["unverified", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 /** /b/:botId/work/:workId — desktop side panel beside the chat, full screen on phones. */
 export function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
@@ -20,7 +20,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   const device = work?.target_node ?? ""
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
   // Any entry forwards the stop; an unreachable device gets it when it is back.
-  const canStop = work && !work.outcome && !work.stop && ["accepted", "starting", "running"].includes(work.state ?? "")
+  const canStop = work && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
   const navigate = useNavigate()
   const close = () => void navigate({ to: "/b/$botId", params: { botId } })
   useEffect(() => {
@@ -49,7 +49,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
         <InlineError error={action.error} />
       </div> : null}
       <Details>
-        <DetailRow label="交代的事" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} />
+        {work.prompt ? <DetailRow label="交代的事" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} /> : null}
         <DetailRow label="任务编号" value={work.work_id} mono />
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
         {device ? <DetailRow label="设备编号" value={device} mono /> : null}

@@ -12,7 +12,7 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseAlerts, parseDecision,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseAlerts, parseDecision, pendingChecks,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
@@ -266,7 +266,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
     if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
-    if (item.method === "resolve") return !context.pending_checks.some((check) => check.check_id === item.params.check_id)
+    if (item.method === "resolve") return !pendingChecks(context).some((check) => check.check_id === item.params.check_id)
     return true
   }
   /** After a (re)connection: confirm what the entry has, resubmit the rest byte for byte, stop at an unknown. */
@@ -511,7 +511,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
       const work = context.works.find((item) => item.work_id === workId)
-      if (!work || work.outcome || !["accepted", "starting", "running"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
+      if (!work || work.outcome || !["accepted", "running"].includes(work.state)) throw new Error("这个任务现在停不了，请再查一次。")
       let receipt: Record<string, unknown>
       try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
       catch (caught) { requireControlRefresh(); throw caught }
@@ -539,28 +539,23 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireCurrent()
       await refreshRef.current()
     }),
-    reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.check_id}`, async () => {
-      const id = activeId.current
-      requireBotContext(id)
-      const result = record(await connection.rpc("reconcile", { conversation_id: id, check_id: check.check_id }))
-      requireCurrent()
-      if (activeId.current === id) await refreshRef.current()
-      return result
-    }),
-    /** A task check records the user's signed choice; a reply check keeps the written evidence. */
-    resolveCheck: (check: PendingCheck, choice: "completed" | "interrupted", note: string) => withMutation(`pending-check:${check.check_id}`, async () => {
+    /** An unverified work: the person's signed choice settles it. */
+    resolveCheck: (check: Extract<PendingCheck, { kind: "work" }>, choice: "completed" | "interrupted", note: string) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
       const text = note.trim()
-      if (check.work_id) {
-        if (new TextEncoder().encode(text).length > 4096) throw new Error("备注太长了。")
-        const attestation = await attest(id, { type: "work_finished", work_id: check.work_id, outcome: choice, result_text: text })
-        try { await signedWrite("resolve", check.check_id, "resolve", { conversation_id: id, check_id: check.check_id, outcome: choice, note: text, attestation }) }
-        catch (caught) { requireControlRefresh(); throw caught }
-      } else {
-        const evidence = `${choice === "completed" ? "用户确认已完成" : "用户确认没做完"}${text ? `：${text}` : "。"}`
-        await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id, evidence })
-      }
+      if (new TextEncoder().encode(text).length > 4096) throw new Error("备注太长了。")
+      const attestation = await attest(id, { type: "work_finished", work_id: check.work_id, outcome: choice, result_text: text })
+      try { await signedWrite("resolve", check.check_id, "resolve", { conversation_id: id, check_id: check.check_id, outcome: choice, note: text, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    /** A coordination process still alive: the person confirms it has stopped. */
+    confirmStopped: (check: Extract<PendingCheck, { kind: "process" }>) => withMutation(`pending-check:${check.check_id}`, async () => {
+      const id = activeId.current
+      requireBotContext(id)
+      await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id })
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),

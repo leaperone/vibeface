@@ -2,7 +2,7 @@ import type { TranscriptMessage } from "../chat/types"
 import type { ReplyStatus } from "../chat/types"
 import type {
   Alert, ConversationPayload, ConversationSummary, DecisionResult, NodeInfo, NotificationRecord, Outlet, Severity, TriageSettings,
-  SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
+  SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit,
 } from "./types"
 
@@ -73,10 +73,9 @@ function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
   return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
 }
-function workState(value: unknown): WorkState | null {
+function workState(value: unknown): WorkState {
   switch (value) {
-    case undefined: case null: return null
-    case "accepted": case "starting": case "running": case "interrupting": case "finished": case "unverified": case "waiting_for_device": case "rejected": return value
+    case "accepted": case "running": case "interrupting": case "finished": case "unverified": return value
     default: throw new Error("任务状态无法识别。")
   }
 }
@@ -93,13 +92,33 @@ function work(value: unknown): WorkRecord {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
     failure_reason: data.failure_reason == null ? null : text(data.failure_reason),
-    ...(data.stop == null ? {} : { stop: { waiting_for_device: flag(record(data.stop).waiting_for_device), timed_out: flag(record(data.stop).timed_out) } }),
   }
 }
-function pendingCheck(value: unknown): PendingCheck {
-  const data = record(value), kind = data.kind
-  if (kind !== "manager_process" && kind !== "work") throw new Error("需要确认的事项无法识别。")
-  return { check_id: text(data.check_id), kind, detail: text(data.detail), process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number), ...(kind === "work" ? { work_id: text(data.work_id), target_node: text(data.target_node) } : {}) }
+/** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
+function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
+  const rows = [...works]
+  for (const item of list(value)) {
+    const data = record(item), state = data.state, work_id = text(data.work_id), target_node = text(data.target_node)
+    if (state === "dispatch_waiting" || state === "dispatch_rejected") {
+      rows.push({ work_id, trigger: "", target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: "", state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason) })
+    } else if (state === "stop_waiting" || state === "stop_timed_out") {
+      const index = rows.findIndex((row) => row.work_id === work_id)
+      if (index >= 0) rows[index] = { ...rows[index], stop: state }
+    } else throw new Error("送达状态无法识别。")
+  }
+  return rows
+}
+function coordinationCheck(value: unknown): CoordinationCheck {
+  const data = record(value)
+  return { check_id: text(data.check_id), conversation_id: text(data.conversation_id), trigger: text(data.trigger), attempt_id: text(data.attempt_id), detail: text(data.detail), process_groups: list(data.process_groups).map(number), created_at_ms: number(data.created_at_ms) }
+}
+/** One card per thing the person must settle: each unverified work, then each coordination process still alive. */
+export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"> | null | undefined): PendingCheck[] {
+  if (!data) return []
+  return [
+    ...data.works.filter((item) => item.state === "unverified").map((item): PendingCheck => ({ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node })),
+    ...data.checks.map((check): PendingCheck => ({ kind: "process", check_id: check.check_id, detail: check.detail })),
+  ]
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
   const data = record(value)
@@ -107,9 +126,9 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
   if (expectedId && owner?.conversation_id !== expectedId) throw new Error("设备返回了别的对话，已暂停。")
   return {
     conversation: owner, messages: list(data.messages).map(message),
-    works: list(data.works).map(work),
+    works: withDeliveries(list(data.works).map(work), data.deliveries),
     scheduler: schedulerSnapshot(data.scheduler),
-    pending_checks: list(data.pending_checks).map(pendingCheck),
+    checks: list(data.checks).map(coordinationCheck),
     local_node: text(data.local_node),
     changes: list(data.changes).map(changeRecord),
     assistant: assistantView(data.assistant),

@@ -72,7 +72,7 @@ export function TriageSettings() {
     <div className="grid gap-2">
       <p className="text-meta font-medium text-muted-foreground">按项目</p>
       {config.projects.length ? <ul className="grid gap-1">{config.projects.map((project) => <li key={project.prefix} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
-        <span className="min-w-0 flex-1 truncate font-mono text-meta" title={project.prefix}>{project.prefix}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-meta" title={project.prefix}>{project.prefix.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || project.prefix}</span>
         <NativeSelect size="sm" aria-label={`${project.prefix} 的去向`} value={project.outlet} disabled={Boolean(busy)}
           onChange={(event) => void save("projects", { projects: config.projects.map((item) => item.prefix === project.prefix ? { ...item, outlet: event.currentTarget.value as Outlet } : item) })}>
           {outlets.map(([value, text]) => <NativeSelectOption key={value} value={value}>{text}</NativeSelectOption>)}

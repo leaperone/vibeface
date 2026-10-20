@@ -29,7 +29,6 @@ const patterns: [RegExp, string][] = [
   [/conversation not found/i, '这台设备上还没有这个对话，可能还在同步。'],
   [/work not found|no work was dispatched/i, '找不到这个任务，可能还在同步。'],
   [/pending check not found|only unverified work/i, '这项确认已处理或不存在。'],
-  [/evidence must be|evidence is required/i, '说明需要 12 到 4096 字节。'],
   [/scheduler inbox is full/i, '排队的消息太多，这条没有收下。请稍后再发。'],
   [/attachment|blob/i, '附件还没同步到这台设备，或校验没通过。'],
   [/artifact/i, '这个产物现在读不了。'],
