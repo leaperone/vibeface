@@ -22,9 +22,9 @@ export function useInbox(): InboxItem[] {
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   const write = workspace.writeState
-  if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这个设备的数据是从备份恢复的吗？", to: "/inbox", kind: "write", write: "read_only" })
-  if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据有两份副本", to: "/inbox", kind: "write", write: "forked" })
-  else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据有两份副本", to: "/inbox", kind: "write", write: "conflicts" })
+  if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这台设备暂时只读", to: "/inbox", kind: "write", write: "read_only" })
+  if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
+  else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
   for (const alert of workspace.alerts) if (alert.resolution === null) items.push({ key: `alert:${alert.alert_id}`, icon: BellRing, title: alert.summary, to: "/inbox", kind: "alert", alert })
   const checks = pendingChecks(data).length
   if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })

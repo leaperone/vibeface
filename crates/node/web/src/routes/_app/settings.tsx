@@ -21,7 +21,7 @@ function SettingsPage() {
   return <div className="mx-auto grid max-w-2xl gap-6">
     <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><Bell aria-hidden="true" className="size-5" />提醒</h2>
-      <Button type="button" variant="secondary" className="w-fit" disabled={workspace.notificationButton.disabled} onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications()) }}>{workspace.notificationButton.label}</Button>
+      <Button type="button" variant="secondary" className="w-fit" disabled={workspace.notificationButton.disabled} onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>
     </section>
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><BellRing aria-hidden="true" className="size-5" />会话提醒</h2>
@@ -44,7 +44,7 @@ function SettingsPage() {
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><LifeBuoy aria-hidden="true" className="size-5" />排障</h2>
       <p className="text-muted-foreground">诊断包里没有密钥和邀请，可以发给帮你排查的人。</p>
-      <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics())) }}><Download aria-hidden="true" />导出诊断包</Button>
+      <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics()), "导出诊断包") }}><Download aria-hidden="true" />导出诊断包</Button>
     </section> : null}
     <section className="grid gap-3 border-t pt-6">
       {leaving ? <>

@@ -1,12 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react"
-import { Link } from "@tanstack/react-router"
-import { Bot, ChevronRight, Crown, Globe, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { Link, useNavigate } from "@tanstack/react-router"
+import { Bot, ChevronRight, Copy, Crown, Globe, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Details, DetailRow, EmptyState, InlineError, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "@/features/workspace/context"
 import { isLoopback } from "@/features/workspace/labels"
+import { terms } from "@/lib/glossary"
 import { docs } from "./assistant-settings"
 import type { NodeInfo } from "@/features/workspace/types"
 import type { Member } from "@/lib/node"
@@ -100,9 +101,13 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const { ready } = device
   const rows = useDeviceRows()
   const entryLabel = useEntryLabel()
+  const { writeState } = useWorkspace()
+  const navigate = useNavigate()
   const action = useAction()
   const [removing, setRemoving] = useState(false)
   const row = rows.find((item) => item.id === deviceId)
+  const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
+  const RemoveIcon = terms.remove.icon
   const canManage = ready?.principal.can_manage === true
   const localSession = ready?.principal.source === "local_session"
   if (!row) return device.directory ? <EmptyState icon={MonitorSmartphone} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-3xl gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
@@ -122,6 +127,11 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         {row.online === false ? <p className="text-meta text-muted-foreground">确认它开着，并且和这台设备网络互通</p> : null}
       </div>
     </header>
+
+    {copied ? <p className="flex items-start gap-2 rounded-xl border border-warning-border bg-warning-soft p-3 text-warning">
+      <Copy aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+      <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。请用管理设备移除它，再重新加入。"}</span>
+    </p> : null}
 
     {row.kind === "node" ? <Section icon={Bot} title="助手">
       {row.entry && (canManage || localSession) ? <AssistantSettings /> : <div className="grid gap-1">
@@ -155,12 +165,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <p>移除后这台设备无法再连接，已有的对话记录会保留。</p>
         <div className="flex flex-wrap justify-end gap-2">
           <Button type="button" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
-          <Button type="button" variant="destructive" disabled={action.busy !== null} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); setRemoving(false); toast("已移除", { tone: "success" }) })}>
-            {action.busy === "remove" ? "移除中" : "移除设备"}
+          <Button type="button" variant="destructive" disabled={action.busy !== null} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
+            <RemoveIcon aria-hidden="true" />{action.busy === "remove" ? "移除中" : "移除设备"}
           </Button>
         </div>
         {action.errorKey === "remove" ? <InlineError error={action.error} /> : null}
-      </> : <Button type="button" variant="ghost" className="w-fit text-danger" onClick={() => setRemoving(true)}>移除设备</Button>}
+      </> : <Button type="button" variant="ghost" className="w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button>}
     </section> : null}
   </div>
 }

@@ -10,6 +10,8 @@ import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice } from './context'
 
 function field(form: HTMLFormElement, name: string) { const element = form.elements.namedItem(name); return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : '' }
+/** A failed try keeps the chosen file and name; only typed passwords leave the page. */
+function clearPasswords(form: HTMLFormElement) { for (const input of form.querySelectorAll<HTMLInputElement>('input[type=password]')) input.value = '' }
 function fileOf(form: HTMLFormElement) { const element = form.elements.namedItem('bundle'); const file = element instanceof HTMLInputElement ? element.files?.[0] : null; if (!file) throw new Error('请选择恢复文件。'); return file }
 const Label = ({ label, children }: { label: string; children: ReactNode }) => <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 
@@ -99,7 +101,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         void run(async () => {
           let work: Promise<void>
           try { work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) }) }
-          finally { form.reset() }
+          finally { clearPasswords(form) }
           await work
         })
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
@@ -121,7 +123,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         void run(async () => {
           let work: Promise<void>
           try { work = device.reencrypt({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password'), field(form, 'confirmation')) }) }
-          finally { form.reset() }
+          finally { clearPasswords(form) }
           await work
         }, '新的恢复文件已下载')
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">

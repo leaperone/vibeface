@@ -398,7 +398,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                         epoch,
                     },
                 };
-                progress(record, WorkPhase::Running, "执行已重新接管")
+                progress(record, WorkPhase::Running, "设备重启后已继续跟进")
             }
             Probe::Terminal {
                 turn_id,
@@ -439,7 +439,8 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 record.state = Running {
                     handle: Handle { epoch, ..handle },
                 };
-                was_unverified.then(|| progress(record, WorkPhase::Running, "执行已重新接管"))?
+                was_unverified
+                    .then(|| progress(record, WorkPhase::Running, "设备重启后已继续跟进"))?
             }
             Probe::Terminal {
                 turn_id,
