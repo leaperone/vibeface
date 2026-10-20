@@ -21,7 +21,8 @@ use std::{
 use tokio::net::TcpListener;
 
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
+/// The Cursor SDK posts tool calls to this path; `vibeface tool` posts the same shape.
+pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 const MAX_CLIENT_SOCKETS: usize = 256;
 const HOOKS: &str = "/api/hooks";
 const TRIAGE: &str = "/api/triage";
@@ -180,12 +181,8 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App::new(node, vec![site]);
     Router::new()
-        .route("/api/tools", post(tool))
-        .route(
-            CALLBACK,
-            post(tool_callback).layer(DefaultBodyLimit::max(MAX_BODY_BYTES / 2)),
-        )
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .route(TOOL_PATH, post(tool))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES / 2))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
         .with_state(app)
 }
@@ -339,10 +336,7 @@ async fn check_boundary(
                 "application/json required".into(),
             ));
         }
-        let is_tool = path == "/api/tools"
-            || path == CALLBACK
-            || path == "/api/local/launch"
-            || path == "/api/decision";
+        let is_tool = path == TOOL_PATH || path == "/api/local/launch" || path == "/api/decision";
         let bearer_call = (is_tool && bearer(headers).is_some()) || path == HOOKS || path == TRIAGE;
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
@@ -667,28 +661,6 @@ async fn local_setup(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolRequest {
-    name: String,
-    arguments: Value,
-}
-
-async fn tool(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Json(input): Json<ToolRequest>,
-) -> ApiResult<Json<Value>> {
-    let access = bearer_access(&app, &headers).await?;
-    validate_tool_call(&input.name)?;
-    Ok(Json(
-        app.node
-            .tool(access, &input.name, input.arguments)
-            .await
-            .map_err(ApiError::bad)?,
-    ))
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolCallback {
     tool_name: String,
@@ -696,7 +668,7 @@ struct ToolCallback {
     agent_id: String,
 }
 
-async fn tool_callback(
+async fn tool(
     State(app): State<App>,
     headers: HeaderMap,
     Json(input): Json<ToolCallback>,
@@ -707,20 +679,12 @@ async fn tool_callback(
             "args must be an object and agentId must be nonempty and bounded",
         ));
     }
-    validate_tool_call(&input.tool_name)?;
     let result = app
         .node
         .tool(access, &input.tool_name, input.args)
         .await
         .map_err(ApiError::bad)?;
     Ok(Json(json!({"result": result})))
-}
-
-fn validate_tool_call(name: &str) -> ApiResult<()> {
-    if name.is_empty() || name.len() > 128 {
-        return Err(ApiError::bad("tool name must be nonempty and bounded"));
-    }
-    Ok(())
 }
 
 async fn hooks(
@@ -981,7 +945,6 @@ mod tests {
             config::{self, Config},
             crypto::LocalIdentity,
             identity::{Genesis, Member, NetworkState},
-            model::NodeRole,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -991,10 +954,12 @@ mod tests {
             .join("../../.artifacts")
             .join(format!("local-setup-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
-        let mut config = Config::local(address, vec![], false);
-        config.roles = vec![NodeRole::Relay];
+        let config = Config::local(address, vec![], false);
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -1084,7 +1049,10 @@ mod tests {
             .join(format!("hook-boundary-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
@@ -1179,7 +1147,5 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
-        assert!(validate_tool_call("dispatch_work").is_ok());
-        assert!(validate_tool_call("").is_err());
     }
 }

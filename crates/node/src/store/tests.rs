@@ -463,7 +463,7 @@ fn the_same_message_id_queues_one_job() -> Result<()> {
             )
             .is_err()
     );
-    assert_eq!(store.scheduler_jobs(&net.network, "c")?.len(), 1);
+    assert_eq!(store.scheduler_jobs("c")?.len(), 1);
     assert_eq!(store.messages(&net.network, "c")?.len(), 1);
     Ok(())
 }
@@ -499,7 +499,7 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
         .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-    store.mark_started(&net.network, "c", &claimed.job.trigger, &attempt)?;
+    store.mark_started("c", &claimed.job.trigger, &attempt)?;
     store.request_manager_cancel(&net.a, &net.network, "c", &claimed.job.trigger)?;
     store.finish_job(
         &net.a,
@@ -527,17 +527,17 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
         .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-    store.mark_started(&net.network, "c", &claimed.job.trigger, &attempt)?;
+    store.mark_started("c", &claimed.job.trigger, &attempt)?;
     // The Node restarts mid-turn: the reply is recorded as interrupted and the process awaits a check.
     store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
     let reply = store
         .message(&net.network, "c", &claimed.job.message_id)?
         .context("reply")?;
     assert_eq!(reply.status, Some(ReplyStatus::Interrupted));
-    assert_eq!(store.pending_checks(&net.network)?.len(), 1);
+    assert_eq!(store.pending_checks()?.len(), 1);
     assert!(matches!(
         store
-            .scheduler_job(&net.network, "c", &message_trigger("m2"))?
+            .scheduler_job("c", &message_trigger("m2"))?
             .context("job")?
             .state,
         JobState::Interrupted { .. }
@@ -566,7 +566,6 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         work_id: WorkSpec::id("c", &trigger, "call-1"),
         conversation: "c".into(),
         trigger: trigger.clone(),
-        attempt: "attempt".into(),
         target: net.a.device_id()?,
         dispatcher: net.a.device_id()?,
         call_ref: "call-1".into(),
@@ -611,7 +610,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
     )?;
     assert!(receipt.is_some());
     let job = store
-        .scheduler_job(&net.network, "c", &work_trigger(&id))?
+        .scheduler_job("c", &work_trigger(&id))?
         .context("result job")?;
     assert_eq!(
         (job.kind, job.reply_to.as_str()),
@@ -649,7 +648,6 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             work_id: WorkSpec::id("c", &trigger, call),
             conversation: "c".into(),
             trigger: trigger.clone(),
-            attempt: "attempt".into(),
             target: target.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: call.into(),
@@ -758,7 +756,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
     );
     assert!(
         store
-            .work_record(&net.network, &local.work_id)?
+            .work_record(&local.work_id)?
             .context("record")?
             .state
             .finished()
@@ -882,8 +880,8 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
             .is_none()
     );
     let trigger = message_trigger("m1");
-    assert!(store.scheduler_job(&net.network, "c", &trigger)?.is_none());
-    let outbox = store.scheduler_outbox(&net.network)?;
+    assert!(store.scheduler_job("c", &trigger)?.is_none());
+    let outbox = store.scheduler_outbox()?;
     assert_eq!(
         outbox.iter().map(|e| e.trigger.clone()).collect::<Vec<_>>(),
         vec![trigger]
@@ -1255,10 +1253,7 @@ fn a_routine_runs_its_latest_time_once() -> Result<()> {
             .is_none()
     );
     assert!(matches!(
-        store
-            .scheduler_job(&net.network, "c", &next[0].1)?
-            .context("job")?
-            .state,
+        store.scheduler_job("c", &next[0].1)?.context("job")?.state,
         JobState::Cancelled { .. }
     ));
     assert!(
@@ -1284,7 +1279,6 @@ fn append_path_uses_indexes_only() -> Result<()> {
         "SELECT 1 FROM log_conflicts WHERE network_id=?1 AND hash=?2",
         "SELECT hash FROM events WHERE network_id=?1 AND author=?2 AND seq=1",
         "SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id='c' AND message_id=?2",
-        "SELECT value FROM local_values WHERE network_id=?1 AND key>=?2 AND key<'z'",
     ];
     for sql in statements {
         let mut plan = store

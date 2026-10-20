@@ -5,8 +5,7 @@ import { humanError } from './errors'
 export type ConnectionEntry = { address: string; device_id: string; local?: boolean }
 export type PublicIdentity = { deviceId: string }
 export type ClientPrincipal = { network_id: string; device_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
-export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
-export type EntryInfo = { device_id: string; name: string; version: string; roles: NodeRole[]; initialized: boolean; network_id: string | null; connection_entry?: ConnectionEntry }
+export type EntryInfo = { device_id: string; name: string; version: string; initialized: boolean; network_id: string | null; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
   readonly generation: number
   entry: ConnectionEntry
@@ -34,7 +33,7 @@ export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type NodeSettingsResponse = {
   settings: NodeSettings
   defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin' | 'node_bin' | 'codex_sdk_script'>
-  readiness: { manager: 'disabled' | 'role_unavailable' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[]; scheduler_available: boolean }
+  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[] }
 }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -50,9 +49,6 @@ export function boolean(value: unknown): boolean { if (typeof value !== 'boolean
 export function integer(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
 export function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
 export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
-export function roles(value: unknown): NodeRole[] {
-  return strings(value).map(role => { switch (role) { case 'gateway': case 'relay': case 'replica': case 'scheduler': return role; default: throw new Error('设备返回了无法识别的能力。') } })
-}
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')
   const entry = { address: validEndpoint(text(v.address)), device_id: validTarget(v.device_id) }
@@ -67,7 +63,7 @@ export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
   const initialized = boolean(v.initialized)
   return {
-    device_id: validTarget(v.device_id), name: text(v.name), version: text(v.version), roles: roles(v.roles), initialized,
+    device_id: validTarget(v.device_id), name: text(v.name), version: text(v.version), initialized,
     network_id: initialized ? validTarget(v.network_id) : null,
     ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }),
   }
@@ -136,11 +132,11 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('助手设置格式不对。')
     manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
   }
-  if (readiness.manager !== 'disabled' && readiness.manager !== 'role_unavailable' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
+  if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
     defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
-    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)), scheduler_available: boolean(readiness.scheduler_available) },
+    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)) },
   }
 }
 export function canonical(value: unknown): string {

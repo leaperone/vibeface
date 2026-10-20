@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod scheduling;
 pub mod store;
+pub mod tools;
 pub mod triage;
 pub mod update;
 pub mod work;

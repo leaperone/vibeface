@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
@@ -26,7 +26,7 @@ mod tests;
 pub(crate) mod work;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;
 
 /// Whether this Node may append to its own log (design 5.7 and 5.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -180,7 +180,7 @@ impl Store {
             blob_dir: blob_dir_for(path),
             process_lock: None,
         };
-        for network in store.networks()? {
+        if let Some(network) = store.network()? {
             store
                 .trust_bundle(&network)?
                 .context("membership is missing")?
@@ -525,19 +525,6 @@ impl Store {
         })
         .collect()
     }
-    pub fn local_value(&self, network_id: &str, key: &str) -> Result<Option<Value>> {
-        local_load(&self.connection, network_id, key)
-    }
-    pub fn local_set(&mut self, network_id: &str, key: &str, value: &Value) -> Result<()> {
-        local_save(&self.connection, network_id, key, value)
-    }
-    pub fn local_delete(&mut self, network_id: &str, key: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM local_values WHERE network_id=? AND key=?",
-            params![network_id, key],
-        )?;
-        Ok(())
-    }
     pub fn pending_notifications(
         &self,
         network_id: &str,
@@ -556,31 +543,8 @@ impl Store {
             .map(|row| Ok(row?))
             .collect()
     }
-    pub fn budget_usage(&self, network_id: &str, day: &str, limit: u64) -> Result<BudgetUsage> {
-        validate_day(day)?;
-        let used = self
-            .connection
-            .query_row(
-                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
-                params![network_id, day],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        Ok(BudgetUsage {
-            day: day.into(),
-            used,
-            limit,
-        })
-    }
-    pub fn reserve_budget(
-        &mut self,
-        network_id: &str,
-        day: &str,
-        units: u64,
-        limit: u64,
-    ) -> Result<BudgetUsage> {
-        validate_day(day)?;
+    /// Counts one more model run against today's UTC limit, or refuses it.
+    pub fn reserve_budget(&mut self, network_id: &str, units: u64, limit: u64) -> Result<()> {
         ensure!(
             units > 0 && limit <= i64::MAX as u64,
             "invalid budget units/limit"
@@ -588,31 +552,23 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let used: u64 = tx
-            .query_row(
-                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
-                params![network_id, day],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
+        let (day, used): (String, u64) = tx.query_row(
+            "SELECT date('now'), COALESCE((SELECT used FROM budget_days WHERE network_id=?1 AND day=date('now')), 0)",
+            [network_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let next = used.checked_add(units).context("budget overflow")?;
         ensure!(next <= limit, "daily model budget exhausted");
         tx.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",params![network_id,day,next])?;
         tx.commit()?;
-        Ok(BudgetUsage {
-            day: day.into(),
-            used: next,
-            limit,
-        })
+        Ok(())
     }
-    pub fn networks(&self) -> Result<Vec<NetworkId>> {
-        let mut statement = self
+    /// A Node belongs to at most one network.
+    pub fn network(&self) -> Result<Option<NetworkId>> {
+        Ok(self
             .connection
-            .prepare("SELECT network_id FROM networks ORDER BY network_id")?;
-        Ok(statement
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .query_row("SELECT network_id FROM networks", [], |r| r.get(0))
+            .optional()?)
     }
     pub fn scopes(&self, network_id: &str) -> Result<Vec<ScopeId>> {
         let mut statement = self.connection.prepare(
@@ -771,47 +727,6 @@ pub(crate) fn message_from(
         .transpose()
 }
 
-pub(crate) fn local_load<T: DeserializeOwned>(
-    connection: &Connection,
-    network: &str,
-    key: &str,
-) -> Result<Option<T>> {
-    optional_json(
-        connection
-            .query_row(
-                "SELECT value FROM local_values WHERE network_id=? AND key=?",
-                params![network, key],
-                |r| r.get(0),
-            )
-            .optional()?,
-    )
-}
-
-pub(crate) fn local_save(
-    connection: &Connection,
-    network: &str,
-    key: &str,
-    value: &impl serde::Serialize,
-) -> Result<()> {
-    connection.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value", params![network,key,serde_json::to_string(value)?])?;
-    Ok(())
-}
-
-/// Values whose key starts with `prefix`, through an index range rather than a table scan.
-pub(crate) fn local_prefix<T: DeserializeOwned>(
-    connection: &Connection,
-    network: &str,
-    prefix: &str,
-) -> Result<Vec<T>> {
-    let mut end = prefix.to_owned();
-    end.push(char::MAX);
-    let mut statement = connection.prepare(
-        "SELECT value FROM local_values WHERE network_id=? AND key>=? AND key<? ORDER BY key",
-    )?;
-    let rows = statement.query_map(params![network, prefix, end], |r| r.get::<_, String>(0))?;
-    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
-}
-
 pub(crate) fn membership_from(
     connection: &Connection,
     network_id: &str,
@@ -840,21 +755,20 @@ pub(crate) fn authorize_node_from(
     membership_from(connection, network_id)?.node(device_id)
 }
 
-fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {
-    value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
+/// A unit enum's serde name, for a text column.
+pub(crate) fn enum_text<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(text)) => text,
+        _ => unreachable!("a unit enum serializes to a string"),
+    }
 }
 
-fn validate_day(day: &str) -> Result<()> {
-    ensure!(
-        day.len() == 10
-            && day.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 {
-                b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }),
-        "day must be YYYY-MM-DD"
-    );
-    Ok(())
+pub(crate) fn enum_from<T: DeserializeOwned>(text: &str) -> Result<T> {
+    Ok(serde_json::from_value(Value::String(text.into()))?)
+}
+
+fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {
+    value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
 }
 
 pub(crate) fn context_from(

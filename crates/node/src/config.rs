@@ -1,13 +1,17 @@
-use crate::{
-    crypto::LocalIdentity,
-    model::{NodeRole, validate_role_dependencies},
-};
+use crate::crypto::LocalIdentity;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
+
+/// Bumped whenever stored data stops being readable by the previous build.
+pub const DATA_EPOCH: u32 = 8;
+
+pub fn data_epoch_marker() -> Vec<u8> {
+    format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
+}
 
 pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
@@ -37,7 +41,6 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
     pub local_auto_access: bool,
-    pub roles: Vec<NodeRole>,
     /// Serves only the web app, the relay and ciphertext forwarding; never joins a network.
     pub public_entry: bool,
     pub roots: Vec<PathBuf>,
@@ -54,7 +57,7 @@ pub struct Config {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
-    pub provider: String,
+    pub provider: crate::manager::ManagerKind,
     pub workspace: PathBuf,
     pub model: String,
     pub cursor_sdk_bin: PathBuf,
@@ -70,12 +73,6 @@ impl Config {
             allowed_origins: vec![],
             allow_insecure_lan,
             local_auto_access: true,
-            roles: vec![
-                NodeRole::Gateway,
-                NodeRole::Relay,
-                NodeRole::Replica,
-                NodeRole::Scheduler,
-            ],
             public_entry: false,
             roots,
             network: crate::net::NetworkConfig::default(),
@@ -93,7 +90,6 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
-        validate_role_dependencies(&self.roles)?;
         self.network.validate()?;
         let url = http_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
@@ -135,10 +131,6 @@ impl Config {
         }
         self.triage.validate()?;
         if let Some(m) = &self.manager {
-            ensure!(
-                matches!(m.provider.as_str(), "cursor_sdk" | "codex_sdk"),
-                "unknown manager provider"
-            );
             ensure!(m.workspace.is_dir(), "manager workspace does not exist");
         }
         Ok(())
@@ -324,28 +316,5 @@ mod tests {
                 .unwrap()
                 .contains(&"http://localhost:4790".into())
         );
-    }
-
-    #[test]
-    fn business_roles_require_replica() {
-        let mut config = Config::local("127.0.0.1:0".parse().unwrap(), vec![], false);
-        assert!(config.validate().is_ok());
-        for roles in [
-            vec![NodeRole::Relay],
-            vec![NodeRole::Replica],
-            vec![NodeRole::Relay, NodeRole::Replica],
-            vec![NodeRole::Gateway, NodeRole::Relay, NodeRole::Replica],
-            vec![NodeRole::Scheduler, NodeRole::Replica],
-        ] {
-            config.roles = roles;
-            assert!(config.validate().is_ok());
-        }
-        for role in [NodeRole::Gateway, NodeRole::Scheduler] {
-            config.roles = vec![role, NodeRole::Relay];
-            assert_eq!(
-                config.validate().unwrap_err().to_string(),
-                "gateway and scheduler roles require replica"
-            );
-        }
     }
 }

@@ -290,6 +290,9 @@ pub(crate) fn works_from(
             cwd,
             title,
             prompt,
+            call_ref,
+            continues,
+            parent,
             ..
         } = serde_json::from_str(&dispatch)?
         else {
@@ -319,6 +322,9 @@ pub(crate) fn works_from(
             cwd,
             title,
             prompt,
+            call_ref,
+            continues,
+            parent,
             phase,
             summary,
             thread_id,
@@ -326,6 +332,7 @@ pub(crate) fn works_from(
             outcome,
             result_text,
             failure_reason,
+            state: WorkStatus::of(kind, phase, outcome),
         });
     }
     Ok(works)

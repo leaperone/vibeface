@@ -576,7 +576,7 @@ async fn dispatch(
                 false => None,
             };
             Ok(
-                json!({"initialized":network_id.is_some(),"network_id":network_id,"device_id":node.identity.device_id()?,"name":crate::config::hostname(),"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
+                json!({"initialized":network_id.is_some(),"network_id":network_id,"device_id":node.identity.device_id()?,"name":crate::config::hostname(),"public_entry":node.config.public_entry,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
             )
         }
         "authenticate" => {
@@ -775,12 +775,7 @@ async fn dispatch(
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
-                result["addresses"] = json!(
-                    node.store
-                        .lock()
-                        .await
-                        .address_book(&state.genesis.network_id)?
-                );
+                result["addresses"] = json!(node.store.lock().await.address_book()?);
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
@@ -1329,19 +1324,18 @@ mod tests {
     #[tokio::test]
     async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
     -> Result<()> {
-        use crate::{
-            config::{self, Config, ManagerSettings},
-            model::NodeRole,
-        };
+        use crate::config::{self, Config, ManagerSettings};
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
-        config.roles = vec![NodeRole::Relay, NodeRole::Replica, NodeRole::Scheduler];
         config.codex_socket = Some(dir.join("unavailable-codex.sock"));
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -1423,7 +1417,7 @@ mod tests {
         let settings = crate::runtime::NodeSettings {
             roots: vec![project.clone(), project.join(".")],
             manager: Some(ManagerSettings {
-                provider: "cursor_sdk".into(),
+                provider: crate::manager::ManagerKind::CursorSdk,
                 workspace: workspace.clone(),
                 model: "auto".into(),
                 cursor_sdk_bin: dir.join("missing-cursor-sdk"),
@@ -1467,7 +1461,6 @@ mod tests {
         assert!(workspace.is_dir());
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
         assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
-        assert_eq!(saved["readiness"]["scheduler_available"], true);
         assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
         assert_eq!(node.info()["manager_available"], true);
         let nodes = node
@@ -1500,7 +1493,7 @@ mod tests {
             saved["settings"]
         );
         let mut codex_settings = settings.clone();
-        codex_settings.manager.as_mut().unwrap().provider = "codex_sdk".into();
+        codex_settings.manager.as_mut().unwrap().provider = crate::manager::ManagerKind::CodexSdk;
         dispatch(
             &node,
             &mut manager_session,
@@ -1522,16 +1515,6 @@ mod tests {
             saved["settings"]
         );
         drop(reopened);
-        let mut restricted = Config::load(&dir)?;
-        restricted.roles = vec![NodeRole::Relay, NodeRole::Replica];
-        restricted.save(&dir)?;
-        let restricted = Runtime::open(&dir).await?;
-        assert_eq!(
-            restricted.node_settings().await?["readiness"]["manager"],
-            "role_unavailable"
-        );
-        assert_eq!(restricted.info()["manager_available"], false);
-        drop(restricted);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1569,7 +1552,10 @@ mod tests {
                 &dir.join("identity.json"),
                 &serde_json::to_vec(&LocalIdentity::generate())?,
             )?;
-            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+            crate::config::private_write(
+                &dir.join("data-epoch.json"),
+                &crate::config::data_epoch_marker(),
+            )?;
             let node = Arc::new(Runtime::open(dir).await?);
             let root = LocalIdentity::generate();
             node.install_membership(NetworkState::new(Genesis::create(
@@ -1778,7 +1764,10 @@ mod tests {
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
-        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);

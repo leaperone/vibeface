@@ -4,6 +4,7 @@
 use super::Runtime;
 use crate::model::{ATTENTION_SCOPE, AlertResolution, EventBody};
 use anyhow::{Context as _, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -40,7 +41,6 @@ pub struct DecisionOutcome {
     pub delivery: Delivery,
 }
 
-#[derive(Deserialize, Serialize)]
 struct Journal {
     thread_id: String,
     text: String,
@@ -48,8 +48,42 @@ struct Journal {
     delivery: Option<Delivery>,
 }
 
-fn key(decision_id: &str) -> String {
-    format!("decision:v1:{decision_id}")
+fn load_journal(connection: &Connection, decision_id: &str) -> Result<Option<Journal>> {
+    let row = connection
+        .query_row(
+            "SELECT thread_id,text,delivery FROM decision_journal WHERE decision_id=?",
+            [decision_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(thread_id, text, delivery)| {
+        Ok(Journal {
+            thread_id,
+            text,
+            delivery: delivery.as_deref().map(serde_json::from_str).transpose()?,
+        })
+    })
+    .transpose()
+}
+
+fn save_journal(connection: &Connection, decision_id: &str, journal: &Journal) -> Result<()> {
+    connection.execute(
+        "INSERT INTO decision_journal(decision_id,thread_id,text,delivery) VALUES(?,?,?,?)
+         ON CONFLICT(decision_id) DO UPDATE SET thread_id=excluded.thread_id,text=excluded.text,delivery=excluded.delivery",
+        params![
+            decision_id,
+            journal.thread_id,
+            journal.text,
+            journal.delivery.as_ref().map(serde_json::to_string).transpose()?
+        ],
+    )?;
+    Ok(())
 }
 
 pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Result<DecisionOutcome> {
@@ -71,7 +105,7 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
         return serde_json::from_value(reply).context("the device returned no decision outcome");
     }
     let card = match &req.alert_id {
-        Some(alert_id) => rt.decision_card(&network, alert_id).await?,
+        Some(alert_id) => rt.decision_card(alert_id).await?,
         None => None,
     };
     // A choice on a card that holds an App Server request answers that request.
@@ -94,9 +128,8 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
         delivery,
     };
     {
-        let mut store = rt.store.lock().await;
-        if let Some(existing) = store.local_value(&network, &key(&req.decision_id))? {
-            let existing: Journal = serde_json::from_value(existing)?;
+        let store = rt.store.lock().await;
+        if let Some(existing) = load_journal(&store.connection, &req.decision_id)? {
             ensure!(
                 existing.thread_id == req.thread_id && existing.text == req.text,
                 "decision ID reused with a different message"
@@ -110,7 +143,7 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
                     drop(store);
                     let delivery = read_back(rt, &req).await;
                     if matches!(delivery, Delivery::Delivered { .. }) {
-                        record(rt, &network, &req, &delivery).await?;
+                        record(rt, &req, &delivery).await?;
                         resolve(rt, &network, &req).await;
                     }
                     return Ok(outcome(delivery));
@@ -124,7 +157,7 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
             text: req.text.clone(),
             delivery: None,
         };
-        store.local_set(&network, &key(&req.decision_id), &json!(journal))?;
+        save_journal(&store.connection, &req.decision_id, &journal)?;
     }
     let delivery = match answer {
         Some((request_id, reply)) => {
@@ -167,7 +200,7 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
             },
         },
     };
-    record(rt, &network, &req, &delivery).await?;
+    record(rt, &req, &delivery).await?;
     if matches!(delivery, Delivery::Delivered { .. }) {
         resolve(rt, &network, &req).await;
     }
@@ -218,22 +251,18 @@ async fn read_back(rt: &Arc<Runtime>, req: &DecisionRequest) -> Delivery {
     }
 }
 
-async fn record(
-    rt: &Arc<Runtime>,
-    network: &str,
-    req: &DecisionRequest,
-    delivery: &Delivery,
-) -> Result<()> {
+async fn record(rt: &Arc<Runtime>, req: &DecisionRequest, delivery: &Delivery) -> Result<()> {
     let journal = Journal {
         thread_id: req.thread_id.clone(),
         text: req.text.clone(),
         // An unknown send stays open so the next attempt only reads back.
         delivery: (!matches!(delivery, Delivery::Unknown { .. })).then(|| delivery.clone()),
     };
-    rt.store
-        .lock()
-        .await
-        .local_set(network, &key(&req.decision_id), &json!(journal))
+    save_journal(
+        &rt.store.lock().await.connection,
+        &req.decision_id,
+        &journal,
+    )
 }
 
 impl Runtime {

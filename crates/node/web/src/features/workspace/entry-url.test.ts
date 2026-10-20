@@ -8,14 +8,14 @@ import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
 import { nodeName } from "./labels.ts"
-import { inputText, parseAlerts, parseArtifactPage, parseConversation, parseDecision, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
+import { inputText, parseAlerts, parseArtifactPage, parseConversation, pendingChecks, parseDecision, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
 import { placeChanges, routineName, routineTrigger } from "./assistant.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], pending_checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] },
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] },
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
 })
@@ -27,13 +27,13 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
 })
 test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
-  assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
+  assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false }] }), "Mac Studio")
   assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [] } }), "工作机")
   assert.equal(nodeName(id), "另一台设备")
 })
 
 test("capabilities parse the actual provider name and reject malformed node lists", () => {
-  const nodes = parseNodes({ nodes: [{ device_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", roots: ["/project"] } }] })
+  const nodes = parseNodes({ nodes: [{ device_id: "n", name: "本机", local: true, online: true, revoked: false, capabilities: { manager: "cursor_agent", roots: ["/project"] } }] })
   assert.equal(nodes[0]?.name, "本机")
   assert.equal(nodes[0]?.capabilities?.manager, "cursor_agent")
   assert.throws(() => parseNodes({ nodes: [{ device_id: "n" }] }))
@@ -53,14 +53,26 @@ test("works, reply status and pending checks keep their exact shape", () => {
   for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
     assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome }] }).works[0].outcome, outcome)
   }
-  assert.equal(parseConversation({ ...context, works: [{ ...work, state: undefined }] }).works[0].state, null)
+  assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: undefined }] }), "a DAG work always has a state")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting" }] }))
+  assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_for_device" }] }), "undelivered dispatches arrive as deliveries")
   assert.throws(() => parseConversation({ ...context, messages: [{ ...message, status: "cancelled" }] }))
-  const check = { check_id: "manager:attempt", kind: "manager_process", detail: "进程退出未确认", process_groups: [42] }
-  assert.deepEqual(parseConversation({ ...context, pending_checks: [check] }).pending_checks, [check])
-  assert.deepEqual(parseConversation({ ...context, pending_checks: [{ check_id: "work:w", kind: "work", detail: "无法证明结果", work_id: "w", target_node: "worker" }] }).pending_checks[0], { check_id: "work:w", kind: "work", detail: "无法证明结果", process_groups: [], work_id: "w", target_node: "worker" })
-  assert.deepEqual(parseConversation({ ...context, works: [{ ...work, state: "waiting_for_device", stop: { waiting_for_device: true, timed_out: false } }] }).works[0].stop, { waiting_for_device: true, timed_out: false })
-  assert.throws(() => parseConversation({ ...context, pending_checks: [{ ...check, kind: "native_turn" }] }))
+  const check = { check_id: "manager:attempt", conversation_id: "chat", trigger: "message:one", attempt_id: "attempt", detail: "进程还在运行", process_groups: [42], created_at_ms: 1 }
+  assert.deepEqual(parseConversation({ ...context, checks: [check] }).checks, [check])
+  assert.throws(() => parseConversation({ ...context, checks: [{ ...check, attempt_id: undefined }] }))
+  assert.throws(() => parseConversation({ ...context, checks: undefined }))
+  const unverified = parseConversation({ ...context, works: [{ ...work, state: "unverified", outcome: "unverified", failure_reason: "无法证明结果" }], checks: [check] })
+  assert.deepEqual(pendingChecks(unverified), [
+    { kind: "work", check_id: "work:work", detail: "无法证明结果", work_id: "work", target_node: "worker" },
+    { kind: "process", check_id: "manager:attempt", detail: "进程还在运行" },
+  ], "an unverified work is its own card; a coordination check is confirmed stopped")
+  const delivered = parseConversation({ ...context, works: [work], deliveries: [
+    { work_id: "new", target_node: "other", state: "dispatch_rejected", kind: "codex", title: "新任务", cwd: "/p", reason: "project unavailable" },
+    { work_id: "work", target_node: "worker", state: "stop_timed_out" },
+  ] })
+  assert.equal(delivered.works[0].stop, "stop_timed_out")
+  assert.deepEqual(delivered.works[1], { work_id: "new", trigger: "", target_node: "other", cwd: "/p", title: "新任务", prompt: "", state: "dispatch_rejected", summary: "", outcome: null, result_text: "", failure_reason: "project unavailable" })
+  assert.throws(() => parseConversation({ ...context, deliveries: [{ work_id: "w", target_node: "n", state: "waiting_for_device" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
   assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }] } }).scheduler?.jobs[0].state, "pending_delivery")
 })
@@ -183,7 +195,7 @@ test("workspace preserves bot and message requests while routing native decision
   const connection: ReadyConnection = {
     generation: 1, entry: { device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
-    info: { device_id: "gateway", name: "gateway", version: "test", roles: ["gateway"], initialized: true, network_id: "network" },
+    info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: [] }
@@ -275,7 +287,7 @@ test("workspace preserves bot and message requests while routing native decision
     const resolved = controls.length
     await render().resolveAlert(alert, "dismissed")
     assert.equal(controls.length, resolved, "a resolved alert is not resolved twice")
-    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", process_groups: [], work_id: "work" }, "completed", " 设备上已看到结果 ")
+    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker" }, "completed", " 设备上已看到结果 ")
     assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
     assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
     await assert.rejects(render().interruptWork("other-work"), /停不了/)
@@ -499,7 +511,7 @@ test("any entrance stops an unfinished task once, even on another device", async
     const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
     data.works = [{ ...work, state: 'unverified' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined)
-    data.works = [{ ...work, target_node: 'other', stop: { waiting_for_device: true, timed_out: false } }]
+    data.works = [{ ...work, target_node: 'other', stop: 'stop_waiting' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined, "a stop already on its way is not sent twice")
     data.works = [{ ...work, target_node: 'other' }]
     ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
@@ -509,7 +521,7 @@ test("any entrance stops an unfinished task once, even on another device", async
 })
 
 test("bot projects use online manager capabilities and preserve device names", () => {
-  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, roles: ['scheduler'], capabilities: { manager: 'codex', roots: ['/project'] } }
+  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/project'] } }
   const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
@@ -552,7 +564,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -678,7 +690,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -734,10 +746,10 @@ test("device id boundaries require the device_id field", () => {
     assert.equal(entry.device_id, id)
     assert.equal(Object.hasOwn(entry, "relay"), false)
   }
-  assert.equal(parsers.parseInfo({ name: "node", version: "1", roles: ["replica"], initialized: true, network_id: other, device_id: id }).device_id, id)
-  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], device_id: id }] })[0].device_id, id)
+  assert.equal(parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, device_id: id }).device_id, id)
+  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, device_id: id }] })[0].device_id, id)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备编号无效/)
-  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", roles: ["replica"], initialized: true, network_id: other, node_id: id }), /设备编号无效/)
+  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备编号无效/)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备编号无效/)
-  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /缺少文字/)
+  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, node_id: id }] }), /缺少文字/)
 })

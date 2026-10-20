@@ -22,8 +22,9 @@ use vibeface_bridge::agent::{
 const MAX_LINE: usize = 1_048_576;
 const MAX_STREAM: usize = 16_777_216;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
 pub enum ManagerKind {
     CursorSdk,
     CodexSdk,

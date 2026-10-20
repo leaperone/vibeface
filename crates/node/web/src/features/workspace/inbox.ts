@@ -3,6 +3,7 @@ import { useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@/features/identity/context"
 import type { JoinRequest } from "@/lib/node"
 import { useWorkspace } from "./context"
+import { pendingChecks } from "./model"
 import type { Alert } from "./types"
 import type { WriteCardKind } from "./write-card"
 
@@ -25,7 +26,7 @@ export function useInbox(): InboxItem[] {
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据有两份副本", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据有两份副本", to: "/inbox", kind: "write", write: "conflicts" })
   for (const alert of workspace.alerts) if (alert.resolution === null) items.push({ key: `alert:${alert.alert_id}`, icon: BellRing, title: alert.summary, to: "/inbox", kind: "alert", alert })
-  const checks = data?.pending_checks.length ?? 0
+  const checks = pendingChecks(data).length
   if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
   for (const join of joins) items.push({ key: `join:${join.join_id}`, icon: MonitorSmartphone, title: `${join.name || "新设备"} 想加入`, to: "/devices", kind: "join", join })

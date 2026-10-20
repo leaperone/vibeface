@@ -96,7 +96,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         requests.push({ method, params })
         if (holds.has(method)) return holds.get(method)?.promise
         const initialized = !bootstrap && local !== 'fresh' && candidate.device_id !== remote
-        if (method === 'info') return { device_id: candidate.device_id, name: 'node', version: 'test', roles: ['relay'], initialized, network_id: initialized ? network : null }
+        if (method === 'info') return { device_id: candidate.device_id, name: 'node', version: 'test', initialized, network_id: initialized ? network : null }
         if (method === 'authenticate' && localSession) return { principal: { network_id: network } }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'join') return joinRequest('pending')

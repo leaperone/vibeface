@@ -6,12 +6,15 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  roles: string[]
-  capabilities?: { manager: string | null; roots: string[] }
+  capabilities?: { manager: string | null; relay: boolean; roots: string[] }
 }
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
-/** `waiting_for_device` and `rejected` are dispatches another device has not taken. */
-export type WorkState = "accepted" | "starting" | "running" | "interrupting" | "finished" | "unverified" | "waiting_for_device" | "rejected"
+/** Where a work stands in the signed DAG. */
+export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
+/** A dispatch this device still carries: the target has not taken it, or refused it. Not in the DAG yet. */
+export type DispatchState = "dispatch_waiting" | "dispatch_rejected"
+/** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
+export type StopState = "stop_waiting" | "stop_timed_out"
 /** `abandoned`: the device was removed before it reported; the work did not run. */
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified" | "abandoned"
 export type WorkRecord = {
@@ -22,13 +25,14 @@ export type WorkRecord = {
   /** A few words for the user; `prompt` is what the agent was asked to do. */
   title: string
   prompt: string
-  state: WorkState | null
+  /** A dispatch delivery shows as a work row until its target answers. */
+  state: WorkState | DispatchState
   summary: string
   outcome: WorkOutcome | null
   result_text: string
   failure_reason: string | null
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
-  stop?: { waiting_for_device: boolean; timed_out: boolean }
+  stop?: StopState
 }
 export type ManagerJob = {
   trigger: string
@@ -46,16 +50,23 @@ export type SchedulerSnapshot = {
 }
 /** An attachment by content: hex SHA-256 and byte size. */
 export type BlobRef = { hash: string; size: number }
-/** A started process or work whose outcome this Node cannot prove; nothing is resent. */
-export type PendingCheck = {
+/** A coordination process still alive after its turn ended; the Node closes it once the process exits. */
+export type CoordinationCheck = {
   check_id: string
-  kind: "manager_process" | "work"
+  conversation_id: string
+  trigger: string
+  attempt_id: string
   detail: string
   process_groups: number[]
-  /** Set on a task check; the user's choice settles that task. */
-  work_id?: string
-  target_node?: string
+  created_at_ms: number
 }
+/**
+ * What only the person can settle; nothing is resent.
+ * `work`: an unverified work, answered completed or interrupted. `process`: a coordination process the person confirms stopped.
+ */
+export type PendingCheck =
+  | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string }
+  | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type FieldEdit = { before: string; after: string }
 export type AssistantSkill = { name: string; description: string; body: string }
@@ -77,7 +88,7 @@ export type ConversationPayload = {
   messages: TranscriptMessage[]
   works: WorkRecord[]
   scheduler: SchedulerSnapshot | null
-  pending_checks: PendingCheck[]
+  checks: CoordinationCheck[]
   local_node: string
   /** Oldest first. */
   changes: AssistantChangeRecord[]

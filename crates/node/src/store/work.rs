@@ -1,21 +1,151 @@
 //! The target Node's work journal. Each signal saves the new state and appends the event it
 //! implies in one transaction, so a crash never leaves the DAG ahead of or behind the journal.
-use super::{Store, local_load, local_prefix, local_save, log, reduce, scheduler};
+use super::{Store, enum_from, enum_text, log, reduce, scheduler};
 use crate::{
     crypto::LocalIdentity,
     model::*,
     scheduling::{AdmissionReceipt, JobOutcome, TriggerKind, task_trigger},
     work::{
-        Dispatch, DispatchState, Signal, StopRequest, WorkRecord, WorkSpec, WorkState, accept,
-        transition,
+        Dispatch, DispatchState, Handle, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
+        accept, transition,
     },
 };
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior};
+use anyhow::{Context as _, Result, bail, ensure};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::path::Path;
 
-fn work_key(work_id: &str) -> String {
-    format!("work:v1:{work_id}")
+const RUN_COLUMNS: &str = "work_id,conversation_id,kind,state,thread_id,turn_id,codex_epoch,outcome,evidence,probe,result_text,send_by_ms,progress,progress_at_ms";
+
+type RunRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    String,
+    i64,
+    String,
+    i64,
+);
+
+fn record_from(row: RunRow) -> Result<WorkRecord> {
+    let (work_id, conversation, kind, state, thread, turn, epoch, outcome, evidence, probe) = (
+        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+    );
+    let handle = match (thread.clone(), turn, epoch) {
+        (Some(thread_id), Some(turn_id), Some(epoch)) => Some(Handle {
+            thread_id,
+            turn_id,
+            epoch,
+        }),
+        _ => None,
+    };
+    let state = match state.as_str() {
+        "accepted" => WorkState::Accepted,
+        "starting" => WorkState::Starting { thread },
+        "running" => WorkState::Running {
+            handle: handle.context("work run handle missing")?,
+        },
+        "interrupting" => WorkState::Interrupting {
+            handle: handle.context("work run handle missing")?,
+        },
+        "finished" => WorkState::Finished {
+            outcome: enum_from(&outcome.context("work run outcome missing")?)?,
+        },
+        "unverified" => WorkState::Unverified {
+            handle,
+            evidence: evidence.unwrap_or_default(),
+            probe: probe.unwrap_or(false),
+        },
+        other => bail!("unknown work run state {other}"),
+    };
+    Ok(WorkRecord {
+        work_id,
+        conversation,
+        kind: enum_from(&kind)?,
+        state,
+        text: row.10,
+        send_by_ms: row.11,
+        progress: row.12,
+        progress_at_ms: row.13,
+    })
+}
+
+fn query_runs(
+    connection: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<WorkRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {RUN_COLUMNS} FROM work_runs WHERE {filter} ORDER BY work_id"
+    ))?;
+    let rows = statement
+        .query_map(params, |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<RunRow>>>()?;
+    rows.into_iter().map(record_from).collect()
+}
+
+fn load_run(connection: &Connection, work_id: &str) -> Result<Option<WorkRecord>> {
+    Ok(query_runs(connection, "work_id=?", [work_id])?.pop())
+}
+
+fn save_run(connection: &Connection, record: &WorkRecord) -> Result<()> {
+    let handle = record.state.handle();
+    let thread = match &record.state {
+        WorkState::Starting { thread } => thread.as_ref(),
+        _ => handle.map(|handle| &handle.thread_id),
+    };
+    let (outcome, evidence, probe) = match &record.state {
+        WorkState::Finished { outcome } => (Some(enum_text(outcome)), None, None),
+        WorkState::Unverified {
+            evidence, probe, ..
+        } => (None, Some(evidence), Some(*probe)),
+        _ => (None, None, None),
+    };
+    connection.execute(
+        &format!(
+            "INSERT OR REPLACE INTO work_runs({RUN_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
+        params![
+            record.work_id,
+            record.conversation,
+            enum_text(&record.kind),
+            record.state.name(),
+            thread,
+            handle.map(|handle| &handle.turn_id),
+            handle.map(|handle| handle.epoch),
+            outcome,
+            evidence,
+            probe,
+            record.text,
+            record.send_by_ms,
+            record.progress,
+            record.progress_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Applies one signal inside the caller's transaction; a finished result is admitted after the
@@ -29,10 +159,9 @@ fn apply_signal_from(
     signal: Signal,
     at: i64,
 ) -> Result<(WorkRecord, Option<AdmissionReceipt>)> {
-    let mut record = local_load::<WorkRecord>(connection, network, &work_key(work_id))?
-        .context("work not found")?;
+    let mut record = load_run(connection, work_id)?.context("work not found")?;
     let event = transition(&mut record, signal);
-    local_save(connection, network, &work_key(work_id), &record)?;
+    save_run(connection, &record)?;
     let mut receipt = None;
     if let Some(event) = event {
         let finished = match &event {
@@ -44,7 +173,7 @@ fn apply_signal_from(
             blob_dir,
             identity,
             network,
-            &record.spec.conversation,
+            &record.conversation,
             event,
             vec![],
             at,
@@ -54,7 +183,7 @@ fn apply_signal_from(
                 connection,
                 network,
                 &identity.device_id()?,
-                &record.spec.conversation,
+                &record.conversation,
                 work_id,
                 outcome,
             )?;
@@ -107,10 +236,6 @@ pub(crate) fn finish_agent_work_from(
     Ok(())
 }
 
-fn settled(record: &WorkRecord) -> bool {
-    !matches!(record.state, WorkState::Unverified { .. })
-}
-
 impl Store {
     /// Retrying the same `work_id` returns the existing record and never starts a second turn.
     /// The returned flag says whether this call created it. An agent task is queued for this
@@ -129,30 +254,39 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = local_load::<WorkRecord>(&tx, network, &work_key(&spec.work_id))? {
-            ensure!(
-                existing.spec == spec,
-                "work ID reused with a different request"
-            );
+        if let Some(existing) = load_run(&tx, &spec.work_id)? {
+            let same = reduce::work_from(&tx, network, &spec.work_id)?.is_some_and(|work| {
+                work.conversation_id == spec.conversation
+                    && work.trigger == spec.trigger
+                    && work.target_node == spec.target
+                    && work.dispatcher == spec.dispatcher
+                    && work.call_ref == spec.call_ref
+                    && work.kind == spec.kind
+                    && work.cwd == spec.cwd
+                    && work.title == spec.title
+                    && work.prompt == spec.prompt
+                    && work.continues == spec.continues
+                    && work.parent == spec.parent
+            });
+            ensure!(same, "work ID reused with a different request");
             return Ok((existing, false));
         }
         let busy = spec.kind == WorkKind::Task
-            && local_prefix::<WorkRecord>(&tx, network, "work:v1:")?
-                .iter()
-                .any(|other| {
-                    other.spec.kind == WorkKind::Task
-                        && other.spec.conversation == spec.conversation
-                        && !other.state.finished()
-                });
+            && !query_runs(
+                &tx,
+                "kind='task' AND conversation_id=? AND state<>'finished'",
+                [&spec.conversation],
+            )?
+            .is_empty();
         let (mut record, event) = accept(spec, at);
-        let work_id = record.spec.work_id.clone();
-        local_save(&tx, network, &work_key(&work_id), &record)?;
+        let work_id = record.work_id.clone();
+        save_run(&tx, &record)?;
         log::append_from(
             &tx,
             &self.blob_dir,
             identity,
             network,
-            &record.spec.conversation,
+            &record.conversation,
             event,
             vec![],
             at,
@@ -172,11 +306,11 @@ impl Store {
                 at,
             )?
             .0;
-        } else if record.spec.kind == WorkKind::Task {
+        } else if record.kind == WorkKind::Task {
             scheduler::admit_from(
                 &tx,
                 network,
-                &record.spec.conversation,
+                &record.conversation,
                 &task_trigger(&work_id),
                 TriggerKind::AgentTask,
                 &work_id,
@@ -315,48 +449,86 @@ impl Store {
         Ok(abandoned)
     }
 
-    pub fn work_record(&self, network: &str, work_id: &str) -> Result<Option<WorkRecord>> {
-        local_load(&self.connection, network, &work_key(work_id))
+    pub fn work_record(&self, work_id: &str) -> Result<Option<WorkRecord>> {
+        load_run(&self.connection, work_id)
     }
 
-    pub fn work_records(&self, network: &str) -> Result<Vec<WorkRecord>> {
-        local_prefix(&self.connection, network, "work:v1:")
+    pub fn work_records(&self) -> Result<Vec<WorkRecord>> {
+        query_runs(&self.connection, "1", [])
     }
 }
 
 fn settle_local_from(connection: &Connection, network: &str) -> Result<()> {
-    for mut record in local_prefix::<WorkRecord>(connection, network, "work:v1:")? {
-        if settled(&record) {
-            continue;
-        }
-        let outcome = reduce::work_from(connection, network, &record.spec.work_id)?
-            .and_then(|work| work.outcome);
+    for mut record in query_runs(connection, "state='unverified'", [])? {
+        let outcome =
+            reduce::work_from(connection, network, &record.work_id)?.and_then(|work| work.outcome);
         if let Some(outcome) = outcome.filter(|outcome| *outcome != WorkOutcome::Unverified) {
             transition(&mut record, Signal::Settled(outcome));
-            local_save(
-                connection,
-                network,
-                &work_key(&record.spec.work_id),
-                &record,
-            )?;
+            save_run(connection, &record)?;
         }
     }
     Ok(())
 }
 
-fn dispatch_key(work_id: &str) -> String {
-    format!("dispatch:v1:{work_id}")
+fn query_dispatches(
+    connection: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<Dispatch>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT spec,state,reason FROM work_dispatches WHERE {filter} ORDER BY work_id"
+    ))?;
+    let rows = statement
+        .query_map(params, |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(spec, state, reason)| {
+            let state = match state.as_str() {
+                "pending" => DispatchState::Pending,
+                "accepted" => DispatchState::Accepted,
+                "rejected" => DispatchState::Rejected {
+                    reason: reason.unwrap_or_default(),
+                },
+                other => bail!("unknown dispatch state {other}"),
+            };
+            Ok(Dispatch {
+                spec: serde_json::from_str(&spec)?,
+                state,
+            })
+        })
+        .collect()
 }
 
-fn stop_key(work_id: &str) -> String {
-    format!("stop:v1:{work_id}")
+fn save_dispatch_row(connection: &Connection, dispatch: &Dispatch) -> Result<()> {
+    let (state, reason) = match &dispatch.state {
+        DispatchState::Pending => ("pending", None),
+        DispatchState::Accepted => ("accepted", None),
+        DispatchState::Rejected { reason } => ("rejected", Some(reason)),
+    };
+    connection.execute(
+        "INSERT OR REPLACE INTO work_dispatches(work_id,conversation_id,target_node,spec,state,reason) VALUES(?,?,?,?,?,?)",
+        params![
+            dispatch.spec.work_id,
+            dispatch.spec.conversation,
+            dispatch.spec.target,
+            serde_json::to_string(&dispatch.spec)?,
+            state,
+            reason,
+        ],
+    )?;
+    Ok(())
 }
 
 impl Store {
     /// The first save fixes the request; a retry with other content is refused.
-    pub fn save_dispatch(&mut self, network: &str, dispatch: &Dispatch) -> Result<Dispatch> {
-        let key = dispatch_key(&dispatch.spec.work_id);
-        if let Some(existing) = local_load::<Dispatch>(&self.connection, network, &key)? {
+    pub fn save_dispatch(&mut self, dispatch: &Dispatch) -> Result<Dispatch> {
+        if let Some(existing) = self.dispatch(&dispatch.spec.work_id)? {
             ensure!(
                 existing.spec == dispatch.spec,
                 "work ID reused with a different request"
@@ -365,53 +537,70 @@ impl Store {
                 return Ok(existing);
             }
         }
-        local_save(&self.connection, network, &key, dispatch)?;
+        save_dispatch_row(&self.connection, dispatch)?;
         Ok(dispatch.clone())
     }
 
-    pub fn dispatch(&self, network: &str, work_id: &str) -> Result<Option<Dispatch>> {
-        local_load(&self.connection, network, &dispatch_key(work_id))
+    pub fn dispatch(&self, work_id: &str) -> Result<Option<Dispatch>> {
+        Ok(query_dispatches(&self.connection, "work_id=?", [work_id])?.pop())
     }
 
-    pub fn dispatches(&self, network: &str) -> Result<Vec<Dispatch>> {
-        local_prefix(&self.connection, network, "dispatch:v1:")
+    pub fn dispatches(&self) -> Result<Vec<Dispatch>> {
+        query_dispatches(&self.connection, "1", [])
     }
 
-    pub fn save_stop_request(&mut self, network: &str, request: &StopRequest) -> Result<()> {
-        local_save(
-            &self.connection,
-            network,
-            &stop_key(&request.work_id),
-            request,
-        )
+    pub fn save_stop_request(&mut self, request: &StopRequest) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO work_stops(work_id,conversation_id,target_node,requested_at_ms,deadline_ms,timed_out) VALUES(?,?,?,?,?,?)",
+            params![
+                request.work_id,
+                request.conversation,
+                request.target,
+                request.requested_at_ms,
+                request.deadline_ms,
+                request.timed_out,
+            ],
+        )?;
+        Ok(())
     }
 
-    pub fn stop_requests(&self, network: &str) -> Result<Vec<StopRequest>> {
-        local_prefix(&self.connection, network, "stop:v1:")
+    pub fn stop_requests(&self) -> Result<Vec<StopRequest>> {
+        let mut statement = self.connection.prepare(
+            "SELECT work_id,conversation_id,target_node,requested_at_ms,deadline_ms,timed_out FROM work_stops ORDER BY work_id",
+        )?;
+        Ok(statement
+            .query_map([], |r| {
+                Ok(StopRequest {
+                    work_id: r.get(0)?,
+                    conversation: r.get(1)?,
+                    target: r.get(2)?,
+                    requested_at_ms: r.get(3)?,
+                    deadline_ms: r.get(4)?,
+                    timed_out: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn forget_stop_request(&mut self, network: &str, work_id: &str) -> Result<()> {
-        self.local_delete(network, &stop_key(work_id))
+    pub fn forget_stop_request(&mut self, work_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM work_stops WHERE work_id=?", [work_id])?;
+        Ok(())
     }
 
     /// A removed device will never answer: its dispatches are refused and stop requests dropped.
-    pub fn drop_requests_to(&mut self, network: &str, removed: &[DeviceId]) -> Result<()> {
-        for mut dispatch in self.dispatches(network)? {
-            if dispatch.state == DispatchState::Pending && removed.contains(&dispatch.spec.target) {
+    pub fn drop_requests_to(&mut self, removed: &[DeviceId]) -> Result<()> {
+        for mut dispatch in query_dispatches(&self.connection, "state='pending'", [])? {
+            if removed.contains(&dispatch.spec.target) {
                 dispatch.state = DispatchState::Rejected {
                     reason: "设备已移除，任务已放弃、未执行".into(),
                 };
-                local_save(
-                    &self.connection,
-                    network,
-                    &dispatch_key(&dispatch.spec.work_id),
-                    &dispatch,
-                )?;
+                save_dispatch_row(&self.connection, &dispatch)?;
             }
         }
-        for request in self.stop_requests(network)? {
+        for request in self.stop_requests()? {
             if removed.contains(&request.target) {
-                self.forget_stop_request(network, &request.work_id)?;
+                self.forget_stop_request(&request.work_id)?;
             }
         }
         Ok(())

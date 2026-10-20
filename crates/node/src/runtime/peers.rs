@@ -137,7 +137,7 @@ impl Runtime {
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
             let view = self.membership_state().await?.project()?;
-            for signed in self.store.lock().await.address_book(&network)? {
+            for signed in self.store.lock().await.address_book()? {
                 if let Ok(record) = signed.open(&network)
                     && view.node(&record.device_id).is_ok()
                 {
@@ -311,7 +311,7 @@ impl Runtime {
                 let records: Vec<SignedAddress> =
                     serde_json::from_value(input["records"].clone()).unwrap_or_default();
                 self.merge_addresses(network, records).await?;
-                Ok(json!({"records":self.store.lock().await.address_book(network)?}))
+                Ok(json!({"records":self.store.lock().await.address_book()?}))
             }
             "deliver" => self.accept_delivery(network, origin, input).await,
             "manager_status" => {
@@ -337,10 +337,10 @@ impl Runtime {
                     .store
                     .lock()
                     .await
-                    .work_record(network, work_id)?
+                    .work_record(work_id)?
                     .context("work not found on this device")?;
                 ensure!(
-                    record.spec.conversation == scope,
+                    record.conversation == scope,
                     "work belongs to another conversation"
                 );
                 self.interrupt_work(network, work_id).await
@@ -352,7 +352,7 @@ impl Runtime {
                 );
                 self.codex_rpc(network, kind, input).await
             }
-            "cancel_manager" | "reconcile" | "resolve" => {
+            "cancel_manager" | "resolve" => {
                 ensure!(
                     input["human"] == true,
                     "management control requires the user"
@@ -365,7 +365,7 @@ impl Runtime {
                 };
                 match kind {
                     "cancel_manager" => self.cancel_manager(&access, input).await,
-                    _ => self.pending_check_control(&access, input, kind).await,
+                    _ => self.resolve_check(&access, input).await,
                 }
             }
             _ => bail!("unknown peer request"),
@@ -817,10 +817,9 @@ impl Runtime {
             .set_write_state(network, &from, WriteState::Writable)
             .await
         {
-            self.store.lock().await.local_set(
-                network,
-                "write-confirmed",
-                &json!({"device":device,"at_ms":now_ms()}),
+            self.store.lock().await.connection.execute(
+                "INSERT INTO identity_meta(key,value) VALUES('write-confirmed',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [json!({"device":device,"at_ms":now_ms()}).to_string()],
             )?;
             tracing::info!(device, "write confirmed without a backup check");
         }
@@ -991,11 +990,7 @@ impl Runtime {
             if let Ok(net) = self.net() {
                 net.forget(&revoked.device_id);
             }
-            let _ = self
-                .store
-                .lock()
-                .await
-                .forget_address(&view.network_id, &revoked.device_id);
+            let _ = self.store.lock().await.forget_address(&revoked.device_id);
         }
         self.abandon_revoked_works(&view.network_id).await;
     }
@@ -1035,20 +1030,16 @@ impl Runtime {
             }
             Err(error) => tracing::warn!(%error, "abandoning work on removed devices is pending"),
         }
-        if let Err(error) = self.store.lock().await.drop_requests_to(network, &removed) {
+        if let Err(error) = self.store.lock().await.drop_requests_to(&removed) {
             tracing::warn!(%error, "dropping requests to removed devices is pending");
         }
     }
 
-    /// Where browsers reach this Node: its public entry, else its own Gateway.
-    pub(crate) fn gateway_url(&self) -> Option<String> {
+    /// Where browsers reach this Node: its public entry, else its own URL.
+    pub(crate) fn gateway_url(&self) -> String {
         match &self.config.network.entry {
-            Some(entry) => Some(entry.url.clone()),
-            None => self
-                .config
-                .roles
-                .contains(&NodeRole::Gateway)
-                .then(|| self.config.public_url.clone()),
+            Some(entry) => entry.url.clone(),
+            None => self.config.public_url.clone(),
         }
     }
 
@@ -1057,10 +1048,10 @@ impl Runtime {
         let net = self.net()?;
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
-        let gateway_url = self.gateway_url();
+        let gateway_url = Some(self.gateway_url());
         let mut store = self.store.lock().await;
         let previous = store
-            .address_book(network)?
+            .address_book()?
             .into_iter()
             .filter_map(|signed| signed.open(network).ok())
             .find(|record| record.device_id == device_id);
@@ -1093,7 +1084,7 @@ impl Runtime {
     }
 
     async fn exchange_addresses(&self, network: &str, peer: &str) -> Result<()> {
-        let records = self.store.lock().await.address_book(network)?;
+        let records = self.store.lock().await.address_book()?;
         let reply = self
             .net()?
             .request(
@@ -1147,7 +1138,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .address_book(network)?
+            .address_book()?
             .into_iter()
             .filter(|signed| {
                 signed.open(network).is_ok_and(|record| {
@@ -1193,10 +1184,14 @@ impl Runtime {
             {
                 tracing::debug!(%error, "work requests wait for their devices");
             }
-            if let Ok(state) = self.membership_state().await
-                && let Err(error) = self.reconcile_works(&state.genesis.network_id).await
-            {
-                tracing::debug!(%error, "work reconciliation pending");
+            if let Ok(state) = self.membership_state().await {
+                let network = &state.genesis.network_id;
+                if let Err(error) = self.reconcile_works(network).await {
+                    tracing::debug!(%error, "work reconciliation pending");
+                }
+                if let Err(error) = self.reconcile_checks(network).await {
+                    tracing::debug!(%error, "pending check reconciliation pending");
+                }
             }
         }
     }
@@ -1204,45 +1199,44 @@ impl Runtime {
     /// Hands each waiting message or result to the conversation's current owner. The owner admits
     /// by trigger, so a retry after an unknown outcome is harmless.
     async fn deliver_outbox(self: &Arc<Self>) -> Result<()> {
-        let networks = self.store.lock().await.networks()?;
+        let Some(network) = self.store.lock().await.network()? else {
+            return Ok(());
+        };
         let local = self.identity.device_id()?;
-        for network in networks {
-            let entries = self.store.lock().await.scheduler_outbox(&network)?;
-            for entry in entries {
-                let owner = self
-                    .store
+        let entries = self.store.lock().await.scheduler_outbox()?;
+        for entry in entries {
+            let owner = self
+                .store
+                .lock()
+                .await
+                .conversation(&network, &entry.conversation_id)?
+                .and_then(|conversation| conversation.owner)
+                .context("conversation has no scheduling Node")?;
+            let delivered = if owner == local {
+                self.store
                     .lock()
                     .await
-                    .conversation(&network, &entry.conversation_id)?
-                    .and_then(|conversation| conversation.owner)
-                    .context("conversation has no scheduling Node")?;
-                let delivered = if owner == local {
+                    .admit_delivery(&local, &network, &entry.conversation_id, &entry.trigger)
+                    .map(|receipt| json!({ "receipt": receipt }))
+            } else {
+                let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
+                        "trigger":entry.trigger});
+                self.peer_request(&network, &owner, request).await
+            };
+            match delivered {
+                Ok(reply) if reply["receipt"].is_object() => {
                     self.store
                         .lock()
                         .await
-                        .admit_delivery(&local, &network, &entry.conversation_id, &entry.trigger)
-                        .map(|receipt| json!({ "receipt": receipt }))
-                } else {
-                    let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
-                        "trigger":entry.trigger});
-                    self.peer_request(&network, &owner, request).await
-                };
-                match delivered {
-                    Ok(reply) if reply["receipt"].is_object() => {
-                        self.store.lock().await.remove_outbox(
-                            &network,
-                            &entry.conversation_id,
-                            &entry.trigger,
-                        )?;
-                        self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
-                        self.schedule_wakeup.notify_one();
-                    }
-                    Ok(_) => {
-                        tracing::debug!(%owner, "delivery answer had no receipt")
-                    }
-                    Err(error) => {
-                        tracing::debug!(%owner, %error, "scheduler delivery pending")
-                    }
+                        .remove_outbox(&entry.conversation_id, &entry.trigger)?;
+                    self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
+                    self.schedule_wakeup.notify_one();
+                }
+                Ok(_) => {
+                    tracing::debug!(%owner, "delivery answer had no receipt")
+                }
+                Err(error) => {
+                    tracing::debug!(%owner, %error, "scheduler delivery pending")
                 }
             }
         }
@@ -1356,7 +1350,7 @@ impl Runtime {
             (
                 store.partial_blob_file(&blob.hash)?,
                 store.blob_file(&blob.hash)?,
-                store.committed_offset(network, &blob.hash)?,
+                store.committed_offset(&blob.hash)?,
             )
         };
         let dir = part.parent().context("partial directory")?;
@@ -1405,7 +1399,7 @@ impl Runtime {
                 self.store
                     .lock()
                     .await
-                    .commit_offset(network, &blob.hash, Some(offset))?;
+                    .commit_offset(&blob.hash, Some(offset))?;
                 unsynced = 0;
             }
         }
@@ -1413,24 +1407,18 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .commit_offset(network, &blob.hash, Some(offset))?;
+            .commit_offset(&blob.hash, Some(offset))?;
         ensure!(offset == blob.size, "attachment stream ended early");
         drop(file);
         let bytes = tokio::fs::read(&part).await?;
         if crate::crypto::digest(&bytes) != blob.hash {
             let _ = tokio::fs::remove_file(&part).await;
-            self.store
-                .lock()
-                .await
-                .commit_offset(network, &blob.hash, None)?;
+            self.store.lock().await.commit_offset(&blob.hash, None)?;
             bail!("downloaded attachment failed its hash check");
         }
         tokio::fs::create_dir_all(target.parent().context("blob directory")?).await?;
         tokio::fs::rename(&part, &target).await?;
-        self.store
-            .lock()
-            .await
-            .commit_offset(network, &blob.hash, None)?;
+        self.store.lock().await.commit_offset(&blob.hash, None)?;
         Ok(())
     }
 }
@@ -1502,7 +1490,10 @@ mod tests {
         configuration.network = network;
         configuration.codex_socket = Some(dir.join("unavailable.sock"));
         configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
@@ -1574,7 +1565,7 @@ mod tests {
                 let (b, network, peer) = (b.clone(), network.clone(), peer_a.clone());
                 tokio::spawn(async move { b.sync_peer(&network, &peer).await })
             };
-            while b.store.lock().await.committed_offset(&network, &blob.hash)? == 0
+            while b.store.lock().await.committed_offset(&blob.hash)? == 0
                 && !first.is_finished()
             {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1585,8 +1576,8 @@ mod tests {
             let heads = a.store.lock().await.heads(&network)?;
             assert_eq!(b.store.lock().await.heads(&network)?, heads);
             assert!(b.store.lock().await.missing_blobs(&network)?.is_empty());
-            assert!(b.store.lock().await.scheduler_jobs(&network, "c")?.is_empty());
-            assert!(b.store.lock().await.scheduler_outbox(&network)?.is_empty());
+            assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());
+            assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
 
             for id in ["m2", "m3"] {
                 a.store.lock().await.accept_message(&ia, &network, "c", id, id, vec![], true,
@@ -1596,9 +1587,9 @@ mod tests {
             b.sync_peer(&network, &ia.device_id()?).await?;
             assert_eq!(b.store.lock().await.heads(&network)?, a.store.lock().await.heads(&network)?);
             assert_eq!(b.store.lock().await.messages(&network, "c")?.len(), 3);
-            assert!(b.store.lock().await.scheduler_jobs(&network, "c")?.is_empty());
+            assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());
             assert!(
-                a.store.lock().await.address_book(&network)?.iter().any(|signed| signed
+                a.store.lock().await.address_book()?.iter().any(|signed| signed
                     .open(&network)
                     .is_ok_and(|record| record.device_id == ib.device_id().unwrap_or_default())),
                 "the pulled Node learned the puller's signed address"
@@ -1607,17 +1598,17 @@ mod tests {
 
             b.store.lock().await.accept_message(&ib, &network, "c", "m4", "m4", vec![], true,
                 user(&ia, &network, "m4")?, now_ms())?;
-            assert_eq!(b.store.lock().await.scheduler_outbox(&network)?.len(), 1);
+            assert_eq!(b.store.lock().await.scheduler_outbox()?.len(), 1);
             b.deliver_outbox().await?;
-            assert!(b.store.lock().await.scheduler_outbox(&network)?.is_empty());
+            assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
             let trigger = crate::scheduling::message_trigger("m4");
-            a.store.lock().await.scheduler_job(&network, "c", &trigger)?
+            a.store.lock().await.scheduler_job("c", &trigger)?
                 .context("the owner admitted the delivered message")?;
             let again = b.peer_request(&network, &ia.device_id()?,
                 json!({"type":"deliver","conversation_id":"c","trigger":trigger})).await?;
             assert_eq!(again["receipt"]["trigger"], trigger.as_str());
             assert_eq!(
-                a.store.lock().await.scheduler_jobs(&network, "c")?.iter().filter(|job| job.trigger == trigger).count(),
+                a.store.lock().await.scheduler_jobs("c")?.iter().filter(|job| job.trigger == trigger).count(),
                 1,
                 "a repeated delivery returns the original admission"
             );
@@ -1629,11 +1620,11 @@ mod tests {
             seeded[0] ^= 1;
             seeded.extend_from_slice(b"bytes after the last synced offset");
             std::fs::write(&part, &seeded)?;
-            b.store.lock().await.commit_offset(&network, &blob.hash, Some(1024 * 1024))?;
+            b.store.lock().await.commit_offset(&blob.hash, Some(1024 * 1024))?;
             let corrupted = b.fetch_blob(&network, &ia.device_id()?, &blob).await;
             assert!(corrupted.is_err() && !part.exists(), "resumed bytes keep the synced prefix and fail the hash check");
             std::fs::write(&part, &content[..1024 * 1024])?;
-            b.store.lock().await.commit_offset(&network, &blob.hash, Some(1024 * 1024))?;
+            b.store.lock().await.commit_offset(&blob.hash, Some(1024 * 1024))?;
             b.fetch_blob(&network, &ia.device_id()?, &blob).await?;
             assert_eq!(std::fs::read(&target)?, content);
             assert!(!part.exists());

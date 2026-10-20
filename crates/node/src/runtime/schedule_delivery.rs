@@ -21,12 +21,7 @@ impl Runtime {
         let Some(manager) = &settings.manager else {
             return Value::Null;
         };
-        let kind = match manager.provider.as_str() {
-            "cursor_sdk" => crate::manager::ManagerKind::CursorSdk,
-            "codex_sdk" => crate::manager::ManagerKind::CodexSdk,
-            _ => return Value::Null,
-        };
-        let mut capabilities = kind.capabilities();
+        let mut capabilities = manager.provider.capabilities();
         capabilities["configured"] = json!(true);
         json!({"provider":manager.provider,"model":manager.model,"capabilities":capabilities})
     }
@@ -61,88 +56,71 @@ impl Runtime {
 
     /// Queues the routines that are due in conversations this Node schedules.
     async fn fire_routines(self: &Arc<Self>) -> Result<()> {
-        if !self.config.roles.contains(&NodeRole::Scheduler)
-            || self.settings_snapshot().manager.is_none()
-        {
+        if self.settings_snapshot().manager.is_none() {
             return Ok(());
         }
-        let networks = self.store.lock().await.networks()?;
-        for network in networks {
-            let admitted =
-                self.store
-                    .lock()
-                    .await
-                    .admit_due_routines(&self.identity, &network, now_ms())?;
-            for (scope, trigger) in admitted {
-                self.publish_changed(&network, &scope, &trigger);
-                self.schedule_wakeup.notify_one();
-            }
+        let Some(network) = self.store.lock().await.network()? else {
+            return Ok(());
+        };
+        let admitted =
+            self.store
+                .lock()
+                .await
+                .admit_due_routines(&self.identity, &network, now_ms())?;
+        for (scope, trigger) in admitted {
+            self.publish_changed(&network, &scope, &trigger);
+            self.schedule_wakeup.notify_one();
         }
         Ok(())
     }
 
     async fn schedule_tick(self: &Arc<Self>) -> Result<()> {
-        if !self.config.roles.contains(&NodeRole::Scheduler) {
+        let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
-        }
-        let networks = self.store.lock().await.networks()?;
-        for network in networks {
-            let workers = self.schedule_workers.lock().await.clone();
-            // A consumer that ended without a terminal outcome leaves its job claimed; settle it.
-            let abandoned = {
-                let mut store = self.store.lock().await;
-                store.recover_scheduler_jobs(
-                    &self.identity,
-                    &network,
-                    crate::scheduler::boot_id(),
-                )?;
-                let mut abandoned = Vec::new();
-                for scope in store.pending_scheduler_conversations(&network)? {
-                    if workers.contains(&(network.clone(), scope.clone())) {
-                        continue;
-                    }
-                    for job in store.scheduler_jobs(&network, &scope)? {
-                        if let JobState::Claimed { attempt }
-                        | JobState::Running { attempt }
-                        | JobState::Cancelling { attempt } = &job.state
-                        {
-                            abandoned.push((
-                                scope.clone(),
-                                job.trigger.clone(),
-                                attempt.id.clone(),
-                            ));
-                        }
+        };
+        let workers = self.schedule_workers.lock().await.clone();
+        // A consumer that ended without a terminal outcome leaves its job claimed; settle it.
+        let abandoned = {
+            let mut store = self.store.lock().await;
+            store.recover_scheduler_jobs(&self.identity, &network, crate::scheduler::boot_id())?;
+            let mut abandoned = Vec::new();
+            for scope in store.pending_scheduler_conversations()? {
+                if workers.contains(&(network.clone(), scope.clone())) {
+                    continue;
+                }
+                for job in store.scheduler_jobs(&scope)? {
+                    if let JobState::Claimed { attempt }
+                    | JobState::Running { attempt }
+                    | JobState::Cancelling { attempt } = &job.state
+                    {
+                        abandoned.push((scope.clone(), job.trigger.clone(), attempt.id.clone()));
                     }
                 }
-                abandoned
-            };
-            for (scope, trigger, attempt) in abandoned {
-                self.fence_manager_attempt(&attempt).await?;
-                self.store.lock().await.finish_job(
-                    &self.identity,
-                    &network,
-                    &scope,
-                    &trigger,
-                    &attempt,
-                    JobOutcome::Interrupted {
-                        detail: "回复进程意外结束，结果待核对。".into(),
-                        process_unconfirmed: true,
-                    },
-                    "",
-                    now_ms(),
-                )?;
-                self.finish_manager_attempt(&attempt).await;
-                self.publish_changed(&network, &scope, &trigger);
             }
-            if self.settings_snapshot().manager.is_some() {
-                let scopes = self
-                    .store
-                    .lock()
-                    .await
-                    .pending_scheduler_conversations(&network)?;
-                for scope in scopes {
-                    self.start_schedule_consumer(network.clone(), scope).await;
-                }
+            abandoned
+        };
+        for (scope, trigger, attempt) in abandoned {
+            self.fence_manager_attempt(&attempt).await?;
+            self.store.lock().await.finish_job(
+                &self.identity,
+                &network,
+                &scope,
+                &trigger,
+                &attempt,
+                JobOutcome::Interrupted {
+                    detail: "回复进程意外结束，结果待核对。".into(),
+                    process_unconfirmed: true,
+                },
+                "",
+                now_ms(),
+            )?;
+            self.finish_manager_attempt(&attempt).await;
+            self.publish_changed(&network, &scope, &trigger);
+        }
+        if self.settings_snapshot().manager.is_some() {
+            let scopes = self.store.lock().await.pending_scheduler_conversations()?;
+            for scope in scopes {
+                self.start_schedule_consumer(network.clone(), scope).await;
             }
         }
         Ok(())
@@ -188,7 +166,7 @@ impl Runtime {
         }
     }
 
-    pub(super) fn spawn_scheduler(&self, _network: &str, _scope: &str) -> Result<()> {
+    pub(super) fn wake_scheduler(&self) -> Result<()> {
         let _work = self.maintenance.enter()?;
         self.schedule_wakeup.notify_one();
         self.outbox_wakeup.notify_one();
@@ -224,7 +202,7 @@ impl Runtime {
             now_ms(),
         )?;
         self.publish_changed(network, &scope, &message.event_hash);
-        self.spawn_scheduler(network, &scope)?;
+        self.wake_scheduler()?;
         Ok(
             json!({"accepted":true,"state":receipt.state,"trigger":receipt.trigger,
             "message_id":message_id,"receipt":receipt}),
@@ -240,8 +218,8 @@ impl Runtime {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;
         store.recover_scheduler_jobs(&self.identity, network, crate::scheduler::boot_id())?;
-        let checks = store.pending_checks(network)?;
-        Ok(match store.scheduler_job(network, scope, trigger)? {
+        let checks = store.pending_checks()?;
+        Ok(match store.scheduler_job(scope, trigger)? {
             Some(job) => json!({"state":job.state.name(),"receipt":job.receipt(network),
                 "job":job_value(&job,&checks)?,"manager":self.scheduler_manager_metadata()}),
             None => json!({"state":"not_found","trigger":trigger}),
@@ -256,7 +234,7 @@ impl Runtime {
     ) -> Result<(Vec<Value>, Vec<PendingCheck>)> {
         let store = self.store.lock().await;
         let checks = store
-            .pending_checks(network)?
+            .pending_checks()?
             .into_iter()
             .filter(|check| check.conversation_id == scope)
             .collect::<Vec<_>>();
@@ -265,13 +243,13 @@ impl Runtime {
             .conversation(network, scope)?
             .and_then(|conversation| conversation.owner);
         let mut jobs = Vec::new();
-        for job in store.scheduler_jobs(network, scope)? {
+        for job in store.scheduler_jobs(scope)? {
             let mut value = job_value(&job, &checks)?;
             value["manager"] = manager.clone();
             jobs.push(value);
         }
         for entry in store
-            .scheduler_outbox(network)?
+            .scheduler_outbox()?
             .into_iter()
             .filter(|entry| entry.conversation_id == scope)
         {

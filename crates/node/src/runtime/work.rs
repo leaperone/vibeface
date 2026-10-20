@@ -55,9 +55,9 @@ impl Runtime {
             signal,
             now_ms(),
         )?;
-        self.publish_changed(network, &record.spec.conversation, work_id);
+        self.publish_changed(network, &record.conversation, work_id);
         if receipt.is_some() {
-            self.spawn_scheduler(network, &record.spec.conversation)?;
+            self.wake_scheduler()?;
         }
         if matches!(record.state, WorkState::Interrupting { .. }) {
             let node = self.clone();
@@ -72,21 +72,21 @@ impl Runtime {
                     now_ms(),
                 );
                 if let Ok((record, _)) = result {
-                    node.publish_changed(&network, &record.spec.conversation, &work_id);
+                    node.publish_changed(&network, &record.conversation, &work_id);
                 }
             });
         }
-        self.observe_live_threads(network).await;
+        self.observe_live_threads().await;
         Ok(record)
     }
 
     /// Threads of live work stay subscribed across App Server reconnects.
-    async fn observe_live_threads(&self, network: &str) {
+    async fn observe_live_threads(&self) {
         let threads = self
             .store
             .lock()
             .await
-            .work_records(network)
+            .work_records()
             .unwrap_or_default()
             .into_iter()
             .filter(live)
@@ -153,14 +153,14 @@ impl Runtime {
             }
             Some(("task", task)) => {
                 let task = store
-                    .work_record(network, task)?
+                    .work_record(task)?
                     .context("agent task not found on this device")?;
                 ensure!(
                     spec.dispatcher == spec.target
                         && spec.kind == WorkKind::Codex
-                        && task.spec.kind == WorkKind::Task
-                        && task.spec.conversation == spec.conversation
-                        && spec.parent.as_deref() == Some(task.spec.work_id.as_str())
+                        && task.kind == WorkKind::Task
+                        && task.conversation == spec.conversation
+                        && spec.parent.as_deref() == Some(task.work_id.as_str())
                         && !task.state.finished(),
                     "an agent task only starts Codex work on its own device"
                 );
@@ -169,10 +169,10 @@ impl Runtime {
         }
         if let Some(original) = &spec.continues {
             let original = store
-                .work_record(network, original)?
+                .work_record(original)?
                 .context("the work to continue is not on this device")?;
             ensure!(
-                original.spec.conversation == spec.conversation && original.spec.kind == spec.kind,
+                original.conversation == spec.conversation && original.kind == spec.kind,
                 "a continuation keeps the original conversation and kind"
             );
         }
@@ -186,8 +186,7 @@ impl Runtime {
                 "an agent task goes to another device"
             );
             ensure!(
-                self.config.roles.contains(&NodeRole::Scheduler)
-                    && self.settings_snapshot().manager.is_some(),
+                self.settings_snapshot().manager.is_some(),
                 "this device has no assistant to take the task"
             );
         }
@@ -206,7 +205,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .work_record(network, &spec.work_id)?
+            .work_record(&spec.work_id)?
             .is_none()
         {
             self.authorize_dispatch(network, &spec).await?;
@@ -216,9 +215,9 @@ impl Runtime {
                 .lock()
                 .await
                 .accept_work(&self.identity, network, spec, now_ms())?;
-        self.publish_changed(network, &record.spec.conversation, &record.spec.work_id);
-        if created && record.spec.kind == WorkKind::Task {
-            self.spawn_scheduler(network, &record.spec.conversation)?;
+        self.publish_changed(network, &record.conversation, &record.work_id);
+        if created && record.kind == WorkKind::Task {
+            self.wake_scheduler()?;
         }
         Ok((record, created))
     }
@@ -252,7 +251,7 @@ impl Runtime {
         };
         Ok(match record {
             Ok(record) => {
-                json!({"work_id":record.spec.work_id,"state":record.state.name()})
+                json!({"work_id":record.work_id,"state":record.state.name()})
             }
             Err(error) => json!({"rejected":error.to_string()}),
         })
@@ -265,13 +264,10 @@ impl Runtime {
         network: &str,
         spec: WorkSpec,
     ) -> Result<Dispatch> {
-        let dispatch = self.store.lock().await.save_dispatch(
-            network,
-            &Dispatch {
-                spec,
-                state: DispatchState::Pending,
-            },
-        )?;
+        let dispatch = self.store.lock().await.save_dispatch(&Dispatch {
+            spec,
+            state: DispatchState::Pending,
+        })?;
         if dispatch.state != DispatchState::Pending {
             return Ok(dispatch);
         }
@@ -295,7 +291,7 @@ impl Runtime {
             }
         };
         let dispatch = Dispatch { state, ..dispatch };
-        self.store.lock().await.save_dispatch(network, &dispatch)?;
+        self.store.lock().await.save_dispatch(&dispatch)?;
         self.publish_changed(network, &dispatch.spec.conversation, &dispatch.spec.work_id);
         Ok(dispatch)
     }
@@ -313,10 +309,10 @@ impl Runtime {
             .store
             .lock()
             .await
-            .work_record(network, work_id)?
+            .work_record(work_id)?
             .context("work not found on this device")?;
         ensure!(
-            record.spec.conversation == scope && record.spec.kind == WorkKind::Codex,
+            record.conversation == scope && record.kind == WorkKind::Codex,
             "work belongs to another conversation"
         );
         let mut record = record;
@@ -374,7 +370,7 @@ impl Runtime {
                 .store
                 .lock()
                 .await
-                .work_record(network, work_id)?
+                .work_record(work_id)?
                 .context("work not found on this device")?;
         }
         Ok(json!({"work_id":work_id,"state":record.state}))
@@ -392,9 +388,9 @@ impl Runtime {
             .store
             .lock()
             .await
-            .work_record(network, work_id)?
+            .work_record(work_id)?
             .context("work not found")?;
-        if record.spec.kind != WorkKind::Codex {
+        if record.kind != WorkKind::Codex {
             return Ok(());
         }
         let over = record.send_window_over(now_ms());
@@ -449,14 +445,14 @@ impl Runtime {
 
     /// Settles works the Agent registered but did not finish starting within its window.
     pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
-        let records = self.store.lock().await.work_records(network)?;
+        let records = self.store.lock().await.work_records()?;
         for record in records {
             if matches!(
                 record.state,
                 WorkState::Accepted | WorkState::Starting { .. }
-            ) && record.spec.kind == WorkKind::Codex
+            ) && record.kind == WorkKind::Codex
                 && record.send_window_over(now_ms())
-                && let Err(error) = self.probe_work(network, &record.spec.work_id, false).await
+                && let Err(error) = self.probe_work(network, &record.work_id, false).await
             {
                 tracing::debug!(%error, "work probe waits for the App Server");
             }
@@ -473,7 +469,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .work_record(network, work_id)?
+            .work_record(work_id)?
             .context("work not found")?;
         match &record.state {
             WorkState::Running { handle } => {
@@ -485,11 +481,11 @@ impl Runtime {
                     .await?;
             }
             // An agent task stops with its coordination turn.
-            WorkState::Accepted if record.spec.kind == WorkKind::Task => {
+            WorkState::Accepted if record.kind == WorkKind::Task => {
                 let job = self.store.lock().await.request_manager_cancel(
                     &self.identity,
                     network,
-                    &record.spec.conversation,
+                    &record.conversation,
                     &task_trigger(work_id),
                 )?;
                 if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
@@ -497,20 +493,25 @@ impl Runtime {
                 {
                     self.fence_manager_attempt(&attempt.id).await?;
                 }
-                self.publish_changed(network, &record.spec.conversation, work_id);
+                self.publish_changed(network, &record.conversation, work_id);
             }
             _ => {}
         }
         // Stopping a work stops what it delegated.
-        let children: Vec<String> = self
-            .store
-            .lock()
-            .await
-            .work_records(network)?
-            .into_iter()
-            .filter(|child| child.spec.parent.as_deref() == Some(work_id) && live(child))
-            .map(|child| child.spec.work_id)
-            .collect();
+        let children = {
+            let store = self.store.lock().await;
+            let mut children = Vec::new();
+            for work in store.works(network, &record.conversation)? {
+                if work.parent.as_deref() == Some(work_id)
+                    && store
+                        .work_record(&work.work_id)?
+                        .is_some_and(|child| live(&child))
+                {
+                    children.push(work.work_id);
+                }
+            }
+            children
+        };
         for child in children {
             Box::pin(self.interrupt_work(network, &child)).await?;
         }
@@ -549,10 +550,7 @@ impl Runtime {
             Ok(Ok(reply)) => Ok(reply),
             failed => {
                 tracing::debug!(?failed, "stop request waits for its device");
-                self.store
-                    .lock()
-                    .await
-                    .save_stop_request(network, &request)?;
+                self.store.lock().await.save_stop_request(&request)?;
                 self.publish_changed(network, scope, work_id);
                 Ok(
                     json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_device":true}),
@@ -574,13 +572,13 @@ impl Runtime {
     /// Retries waiting dispatches and stop requests; a stop request past its deadline stays
     /// listed as unconfirmed until the work ends.
     pub(super) async fn deliver_work_requests(self: &Arc<Self>, network: &str) -> Result<()> {
-        let dispatches = self.store.lock().await.dispatches(network)?;
+        let dispatches = self.store.lock().await.dispatches()?;
         for dispatch in dispatches {
             if dispatch.state == DispatchState::Pending {
                 self.send_dispatch(network, dispatch.spec).await?;
             }
         }
-        let requests = self.store.lock().await.stop_requests(network)?;
+        let requests = self.store.lock().await.stop_requests()?;
         for mut request in requests {
             let ended = self
                 .store
@@ -593,7 +591,7 @@ impl Runtime {
                 self.store
                     .lock()
                     .await
-                    .forget_stop_request(network, &request.work_id)?;
+                    .forget_stop_request(&request.work_id)?;
                 continue;
             }
             if request.timed_out {
@@ -606,13 +604,10 @@ impl Runtime {
                 self.store
                     .lock()
                     .await
-                    .forget_stop_request(network, &request.work_id)?;
+                    .forget_stop_request(&request.work_id)?;
             } else if now_ms() >= request.deadline_ms {
                 request.timed_out = true;
-                self.store
-                    .lock()
-                    .await
-                    .save_stop_request(network, &request)?;
+                self.store.lock().await.save_stop_request(&request)?;
             } else {
                 continue;
             }
@@ -628,15 +623,14 @@ impl Runtime {
         event: Value,
     ) -> Result<()> {
         let method = event["method"].as_str().unwrap_or_default();
-        let records = self.store.lock().await.work_records(network)?;
+        let records = self.store.lock().await.work_records()?;
         match method {
             "bridge.codex_connected" => {
                 let epoch = self.store.lock().await.next_codex_epoch()?;
                 self.codex_epoch
                     .store(epoch, std::sync::atomic::Ordering::SeqCst);
                 for record in records.into_iter().filter(live) {
-                    if let Err(error) = self.probe_work(network, &record.spec.work_id, false).await
-                    {
+                    if let Err(error) = self.probe_work(network, &record.work_id, false).await {
                         tracing::debug!(%error, "work probe after reconnect failed");
                     }
                 }
@@ -647,7 +641,7 @@ impl Runtime {
                     .into_iter()
                     .filter(|r| r.state.handle().is_some() && live(r))
                 {
-                    self.signal_work(network, &record.spec.work_id, Signal::Disconnected)
+                    self.signal_work(network, &record.work_id, Signal::Disconnected)
                         .await?;
                 }
                 return Ok(());
@@ -661,7 +655,7 @@ impl Runtime {
     async fn route_turn_event(self: &Arc<Self>, network: &str, event: Value) -> Result<()> {
         let method = event["method"].as_str().unwrap_or_default();
         let params = &event["params"];
-        let records = self.store.lock().await.work_records(network)?;
+        let records = self.store.lock().await.work_records()?;
         let thread = params["threadId"].as_str();
         let turn = params["turnId"]
             .as_str()
@@ -673,10 +667,10 @@ impl Runtime {
         }) else {
             return Ok(());
         };
-        let work_id = record.spec.work_id.clone();
+        let work_id = record.work_id.clone();
         self.publish_progress(
             network,
-            json!({"type":"native_progress","conversation_id":record.spec.conversation,"work_id":work_id,
+            json!({"type":"native_progress","conversation_id":record.conversation,"work_id":work_id,
                 "target_node":self.identity.device_id()?,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 "progress":observation::native_progress(&event)}),
         );
@@ -729,11 +723,11 @@ impl Runtime {
                     _ => {}
                 }
                 node.triage_app_server(&event);
-                let networks = node.store.lock().await.networks().unwrap_or_default();
-                for network in networks {
-                    if let Err(error) = node.route_codex_event(&network, event.clone()).await {
-                        tracing::warn!(%error, "could not apply an App Server event");
-                    }
+                let network = node.store.lock().await.network().ok().flatten();
+                if let Some(network) = network
+                    && let Err(error) = node.route_codex_event(&network, event).await
+                {
+                    tracing::warn!(%error, "could not apply an App Server event");
                 }
             }
         });

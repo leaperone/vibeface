@@ -1,13 +1,13 @@
 //! Reads and local records for Node-to-Node sync: log ranges, heads, the signed address book,
 //! scheduler deliveries and resumable attachment downloads.
 use super::{
-    Store, local_load, local_prefix, local_save, log, message_from,
+    Store, log, message_from,
     scheduler::{admit_from, admit_work_result_from},
 };
 use crate::{
     model::*,
     net::{AddressRecord, SignedAddress},
-    scheduling::{AdmissionReceipt, SCHEDULING_VERSION, TriggerKind, scheduler_key},
+    scheduling::{AdmissionReceipt, SCHEDULING_VERSION, TriggerKind},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -15,8 +15,6 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 pub const MAX_PULL_EVENTS: usize = 1024;
 pub const MAX_PULL_BYTES: usize = 8 * 1024 * 1024;
-const ADDRESS_PREFIX: &str = "address:";
-const PARTIAL_PREFIX: &str = "blob-partial:";
 
 impl Store {
     /// `{author: (max_seq, head_hash)}`.
@@ -111,8 +109,12 @@ impl Store {
         Ok(events)
     }
 
-    pub fn address_book(&self, network: &str) -> Result<Vec<SignedAddress>> {
-        local_prefix(&self.connection, network, ADDRESS_PREFIX)
+    pub fn address_book(&self) -> Result<Vec<SignedAddress>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM addresses ORDER BY device_id")?;
+        let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
     /// Keeps the higher `seq` per device. Returns whether the stored record changed.
@@ -122,18 +124,33 @@ impl Store {
         record: &AddressRecord,
         signed: &SignedAddress,
     ) -> Result<bool> {
-        let key = format!("{ADDRESS_PREFIX}{}", record.device_id);
-        if let Some(existing) = local_load::<SignedAddress>(&self.connection, network, &key)?
-            && existing.open(network)?.seq >= record.seq
+        let existing: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM addresses WHERE device_id=?",
+                [&record.device_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing
+            && serde_json::from_str::<SignedAddress>(&existing)?
+                .open(network)?
+                .seq
+                >= record.seq
         {
             return Ok(false);
         }
-        local_save(&self.connection, network, &key, signed)?;
+        self.connection.execute(
+            "INSERT INTO addresses(device_id,record) VALUES(?,?) ON CONFLICT(device_id) DO UPDATE SET record=excluded.record",
+            params![record.device_id, serde_json::to_string(signed)?],
+        )?;
         Ok(true)
     }
 
-    pub fn forget_address(&mut self, network: &str, device_id: &str) -> Result<()> {
-        self.local_delete(network, &format!("{ADDRESS_PREFIX}{device_id}"))
+    pub fn forget_address(&mut self, device_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM addresses WHERE device_id=?", [device_id])?;
+        Ok(())
     }
 
     /// Whether `token` belongs to an invite registered here that can still be used.
@@ -148,15 +165,6 @@ impl Store {
             }
         }
         Ok(false)
-    }
-
-    pub fn remove_outbox(
-        &mut self,
-        network: &str,
-        conversation: &str,
-        trigger: &str,
-    ) -> Result<()> {
-        self.local_delete(network, &scheduler_key("outbox", conversation, trigger))
     }
 
     /// The owner admits a user message or a work result another Node holds. Idempotent by
@@ -264,20 +272,28 @@ impl Store {
     }
 
     /// Bytes of a download that were synced to disk; anything after this is discarded.
-    pub fn committed_offset(&self, network: &str, hash: &str) -> Result<u64> {
-        Ok(local_load(
-            &self.connection,
-            network,
-            &format!("{PARTIAL_PREFIX}{hash}"),
-        )?
-        .unwrap_or(0))
+    pub fn committed_offset(&self, hash: &str) -> Result<u64> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT committed FROM blob_offsets WHERE hash=?",
+                [hash],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
     }
 
-    pub fn commit_offset(&mut self, network: &str, hash: &str, offset: Option<u64>) -> Result<()> {
-        let key = format!("{PARTIAL_PREFIX}{hash}");
+    pub fn commit_offset(&mut self, hash: &str, offset: Option<u64>) -> Result<()> {
         match offset {
-            Some(offset) => local_save(&self.connection, network, &key, &offset),
-            None => self.local_delete(network, &key),
-        }
+            Some(offset) => self.connection.execute(
+                "INSERT INTO blob_offsets(hash,committed) VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET committed=excluded.committed",
+                params![hash, offset],
+            )?,
+            None => self
+                .connection
+                .execute("DELETE FROM blob_offsets WHERE hash=?", [hash])?,
+        };
+        Ok(())
     }
 }

@@ -1,6 +1,7 @@
 use super::{Access, Runtime, now_ms};
 use crate::model::WorkOutcome;
 use crate::scheduling::{JobState, PendingCheck};
+use crate::work::{Signal, WorkState};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::sync::{
@@ -43,7 +44,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .scheduler_job(&access.network_id, scope, trigger)?
+            .scheduler_job(scope, trigger)?
             .context("manager job missing")?;
         let attempt = job.state.attempt().context("manager attempt missing")?;
         ensure!(attempt.id == attempt_id, "manager attempt mismatch");
@@ -82,7 +83,6 @@ impl Runtime {
                 .as_ref()
                 .context("manager metadata missing")?;
             self.store.lock().await.fence_manager_permission(
-                &active.access.network_id,
                 active
                     .access
                     .conversation_id
@@ -147,12 +147,7 @@ impl Runtime {
             .as_deref()
             .context("missing management scope")?;
         ensure!(
-            store.manager_attempt_allowed(
-                &access.network_id,
-                scope,
-                &manager.trigger,
-                &manager.attempt_id,
-            )?,
+            store.manager_attempt_allowed(scope, &manager.trigger, &manager.attempt_id,)?,
             "management invocation permission is no longer valid"
         );
         Ok(())
@@ -181,86 +176,77 @@ impl Runtime {
         Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
-    /// Pending checks belong to this Node: an unconfirmed coordination process (`manager:`)
-    /// or a work whose real result cannot be proven (`work:`).
-    pub(super) async fn pending_check_control(
+    /// A coordination process left over from a crash is checked by its recorded process groups.
+    /// Once every group has exited the check resolves itself; an agent task waiting on it ends
+    /// as interrupted. Only a group that is still alive leaves a card for the user.
+    pub(super) async fn reconcile_checks(self: &Arc<Self>, network: &str) -> Result<()> {
+        let checks = self.store.lock().await.pending_checks()?;
+        for check in checks {
+            if check.process_groups.iter().any(|group| group_alive(*group)) {
+                continue;
+            }
+            self.close_check(network, &check).await?;
+            if let Some(work_id) = check.trigger.strip_prefix("task:")
+                && self
+                    .store
+                    .lock()
+                    .await
+                    .work_record(work_id)?
+                    .is_some_and(|record| {
+                        matches!(record.state, WorkState::Unverified { handle: None, .. })
+                    })
+            {
+                self.signal_work(network, work_id, Signal::ProcessExited)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn close_check(&self, network: &str, check: &PendingCheck) -> Result<()> {
+        self.fence_manager_attempt(&check.attempt_id).await?;
+        self.store
+            .lock()
+            .await
+            .resolve_pending_check(&check.attempt_id)?;
+        self.publish_changed(network, &check.conversation_id, &check.trigger);
+        Ok(())
+    }
+
+    /// The user's one tap on a card the Node could not settle: a coordination process they
+    /// confirm is stopped, or the signed result of an unverified work.
+    pub(super) async fn resolve_check(
         self: &Arc<Self>,
         access: &Access,
         input: &Value,
-        kind: &str,
     ) -> Result<Value> {
-        ensure!(access.human, "only the user reconciles pending checks");
+        ensure!(access.human, "only the user resolves pending checks");
         let scope = super::field(input, "conversation_id")?;
         let check_id = super::field(input, "check_id")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
         if let Some(work_id) = check_id.strip_prefix("work:") {
-            return self
-                .work_check_control(network, scope, work_id, input, kind)
-                .await;
+            return self.settle_work_check(network, scope, work_id, input).await;
         }
-        let check = self.local_pending_check(network, scope, check_id).await?;
-        let processes = process_groups(&check.process_groups).await;
-        if kind == "reconcile" {
-            return Ok(
-                json!({"check_id":check_id,"pending":true,"check":check,"process_groups":processes,
-                "note":"Exited process groups do not prove that detached tools or external side effects stopped."}),
-            );
-        }
-        let evidence = evidence(input)?;
-        let running = processes
-            .into_iter()
-            .filter(|group| group["exited"] != true)
-            .filter_map(|group| group["process_group"].as_u64())
-            .collect::<Vec<_>>();
-        ensure!(
-            running.is_empty(),
-            "process groups {running:?} are still running or cannot be checked; stop them before confirming"
-        );
-        self.fence_manager_attempt(&check.attempt_id).await?;
-        self.store
+        let check = self
+            .store
             .lock()
             .await
-            .resolve_pending_check(network, check_id, evidence)?;
-        self.publish_changed(network, scope, &check.trigger);
+            .pending_checks()?
+            .into_iter()
+            .find(|check| check.check_id == check_id && check.conversation_id == scope)
+            .context("pending check not found")?;
+        self.close_check(network, &check).await?;
         Ok(json!({"check_id":check_id,"resolved":true}))
     }
 
-    /// An unverified work result is checked again on the device that ran it; the user's choice
-    /// is signed and written by whichever entry they use.
-    async fn work_check_control(
+    async fn settle_work_check(
         self: &Arc<Self>,
         network: &str,
         scope: &str,
         work_id: &str,
         input: &Value,
-        kind: &str,
     ) -> Result<Value> {
-        let check_id = format!("work:{work_id}");
-        let work = self
-            .store
-            .lock()
-            .await
-            .works(network, scope)?
-            .into_iter()
-            .find(|work| work.work_id == work_id)
-            .context("work not found in this conversation")?;
-        if kind == "reconcile" {
-            if work.target_node != self.identity.device_id()? {
-                return self
-                    .peer_request(
-                        network,
-                        &work.target_node,
-                        json!({"type":"reconcile","conversation_id":scope,"check_id":check_id,"human":true}),
-                    )
-                    .await;
-            }
-            self.probe_work(network, work_id, true).await?;
-            let record = self.store.lock().await.work_record(network, work_id)?;
-            return Ok(
-                json!({"check_id":check_id,"pending":record.as_ref().is_none_or(|r| !r.state.finished()),"work":record}),
-            );
-        }
         let outcome = match super::field(input, "outcome")? {
             "completed" => WorkOutcome::Completed,
             "interrupted" => WorkOutcome::Interrupted,
@@ -273,31 +259,11 @@ impl Runtime {
             .store
             .lock()
             .await
-            .pending_checks(network)?
+            .pending_checks()?
             .into_iter()
             .find(|check| check.trigger == crate::scheduling::task_trigger(work_id));
         if let Some(check) = manager {
-            let running = process_groups(&check.process_groups)
-                .await
-                .into_iter()
-                .filter(|group| group["exited"] != true)
-                .filter_map(|group| group["process_group"].as_u64())
-                .collect::<Vec<_>>();
-            ensure!(
-                running.is_empty(),
-                "process groups {running:?} are still running or cannot be checked; stop them before confirming"
-            );
-            self.fence_manager_attempt(&check.attempt_id).await?;
-            let evidence = format!("{outcome:?}: {note}");
-            self.store.lock().await.resolve_pending_check(
-                network,
-                &check.check_id,
-                if note.is_empty() {
-                    "settled with the work's own check"
-                } else {
-                    &evidence
-                },
-            )?;
+            self.close_check(network, &check).await?;
         }
         let receipt = self.store.lock().await.settle_work(
             &self.identity,
@@ -311,51 +277,18 @@ impl Runtime {
         )?;
         self.publish_changed(network, scope, work_id);
         if receipt.is_some() {
-            self.spawn_scheduler(network, scope)?;
+            self.wake_scheduler()?;
         }
-        Ok(json!({"check_id":check_id,"resolved":true}))
-    }
-
-    async fn local_pending_check(
-        &self,
-        network: &str,
-        scope: &str,
-        check_id: &str,
-    ) -> Result<PendingCheck> {
-        let check = self
-            .store
-            .lock()
-            .await
-            .pending_check(network, check_id)?
-            .context("pending check not found")?;
-        ensure!(
-            check.conversation_id == scope,
-            "pending check belongs to another conversation"
-        );
-        Ok(check)
+        Ok(json!({"check_id":format!("work:{work_id}"),"resolved":true}))
     }
 }
 
-fn evidence(input: &Value) -> Result<&str> {
-    let evidence = super::field(input, "evidence")?;
-    ensure!(
-        (12..=4096).contains(&evidence.trim().len()),
-        "evidence must be 12 to 4096 bytes"
-    );
-    Ok(evidence)
-}
-
-/// Signal 0 only checks the recorded group; it never stops a group whose ID may have been reused.
-async fn process_groups(groups: &[u32]) -> Vec<Value> {
-    let mut result = Vec::new();
-    for group in groups {
-        let probe = tokio::process::Command::new("/bin/kill")
-            .args(["-0", "--", &format!("-{group}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        result.push(json!({"process_group":group,"exited":matches!(probe, Ok(status) if !status.success())}));
-    }
-    result
+/// Signal 0 only asks whether the recorded group still exists; it never signals the processes.
+fn group_alive(group: u32) -> bool {
+    let Ok(group) = libc::pid_t::try_from(group) else {
+        return false;
+    };
+    // SAFETY: kill with signal 0 performs only the existence and permission check.
+    let result = unsafe { libc::kill(-group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }

@@ -348,7 +348,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("this package needs a manual bootstrap to the updater-enabled release")?;
     ensure!(
-        manifest.update_protocol == 2 && manifest.data_epoch == 7,
+        manifest.update_protocol == 2 && manifest.data_epoch == crate::config::DATA_EPOCH,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
@@ -640,7 +640,7 @@ async fn prepare_sidecar(
     let Some(manager) = config.manager else {
         return Ok(());
     };
-    if manager.provider != "codex_sdk"
+    if manager.provider != crate::manager::ManagerKind::CodexSdk
         || !uses_bundled_sidecar(&manager.codex_sdk_script, root, previous)
     {
         return Ok(());
@@ -943,7 +943,10 @@ mod tests {
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":7}}"#),
+            format!(
+                r#"{{"version":"{version}","update_protocol":2,"data_epoch":{}}}"#,
+                crate::config::DATA_EPOCH
+            ),
         )
         .unwrap();
         directory
@@ -1013,7 +1016,10 @@ mod tests {
         assert!(manifest(&old).is_err());
         fs::write(
             old.join("BUILD-INFO.json"),
-            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":7}"#,
+            format!(
+                r#"{{"version":"1.0.0","update_protocol":1,"data_epoch":{}}}"#,
+                crate::config::DATA_EPOCH
+            ),
         )
         .unwrap();
         assert!(manifest(&old).is_err());

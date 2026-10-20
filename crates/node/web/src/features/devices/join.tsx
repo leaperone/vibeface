@@ -58,7 +58,7 @@ export function JoinCard({ request, auto = false }: { request: JoinRequest; auto
   return <ActionCard
     icon={deviceIcon({ kind: request.kind, name: request.name, entry: false })}
     tone="info"
-    title={`${request.name || "新设备"} 想加入`}
+    title={<span className="flex min-w-0"><span className="truncate" title={request.name || undefined}>{request.name || "新设备"}</span><span className="shrink-0">&nbsp;想加入</span></span>}
     meta={request.kind === "node" ? "电脑" : "浏览器"}
     actions={<>
       <Button type="button" variant="ghost" disabled={busy} onClick={() => void action.run("reject", () => device.rejectJoin(request.join_id), "已拒绝")}>拒绝</Button>

@@ -18,7 +18,7 @@ use vibeface::{
     identity::local::BootstrapCapability,
     local_access::Launcher,
     maintenance,
-    model::NodeRole,
+    manager::ManagerKind,
     net::{self, NetworkConfig, PublicEntry},
     runtime::Runtime,
     store::Store,
@@ -140,23 +140,6 @@ struct Serve {
     data: DataDir,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Manager {
-    #[value(name = "cursor_sdk")]
-    CursorSdk,
-    #[value(name = "codex_sdk")]
-    CodexSdk,
-}
-
-impl Manager {
-    fn provider(self) -> &'static str {
-        match self {
-            Self::CursorSdk => "cursor_sdk",
-            Self::CodexSdk => "codex_sdk",
-        }
-    }
-}
-
 #[derive(Args)]
 struct Init {
     #[command(flatten)]
@@ -180,7 +163,7 @@ struct Init {
     #[arg(long)]
     allow_insecure_lan: bool,
     #[arg(long, value_enum, requires = "workspace")]
-    manager: Option<Manager>,
+    manager: Option<ManagerKind>,
     #[arg(long, requires = "manager")]
     workspace: Option<PathBuf>,
     #[arg(long, requires = "manager")]
@@ -574,7 +557,7 @@ async fn status(options: Access) -> Result<()> {
             "{}",
             json!({
                 "status":state, "device_id":device_id, "data_dir":data,
-                "listen":configuration.listen, "roles":configuration.roles,
+                "listen":configuration.listen, "public_entry":configuration.public_entry,
                 "version":health.as_ref().ok().map(|health| &health.version),
                 "write_state":health.as_ref().ok().and_then(|health| health.write_state),
                 "peers":health.as_ref().ok().map(|health| &health.peers),
@@ -651,9 +634,6 @@ fn init(options: Init) -> Result<()> {
         ..NetworkConfig::default()
     };
     configuration.public_entry = options.public_entry;
-    if options.public_entry {
-        configuration.roles = vec![NodeRole::Relay];
-    }
     let entry_token = match &options.relay_token_file {
         Some(path) => Some(net::read_token_file(path)?),
         None => options.public_entry.then(|| random_hex(32)),
@@ -663,12 +643,12 @@ fn init(options: Init) -> Result<()> {
             .workspace
             .context("--manager requires --workspace")?;
         configuration.manager = Some(ManagerSettings {
-            provider: manager.provider().to_owned(),
+            provider: manager,
             workspace: workspace
                 .canonicalize()
                 .context("resolve manager workspace")?,
             model: options.model.unwrap_or_else(|| {
-                if matches!(manager, Manager::CursorSdk) {
+                if manager == ManagerKind::CursorSdk {
                     "auto".into()
                 } else {
                     String::new()
@@ -723,7 +703,10 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
     if let Some(token) = &entry_token {
         create_private(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
     }
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+    create_private(
+        &dir.join("data-epoch.json"),
+        &crate::config::data_epoch_marker(),
+    )?;
     println!("Initialized device with Peer ID {}", identity.device_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     if configuration.public_entry {
@@ -770,7 +753,7 @@ async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":7}),
+        epoch == json!({"data_epoch":crate::config::DATA_EPOCH}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
@@ -914,8 +897,7 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let write =
-        name == "dispatch_work" || vibeface::scheduler::SETTINGS_TOOLS.contains(&name.as_str());
+    let tool = vibeface::tools::Tool::parse(&name).context("unknown coordination tool")?;
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
@@ -926,14 +908,14 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     );
     let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
     ensure!(
-        !write || call_ref.is_some(),
+        !tool.needs_call_ref() || call_ref.is_some(),
         "{name} requires --call-ref; keep it and query call_lookup after any uncertain result"
     );
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);
     }
     let call_id = call_ref.unwrap_or_default();
-    let result = if name == "dispatch_work" {
+    let result = if tool == vibeface::tools::Tool::DispatchWork {
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET")
             .context("VIBEFACE_CODEX_SOCKET is required")?;
         vibeface::agent_cli::dispatch(
@@ -963,9 +945,9 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?
-        .post(url.join("api/tools")?)
+        .post(url.join(api::TOOL_PATH.trim_start_matches('/'))?)
         .bearer_auth(token)
-        .json(&json!({"name": name, "arguments": arguments}))
+        .json(&json!({"toolName": name, "args": arguments, "agentId": "cli"}))
         .send()
         .await
         .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
@@ -979,7 +961,8 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
             .unwrap_or_default();
         bail!("node tool rejected with HTTP {status}: {reason}; preserve call_ref {call_id}");
     }
-    serde_json::from_slice(&body).context("invalid node tool response")
+    let mut reply: Value = serde_json::from_slice(&body).context("invalid node tool response")?;
+    Ok(reply["result"].take())
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {

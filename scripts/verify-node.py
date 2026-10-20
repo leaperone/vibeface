@@ -510,7 +510,7 @@ class Node:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds: {result.stderr.decode(errors='replace')[-300:]}")
-        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 7},
+        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
         self.configure_network(bind=f"127.0.0.1:{self.port}")
@@ -733,6 +733,8 @@ def websocket_send(stream, value):
     websocket_send_frame(stream, json.dumps(value).encode())
 
 
+DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
+                           (Path(__file__).resolve().parents[1] / "crates/node/src/config.rs").read_text(), re.M)[1])
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"
 # Methods whose answer depends on fixture thread state; every other client request gets a canned answer.
 FIXTURE_STATEFUL = {"initialize", "thread/start", "thread/resume", "thread/read", "thread/turns/list", "thread/list",
@@ -1120,13 +1122,13 @@ def fixture_manager(arguments):
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
         environment = initial["tool_env"]
         request = urllib.request.Request(
-            environment["VIBEFACE_NODE_URL"] + "/api/tools",
-            json.dumps({"name": name, "arguments": arguments}).encode(),
+            environment["VIBEFACE_NODE_URL"] + "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+            json.dumps({"toolName": name, "args": arguments, "agentId": "fixture"}).encode(),
             {"Content-Type": "application/json", "Authorization": "Bearer " + environment["VIBEFACE_TOOL_TOKEN"]})
         started = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                value = None if discard else json.load(response)
+                value = None if discard else json.load(response)["result"]
             accepted = True
         except urllib.error.HTTPError as error:
             raw_error = error.read(16385)
@@ -1394,15 +1396,16 @@ def verify_recovery(node, other, network):
     return checkpoint
 
 
-def scheduler_records(node, network, kind="job"):
+def scheduler_records(node, network):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key LIKE ?",
-                                  (network, "scheduler:v2:" + kind + ":%"))
-        return [json.loads(row[0]) for row in rows]
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT * FROM scheduler_jobs").fetchall()
+    return [{**dict(row), "attempt": {"id": row["attempt_id"]} if row["attempt_id"] else None, "detail": row["detail"] or ""}
+            for row in rows]
 
 
-def scheduler_record(node, network, trigger, kind="job"):
-    return next((row for row in scheduler_records(node, network, kind) if row["trigger"] == trigger), None)
+def scheduler_record(node, network, trigger):
+    return next((row for row in scheduler_records(node, network) if row["trigger"] == trigger), None)
 
 
 def require_quiet(description, predicate):
@@ -1721,20 +1724,14 @@ def work_checks(run, workspace, a, network, passed):
     a.client.authenticate()
     lost = wait_for("an unreadable turn becomes unverified", lambda: in_state(name, work_id, "unverified"))
     check_id = "work:" + work_id
-    wait_for("the unverified work lists one pending check", lambda: any(
-        check["check_id"] == check_id and check["kind"] == "work" for check in snapshot(name)["pending_checks"]))
     require_quiet("an unverified work never reports or reruns", lambda:
         scheduler_record(a, network, "work:" + work_id) is None
         and len([row for row in rpc("thread/start") if row["message"]["params"]["cwd"] == str(directory)]) == 1)
-    reconciled = a.client.rpc("reconcile", conversation_id=name, check_id=check_id)
-    require(reconciled["pending"], "reconcile keeps an unreadable turn pending")
     a.client.rpc("resolve", conversation_id=name, check_id=check_id, outcome="interrupted",
                  note="Fixture thread was deleted; no file in the work directory changed.")
-    resolved = wait_for("the user's evidence settles the work", lambda: in_state(name, work_id, "finished"))
-    require(not any(check["check_id"] == check_id for check in snapshot(name)["pending_checks"]),
-            "resolution clears the pending check")
-    passed("an unreadable turn stays unverified until the user resolves it with evidence",
-           work_id=work_id, outcome=resolved["outcome"], evidence=lost.get("summary"))
+    resolved = wait_for("the user's choice settles the work", lambda: in_state(name, work_id, "finished"))
+    passed("an unreadable turn stays unverified until the user settles it",
+           work_id=work_id, outcome=resolved["outcome"], evidence=lost.get("failure_reason"))
 
     server = app_server()["pid"]
     require(alive(server), "the restarted App Server is running")
@@ -2202,17 +2199,9 @@ def phase1_acceptance(options):
             require(len(answer) == 1 and answer[0]["status"] == ("interrupted" if unconfirmed else "stopped")
                     and answer[0]["in_reply_to"] == cancelled["message_id"],
                     "the stopped turn becomes one assistant message marked with its status")
-            checks = conversation(name)["pending_checks"]
-            require([check["check_id"] for check in checks] == (["manager:" + stopped["attempt"]["id"]] if unconfirmed else []),
-                    "only an unconfirmed process exit registers a pending check")
-            if unconfirmed:
-                reconciled = a.client.rpc("reconcile", conversation_id=name, check_id=checks[0]["check_id"])
-                require(reconciled["process_groups"] and all(group["exited"] for group in reconciled["process_groups"]),
-                        "reconcile only probes the recorded manager process groups")
-                a.client.rpc("resolve", conversation_id=name, check_id=checks[0]["check_id"],
-                             evidence="Owned fixture sidecar exited; it started no tools or native turns.")
-                require(not conversation(name)["pending_checks"] and state(cancelled, "interrupted"),
-                        "resolve clears the check without changing or replaying the interrupted job")
+            wait_for("the Node settles the exited process without a card", lambda: not conversation(name)["checks"])
+            require(state(cancelled, terminal) and len(calls(name)) == 1,
+                    "reconciliation neither changes nor replays the stopped job")
             passed("management stop becomes " + terminal + " with a " + answer[0]["status"] + " reply",
                    trigger=cancelled["trigger"])
 
@@ -2230,18 +2219,10 @@ def phase1_acceptance(options):
         wait_for("queued trigger performs its first call after restart", lambda: completed(queued))
         require(stopped["attempt"]["id"] == old_attempt and len(calls(name, label="restart-running")) == 1
                 and len(calls(name, label="restart-queued")) == 1, "recovery keeps the original attempt and never replays it")
-        check_id = "manager:" + old_attempt
-        require([check["check_id"] for check in conversation(name)["pending_checks"]] == [check_id],
-                "an interrupted attempt registers one pending check without freezing later work")
-        reconciled = a.client.rpc("reconcile", conversation_id=name, check_id=check_id)
-        require(reconciled["process_groups"] and all(group["exited"] for group in reconciled["process_groups"]),
-                "reconcile reports the recorded process groups of the original attempt")
-        a.client.rpc("resolve", conversation_id=name, check_id=check_id,
-                     evidence="Owned fixture process terminated; original attempt admitted no business operations.")
-        require(not conversation(name)["pending_checks"] and state(interrupted, "interrupted")
-                and len(calls(name, label="restart-running")) == 1,
-                "resolution neither changes nor replays the original interrupted job")
-        passed("a crash interrupts the running attempt, registers one pending check and never replays it",
+        wait_for("the Node settles the crashed attempt's exited processes", lambda: not conversation(name)["checks"])
+        require(state(interrupted, "interrupted") and len(calls(name, label="restart-running")) == 1,
+                "reconciliation neither changes nor replays the original interrupted job")
+        passed("a crash interrupts the running attempt, reconciles its processes and never replays it",
                attempt_id=old_attempt)
 
         name = new_conversation("phase1-budget")
@@ -2541,9 +2522,8 @@ def scope_events(node, network, scope):
 
 def committed_blob_offset(node, network, digest):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        row = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key=?",
-                                 (network, "blob-partial:" + digest)).fetchone()
-    return json.loads(row[0]) if row else 0
+        row = connection.execute("SELECT committed FROM blob_offsets WHERE hash=?", (digest,)).fetchone()
+    return row[0] if row else 0
 
 
 def phase4_acceptance(options):
@@ -2591,6 +2571,10 @@ def phase4_acceptance(options):
 
     def works(client):
         return {row["work_id"]: row for row in client.rpc("conversation", conversation_id=conversation)["works"]}
+
+    def delivery(client, work_id):
+        rows = client.rpc("conversation", conversation_id=conversation)["deliveries"]
+        return next((row["state"] for row in rows if row["work_id"] == work_id), None)
 
     def work_in(client, work_id, *states):
         row = works(client).get(work_id)
@@ -2788,14 +2772,13 @@ def phase4_acceptance(options):
         c.stop(crash=True)
         stop = a.client.rpc("interrupt_work", conversation_id=conversation, work_id=lost)
         require(stop.get("waiting_for_device") and not stop["confirmed"], "a stop to an offline device waits for it")
-        require(works(a.client)[lost].get("stop") == {"waiting_for_device": True, "timed_out": False}, "the work shows the waiting stop")
-        timed = wait_for("the stop request times out", lambda: (lambda row: row if row.get("stop", {}).get("timed_out") else None)(
-            works(a.client)[lost]), timeout=60)
+        require(delivery(a.client, lost) == "stop_waiting", "the work shows the waiting stop")
+        wait_for("the stop request times out", lambda: delivery(a.client, lost) == "stop_timed_out", timeout=60)
         a.client.revoke(c.device_id, heads(a, network).get(c.device_id, 0))
         abandoned = wait_for("A abandons the revoked device's work", lambda: (lambda row: row if row["outcome"] == "abandoned" else None)(
             works(a.client)[lost]), timeout=60)
-        require("stop" not in abandoned, "the abandoned work drops its stop request")
-        passed("offline-stop-and-revoke", stop=timed["stop"], outcome=abandoned["outcome"])
+        require(delivery(a.client, lost) is None, "the abandoned work drops its stop request")
+        passed("offline-stop-and-revoke", stop="stop_timed_out", outcome=abandoned["outcome"])
 
         check_dir = folder("p4-check")
         r6a = send(a.client, "p4-m6a", {"label": "p4-m6a", "dispatch": {"label": "p4-check-done", "cwd": str(check_dir),
@@ -2818,10 +2801,6 @@ def phase4_acceptance(options):
         turns_before = len(codex_rpc(a, "turn/start"))
         for work_id in (done_id, not_id):
             wait_for("B hears of the unreadable work soon after A restarts", lambda: work_in(at_b, work_id, "unverified"), timeout=20)
-        checks = {row["check_id"] for row in at_b.rpc("conversation", conversation_id=conversation)["pending_checks"]}
-        require({"work:" + done_id, "work:" + not_id} <= checks, "entrance B lists both checks")
-        again = at_b.rpc("reconcile", conversation_id=conversation, check_id="work:" + done_id)
-        require(again["pending"], "checking again on the device stays undecided")
         at_b.rpc("resolve", conversation_id=conversation, check_id="work:" + done_id, outcome="completed", note="设备上已看到结果")
         a.client.rpc("resolve", conversation_id=conversation, check_id="work:" + not_id, outcome="interrupted")
         done_row = wait_for("the done choice settles", lambda: work_in(a.client, done_id, "finished"), timeout=60)
@@ -3236,7 +3215,7 @@ def phase5_acceptance(options):
         require(not any(secret in exported for secret in secrets) and "vibeface1" not in exported,
                 "the diagnostics export holds no capability, passphrase or invite")
         epoch = json.loads((a.directory / "data-epoch.json").read_text())["data_epoch"]
-        require(epoch == 7, "data epoch 7")
+        require(epoch == DATA_EPOCH, "data epoch matches the build")
         passed("logs-and-diagnostics-hold-no-secrets", logs=len(logs), data_epoch=epoch)
         report["status"] = "passed"
     except BaseException as error:
