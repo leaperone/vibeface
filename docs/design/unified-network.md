@@ -1,6 +1,8 @@
 # 统一网络、同步与身份设计
 
-状态为已实施。五期都在 PR #63 中完成，各期与本文的差异见第 8 节各期的实施记录，最终协议见 `docs/node-protocol.md`。2026-10-20 的设计审查（基线 `d685b9a`）提出的修订已并入正文和第五期实施记录，留到之后的项目列在第 10 节。本文以 `origin/main` 的 `1bdf6fd` 为现状，该提交已包含 #55（删除 Task，新增会话级 `set_autonomy`）和 #56（Node 的 `codex` 工具取代 `vibeface codex` 命令，并强制原生审批策略）。本文另外假定两项改动会先合入，即 #54 删除向后兼容，以及统一待核对（调度 job 不再有 `unknown` 和写冻结，只保留本机待核对记录）。文中的行数用 `wc -l` 在 `1bdf6fd` 上统计，标为“约”的数字是按函数范围估算的生产代码行数。第 9 节记录已经决定的事项。
+状态为已实施。五期都在 PR #63 中完成，各期与本文的差异见第 8 节各期的实施记录，最终协议见 `docs/node-protocol.md`。2026-10-20 的设计审查（基线 `d685b9a`）提出的修订已并入正文和第五期实施记录，留到之后的项目列在第 10 节。本文以 `origin/main` 的 `1bdf6fd` 为现状，该提交已包含 #55（删除 Task，新增会话级 `set_autonomy`）和 #56（Node 的 `codex` 工具取代 `vibeface codex` 命令，并强制原生审批策略）。本文另外假定两项改动会先合入，即 #54 删除向后兼容，以及统一待核对（调度 job 不再有 `unknown` 和写冻结，只保留本机待核对记录）。文中的行数用 `wc -l` 在 `1bdf6fd` 上统计，标为“约”的数字是按函数范围估算的生产代码行数。
+
+之后的直连 PR（`docs/design/agent-direct-app-server.md`）删除了会话自主度：`AutonomySet`、`off/report/continue` 和只读汇报轮都已不存在，协调 Agent 总是完全权限；Codex 的服务端请求交给协调 Agent 处理，需要本人时生成拍板卡片。下文提到自主度的地方是当时的设计。第 9 节记录已经决定的事项。
 
 ## 1. 目标与非目标
 
@@ -386,7 +388,7 @@ Attestation {
 | `WorkDispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind: codex \| task`、`cwd`、`prompt`、`continues?: work_id`、`parent?: work_id` | 目标 Node | 目标接纳时写入，此后才有进度。作者即目标，不另写 `target_node` |
 | `WorkProgress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写。`codex` 的 thread 和 turn 在 `running` 时随进度写入。`task` 路径的摘要由目标协调层给出 |
 | `WorkFinished` | `work_id`、`outcome`、`result_text`、`failure_reason?`，结果正文过长时放入 `blobs` | 目标 Node，`unverified` 的复核由入口 Node 写 | `outcome` 为 `completed`、`failed`、`interrupted` 或 `unverified` |
-| `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码 |
+| `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码；直连 PR 已删除 |
 | `NotificationAcked` | `notification_id`、`client_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
 | `AssistantChanged` | `change_id`、`cause`、`change` | 调度 Node | 本人在聊天里要求修改助手名称、说明、共用 skill 或例行任务，见 [在聊天中修改助手](assistant-config.md) |
 | `ContextCheckpoint` | `summary`、`covers: VersionVector` | 调度 Node | 保留现有类型，用于长会话的上下文压缩，`covered_heads` 改为版本向量 |
@@ -559,10 +561,10 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 两类工作共用以下授权规则：
 
-- 派发方必须处于一次正在运行、非只读的调度 attempt 中。该 attempt 由带 `Attestation` 的本人消息触发，或由当前会话 `AutonomySet` 为 `continue` 的自主后续触发。
-- 目标 Node 核对派发方是未撤销的成员 Node，核对触发链上的本人签名或自主授权，核对 `cwd` 位于目标 Node 自己 `config.json` 的 `roots` 中。
+- 派发方必须处于一次正在运行的调度 attempt 中。直连 PR 之后没有自主度，本人消息、工作结果和例行任务触发的轮次都能派发。
+- 目标 Node 核对派发方是未撤销的成员 Node，核对 `cwd` 位于目标 Node 自己 `config.json` 的 `roots` 中。
 - 重试保留原 `work_id` 和 `call_ref`。结果不明时向原目标查询，不改派到其他 Node。
-- 两边的协调 Agent 都不能加入或撤销设备，也不能修改 `AutonomySet`。
+- 两边的协调 Agent 都不能加入或撤销设备。
 
 直连 PR 之后每台设备只有一个协调角色（协调 Agent 加 Node 运行时），协调 Agent 的 Shell 完全访问本机，不再逐条审批。跨设备只有 `kind=task` 一种：把任务交给目标设备的协调 Agent，由它在本机直连 App Server。下表为现状：
 

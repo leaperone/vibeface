@@ -11,6 +11,9 @@
 - 协调 Agent 的 Shell 完全访问（`danger-full-access`、`approvalPolicy=never`），能写状态、跑 git 和 gh，直接经 socket 驱动本机 Codex。Node 不替它包装方法、不限制路径。
 - App Server 客户端覆盖全部方法。执行的命令、命令输出、diff 和改动文件列表只进状态，不在网页显示。
 - 分诊在 Node 完成，目的是节省 Grok Bot 额度。网页和 Grok Bot 可以互相替代。
+- 删除会话自主度（`AutonomySet`、`off/report/continue`、只读汇报轮和只读 sidecar 配置）。协调 Agent 总是完全权限。
+- Codex 发起的服务端请求没有固定策略：Node 挂起请求，交给协调 Agent 处理；需要本人拍板时，Agent 生成带选项的拍板卡片或转发 Grok Bot。
+- 网页不再透传 App Server 方法，只读状态摘要并送决定。
 
 ## 1. App Server 客户端
 
@@ -22,7 +25,7 @@
 | | `write` | 有副作用，连接中断时结果不明，不自动重发 |
 | | `hidden` | 客户端能发，但不经 Node 暴露给网页（文件读写、任意命令执行、凭证刷新） |
 | 服务端通知 | 归约类别 | 每个通知归入一个类别（线程、回合、条目、计划、推理摘要、用量、额度、账户、配置、技能、插件、MCP、应用、文件监视、进程、实时、警告等），由观察状态的归约函数处理 |
-| 服务端请求 | 回复策略 | 只回复本 Node 负责的工作线程上的请求，按策略立即回复并记录，见 1.2 |
+| 服务端请求 | 交给协调 Agent | Node 挂起请求并唤醒协调 Agent，由它回答或生成拍板卡片，见 1.2 |
 
 ### 1.1 观察状态
 
@@ -32,16 +35,24 @@
 
 ### 1.2 服务端请求
 
-工作线程用 `approvalPolicy=never` 启动，正常不会收到审批。仍可能到达的请求都要有确定的回复，避免回合挂起：
+工作线程用 `approvalPolicy=never` 启动，正常不会收到审批。仍可能到达的请求（Node 订阅的线程上的，或不属于任何线程的）由 bridge 交给 Node，Node 不按方法自动回复：
 
-| 请求 | 回复 |
+1. Node 给请求分配 `request_id`，挂起并记入 `node.log`（方法和线程，不含命令文本），然后作为 `needs_input` 事件（带 `request_id`）立即唤醒本机协调 Agent。事件只含方法、原因和问题，命令、补丁和路径不进事件。
+2. Agent 用 `vibeface codex requests` 查看挂起的请求（含完整参数），用 `vibeface codex respond <request_id> '<result-json>'` 回答。同一 `request_id` 只回答一次，重复调用返回第一次的结果。
+3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --choice '批准={"decision":"accept"}' ...` 生成拍板卡片。卡片挂住请求，不设超时；本人选一项即回答请求，忽略卡片等于拒绝。
+4. 没有配置协调 Agent、唤醒失败，或 Agent 120 秒内既没回答也没生成卡片时，Node 按方法给出确定的拒绝并记录：
+
+| 请求 | 兜底回复 |
 |---|---|
-| `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval`、`execCommandApproval`、`applyPatchApproval` | 批准。线程本来就是完全访问，批准不扩大权限 |
-| `item/tool/requestUserInput`、`mcpServer/elicitation/request` | 取消（没有人在场回答） |
-| `item/tool/call` | 返回失败，Node 不提供动态工具 |
+| `item/commandExecution/requestApproval`、`item/fileChange/requestApproval` | `decline` |
+| `execCommandApproval`、`applyPatchApproval` | `denied` |
+| `item/permissions/requestApproval` | 不授予任何权限 |
+| `item/tool/requestUserInput` | 空回答 |
+| `mcpServer/elicitation/request` | `cancel` |
+| `item/tool/call` | 返回失败 |
 | `account/chatgptAuthTokens/refresh`、`attestation/generate` | JSON-RPC 错误，Node 不持有凭证 |
 
-Node 只回复自己工作线程上的请求。终端里打开的会话、别的客户端发起的回合，即使 Node 订阅了观察，也留给原客户端回答。每次回复写入 `node.log` 一行（方法和决定，不含命令文本）。
+挂起的请求只在内存里，随 App Server 连接断开而作废。终端里打开的会话、别的客户端发起的回合，Node 没有订阅时留给原客户端回答。
 
 ## 2. 协调 Agent 直连
 
@@ -106,7 +117,7 @@ sequenceDiagram
 
 ### 2.5 观察和记录
 
-Node 对每个未结束工作的线程保持 `thread/resume` 订阅（重连后自动恢复），并只回复这些线程上的服务端请求（1.2）。进展写成 `WorkProgress` 事件，手机离线后也能看到：计划更新和阶段性说明写入，同一工作两次写入至少间隔 5 秒，摘要不变时不写。事件只含计划和说明文字，不含命令、输出和 diff。
+Node 对每个未结束工作的线程保持 `thread/resume` 订阅（重连后自动恢复），这些线程上的服务端请求交给协调 Agent（1.2）。进展写成 `WorkProgress` 事件，手机离线后也能看到：计划更新和阶段性说明写入，同一工作两次写入至少间隔 5 秒，摘要不变时不写。事件只含计划和说明文字，不含命令、输出和 diff。
 
 `interrupt_work` 由 Node 发 `turn/interrupt`，停止按钮不变。
 
@@ -120,21 +131,18 @@ Node 对每个未结束工作的线程保持 `thread/resume` 订阅（重连后�
 
 其余 App Server 操作（插话、读线程、模型列表、review、fork 等）都用 `vibeface codex`，Node 不再提供 `codex`、`steer_work` 这类包装工具。
 
-Codex SDK sidecar 的协调回合用 `sandboxMode=danger-full-access`、`approvalPolicy=never`，不再用 `vibeface_manager` 权限配置。只读的结果汇报回合保留该配置（只读文件系统、仅回环网络）。
+Codex SDK sidecar 的协调回合总是用 `sandboxMode=danger-full-access`、`approvalPolicy=never`，没有只读回合和 `vibeface_manager` 权限配置。
 
 ## 3. 网页的会话控制
 
-网页通过所连 Node 的 RPC 操作任一设备上的 Codex，`node` 参数指向另一台设备时，Node 经成员连接转发（对方要求 `human=true`）。三者都只接受本人令牌。
+网页不调用 App Server 方法，只读状态摘要并送决定。`node` 参数指向另一台设备时，Node 经成员连接转发（对方要求 `human=true`）。两者都只接受本人令牌。
 
 | RPC | 作用 |
 |---|---|
-| `codex {node?, method, params}` | 调用表中非 `hidden` 的客户端请求，结果经 `sanitize`；写方法结果不明时报错，不重发 |
-| `codex_state {node?, thread_id?}` | 观察状态快照，经 `sanitize`；给 `thread_id` 时 `threads` 只含该线程 |
-| `send_decision {node?, thread_id, text, decision_id, model?, effort?, images?}` | 见第 5 节；返回 `{decision_id, thread_id, status, mode?, turn_id?, reason?}`，`status` 为 `delivered`、`unknown` 或 `rejected` |
+| `codex_state {node?}` | 返回 `{connection, threads: [{thread_id, name, status, cwd, plan, reasoning, token_usage}], rate_limits}`，不含命令、输出和 diff |
+| `send_decision {node?, thread_id, decision_id, text?, alert_id?, choice?, model?, effort?, images?}` | 见第 5 节；返回 `{decision_id, thread_id, status, mode?, turn_id?, reason?}`，`status` 为 `delivered`、`unknown` 或 `rejected` |
 
-`codex_state` 的键：`connection`、`threads`、`pending_requests`、`account`、`rate_limits`、`mcp`、`apps`、`skills_changed_at_ms`、`warnings`、`events`、`hidden`、`reads`、`replies`。
-
-页面提供：续接已有会话（`thread/list`、`thread/read`）、插话、选模型和推理强度、附图片、计划和推理摘要、token 用量与额度、review、fork、回退、压缩、重命名、归档，以及技能、插件、MCP 的状态与管理。
+续接会话、review、fork、模型和技能管理等操作交给协调 Agent 用 `vibeface codex` 完成。
 
 ## 4. 分诊
 
@@ -164,22 +172,23 @@ Codex SDK sidecar 的协调回合用 `sandboxMode=danger-full-access`、`approva
 
 判断留在协调 Agent 里，Node 不写规则。Node 只做不花 token 的确定性工作：收事件、去重、排队、按 Agent 的决定路由和投递。
 
-- 新事件进入本机待处理队列。每 20 秒最多唤醒一次本机协调 Agent，把它还没见过的事件（最多 20 条）交给它，新会话，带完整 Shell。`test=true` 的事件只确认收到，不入队。
+- 新事件进入本机待处理队列。每 20 秒唤醒一次本机协调 Agent（有挂起的服务端请求时立即唤醒），把待处理事件（最多 20 条）交给它，新会话，带完整 Shell。这一轮结束后，它没处理的事件直接丢弃，没回答也没生成卡片的请求按兜底回复。`test=true` 的事件只确认收到，不入队。
 - Agent 用 Shell 命令回答：
   - `vibeface triage events [--since <毫秒>]`：列出待处理事件（JSON）。
-  - `vibeface triage raise --event-id <ID> --severity info|attention|urgent --summary <一句话> --matter <键>`：需要本人看。
+  - `vibeface triage raise --event-id <ID> --severity info|attention|urgent --summary <一句话> --matter <键> [--thread <线程>] [--request-id <ID>] [--choice '<标签>=<json>']...`：需要本人看。`--thread` 是决定送往的 Codex 线程，缺省取事件的会话；`--choice` 可重复，最多 8 个，值不是 JSON 时按字符串；`--request-id` 让卡片挂住该请求，此时必须给选项。
+  - `vibeface codex requests`、`vibeface codex respond <request_id> '<result-json>'`：查看和回答挂起的服务端请求（1.2），也走 `/api/triage`。
   - `vibeface triage dismiss --event-id <ID>`：静默处理。
 - 命令走本机监听器的 `/api/triage`，边界与 `/api/hooks` 相同。唤醒时 Node 把本机监听器地址放进 `VIBEFACE_TRIAGE_URL`。
-- 没有配置协调 Agent 时，事件留在本机队列，不转发；7 天后与去重记录一起过期。
+- 没有配置协调 Agent 时，事件直接丢弃，不排队也不过期；服务端请求立即按兜底回复。
 
-`raise` 和 `dismiss` 按 `event_id` 幂等，重复调用返回第一次的结果。同一 `matter` 在 30 分钟内再次 `raise` 时只把计数加一，严重度升高才再次送出，这是确定性去重，不是判断。
+`raise` 和 `dismiss` 按 `event_id` 幂等，重复调用返回第一次的结果。同一 `matter` 在 30 分钟内再次 `raise` 时只把计数加一，严重度升高才再次送出，这是确定性去重，不是判断。挂住请求的卡片不参与合并，总是单独送出。
 
 ### 4.3 出口
 
 出口按项目选择：`config.json` 的 `triage.projects` 按 `cwd` 前缀匹配，最长前缀优先，没有匹配时用 `triage.default_outlet`。取值为 `record`、`webhook`、`both`、`off`。
 
-- **record**：写一条 `AttentionRaised` 事件，作用域为 `attention`，随 DAG 同步到所有设备，网页的“待处理”显示成卡片。本人发送决定或忽略后，浏览器签名写 `AttentionResolved`。
-- **webhook**：HMAC 签名 POST 到 `triage.webhook_url`。请求头 `X-Vibeface-Event-Id`、`X-Vibeface-Timestamp`（Unix 秒）、`X-Vibeface-Signature: v1=<hex>`，签名为 `HMAC-SHA256(key, timestamp + "." + body)`。正文含 `event_id`、`alert_id`、`matter`、`severity`、`summary`、`count`、完整事件，以及 Codex 会话的 `decision: {url, device_id, thread_id}`。接收方应拒绝 5 分钟以外的时间戳，并按 `event_id` 去重。发件箱存在本机 SQLite（不同步）：2xx 记为已送达；408、429 和 5xx 退避重试（10 秒起翻倍），最多 8 次后进入死信；其他 4xx 直接死信。同一 `event_id` 只入队一次。
+- **record**：写一条 `AttentionRaised` 事件，作用域为 `attention`，随 DAG 同步到所有设备，网页的“待处理”显示成卡片。事件带可选的 `thread_id`、`request_id` 和选项标签 `choices: [{label}]`；每个选项要送的 JSON 只存在生成卡片的设备上，不进 DAG。决定送达后由该设备的 Node 写 `AttentionResolved{decided}`；本人忽略时浏览器签名写 `AttentionResolved{dismissed}`。
+- **webhook**：HMAC 签名 POST 到 `triage.webhook_url`。请求头 `X-Vibeface-Event-Id`、`X-Vibeface-Timestamp`（Unix 秒）、`X-Vibeface-Signature: v1=<hex>`，签名为 `HMAC-SHA256(key, timestamp + "." + body)`。正文含 `event_id`、`alert_id`、`matter`、`severity`、`summary`、`count`、完整事件，`request_id`、`choices: [{index, label}]`，以及有线程时的 `decision: {url, device_id, thread_id, alert_id}`。接收方应拒绝 5 分钟以外的时间戳，并按 `event_id` 去重。发件箱存在本机 SQLite（不同步）：2xx 记为已送达；408、429 和 5xx 退避重试（10 秒起翻倍），最多 8 次后进入死信；其他 4xx 直接死信。同一 `event_id` 只入队一次。
 
 密钥只存在数据目录的 `triage-webhook.key`（0600），不进 `config.json`、DAG、日志和诊断包。网页只能设置或清除，读不回来。
 
@@ -193,20 +202,20 @@ Codex SDK sidecar 的协调回合用 `sandboxMode=danger-full-access`、`approva
 | `create_decision_token` | `{label}` | `{token_id, token, label, created_ms}`，`token` 只在这里出现一次 |
 | `revoke_decision_token` | `{token_id}` | `{revoked}` |
 
-卡片经 `rpc` 读写：`alerts` 返回 `{alerts: [{alert_id, matter, agent, session_id, turn_id?, cwd, severity, summary, count, node, created_at_ms, resolution}]}`，未处理的在前；`resolve_alert {alert_id, resolution: decided|dismissed, attestation}` 写 `AttentionResolved`，签名的作用域是 `attention`。
+卡片经 `rpc` 读写：`alerts` 返回 `{alerts: [{alert_id, matter, agent, session_id, thread_id?, request_id?, choices: [{label}], turn_id?, cwd, severity, summary, count, node, created_at_ms, resolution}]}`，未处理的在前；`resolve_alert {alert_id, resolution: decided|dismissed, attestation}` 写 `AttentionResolved`，签名的作用域是 `attention`。
 
 ## 5. 送决定回会话
 
-一个接口，网页和 Grok Bot 共用。`send_decision` 的步骤：
+一个接口，网页和 Grok Bot 共用。带 `alert_id` 和 `choice` 时按卡片的选项处理：卡片挂着服务端请求时，用该选项的 JSON 回答请求（`mode=answer`），不发消息；否则把选项标签当作文本发送。送达后 Node 把卡片记为 `decided`。`send_decision` 的步骤：
 
-1. 按 `decision_id` 查本机日志。已送达直接返回原结果；文本不同则拒绝。
+1. 按 `decision_id` 查本机日志。已送达直接返回原结果；文本不同则拒绝。回答请求的决定不回读，同一 `decision_id` 返回第一次的结果。
 2. 记为发送中，`thread/resume`。
 3. 有进行中的回合时 `turn/steer`（`expectedTurnId`），否则 `turn/start`。两者都带 `clientUserMessageId=decision_id`。
 4. 回读线程，找到 `clientId=decision_id` 的用户消息才算送达。
 
 发送结果不明时返回 `unknown`，再次调用同一 `decision_id` 只回读，不重发。
 
-Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, thread_id, text, decision_id}`。公共入口不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备通过 `--entry` 连在入口的 relay 上）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机会话，其他设备的转给目标。令牌错误返回 401。
+Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, thread_id, decision_id, text?, alert_id?, choice?}`，`text` 与 `choice` 二选一。公共入口不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备通过 `--entry` 连在入口的 relay 上）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机会话，其他设备的转给目标。令牌错误返回 401。
 
 这替代了 Leo 方案里的 `codex-ws-proxy` 和 frpc。原方案把 App Server 的控制 socket 以明文 `ws://` 暴露在公网，持有 Bearer 的一方能调用 App Server 的全部方法。现在公网只有 TLS 之后的一个窄接口，令牌只能送决定；上行改为 Node 签名推送，Grok Bot 不再需要本机 Shell 读 jsonl 和每 3 小时巡检。
 
@@ -229,9 +238,13 @@ vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 - 执行层：`Executor` trait、`CodexExecutor`、`ExecutorHost`（改为 `runtime/codex_server.rs` 的 `CodexServer`）、Node 的 `start_work`、`start_thread`、`start_turn`、`answer`、路径限制。
 - `model::Executor` 改为 `WorkKind { codex, task }`，工作字段 `executor` 改为 `kind`；节点能力里的 `executor` 改为 `codex`。
 - 网页的审批卡片和表单（网页另行处理）。
+- 自主度：`AutonomySet` 事件、`autonomy` 表与投影、`set_autonomy` RPC、`off/report/continue`、只读汇报轮、`ManagerAttempt.read_only`、sidecar 的只读配置与只读工具集。
+- 服务端请求的固定回复策略（`methods::reply`、`bridge.codex_replied`）。
+- 网页的 `codex` 透传 RPC，`codex_state` 改为状态摘要。
+- 分诊的 `offered` 记录和待处理事件的 7 天过期。
 - 到“执行层”的跨设备派发：跨设备只有协调 Agent 之间的 `task`。
 
 ## 8. 验证
 
-- Rust：方法表覆盖测试、归约函数对每类通知的测试、服务端请求策略、`sanitize`、`track_work` 只允许发送一次、`clientId` 对账、决定日志幂等、HMAC 签名、发件箱重试和死信、`event_id` 去重、hook 安装只追加。
+- Rust：方法表覆盖测试、归约函数对每类通知的测试、服务端请求的兜底回复、Agent 回答挂起请求、无 Agent 时拒绝并记录、选项决定只回答一次、自主度已删除、`sanitize`、`track_work` 只允许发送一次、`clientId` 对账、决定日志幂等、HMAC 签名、发件箱重试和死信、`event_id` 去重、hook 安装只追加。
 - 夹具：`scripts/verify-node.py` 的 App Server 夹具按方法名单实现全部客户端请求，启动时核对名单。`--chat-agent` 覆盖直连派发、插话、对账、分诊与 webhook、决定回送；`--public-entry` 覆盖经入口送决定；`--phase4` 覆盖跨设备 Agent 任务。CI 不调用真实 Provider。
