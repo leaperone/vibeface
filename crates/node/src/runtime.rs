@@ -281,6 +281,7 @@ impl Runtime {
         }
         self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
+        self.align(&network).await;
         self.wake_sync_all();
         Ok(view)
     }

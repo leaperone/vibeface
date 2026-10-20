@@ -32,6 +32,8 @@ pub(super) struct PeerSync {
     /// The last pair of differing fork digests that woke a sync, so evidence one side cannot
     /// store does not keep both waking each other.
     forks: Option<String>,
+    /// This boot has seen the peer hold nothing of this device's log beyond ours.
+    confirmed: bool,
 }
 
 #[derive(Clone)]
@@ -594,7 +596,6 @@ impl Runtime {
                 })
                 .map(|member| member.device_id.clone())
                 .collect();
-            let members = Arc::new(peers.clone());
             for peer in peers {
                 {
                     let mut states = self.sync_peers.lock().expect("sync peers");
@@ -607,36 +608,35 @@ impl Runtime {
                 }
                 let node = self.clone();
                 let network = network.clone();
-                let members = members.clone();
                 tokio::spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
-                    if result.is_err() && node.unreachable(&members, &peer) {
-                        node.set_write_state(
-                            &network,
-                            &[WriteState::Aligning],
-                            WriteState::ReadOnly,
-                        )
-                        .await;
-                    }
-                    let mut states = node.sync_peers.lock().expect("sync peers");
-                    let entry = states.entry(peer.clone()).or_default();
-                    entry.running = false;
-                    match &result {
-                        Ok(()) => {
-                            entry.failures = 0;
-                            entry.synced_ms = Some(now_ms());
-                            entry.due = Some(Instant::now() + HELLO_INTERVAL);
+                    let rerun = {
+                        let mut states = node.sync_peers.lock().expect("sync peers");
+                        let entry = states.entry(peer.clone()).or_default();
+                        entry.running = false;
+                        match &result {
+                            Ok(()) => {
+                                entry.failures = 0;
+                                entry.synced_ms = Some(now_ms());
+                                entry.due = Some(Instant::now() + HELLO_INTERVAL);
+                            }
+                            Err(error) => {
+                                entry.failures = entry.failures.saturating_add(1);
+                                let wait = Duration::from_secs(1 << entry.failures.min(5));
+                                entry.due = Some(Instant::now() + wait.min(RETRY_LIMIT));
+                                tracing::debug!(%peer, %error, "sync with peer pending");
+                            }
                         }
-                        Err(error) => {
-                            entry.failures = entry.failures.saturating_add(1);
-                            let wait = Duration::from_secs(1 << entry.failures.min(5));
-                            entry.due = Some(Instant::now() + wait.min(RETRY_LIMIT));
-                            tracing::debug!(%peer, %error, "sync with peer pending");
+                        let rerun = std::mem::take(&mut entry.rerun);
+                        if rerun {
+                            entry.due = Some(Instant::now());
                         }
+                        rerun
+                    };
+                    if result.is_err() {
+                        node.align(&network).await;
                     }
-                    if std::mem::take(&mut entry.rerun) {
-                        entry.due = Some(Instant::now());
-                        drop(states);
+                    if rerun {
                         node.sync_wakeup.notify_one();
                     }
                 });
@@ -745,12 +745,30 @@ impl Runtime {
         states.get(peer).is_some_and(|state| state.failures > 0)
     }
 
-    /// Whether every other member Node has failed since boot, counting this failure of `peer`.
-    fn unreachable(&self, members: &[String], peer: &str) -> bool {
-        let states = self.sync_peers.lock().expect("sync peers");
-        members.iter().all(|member| {
-            member == peer || states.get(member).is_some_and(|state| state.failures > 0)
-        })
+    /// Writable once every other current member Node has confirmed this device's log since
+    /// boot; read-only, until the user confirms, once every one that has not is failing.
+    pub(super) async fn align(&self, network: &str) {
+        let Ok((_, peers)) = self.member_peers().await else {
+            return;
+        };
+        let unconfirmed: Vec<u32> = {
+            let states = self.sync_peers.lock().expect("sync peers");
+            peers
+                .iter()
+                .filter_map(|peer| match states.get(peer) {
+                    Some(state) if state.confirmed => None,
+                    state => Some(state.map_or(0, |state| state.failures)),
+                })
+                .collect()
+        };
+        if unconfirmed.is_empty() {
+            let from = [WriteState::Aligning, WriteState::ReadOnly];
+            self.set_write_state(network, &from, WriteState::Writable)
+                .await;
+        } else if unconfirmed.iter().all(|failures| *failures > 0) {
+            self.set_write_state(network, &[WriteState::Aligning], WriteState::ReadOnly)
+                .await;
+        }
     }
 
     /// Starting up with other member Nodes, this one waits to learn it holds every event it
@@ -775,9 +793,9 @@ impl Runtime {
         Ok(state == WriteState::Writable)
     }
 
-    /// Compares what `peer` holds of this device's log with ours. A different event at the
-    /// same sequence means another copy of this data directory wrote it: that copy is kept
-    /// aside beside ours, and this Node stops writing.
+    /// Compares what `peer` holds of this device's log with ours, after the walk-back pulled any
+    /// branch it has. A different event at the same sequence means another copy of this data
+    /// directory wrote it: that copy is kept aside beside ours, and this Node stops writing.
     async fn check_own_log(
         &self,
         network: &str,
@@ -785,30 +803,20 @@ impl Runtime {
         vector: &BTreeMap<String, (u64, String)>,
     ) -> Result<()> {
         let own = self.identity.device_id()?;
-        let theirs = vector.get(&own);
         let local = self.local_seq(network, &own).await?;
-        let ours = match theirs {
-            Some((seq, _)) if *seq <= local => {
-                self.store.lock().await.hash_at(network, &own, *seq)?
+        let confirmed = match vector.get(&own) {
+            None => true,
+            Some((seq, hash)) => {
+                *seq <= local
+                    && self
+                        .store
+                        .lock()
+                        .await
+                        .hash_at(network, &own, *seq)?
+                        .as_ref()
+                        == Some(hash)
             }
-            _ => None,
         };
-        if let Some((seq, hash)) = theirs
-            && *seq <= local
-            && ours.as_deref() != Some(hash)
-        {
-            let reply = self
-                .net()?
-                .request(
-                    peer,
-                    net::SYNC,
-                    &json!({"type":"pull","network_id":network,"author":own,"from_seq":seq,"limit":1}),
-                    PEER_TIMEOUT,
-                )
-                .await?;
-            let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
-            self.ingest(network, &events).await?;
-        }
         if self.store.lock().await.has_conflicts_by(network, &own)? {
             let from = [
                 WriteState::Aligning,
@@ -821,10 +829,14 @@ impl Runtime {
             {
                 tracing::warn!(%peer, "another copy of this device wrote different events; writes stopped");
             }
-        } else if theirs.is_none_or(|(seq, _)| *seq <= local) {
-            let from = [WriteState::Aligning, WriteState::ReadOnly];
-            self.set_write_state(network, &from, WriteState::Writable)
-                .await;
+        } else if confirmed {
+            self.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.to_owned())
+                .or_default()
+                .confirmed = true;
+            self.align(network).await;
         }
         Ok(())
     }
@@ -1737,6 +1749,64 @@ mod tests {
         assert!(!forks.is_empty());
         assert_eq!(evidence(&q)?, (stored, effective, forks));
         Ok(())
+    }
+
+    /// Writes wait until every other member Node has confirmed this device's log since boot.
+    /// With the unconfirmed ones failing the Node turns read-only; a confirmation completing
+    /// the set, or revoking the Node still missing, lets it write.
+    #[tokio::test]
+    async fn alignment_waits_for_every_member_node_to_confirm() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Revocation};
+        let (ia, ib, ic) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let (b, c) = (ib.device_id()?, ic.device_id()?);
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, b.clone(), c.clone()])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            assert!(!a.align_on_start().await?);
+            let mark = |peer: &str, confirmed: bool| {
+                let mut states = a.sync_peers.lock().expect("sync peers");
+                let entry = states.entry(peer.into()).or_default();
+                entry.confirmed = confirmed;
+                entry.failures = u32::from(!confirmed);
+            };
+            let now = || *a.write_state.borrow();
+            mark(&b, true);
+            a.align(&network).await;
+            assert_eq!(now(), WriteState::Aligning, "c has not answered yet");
+            mark(&c, false);
+            a.align(&network).await;
+            assert_eq!(now(), WriteState::ReadOnly);
+            mark(&c, true);
+            a.align(&network).await;
+            assert_eq!(now(), WriteState::Writable);
+
+            a.set_write_state(&network, &[WriteState::Writable], WriteState::Aligning)
+                .await;
+            mark(&c, false);
+            let mut next = state.clone();
+            next.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Revocation::new(&c, None)?,
+            )?)?;
+            a.install_membership(next).await?;
+            assert_eq!(
+                now(),
+                WriteState::Writable,
+                "a revoked Node no longer counts"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(a);
+        let _ = std::fs::remove_dir_all(dir);
+        result
     }
 
     #[tokio::test(flavor = "multi_thread")]

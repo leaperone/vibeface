@@ -27,7 +27,7 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
     <Button type="button" variant="ghost" onClick={() => setWaiting(true)}>是，先同步</Button>
     <ActionButton variant="default" action={() => workspace.confirmWritable()}>不是，继续使用</ActionButton>
   </>}>
-    <p className="text-muted-foreground">{waiting ? "打开你的其他设备，连上后会自动对齐，然后就能写。" : "你的其他设备都连不上，这台设备先只读。"}</p>
+    <p className="text-muted-foreground">{waiting ? "打开你的其他设备，连上后会自动对齐，然后就能写。" : "还有其他设备连不上，没法确认，这台设备先只读。"}</p>
   </ActionCard>
   const conflicts = workspace.writeState.conflicts
   const authors = [...new Set(conflicts.map((item) => item.author))]
