@@ -757,7 +757,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 文档：重写 `docs/node-protocol.md`，README、`docs/install.md`、`docs/node.md`、`docs/releasing.md` 和 `docs/ci.md` 按实现更新，新增 `docs/troubleshooting.md`。`docs/peer-id-migration.md` 在此前已删除。整理文档时发现 `install.sh` 仍只接受 epoch 6 的包，一并改为 7。
 - 核对方式：`verify-node.py --phase5` 用两台真实 Node 进程（A，以及运行 relay 的 B）覆盖：从备份恢复的 A 在对齐前拒绝写入，对齐后拉回自己的日志且没有分叉；B 离线时 A 保持只读，本人确认后才写；复制 A 的数据目录并运行后，副本在 B 处分叉，只有副本停写并列出冲突，原 A 与 B 继续写；`status` 的对端行；`node.log` 的权限与内容；日志和诊断包中没有 capability、恢复口令和邀请。`--public-entry` 覆盖浏览器经入口加入和对话、入口重启后重连、错误令牌被 relay 拒绝，以及入口不存事件和附件。`--phase4` 增加经新入口按二进制下载 64 MiB 附件并核对哈希。扩展 CI 中 Linux x64 运行默认、`--phase1`、`--phase4` 和 `--public-entry`，macOS ARM64 运行 `--chat-agent` 和 `--phase5`。
 - 未按原标准核对的项：“三平台制品通过多进程验收”中 Linux ARM64 只启动网页进程，多进程业务验收在 Linux x64 和 macOS ARM64 各跑一部分。备份恢复用停机复制数据目录模拟，没有用文件系统快照工具。
-- 验收中修复的网页问题：会话负责人尚未接收的消息（入口回执 `pending_delivery`）让会话页报“设备返回的内容缺少文字”，原因是调度列表的解析器要求 job 带 `kind` 和 `sequence`，这两个字段网页并不使用，已删除；返回会话时视图停在最早的消息，原因是 `MessageScroller` 对齐第一个尚未对齐的锚点，现在只有最新一条本人消息是锚点。
+- 验收中修复的网页问题：会话负责人尚未接收的消息（入口回执 `pending_delivery`）让会话页报“设备返回的内容缺少文字”，原因是调度列表的解析器要求 job 带 `kind` 和 `sequence`，这两个字段网页并不使用，已删除；返回会话时视图停在最早的消息，原因是 `MessageScroller` 对齐第一个尚未对齐的锚点，现在只有最新一条本人消息是锚点。任务停止后抽屉的“结果”显示最后一条进度“正在停止”，审批答完后抽屉仍写“等你处理”，两者都来自过时的进度，现在结果只取结果文字或失败原因，没有待答审批时不显示“等你处理”。
 - 设计审查（2026-10-20，基线 `d685b9a`）后的修订。本期处理以下各项，其余按用户决定列在第 10 节：
   - R1：代码中 `Attestation` 已覆盖 domain、`network_id`、`scope_id` 和 body（`crates/secure/src/join.rs` 的 `attestation_payload`），5.1 节按代码改写。
   - R7：代码中 relay 令牌由登记的 `invite_hash` 派生，发邀请 Node 自己的 relay 能核对，只是文档写成了由 secret 派生，4.1 节按代码改写。其他 Node 的 relay 仍不认这个令牌，所以 ticket 写明发邀请 Node 自己的 relay。

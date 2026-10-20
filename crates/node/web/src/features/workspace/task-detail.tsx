@@ -38,7 +38,8 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
     if (fresh && fresh.work !== workId) void navigate({ to: "/b/$botId/work/$workId", params: { botId, workId: fresh.work } })
   }, [waiting.map((item) => item.key).join()])
   const answered = work?.answered_approvals ?? []
-  const result = work?.result_text || work?.failure_reason || work?.summary || ""
+  // The last progress line is stale once a task ends, so it never stands in for a result.
+  const result = work?.result_text || work?.failure_reason || ""
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
 
   return <aside aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background md:static md:z-auto md:w-[420px] md:shrink-0 md:border-l">
@@ -50,7 +51,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
       {device ? <p className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</p> : null}
-      {progress?.status && taskActive(state) && state !== "waiting_approval" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
+      {progress?.status && taskActive(state) && state !== "waiting_approval" && progress.status !== "awaiting_input" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
       {work.open_approvals.map((request) => <ApprovalCard key={request.request_id} work={work} request={request} stoppable={false} />)}
       {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">结果</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}
