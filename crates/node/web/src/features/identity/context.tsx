@@ -539,7 +539,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       throw failure
     }
     if (status.status === 'joined') {
-      if (pin?.network_id !== status.network_id) throw new Error('加入结果与核对安全码时的个人网络不一致。')
+      if (pin?.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。请重新生成加入链接。')
       const state = record(await request('join_status', { join_id: pending.join_id })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error('加入结果没有包含此浏览器。') })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
