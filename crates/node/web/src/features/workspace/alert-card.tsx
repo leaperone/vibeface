@@ -20,6 +20,7 @@ const looks: Record<Severity, { icon: LucideIcon; tone: Tone }> = {
 const agents: Record<string, string> = { codex: "Codex", claude: "Claude Code" }
 type Answer = { text: string } | { choice: number }
 const same = (a: Answer, b: Answer) => JSON.stringify(a) === JSON.stringify(b)
+const project = (cwd: string) => cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd
 
 /** A triaged session waiting on the person: fixed choices, a short reply, or dismiss. Commands and diffs never show here. */
 export function AlertCard({ alert }: { alert: Alert }) {
@@ -45,12 +46,12 @@ export function AlertCard({ alert }: { alert: Alert }) {
   return <ActionCard
     icon={icon}
     tone={tone}
-    title={<span className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate">{alert.summary}</span>{alert.count > 1 ? <span className="shrink-0 rounded-full bg-background/70 px-1.5 text-meta tabular-nums">×{alert.count}</span> : null}</span>}
+    title={<span className="flex min-w-0 items-center gap-2"><span className="line-clamp-2 min-w-0">{alert.summary}</span>{alert.count > 1 ? <span className="shrink-0 rounded-full bg-background/70 px-1.5 text-meta tabular-nums">×{alert.count}</span> : null}</span>}
     meta={`${agents[alert.agent] ?? alert.agent} · ${nodeName(alert.node, { nodes: workspace.nodes, directory })}`}
     menu={open ? <ActionButton variant="ghost" className="-my-2 size-9 px-0" disabled={disabled} action={() => workspace.resolveAlert(alert, "dismissed")}><X aria-hidden="true" /><span className="sr-only">忽略</span></ActionButton> : <StatusPill tone="neutral">{alert.resolution === "decided" ? "已回复" : "已忽略"}</StatusPill>}
     actions={replyable && alert.choices.length ? alert.choices.map((choice, index) => <ActionButton key={choice.label} variant={index === 0 ? "default" : "secondary"} disabled={disabled} action={() => send({ choice: index })}>{choice.label}</ActionButton>) : undefined}
   >
-    {alert.cwd ? <p className="truncate font-mono text-meta text-muted-foreground" title={alert.cwd}>{alert.cwd}</p> : null}
+    {alert.cwd ? <p className="truncate text-meta text-muted-foreground" title={alert.cwd}><span className="sr-only">项目 </span>{project(alert.cwd)}</p> : null}
     {replyable && !alert.choices.length ? <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void workspace.run(() => send({ text })) }}>
       <Input aria-label="回复" placeholder="回复这个会话" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
       <Button type="submit" size="icon" aria-label="发送" title="发送" disabled={disabled || !text.trim()}><SendHorizontal aria-hidden="true" /></Button>
