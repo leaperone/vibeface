@@ -2,13 +2,13 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use vibeface_secure::{Channel, Handshake, Identity};
 
-type Result<T> = std::result::Result<T, String>;
+type Result<T> = std::result::Result<T, vibeface_secure::Error>;
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
     input
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing {key}"))
+        .ok_or_else(|| format!("missing {key}").into())
 }
 fn bytes(input: &Value) -> Result<Vec<u8>> {
     hex::decode(text(input, "data")?).map_err(|_| "invalid hexadecimal data".into())
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
         })();
         let response = match result {
             Ok(value) => json!({"ok":true,"result":value}),
-            Err(error) => json!({"ok":false,"error":error}),
+            Err(error) => json!({"ok":false,"error":error.to_string()}),
         };
         println!("{response}");
         io::stdout().flush().map_err(|_| "probe output failed")?;
