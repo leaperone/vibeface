@@ -9,7 +9,7 @@ export type NodeInfo = {
   roles: string[]
   capabilities?: { manager: string | null; roots: string[] }
 }
-export type ConversationSummary = { conversation_id: string; title: string; owner: string | null }
+export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
 /** An open executor request. `form` exists only on the device that runs the work. */
 export type WorkApproval = { request_id: string; kind: string; summary: string; answering?: boolean; form?: { command?: string; cwd?: string; reason?: string; files?: string[]; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] } }

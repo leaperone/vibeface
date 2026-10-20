@@ -35,7 +35,7 @@ function list(value: unknown): unknown[] {
 function texts(value: unknown): string[] { return list(value).map(text) }
 function conversation(value: unknown): ConversationSummary {
   const data = record(value)
-  return { conversation_id: text(data.conversation_id), title: text(data.title), owner: data.owner == null ? null : text(data.owner) }
+  return { conversation_id: text(data.conversation_id), title: text(data.title), owner: data.owner == null ? null : text(data.owner), owner_epoch: number(data.owner_epoch) }
 }
 export function parseNodes(value: unknown): NodeInfo[] {
   return list(record(value).nodes).map((item) => {

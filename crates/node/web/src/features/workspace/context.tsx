@@ -263,6 +263,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
     if (item.method === "answer_approval") return !context.works.some((work) => work.work_id === item.params.work_id && work.open_approvals.some((request) => request.request_id === item.params.request_id))
     if (item.method === "set_autonomy") return context.autonomy.version !== item.params.expected_version
+    if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
     if (item.method === "resolve") return !context.pending_checks.some((check) => check.check_id === item.params.check_id)
     return true
   }
@@ -510,6 +511,17 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       }
       requireCurrent()
       setNoticeText(mode === "off" ? "已停止这个对话的后续。" : mode === "report" ? "后续只汇报结果，不再继续动手。" : "已允许 Agent 收到结果后继续工作。")
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
+      const id = activeId.current, context = requireBotContext(id)
+      if (!context.conversation) throw new Error("这台设备上还没有这个对话，可能还在同步。")
+      const scheduler = context.local_node, epoch = context.conversation.owner_epoch + 1
+      const attestation = await attest(id, { type: "conversation_owner", scheduler_node: scheduler, epoch })
+      try { await signedWrite("owner", `${id}:${epoch}`, "set_owner", { conversation_id: id, scheduler_node: scheduler, epoch, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      setNoticeText("已交给这台设备处理，排队的消息会在这里继续。")
       if (activeId.current === id) await refreshRef.current()
     }),
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
