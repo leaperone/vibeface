@@ -810,6 +810,24 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
     store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 100)?;
     let context = store.context(&net.network, "c", None)?;
     assert!(crate::scheduler::checkpoint(&context, &works).is_none());
+    for i in 20..40 {
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            user(&net, &format!("m{i}"), &text),
+            vec![],
+            200 + i,
+        )?;
+    }
+    let full = store.context(&net.network, "c", None)?;
+    let recent = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
+    assert!(recent.events.len() < full.events.len(), "covered events are not read");
+    assert_eq!(
+        crate::scheduler::checkpoint(&recent, &works),
+        crate::scheduler::checkpoint(&full, &works),
+        "the next checkpoint is the same from the uncovered events alone"
+    );
     Ok(())
 }
 

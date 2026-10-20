@@ -447,7 +447,7 @@ fn latest_checkpoint(context: &Context) -> Option<(&VersionVector, &EventBody)> 
 
 /// A deterministic condensation of messages a prompt can no longer carry, written by the owner
 /// after a turn. Every entry and any later owner then reads the same shortened history.
-/// ponytail: plain excerpts, not a model-written summary; phase 5 can ask the Agent for one.
+/// ponytail: plain excerpts, not a model-written summary; ask the Agent for one if they read poorly.
 pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<EventBody> {
     let empty = VersionVector::new();
     let (since, previous) = match latest_checkpoint(context) {

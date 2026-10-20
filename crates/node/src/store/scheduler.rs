@@ -320,8 +320,7 @@ fn end_job_from(
             vec![],
             at,
         )?;
-        // ponytail: reads the whole conversation per turn; index message sizes if this shows up.
-        let context = super::context_from(connection, network, &job.conversation_id, None)?;
+        let context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
         let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
         if let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
             log::append_from(

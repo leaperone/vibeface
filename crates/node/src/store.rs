@@ -901,14 +901,49 @@ pub(crate) fn context_from(
     scope_id: &str,
     basis: Option<&VersionVector>,
 ) -> Result<Context> {
+    context_after(connection, network_id, scope_id, basis, &VersionVector::new())
+}
+
+/// The newest checkpoint and the events it does not cover, in shared order. The next checkpoint
+/// needs only these, so a long conversation does not reload its whole history every turn.
+pub(crate) fn since_checkpoint_from(
+    connection: &Connection,
+    network_id: &str,
+    scope_id: &str,
+) -> Result<Context> {
+    let mut newest = connection.prepare(
+        "SELECT envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY lamport DESC,created_at_ms DESC,hash DESC",
+    )?;
+    let mut rows = newest.query(params![network_id, scope_id])?;
+    let mut covers = VersionVector::new();
+    while let Some(row) = rows.next()? {
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        if let EventBody::ContextCheckpoint { covers: found, .. } = event.body {
+            covers = found;
+            break;
+        }
+    }
+    context_after(connection, network_id, scope_id, None, &covers)
+}
+
+fn context_after(
+    connection: &Connection,
+    network_id: &str,
+    scope_id: &str,
+    basis: Option<&VersionVector>,
+    covers: &VersionVector,
+) -> Result<Context> {
     let basis = match basis {
         Some(basis) => basis.clone(),
         None => log::version_vector_from(connection, network_id)?,
     };
     let mut statement = connection.prepare(
-        "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY lamport,created_at_ms,hash",
+        "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=?
+         AND seq>COALESCE((SELECT value FROM json_each(?) WHERE key=events.author),0)
+         ORDER BY lamport,created_at_ms,hash",
     )?;
-    let rows = statement.query_map(params![network_id, scope_id], |r| {
+    let rows = statement.query_map(params![network_id, scope_id, serde_json::to_string(covers)?], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, u64>(1)?,
