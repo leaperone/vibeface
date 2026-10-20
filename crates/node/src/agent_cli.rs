@@ -90,7 +90,37 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
             }
         }
         Command::Send(outgoing) => {
-            let delivery = session.send(&outgoing).await;
+            // ponytail: the log lives beside the socket in its private /tmp directory, which a
+            // reboot clears; move it into the Node store if sends must survive reboots.
+            let log = socket.with_file_name("sends");
+            let delivery = match claim(&log, &outgoing)? {
+                Claim::Done(delivery) => delivery,
+                Claim::ReadBack => {
+                    let delivery = match session
+                        .read_back(&outgoing.thread_id, &outgoing.client_id)
+                        .await
+                    {
+                        Ok(Some(turn_id)) => Delivery::Delivered {
+                            mode: "existing".into(),
+                            turn_id,
+                        },
+                        Ok(None) => Delivery::Unknown {
+                            reason: "the message is not in the thread; send it with a new --id"
+                                .into(),
+                        },
+                        Err(error) => Delivery::Unknown {
+                            reason: error.message,
+                        },
+                    };
+                    record(&log, &outgoing, &delivery)?;
+                    delivery
+                }
+                Claim::Send => {
+                    let delivery = session.send(&outgoing).await;
+                    record(&log, &outgoing, &delivery)?;
+                    delivery
+                }
+            };
             println!(
                 "{}",
                 json!({"client_id":outgoing.client_id,"delivery":delivery})
@@ -114,6 +144,64 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+enum Claim {
+    Send,
+    ReadBack,
+    Done(Delivery),
+}
+
+fn entry_path(log: &Path, outgoing: &Outgoing) -> std::path::PathBuf {
+    log.join(crate::crypto::digest(outgoing.client_id.as_bytes()))
+}
+
+/// One send per client ID: the entry is created exclusively before the send, so a rerun, even
+/// a concurrent one, only reads back. The same ID for another message is refused.
+fn claim(log: &Path, outgoing: &Outgoing) -> Result<Claim> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(log)?;
+    let path = entry_path(log, outgoing);
+    let entry = json!({"thread_id":outgoing.thread_id,"text":outgoing.text});
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(entry.to_string().as_bytes())?;
+            file.sync_all()?;
+            Ok(Claim::Send)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: Value = serde_json::from_slice(&std::fs::read(&path)?)
+                .context("unreadable send log entry")?;
+            anyhow::ensure!(
+                existing["thread_id"] == entry["thread_id"] && existing["text"] == entry["text"],
+                "message ID reused with a different message"
+            );
+            Ok(
+                match serde_json::from_value::<Delivery>(existing["delivery"].clone()) {
+                    Ok(delivery @ (Delivery::Delivered { .. } | Delivery::Rejected { .. })) => {
+                        Claim::Done(delivery)
+                    }
+                    _ => Claim::ReadBack,
+                },
+            )
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn record(log: &Path, outgoing: &Outgoing, delivery: &Delivery) -> Result<()> {
+    let entry = json!({"thread_id":outgoing.thread_id,"text":outgoing.text,"delivery":delivery});
+    crate::config::private_write(&entry_path(log, outgoing), entry.to_string().as_bytes())
+}
+
 pub enum Command {
     Call {
         method: String,
@@ -123,4 +211,46 @@ pub enum Command {
     Watch {
         thread_id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_client_id_is_sent_once_and_then_only_read_back() -> Result<()> {
+        let log = std::env::temp_dir().join(format!("vibeface-sends-{}", uuid::Uuid::new_v4()));
+        let outgoing = Outgoing {
+            thread_id: "t".into(),
+            text: "go".into(),
+            client_id: "m1".into(),
+            ..Default::default()
+        };
+        assert_eq!(claim(&log, &outgoing)?, Claim::Send);
+        // Cut off before the result: a rerun reads back instead of sending again.
+        assert_eq!(claim(&log, &outgoing)?, Claim::ReadBack);
+        let unknown = Delivery::Unknown {
+            reason: "lost".into(),
+        };
+        record(&log, &outgoing, &unknown)?;
+        assert_eq!(claim(&log, &outgoing)?, Claim::ReadBack);
+        let delivered = Delivery::Delivered {
+            mode: "start".into(),
+            turn_id: "r".into(),
+        };
+        record(&log, &outgoing, &delivered)?;
+        assert_eq!(claim(&log, &outgoing)?, Claim::Done(delivered));
+        let other = Outgoing {
+            text: "different".into(),
+            ..outgoing.clone()
+        };
+        assert!(claim(&log, &other).is_err());
+        let moved = Outgoing {
+            thread_id: "u".into(),
+            ..outgoing
+        };
+        assert!(claim(&log, &moved).is_err());
+        std::fs::remove_dir_all(&log)?;
+        Ok(())
+    }
 }
