@@ -1,7 +1,7 @@
 import {
-  Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
-  Laptop, Link, ListChecks, Lock, Monitor, MonitorSmartphone, QrCode, RefreshCw, ScrollText, Server, Settings, ShieldCheck,
-  Smartphone, Sparkles, Workflow, ArchiveRestore,
+  Ban, Bot, CircleAlert, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Inbox,
+  Laptop, Link, ListChecks, Lock, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
+  Smartphone, Sparkles, ArchiveRestore,
 } from "lucide-react"
 
 /** One icon and one word per concept, see docs/design/web-ux.md section 2. */
@@ -25,7 +25,6 @@ export const terms = {
   assistant: { label: "助手", icon: Bot },
   aiService: { label: "AI 服务", icon: Sparkles },
   task: { label: "任务", icon: ListChecks },
-  approval: { label: "需要你同意", icon: Hand },
   confirm: { label: "需要确认", icon: CircleQuestionMark },
   inbox: { label: "待处理", icon: Inbox },
   folders: { label: "可用文件夹", icon: FolderOpen },
@@ -34,10 +33,4 @@ export const terms = {
   sending: { label: "发送中", icon: Clock },
   undelivered: { label: "未送达", icon: CircleAlert },
   settings: { label: "设置", icon: Settings },
-} as const
-
-export const autonomyTerms = {
-  off: { label: "停下", icon: CirclePause },
-  report: { label: "只汇报", icon: ScrollText },
-  continue: { label: "继续做", icon: Workflow },
 } as const

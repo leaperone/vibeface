@@ -3,15 +3,14 @@ import { Link } from '@tanstack/react-router'
 import { ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
 import { useWorkspace } from '@/features/workspace/context'
 import { humanError } from '@/lib/errors'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
-import { ApprovalCard, ConfirmCard } from '@/features/workspace/task-activity'
-import { approvalKind, decisionLabel, nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
-import type { AssistantChangeRecord, AutonomyMode, ManagerJob, WorkAnswer, WorkRecord } from '@/features/workspace/types'
+import { ConfirmCard } from '@/features/workspace/task-activity'
+import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
+import type { AssistantChangeRecord, ManagerJob, WorkRecord } from '@/features/workspace/types'
 import { placeChanges, routineName, routineTrigger } from '@/features/workspace/assistant'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
@@ -48,16 +47,14 @@ export function ConversationScreen() {
   const pendingRow = (message: ChatMessage) => ({ key: message.message_id, anchor: message.role === 'user', node: <Message message={message} /> })
   const interruptedRow = (reply: (typeof workspace.interrupted)[number]): ChatMessage => ({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: 0, state: 'interrupted' })
 
-  // Tasks and the approvals answered inside them sit right after the message that started them.
+  // Tasks sit right after the message that started them.
   const works = data?.works ?? []
   const tasks: TaskRow[] = works.map((work) => ({ id: work.work_id, state: shownState(work), device: work.target_node, summary: work.summary, trigger: work.trigger, work }))
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'unverified')
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
-    const rows = bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} open={openTasks.includes(task)} /> }] : []
-    for (const answer of task.work.answered_approvals) rows.push({ key: `answered:${task.id}:${answer.request_id}`, node: <AnsweredLine answer={answer} /> })
-    return rows
+    return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} open={openTasks.includes(task)} /> }] : []
   }
 
   // What a turn changed in the assistant shows after its reply, or after the message while no reply exists.
@@ -91,7 +88,6 @@ export function ConversationScreen() {
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
-  const approvals = works.flatMap((work) => work.open_approvals.map((request) => ({ work, request, key: `${work.work_id}:${request.request_id}` })))
   const needsConfirm = pendingChecks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p> })
@@ -109,7 +105,6 @@ export function ConversationScreen() {
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
     }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
     ...pendingChecks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
-    ...approvals.map(({ work, request, key }) => <ApprovalCard key={key} work={work} request={request} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
@@ -180,17 +175,6 @@ export function ConversationScreen() {
         <InlineError error={sendError} />
         {cards.length ? <button type="button" className="w-fit font-medium text-foreground underline underline-offset-4" onClick={() => document.getElementById('chat-waiting')?.scrollIntoView({ block: 'end', behavior: 'smooth' })}>去处理</button> : null}
         {needsSetup ? <Link to="/devices" className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
-        {data && bot ? <label className="flex w-fit items-center gap-1">
-          完成后：
-          <NativeSelect size="sm" aria-label="完成后" value={data.autonomy.mode} disabled={!workspace.writable || data.autonomy.version === null} onChange={(event) => {
-            const mode = event.currentTarget.value as AutonomyMode
-            void workspace.run(() => workspace.setAutonomy(mode))
-          }}>
-            <NativeSelectOption value="off">停下</NativeSelectOption>
-            <NativeSelectOption value="report">只汇报</NativeSelectOption>
-            <NativeSelectOption value="continue">继续做</NativeSelectOption>
-          </NativeSelect>
-        </label> : null}
       </PromptInput>
     </section>
   )
@@ -214,14 +198,6 @@ function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string;
     <span className="min-w-0 flex-1 truncate"><span className="font-medium">{title}</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
   </Link>
-}
-
-function AnsweredLine({ answer }: { answer: WorkAnswer }) {
-  const agreed = answer.decision === 'accept' || answer.decision === 'answered'
-  return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
-    {agreed ? <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /> : <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />}
-    <span className="min-w-0 flex-1 truncate">{decisionLabel(answer.decision)} · {approvalKind(answer)}</span>
-  </p>
 }
 
 function JobLine({ job }: { job: ManagerJob }) {
