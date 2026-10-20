@@ -258,6 +258,8 @@ fn finish(
     })
 }
 
+const DISCONNECTED: &str = "执行器连接已断开，等待重新核对";
+
 fn unverified(
     record: &mut WorkRecord,
     handle: Option<Handle>,
@@ -472,7 +474,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         ) => {
             record.state = Unverified {
                 handle: Some(handle),
-                evidence: "执行器连接已断开，等待重新核对".into(),
+                evidence: DISCONNECTED.into(),
                 probe: true,
             };
             None
@@ -561,7 +563,9 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 )
             }
             _ => {
-                if matches!(record.state, Unverified { .. }) {
+                // Report once; a disconnect alone has not been reported yet.
+                if matches!(&record.state, Unverified { evidence, .. } if evidence != DISCONNECTED)
+                {
                     return None;
                 }
                 unverified(
@@ -764,5 +768,18 @@ mod tests {
             Some(EventBody::WorkProgress { .. })
         ));
         assert_eq!(work.state.handle().map(|handle| handle.epoch), Some(2));
+        let mut work = running();
+        transition(&mut work, Signal::Disconnected);
+        assert!(
+            matches!(
+                transition(&mut work, Signal::Probed(Probe::Missing)),
+                Some(EventBody::WorkFinished {
+                    outcome: WorkOutcome::Unverified,
+                    ..
+                })
+            ),
+            "a disconnect then a missing turn is reported once"
+        );
+        assert!(transition(&mut work, Signal::Probed(Probe::Missing)).is_none());
     }
 }

@@ -10,6 +10,8 @@ use crate::work::{
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a stop request for an unreachable device keeps retrying before it shows as unconfirmed.
 const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The user waits this long for the first stop attempt; a stop is idempotent, so retries are safe.
+const STOP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn live(record: &WorkRecord) -> bool {
     !matches!(
@@ -288,16 +290,17 @@ impl Runtime {
             return Ok(());
         }
         let executor = &self.executor.executor;
+        // A finished work keeps its thread only in the shared history; dispatch already checked
+        // that the original ran on this device.
         let continued = match &record.spec.continues {
             Some(original) => self
                 .store
                 .lock()
                 .await
-                .work_record(network, original)?
-                .and_then(|original| match original.state {
-                    WorkState::Starting { thread } => thread,
-                    state => state.handle().map(|handle| handle.thread_id.clone()),
-                }),
+                .works(network, &record.spec.conversation)?
+                .into_iter()
+                .find(|work| &work.work_id == original)
+                .and_then(|work| work.thread_id),
             None => None,
         };
         let thread = match &record.state {
@@ -486,10 +489,11 @@ impl Runtime {
             deadline_ms: now_ms() + STOP_DELIVERY_TIMEOUT.as_millis() as i64,
             timed_out: false,
         };
-        match self.deliver_stop(network, &request).await {
-            Ok(reply) => Ok(reply),
-            Err(error) => {
-                tracing::debug!(%error, "stop request waits for its device");
+        match tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request)).await
+        {
+            Ok(Ok(reply)) => Ok(reply),
+            failed => {
+                tracing::debug!(?failed, "stop request waits for its device");
                 self.store
                     .lock()
                     .await

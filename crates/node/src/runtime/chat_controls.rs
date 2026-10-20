@@ -75,8 +75,9 @@ impl Runtime {
         if offset != committed {
             return Ok(json!({"offset":committed,"complete":false}));
         }
+        // A 1 MiB chunk is longer than `field` allows for ordinary text.
         let data = base64::engine::general_purpose::STANDARD
-            .decode(field(input, "data")?)
+            .decode(input["data"].as_str().context("data is required")?)
             .context("attachment data must be base64")?;
         ensure!(
             data.len() <= UPLOAD_CHUNK && committed + data.len() as u64 <= blob.size,
@@ -168,12 +169,10 @@ impl Runtime {
                 _ if work.executor == Executor::Agent && work.outcome.is_none() => json!("running"),
                 Some(record) => json!(record.state.name()),
                 // Another device runs it: its progress events say where it is.
+                // `Started` is written when the native turn starts, so it already means running.
                 None => json!(match (work.outcome, work.phase) {
                     (Some(_), _) => "finished",
-                    (None, Some(WorkPhase::Started)) => "starting",
-                    (None, Some(WorkPhase::WaitingApproval)) if !work.open_approvals.is_empty() => {
-                        "waiting_approval"
-                    }
+                    (None, _) if !work.open_approvals.is_empty() => "waiting_approval",
                     (None, Some(WorkPhase::Interrupting)) => "interrupting",
                     (None, Some(_)) => "running",
                     (None, None) => "accepted",
