@@ -57,6 +57,21 @@ export type PendingCheck = {
   target_node?: string
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
+export type FieldEdit = { before: string; after: string }
+export type AssistantSkill = { name: string; description: string; body: string }
+/** Runs at `first_run_at_ms` and every `every_minutes` after it. */
+export type AssistantRoutine = { name: string; prompt: string; first_run_at_ms: number; every_minutes: number; enabled: boolean }
+/** `before` null is a new item, `after` null a removed one (docs/design/assistant-config.md section 2). */
+export type AssistantChange =
+  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit }
+  | { kind: "skill"; skill_id: string; before: AssistantSkill | null; after: AssistantSkill | null }
+  | { kind: "routine"; routine_id: string; before: AssistantRoutine | null; after: AssistantRoutine | null }
+/** A change applied from the person's message `cause`. */
+export type AssistantChangeRecord = { change_id: string; cause: string; event_hash: string; created_at_ms: number; change: AssistantChange }
+export type SkillSummary = { skill_id: string; name: string; description: string }
+export type RoutineView = AssistantRoutine & { routine_id: string; next_run_at_ms: number | null }
+/** This assistant's routines and the skill library every assistant shares. */
+export type AssistantView = { skills: SkillSummary[]; routines: RoutineView[] }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
@@ -64,6 +79,9 @@ export type ConversationPayload = {
   scheduler: SchedulerSnapshot | null
   pending_checks: PendingCheck[]
   local_node: string
+  /** Oldest first. */
+  changes: AssistantChangeRecord[]
+  assistant: AssistantView
 }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
 export type WorkspaceView = "chat" | "other"

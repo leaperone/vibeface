@@ -17,7 +17,6 @@ const patterns: [RegExp, string][] = [
   [/another personal network|wrong personal network|wrong membership network|unknown network|network mismatch/i, '这台设备属于另一组设备。'],
   [/not a member of the personal network|client identity missing/i, '这个浏览器还不在我的设备里。'],
   [/write needs the signature|signed by another device|client_id differs/i, '这个浏览器的身份校验没通过。请刷新页面后重试。'],
-  [/autonomy changed/i, '后续授权已在别处更改。请刷新确认后再改。'],
   [/conversation moved meanwhile/i, '这个对话刚换过负责的设备，已刷新。请确认后再试。'],
   [/management reply changed/i, '回复状态已变化，请刷新后再停止。'],
   [/scheduled on another device/i, '这条回复由另一台设备负责，请到那台设备上停止。'],

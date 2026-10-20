@@ -9,7 +9,7 @@ import {
 
 import type { ReactNode } from 'react'
 
-/** One row of the conversation: a message, a task card, an answered approval or a card waiting on the person. */
+/** One row of the conversation: a message, a task card, a change card or a card waiting on the person. */
 export type ChatEntry = { key: string; anchor?: boolean; node: ReactNode }
 
 export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNode }) {

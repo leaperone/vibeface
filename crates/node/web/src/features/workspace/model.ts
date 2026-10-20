@@ -3,6 +3,7 @@ import type { ReplyStatus } from "../chat/types"
 import type {
   Alert, ConversationPayload, ConversationSummary, DecisionResult, NodeInfo, NotificationRecord, Outlet, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
+  AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit,
 } from "./types"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -110,6 +111,51 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     scheduler: schedulerSnapshot(data.scheduler),
     pending_checks: list(data.pending_checks).map(pendingCheck),
     local_node: text(data.local_node),
+    changes: list(data.changes).map(changeRecord),
+    assistant: assistantView(data.assistant),
+  }
+}
+function edit(value: unknown): FieldEdit | undefined {
+  if (value == null) return undefined
+  const data = record(value)
+  return { before: text(data.before), after: text(data.after) }
+}
+function skill(value: unknown): AssistantSkill {
+  const data = record(value)
+  return { name: text(data.name), description: text(data.description), body: text(data.body) }
+}
+function routine(value: unknown): AssistantRoutine {
+  const data = record(value)
+  const every = number(data.every_minutes)
+  if (every === 0) throw new Error("例行任务的间隔不对。")
+  return { name: text(data.name), prompt: text(data.prompt), first_run_at_ms: number(data.first_run_at_ms), every_minutes: every, enabled: flag(data.enabled) }
+}
+function assistantChange(value: unknown): AssistantChange {
+  const data = record(value)
+  if (data.kind === "profile") {
+    const name = edit(data.name), instructions = edit(data.instructions)
+    if (!name && !instructions) throw new Error("助手修改记录是空的。")
+    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}) }
+  }
+  if (data.kind !== "skill" && data.kind !== "routine") throw new Error("助手修改记录无法识别。")
+  if (data.before == null && data.after == null) throw new Error("助手修改记录是空的。")
+  return data.kind === "skill"
+    ? { kind: "skill", skill_id: text(data.skill_id), before: side(skill, data.before), after: side(skill, data.after) }
+    : { kind: "routine", routine_id: text(data.routine_id), before: side(routine, data.before), after: side(routine, data.after) }
+}
+function side<T>(read: (value: unknown) => T, value: unknown): T | null { return value == null ? null : read(value) }
+function changeRecord(value: unknown): AssistantChangeRecord {
+  const data = record(value)
+  return { change_id: text(data.change_id), cause: text(data.cause), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), change: assistantChange(data.change) }
+}
+function assistantView(value: unknown): AssistantView {
+  const data = record(value)
+  return {
+    skills: list(data.skills).map((item) => { const skill = record(item); return { skill_id: text(skill.skill_id), name: text(skill.name), description: text(skill.description) } }),
+    routines: list(data.routines).map((item) => {
+      const view = record(item)
+      return { ...routine(view), routine_id: text(view.routine_id), next_run_at_ms: view.next_run_at_ms === null ? null : number(view.next_run_at_ms) }
+    }),
   }
 }
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {

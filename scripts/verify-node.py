@@ -865,6 +865,9 @@ def fixture_codex(arguments):
         threading.Thread(target=connection, args=(stream,), daemon=True).start()
 
 
+SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_routine", "remove_routine"}
+
+
 def fixture_manager(arguments):
     """Exercise only the sidecar protocol and real scoped Node tools, never a model."""
     run = Path(arguments[arguments.index("--fixture-root") + 1])
@@ -908,9 +911,11 @@ def fixture_manager(arguments):
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
     schemas = initial.get("custom_tools", {})
-    expected_tools = {"nodes", "context", "work_status", "call_lookup"}
+    expected_tools = {"nodes", "context", "work_status", "call_lookup", "read_skill"}
     if not read_only:
         expected_tools.update({"dispatch_work", "interrupt_work"})
+    if not read_only and kind == "human":
+        expected_tools.update(SETTINGS_TOOLS)
     require(set(schemas) == expected_tools, "sidecar receives the authoritative scoped tool catalog")
     require("VIBEFACE_CODEX_SOCKET" not in initial["tool_env"], "Agents never receive the native Socket")
 
@@ -963,6 +968,7 @@ def fixture_manager(arguments):
         require(read_only, "work results in report mode have server-enforced read-only authority")
         tool("dispatch_work", {"title": "forbidden", "prompt": "forbidden", "cwd": initial["cwd"], "call_ref": "forbidden-followup"},
              expected=False)
+        tool("update_profile", {"call_ref": "forbidden-rename", "name": "forbidden"}, expected=False)
         status = tool("work_status", {"work_id": body["work_id"]})
         fixture_record(run, "manager-results.jsonl", {"trigger": trigger, "work_id": body["work_id"],
                        "outcome": body.get("outcome"), "status_outcome": status["outcome"]})
@@ -979,6 +985,12 @@ def fixture_manager(arguments):
                  rejection=dispatch["changed"])
         fixture_record(run, "manager-native-work.jsonl", {"trigger": trigger, "label": dispatch["label"],
                        "work_id": found["work_id"]})
+    if kind == "routine":
+        tool("update_profile", {"call_ref": "routine-rename", "name": "forbidden"}, expected=False,
+             rejection="user's own message")
+    rename = re.match(r"^(rename yourself to|改名为|改名叫)\s*(.+)$", body.get("text", "")) if kind == "human" else None
+    if rename:
+        tool("update_profile", {"call_ref": "rename", "name": rename.group(2).strip()})
     for action in directive.get("tools", []):
         tool(action["name"], action["arguments"], expected=action.get("accepted", True),
              rejection=action.get("rejection", "read-only"))
@@ -1426,6 +1438,86 @@ def work_checks(run, workspace, a, network, passed):
     passed("a clean stop leaves no App Server behind")
 
 
+def assistant_checks(run, a, network, passed):
+    """The user's own message changes the assistant through tools; a routine runs once per time."""
+    name = "bot-history-alpha"
+
+    def send(message_id, text):
+        receipt = a.client.rpc("message", conversation_id=name, message_id=message_id, text=text)
+        wait_for("the settings turn gets its final reply", lambda:
+            (scheduler_record(a, network, receipt["trigger"]) or {}).get("state") == "completed")
+        return receipt
+
+    def snapshot():
+        return a.client.rpc("conversation", conversation_id=name)
+
+    def results(trigger, tool_name):
+        return [row for row in fixture_records(run, "manager-tools.jsonl")
+                if row["trigger"] == trigger and row["name"] == tool_name]
+
+    first_run = int(time.time() * 1000) + 3000
+    profile = {"call_ref": "profile", "name": "Nova", "instructions": "assistant-nova-instructions"}
+    routine = {"call_ref": "routine", "name": "Ping", "prompt": "Reply with one line saying the routine ran; "
+               "if nothing is available, say so.", "first_run_at_ms": first_run, "every_minutes": 5}
+    receipt = send("assistant-settings", json.dumps({"chat_agent": True, "tools": [
+        {"name": "update_profile", "arguments": profile},
+        {"name": "update_profile", "arguments": profile},
+        {"name": "update_profile", "arguments": {**profile, "name": "Other"}, "accepted": False,
+         "rejection": "different change"},
+        {"name": "update_profile", "arguments": {"call_ref": "model", "model": "other"}, "accepted": False,
+         "rejection": "only in Settings"},
+        {"name": "save_skill", "arguments": {"call_ref": "skill", "name": "Digest", "description": "Summarize commits",
+                                             "body": "List yesterday's commits by author."}},
+        {"name": "save_routine", "arguments": routine},
+        {"name": "call_lookup", "arguments": {"call_ref": "profile"}},
+    ]}))
+    first, retry = results(receipt["trigger"], "update_profile")[:2]
+    lookup = results(receipt["trigger"], "call_lookup")[0]["result"]
+    require(first["result"] == retry["result"] == lookup and first["result"]["cause"] == "assistant-settings",
+            "a retried or looked-up call_ref returns the one recorded change")
+    view = snapshot()
+    changes = view["changes"]
+    require([change["change"]["kind"] for change in changes] == ["profile", "skill", "routine"]
+            and len({change["change_id"] for change in changes}) == 3
+            and all(change["cause"] == "assistant-settings" and change["event_hash"] for change in changes),
+            "the conversation lists one change record per applied change, without the retry")
+    require(changes[0]["change"]["name"] == {"before": "Alpha", "after": "Nova"}
+            and view["bot"]["name"] == "Nova" and view["bot"]["instructions"] == "assistant-nova-instructions"
+            and any(bot["name"] == "Nova" for bot in a.client.rpc("bots")["bots"]),
+            "the merged profile shows in the conversation and the bots listing")
+    skill = next(row for row in view["assistant"]["skills"] if row["name"] == "Digest")
+    saved = next(row for row in view["assistant"]["routines"] if row["name"] == "Ping")
+    require(saved["first_run_at_ms"] == first_run and saved["enabled"] and saved["next_run_at_ms"] is not None,
+            "the conversation lists the shared skill and its routine with the next run")
+
+    def routine_replies():
+        return [message for message in snapshot()["messages"]
+                if (message.get("in_reply_to") or "").startswith("routine:" + saved["routine_id"] + ":")]
+
+    replies = wait_for("the routine runs at its first time", routine_replies, timeout=60)
+    deadline = time.monotonic() + 32
+    while time.monotonic() < deadline:
+        require(len(routine_replies()) == 1, "one routine time runs exactly once")
+        time.sleep(1)
+    rejected = results(replies[0]["in_reply_to"], "update_profile")
+    require(rejected and not rejected[0]["accepted"], "a routine run cannot change the assistant")
+    receipt = send("assistant-cleanup", json.dumps({"chat_agent": True, "tools": [
+        {"name": "remove_routine", "arguments": {"call_ref": "routine-off", "routine_id": saved["routine_id"]}},
+        {"name": "read_skill", "arguments": {"skill_id": skill["skill_id"]}},
+    ]}))
+    require(results(receipt["trigger"], "read_skill")[0]["result"]["body"] == "List yesterday's commits by author."
+            and snapshot()["assistant"]["routines"] == [], "a removed routine stops and a shared skill reads back")
+    send("assistant-rename", "rename yourself to Orion")
+    require(snapshot()["bot"]["name"] == "Orion" and len(snapshot()["changes"]) == 5,
+            "the user's plain request renames the assistant")
+    autonomous = [row for row in fixture_records(run, "manager-tools.jsonl")
+                  if row["name"] == "update_profile" and row["trigger"].startswith("work:")]
+    require(autonomous and not any(row["accepted"] for row in autonomous),
+            "a work result turn cannot change the assistant")
+    passed("the user's own message changes the assistant once per call_ref and a routine runs once per time",
+           changes=len(snapshot()["changes"]), routine=saved["routine_id"])
+
+
 def chat_agent_acceptance(options):
     binary = options.binary.resolve(strict=True)
     module = options.crypto_module.resolve(strict=True)
@@ -1461,6 +1553,7 @@ def chat_agent_acceptance(options):
         outsider.bootstrap()
         bot_checks(run, workspace, a, network, passed, outsider)
         work_checks(run, workspace, a, network, passed)
+        assistant_checks(run, a, network, passed)
         report["status"] = "passed"
         report["manager_invocations"] = len(fixture_records(run))
         report["dag"] = verify_dag(a, network)

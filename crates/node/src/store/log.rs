@@ -212,8 +212,41 @@ fn place(
             return pending(connection, network, envelope, event, dep, now);
         }
     }
+    if let Err(error) = authorize_change(connection, network, event) {
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
     insert_event(connection, network, envelope, event)?;
     Ok(IngestStatus::Accepted)
+}
+
+/// The user's device signature on `cause` is what authorizes an assistant change, so one of its
+/// stored parents must be that signed user message in the same conversation.
+fn authorize_change(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    let EventBody::AssistantChanged { cause, .. } = &event.body else {
+        return Ok(());
+    };
+    for parent in event.prev.iter().chain(&event.deps) {
+        let Some(envelope) = connection
+            .query_row(
+                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                params![network, parent],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        let parent: Event = serde_json::from_str(&envelope.canonical_body)?;
+        if parent.scope_id == event.scope_id
+            && matches!(&parent.body, EventBody::MessagePosted {
+                message_id, role: Role::User, attestation: Some(_), ..
+            } if message_id == cause)
+        {
+            return Ok(());
+        }
+    }
+    bail!("an assistant change must follow the user's own signed message in this conversation")
 }
 
 fn insert_event(
@@ -258,7 +291,8 @@ fn insert_event(
 }
 
 /// Appends to this device's log. `deps` name every other author's latest event in the
-/// conversation, so the new event follows everything this Node has seen there.
+/// conversation, so the new event follows everything this Node has seen there, and an
+/// assistant change also names the user message that caused it.
 #[expect(clippy::too_many_arguments, reason = "an event's fields")]
 pub(crate) fn append_from(
     connection: &Connection,
@@ -309,12 +343,20 @@ pub(crate) fn append_from(
             deps.push(hash);
         }
     }
+    let prev = (max > 0).then_some(head_hash);
+    if let EventBody::AssistantChanged { cause, .. } = &body {
+        let message = super::message_from(connection, network, scope, cause)?
+            .context("the user's message is not stored on this device")?;
+        if prev.as_ref() != Some(&message.event_hash) {
+            deps.push(message.event_hash);
+        }
+    }
     let envelope = identity.sign_event(Event {
         version: WIRE_VERSION,
         network_id: network.into(),
         author,
         seq: max + 1,
-        prev: (max > 0).then_some(head_hash),
+        prev,
         deps,
         scope_id: scope.into(),
         created_at_ms,
@@ -322,6 +364,7 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
+    authorize_change(connection, network, &event)?;
     insert_event(connection, network, &envelope, &event)?;
     Ok(envelope)
 }

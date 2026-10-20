@@ -282,6 +282,8 @@ fn validate_attestation(event: &Event) -> Result<()> {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
         } => UserSignature::Optional,
+        // It stands on the user's signed message among its parents; see `store::log`.
+        EventBody::AssistantChanged { .. } => UserSignature::Forbidden,
         _ => UserSignature::Forbidden,
     };
     match (rule, event.body.attestation()) {
@@ -375,7 +377,11 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         report_results.is_none() && status.is_some() && attachments.is_empty(),
                         "an assistant reply carries its turn status"
                     );
-                    in_reply_to.as_deref().map(id).transpose()?;
+                    if let Some(answered) = in_reply_to
+                        && crate::scheduling::parse_routine_trigger(answered).is_none()
+                    {
+                        id(answered)?;
+                    }
                 }
             }
         }
@@ -397,12 +403,14 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ..
         } => {
             id(work_id)?;
-            let (kind, trigger_id) = trigger.split_once(':').unwrap_or_default();
-            ensure!(
-                matches!(kind, "message" | "work" | "task"),
-                "invalid work trigger"
-            );
-            id(trigger_id)?;
+            match trigger.split_once(':').unwrap_or_default() {
+                ("message" | "work" | "task", trigger_id) => id(trigger_id)?,
+                ("routine", _) => ensure!(
+                    crate::scheduling::parse_routine_trigger(trigger).is_some(),
+                    "invalid routine trigger"
+                ),
+                _ => anyhow::bail!("invalid work trigger"),
+            }
             id(call_ref)?;
             decode32(dispatcher)?;
             for work in continues.iter().chain(parent.iter()) {
@@ -450,6 +458,15 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             for author in covers.keys() {
                 decode32(author)?;
             }
+        }
+        EventBody::AssistantChanged {
+            change_id,
+            cause,
+            change,
+        } => {
+            id(change_id)?;
+            id(cause)?;
+            change.validate()?;
         }
         _ => {}
     }

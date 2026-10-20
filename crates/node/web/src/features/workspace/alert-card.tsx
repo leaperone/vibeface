@@ -38,7 +38,8 @@ export function AlertCard({ alert }: { alert: Alert }) {
     setSent({ id, answer })
     const result = await workspace.sendDecision(alert, id, answer)
     setSent({ id, answer, result })
-    if (result.status === "delivered") { setText(""); workspace.announce("已送达"); await workspace.resolveAlert(alert, "decided") }
+    // The device marks the alert decided once the session has the answer.
+    if (result.status === "delivered") { setText(""); workspace.announce("已送达") }
   }
   const status = sent?.result?.status
   return <ActionCard

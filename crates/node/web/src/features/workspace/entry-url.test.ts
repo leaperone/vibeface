@@ -9,12 +9,13 @@ import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
 import { nodeName } from "./labels.ts"
 import { inputText, parseAlerts, parseArtifactPage, parseConversation, parseDecision, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
+import { placeChanges, routineName, routineTrigger } from "./assistant.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], pending_checks: [], local_node: "gateway",
+  works: [], pending_checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] },
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
 })
@@ -477,7 +478,7 @@ test("alert cards answer with a fixed choice or a short reply and keep the decis
     status = 'delivered'
     await (button(app.render('AlertCard', { alert }), '拒绝')?.props.action as () => Promise<void>)()
     assert.deepEqual(plain(sent[1]), [alert, 'id-0', { choice: 1 }], 'the same answer reuses the decision id')
-    assert.deepEqual(plain(resolved), [[alert, 'decided']])
+    assert.deepEqual(resolved, [], 'the device resolves a delivered decision itself')
     elements = app.render('AlertCard', { alert: { ...alert, choices: [] } })
     assert.equal(elements.some(({ type }) => type === 'form'), true, 'a Codex session without choices takes a reply')
     elements = app.render('AlertCard', { alert: { ...alert, choices: [], agent: 'claude' } })
@@ -492,10 +493,10 @@ test("any entrance stops an unfinished task once, even on another device", async
   const data = { local_node: 'worker', works: [] as unknown[] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', decisionLabel: () => '', approvalKind: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   try {
-    const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, open_approvals: [], answered_approvals: [] }
+    const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
     data.works = [{ ...work, state: 'unverified' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined)
     data.works = [{ ...work, target_node: 'other', stop: { waiting_for_device: true, timed_out: false } }]
@@ -551,7 +552,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -677,7 +678,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()

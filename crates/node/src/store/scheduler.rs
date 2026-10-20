@@ -170,6 +170,84 @@ pub(crate) fn admit_from(
     Ok(job.receipt(network))
 }
 
+/// The enabled routine a routine job runs, if it still belongs to the job's conversation.
+pub(crate) fn live_routine(
+    connection: &Connection,
+    network: &str,
+    job: &SchedulerJob,
+) -> Result<Option<Routine>> {
+    let Some((routine_id, _)) = parse_routine_trigger(&job.trigger) else {
+        return Ok(None);
+    };
+    Ok(
+        super::assistant::routine_from(connection, network, routine_id)?
+            .filter(|entry| entry.conversation_id == job.conversation_id && entry.routine.enabled)
+            .map(|entry| entry.routine),
+    )
+}
+
+/// A time this long before a routine's last change still runs, so "starting now" runs now;
+/// anything older waits for the next time, so resuming never runs a missed one.
+const LATE_START_MS: i64 = 5 * 60_000;
+
+/// Queues the latest due time of each routine in conversations this Node schedules. Earlier
+/// missed times are never run, a time any owner already answered is skipped, and a routine
+/// waits while its previous run is still queued. Returns `(conversation, trigger)` per job.
+fn admit_due_routines_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    now: i64,
+) -> Result<Vec<(String, String)>> {
+    let mut admitted = Vec::new();
+    for entry in super::assistant::routines_from(connection, network, None)? {
+        let conversation = entry.conversation_id.as_str();
+        let Some(slot) = latest_slot(&entry.routine, now)
+            .filter(|slot| entry.routine.enabled && *slot >= entry.changed_at_ms - LATE_START_MS)
+        else {
+            continue;
+        };
+        let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
+        let key = scheduler_key("routine", conversation, &entry.routine_id);
+        if owner.as_deref() != Some(local)
+            || local_load::<i64>(connection, network, &key)?.is_some_and(|fired| fired >= slot)
+        {
+            continue;
+        }
+        let session = load_session(connection, network, conversation)?;
+        if session.pending.len() >= MAX_PENDING_JOBS
+            || session.pending.iter().any(|trigger| {
+                parse_routine_trigger(trigger).is_some_and(|(id, _)| id == entry.routine_id)
+            })
+        {
+            continue;
+        }
+        local_save(connection, network, &key, &slot)?;
+        let trigger = routine_trigger(&entry.routine_id, slot);
+        // Another owner already ran this time before the conversation moved here.
+        if message_from(
+            connection,
+            network,
+            conversation,
+            &reply_message_id(conversation, &trigger),
+        )?
+        .is_some()
+        {
+            continue;
+        }
+        admit_from(
+            connection,
+            network,
+            conversation,
+            &trigger,
+            TriggerKind::Routine,
+            &trigger,
+        )?;
+        admitted.push((conversation.to_owned(), trigger));
+    }
+    Ok(admitted)
+}
+
 /// Keeps a trigger for the conversation's owner until it returns a receipt.
 pub(crate) fn queue_delivery_from(
     connection: &Connection,
@@ -205,6 +283,8 @@ fn origin_message(connection: &Connection, network: &str, work_id: &str) -> Resu
         match work.trigger.split_once(':') {
             Some(("message", message)) => return Ok(Some(message.into())),
             Some(("work" | "task", parent)) => work_id = parent.into(),
+            // A routine run has no message; its result answers the run.
+            Some(("routine", _)) => return Ok(Some(work.trigger)),
             _ => return Ok(None),
         }
     }
@@ -489,6 +569,20 @@ impl Store {
         Ok((message, receipt))
     }
 
+    pub fn admit_due_routines(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        now: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admitted = admit_due_routines_from(&tx, network, &identity.device_id()?, now)?;
+        tx.commit()?;
+        Ok(admitted)
+    }
+
     pub fn scheduler_job(
         &self,
         network: &str,
@@ -585,13 +679,16 @@ impl Store {
                 matches!(job.state, JobState::Queued),
                 "pending scheduler job is not queued"
             );
-            // The user moved the conversation: what never started goes to the new owner.
+            // The user moved the conversation: what never started goes to the new owner, which
+            // runs routines on its own schedule.
             if !owned && job.kind != TriggerKind::AgentTask {
                 tx.execute(
                     "DELETE FROM local_values WHERE network_id=? AND key=?",
                     params![network, job_key(conversation, &trigger)],
                 )?;
-                queue_delivery_from(&tx, network, conversation, &trigger)?;
+                if job.kind != TriggerKind::Routine {
+                    queue_delivery_from(&tx, network, conversation, &trigger)?;
+                }
                 session.pending.retain(|pending| pending != &trigger);
                 continue;
             }
@@ -601,10 +698,17 @@ impl Store {
         let mode = autonomy_from(&tx, network, conversation)?.mode;
         let mut selected = None;
         for mut job in queued {
-            if job.kind == TriggerKind::WorkResult && mode == AutonomyMode::Off {
+            let evidence = match job.kind {
+                TriggerKind::WorkResult if mode == AutonomyMode::Off => Some("自动跟进已关闭"),
+                TriggerKind::Routine if live_routine(&tx, network, &job)?.is_none() => {
+                    Some("例行任务已暂停或删除")
+                }
+                _ => None,
+            };
+            if let Some(evidence) = evidence {
                 job.state = JobState::Cancelled {
                     attempt: None,
-                    evidence: "自动跟进已关闭".into(),
+                    evidence: evidence.into(),
                 };
                 session.pending.retain(|pending| pending != &job.trigger);
                 save_job(&tx, network, &job)?;

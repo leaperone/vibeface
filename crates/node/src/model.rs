@@ -46,11 +46,9 @@ pub enum AutonomyMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// `codex`: a Codex turn this device's coordination Agent sent and the Node watches.
-/// `task`: work handed to a device's coordination Agent as a task turn.
-pub enum WorkKind {
+pub enum Executor {
     Codex,
-    Task,
+    Agent,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +56,7 @@ pub enum WorkKind {
 pub enum WorkPhase {
     Started,
     Running,
+    WaitingApproval,
     Interrupting,
     Finishing,
 }
@@ -70,31 +69,20 @@ pub enum WorkOutcome {
     Interrupted,
     /// Never started; retrying with the same `work_id` is safe.
     Rejected,
-    /// The real result cannot be proven; only the user or a later probe settles it.
+    /// The executor's real result cannot be proven; only the user or a later probe settles it.
     Unverified,
     /// Its target was removed before reporting a result; written by the conversation's owner.
     Abandoned,
 }
 
-/// How soon the user should look at a triaged session.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    Info,
-    Attention,
-    Urgent,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum AlertResolution {
-    /// A decision went back to the session.
-    Decided,
-    Dismissed,
+pub enum ApprovalDecision {
+    Accept,
+    Decline,
+    Cancel,
+    Answered,
 }
-
-/// Scope of the triage cards every device shows.
-pub const ATTENTION_SCOPE: &str = "attention";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +97,178 @@ pub struct OpenWork {
 pub struct Attestation {
     pub device_id: DeviceId,
     pub signature: String,
+}
+
+pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
+pub const MAX_SKILL_NAME_CHARS: usize = 64;
+pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 512;
+pub const MAX_SKILL_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_ROUTINE_NAME_CHARS: usize = 120;
+pub const MAX_ROUTINE_PROMPT_BYTES: usize = 8 * 1024;
+/// Every 5 minutes up to every 4 weeks; a day is 1440 and a week 10080.
+pub const ROUTINE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
+
+/// One setting's value before and after a change; `before` is what the writer saw.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Edit {
+    pub before: String,
+    pub after: String,
+}
+
+/// A saved workflow in the library every assistant of the network shares.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// A turn its assistant runs at `first_run_at_ms` and then every `every_minutes`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Routine {
+    pub name: String,
+    pub prompt: String,
+    pub first_run_at_ms: i64,
+    pub every_minutes: u32,
+    pub enabled: bool,
+}
+
+/// What a chat turn changed about its assistant. A `None` after removes the skill or routine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AssistantChange {
+    Profile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<Edit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<Edit>,
+    },
+    Skill {
+        skill_id: String,
+        before: Option<Skill>,
+        after: Option<Skill>,
+    },
+    Routine {
+        routine_id: String,
+        before: Option<Routine>,
+        after: Option<Routine>,
+    },
+}
+
+fn validate_line(value: &str, what: &str, max_chars: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.trim().is_empty()
+            && value.chars().count() <= max_chars
+            && !value.chars().any(char::is_control),
+        "{what} must be one line of 1-{max_chars} characters"
+    );
+    Ok(())
+}
+
+pub fn validate_bot_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.trim().is_empty() && name.len() <= 512 && !name.chars().any(char::is_control),
+        "invalid Bot name"
+    );
+    Ok(())
+}
+
+pub fn validate_instructions(instructions: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        instructions.len() <= MAX_INSTRUCTIONS_BYTES,
+        "Bot instructions must be at most {MAX_INSTRUCTIONS_BYTES} bytes"
+    );
+    Ok(())
+}
+
+impl Skill {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_line(&self.name, "a skill name", MAX_SKILL_NAME_CHARS)?;
+        anyhow::ensure!(
+            self.description.len() <= MAX_SKILL_DESCRIPTION_BYTES,
+            "a skill description must be at most {MAX_SKILL_DESCRIPTION_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            !self.body.trim().is_empty() && self.body.len() <= MAX_SKILL_BODY_BYTES,
+            "a skill body must be 1-{MAX_SKILL_BODY_BYTES} bytes"
+        );
+        Ok(())
+    }
+}
+
+impl Routine {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_line(&self.name, "a routine name", MAX_ROUTINE_NAME_CHARS)?;
+        anyhow::ensure!(
+            !self.prompt.trim().is_empty() && self.prompt.len() <= MAX_ROUTINE_PROMPT_BYTES,
+            "a routine prompt must be 1-{MAX_ROUTINE_PROMPT_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            self.first_run_at_ms >= 0,
+            "first_run_at_ms must be a Unix time in milliseconds"
+        );
+        anyhow::ensure!(
+            ROUTINE_MINUTES.contains(&self.every_minutes),
+            "every_minutes must be between {} and {}",
+            ROUTINE_MINUTES.start(),
+            ROUTINE_MINUTES.end()
+        );
+        Ok(())
+    }
+}
+
+impl AssistantChange {
+    /// Every change sets something new; a removal needs something to remove.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
+        match self {
+            Self::Profile { name, instructions } => {
+                anyhow::ensure!(
+                    name.is_some() || instructions.is_some(),
+                    "a profile change names a field"
+                );
+                if let Some(name) = name {
+                    validate_bot_name(&name.after)?;
+                    anyhow::ensure!(name.before != name.after, "the name is unchanged");
+                }
+                if let Some(instructions) = instructions {
+                    validate_instructions(&instructions.after)?;
+                    anyhow::ensure!(
+                        instructions.before != instructions.after,
+                        "the instructions are unchanged"
+                    );
+                }
+            }
+            Self::Skill {
+                skill_id,
+                before,
+                after,
+            } => {
+                id(skill_id)?;
+                anyhow::ensure!(
+                    (before.is_some() || after.is_some()) && before != after,
+                    "the skill is unchanged"
+                );
+                after.as_ref().map(Skill::validate).transpose()?;
+            }
+            Self::Routine {
+                routine_id,
+                before,
+                after,
+            } => {
+                id(routine_id)?;
+                anyhow::ensure!(
+                    (before.is_some() || after.is_some()) && before != after,
+                    "the routine is unchanged"
+                );
+                after.as_ref().map(Routine::validate).transpose()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -156,9 +316,9 @@ pub enum EventBody {
         trigger: String,
         dispatcher: DeviceId,
         call_ref: String,
-        kind: WorkKind,
+        executor: Executor,
         cwd: String,
-        /// A short line for the user; `prompt` is what the work gets.
+        /// A short line for the user; `prompt` is what the executor gets.
         title: String,
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +334,19 @@ pub enum EventBody {
         thread_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+    },
+    ApprovalRequested {
+        work_id: String,
+        request_id: String,
+        kind: String,
+        summary: String,
+    },
+    ApprovalAnswered {
+        work_id: String,
+        request_id: String,
+        decision: ApprovalDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     /// Written by the target. The user settles an `unverified` result through any entry Node,
     /// signed; the owner records `abandoned` after the target is removed.
@@ -198,25 +371,12 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// A triaged session that needs the user, in scope `attention`; a later raise of the same
-    /// `matter` (an escalation) replaces the card.
-    AttentionRaised {
-        alert_id: String,
-        matter: String,
-        agent: String,
-        session_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<String>,
-        cwd: String,
-        severity: Severity,
-        summary: String,
-        count: u64,
-    },
-    AttentionResolved {
-        alert_id: String,
-        resolution: AlertResolution,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
+    /// Written by the owner in a turn the user's message `cause` started; that message is one
+    /// of its parents. `change_id` derives from the turn and the tool's `call_ref`.
+    AssistantChanged {
+        change_id: String,
+        cause: String,
+        change: AssistantChange,
     },
     /// Written only by the owner in a read-only closing turn; covered events stay stored.
     ContextCheckpoint {
@@ -236,9 +396,9 @@ impl EventBody {
             | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
+            | Self::ApprovalAnswered { attestation, .. }
             | Self::AutonomySet { attestation, .. }
-            | Self::NotificationAcked { attestation, .. }
-            | Self::AttentionResolved { attestation, .. } => attestation.as_ref(),
+            | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
@@ -246,6 +406,8 @@ impl EventBody {
         match self {
             Self::WorkDispatched { work_id, .. }
             | Self::WorkProgress { work_id, .. }
+            | Self::ApprovalRequested { work_id, .. }
+            | Self::ApprovalAnswered { work_id, .. }
             | Self::WorkFinished { work_id, .. } => Some(work_id),
             _ => None,
         }
@@ -351,6 +513,34 @@ pub struct Bot {
     pub event_hash: EventHash,
 }
 
+/// The earliest `AssistantChanged` of one `change_id`; the chat shows it as a card.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeRecord {
+    pub change_id: String,
+    pub cause: String,
+    pub event_hash: EventHash,
+    pub created_at_ms: i64,
+    pub change: AssistantChange,
+}
+
+/// Output only: `flatten` cannot read back a `deny_unknown_fields` struct.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub skill_id: String,
+    #[serde(flatten)]
+    pub skill: Skill,
+}
+
+/// A routine that is not removed; `changed_at_ms` is when its current definition was written.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoutineEntry {
+    pub routine_id: String,
+    pub conversation_id: ScopeId,
+    #[serde(flatten)]
+    pub routine: Routine,
+    pub changed_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Conversation {
     pub conversation_id: ScopeId,
@@ -387,7 +577,7 @@ pub struct WorkProjection {
     pub target_node: DeviceId,
     pub trigger: String,
     pub dispatcher: DeviceId,
-    pub kind: WorkKind,
+    pub executor: Executor,
     pub cwd: String,
     pub title: String,
     pub prompt: String,
@@ -398,6 +588,22 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
+    pub open_approvals: Vec<ApprovalProjection>,
+    /// Requests already answered, kept so the conversation shows who decided what.
+    pub answered_approvals: Vec<AnsweredApproval>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalProjection {
+    pub request_id: String,
+    pub kind: String,
+    pub summary: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnsweredApproval {
+    pub request_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub decision: ApprovalDecision,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Autonomy {

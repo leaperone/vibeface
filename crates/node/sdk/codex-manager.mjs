@@ -211,8 +211,7 @@ function closeInput() {
 function sdkConfig(input) {
   return {
     approval_policy: "never",
-    // A read-only report turn may read the host and reach the loopback Node, nothing else.
-    ...(input.readOnly ? { default_permissions: "vibeface_manager" } : {}),
+    default_permissions: "vibeface_manager",
     web_search: "disabled",
     check_for_update_on_startup: false,
     analytics: { enabled: false },
@@ -296,8 +295,8 @@ function managerPrompt(prompt, toolCli, tools, readOnly) {
   const catalog = Object.entries(tools).map(([name, spec]) => `${name}\n${spec.description || ""}\nJSON schema: ${JSON.stringify(spec.inputSchema)}`).join("\n\n");
   const host = readOnly
     ? "This invocation is read-only. Read existing status and files; do not edit files, start work, interrupt work, or answer native requests."
-    : "Your shell has full access to this host: you can edit files, run git and gh, and call this device's Codex App Server. `vibeface codex call METHOD 'JSON_PARAMS'` calls any App Server method; `vibeface codex send THREAD_ID 'TEXT' --id MESSAGE_ID` adds a message to a thread, steering its running turn or starting one, and rerunning it with the same --id only reads back; `vibeface codex watch THREAD_ID` prints the thread's events. For longer coding work call dispatch_work with a prompt and a cwd inside an allowed root: it registers the work with the Node, starts one Codex turn on this host and the Node watches it. With target_node it hands the task to that device's assistant. Your turn ends after dispatch; when the work finishes, the Node starts a new turn with its result.";
-  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor dispatch_work, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. ${host}\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
+    : "Your shell and file tools can read this host but cannot change it. To change files on this host, call dispatch_work with a prompt and a cwd inside an allowed root. The Node starts one native Codex turn, pins approval to the user and the sandbox to that cwd, and you cannot answer its approval requests. Your turn ends after dispatch; when the work finishes, the Node starts a new turn with its result.";
+  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor dispatch_work, update_profile, save_skill, remove_skill, save_routine and remove_routine, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. ${host}\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
 }
@@ -501,10 +500,10 @@ async function run(input, reader, secrets) {
   const codex = new Codex({
     codexPathOverride: codexPath,
     config: sdkConfig(input),
-    configOverrides: input.readOnly ? [
+    configOverrides: [
       'permissions.vibeface_manager.filesystem={":root"="read"}',
       'permissions.vibeface_manager.network={enabled=true,allow_local_binding=true,mode="limited",domains={"127.0.0.1"="allow","localhost"="allow"}}',
-    ] : [],
+    ],
     env: childEnvironment(input),
   });
   const threadOptions = {
@@ -513,7 +512,6 @@ async function run(input, reader, secrets) {
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     approvalPolicy: "never",
-    ...(input.readOnly ? {} : { sandboxMode: "danger-full-access" }),
     webSearchMode: "disabled",
   };
   const thread = input.sessionId === null
