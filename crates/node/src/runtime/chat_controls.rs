@@ -35,19 +35,27 @@ impl Runtime {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         let hash = field(input, "blob_hash")?;
+        if input["binary"] == true {
+            use base64::Engine as _;
+            let offset = input["offset"].as_u64().unwrap_or(0);
+            let (size, bytes) = self.store.lock().await.read_blob_range(
+                &access.network_id,
+                scope,
+                hash,
+                offset,
+                BINARY_PAGE,
+            )?;
+            let start = offset.min(size);
+            let end = start + bytes.len() as u64;
+            return Ok(json!({"blob_hash":hash,"offset":start,"size":size,
+                "next_offset":(end < size).then_some(end),
+                "data":base64::engine::general_purpose::STANDARD.encode(&bytes)}));
+        }
         let (_, bytes) = self
             .store
             .lock()
             .await
             .read_blob(&access.network_id, scope, hash)?;
-        if input["binary"] == true {
-            use base64::Engine as _;
-            let start = usize::try_from(input["offset"].as_u64().unwrap_or(0))?.min(bytes.len());
-            let end = start.saturating_add(BINARY_PAGE).min(bytes.len());
-            return Ok(json!({"blob_hash":hash,"offset":start,"size":bytes.len(),
-                "next_offset":(end < bytes.len()).then_some(end),
-                "data":base64::engine::general_purpose::STANDARD.encode(&bytes[start..end])}));
-        }
         artifact_page(
             hash,
             &bytes,

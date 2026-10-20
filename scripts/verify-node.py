@@ -2356,9 +2356,15 @@ def phase4_acceptance(options):
         wait_for("the browser reconnects to the restarted B", lambda: at_b.authenticate())
         shown = next(row for row in at_b.rpc("conversation", conversation_id=conversation)["messages"] if row["message_id"] == "p4-attachment")
         require(shown["blobs"] == [{"hash": digest, "size": size}], "the message carries its attachment on every entrance")
+        download, offset, pages = hashlib.sha256(), 0, 0
+        while offset is not None:
+            page = at_b.rpc("read_artifact", conversation_id=conversation, blob_hash=digest, offset=offset, binary=True)
+            download.update(base64.b64decode(page["data"]))
+            offset, pages = page["next_offset"], pages + 1
+        require(download.hexdigest() == digest, "the new entrance downloads the attachment byte for byte")
         payload.unlink()
         passed("attachment-64mib-restart-resume", size=size, upload_restart_at=restarted_at, download_kept=kept,
-               message=receipt["message_id"])
+               message=receipt["message_id"], binary_pages_at_b=pages)
 
         require(file_sha256(binary) == report["binary_sha256"], "one immutable binary completes acceptance")
         report["status"] = "passed"

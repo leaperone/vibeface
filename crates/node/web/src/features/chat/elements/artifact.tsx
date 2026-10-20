@@ -57,6 +57,8 @@ export function Artifact({ hash, size, attachment = false }: { hash: string; siz
           }
           const whole = new Uint8Array(size)
           parts.reduce((at, part) => { whole.set(part, at); return at + part.length }, 0)
+          const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', whole))].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+          if (digest !== hash) throw new Error('下载内容与原请求不符。')
           const url = URL.createObjectURL(new Blob([whole]))
           const link = document.createElement('a')
           link.href = url

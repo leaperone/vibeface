@@ -422,16 +422,44 @@ impl Store {
     }
 
     /// Reads an attachment referenced by a stored event of this conversation.
-    pub fn read_blob(&self, network: &str, scope: &str, hash: &str) -> Result<(BlobRef, Vec<u8>)> {
-        let size: u64 = self
-            .connection
+    fn referenced_size(&self, network: &str, scope: &str, hash: &str) -> Result<u64> {
+        self.connection
             .query_row(
                 "SELECT b.size FROM event_blobs b JOIN events e ON e.network_id=b.network_id AND e.hash=b.hash WHERE b.network_id=? AND b.blob=? AND e.scope_id=? LIMIT 1",
                 params![network, hash, scope],
                 |r| r.get(0),
             )
             .optional()?
-            .context("attachment is not referenced by this conversation")?;
+            .context("attachment is not referenced by this conversation")
+    }
+
+    /// Up to `len` bytes of an attachment from `offset`, and its size. The file was verified
+    /// when stored; the reader checks the assembled download against the hash.
+    pub fn read_blob_range(
+        &self,
+        network: &str,
+        scope: &str,
+        hash: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<(u64, Vec<u8>)> {
+        use std::io::{Read, Seek};
+        let size = self.referenced_size(network, scope, hash)?;
+        let mut file = std::fs::File::open(self.blob_path(hash)?)
+            .context("attachment content is not on this device")?;
+        ensure!(
+            file.metadata()?.len() == size,
+            "stored attachment failed content verification"
+        );
+        let start = offset.min(size);
+        let mut bytes = vec![0; len.min((size - start) as usize)];
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        Ok((size, bytes))
+    }
+
+    pub fn read_blob(&self, network: &str, scope: &str, hash: &str) -> Result<(BlobRef, Vec<u8>)> {
+        let size = self.referenced_size(network, scope, hash)?;
         let bytes = std::fs::read(self.blob_path(hash)?)
             .context("attachment content is not on this device")?;
         ensure!(
