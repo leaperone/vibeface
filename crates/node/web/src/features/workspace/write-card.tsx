@@ -35,11 +35,11 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const target = kind === "forked" ? entry : authors[0]
   return <ActionCard icon={Copy} title={kind === "forked" ? "这台设备的数据有两份副本" : `${authors.map((id) => nodeName(id, lookup)).join("、")} 的数据有两份副本`}
     actions={target ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: target }}>去设备页</Link></Button> : undefined}>
-    <p className="text-muted-foreground">{kind === "forked" ? "它已停止写入，其他设备照常使用。移除这台设备，再用新的数据目录重新加入；需要保留的内容请重新发送。" : "一份复制出来的数据写了不同的内容，已放在一边，不影响对话。移除那台设备后重新加入即可。"}</p>
+    <p className="text-muted-foreground">{kind === "forked" ? "它已停止写入，其他设备照常使用。移除这台设备，再用新的数据目录重新加入；需要保留的内容请重新发送。" : "一份复制出来的数据写了不同的内容，从分叉处起两份都先不算数，其他内容照常。移除那台设备时保留这里先收到的那份，再用新的数据目录重新加入。"}</p>
     {conflicts.length ? <Details label="两份内容">
       {conflicts.map((item) => <div key={item.other.hash} className="grid gap-1 border-t pt-2 first:border-t-0 first:pt-0">
-        <DetailRow label={`${nodeName(item.author, lookup)} 第 ${item.seq} 条 · 保留的`} value={summary(item.kept)} />
-        <DetailRow label="放在一边的" value={summary(item.other)} />
+        <DetailRow label={`${nodeName(item.author, lookup)} 第 ${item.seq} 条 · 这里先收到的`} value={summary(item.kept)} />
+        <DetailRow label="另一份" value={summary(item.other)} />
       </div>)}
     </Details> : null}
   </ActionCard>

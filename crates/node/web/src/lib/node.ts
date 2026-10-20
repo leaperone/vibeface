@@ -19,8 +19,8 @@ export type ReadyConnection = {
   catchingUp?(): boolean
 }
 export type Member = { device_id: string; kind: 'node' | 'client'; name: string; manage: boolean }
-export type Revocation = { device_id: string; cutoff_seq: number }
-export type MembershipView = { network_id: string; epoch: number; heads: string[]; members: Member[]; revoked: Revocation[] }
+export type Revocation = { device_id: string; cutoff_seq: number; cutoff_hash: string | null }
+export type MembershipView = { network_id: string; epoch: number; heads: string[]; members: Member[]; revoked: Revocation[]; attesters: string[] }
 export type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'expired'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
@@ -80,7 +80,8 @@ export function parseView(value: unknown): MembershipView {
   const v = record(value)
   return {
     network_id: validTarget(v.network_id), epoch: integer(v.epoch), heads: strings(v.heads), members: array(v.members).map(parseMember),
-    revoked: array(v.revoked).map(item => { const r = record(item); return { device_id: validTarget(r.device_id), cutoff_seq: cutoff(r.cutoff_seq) } }),
+    revoked: array(v.revoked).map(item => { const r = record(item); return { device_id: validTarget(r.device_id), cutoff_seq: cutoff(r.cutoff_seq), cutoff_hash: r.cutoff_hash === null ? null : text(r.cutoff_hash) } }),
+    attesters: strings(v.attesters),
   }
 }
 export function parsePrincipal(value: unknown): ClientPrincipal {

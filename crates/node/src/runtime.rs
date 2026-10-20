@@ -456,7 +456,7 @@ impl Runtime {
                     .trust_bundle(network)?
                     .context("unknown network")?;
                 let local = self.identity.device_id()?;
-                let max_seq = self.store.lock().await.version_vector(network)?;
+                let heads = self.store.lock().await.heads(network)?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
                 let display_names = node_display_names(&bundle);
@@ -490,12 +490,15 @@ impl Runtime {
                 for (member, capabilities) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
                     let live = !capabilities.is_null();
-                    let seq = max_seq.get(&member.device_id).copied().unwrap_or(0);
-                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"capabilities":capabilities}));
+                    let (seq, hash) = match heads.get(&member.device_id) {
+                        Some((seq, hash)) => (*seq, Some(hash)),
+                        None => (0, None),
+                    };
+                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"head_hash":hash,"capabilities":capabilities}));
                 }
                 for revoked in view.revoked {
                     if let Some(name) = display_names.get(&revoked.device_id) {
-                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"capabilities":Value::Null}));
+                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"head_hash":revoked.cutoff_hash,"capabilities":Value::Null}));
                     }
                 }
                 Ok(json!({"nodes":nodes}))

@@ -1,5 +1,5 @@
 import { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, recoveryOpen, recoverySeal, shortCode, ticketEncode, verify, verifyMembership } from '../../generated/vibeface_secure.js'
-import { integer, parsePrincipal, parseView, record, same, text } from './node'
+import { array, integer, parsePrincipal, parseView, record, same, text } from './node'
 import type { ClientPrincipal, MembershipView, PublicIdentity } from './node'
 
 const encoder = new TextEncoder()
@@ -21,7 +21,7 @@ export function verifyAuthentication(value: unknown, own: PublicIdentity, expect
   const principal = parsePrincipal(auth.principal)
   const state = record(auth.state)
   if (principal.device_id !== own.deviceId || expected && principal.network_id !== expected.networkId) throw new Error('设备返回的身份和这个浏览器对不上。')
-  if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
+  if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(array(state.checkpoints).at(-1), expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
   const view = verifiedView(state, principal.network_id)
   if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('设备列表没通过校验。')
   const revoked = (id: string) => view.revoked.some(item => item.device_id === id)
@@ -61,7 +61,7 @@ export async function openPackage(file: File, password: string) {
   try {
     root = Identity.fromSecretHex(text(payload.root_secret_key))
     if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.deviceId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复文件内容对不上。')
-    verifyState({ genesis: record(payload.genesis), checkpoint: null, events: [] }, networkId).free()
+    verifyState({ genesis: record(payload.genesis), checkpoints: [], events: [] }, networkId).free()
     const openedRoot = root
     let released = false
     return { payload, root: openedRoot, networkId, epoch, release() { if (!released) { released = true; openedRoot.free(); payload.root_secret_key = '' } } }

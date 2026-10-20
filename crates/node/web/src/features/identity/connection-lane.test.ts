@@ -28,7 +28,7 @@ const localCapability = 'f'.repeat(64)
 const localInvitation = { url: localEntry.address, device_id: target, capability: localCapability }
 const localLaunch = { url: 'http://127.0.0.1:49781', device_id: target, token: 'e'.repeat(64) }
 const genesis = { version: 1, network_id: network, first_client: { device_id: subject, kind: 'client', name: 'browser', manage: true }, first_node: { device_id: target, kind: 'node', name: 'node', manage: false }, signature: 's' }
-const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1 }
+const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1, attesters: [] }
 const inviteId = '1'.repeat(32), joinNonce = '9'.repeat(64)
 const joinRequest = (status: string, extra: Record<string, unknown> = {}) => ({ join_id: 'join', status, network_id: network, invite_id: inviteId, device_id: subject, kind: 'client', name: 'browser', commit: 'd'.repeat(64), admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 60000, ...extra })
 const deferred = () => {
@@ -104,7 +104,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
         if (method === 'directory') return { state: { genesis }, view: secure.verifiedView() }
         if (method === 'join_status') return params.reveal ? { ...joinStatus.value, joiner_nonce: params.reveal } : joinStatus.value.status === 'joined' ? { ...joinStatus.value, state: { genesis } } : joinStatus.value
-        if (method === 'recovery_state' || method === 'directory') return { state: { genesis }, view: membership }
+        if (method === 'recovery_state' || method === 'directory') return { state: { genesis }, view: membership, heads: {} }
         return {}
       } }
     },
