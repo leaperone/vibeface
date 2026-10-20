@@ -12,7 +12,7 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseAlerts, parseDecision, parseTriageSettings,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseAlerts, parseDecision,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
@@ -539,13 +539,6 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireCurrent()
       await refreshRef.current()
     }),
-    triage: {
-      settings: async () => { requireCurrent(); return parseTriageSettings(await connection.request("triage_settings")) },
-      configure: async (settings: Record<string, unknown>) => { requireCurrent(); await connection.request("configure_triage", settings) },
-      testWebhook: async () => { requireCurrent(); return record(await connection.request("test_webhook")) },
-      createToken: async (label: string) => { requireCurrent(); const token = record(await connection.request("create_decision_token", { label })); return String(token.token) },
-      revokeToken: async (tokenId: string) => { requireCurrent(); await connection.request("revoke_decision_token", { token_id: tokenId }) },
-    },
     reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
