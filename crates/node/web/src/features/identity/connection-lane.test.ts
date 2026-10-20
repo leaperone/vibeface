@@ -616,8 +616,7 @@ for (const stage of ['authenticate', 'subscribe']) test(`cancelPair during ${sta
     const hold = deferred(); app.holds.set(stage, hold)
     const checking = app.render().checkPair()
     const rejected = assert.rejects(checking, /换了|取消/)
-    await settle()
-    assert.ok(app.calls.includes(stage))
+    await until(() => app.calls.includes(stage))
     app.render().cancelPair()
     hold.resolve({})
     await rejected; await settle()
@@ -690,7 +689,6 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     }
     const rejected = assert.rejects(work, /换了|取消/)
     await until(() => app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'))
-    assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'))
     hold.resolve({ state: { genesis }, view: membership })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()
