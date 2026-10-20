@@ -40,8 +40,6 @@ export type WorkRecord = {
 export type ManagerJob = {
   trigger: string
   state: string
-  kind: string
-  sequence: number
   message_id?: string
   reply_message_id?: string
   read_only?: boolean

@@ -44,7 +44,7 @@ test("works, approvals with decline, reply status and pending checks keep their 
   const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "waiting_approval", summary: "等待决定", outcome: null, result_text: "", failure_reason: null,
     open_approvals: [{ request_id: "req", kind: "commandExecution", summary: "运行命令", form: { command: "npm test", cwd: "/project", files: ["a.ts"], choices: [{ label: "拒绝", response: { decision: "decline" } }] } }],
     answered_approvals: [{ request_id: "old", kind: "commandExecution", summary: "运行命令", decision: "accept" }] }
-  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", kind: "human", sequence: 0, message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false } }
+  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false } }
   const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped", blobs: [{ hash: "result", size: 20 }] }
   const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message] })
   assert.deepEqual(parsed.works[0].open_approvals[0].form?.choices?.[0].response, { decision: "decline" })
@@ -73,7 +73,8 @@ test("works, approvals with decline, reply status and pending checks keep their 
   assert.deepEqual(parseConversation({ ...context, pending_checks: [{ check_id: "work:w", kind: "work", detail: "无法证明结果", work_id: "w", target_node: "worker" }] }).pending_checks[0], { check_id: "work:w", kind: "work", detail: "无法证明结果", process_groups: [], work_id: "w", target_node: "worker" })
   assert.deepEqual(parseConversation({ ...context, works: [{ ...work, state: "waiting_for_device", stop: { waiting_for_device: true, timed_out: false } }] }).works[0].stop, { waiting_for_device: true, timed_out: false })
   assert.throws(() => parseConversation({ ...context, pending_checks: [{ ...check, kind: "native_turn" }] }))
-  assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], sequence: -1 }] } }))
+  assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
+  assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }] } }).scheduler?.jobs[0].state, "pending_delivery")
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
