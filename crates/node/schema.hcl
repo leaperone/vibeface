@@ -40,30 +40,6 @@ table "node_certificates" {
     on_delete   = NO_ACTION
   }
 }
-table "local_identities" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "peer_id" {
-    null = false
-    type = text
-  }
-  column "identity" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.peer_id]
-  }
-  foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
-    on_update   = NO_ACTION
-    on_delete   = NO_ACTION
-  }
-}
 table "events" {
   schema = schema.main
   column "network_id" {
