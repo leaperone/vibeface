@@ -795,7 +795,7 @@ async fn dispatch(
             let event: GovernanceEvent = from_field(&params, "event")?;
             ensure!(
                 event.issuer == session.device_id
-                    && matches!(event.action, GovernanceAction::Revoke { .. }),
+                    && matches!(event.action, GovernanceAction::Revoke(_)),
                 "invalid revoke signer or action"
             );
             let mut state = node.membership_state().await?;
@@ -826,7 +826,8 @@ async fn dispatch(
                 text(&params, "signature")?,
             )
             .context("recovery key does not own this personal network")?;
-            Ok(json!({"state":state}))
+            let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
+            Ok(json!({"state":state,"heads":heads}))
         }
         "recover" => {
             recover(node, session, &params).await?;
@@ -1319,7 +1320,7 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::Member;
+    use crate::identity::{Member, Revocation};
 
     #[tokio::test]
     async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
@@ -1705,7 +1706,7 @@ mod tests {
             let checkpoint = RootCheckpoint::create(&root, state.epoch() + 1, vec![
                 Member::node(&node.identity, "local device")?,
                 Member::client(&replacement_manager, "replacement manager", true)?,
-            ])?;
+            ], vec![])?;
             state.recover(checkpoint)?;
             node.install_membership(state).await?;
             let after_recovery = std::fs::read(dir.join("config.json"))?;
@@ -1723,7 +1724,7 @@ mod tests {
             let save = node.config_save.lock().await;
             let mut queued_settings = Box::pin(node.configure_node(settings, &browser_id, Some(&cookie)));
             assert!(futures_util::poll!(queued_settings.as_mut()).is_pending());
-            state.append(GovernanceEvent::revoke(&replacement_manager, &state.project()?, &node_id, 0)?)?;
+            state.append(GovernanceEvent::revoke(&replacement_manager, &state.project()?, Revocation::new(&node_id, None)?)?)?;
             node.install_membership(state.clone()).await?;
             assert!(node.local_access.session(&cookie, &node_id, &state.genesis.network_id).is_ok());
             let after_revoke = std::fs::read(dir.join("config.json"))?;
@@ -1864,7 +1865,7 @@ mod tests {
             let mut watching = connect(phone.clone()).await?;
             watching.call("subscribe", json!({})).await?;
             let view = node.membership_state().await?.project()?;
-            let revoke = GovernanceEvent::revoke(&admin, &view, &phone.device_id()?, 0)?;
+            let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;
             assert!(joiner.call("revoke", json!({"event":revoke})).await.is_err(), "issuer must be the session");
             manager.call("revoke", json!({"event":revoke})).await?;
             assert!(joiner.call("directory", json!({})).await.is_err());
@@ -1878,8 +1879,8 @@ mod tests {
                 Member::client(&admin, "admin", true)?,
                 Member::client(&replacement, "new laptop", true)?,
                 Member::node(&node.identity, "node")?,
-            ])?;
-            let dropped = RootCheckpoint::create(&root, epoch, vec![Member::client(&replacement, "new laptop", true)?])?;
+            ], vec![])?;
+            let dropped = RootCheckpoint::create(&root, epoch, vec![Member::client(&replacement, "new laptop", true)?], vec![])?;
             let mut recovering = connect(replacement.clone()).await?;
             let expires = crate::runtime::now_ms() + 60_000;
             let read = |signer: &LocalIdentity| -> Result<Value> {

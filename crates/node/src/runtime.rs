@@ -37,13 +37,12 @@ pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    for member in bundle.genesis.members().iter().chain(
-        bundle
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.members.as_slice())
-            .unwrap_or(&[]),
-    ) {
+    for member in bundle
+        .genesis
+        .members()
+        .iter()
+        .chain(bundle.checkpoints.iter().flat_map(|c| &c.members))
+    {
         if member.kind == IdentityKind::Node {
             names.insert(member.device_id.clone(), member.name.clone());
         }
@@ -62,7 +61,7 @@ fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
 mod node_display_names_tests {
     use super::node_display_names;
     use crate::crypto::LocalIdentity;
-    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState};
+    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, Revocation};
     use anyhow::Result;
 
     #[test]
@@ -84,8 +83,7 @@ mod node_display_names_tests {
         state.append(GovernanceEvent::revoke(
             &admin,
             &state.project()?,
-            &node.device_id()?,
-            0,
+            Revocation::new(&node.device_id()?, None)?,
         )?)?;
         let names = node_display_names(&state);
         assert_eq!(
@@ -199,7 +197,8 @@ impl Runtime {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
             epoch == json!({"data_epoch":crate::config::DATA_EPOCH}),
-            "this Node requires an initialized data epoch 7 directory"
+            "this Node requires an initialized data epoch {} directory",
+            crate::config::DATA_EPOCH
         );
         let config = Config::load(dir)?;
         let entry_token = (config.public_entry || config.network.entry.is_some())
@@ -271,11 +270,18 @@ impl Runtime {
         if store.has_network()? {
             state = store.public_state()?.merge(&state)?;
         }
-        let view = state.project()?;
-        store.install_state(state)?;
+        let network = state.genesis.network_id.clone();
+        let (view, rebuilt) = store.install_state(state)?;
+        if rebuilt {
+            store.settle_local_works(&network)?;
+        }
         drop(store);
+        if rebuilt {
+            self.publish_rebuilt(&network);
+        }
         self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
+        self.align(&network).await;
         self.wake_sync_all();
         Ok(view)
     }
@@ -370,6 +376,13 @@ impl Runtime {
         self.publish_changed(network, scope, &event.hash);
         Ok(event)
     }
+    /// Which events count changed, so every conversation may read differently now.
+    pub(crate) fn publish_rebuilt(&self, network: &str) {
+        let _ = self.events.send(Update {
+            network_id: network.into(),
+            payload: json!({"type":"changed"}),
+        });
+    }
     fn publish_changed(&self, network: &str, scope: &str, event_hash: &str) {
         let _ = self.events.send(Update {
             network_id: network.into(),
@@ -443,7 +456,7 @@ impl Runtime {
                     .trust_bundle(network)?
                     .context("unknown network")?;
                 let local = self.identity.device_id()?;
-                let max_seq = self.store.lock().await.version_vector(network)?;
+                let heads = self.store.lock().await.heads(network)?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
                 let display_names = node_display_names(&bundle);
@@ -477,12 +490,15 @@ impl Runtime {
                 for (member, capabilities) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
                     let live = !capabilities.is_null();
-                    let seq = max_seq.get(&member.device_id).copied().unwrap_or(0);
-                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"capabilities":capabilities}));
+                    let (seq, hash) = match heads.get(&member.device_id) {
+                        Some((seq, hash)) => (*seq, Some(hash)),
+                        None => (0, None),
+                    };
+                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"head_hash":hash,"capabilities":capabilities}));
                 }
                 for revoked in view.revoked {
                     if let Some(name) = display_names.get(&revoked.device_id) {
-                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"capabilities":Value::Null}));
+                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"head_hash":revoked.cutoff_hash,"capabilities":Value::Null}));
                     }
                 }
                 Ok(json!({"nodes":nodes}))

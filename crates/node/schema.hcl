@@ -50,8 +50,20 @@ table "events" {
     null = false
     type = text
   }
+  column "main" {
+    null = false
+    type = integer
+  }
+  column "effective" {
+    null = false
+    type = integer
+  }
+  column "detected_at_ms" {
+    null = true
+    type = integer
+  }
   primary_key {
-    columns = [column.network_id, column.author, column.seq]
+    columns = [column.network_id, column.hash]
   }
   foreign_key "0" {
     columns     = [column.network_id]
@@ -59,9 +71,14 @@ table "events" {
     on_update   = NO_ACTION
     on_delete   = NO_ACTION
   }
-  index "events_hash" {
+  index "events_main" {
     unique  = true
-    columns = [column.network_id, column.hash]
+    columns = [column.network_id, column.author, column.seq]
+    where   = "main = 1"
+  }
+  index "events_forks" {
+    columns = [column.network_id, column.author, column.seq]
+    where   = "main = 0"
   }
   index "events_order" {
     columns = [column.network_id, column.scope_id, column.lamport, column.created_at_ms, column.hash]
@@ -152,43 +169,6 @@ table "pending_events" {
   }
   index "pending_events_missing" {
     columns = [column.network_id, column.missing]
-  }
-}
-table "log_conflicts" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "hash" {
-    null = false
-    type = text
-  }
-  column "author" {
-    null = false
-    type = text
-  }
-  column "seq" {
-    null = false
-    type = integer
-  }
-  column "envelope" {
-    null = false
-    type = text
-  }
-  column "kept_hash" {
-    null = false
-    type = text
-  }
-  column "detected_at_ms" {
-    null = false
-    type = integer
-  }
-  primary_key {
-    columns = [column.network_id, column.hash]
-  }
-  index "log_conflicts_author" {
-    columns = [column.network_id, column.author, column.seq]
   }
 }
 table "conversations" {

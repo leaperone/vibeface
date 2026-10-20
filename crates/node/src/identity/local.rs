@@ -131,7 +131,8 @@ impl Store {
         let view = state.project()?;
         self.transaction(|tx| {
             ensure!(!has_network_in(tx)?, "network already installed");
-            save_state(tx, &state)
+            save_state(tx, &state)?;
+            Ok(())
         })?;
         Ok(view)
     }
@@ -146,8 +147,9 @@ impl Store {
         has_network_in(&self.connection)
     }
 
-    /// Merges `incoming`; a higher recovery epoch voids every invite and join request.
-    pub fn install_state(&mut self, incoming: NetworkState) -> Result<AuthorizationView> {
+    /// Merges `incoming`; a higher recovery epoch voids every invite and join request. Also
+    /// returns whether the projections were rebuilt.
+    pub fn install_state(&mut self, incoming: NetworkState) -> Result<(AuthorizationView, bool)> {
         incoming.project()?;
         self.transaction(|tx| {
             let next = if has_network_in(tx)? {
@@ -161,8 +163,8 @@ impl Store {
                 incoming
             };
             let view = next.project()?;
-            save_state(tx, &next)?;
-            Ok(view)
+            let rebuilt = save_state(tx, &next)?;
+            Ok((view, rebuilt))
         })
     }
 
@@ -507,9 +509,8 @@ fn load_state(conn: &Connection) -> Result<NetworkState> {
         .context("personal network is not installed")?;
     Ok(serde_json::from_str(&encoded)?)
 }
-fn save_state(conn: &Connection, state: &NetworkState) -> Result<()> {
-    crate::store::install_trust_bundle_in(conn, &state.genesis.network_id, state)?;
-    Ok(())
+fn save_state(conn: &Connection, state: &NetworkState) -> Result<bool> {
+    crate::store::install_trust_bundle_in(conn, &state.genesis.network_id, state)
 }
 fn has_network_in(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row("SELECT COUNT(*) FROM networks", [], |r| r.get::<_, i64>(0))? > 0)

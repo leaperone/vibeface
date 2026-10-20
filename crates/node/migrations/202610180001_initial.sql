@@ -1,9 +1,11 @@
 -- Create "networks" table
 CREATE TABLE `networks` (`network_id` text NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
 -- Create "events" table
-CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, PRIMARY KEY (`network_id`, `author`, `seq`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
--- Create index "events_hash" to table: "events"
-CREATE UNIQUE INDEX `events_hash` ON `events` (`network_id`, `hash`);
+CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, `detected_at_ms` integer NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+-- Create index "events_main" to table: "events"
+CREATE UNIQUE INDEX `events_main` ON `events` (`network_id`, `author`, `seq`) WHERE main = 1;
+-- Create index "events_forks" to table: "events"
+CREATE INDEX `events_forks` ON `events` (`network_id`, `author`, `seq`) WHERE main = 0;
 -- Create index "events_order" to table: "events"
 CREATE INDEX `events_order` ON `events` (`network_id`, `scope_id`, `lamport`, `created_at_ms`, `hash`);
 -- Create index "events_scope_author" to table: "events"
@@ -18,10 +20,6 @@ CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `m
 CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `envelope` text NOT NULL, `missing` text NOT NULL, `received_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`));
 -- Create index "pending_events_missing" to table: "pending_events"
 CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missing`);
--- Create "log_conflicts" table
-CREATE TABLE `log_conflicts` (`network_id` text NOT NULL, `hash` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `envelope` text NOT NULL, `kept_hash` text NOT NULL, `detected_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`));
--- Create index "log_conflicts_author" to table: "log_conflicts"
-CREATE INDEX `log_conflicts_author` ON `log_conflicts` (`network_id`, `author`, `seq`);
 -- Create "conversations" table
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
@@ -104,4 +102,4 @@ CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `conversation_id` text 
 -- Create "work_stops" table
 CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));
 
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;

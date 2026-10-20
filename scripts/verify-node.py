@@ -257,7 +257,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       case 'recovery_checkpoint': {
         const verified = verifyMembership(JSON.stringify(input.state), input.network_id);
-        try { result = JSON.parse(verified.createRecoveryCheckpoint(root('recovered'), JSON.stringify(input.members), input.epoch)); }
+        try { result = JSON.parse(verified.createRecoveryCheckpoint(root('recovered'), JSON.stringify(input.members), JSON.stringify(input.heads), input.epoch)); }
         finally { verified.free(); }
         break;
       }
@@ -448,9 +448,12 @@ class Client:
         require(result["status"] == "joined", "the signed grant admits the device")
         return result
 
-    def revoke(self, device_id, cutoff_seq=0):
+    def revoke(self, device_id, cutoff=None):
+        """`cutoff` is the `(seq, hash)` of the device's last event that keeps counting."""
+        seq, cutoff_hash = cutoff or (0, None)
         event = self.command("governance", state=self.directory_state(), network_id=self.network_id,
-                             action={"type": "revoke", "device_id": device_id, "cutoff_seq": cutoff_seq})
+                             action={"type": "revoke", "device_id": device_id, "cutoff_seq": seq,
+                                     "cutoff_hash": cutoff_hash})
         return self.call("revoke", {"event": event})
 
     def join(self, owner, name, *, manage=False, reveal=None, via=None):
@@ -1348,9 +1351,9 @@ def recover_fresh_node(node, backup, password):
     info = node.client.call("info")
     members = [{"device_id": node.client.own_id(), "kind": "client", "name": "Fresh recovery manager", "manage": True},
                {"device_id": node.device_id, "kind": "node", "name": info["name"], "manage": False}]
-    state = {"genesis": material["genesis"], "checkpoint": None, "events": []}
+    state = {"genesis": material["genesis"], "checkpoints": [], "events": []}
     checkpoint = node.client.command("recovery_checkpoint", state=state, network_id=material["network_id"],
-                                     members=members, epoch=material["recovery_epoch"])
+                                     members=members, heads={}, epoch=material["recovery_epoch"])
     node.client.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint}, status=400)
     result = node.client.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint,
                                           "capability": node.access["capability"]})
@@ -1377,14 +1380,14 @@ def verify_recovery(node, other, network):
                                              body={"type": "probe"})["signature"]
     response = other.call("recovery_state", stale, status=400)
     require("state" not in response, "a proof not signed by the root reveals no membership")
-    state = other.call("recovery_state", other.command("recovery_read_proof", network_id=network))["state"]
+    read = other.call("recovery_state", other.command("recovery_read_proof", network_id=network))
     view = node.client.call("directory")["view"]
     revoked = {item["device_id"] for item in view["revoked"]}
     keep = [member for member in view["members"] if member["device_id"] not in revoked]
     managers = [member["device_id"] for member in keep if member["manage"]]
     keep.append({"device_id": me, "kind": "client", "name": "Recovered management client", "manage": True})
-    checkpoint = other.command("recovery_checkpoint", state=state, network_id=network, members=keep,
-                               epoch=material["recovery_epoch"])
+    checkpoint = other.command("recovery_checkpoint", state=read["state"], network_id=network, members=keep,
+                               heads=read["heads"], epoch=material["recovery_epoch"])
     result = other.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint})
     other.network_id = network
     require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"] > view["epoch"],
@@ -2010,29 +2013,31 @@ def chat_agent_acceptance(options):
 
 
 def verify_dag(node, network):
-    """The per-device signed log is contiguous, heads match it and every dependency is present."""
+    """Each device's main log is contiguous, heads match it and every stored event's parents are stored."""
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT author, seq, hash, lamport, envelope FROM events WHERE network_id=? "
-                                  "ORDER BY author, seq", (network,)).fetchall()
+        rows = connection.execute("SELECT author, seq, hash, lamport, envelope, main FROM events WHERE network_id=? "
+                                  "ORDER BY main DESC, author, seq", (network,)).fetchall()
         heads = dict(((author, (seq, head)) for author, seq, head in connection.execute(
             "SELECT author, max_seq, head_hash FROM log_heads WHERE network_id=?", (network,))))
         pending = connection.execute("SELECT COUNT(*) FROM pending_events WHERE network_id=?", (network,)).fetchone()[0]
-        conflicts = connection.execute("SELECT COUNT(*) FROM log_conflicts WHERE network_id=?", (network,)).fetchone()[0]
     lamport = {row[2]: row[3] for row in rows}
-    previous = {}
-    for author, seq, event_hash, clock, envelope in rows:
+    previous, forks = {}, 0
+    for author, seq, event_hash, clock, envelope, main in rows:
         event = json.loads(json.loads(envelope)["canonical_body"])
         require(event["author"] == author and event["seq"] == seq, "stored columns match the signed body")
+        parents = event["deps"] + ([event["prev"]] if event["prev"] else [])
+        require(event["deps"] == sorted(event["deps"]) and all(parent in lamport for parent in parents),
+                "dependencies are sorted and every parent is stored")
+        require(all(clock > lamport[parent] for parent in parents), "lamport clock exceeds every causal parent")
+        if not main:
+            forks += 1
+            continue
         expected_seq, expected_prev = previous.get(author, (0, None))
         require(seq == expected_seq + 1 and event["prev"] == expected_prev,
-                "each author's log is contiguous and chained by prev")
-        require(event["deps"] == sorted(event["deps"]) and all(dep in lamport for dep in event["deps"]),
-                "dependencies are sorted and already stored")
-        require(all(clock > lamport[dep] for dep in event["deps"] + ([expected_prev] if expected_prev else [])),
-                "lamport clock exceeds every causal parent")
+                "each author's main log is contiguous and chained by prev")
         previous[author] = (seq, event_hash)
-    require(heads == previous, "log_heads equals the last event of every author log")
-    require(pending == 0 and conflicts == 0, "a single Node keeps no pending or conflicting events")
+    require(heads == previous, "log_heads equals the last event of every author's main log")
+    require(pending == 0 and forks == 0, "a single Node keeps no pending or forked events")
     return {"events": len(rows), "authors": len(previous), "heads": {author: seq for author, (seq, _) in previous.items()}}
 
 
@@ -2299,6 +2304,12 @@ def heads(node, network):
         return dict(connection.execute("SELECT author, max_seq FROM log_heads WHERE network_id=?", (network,)))
 
 
+def head(node, network, author):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        return connection.execute("SELECT max_seq, head_hash FROM log_heads WHERE network_id=? AND author=?",
+                                  (network, author)).fetchone()
+
+
 def converged(nodes, network):
     """Every Node holds the same per-author heads and a contiguous, fully linked log."""
     first = heads(nodes[0], network)
@@ -2490,7 +2501,7 @@ def acceptance(options):
         require(sorted(shown) == ["m1", "m2-delivered", "m3", "m4"], "each message appears once after failover")
         passed("entrance-switch", heads=final, messages=shown)
 
-        a.client.revoke(c.device_id, heads(a, network).get(c.device_id, 0))
+        a.client.revoke(c.device_id, head(a, network, c.device_id))
         wait_for("P drops C's entrance after the revocation", lambda: all(
             json.loads(item["payload"])["device_id"] != c.device_id
             for item in failover.call("entrances")["entrances"]))
@@ -2774,7 +2785,7 @@ def phase4_acceptance(options):
         require(stop.get("waiting_for_device") and not stop["confirmed"], "a stop to an offline device waits for it")
         require(delivery(a.client, lost) == "stop_waiting", "the work shows the waiting stop")
         wait_for("the stop request times out", lambda: delivery(a.client, lost) == "stop_timed_out", timeout=60)
-        a.client.revoke(c.device_id, heads(a, network).get(c.device_id, 0))
+        a.client.revoke(c.device_id, head(a, network, c.device_id))
         abandoned = wait_for("A abandons the revoked device's work", lambda: (lambda row: row if row["outcome"] == "abandoned" else None)(
             works(a.client)[lost]), timeout=60)
         require(delivery(a.client, lost) is None, "the abandoned work drops its stop request")
@@ -3173,7 +3184,8 @@ def phase5_acceptance(options):
         b.start()
         reopen(a)
         until(a, "writable")
-        write(a.client)
+        original = f"p5-{next(created)}"
+        a.client.rpc("create_conversation", conversation_id=original, title=original)
         wait_for("B holds A's newest event", lambda: converged(nodes, network), timeout=60)
         a.stop()
         b.stop()
@@ -3196,12 +3208,18 @@ def phase5_acceptance(options):
         require(diagnostics["write_state"] == "forked" and diagnostics["conflicts"] >= 1
                 and diagnostics["logs"].get("node.log"), "the diagnostics export carries the fork and the log tail")
         private_json(run / "diagnostics.json", diagnostics)
+        viewer = at_b()
+        wait_for("B holds both copies' events", lambda: state(viewer)["conflicts"] or None, timeout=60)
         twin.stop()
         reopen(a)
-        until(a, "writable")
-        write(a.client)
-        write(at_b())
-        passed("copied-data-directory-forks-and-only-the-copy-stops", conflicts=len(kept), refused=refused[:120])
+        until(a, "forked")
+        require("forked" in write(a.client, status=400)["error"], "the original stops too once it sees the copy's events")
+        listed = lambda: {row["conversation_id"] for row in viewer.rpc("conversations")["conversations"]}
+        require(original not in listed(), "neither copy's events count from the fork on")
+        write(viewer)
+        viewer.revoke(a.device_id, head(b, network, a.device_id))
+        wait_for("removing A counts the branch B holds", lambda: original in listed() or None, timeout=30)
+        passed("copied-data-directory-forks-and-removal-keeps-one-branch", conflicts=len(kept), refused=refused[:120])
 
         secrets = [node.access["capability"] for node in (a, b)] + [a.backup_password]
         logs = [path for path in run.rglob("*.log*") if path.is_file()]

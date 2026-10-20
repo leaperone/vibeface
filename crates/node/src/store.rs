@@ -1,5 +1,6 @@
-//! One SQLite store per Node. Business events form one signed log per device;
-//! projections are updated incrementally by the reducer as each event is stored.
+//! One SQLite store per Node. Business events form one signed log per device; projections are
+//! updated incrementally as each effective event is stored, and rebuilt from the effective
+//! events when governance or fork evidence changes which events count.
 use crate::{
     crypto::{LocalIdentity, digest},
     identity::{AuthorizationView, Member, NetworkState},
@@ -58,6 +59,7 @@ pub struct Store {
     process_lock: Option<Arc<std::fs::File>>,
 }
 
+/// Merges `state` into the stored history. Returns whether the projections were rebuilt.
 pub(crate) fn install_trust_bundle_in(
     connection: &Connection,
     network_id: &str,
@@ -85,7 +87,7 @@ pub(crate) fn install_trust_bundle_in(
         return Ok(false);
     }
     connection.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
-    Ok(true)
+    log::recompute(connection, &merged.project()?)
 }
 
 /// Total order shared by prompts and UI: a Kahn sort of the DAG with ties broken by
@@ -246,24 +248,27 @@ impl Store {
         Ok(())
     }
     /// Stores each event or reports why not; one bad event never aborts the batch.
-    /// Signatures are verified here, once; stored events are trusted afterwards.
+    /// Signatures are verified here, once; stored events are trusted afterwards. Also returns
+    /// whether the batch changed which events count and so rebuilt the projections.
     pub fn ingest_events(
         &mut self,
         network_id: &str,
         envelopes: &[SignedEvent],
-    ) -> Result<Vec<IngestStatus>> {
+    ) -> Result<(Vec<IngestStatus>, bool)> {
         ensure!(envelopes.len() <= 1024, "event batch is too large");
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = crate::runtime::now_ms();
         let view = membership_from(&tx, network_id)?;
+        let mut stale = false;
         let statuses = envelopes
             .iter()
-            .map(|envelope| log::ingest_from(&tx, &view, envelope, now))
+            .map(|envelope| log::ingest_from(&tx, &view, envelope, now, &mut stale))
             .collect::<Result<Vec<_>>>()?;
+        let rebuilt = stale && log::recompute(&tx, &view)?;
         tx.commit()?;
-        Ok(statuses)
+        Ok((statuses, rebuilt))
     }
 
     pub fn append_event(
@@ -346,7 +351,8 @@ impl Store {
         log::version_vector_from(&self.connection, network_id)
     }
 
-    /// The conversation's events covered by `basis` (default: everything stored), in shared order.
+    /// The conversation's effective events covered by `basis` (default: all of them), in shared
+    /// order.
     pub fn context(
         &self,
         network_id: &str,
@@ -794,7 +800,7 @@ pub(crate) fn since_checkpoint_from(
     scope_id: &str,
 ) -> Result<Context> {
     let mut newest = connection.prepare(
-        "SELECT envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY lamport DESC,created_at_ms DESC,hash DESC",
+        "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1 ORDER BY lamport DESC,created_at_ms DESC,hash DESC",
     )?;
     let mut rows = newest.query(params![network_id, scope_id])?;
     let mut covers = VersionVector::new();
@@ -816,12 +822,14 @@ fn context_after(
     basis: Option<&VersionVector>,
     covers: &VersionVector,
 ) -> Result<Context> {
+    // A former Node's counted branch can run past the main chain, so only an explicit basis cuts.
+    let limit = basis;
     let basis = match basis {
         Some(basis) => basis.clone(),
         None => log::version_vector_from(connection, network_id)?,
     };
     let mut statement = connection.prepare(
-        "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=?
+        "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1
          AND seq>COALESCE((SELECT value FROM json_each(?) WHERE key=events.author),0)
          ORDER BY lamport,created_at_ms,hash",
     )?;
@@ -839,7 +847,9 @@ fn context_after(
     let mut events = Vec::new();
     for row in rows {
         let (author, seq, hash, envelope) = row?;
-        if seq > basis.get(&author).copied().unwrap_or(0) {
+        if let Some(limit) = &limit
+            && seq > limit.get(&author).copied().unwrap_or(0)
+        {
             continue;
         }
         let envelope: SignedEvent = serde_json::from_str(&envelope)?;

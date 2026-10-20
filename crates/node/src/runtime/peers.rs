@@ -19,6 +19,7 @@ const BLOB_SYNC_BYTES: u64 = 1024 * 1024;
 const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_OBJECTS: usize = 64;
 const MAX_ADDRESS_RECORDS: usize = 256;
+const MAX_FORK_PAGES: usize = 64;
 
 #[derive(Default)]
 pub(super) struct PeerSync {
@@ -28,6 +29,11 @@ pub(super) struct PeerSync {
     rerun: bool,
     boot: Option<String>,
     synced_ms: Option<i64>,
+    /// The last pair of differing fork digests that woke a sync, so evidence one side cannot
+    /// store does not keep both waking each other.
+    forks: Option<String>,
+    /// This boot has seen the peer hold nothing of this device's log beyond ours.
+    confirmed: bool,
 }
 
 #[derive(Clone)]
@@ -80,16 +86,55 @@ impl iroh_relay::server::AccessControl for RelayAccess {
     }
 }
 
+/// Merged states are canonical, so equal histories encode equally.
 fn membership_digest(state: &NetworkState) -> Result<String> {
-    let mut hashes = state
-        .events
-        .iter()
-        .map(|event| event.hash())
-        .collect::<Result<Vec<_>>>()?;
-    hashes.sort();
-    Ok(crate::crypto::digest(
-        serde_json::to_string(&(state.epoch(), &state.checkpoint, hashes))?.as_bytes(),
-    ))
+    Ok(crate::crypto::digest(&serde_json::to_vec(state)?))
+}
+
+/// Fetches what the peer holds of one author's log past a fork. Range pulls only extend the
+/// chain from our head, so a branch that left it earlier never arrives that way. Unless the
+/// peer's head is already here, this walks back from the shorter head in doubling steps to the
+/// newest of the peer's events held here, then ingests the peer's chain from there. Returns
+/// whether it fetched anything.
+pub(crate) async fn reconcile_log<H, P, I>(
+    our_max: u64,
+    (their_max, their_head): (u64, &str),
+    mut holds: impl FnMut(String) -> H,
+    mut pull: impl FnMut(u64, usize) -> P,
+    mut ingest: impl FnMut(Vec<SignedEvent>) -> I,
+) -> Result<bool>
+where
+    H: Future<Output = Result<bool>>,
+    P: Future<Output = Result<Vec<SignedEvent>>>,
+    I: Future<Output = Result<()>>,
+{
+    if their_max == 0 || holds(their_head.to_owned()).await? {
+        return Ok(false);
+    }
+    let mut held = our_max.min(their_max);
+    if held == their_max {
+        held -= 1;
+    }
+    let mut step = 1;
+    while held > 0 {
+        if let Some(event) = pull(held, 1).await?.first()
+            && holds(event.hash.clone()).await?
+        {
+            break;
+        }
+        held = held.saturating_sub(step);
+        step = step.saturating_mul(2);
+    }
+    let mut from = held + 1;
+    while from <= their_max {
+        let events = pull(from, crate::store::MAX_PULL_EVENTS).await?;
+        let Some(last) = events.last() else { break };
+        let next = serde_json::from_str::<Event>(&last.canonical_body)?.seq + 1;
+        ensure!(next > from, "peer answered a log range out of order");
+        ingest(events).await?;
+        from = next;
+    }
+    Ok(true)
 }
 
 impl Runtime {
@@ -374,11 +419,45 @@ impl Runtime {
 
     async fn hello(&self, network: &str) -> Result<Value> {
         let state = self.membership_state().await?;
-        let heads = self.store.lock().await.heads(network)?;
+        let (heads, forks) = {
+            let store = self.store.lock().await;
+            (store.heads(network)?, store.fork_digest(network)?)
+        };
         Ok(
             json!({"type":"hello","network_id":network,"vector":heads,"boot":self.boot,
-            "membership_epoch":state.epoch(),"membership":membership_digest(&state)?}),
+            "membership_epoch":state.epoch(),"membership":membership_digest(&state)?,"forks":forks}),
         )
+    }
+
+    /// Whether differing fork digests are new for `peer`; remembers them if so.
+    fn note_forks(&self, peer: &str, theirs: &Value, ours: &Value) -> bool {
+        let pair = Some(format!("{theirs}/{ours}"));
+        let mut peers = self.sync_peers.lock().expect("sync peers");
+        let known = &mut peers.entry(peer.to_owned()).or_default().forks;
+        let new = *known != pair;
+        *known = pair;
+        new
+    }
+
+    async fn pull(
+        &self,
+        network: &str,
+        peer: &str,
+        author: &str,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SignedEvent>> {
+        let reply = self
+            .net()?
+            .request(
+                peer,
+                net::SYNC,
+                &json!({"type":"pull","network_id":network,"author":author,
+                    "from_seq":from_seq,"limit":limit}),
+                PEER_TIMEOUT,
+            )
+            .await?;
+        Ok(serde_json::from_value(reply["events"].clone())?)
     }
 
     async fn handle_sync(&self, network: &str, origin: &str, input: &Value) -> Result<Value> {
@@ -390,12 +469,16 @@ impl Runtime {
                 let ours = self.hello(network).await?;
                 let theirs: BTreeMap<String, (u64, String)> =
                     serde_json::from_value(input["vector"].clone()).context("invalid vector")?;
-                let local: BTreeMap<String, (u64, String)> =
-                    serde_json::from_value(ours["vector"].clone())?;
-                let behind = theirs.iter().any(|(author, (seq, _))| {
-                    local.get(author).map(|head| head.0).unwrap_or(0) < *seq
-                });
-                if behind || input["membership"] != ours["membership"] {
+                // A head we lack is either further along or on another branch of that log.
+                let behind = {
+                    let store = self.store.lock().await;
+                    theirs.values().try_fold(false, |behind, (_, hash)| {
+                        anyhow::Ok(behind || store.event(network, hash)?.is_none())
+                    })?
+                };
+                let forks = input["forks"] != ours["forks"]
+                    && self.note_forks(origin, &input["forks"], &ours["forks"]);
+                if behind || forks || input["membership"] != ours["membership"] {
                     self.wake_sync(origin);
                 }
                 Ok(ours)
@@ -407,10 +490,19 @@ impl Runtime {
                     incoming.genesis.network_id == network,
                     "wrong membership network"
                 );
-                if incoming.epoch() >= self.membership_state().await?.epoch() {
-                    self.install_membership(incoming).await?;
-                }
+                self.install_membership(incoming).await?;
                 Ok(json!({"state":self.membership_state().await?}))
+            }
+            "forks" => {
+                let after: Option<(String, u64, String)> =
+                    serde_json::from_value(input["after"].clone())
+                        .context("invalid fork cursor")?;
+                let events = self
+                    .store
+                    .lock()
+                    .await
+                    .fork_events(network, after.as_ref())?;
+                Ok(json!({"events":events}))
             }
             "pull" => {
                 let author = field(input, "author")?;
@@ -506,7 +598,6 @@ impl Runtime {
                 })
                 .map(|member| member.device_id.clone())
                 .collect();
-            let members = Arc::new(peers.clone());
             for peer in peers {
                 {
                     let mut states = self.sync_peers.lock().expect("sync peers");
@@ -519,36 +610,35 @@ impl Runtime {
                 }
                 let node = self.clone();
                 let network = network.clone();
-                let members = members.clone();
                 tokio::spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
-                    if result.is_err() && node.unreachable(&members, &peer) {
-                        node.set_write_state(
-                            &network,
-                            &[WriteState::Aligning],
-                            WriteState::ReadOnly,
-                        )
-                        .await;
-                    }
-                    let mut states = node.sync_peers.lock().expect("sync peers");
-                    let entry = states.entry(peer.clone()).or_default();
-                    entry.running = false;
-                    match &result {
-                        Ok(()) => {
-                            entry.failures = 0;
-                            entry.synced_ms = Some(now_ms());
-                            entry.due = Some(Instant::now() + HELLO_INTERVAL);
+                    let rerun = {
+                        let mut states = node.sync_peers.lock().expect("sync peers");
+                        let entry = states.entry(peer.clone()).or_default();
+                        entry.running = false;
+                        match &result {
+                            Ok(()) => {
+                                entry.failures = 0;
+                                entry.synced_ms = Some(now_ms());
+                                entry.due = Some(Instant::now() + HELLO_INTERVAL);
+                            }
+                            Err(error) => {
+                                entry.failures = entry.failures.saturating_add(1);
+                                let wait = Duration::from_secs(1 << entry.failures.min(5));
+                                entry.due = Some(Instant::now() + wait.min(RETRY_LIMIT));
+                                tracing::debug!(%peer, %error, "sync with peer pending");
+                            }
                         }
-                        Err(error) => {
-                            entry.failures = entry.failures.saturating_add(1);
-                            let wait = Duration::from_secs(1 << entry.failures.min(5));
-                            entry.due = Some(Instant::now() + wait.min(RETRY_LIMIT));
-                            tracing::debug!(%peer, %error, "sync with peer pending");
+                        let rerun = std::mem::take(&mut entry.rerun);
+                        if rerun {
+                            entry.due = Some(Instant::now());
                         }
+                        rerun
+                    };
+                    if result.is_err() {
+                        node.align(&network).await;
                     }
-                    if std::mem::take(&mut entry.rerun) {
-                        entry.due = Some(Instant::now());
-                        drop(states);
+                    if rerun {
                         node.sync_wakeup.notify_one();
                     }
                 });
@@ -577,9 +667,7 @@ impl Runtime {
                 )
                 .await?;
             let incoming: NetworkState = serde_json::from_value(reply["state"].clone())?;
-            if incoming.epoch() >= state.epoch() {
-                self.install_membership(incoming).await?;
-            }
+            self.install_membership(incoming).await?;
         }
         if let Err(error) = self.exchange_addresses(network, peer).await {
             tracing::debug!(%peer, %error, "address book exchange pending");
@@ -594,16 +682,15 @@ impl Runtime {
                     if local >= *seq {
                         break;
                     }
-                    let reply = net
-                        .request(
+                    let events = self
+                        .pull(
+                            network,
                             peer,
-                            net::SYNC,
-                            &json!({"type":"pull","network_id":network,"author":author,
-                                "from_seq":local + 1,"limit":crate::store::MAX_PULL_EVENTS}),
-                            PEER_TIMEOUT,
+                            author,
+                            local + 1,
+                            crate::store::MAX_PULL_EVENTS,
                         )
                         .await?;
-                    let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
                     if events.is_empty() {
                         break;
                     }
@@ -616,6 +703,35 @@ impl Runtime {
             }
             if !progressed {
                 break;
+            }
+        }
+        for (author, head) in &vector {
+            let our_max = self.local_seq(network, author).await?;
+            reconcile_log(
+                our_max,
+                (head.0, &head.1),
+                |hash| async move { Ok(self.store.lock().await.event(network, &hash)?.is_some()) },
+                |from, limit| self.pull(network, peer, author, from, limit),
+                |events| async move { self.ingest(network, &events).await },
+            )
+            .await?;
+        }
+        if theirs["forks"] != json!(self.store.lock().await.fork_digest(network)?) {
+            let mut after: Option<(String, u64, String)> = None;
+            for _ in 0..MAX_FORK_PAGES {
+                let reply = net
+                    .request(
+                        peer,
+                        net::SYNC,
+                        &json!({"type":"forks","network_id":network,"after":after}),
+                        PEER_TIMEOUT,
+                    )
+                    .await?;
+                let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
+                let Some(last) = events.last() else { break };
+                let event: Event = serde_json::from_str(&last.canonical_body)?;
+                after = Some((event.author, event.seq, last.hash.clone()));
+                self.ingest(network, &events).await?;
             }
         }
         self.check_own_log(network, peer, &vector).await?;
@@ -631,12 +747,30 @@ impl Runtime {
         states.get(peer).is_some_and(|state| state.failures > 0)
     }
 
-    /// Whether every other member Node has failed since boot, counting this failure of `peer`.
-    fn unreachable(&self, members: &[String], peer: &str) -> bool {
-        let states = self.sync_peers.lock().expect("sync peers");
-        members.iter().all(|member| {
-            member == peer || states.get(member).is_some_and(|state| state.failures > 0)
-        })
+    /// Writable once every other current member Node has confirmed this device's log since
+    /// boot; read-only, until the user confirms, once every one that has not is failing.
+    pub(super) async fn align(&self, network: &str) {
+        let Ok((_, peers)) = self.member_peers().await else {
+            return;
+        };
+        let unconfirmed: Vec<u32> = {
+            let states = self.sync_peers.lock().expect("sync peers");
+            peers
+                .iter()
+                .filter_map(|peer| match states.get(peer) {
+                    Some(state) if state.confirmed => None,
+                    state => Some(state.map_or(0, |state| state.failures)),
+                })
+                .collect()
+        };
+        if unconfirmed.is_empty() {
+            let from = [WriteState::Aligning, WriteState::ReadOnly];
+            self.set_write_state(network, &from, WriteState::Writable)
+                .await;
+        } else if unconfirmed.iter().all(|failures| *failures > 0) {
+            self.set_write_state(network, &[WriteState::Aligning], WriteState::ReadOnly)
+                .await;
+        }
     }
 
     /// Starting up with other member Nodes, this one waits to learn it holds every event it
@@ -661,9 +795,9 @@ impl Runtime {
         Ok(state == WriteState::Writable)
     }
 
-    /// Compares what `peer` holds of this device's log with ours. A different event at the
-    /// same sequence means another copy of this data directory wrote it: that copy is kept
-    /// aside beside ours, and this Node stops writing.
+    /// Compares what `peer` holds of this device's log with ours, after the walk-back pulled any
+    /// branch it has. A different event at the same sequence means another copy of this data
+    /// directory wrote it: that copy is kept aside beside ours, and this Node stops writing.
     async fn check_own_log(
         &self,
         network: &str,
@@ -671,30 +805,20 @@ impl Runtime {
         vector: &BTreeMap<String, (u64, String)>,
     ) -> Result<()> {
         let own = self.identity.device_id()?;
-        let theirs = vector.get(&own);
         let local = self.local_seq(network, &own).await?;
-        let ours = match theirs {
-            Some((seq, _)) if *seq <= local => {
-                self.store.lock().await.hash_at(network, &own, *seq)?
+        let confirmed = match vector.get(&own) {
+            None => true,
+            Some((seq, hash)) => {
+                *seq <= local
+                    && self
+                        .store
+                        .lock()
+                        .await
+                        .hash_at(network, &own, *seq)?
+                        .as_ref()
+                        == Some(hash)
             }
-            _ => None,
         };
-        if let Some((seq, hash)) = theirs
-            && *seq <= local
-            && ours.as_deref() != Some(hash)
-        {
-            let reply = self
-                .net()?
-                .request(
-                    peer,
-                    net::SYNC,
-                    &json!({"type":"pull","network_id":network,"author":own,"from_seq":seq,"limit":1}),
-                    PEER_TIMEOUT,
-                )
-                .await?;
-            let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
-            self.ingest(network, &events).await?;
-        }
         if self.store.lock().await.has_conflicts_by(network, &own)? {
             let from = [
                 WriteState::Aligning,
@@ -707,10 +831,14 @@ impl Runtime {
             {
                 tracing::warn!(%peer, "another copy of this device wrote different events; writes stopped");
             }
-        } else if theirs.is_none_or(|(seq, _)| *seq <= local) {
-            let from = [WriteState::Aligning, WriteState::ReadOnly];
-            self.set_write_state(network, &from, WriteState::Writable)
-                .await;
+        } else if confirmed {
+            self.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.to_owned())
+                .or_default()
+                .confirmed = true;
+            self.align(network).await;
         }
         Ok(())
     }
@@ -838,13 +966,16 @@ impl Runtime {
     }
 
     async fn ingest(&self, network: &str, events: &[SignedEvent]) -> Result<()> {
-        let statuses = {
+        let (statuses, rebuilt) = {
             let mut store = self.store.lock().await;
-            let statuses = store.ingest_events(network, events)?;
+            let ingested = store.ingest_events(network, events)?;
             // The user's choice on an unverified result may have arrived from another entry.
             store.settle_local_works(network)?;
-            statuses
+            ingested
         };
+        if rebuilt {
+            self.publish_rebuilt(network);
+        }
         let mut scopes = BTreeSet::new();
         for (event, status) in events.iter().zip(&statuses) {
             match status {
@@ -857,7 +988,7 @@ impl Runtime {
                     tracing::debug!(hash = %event.hash, reason, "peer event rejected")
                 }
                 IngestStatus::Conflict => {
-                    tracing::warn!(hash = %event.hash, "conflicting event kept aside")
+                    tracing::warn!(hash = %event.hash, "forked event stored as evidence")
                 }
                 IngestStatus::Duplicate => {}
             }
@@ -1527,6 +1658,157 @@ mod tests {
             .attestation()
             .cloned()
             .context("signed message")
+    }
+
+    /// Each side's copy of x's log split at seq 3. Walking back from the peer's head finds the
+    /// fork, and after one pass each way both hold the same evidence and count the same events.
+    #[tokio::test]
+    async fn diverged_logs_walk_back_to_the_fork_and_converge() -> Result<()> {
+        use std::sync::Mutex;
+        let (ia, ix) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ix.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let author = ix.device_id()?;
+        let replica = || -> Result<Store> {
+            let mut store = Store::open(":memory:")?;
+            store.install_trust_bundle(&network, &state)?;
+            Ok(store)
+        };
+        let message = |id: &str| -> Result<EventBody> {
+            Ok(EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                attestation: Some(user(&ia, &network, id)?),
+            })
+        };
+        let (mut p, mut q) = (replica()?, replica()?);
+        let created = EventBody::ConversationCreated { title: "t".into() };
+        let shared = vec![
+            p.append_event(&ix, &network, "c", created, vec![], 1)?,
+            p.append_event(&ix, &network, "c", message("x2")?, vec![], 2)?,
+        ];
+        for id in ["a3", "a4", "a5"] {
+            p.append_event(&ix, &network, "c", message(id)?, vec![], 3)?;
+        }
+        q.ingest_events(&network, &shared)?;
+        for id in ["b3", "b4", "b5", "b6"] {
+            q.append_event(&ix, &network, "c", message(id)?, vec![], 3)?;
+        }
+        let (p, q) = (Mutex::new(p), Mutex::new(q));
+        let pulls = Mutex::new(0);
+        let network = network.as_str();
+        let fetch = async |to: &Mutex<Store>, from: &Mutex<Store>| -> Result<bool> {
+            let their = from.lock().unwrap().heads(network)?[&author].clone();
+            let our_max = to.lock().unwrap().heads(network)?[&author].0;
+            reconcile_log(
+                our_max,
+                (their.0, &their.1),
+                |hash| async move { Ok(to.lock().unwrap().event(network, &hash)?.is_some()) },
+                |seq, limit| {
+                    *pulls.lock().unwrap() += 1;
+                    let events = from
+                        .lock()
+                        .unwrap()
+                        .events_from(network, &author, seq, limit);
+                    async move { events }
+                },
+                |events| async move {
+                    to.lock().unwrap().ingest_events(network, &events)?;
+                    Ok(())
+                },
+            )
+            .await
+        };
+        assert!(fetch(&q, &p).await?);
+        assert!(
+            *pulls.lock().unwrap() <= 4,
+            "walk-back probes in doubling steps"
+        );
+        assert!(fetch(&p, &q).await?);
+        assert!(!fetch(&q, &p).await? && !fetch(&p, &q).await?);
+        let evidence = |store: &Mutex<Store>| -> Result<(Vec<String>, Vec<String>, String)> {
+            let store = store.lock().unwrap();
+            let hashes = |sql: &str| -> Result<Vec<String>> {
+                Ok(store
+                    .connection
+                    .prepare(sql)?
+                    .query_map([network], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            };
+            Ok((
+                hashes("SELECT hash FROM events WHERE network_id=? ORDER BY hash")?,
+                hashes("SELECT hash FROM events WHERE network_id=? AND effective=1 ORDER BY hash")?,
+                store.fork_digest(network)?,
+            ))
+        };
+        let (stored, effective, forks) = evidence(&p)?;
+        assert_eq!((stored.len(), effective.len()), (9, 2));
+        assert!(!forks.is_empty());
+        assert_eq!(evidence(&q)?, (stored, effective, forks));
+        Ok(())
+    }
+
+    /// Writes wait until every other member Node has confirmed this device's log since boot.
+    /// With the unconfirmed ones failing the Node turns read-only; a confirmation completing
+    /// the set, or revoking the Node still missing, lets it write.
+    #[tokio::test]
+    async fn alignment_waits_for_every_member_node_to_confirm() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Revocation};
+        let (ia, ib, ic) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let (b, c) = (ib.device_id()?, ic.device_id()?);
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, b.clone(), c.clone()])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            assert!(!a.align_on_start().await?);
+            let mark = |peer: &str, confirmed: bool| {
+                let mut states = a.sync_peers.lock().expect("sync peers");
+                let entry = states.entry(peer.into()).or_default();
+                entry.confirmed = confirmed;
+                entry.failures = u32::from(!confirmed);
+            };
+            let now = || *a.write_state.borrow();
+            mark(&b, true);
+            a.align(&network).await;
+            assert_eq!(now(), WriteState::Aligning, "c has not answered yet");
+            mark(&c, false);
+            a.align(&network).await;
+            assert_eq!(now(), WriteState::ReadOnly);
+            mark(&c, true);
+            a.align(&network).await;
+            assert_eq!(now(), WriteState::Writable);
+
+            a.set_write_state(&network, &[WriteState::Writable], WriteState::Aligning)
+                .await;
+            mark(&c, false);
+            let mut next = state.clone();
+            next.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Revocation::new(&c, None)?,
+            )?)?;
+            a.install_membership(next).await?;
+            assert_eq!(
+                now(),
+                WriteState::Writable,
+                "a revoked Node no longer counts"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(a);
+        let _ = std::fs::remove_dir_all(dir);
+        result
     }
 
     #[tokio::test(flavor = "multi_thread")]

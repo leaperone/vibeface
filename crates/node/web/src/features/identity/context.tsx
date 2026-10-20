@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import type { ReactNode } from 'react'
 import { connectDevice, initClient, parseJoinLink, signClient, validTarget } from '../../../transport.js'
 import type { DeviceChannel, JoinLink } from '../../../transport.js'
-import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, parseLocalSetup, record, same } from '@/lib/node'
+import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, parseLocalSetup, record, same, text } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PublicIdentity, ReadyConnection } from '@/lib/node'
 import { shouldAutoConnect } from './connection-lane'
 import { localBrowserEntry } from '@/lib/local-access'
@@ -482,15 +482,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const member = directory?.members.find(item => item.device_id === deviceId)
     if (!member) throw new Error('成员不存在。请刷新目录。')
     if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error('不能移除这个浏览器或当前连接的电脑。')
-    let cutoff = 0
+    // A Node's log counts up to the head this entry holds, along that branch if it forked.
+    let cutoff = 0, cutoffHash: string | null = null
     if (member.kind === 'node') {
       const node = array(record(await connection.rpc('nodes')).nodes).map(item => record(item)).find(item => item.device_id === deviceId)
-      cutoff = typeof node?.max_seq === 'number' ? node.max_seq : 0
+      if (typeof node?.max_seq === 'number' && node.max_seq > 0) { cutoff = node.max_seq; cutoffHash = text(node.head_hash) }
     }
     const state = record(await request('directory')).state
     const verified = verifyState(state, connection.principal.network_id)
     let event: Record<string, unknown>
-    try { event = JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'revoke', device_id: deviceId, cutoff_seq: cutoff }))) }
+    try { event = JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'revoke', device_id: deviceId, cutoff_seq: cutoff, cutoff_hash: cutoffHash }))) }
     finally { verified.free() }
     event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
     await request('revoke', { event }); await refreshDirectory()
@@ -620,12 +621,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const capability = fresh && localSetup?.kind === 'uninitialized' && entryKey(localSetup.entry) === entryKey(active.entry) ? localSetup.capability : ''
       if (fresh && !capability) throw new Error('恢复到新电脑需要在那台电脑的本机页面进行。')
       if (!fresh && active.info.network_id !== opened.networkId) throw new Error('这台电脑属于另一组设备。')
-      let state: unknown = { genesis: opened.payload.genesis, checkpoint: null, events: [] }
+      let state: unknown = { genesis: opened.payload.genesis, checkpoints: [], events: [] }
+      let heads: unknown = {}
       if (!fresh) {
         const expires = Date.now() + 60_000
         const proof = `{"device_id":"${me}","expires_at_ms":${expires},"network_id":"${opened.networkId}"}`
         const signature = opened.root.sign('identity-recovery-read', new TextEncoder().encode(proof))
-        state = record(await request('recovery_state', { expires_at_ms: expires, signature })).state
+        const read = record(await request('recovery_state', { expires_at_ms: expires, signature }))
+        state = read.state; heads = read.heads
       }
       if (session.current !== active || active.generation !== generation.current) throw changed()
       verified = verifyState(state, opened.networkId)
@@ -647,7 +650,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
           selected.push(newManager)
           try {
-            const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, JSON.stringify(selected), opened.epoch))
+            const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, JSON.stringify(selected), JSON.stringify(heads), opened.epoch))
             const auth = await request('recover', { genesis: opened.payload.genesis, checkpoint, ...(fresh ? { capability } : {}) })
             if (released) throw new Error('恢复已提交，但这里已取消。请重新连接看一下结果，并保留原恢复文件。')
             opened.payload.recovery_epoch = record(checkpoint).epoch
