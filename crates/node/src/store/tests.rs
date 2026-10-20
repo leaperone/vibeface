@@ -1005,8 +1005,9 @@ fn assistant_reply(id: &str, to: &str) -> EventBody {
     }
 }
 
-fn skill(name: &str, body: &str) -> Skill {
-    Skill {
+fn save_skill(skill_id: Option<&str>, name: &str, body: &str) -> ChangeRequest {
+    ChangeRequest::SaveSkill {
+        skill_id: skill_id.map(Into::into),
         name: name.into(),
         description: format!("{name} in short"),
         body: body.into(),
@@ -1025,7 +1026,7 @@ fn save_routine(routine_id: Option<&str>, name: &str, every_minutes: u32) -> Cha
 }
 
 fn rename(name: &str) -> ChangeRequest {
-    ChangeRequest::Profile {
+    ChangeRequest::UpdateProfile {
         name: Some(name.into()),
         instructions: None,
     }
@@ -1165,10 +1166,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         &net.a,
         "message:m1",
         "r3",
-        ChangeRequest::SaveSkill {
-            skill_id: None,
-            skill: skill("Digest", "List the commits."),
-        },
+        save_skill(None, "Digest", "List the commits."),
         6,
     )?;
     let AssistantChange::Skill { skill_id, .. } = saved.change else {
@@ -1179,10 +1177,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         &net.a,
         "message:m1",
         "r4",
-        ChangeRequest::SaveSkill {
-            skill_id: None,
-            skill: skill("digest", "Other."),
-        },
+        save_skill(None, "digest", "Other."),
         6,
     )
     .unwrap_err();
@@ -1207,10 +1202,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         &net.b,
         "message:m2",
         "r2",
-        ChangeRequest::SaveSkill {
-            skill_id: Some(skill_id.clone()),
-            skill: skill("Digest", "List the commits by author."),
-        },
+        save_skill(Some(&skill_id), "Digest", "List the commits by author."),
         10,
     )?;
     change(

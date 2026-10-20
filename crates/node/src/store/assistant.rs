@@ -16,16 +16,25 @@ fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
     )
 }
 
-/// What a settings tool asked for; the writer adds the values it replaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One turn's tool call names one change, so a retried call finds it again.
+pub fn change_id(conversation: &str, trigger: &str, call_ref: &str) -> String {
+    format!("change-{}", change_digest(conversation, trigger, call_ref))
+}
+
+/// What a settings tool asked for, tagged by the tool's name; the writer adds the values it
+/// replaces.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChangeRequest {
-    Profile {
+    UpdateProfile {
         name: Option<String>,
         instructions: Option<String>,
     },
     SaveSkill {
         skill_id: Option<String>,
-        skill: Skill,
+        name: String,
+        description: String,
+        body: String,
     },
     RemoveSkill {
         skill_id: String,
@@ -50,20 +59,30 @@ impl ChangeRequest {
         let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
         match (self, change) {
             (
-                Self::Profile { name, instructions },
+                Self::UpdateProfile { name, instructions },
                 AssistantChange::Profile {
                     name: changed_name,
                     instructions: changed_instructions,
                 },
             ) => *name == after(changed_name) && *instructions == after(changed_instructions),
             (
-                Self::SaveSkill { skill_id, skill },
+                Self::SaveSkill {
+                    skill_id,
+                    name,
+                    description,
+                    body,
+                },
                 AssistantChange::Skill {
                     skill_id: id,
                     after: Some(saved),
                     ..
                 },
-            ) => skill_id.as_ref().is_none_or(|wanted| wanted == id) && skill == saved,
+            ) => {
+                skill_id.as_ref().is_none_or(|wanted| wanted == id)
+                    && *name == saved.name
+                    && *description == saved.description
+                    && *body == saved.body
+            }
             (
                 Self::RemoveSkill { skill_id },
                 AssistantChange::Skill {
@@ -250,7 +269,7 @@ fn resolve(
     request: ChangeRequest,
 ) -> Result<AssistantChange> {
     let change = match request {
-        ChangeRequest::Profile { name, instructions } => {
+        ChangeRequest::UpdateProfile { name, instructions } => {
             ensure!(
                 name.is_some() || instructions.is_some(),
                 "name or instructions is required"
@@ -282,7 +301,17 @@ fn resolve(
                 }),
             }
         }
-        ChangeRequest::SaveSkill { skill_id, skill } => {
+        ChangeRequest::SaveSkill {
+            skill_id,
+            name,
+            description,
+            body,
+        } => {
+            let skill = Skill {
+                name,
+                description,
+                body,
+            };
             skill.validate()?;
             let (skill_id, before) = match skill_id {
                 Some(id) => {
