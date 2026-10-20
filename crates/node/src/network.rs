@@ -2531,14 +2531,7 @@ fn validate_url(value: &str) -> Result<()> {
     Ok(())
 }
 fn check_id(value: &str) -> Result<()> {
-    ensure!(
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "invalid network identifier"
-    );
-    Ok(())
+    crate::identity::validate_id(value).context("invalid network identifier")
 }
 fn now_secs() -> Result<i64> {
     Ok(SystemTime::now()

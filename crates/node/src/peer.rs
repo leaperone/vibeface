@@ -1167,14 +1167,7 @@ fn now_ms() -> Result<i64> {
         .try_into()?)
 }
 fn check_hex_id(value: &str) -> Result<()> {
-    ensure!(
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "invalid peer identifier"
-    );
-    Ok(())
+    crate::identity::validate_id(value).context("invalid peer identifier")
 }
 fn validate_body(body: &Body, now: i64) -> Result<()> {
     ensure!(
