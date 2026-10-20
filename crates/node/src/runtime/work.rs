@@ -544,7 +544,10 @@ impl Runtime {
             if request.timed_out {
                 continue;
             }
-            if self.deliver_stop(network, &request).await.is_ok() {
+            // Bounded like the first attempt, so an offline device cannot hold up the outbox.
+            let attempt =
+                tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request));
+            if matches!(attempt.await, Ok(Ok(_))) {
                 self.store
                     .lock()
                     .await
