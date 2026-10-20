@@ -45,10 +45,11 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
     <Steps items={["在另一台设备上移除它", "在这台电脑上重新加入"]} />
   </ActionCard>
   const RemoveIcon = terms.remove.icon
+  const canManage = device.ready?.principal.can_manage === true
   return <ActionCard icon={Copy} title={`${authors.map((id) => nodeName(id, lookup)).join("、")} 的数据被复制过`}
-    actions={authors[0] ? <Button asChild variant="default"><Link to="/devices/$deviceId" params={{ deviceId: authors[0] }}><RemoveIcon aria-hidden="true" />去移除</Link></Button> : undefined}>
+    actions={authors[0] && canManage ? <Button asChild variant="default"><Link to="/devices/$deviceId" params={{ deviceId: authors[0] }}><RemoveIcon aria-hidden="true" />去移除</Link></Button> : undefined}>
     <p className="text-muted-foreground">两份记了不同的内容，这部分先不算，其他内容照常。</p>
-    <Steps items={["移除它，保留这里先收到的那份", "在那台电脑上重新加入"]} />
+    <Steps items={[canManage ? "移除它，保留这里先收到的那份" : "用管理设备移除它，保留先收到的那份", "在那台电脑上重新加入"]} />
     {conflicts.length ? <Details label="两份内容">
       {conflicts.map((item) => <div key={item.other.hash} className="grid gap-1 border-t pt-2 first:border-t-0 first:pt-0">
         <DetailRow label="这里先收到的" value={summary(item.kept)} />

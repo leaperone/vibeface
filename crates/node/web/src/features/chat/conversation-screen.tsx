@@ -108,7 +108,8 @@ export function ConversationScreen() {
     }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
     // A decision a running task of this chat waits on shows here too, not only in 待处理.
-    ...workspace.alerts.filter((alert) => alert.resolution === null && works.some((work) => !work.outcome && work.target_node === alert.node && work.cwd === alert.cwd))
+    // ponytail: matched by node (and cwd when the alert has one); match thread_id if works ever carry it.
+    ...workspace.alerts.filter((alert) => alert.resolution === null && works.some((work) => !work.outcome && work.target_node === alert.node && (!alert.cwd || work.cwd === alert.cwd)))
       .map((alert) => <AlertCard key={alert.alert_id} alert={alert} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
