@@ -231,16 +231,6 @@ impl Store {
     ) -> Result<NodeCertificate> {
         authorize_node_from(&self.connection, network_id, peer_id, role)
     }
-    pub fn save_local_identity(
-        &mut self,
-        network_id: &str,
-        identity: &LocalIdentity,
-    ) -> Result<()> {
-        let peer_id = identity.peer_id()?;
-        self.authorize_node(network_id, &peer_id, None)?;
-        self.connection.execute("INSERT INTO local_identities(network_id,peer_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,peer_id) DO UPDATE SET identity=excluded.identity",params![network_id,peer_id,serde_json::to_string(identity)?])?;
-        Ok(())
-    }
     fn public_key(&self, network_id: &str, author: &str) -> Result<String> {
         self.connection
             .query_row(
@@ -2901,7 +2891,6 @@ mod tests {
             &owner.fixture_network_id()?,
             &owner.sign_network_fixture(1, nodes)?,
         )?;
-        store.save_local_identity(&owner.fixture_network_id()?, owner)?;
         Ok(store)
     }
     fn conversation(store: &mut Store, owner: &LocalIdentity) -> Result<SignedEvent> {
@@ -3212,7 +3201,6 @@ mod tests {
                 vec![owner.certificate(roles())?, peer.certificate(roles())?],
             )?,
         )?;
-        store.save_local_identity(&network, &owner)?;
         let root = conversation(&mut store, &owner)?;
         let message = admitted_message(&mut store, &owner, "known-result", &target)?;
         let claimed = store

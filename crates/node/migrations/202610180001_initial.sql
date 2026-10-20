@@ -2,8 +2,6 @@
 CREATE TABLE `networks` (`network_id` text NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
 -- Create "node_certificates" table
 CREATE TABLE `node_certificates` (`network_id` text NOT NULL, `peer_id` text NOT NULL, `public_key` text NOT NULL, PRIMARY KEY (`network_id`, `peer_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
--- Create "local_identities" table
-CREATE TABLE `local_identities` (`network_id` text NOT NULL, `peer_id` text NOT NULL, `identity` text NOT NULL, PRIMARY KEY (`network_id`, `peer_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create "events" table
 CREATE TABLE `events` (`network_id` text NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `author` text NOT NULL, `sequence` integer NOT NULL, `envelope` text NOT NULL, `status` text NOT NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create index "events_author_sequence" to table: "events"

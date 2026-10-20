@@ -73,6 +73,13 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 const settle = () => new Promise(setImmediate)
+const until = async (ready: () => boolean) => {
+  const deadline = Date.now() + 5000
+  while (!ready()) {
+    if (Date.now() > deadline) throw new Error('condition not reached within 5s')
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+}
 function nodeJoinFixture() {
   const expires_at_ms = Date.now() + 60000
   const payload = { invite_id: 'node-invite', network_id: network, inviter_subject_id: '9'.repeat(64), new_kind: 'node', manage: false, node_roles: ['relay'], epoch: 1, expires_at_ms }
@@ -418,7 +425,7 @@ test('refreshing a local Node whose acceptance never landed sends it once withou
   app.joinResponses.set('accept', { ...receipt, kind: 'pending' })
   try {
     app.render()
-    for (let tries = 0; tries < 50 && app.render().localJoin?.kind !== 'pending'; tries++) await settle()
+    await until(() => app.render().localJoin?.kind === 'pending')
     assert.equal(app.render().localJoin?.kind, 'pending')
     assert.deepEqual(app.joinRequests.map(request => request.action), ['status', 'accept'])
     assert.equal(app.render().ready, null)
@@ -449,7 +456,7 @@ test('a lost Node acceptance response is reconciled through status without autom
     app.joinResponses.set('request', receipt)
     const hold = deferred(); app.holds.set('local_join:accept', hold)
     const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /response lost/)
-    for (let tries = 0; tries < 50 && !app.calls.includes('local_join:accept'); tries++) await settle()
+    await until(() => app.calls.includes('local_join:accept'))
     hold.reject(new Error('response lost')); await rejected
     assert.equal(app.render().localJoin?.kind, 'review')
     assert.equal(app.joinRequests.filter(request => request.action === 'accept').length, 1)
@@ -466,7 +473,7 @@ test('switching away while a Node join request is pending prevents a stale revie
     app.render(); await settle()
     const hold = deferred(); app.holds.set('local_join:request', hold)
     const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /换了/)
-    await settle(); assert.ok(app.calls.includes('local_join:request'))
+    await until(() => app.calls.includes('local_join:request'))
     app.render().disconnect()
     hold.resolve(receipt); await rejected
     assert.equal(app.render().localJoin?.kind, 'idle')
@@ -485,7 +492,7 @@ test('recovering onto a fresh localhost Node reuses local setup authority withou
     challengeHold.resolve({ challenge_id: 'challenge', challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
     const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: localEntry, bootstrap: '' })
     const rejected = assert.rejects(recovering, /stop after authority check/)
-    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    await until(() => app.calls.includes('recovery_context'))
     assert.equal(app.requests.find(request => request.method === 'recovery_context')?.params.capability, localCapability)
     contextHold.reject(new Error('stop after authority check')); await rejected
     assert.equal(app.render().ready, null)
@@ -504,7 +511,7 @@ test('localhost recovery can use a remote fresh Node invitation without sending 
     challengeHold.resolve({ challenge_id: challenge.challenge_id, challenge, signing: { domain: 'identity-recovery-access', payload: canonical(challenge) } })
     const recovering = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: remote, bootstrap: JSON.stringify({ url: remote.address, peer_id: remote.peer_id, capability }) })
     const rejected = assert.rejects(recovering, /stop after remote authority check/)
-    for (let tries = 0; tries < 100 && !app.calls.includes('recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
+    await until(() => app.calls.includes('recovery_context'))
     const sent = app.requests.find(request => request.method === 'recovery_context')?.params.capability
     assert.equal(sent, capability)
     assert.notEqual(sent, localCapability)
@@ -609,8 +616,7 @@ for (const stage of ['authenticate', 'subscribe']) test(`cancelPair during ${sta
     const hold = deferred(); app.holds.set(stage, hold)
     const checking = app.render().checkPair()
     const rejected = assert.rejects(checking, /换了|取消/)
-    await settle()
-    assert.ok(app.calls.includes(stage))
+    await until(() => app.calls.includes(stage))
     app.render().cancelPair()
     hold.resolve({})
     await rejected; await settle()
@@ -631,7 +637,7 @@ for (const stage of ['bootstrap', 'subscribe']) test(`cancelSensitive during ${s
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
     const rejected = assert.rejects(confirming, /换了|取消/)
-    await settle(); assert.ok(app.calls.includes(stage))
+    await until(() => app.calls.includes(stage))
     app.render().cancelSensitive()
     hold.resolve({})
     await rejected; await settle()
@@ -655,7 +661,7 @@ for (const flow of ['pair', 'sensitive']) test(`cancelling ${flow} after subscri
     const hold = deferred(); app.holds.set('subscribe', hold)
     const checking = flow === 'pair' ? app.render().checkPair() : app.render().confirmBootstrap(true)
     const rejected = assert.rejects(checking, /换了|取消/)
-    await settle(); assert.ok(app.calls.includes('subscribe'))
+    await until(() => app.calls.includes('subscribe'))
     hold.resolve({})
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => {
       if (flow === 'pair') app.render().cancelPair(); else app.render().cancelSensitive()
@@ -682,8 +688,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
       work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', bootstrap: '', entry })
     }
     const rejected = assert.rejects(work, /换了|取消/)
-    for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
-    assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'))
+    await until(() => app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_context'))
     hold.resolve({ state: { genesis }, view: membership })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()

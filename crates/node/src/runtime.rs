@@ -3014,16 +3014,6 @@ impl Runtime {
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
-        if store.has_network()? {
-            let state = store.public_state()?;
-            if state
-                .project()?
-                .authorize_node(&identity.peer_id()?, None)
-                .is_ok()
-            {
-                store.save_local_identity(&state.genesis.network_id, &identity)?;
-            }
-        }
         let store = Arc::new(Mutex::new(store));
         let (hub, peer_rx) = PeerHub::new(identity.clone(), store.clone(), &config.roles);
         let (network, network_rx) = NetworkHub::new(identity.clone(), config.network.clone());
@@ -3083,9 +3073,6 @@ impl Runtime {
         }
         let view = state.project()?;
         store.install_state(state)?;
-        if view.authorize_node(&self.identity.peer_id()?, None).is_ok() {
-            store.save_local_identity(&view.network_id, &self.identity)?;
-        }
         Ok(view)
     }
 
