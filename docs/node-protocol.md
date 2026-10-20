@@ -1,16 +1,16 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=8`，数据库 `user_version=8`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=9`，数据库 `user_version=9`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
 `network_id` 是个人网络根 Ed25519 公钥，`device_id` 是设备 Ed25519 公钥本身，均编码为 64 个小写十六进制字符。Node 的 `device_id` 同时是它的 iroh `EndpointId`。地址不参与身份计算。
 
-个人网络使用 `NetworkState { genesis, checkpoint, events }`。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
+个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态的合并是并集。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
 
 `Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 单独决定是否运行 relay；`public_entry` 是不入网的公共入口。
 
-管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq`，接收方只接受被撤销设备 `seq <= cutoff_seq` 的事件。并发的授予与撤销冲突时撤销优先。根恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
+管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。根恢复由根签名的更高 epoch checkpoint 建立新授权；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。`attestation` 的签名设备须在任一 epoch 做过客户端。
 
 一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。地址、成员关系、项目和会话都不发布到公共目录。
 
@@ -70,8 +70,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":8}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=8` |
+| `data-epoch.json` | `{"data_epoch":9}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=9` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -136,7 +136,7 @@
 | `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
 | `approve` | `join_id` 加 `admin_nonce`、`event` 或 `reject: true` | 管理设备推进或拒绝加入，请求在其他入口时转发过去 |
 | `revoke` | `event` | 管理设备签名撤销成员 |
-| `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的两分钟签名读取当前目录 |
+| `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的两分钟签名读取当前目录 `state` 和本机各作者主分支的头 `heads`，新 checkpoint 据此为没有保留的 Node 写 `retired` |
 | `recover` | `genesis`、`checkpoint`、`capability` | 空 Node 安装根签目录，已建网 Node 安装更高 epoch checkpoint |
 
 未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证 `RootCheckpoint` 的根签名并要求 epoch 更高，验证前没有副作用。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
@@ -155,7 +155,7 @@
 
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
-| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq` 和能力；同步正在失败的 Node 直接记为离线，不等待探测 |
+| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测 |
 | `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改 |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `conversations` | 无 | 本地已知会话 |
@@ -265,7 +265,9 @@ Event {
 
 通知由 `work_finished` 派生，通知 ID 即该事件 hash。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 
-入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者成员资格与 `cutoff_seq`，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会写入 `log_conflicts`，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；同作者同序号不同内容写入 `log_conflicts`，不锁住会话；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。`log_heads` 保存每个作者的 `max_seq` 和 `head_hash`，即本机版本向量。
+入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
+
+`effective` 标记事件是否计入投影，只由签名证据决定：作者从分叉序号起两支都不计入；当前成员 Node 计入此前的主分支事件；被撤销设备计入不超过上限的事件，分叉后沿 `cutoff_hash` 往回的那一支也计入。依赖只决定顺序，不传递是否计入。成员目录变化或分叉证据到达时，同一事务内重新计算 `effective`，有变化时清空并按顺序重放 reducer 写的投影表，本机账本不变，不重放副作用，然后推送一条不带会话的 `changed`。详见 [统一网络设计](design/unified-network.md#55-入库与投影)。
 
 入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者；工作状态只前进。负责人同级再相同时取请求身份较小者，请求身份为 `SHA256(attestation 签名输入 ‖ 签名设备)`。同一份已签名请求经不同入口重试时请求身份相同，外层事件 hash 不参与仲裁，重试不会改变结果。
 
@@ -277,14 +279,14 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 | 状态 | 进入条件 | 离开条件 |
 |---|---|---|
-| `aligning` | 启动时成员目录中还有其他 Node | 某个对端的 Hello 表明它记录的本机 `max_seq` 不大于本机，且同序号 hash 一致；对端更多时先拉回本机自己的日志 |
-| `read_only` | 对齐中且所有其他 Node 都同步失败 | 对端恢复后照常对齐，或本人调用 `confirm_writable` |
+| `aligning` | 启动时成员目录中还有其他 Node | 本次启动以来每台其他当前成员 Node 都确认过：一次同步结束时它记录的本机 `max_seq` 不大于本机，本机在该序号上的事件就是它的头，本机日志也没有分叉；对端更多时先拉回本机自己的日志。成员目录变化时重新判断，被撤销的 Node 不再需要确认 |
+| `read_only` | 对齐中且还没确认的 Node 都同步失败 | 这些 Node 恢复后补齐确认，或本人调用 `confirm_writable` |
 | `writable` | 没有其他 Node、对齐完成或本人确认 | 发现分叉 |
-| `forked` | 某个对端持有本机作者同序号的不同事件 | 不离开；撤销这台设备后用新数据目录重新加入 |
+| `forked` | 本机存有自己日志的另一支 | 不离开；撤销这台设备后用新数据目录重新加入 |
 
 拒绝写入时的错误为 `this Node is aligning with other Nodes; try again shortly`、`this Node is read-only until you confirm it was not restored from a backup` 和 `this Node's log has forked and it no longer writes`，网页翻译成中文。`confirm_writable` 只记录在本机，不进入 DAG，对 `forked` 无效。
 
-对端发现某个作者的分叉时，保留先到的一条，后到的写入 `log_conflicts`，其他会话照常写入。分叉的 Node 自己在 Hello 中看到同序号不同 hash 时拉取对方那条，记下冲突后进入 `forked` 并停止写入。`write_state` 返回 `{ state, conflicts }`，每条冲突含作者、序号、保留的和放在一边的版本。状态变化时向已订阅的浏览器推送 `{"type":"changed","payload":{"type":"write_state","state":...}}`。
+分叉的两支经同步传给每台成员 Node，从分叉序号起两支都不计入，其他作者和其他会话照常写入。同一设备的两份副本都会存有对方那一支，都进入 `forked` 并停止写入。`write_state` 返回 `{ state, conflicts }`，每条冲突含作者、序号、本机主分支的版本（`kept`）和另一支的版本（`other`）。状态变化时向已订阅的浏览器推送 `{"type":"changed","payload":{"type":"write_state","state":...}}`。
 
 ## Node 之间的传输
 
@@ -296,7 +298,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 | ALPN | 用途 | 接受的对端 |
 |---|---|---|
-| `vibeface/sync/1` | `hello`、`membership`、`pull`、`have` | 未撤销的成员 Node |
+| `vibeface/sync/1` | `hello`、`membership`、`pull`、`forks`、`have` | 未撤销的成员 Node |
 | `vibeface/blob/1` | 按哈希和偏移读取附件 | 未撤销的成员 Node |
 | `vibeface/rpc/1` | 投递、派发、中断、App Server 操作转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
 | `vibeface/client/1` | 网关转发的浏览器 Noise 会话，每条流一个会话 | 任意设备，会话本身由 Noise 认证 |
@@ -306,10 +308,12 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### 同步
 
-1. 双方交换 `{"type":"hello", network_id, vector: {author: [max_seq, head_hash]}, boot, membership_epoch, membership}`。成员目录摘要不同时交换 `membership`，epoch 不低于本机的目录被合并。
-2. 对每个对方领先的作者发 `{"type":"pull", author, from_seq, limit}`，对方按 `seq` 升序返回，每批最多 1024 条、合计 8 MiB。
-3. 本机追加事件后向已连接的成员发 `{"type":"have", author, seq, hash}`，对方落后时立即同步。空闲连接每 60 秒重新 Hello。
-4. `boot` 是对端本次启动的编号。编号变化说明对端重启，本机立即关闭到它的旧连接并重新同步，不等 QUIC 空闲超时。
+1. 双方交换 `{"type":"hello", network_id, vector: {author: [max_seq, head_hash]}, boot, membership_epoch, membership, forks}`。成员目录摘要不同时交换 `membership`，双方都合并为并集。
+2. 对每个对方领先的作者发 `{"type":"pull", author, from_seq, limit}`，对方按 `seq` 升序返回主分支事件，每批最多 1024 条、合计 8 MiB。
+3. 对方的头本机没有时，从两边较小的序号起每次加倍退后、每次拉一条，直到拉到本机已有的事件，再向后拉回对方那一支。
+4. `forks` 是本机所有分叉作者从分叉序号起两支事件 hash 的摘要，没有分叉时为空字符串。摘要不同时发 `{"type":"forks", after}`，`after` 为上一页最后一条的 `[author, seq, hash]` 或 `null`，对方返回其后的分叉证据，每页限额同 `pull`，每轮最多 64 页。
+5. 本机追加事件后向已连接的成员发 `{"type":"have", author, seq, hash}`，对方落后时立即同步。收到的 Hello 带本机没有的头、不同的成员目录摘要或新的一对不同分叉摘要时，也立即同步。空闲连接每 60 秒重新 Hello。
+6. `boot` 是对端本次启动的编号。编号变化说明对端重启，本机立即关闭到它的旧连接并重新同步，不等 QUIC 空闲超时。
 
 同步只写入历史和投影，不重新执行历史中的操作。同步失败按退避重试，最长间隔 30 秒。
 

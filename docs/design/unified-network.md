@@ -98,20 +98,23 @@ Genesis {
 GovernanceEvent {
 	version, network_id, epoch, parents: Vec<Hash>,
 	issuer: DeviceId,
-	action: Grant { member } | Revoke { device_id, cutoff_seq },
+	action: Grant { member } | Revoke(Revocation),
 	signature,              // issuer 的设备密钥
 }
+
+Revocation { device_id, cutoff_seq, cutoff_hash: Option<Hash> }
 
 RootCheckpoint {
 	version, network_id, epoch,
 	members: Vec<Member>,
+	retired: Vec<Revocation>,   // 不再保留的设备和它们最终的写入上限
 	signature,              // 根私钥
 }
 
-NetworkState { genesis, checkpoint: Option<RootCheckpoint>, events: Vec<GovernanceEvent> }
+NetworkState { genesis, checkpoints: Vec<RootCheckpoint>, events: Vec<GovernanceEvent> }
 ```
 
-成员目录仍是独立的小 DAG，与业务日志分开同步，上限仍为 1024 个成员。与现状相比有三处变化。`Member` 删除 `node_roles`，成员 Node 不分角色，是否运行 relay 只取它自己的 `config.json`。`subject_id` 改为 `device_id`。`Revoke` 增加 `cutoff_seq`，表示签发者当时已知的该设备最大日志序号。
+成员目录仍是独立的小 DAG，与业务日志分开同步，上限仍为 1024 个成员。与现状相比有三处变化。`Member` 删除 `node_roles`，成员 Node 不分角色，是否运行 relay 只取它自己的 `config.json`。`subject_id` 改为 `device_id`。`Revoke` 带写入上限 `Revocation`：`cutoff_seq` 和 `cutoff_hash` 是发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和空。
 
 授权规则如下：
 
@@ -119,8 +122,10 @@ NetworkState { genesis, checkpoint: Option<RootCheckpoint>, events: Vec<Governan
 - `Grant` 可以授予 `manage=true`。现在 `membership.rs:466-469` 只允许根 checkpoint 建立管理客户端，改造后删除这条限制。
 - `node` 成员不能持有 `manage`。Node 常驻无人值守的机器，不签成员变更。
 - 管理设备可以撤销任何设备，包括其他管理设备和自己。并发的 `Grant` 与 `Revoke` 冲突时撤销优先。
-- 撤销后，接收方只接受该设备 `seq <= cutoff_seq` 的日志条目。正在路上的合法事件仍能入库，之后的写入一律拒绝，各副本结果一致。
-- 根私钥只用于签 `Genesis` 和 `RootCheckpoint`。`RootCheckpoint.epoch` 严格递增，较低 epoch 的目录和事件被拒绝，较高 epoch 替换当前目录并丢弃旧 epoch 的 `GovernanceEvent`。
+- 撤销后，该设备只有不超过上限的日志条目计入投影，规则见 5.5 节。超过上限的事件仍可入库，但不计入，所以各副本不论先收到撤销还是先收到事件，结果都一致。同一设备有多条撤销时取序号最大的一条，序号相同时取 hash 较大的一条。
+- 根私钥只用于签 `Genesis` 和 `RootCheckpoint`。`RootCheckpoint.epoch` 严格递增，最多 64 个。新 checkpoint 只追加，不丢弃历史：`NetworkState` 保留所有 checkpoint 和各 epoch 的 `GovernanceEvent`，两份 `NetworkState` 的合并是并集，与合并顺序无关。同一 epoch 的 checkpoint 必须完全相同。每个 epoch 从自己的 checkpoint 成员出发投影，当前目录取最高 epoch。
+- 根恢复时，没有保留的 Node 连同本机记录的日志头写入新 checkpoint 的 `retired`，此前撤销或退役的设备保留原上限，`retired` 与 `members` 不重叠。旧 epoch 的治理事件以后仍可同步入库，但不能放宽当前的上限。
+- 业务事件的 `Attestation` 要求签名设备在任一 epoch 中做过客户端，即 `Genesis.first_client`、各 checkpoint 中的客户端和被授予的客户端。根恢复后，历史请求的签名仍能验证。本机新追加的事件仍要求当前客户端签名。
 - 每台设备的私钥只在本设备生成和保存。Node 不持有根私钥。
 
 ### 3.3 Ticket
@@ -296,9 +301,9 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 
 1. 连接接受时，`ProtocolHandler` 读取 `remote_id()`，核对它是当前成员目录中未撤销的 Node，不是则直接关闭连接。`vibeface/join/1` 例外，但只开放两个方法。
 2. 每条 `vibeface/sync/1` 流的首帧携带 `network_id`，与本机不一致时关闭连接。
-3. 事件入库时核对 `network_id`、作者成员资格和撤销 `cutoff_seq`。
+3. 事件入库时核对 `network_id` 和作者成员资格，撤销后按 5.5 节的上限计入。
 
-成员目录变化立即作用于已有连接，不等重连。撤销后本机关闭到被撤销 Node 的出站连接并删除它的地址。每条已接受的入站 iroh 连接在目录变化时重新核对对端，对端不再是成员就关闭连接，其上的 `sync`、`rpc`、`blob` 和 `client` 流随之中断。浏览器会话的每个请求都重新查成员目录；已订阅 `changed` 或正在观察进度的会话在目录变化时也重新核对，设备被移除后会话关闭，推送随之停止。根恢复移除（而不是撤销）的 Node 的出站连接不主动关闭，本机不再向它发请求，连接空闲后由 QUIC 回收。
+成员目录变化立即作用于已有连接，不等重连。撤销后本机关闭到被撤销 Node 的出站连接并删除它的地址。每条已接受的入站 iroh 连接在目录变化时重新核对对端，对端不再是成员就关闭连接，其上的 `sync`、`rpc`、`blob` 和 `client` 流随之中断。浏览器会话的每个请求都重新查成员目录；已订阅 `changed` 或正在观察进度的会话在目录变化时也重新核对，设备被移除后会话关闭，推送随之停止。根恢复没有保留的 Node 记入 `retired`，与撤销一样关闭连接并删除地址。
 
 SQLite 表不再需要 `network_id` 列，跨网络读取在结构上不可能发生。一个数据目录只属于一个个人网络是已决定事项，见第 9 节。
 
@@ -413,18 +418,22 @@ Attestation {
 
 ```sql
 events(
-	author TEXT, seq INTEGER, hash TEXT UNIQUE, scope_id TEXT,
+	hash TEXT PRIMARY KEY, author TEXT, seq INTEGER, scope_id TEXT,
 	lamport INTEGER,                              -- 1 + max(prev, deps 的 lamport)
 	created_at_ms INTEGER, envelope TEXT,
-	PRIMARY KEY (author, seq)
+	main INTEGER,                                 -- 在本机该作者的主分支上
+	effective INTEGER,                            -- 计入投影，见 5.5 节
+	detected_at_ms INTEGER                        -- 分支外事件被发现的时间
 )
+UNIQUE (author, seq) WHERE main = 1
 event_blobs(hash TEXT, blob TEXT)                 -- 附件授权读取的依据
-log_heads(author TEXT PRIMARY KEY, max_seq INTEGER, head_hash TEXT)
+log_heads(author TEXT PRIMARY KEY, max_seq INTEGER, head_hash TEXT)   -- 主分支的头
 pending_events(hash TEXT PRIMARY KEY, envelope TEXT, missing TEXT)
-log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT, detected_at_ms INTEGER)
 ```
 
-`log_heads` 就是本机的版本向量。本机存储保持一个不变量，`events` 中每个事件的 `prev` 和 `deps` 也都在 `events` 中。因此 `{author: max_seq}` 精确描述本机拥有的事件集合。
+所有已入库事件在同一张 `events` 表里。每个作者在本机有一条主分支（`main = 1`），每个序号最多一条；分叉的另一支作为证据也存在这里（`main = 0`，5.7 节）。`main` 取决于本机的到达顺序，各副本可能不同；`effective` 只取决于签名证据，持有相同证据的副本完全相同。
+
+`log_heads` 就是本机的版本向量，记录每个作者主分支的头。本机存储保持一个不变量，`events` 中每个事件（不论在不在主分支上）的 `prev` 和 `deps` 也都在 `events` 中。因此 `{author: max_seq}` 精确描述本机主分支上的事件集合，分支外的证据由 5.4 节的分叉摘要描述。
 
 读取顺序为 `(lamport, created_at_ms, hash)`。`lamport` 只由事件内容决定，与到达顺序无关，并且总大于它的每个因果前项，所以按它排序满足因果顺序。投影保存同样的 `rank` 字符串，增量合并时比较 rank 即可，不需要 `event_deps` 表。
 
@@ -432,11 +441,13 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 
 两台 Node 在 `vibeface/sync/1` 上同步：
 
-1. 双方发送 `Hello { network_id, vector: { author: (max_seq, head_hash) }, membership_epoch, membership_heads }`。成员目录不一致时先交换 `NetworkState`。
+1. 双方发送 `Hello { network_id, vector: { author: (max_seq, head_hash) }, boot, membership_epoch, membership, forks }`。`membership` 是成员目录的摘要，不一致时交换 `NetworkState`，双方都按 3.2 节取并集，不比较 epoch。
 2. 对每个作者，若对方的 `max_seq` 大于本机，发送 `Pull { author, from_seq: 本机 max_seq + 1, limit }`。
 3. 对方按 `seq` 升序返回 `Events { author, events }`，每批最多 1024 条、正文合计 8 MiB。
 4. 接收方按 5.5 节入库。缺少其他作者的 `deps` 时，事件进入 `pending_events`，并对缺失作者追加 `Pull`。
-5. 本机追加事件后，向已连接的成员 Node 发送 `Have { author, seq, hash }`，对方据此拉取。连接空闲时每 60 秒重新交换一次 `Hello`，补上丢失的通知。
+5. 对每个作者，对方的头 `head_hash` 本机没有时，说明这条日志在对方那里走了另一支。本机从两边较小的 `max_seq` 起向前探测，每次退后的步数加倍，每次只拉一条，直到拉到的事件本机已经有（或到了 #1），再从那里向后分页拉回对方那一支。拉回的事件按 5.5 节入库，成为分叉证据。
+6. `forks` 是本机分叉证据的摘要：所有分叉作者从分叉序号起两支全部事件的 hash，没有分叉时为空。两边的主分支可能不同，所以摘要覆盖两支，而不只是本机的分支外事件。摘要不一致时发送 `Forks { after }`，对方按 `(author, seq, hash)` 升序从游标之后返回分叉证据，每页限额与 `Pull` 相同。
+7. 本机追加事件后，向已连接的成员 Node 发送 `Have { author, seq, hash }`，对方据此拉取。收到的 `Hello` 中有本机没有的头（对方更多或在另一支上），或分叉摘要、成员目录摘要不一致时，立即与对方同步。同一对不一致的分叉摘要只唤醒一次，避免一方存不下的证据让双方互相唤醒，之后由定时同步补齐。连接空闲时每 60 秒重新交换一次 `Hello`，补上丢失的通知。
 
 现在的同步每 3 秒向最多 4 个副本请求所有会话的 heads（`crates/node/src/runtime.rs:3268-3278`），再沿 `parents` 和 `previous` 逐个或分批取闭包。改造后一次往返就知道缺什么，拉取按序号区间进行，不需要沿 hash 回溯。
 
@@ -444,32 +455,40 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 
 每批事件在一个 SQLite 事务中处理，每个事件依次检查：
 
-1. 解析规范 JSON，核对 `hash`、`network_id` 和事件形状。需要本人签名的类型验证 `Attestation`，不允许带签名的类型带了就拒绝。
-2. `hash` 已在 `events`、`pending_events` 或 `log_conflicts` 中时视为重复，忽略。
-3. 作者是成员 Node，且 `seq` 不超过撤销的 `cutoff_seq`。
+1. 解析规范 JSON，核对 `hash`、`network_id` 和事件形状。需要本人签名的类型验证 `Attestation`，签名设备须在任一 epoch 做过客户端（3.2 节），不允许带签名的类型带了就拒绝。
+2. `hash` 已在 `events` 或 `pending_events` 中时视为重复，忽略。
+3. 作者是当前成员 Node，或是带写入上限的已撤销、已退役设备。
 4. 验证作者签名。第 1 步和这一步是该事件唯一一次验签。
-5. 只有通过前四步的事件才产生副作用。`seq == log_heads[author].max_seq + 1` 且 `prev == head_hash` 时继续；序号已存在且内容不同时写入 `log_conflicts`（5.7 节）；序号跳过时丢弃并从缺口处重新拉取；`deps` 不全时放入 `pending_events`。
-6. 写入 `events`，更新 `log_heads`，调用投影 reducer，再检查 `pending_events` 中是否有事件因此满足条件。
+5. 只有通过前四步的事件才产生副作用。`prev` 不在本机时，序号不超过主分支 `max_seq + 1` 的放入 `pending_events`，再往后的丢弃并从缺口处重新拉取；`prev` 在本机但不是同作者的前一条时拒绝；`deps` 不全时放入 `pending_events`。
+6. 写入 `events`。`prev` 是本机主分支的头（#1 则要求本机还没有该作者）时 `main = 1` 并更新 `log_heads`，否则 `main = 0`，作为分叉证据。按下面的有效集合确定 `effective`，再检查 `pending_events` 中是否有事件因此满足条件。
 
-签名无效或作者无权的事件不会写入 `log_conflicts`，也不会让任何 Node 进入 `forked`。Hello 中的 `head_hash` 不一致只触发拉取，拉回的事件同样先经过这些检查。
+签名无效或作者无权的事件不会入库，也不会让任何 Node 进入 `forked`。Hello 中本机没有的头只触发拉取，拉回的事件同样先经过这些检查。
+
+**有效集合。** 每个作者的 `fork` 是它分支外事件的最小序号，没有分叉时为无穷大。哪些事件计入只看签名证据：
+
+- 当前成员 Node：主分支上 `seq < fork` 的事件。
+- 带写入上限 `(cutoff_seq, cutoff_hash)` 的设备：主分支上 `seq <= min(cutoff_seq, fork - 1)` 的事件；`cutoff_hash` 在本机且正是该作者序号 `cutoff_seq` 的事件时，再加上从它沿 `prev` 往回、`seq >= fork` 的那一支。撤销时的 `cutoff_hash` 因此选定分叉后保留哪一支。
+- 其他设备：没有。
+
+分叉前的事件在各副本上相同，`fork` 和沿 `prev` 的那一支也只由证据决定，所以结果与哪一支在本机是主分支无关。依赖只决定顺序，不传递有效性：其他作者的事件引用了不计入的事件，自己仍然计入。
 
 入库后的事件不再验签。现在的 `load_events_from`（`crates/node/src/store.rs:2469`）在每次追加、每次重建以及 bots 和 followup 的读取中，都对全网每个事件查证书并完整验签。该函数删除，读取直接查表。数据目录的完整性属于本机信任边界，需要时用维护命令 `vibeface store verify` 离线重新验签。
 
-投影 reducer 对每个事件只执行一次，不再全量重建。现在的 `rebuild_projections_from`（`crates/node/src/store.rs:2300-2432`）在每次入库或追加时删除并重写全部投影表。为了让增量结果与到达顺序无关，每个投影都满足交换律：
+投影 reducer 平时对每个事件只执行一次。现在的 `rebuild_projections_from`（`crates/node/src/store.rs:2300-2432`）在每次入库或追加时删除并重写全部投影表。为了让增量结果与到达顺序无关，每个投影都满足交换律：
 
 | 投影 | 合并规则 |
 |---|---|
 | 会话与消息 | 按 `(lamport, created_at_ms, hash)` 在读取时排序，不在入库时分配 `ordinal`。同一 `message_id` 的多条 `MessagePosted(user)` 若 `Attestation` 覆盖的内容相同，视为同一条消息，保留因果最早者，并发时取 hash 较小者，浏览器不会为同一 `message_id` 签两份内容，万一出现，投影只采用最早者并在界面标出另一条。这对应 4.5 节切换入口后的重复提交 |
 | Bot | 同一 `bot_id` 取因果最早的 `BotCreated`，并发时取 hash 较小者 |
 | 工作 | 每个 `work_id` 的状态只前进，`WorkFinished` 为终态，只有 `unverified` 可被取代 |
-| 审批 | 同一 `request_id` 的回答先按请求身份合并，不同的回答取更严格的决定（取消严于拒绝，拒绝严于批准或作答），仍相同时取请求身份较小者。执行层按自己先收到的回答执行，拒绝过期回答 |
-| 自主授权 | `version` 最大者生效。相同版本取更严格的模式（`off` 严于 `report`，`report` 严于 `continue`），仍相同时取请求身份较小者 |
 | 会话负责人 | `epoch` 最大的 `ConversationOwner` 生效，相同时取请求身份较小者 |
 | 通知确认 | 集合并集 |
 
 请求身份是 `SHA256(Attestation 签名内容 ‖ 签名设备编号)`，签名内容即 5.1 节的 `{network_id, scope_id, body}`。同一份已签名请求无论由哪个入口包装、外层事件 hash 是多少，请求身份都相同，所以换入口重试的副本合并为一份，不改变仲裁结果，外层事件 hash 不参与仲裁。Ed25519 签名是确定的，同一设备对同一内容只有一个签名，请求身份不需要包含签名本身。真正不同的决定才按上表仲裁；本人也可以签一个更高的版本或 epoch 来明确结果。
 
-只有数据格式本身变化时才需要全量重建。项目不保留兼容，格式变化时直接使用新数据目录。
+**重算。** 事件在主分支上且作者没有分叉时，按作者的上限决定是否计入，计入的直接增量执行 reducer。成员目录变化（授予、撤销、checkpoint），或新入库的事件不在主分支上、作者已分叉时，在本批事务结束时重算。重算按有效集合重新计算每个事件的 `effective`，有变化时清空 reducer 写的投影表（会话、消息、Bot、助手配置、技能、例行任务、助手变更、工作、通知及确认、提醒及处理），再按 `(lamport, created_at_ms, hash)` 重放所有 `effective = 1` 的事件。调度队列、工作派发与停止、例行运行、outbox、分诊和邀请是本机账本，不在重算范围内，重算也不重放任何副作用。重算后向浏览器推送一条不带会话的 `changed`，网页整体刷新。
+
+数据格式变化时不迁移。项目不保留兼容，直接使用新数据目录。
 
 ### 5.6 附件
 
@@ -486,27 +505,24 @@ log_conflicts(author TEXT, seq INTEGER, hash TEXT, envelope TEXT, kept_hash TEXT
 
 同一作者同一序号出现两条不同事件，只会在数据目录被复制或从备份恢复后继续写入时发生。处理规则如下：
 
-- 接收方保留先到的一条。后到的一条和依赖它的同作者后续事件写入 `log_conflicts`，不进入 `events`。
-- `Hello` 中的 `head_hash` 用于发现分叉。序号相同而 hash 不同，或拉到的第一条 `prev` 不等于本机 `head_hash` 时，接收方向前逐条比对到分叉点，并记录冲突。
-- 其他作者的事件若在 `deps` 中引用了被拒绝的事件，仍然入库。被拒绝的 hash 视为“已知但处于冲突中”，满足依赖检查，界面在该事件旁标出它依据了冲突内容。
+- 两支都入库。本机先到的一支是主分支，另一支 `main = 0`，作为证据保存，它的后续事件同样入库。
+- 5.4 节的头比对和向前探测发现分叉，分叉摘要和 `Forks` 请求把两支证据传给每台成员 Node。持有相同证据的副本结果相同，与哪一支先到无关。
+- 从分叉序号起，该作者两支的事件在所有副本上都不计入，分叉前的照常计入（5.5 节）。其他作者引用了这些事件的事件仍然计入，依赖都在 `events` 中，5.3 节的不变量不变。
 - 冲突不锁住会话，也不阻止其他作者和其他会话继续写入。
-- 发生分叉的作者 Node 在得知冲突后停止写入，进入 `forked` 状态，并向本人发出通知。
-- 本人在网页上查看两条分叉内容，然后撤销该设备编号，并让该 Node 用新密钥重新加入。需要保留的分叉内容由本人重新发送。这是设计决定，记录在第 9 节。
+- 作者 Node 一旦存有自己日志的另一支就进入 `forked`，停止写入，并向本人发出通知。两份副本都会如此。
+- 本人在网页上查看两支内容，然后撤销该设备。撤销的 `cutoff_hash` 取发起撤销所连 Node 主分支的头，这一支随即在所有副本上重新计入，另一支仍不计入。该设备用新的数据目录和密钥重新加入，另一支中需要保留的内容由本人重新发送。这是设计决定，记录在第 9 节。
 
 现在的实现把重复序号标为 `conflict`，并让整个会话拒绝追加（`crates/node/src/store.rs:2262`、`2316-2346`），本设计删除这个锁定。
 
 ### 5.8 备份恢复后的写入保护
 
-Node 启动后进入 `aligning` 状态，满足以下任一条件才进入 `writable`：
-
-- 至少一台其他成员 Node 完成 `Hello`，对方记录的本机作者 `max_seq` 不大于本机。如果对方更大，先拉回本机自己的日志再进入 `writable`。
-- 成员目录中没有其他 Node。
+Node 启动后进入 `aligning` 状态。本次启动以来，每台其他当前成员 Node 都确认过本机日志，才进入 `writable`。一次同步结束时，对方记录的本机作者 `max_seq` 不大于本机，本机在该序号上的事件就是对方的头，并且本机日志没有分叉，就算对方确认。对方更多时先拉回本机自己的日志再比对。成员目录中没有其他 Node 时直接进入 `writable`。
 
 `aligning` 期间可以读取和同步，不能追加事件。调度 job 保持排队，入口收到的用户消息保存在本机 outbox，写入后再投递。
 
-所有其他 Node 都不可达时，Node 默认保持只读。本人可以在网页上确认“此数据目录没有从备份恢复”，Node 随即进入 `writable`。这一确认要求本机会话或带 `Attestation` 的管理设备，只记录在本机，不进入 DAG。这是已决定事项，记录在第 9 节。
+还没确认的 Node 都同步失败时，Node 进入 `read_only`。本人可以在网页上确认“此数据目录没有从备份恢复”，Node 随即进入 `writable`。这一确认要求本机会话或带 `Attestation` 的管理设备，只记录在本机，不进入 DAG。这是已决定事项，记录在第 9 节。本人没有确认时，那些 Node 恢复连接并补齐确认后，Node 同样进入 `writable`。
 
-已知限制：只要有一台其他成员 Node 记录的本机作者序号不比本机多，本机就进入 `writable`，即使那台 Node 自己也落后。例如 P 从 #7 的备份恢复，而 P 之前写的 #8 到 #10 只同步给了 L、还没到 G；恢复后的 P 只连上 G 时会自动可写并写出新的 #8，L 上线后出现分叉，按 5.7 节处理，全程不需要本人误确认。完整方案是等待所有仍保留的成员完成对齐，或取得不会随备份回退的作者水位证明，列在第 10 节。
+成员目录变化时重新判断。撤销一台离线的 Node 后它不再需要确认，其余 Node 都已确认时随即可写。例如 P 从 #7 的备份恢复，而 P 之前写的 #8 到 #10 只同步给了 L、还没到 G：P 连上 G 后仍要等 L，L 确认前会先把 #8 到 #10 还给 P，所以不会写出另一个 #8。
 
 ### 5.9 三设备示例
 
@@ -775,7 +791,11 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - iroh relay 服务能否挂在 Gateway 现有的 axum 监听器上尚未验证，可能需要单独端口。第三期第一步先做这个实验。
 - WebCrypto 的 Ed25519 需要较新的浏览器，旧版 Safari 不支持。设备签名和 Noise 握手的 `Proof` 都依赖它，不支持的浏览器无法成为设备，页面会明确提示。
 - 用户可能不看短码直接批准。批准按钮在短码显示后才可用，但不能强制用户比对。
-- 恢复备份后若本人误确认解除只读，仍会产生分叉。只连上一台同样落后的成员时，不需要误确认也会自动可写并分叉（5.8 节已知限制）。5.7 节的处理保证不锁死会话，但分叉设备需要重新加入。
+- 恢复备份后若本人误确认解除只读，仍会产生分叉。5.7 节的处理保证不锁死会话，但分叉设备需要重新加入，分叉后的内容在撤销前两支都不计入。
+- 一台成员 Node 长期离线时，其他 Node 重启后都要等它或本人确认才能写。离线的 Node 不再使用时应撤销，撤销后不再需要它确认（5.8 节）。
+- 成员目录变化或分叉证据到达时，重算清空并重放全部投影，成本随计入的事件数线性增长。治理变化和分叉都很少见，暂不做按作者的局部重算。
+- 根恢复后旧 epoch 的客户端签名仍然有效，旧 epoch 的治理事件也仍可同步入库。它们不能放宽当前的写入上限，但每个 epoch 最多可堆积 1024 条治理事件，成员目录随之变大。
+- 一方存不下的分叉证据（例如在它那里验证不过的事件）会让两边的分叉摘要一直不一致。同一对摘要只唤醒一次同步，之后靠定时同步重试，双方不会反复互相唤醒。每轮同步最多取 64 页分叉证据，更多的在下一轮补齐。
 - 客户端 origin 和它的应用分发是信任前提（4.3 节）。控制这个 origin 的一方能读取明文并以这个浏览器的名义签名，公共入口必须是本人自己的服务器。
 - `executor=agent` 发往 Cursor SDK 协调层时没有逐条审批，本机 shell 的权限取决于目标 Node 的 Provider 配置。
 - iroh 1.x 承诺协议稳定，`iroh-blobs` 等上层库仍为 0.x，本设计只依赖 `iroh` 和 `iroh-relay`。
@@ -789,7 +809,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 1. **浏览器接入。** 保留浏览器到 Node 的端到端加密。浏览器经 Node 的 WebSocket 网关接入，网关之上继续运行浏览器与 Node 的 Noise 握手，这是唯一保留的 Noise 链路。设备 CryptoKey 对每次会话的 Noise 临时静态密钥签名，见 4.3 节。
 2. **跨设备工作两条路径并存。** 保留把任务发给另一台 Node 的协调 Agent、由它在本机执行的远端 shell 能力，与委派目标 Node 上的 Codex 并存。两条路径的授权和审批边界见 6.1 节。
 3. **一个数据目录只属于一个个人网络。** SQLite 表不再按 `network_id` 分区，同一主机服务多个网络时运行多个进程，见 4.4 节。
-4. **其他 Node 都不可达时默认只读。** 本人在网页上确认“此数据目录没有从备份恢复”后解除，确认只记录在本机，见 5.8 节。
+4. **还没确认的 Node 都不可达时默认只读。** 本人在网页上确认“此数据目录没有从备份恢复”后解除，确认只记录在本机，见 5.8 节。
 5. **默认 relay。** 只使用个人网络中启用 `relay` 的 Node，n0 公共 relay 需要在配置中手动打开，见 4.1 节。
 6. **五期在一个 PR 中完成。** 第 8 节的五期依次在同一分支上追加提交，最终作为一个 PR 合并。第 8 节各期验收中关于停止回复、设备名称、根恢复、端口占用、邀请入口、公网入口指引、入口可达性、撤销后的工作、待核对、日志和排障文档的条目，来自普通用户走查，是用户确认的补充。
 
@@ -797,7 +817,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 7. **浏览器不写日志。** 浏览器发起的写操作由所连 Node 作为作者写入，事件附带浏览器设备签名的 `Attestation`，见 5.1 节。
 8. **`WorkDispatched` 在目标确认后才写入。** 确认前的派发只在本机 outbox 中，见 5.2 节。
-9. **分叉设备撤销后重新加入。** 分叉的作者 Node 停止写入，本人撤销其设备编号后用新密钥重新加入，见 5.7 节。
+9. **分叉设备撤销后重新加入。** 分叉的作者 Node 停止写入，本人撤销其设备编号后用新密钥重新加入。撤销的 `cutoff_hash` 选定保留哪一支，见 5.7 节。
 10. **附件不用 `iroh-blobs`。** 附件使用按 SHA256 命名的文件和自有的 `vibeface/blob/1`，见 5.6 节。
 11. **入口切换并入本设计，替代 #38。** #38（`feat/collaborative-cluster`）要解决的需求成立，即本人的某台入口离线时，浏览器应自动连到同一个人网络中另一台已授权的入口，继续读写同一份会话。本设计用固定客户端 origin、service worker、签名地址簿中的入口列表和跨源 `/api/client` 实现这一需求，见 4.5 节。#38 的实现不保留，原因有三。它依赖的 `Control::LookupCluster` 和签名 `Reachability` 中的 Cluster 声明属于第 7 节删除的自研发现与 relay 目录。它把 cluster 归属发布到公共 relay 目录，等于向公共服务暴露哪些设备属于同一个人，本设计的入口地址只在个人网络内部传播。它把“个人网络”全量改名为 Cluster，牵动签名身份、事件、数据库、恢复和网页，与需求无关。本设计不采纳这次改名，继续使用“个人网络”和 `NetworkId`。
 
@@ -810,13 +830,16 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 14. **写入闸门放在追加入口。** 写入状态在存储锁内同时更新内存和存储连接上的 TEMP 表，`log::append_from` 每次追加前读取，状态变化与追加之间没有窗口，也不需要每个调用方各自检查。只读确认只记在本机，不进入 DAG。
 
+设计审查 R2 到 R5 的决定：
+
+15. **计入哪些事件只由签名证据决定。** 所有已入库事件存在同一张表里，`effective` 由成员目录和全部已知事件按 5.5 节的规则算出，与到达顺序和本机主分支无关。治理或分叉证据变化后确定性重算投影，只动 reducer 写的投影表，不碰本机账本，也不重放副作用。
+16. **治理历史不丢弃。** `NetworkState` 保留所有 checkpoint 和治理事件，合并是并集。根恢复把没有保留的 Node 连同日志头写进 `retired`，历史客户端的签名仍可验证，见 3.2 节。
+17. **分叉后两支都不计入，撤销时选一支。** 不按到达顺序裁决，所有副本交换两支证据后结果相同，见 5.7 节。
+18. **对齐等所有其他成员 Node 确认。** 不再是任一 Node 不更多即可写，见 5.8 节。
+
 ## 10. 后续工作
 
-以下各项来自 2026-10-20 的设计审查，用户决定在 #63 合并后另开 PR 处理：
+以下各项来自 2026-10-20 的设计审查，用户决定在 #63 合并后另开 PR 处理。R2 到 R5 已在 #74 中实现，见 3.2、5.3 到 5.8 节和第 9 节。
 
-- **R2 撤销 cutoff 的收敛。** 撤销按签发者当时已知的序号截断，但已入库的事件不会因此移出，各副本可能保留不同的历史。需要定义治理变化后的有效事件集合和因果后继资格，并在治理变化后确定性地重算投影。
-- **R3 根恢复保留历史授权证据。** `RootCheckpoint` 只列当前成员，旧 epoch 的治理记录被丢弃，新副本无法证明被移除的设备当时有权写入。需要保留可验证的旧治理链或历史授权承诺，区分当前连接权限与历史写入资格。
-- **R4 对齐的完整方案。** 等待所有仍保留的成员完成对齐，或取得不会随备份回退的作者水位证明，代替 5.8 节“任一成员不更多即可写”。
-- **R5 分叉的统一裁决。** 现在各副本保留各自先到的分支，交换证据后也不收敛；5.7 节允许依赖冲突条目，又与 5.3 节“依赖都在 `events` 中”的不变量矛盾。需要可同步的统一分支裁决或冲突投影规则，并确定性重算受影响内容。R2 到 R5 共用“治理或证据变化后确定性重算，同时保留历史治理链”这一套机制，计划一起设计。
 - **R6 审批实际生效的回答。** 随调度 Agent 直连 App Server、默认完全访问的 PR 处理。该 PR 删除逐条审批，记录“哪次回答实际被消费”的问题随之消失；保留审批的部分由目标记录实际消费的回答。
 - **R11 选择 Cursor 时的权限告知。** 同样随直连与完全访问的 PR 处理，在切换执行方式时一次说明可修改文件、运行命令和审批差异。
