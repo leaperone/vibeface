@@ -1,14 +1,20 @@
 //! One signed append-only log per device. An event is stored once its predecessor and
-//! dependencies are; a second event at the same `(author, seq)` is kept aside as a conflict.
+//! dependencies are. The first chain stored per device is its main chain; an event that forks
+//! it is stored beside it as evidence. Which stored events count (`effective`) follows from the
+//! governance view and the fork evidence alone, so every replica holding the same evidence
+//! agrees.
 use super::{rank, reduce};
 use crate::{
     crypto::{LocalIdentity, check_event, verify_event_signature},
-    identity::AuthorizationView,
+    identity::{AuthorizationView, WriteBound},
     model::*,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 pub const MAX_PENDING_EVENTS: i64 = 10_000;
 
@@ -66,60 +72,65 @@ fn head(connection: &Connection, network: &str, author: &str) -> Result<Option<(
 }
 
 /// Verifies once, then places; events waiting on this one are placed without re-verifying.
+/// Sets `stale` when the effective set must be recomputed before the batch commits.
 pub(crate) fn ingest_from(
     connection: &Connection,
     view: &AuthorizationView,
     envelope: &SignedEvent,
     now: i64,
+    stale: &mut bool,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
     let event = match check_event(network, envelope) {
         Ok(event) => event,
         Err(error) => return Ok(IngestStatus::Rejected(error.to_string())),
     };
-    for table in ["events", "pending_events", "log_conflicts"] {
+    for table in ["events", "pending_events"] {
         if exists(connection, table, network, &envelope.hash)? {
             return Ok(IngestStatus::Duplicate);
         }
     }
-    if let Err(error) = authorize_author(view, &event.author, event.seq) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
+    // Writes past a revocation bound are stored but never count; nothing else is admitted.
+    if view.write_bound(&event.author).is_none() {
+        return Ok(IngestStatus::Rejected("unknown author".into()));
+    }
+    if let Some(attestation) = event.body.attestation()
+        && !view.attester(&attestation.device_id)
+    {
+        return Ok(IngestStatus::Rejected(
+            "attestation is not signed by a client of this network".into(),
+        ));
     }
     if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
-    let status = place(connection, network, envelope, &event, now)?;
+    let status = place(connection, view, envelope, &event, now, stale)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
-        cascade(connection, network, &envelope.hash, now)?;
+        cascade(connection, view, &envelope.hash, now, stale)?;
     }
     Ok(status)
 }
 
-/// A current member Node, or a revoked one up to the `cutoff_seq` its revoker had seen.
-fn authorize_author(view: &AuthorizationView, author: &str, seq: u64) -> Result<()> {
-    match view.cutoff(author) {
-        Some(cutoff) => ensure!(seq <= cutoff, "author was revoked before this event"),
-        None => {
-            view.node(author).context("unknown author")?;
-        }
-    }
-    Ok(())
-}
-
-fn cascade(connection: &Connection, network: &str, hash: &str, now: i64) -> Result<()> {
+fn cascade(
+    connection: &Connection,
+    view: &AuthorizationView,
+    hash: &str,
+    now: i64,
+    stale: &mut bool,
+) -> Result<()> {
     let mut ready = vec![hash.to_owned()];
     while let Some(hash) = ready.pop() {
         let waiting: Vec<String> = connection
             .prepare(
                 "DELETE FROM pending_events WHERE network_id=? AND missing=? RETURNING envelope",
             )?
-            .query_map(params![network, hash], |r| r.get(0))?
+            .query_map(params![view.network_id, hash], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for envelope in waiting {
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             if matches!(
-                place(connection, network, &envelope, &event, now)?,
+                place(connection, view, &envelope, &event, now, stale)?,
                 IngestStatus::Accepted | IngestStatus::Conflict
             ) {
                 ready.push(envelope.hash);
@@ -127,21 +138,6 @@ fn cascade(connection: &Connection, network: &str, hash: &str, now: i64) -> Resu
         }
     }
     Ok(())
-}
-
-fn conflict(
-    connection: &Connection,
-    network: &str,
-    envelope: &SignedEvent,
-    event: &Event,
-    kept: &str,
-    now: i64,
-) -> Result<IngestStatus> {
-    connection.execute(
-        "INSERT INTO log_conflicts(network_id,hash,author,seq,envelope,kept_hash,detected_at_ms) VALUES(?,?,?,?,?,?,?)",
-        params![network, envelope.hash, event.author, event.seq, serde_json::to_string(envelope)?, kept, now],
-    )?;
-    Ok(IngestStatus::Conflict)
 }
 
 fn pending(
@@ -169,54 +165,61 @@ fn pending(
 
 fn place(
     connection: &Connection,
-    network: &str,
+    view: &AuthorizationView,
     envelope: &SignedEvent,
     event: &Event,
     now: i64,
+    stale: &mut bool,
 ) -> Result<IngestStatus> {
-    let stored: Option<String> = connection
-        .query_row(
-            "SELECT hash FROM events WHERE network_id=? AND author=? AND seq=?",
-            params![network, event.author, event.seq],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(kept) = stored {
-        return conflict(connection, network, envelope, event, &kept, now);
-    }
+    let network = view.network_id.as_str();
     let (max, head_hash) = head(connection, network, &event.author)?.unwrap_or((0, String::new()));
-    if let Some(prev) = &event.prev
-        && exists(connection, "log_conflicts", network, prev)?
-    {
-        return conflict(connection, network, envelope, event, &head_hash, now);
-    }
-    if event.seq > max + 1 {
-        return match &event.prev {
-            Some(prev) if exists(connection, "pending_events", network, prev)? => {
-                pending(connection, network, envelope, event, prev, now)
+    if let Some(prev) = &event.prev {
+        let stored: Option<(String, u64)> = connection
+            .query_row(
+                "SELECT author,seq FROM events WHERE network_id=? AND hash=?",
+                params![network, prev],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match stored {
+            None if event.seq <= max + 1
+                || exists(connection, "pending_events", network, prev)? =>
+            {
+                return pending(connection, network, envelope, event, prev, now);
             }
-            _ => Ok(IngestStatus::Rejected(format!(
-                "sequence gap: expected {} got {}",
-                max + 1,
-                event.seq
-            ))),
-        };
-    }
-    if event.prev.as_deref().unwrap_or("") != head_hash {
-        return conflict(connection, network, envelope, event, &head_hash, now);
+            None => {
+                return Ok(IngestStatus::Rejected(format!(
+                    "sequence gap: expected {} got {}",
+                    max + 1,
+                    event.seq
+                )));
+            }
+            Some((author, seq)) if author != event.author || seq + 1 != event.seq => {
+                return Ok(IngestStatus::Rejected(
+                    "prev is not this log's previous event".into(),
+                ));
+            }
+            Some(_) => {}
+        }
     }
     for dep in &event.deps {
-        if !exists(connection, "events", network, dep)?
-            && !exists(connection, "log_conflicts", network, dep)?
-        {
+        if !exists(connection, "events", network, dep)? {
             return pending(connection, network, envelope, event, dep, now);
         }
     }
     if let Err(error) = authorize_change(connection, network, event) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
-    insert_event(connection, network, envelope, event)?;
-    Ok(IngestStatus::Accepted)
+    let main = match &event.prev {
+        Some(prev) => *prev == head_hash,
+        None => max == 0,
+    };
+    *stale |= !insert_event(connection, view, envelope, event, main, now)?;
+    Ok(if main {
+        IngestStatus::Accepted
+    } else {
+        IngestStatus::Conflict
+    })
 }
 
 /// The user's device signature on `cause` is what authorizes an assistant change, so one of its
@@ -249,12 +252,35 @@ fn authorize_change(connection: &Connection, network: &str, event: &Event) -> Re
     bail!("an assistant change must follow the user's own signed message in this conversation")
 }
 
+fn has_forks(connection: &Connection, network: &str, author: &str) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM events WHERE network_id=? AND author=? AND main=0 LIMIT 1",
+            params![network, author],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Stores the event and applies it at once when it plainly counts. Returns false when only a
+/// recompute can tell: it forks its log, or its log has forked.
 fn insert_event(
     connection: &Connection,
-    network: &str,
+    view: &AuthorizationView,
     envelope: &SignedEvent,
     event: &Event,
-) -> Result<()> {
+    main: bool,
+    now: i64,
+) -> Result<bool> {
+    let network = view.network_id.as_str();
+    let settled = main && !has_forks(connection, network, &event.author)?;
+    let effective = settled
+        && match view.write_bound(&event.author) {
+            Some(WriteBound::Unlimited) => true,
+            Some(WriteBound::Cutoff(revocation)) => event.seq <= revocation.cutoff_seq,
+            None => false,
+        };
     let mut lamport = 0u64;
     for parent in event.prev.iter().chain(&event.deps) {
         let parent: Option<u64> = connection
@@ -268,8 +294,8 @@ fn insert_event(
     }
     lamport += 1;
     connection.execute(
-        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope) VALUES(?,?,?,?,?,?,?,?)",
-        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?],
+        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope,main,effective,detected_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?, main, effective, (!main).then_some(now)],
     )?;
     for blob in &event.blobs {
         connection.execute(
@@ -277,17 +303,130 @@ fn insert_event(
             params![network, envelope.hash, blob.hash, blob.size],
         )?;
     }
-    connection.execute(
-        "INSERT INTO log_heads(network_id,author,max_seq,head_hash) VALUES(?,?,?,?) ON CONFLICT(network_id,author) DO UPDATE SET max_seq=excluded.max_seq,head_hash=excluded.head_hash",
-        params![network, event.author, event.seq, envelope.hash],
+    if main {
+        connection.execute(
+            "INSERT INTO log_heads(network_id,author,max_seq,head_hash) VALUES(?,?,?,?) ON CONFLICT(network_id,author) DO UPDATE SET max_seq=excluded.max_seq,head_hash=excluded.head_hash",
+            params![network, event.author, event.seq, envelope.hash],
+        )?;
+    }
+    if effective {
+        reduce::apply(
+            connection,
+            network,
+            &envelope.hash,
+            event,
+            &rank(lamport, event.created_at_ms, &envelope.hash),
+        )?;
+    }
+    Ok(settled)
+}
+
+/// The events that count for one author: a current member's log up to its first fork; a former
+/// Node's up to its bound, along the branch ending at the bound's hash when that is stored.
+/// Depending on an event never makes another one count.
+fn effective_set(
+    connection: &Connection,
+    view: &AuthorizationView,
+    author: &str,
+    rows: &[(u64, String, bool, bool)],
+) -> Result<BTreeSet<String>> {
+    let fork = rows
+        .iter()
+        .filter(|(_, _, main, _)| !main)
+        .map(|(seq, ..)| *seq)
+        .min()
+        .unwrap_or(u64::MAX);
+    let (limit, mut tip) = match view.write_bound(author) {
+        None => return Ok(BTreeSet::new()),
+        Some(WriteBound::Unlimited) => (fork - 1, None),
+        Some(WriteBound::Cutoff(revocation)) => (
+            revocation.cutoff_seq.min(fork - 1),
+            revocation.cutoff_hash.clone().filter(|hash| {
+                revocation.cutoff_seq >= fork
+                    && rows
+                        .iter()
+                        .any(|(seq, row, ..)| row == hash && *seq == revocation.cutoff_seq)
+            }),
+        ),
+    };
+    let mut wanted: BTreeSet<String> = rows
+        .iter()
+        .filter(|(seq, _, main, _)| *main && *seq <= limit)
+        .map(|(_, hash, ..)| hash.clone())
+        .collect();
+    while let Some(hash) = tip {
+        let (seq, envelope): (u64, String) = connection.query_row(
+            "SELECT seq,envelope FROM events WHERE network_id=? AND hash=?",
+            params![view.network_id, hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if seq < fork {
+            break;
+        }
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        tip = serde_json::from_str::<Event>(&envelope.canonical_body)?.prev;
+        wanted.insert(hash);
+    }
+    Ok(wanted)
+}
+
+/// Brings every `effective` flag in line with `view` and the fork evidence. When one moves, the
+/// projections are rebuilt from the effective events in shared order; local ledgers are left
+/// alone. Returns whether the projections were rebuilt.
+pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Result<bool> {
+    let network = view.network_id.as_str();
+    let mut logs: BTreeMap<String, Vec<(u64, String, bool, bool)>> = BTreeMap::new();
+    {
+        let mut statement = connection
+            .prepare("SELECT author,seq,hash,main,effective FROM events WHERE network_id=?")?;
+        let rows = statement.query_map([network], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+            ))
+        })?;
+        for row in rows {
+            let (author, row) = row?;
+            logs.entry(author).or_default().push(row);
+        }
+    }
+    let mut flips = Vec::new();
+    for (author, rows) in &logs {
+        let wanted = effective_set(connection, view, author, rows)?;
+        for (_, hash, _, effective) in rows {
+            if *effective != wanted.contains(hash) {
+                flips.push((hash, !effective));
+            }
+        }
+    }
+    if flips.is_empty() {
+        return Ok(false);
+    }
+    for (hash, effective) in flips {
+        connection.execute(
+            "UPDATE events SET effective=? WHERE network_id=? AND hash=?",
+            params![effective, network, hash],
+        )?;
+    }
+    reduce::clear(connection, network)?;
+    let mut statement = connection.prepare(
+        "SELECT hash,lamport,created_at_ms,envelope FROM events WHERE network_id=? AND effective=1
+         ORDER BY lamport,created_at_ms,hash",
     )?;
-    reduce::apply(
-        connection,
-        network,
-        &envelope.hash,
-        event,
-        &rank(lamport, event.created_at_ms, &envelope.hash),
-    )
+    let mut rows = statement.query([network])?;
+    while let Some(row) = rows.next()? {
+        let hash: String = row.get(0)?;
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        reduce::apply(
+            connection,
+            network,
+            &hash,
+            &event,
+            &rank(row.get(1)?, row.get(2)?, &hash),
+        )?;
+    }
+    Ok(true)
 }
 
 /// Appends to this device's log. `deps` name every other author's latest event in the
@@ -315,9 +454,10 @@ pub(crate) fn append_from(
         _ => bail!("this Node is aligning with other Nodes; try again shortly"),
     }
     let author = identity.device_id()?;
-    super::authorize_node_from(connection, network, &author)?;
+    let view = super::membership_from(connection, network)?;
+    view.node(&author)?;
     if let Some(attestation) = body.attestation() {
-        super::membership_from(connection, network)?.client(&attestation.device_id)?;
+        view.client(&attestation.device_id)?;
     }
     for blob in &blobs {
         ensure!(
@@ -334,7 +474,7 @@ pub(crate) fn append_from(
     for other in authors {
         if let Some(hash) = connection
             .query_row(
-                "SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? ORDER BY seq DESC LIMIT 1",
+                "SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND main=1 ORDER BY seq DESC LIMIT 1",
                 params![network, scope, other],
                 |r| r.get::<_, String>(0),
             )
@@ -365,6 +505,9 @@ pub(crate) fn append_from(
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     authorize_change(connection, network, &event)?;
-    insert_event(connection, network, &envelope, &event)?;
+    ensure!(
+        insert_event(connection, &view, &envelope, &event, true, created_at_ms)?,
+        "this Node's log has forked and it no longer writes"
+    );
     Ok(envelope)
 }

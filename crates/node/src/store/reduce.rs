@@ -47,6 +47,32 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
     Ok(crate::crypto::digest(&signed))
 }
 
+/// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
+pub(crate) const TABLES: [&str; 12] = [
+    "conversations",
+    "messages",
+    "bots",
+    "assistant_profiles",
+    "skills",
+    "routines",
+    "assistant_changes",
+    "works",
+    "notifications",
+    "notification_acks",
+    "alerts",
+    "alert_resolutions",
+];
+
+pub(crate) fn clear(connection: &Connection, network: &str) -> Result<()> {
+    for table in TABLES {
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE network_id=?"),
+            [network],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn apply(
     connection: &Connection,
     network: &str,

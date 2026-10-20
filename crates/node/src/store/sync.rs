@@ -30,7 +30,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT hash FROM events WHERE network_id=? AND author=? AND seq=?",
+                "SELECT hash FROM events WHERE network_id=? AND author=? AND seq=? AND main=1",
                 params![network, author, seq],
                 |r| r.get(0),
             )
@@ -41,7 +41,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT 1 FROM log_conflicts WHERE network_id=? AND author=? LIMIT 1",
+                "SELECT 1 FROM events WHERE network_id=? AND author=? AND main=0 LIMIT 1",
                 params![network, author],
                 |_| Ok(()),
             )
@@ -49,12 +49,12 @@ impl Store {
             .is_some())
     }
 
-    /// The first conflicts kept aside, each beside the event stored at the same place.
+    /// The first fork events, each beside the main-chain event at the same place.
     pub fn conflicts(&self, network: &str) -> Result<Vec<serde_json::Value>> {
         let mut statement = self.connection.prepare(
-            "SELECT c.author,c.seq,c.envelope,e.envelope FROM log_conflicts c LEFT JOIN events e
-             ON e.network_id=c.network_id AND e.author=c.author AND e.seq=c.seq
-             WHERE c.network_id=? ORDER BY c.author,c.seq LIMIT 20",
+            "SELECT c.author,c.seq,c.envelope,e.envelope FROM events c LEFT JOIN events e
+             ON e.network_id=c.network_id AND e.author=c.author AND e.seq=c.seq AND e.main=1
+             WHERE c.network_id=? AND c.main=0 ORDER BY c.author,c.seq,c.hash LIMIT 20",
         )?;
         let rows = statement.query_map([network], |r| {
             Ok((
@@ -81,7 +81,7 @@ impl Store {
         Ok(conflicts)
     }
 
-    /// One author's events from `from_seq` on, within the batch limits.
+    /// One author's main-chain events from `from_seq` on, within the batch limits.
     pub fn events_from(
         &self,
         network: &str,
@@ -90,7 +90,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<SignedEvent>> {
         let mut statement = self.connection.prepare(
-            "SELECT envelope FROM events WHERE network_id=? AND author=? AND seq>=? ORDER BY seq LIMIT ?",
+            "SELECT envelope FROM events WHERE network_id=? AND author=? AND seq>=? AND main=1 ORDER BY seq LIMIT ?",
         )?;
         let rows = statement.query_map(
             params![network, author, from_seq, limit.min(MAX_PULL_EVENTS) as i64],

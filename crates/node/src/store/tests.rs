@@ -128,7 +128,7 @@ fn out_of_order_delivery_converges() -> Result<()> {
     let expected = projection(&origin, &net, "c")?;
 
     let mut b_first = store(&net)?;
-    let statuses = b_first.ingest_events(&net.network, &b_events)?;
+    let statuses = b_first.ingest_events(&net.network, &b_events)?.0;
     assert!(
         statuses
             .iter()
@@ -172,20 +172,24 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
     let third = origin.append_event(&net.a, &net.network, "c", user(&net, "m2", "y"), vec![], 3)?;
     let mut target = store(&net)?;
     assert_eq!(
-        target.ingest_events(&net.network, std::slice::from_ref(&first))?,
+        target
+            .ingest_events(&net.network, std::slice::from_ref(&first))?
+            .0,
         vec![IngestStatus::Accepted]
     );
     assert_eq!(
-        target.ingest_events(&net.network, std::slice::from_ref(&first))?,
+        target
+            .ingest_events(&net.network, std::slice::from_ref(&first))?
+            .0,
         vec![IngestStatus::Duplicate]
     );
     assert!(
-        matches!(target.ingest_events(&net.network, &[third])?[0], IngestStatus::Rejected(ref e) if e.contains("gap"))
+        matches!(target.ingest_events(&net.network, &[third])?.0[0], IngestStatus::Rejected(ref e) if e.contains("gap"))
     );
     let mut forged = first.clone();
     forged.signature = "00".repeat(64);
     assert_eq!(
-        target.ingest_events(&net.network, &[forged])?,
+        target.ingest_events(&net.network, &[forged])?.0,
         vec![IngestStatus::Duplicate]
     );
     let stranger = LocalIdentity::generate();
@@ -202,7 +206,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         blobs: vec![],
     })?;
     assert!(
-        matches!(target.ingest_events(&net.network, &[foreign])?[0], IngestStatus::Rejected(ref e) if e.contains("unknown author"))
+        matches!(target.ingest_events(&net.network, &[foreign])?.0[0], IngestStatus::Rejected(ref e) if e.contains("unknown author"))
     );
     let mut tampered = net.b.sign_event(Event {
         version: WIRE_VERSION,
@@ -221,15 +225,16 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         .sign_event(serde_json::from_str::<Event>(&first.canonical_body)?)?
         .signature;
     assert!(matches!(
-        target.ingest_events(&net.network, &[tampered])?[0],
+        target.ingest_events(&net.network, &[tampered])?.0[0],
         IngestStatus::Rejected(_)
     ));
     Ok(())
 }
 
-/// A device that forks its own log does not block the conversation for anyone else.
+/// A device that forks its own log stops counting from the fork on, without blocking the
+/// conversation for anyone else.
 #[test]
-fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
+fn a_forked_log_stops_counting_and_the_conversation_stays_appendable() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
     let created = origin.append_event(
@@ -274,7 +279,9 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
     })?;
     let mut target = store(&net)?;
     assert_eq!(
-        target.ingest_events(&net.network, &[created, kept, fork, after_fork])?,
+        target
+            .ingest_events(&net.network, &[created, kept, fork, after_fork])?
+            .0,
         vec![
             IngestStatus::Accepted,
             IngestStatus::Accepted,
@@ -299,7 +306,7 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         5,
     )?;
     assert_eq!(
-        target.ingest_events(&net.network, &[next])?,
+        target.ingest_events(&net.network, &[next])?.0,
         vec![IngestStatus::Accepted]
     );
     let texts: Vec<_> = target
@@ -307,13 +314,15 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         .into_iter()
         .map(|m| m.text)
         .collect();
-    assert_eq!(texts, vec!["kept", "still works", "a continues"]);
+    assert_eq!(texts, vec!["still works"]);
+    assert!(target.conversation(&net.network, "c")?.is_some());
     assert!(target.has_conflicts_by(&net.network, &net.a.device_id()?)?);
     assert!(!target.has_conflicts_by(&net.network, &net.b.device_id()?)?);
     let conflicts = target.conflicts(&net.network)?;
     assert_eq!(conflicts.len(), 2);
     assert_eq!(conflicts[0]["other"]["body"]["text"], "forked");
     assert_eq!(conflicts[0]["kept"]["body"]["text"], "kept");
+    assert_eq!(conflicts[1]["kept"]["body"]["text"], "a continues");
     Ok(())
 }
 
@@ -342,7 +351,7 @@ fn the_write_gate_stops_local_appends_only() -> Result<()> {
         assert!(error.to_string().contains(refusal), "{error}");
     }
     assert_eq!(
-        gated.ingest_events(&net.network, &[created])?,
+        gated.ingest_events(&net.network, &[created])?.0,
         vec![IngestStatus::Accepted]
     );
     gated.set_write_state(WriteState::Writable)?;
@@ -978,6 +987,7 @@ fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
     assert!(
         target
             .ingest_events(&net.network, &a_events)?
+            .0
             .iter()
             .all(|status| *status == IngestStatus::Accepted)
     );
@@ -1011,14 +1021,16 @@ fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
         ("m2", vec![m1.hash.clone()]),
     ] {
         assert!(
-            matches!(&target.ingest_events(&net.network, &[change(cause, deps)?])?[0],
+            matches!(&target.ingest_events(&net.network, &[change(cause, deps)?])?.0[0],
                 IngestStatus::Rejected(error) if error.contains("user's own signed message")),
             "{cause}"
         );
     }
     assert_eq!(target.bots(&net.network)?[0].name, "Helper");
     assert_eq!(
-        target.ingest_events(&net.network, &[change("m1", vec![m1.hash.clone()])?])?,
+        target
+            .ingest_events(&net.network, &[change("m1", vec![m1.hash.clone()])?])?
+            .0,
         vec![IngestStatus::Accepted]
     );
     assert_eq!(target.bots(&net.network)?[0].name, "Nova");
@@ -1273,11 +1285,12 @@ fn append_path_uses_indexes_only() -> Result<()> {
     let statements = [
         "SELECT max_seq,head_hash FROM log_heads WHERE network_id=?1 AND author=?2",
         "SELECT author FROM log_heads WHERE network_id=?1 AND author<>?2",
-        "SELECT hash FROM events WHERE network_id=?1 AND scope_id='c' AND author=?2 ORDER BY seq DESC LIMIT 1",
+        "SELECT hash FROM events WHERE network_id=?1 AND scope_id='c' AND author=?2 AND main=1 ORDER BY seq DESC LIMIT 1",
+        "SELECT 1 FROM events WHERE network_id=?1 AND author=?2 AND main=0 LIMIT 1",
         "SELECT lamport FROM events WHERE network_id=?1 AND hash=?2",
+        "SELECT author,seq FROM events WHERE network_id=?1 AND hash=?2",
         "SELECT 1 FROM pending_events WHERE network_id=?1 AND hash=?2",
-        "SELECT 1 FROM log_conflicts WHERE network_id=?1 AND hash=?2",
-        "SELECT hash FROM events WHERE network_id=?1 AND author=?2 AND seq=1",
+        "SELECT hash FROM events WHERE network_id=?1 AND author=?2 AND seq=1 AND main=1",
         "SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id='c' AND message_id=?2",
     ];
     for sql in statements {
@@ -1338,4 +1351,505 @@ fn autonomy_is_not_an_event() {
         serde_json::from_value::<EventBody>(body).is_err(),
         "the coordination Agent always runs with full permission; there is no autonomy setting"
     );
+}
+
+/// Nodes `a`, `b` and `x` under real signed governance, managed by the fixture admin.
+struct Fleet {
+    net: Net,
+    x: LocalIdentity,
+    admin: LocalIdentity,
+}
+
+fn fleet() -> Result<Fleet> {
+    let a = LocalIdentity::generate();
+    let b = LocalIdentity::generate();
+    let x = LocalIdentity::generate();
+    let state = a.sign_network_fixture(1, vec![a.device_id()?, b.device_id()?, x.device_id()?])?;
+    Ok(Fleet {
+        admin: a.fixture_admin(),
+        net: Net {
+            network: a.fixture_network_id()?,
+            a,
+            b,
+            state,
+        },
+        x,
+    })
+}
+
+fn seq_of(envelope: &SignedEvent) -> Result<u64> {
+    Ok(serde_json::from_str::<Event>(&envelope.canonical_body)?.seq)
+}
+
+/// `state` plus the admin's revocation of `device`, counting its log up to `last`.
+fn revoke(
+    fleet: &Fleet,
+    state: &NetworkState,
+    device: &LocalIdentity,
+    last: Option<&SignedEvent>,
+) -> Result<NetworkState> {
+    use crate::identity::{GovernanceEvent, Revocation};
+    let cutoff = last.map(|event| Ok::<_, anyhow::Error>((seq_of(event)?, event.hash.as_str())));
+    let revocation = Revocation::new(&device.device_id()?, cutoff.transpose()?)?;
+    let mut next = state.clone();
+    next.append(GovernanceEvent::revoke(
+        &fleet.admin,
+        &state.project()?,
+        revocation,
+    )?)?;
+    Ok(next)
+}
+
+fn grant(fleet: &Fleet, state: &NetworkState, node: &LocalIdentity) -> Result<NetworkState> {
+    use crate::identity::GovernanceEvent;
+    let mut next = state.clone();
+    next.append(GovernanceEvent::grant(
+        &fleet.admin,
+        &state.project()?,
+        Member::node(node, "granted")?,
+    )?)?;
+    Ok(next)
+}
+
+fn write(
+    store: &mut Store,
+    net: &Net,
+    author: &LocalIdentity,
+    id: &str,
+    at: i64,
+) -> Result<SignedEvent> {
+    store.append_event(author, &net.network, "c", user(net, id, id), vec![], at)
+}
+
+fn created(store: &mut Store, net: &Net, author: &LocalIdentity) -> Result<SignedEvent> {
+    store.append_event(
+        author,
+        &net.network,
+        "c",
+        EventBody::ConversationCreated { title: "t".into() },
+        vec![],
+        1,
+    )
+}
+
+enum Piece {
+    Governance(NetworkState),
+    Events(Vec<SignedEvent>),
+}
+
+/// Applies `pieces` in `order` to a fresh replica, then delivers every event once more, as sync
+/// fetches again what a gap or an unknown author refused earlier.
+fn replay(net: &Net, pieces: &[Piece], order: &[usize]) -> Result<Store> {
+    let mut replica = store(net)?;
+    let events = pieces
+        .iter()
+        .filter(|piece| matches!(piece, Piece::Events(_)));
+    for piece in order.iter().map(|index| &pieces[*index]).chain(events) {
+        match piece {
+            Piece::Governance(state) => {
+                replica.install_trust_bundle(&net.network, state)?;
+            }
+            Piece::Events(events) => {
+                replica.ingest_events(&net.network, events)?;
+            }
+        }
+    }
+    Ok(replica)
+}
+
+/// Every projection row (all columns) and the effective set, in a stable order.
+fn dump(store: &Store, network: &str) -> Result<Vec<String>> {
+    let mut dump = Vec::new();
+    for table in reduce::TABLES {
+        let mut statement = store
+            .connection
+            .prepare(&format!("SELECT * FROM {table} WHERE network_id=?"))?;
+        let columns = statement.column_count();
+        let mut rows = statement
+            .query_map([network], |r| {
+                (0..columns)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })?
+            .map(|row| Ok(format!("{table}: {:?}", row?)))
+            .collect::<Result<Vec<_>>>()?;
+        rows.sort();
+        dump.extend(rows);
+    }
+    let mut statement = store
+        .connection
+        .prepare("SELECT hash FROM events WHERE network_id=? AND effective=1 ORDER BY hash")?;
+    for hash in statement.query_map([network], |r| r.get::<_, String>(0))? {
+        dump.push(format!("effective: {}", hash?));
+    }
+    Ok(dump)
+}
+
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![vec![]];
+    }
+    let mut all = Vec::new();
+    for rest in permutations(n - 1) {
+        for at in 0..=rest.len() {
+            let mut order = rest.clone();
+            order.insert(at, n - 1);
+            all.push(order);
+        }
+    }
+    all
+}
+
+/// Every arrival order of the same evidence ends in the same place, and that is where a rebuild
+/// from scratch ends. Returns that reference replica.
+fn converges(net: &Net, pieces: &[Piece]) -> Result<Store> {
+    let orders = permutations(pieces.len());
+    let dumps = orders
+        .iter()
+        .map(|order| dump(&replay(net, pieces, order)?, &net.network))
+        .collect::<Result<Vec<_>>>()?;
+    for (order, found) in orders.iter().zip(&dumps) {
+        assert_eq!(
+            found, &dumps[0],
+            "arrival order {order:?} against {:?}",
+            orders[0]
+        );
+    }
+    let reference = replay(net, pieces, &orders[0])?;
+    reference.connection.execute(
+        "UPDATE events SET effective=0 WHERE network_id=?",
+        [&net.network],
+    )?;
+    reduce::clear(&reference.connection, &net.network)?;
+    log::recompute(
+        &reference.connection,
+        &membership_from(&reference.connection, &net.network)?,
+    )?;
+    assert_eq!(
+        dump(&reference, &net.network)?,
+        dumps[0],
+        "rebuild from scratch"
+    );
+    Ok(reference)
+}
+
+/// Whether each event is stored and counts.
+fn effective(store: &Store, net: &Net, events: &[&SignedEvent]) -> Result<Vec<bool>> {
+    events
+        .iter()
+        .map(|event| {
+            Ok(store
+                .connection
+                .query_row(
+                    "SELECT effective FROM events WHERE network_id=? AND hash=?",
+                    params![net.network, event.hash],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
+        .collect()
+}
+
+/// R2: P holds x#1..#10 and Q only #1..#7 when the revocation that counts up to #7 arrives.
+/// After they sync, both count the same events, however the evidence arrived.
+#[test]
+fn a_revocation_cutoff_converges_whatever_arrived_first() -> Result<()> {
+    let fleet = fleet()?;
+    let net = &fleet.net;
+    let mut origin = store(net)?;
+    let created = created(&mut origin, net, &net.a)?;
+    let mut writes = vec![];
+    for i in 1..=10 {
+        writes.push(write(&mut origin, net, &fleet.x, &format!("x{i}"), 10 + i)?);
+    }
+    // b answers after x#10, so it depends on an event that will not count.
+    let answer = write(&mut origin, net, &net.b, "b1", 30)?;
+    let revoked = revoke(&fleet, &net.state, &fleet.x, Some(&writes[6]))?;
+    let pieces = [
+        Piece::Events([vec![created], writes[..7].to_vec()].concat()),
+        Piece::Events([writes[7..].to_vec(), vec![answer.clone()]].concat()),
+        Piece::Governance(revoked),
+    ];
+    let reference = converges(net, &pieces)?;
+    let texts: Vec<_> = reference
+        .messages(&net.network, "c")?
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    let mut expected: Vec<_> = (1..=7).map(|i| format!("x{i}")).collect();
+    expected.push("b1".into());
+    assert_eq!(texts.len(), expected.len());
+    assert!(
+        expected.iter().all(|text| texts.contains(text)),
+        "{texts:?}"
+    );
+    assert_eq!(
+        effective(&reference, net, &[&writes[7], &writes[9], &answer])?,
+        vec![false, false, true]
+    );
+    Ok(())
+}
+
+/// A revocation issued without seeing the grant still wins when it arrives first or last.
+#[test]
+fn a_revocation_arriving_before_the_grant_still_wins() -> Result<()> {
+    let fleet = fleet()?;
+    let net = &fleet.net;
+    let y = LocalIdentity::generate();
+    let granted = grant(&fleet, &net.state, &y)?;
+    let concurrent = revoke(&fleet, &net.state, &y, None)?;
+    let mut origin = store(net)?;
+    origin.install_trust_bundle(&net.network, &granted)?;
+    let created = created(&mut origin, net, &net.a)?;
+    let mut writes = vec![created.clone()];
+    for i in 1..=3 {
+        writes.push(write(&mut origin, net, &y, &format!("y{i}"), 10 + i)?);
+    }
+    let pieces = [
+        Piece::Events(writes.clone()),
+        Piece::Governance(granted),
+        Piece::Governance(concurrent),
+    ];
+    let reference = converges(net, &pieces)?;
+    assert!(reference.messages(&net.network, "c")?.is_empty());
+    assert_eq!(
+        effective(&reference, net, &[&created, &writes[1], &writes[3]])?,
+        vec![true, false, false]
+    );
+    Ok(())
+}
+
+/// A root recovery that never saw a concurrent grant leaves the granted Node out, and the Node
+/// it retires counts up to its bound only.
+#[test]
+fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
+    use crate::identity::{Revocation, RootCheckpoint};
+    let fleet = fleet()?;
+    let net = &fleet.net;
+    let z = LocalIdentity::generate();
+    let granted = grant(&fleet, &net.state, &z)?;
+    let mut origin = store(net)?;
+    origin.install_trust_bundle(&net.network, &granted)?;
+    let created = created(&mut origin, net, &net.a)?;
+    let mut x_writes = vec![];
+    for i in 1..=5 {
+        x_writes.push(write(&mut origin, net, &fleet.x, &format!("x{i}"), 10 + i)?);
+    }
+    let z_write = write(&mut origin, net, &z, "z1", 20)?;
+    let mut recovered = net.state.clone();
+    recovered.recover(RootCheckpoint::create(
+        &net.a.fixture_root(),
+        3,
+        vec![
+            Member::client(&fleet.admin, "fixture-admin", true)?,
+            Member::node(&net.a, "a")?,
+            Member::node(&net.b, "b")?,
+        ],
+        vec![Revocation::new(
+            &fleet.x.device_id()?,
+            Some((3, &x_writes[2].hash)),
+        )?],
+    )?)?;
+    let pieces = [
+        Piece::Events([vec![created], x_writes.clone(), vec![z_write.clone()]].concat()),
+        Piece::Governance(granted),
+        Piece::Governance(recovered),
+    ];
+    let reference = converges(net, &pieces)?;
+    assert_eq!(
+        effective(
+            &reference,
+            net,
+            &[&x_writes[2], &x_writes[3], &x_writes[4], &z_write]
+        )?,
+        vec![true, false, false, false]
+    );
+    Ok(())
+}
+
+/// R5: x forks at seq 3. Once a replica holds both branches nothing of x from seq 3 counts, while
+/// b's event that depends on branch a does. A later revocation naming b#4 makes branch b count.
+#[test]
+fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
+    let fleet = fleet()?;
+    let net = &fleet.net;
+    let mut first = store(net)?;
+    let x1 = created(&mut first, net, &fleet.x)?;
+    let x2 = write(&mut first, net, &fleet.x, "x2", 2)?;
+    let x3a = write(&mut first, net, &fleet.x, "x3a", 3)?;
+    let w1 = write(&mut first, net, &net.b, "w1", 4)?;
+    let x4a = write(&mut first, net, &fleet.x, "x4a", 5)?;
+    let mut second = store(net)?;
+    second.ingest_events(&net.network, &[x1.clone(), x2.clone()])?;
+    let x3b = write(&mut second, net, &fleet.x, "x3b", 3)?;
+    let x4b = write(&mut second, net, &fleet.x, "x4b", 4)?;
+    assert!(
+        serde_json::from_str::<Event>(&w1.canonical_body)?
+            .deps
+            .contains(&x3a.hash)
+    );
+    let base = Piece::Events(vec![x1.clone(), x2.clone()]);
+    let branch_a = Piece::Events(vec![x3a.clone(), w1.clone(), x4a.clone()]);
+    let branch_b = Piece::Events(vec![x3b.clone(), x4b.clone()]);
+    let all = [&x1, &x2, &x3a, &x4a, &x3b, &x4b, &w1];
+
+    let a_only = replay(net, &[base, branch_a], &[0, 1])?;
+    assert_eq!(
+        effective(&a_only, net, &all[..4])?,
+        vec![true, true, true, true]
+    );
+    let base = Piece::Events(vec![x1.clone(), x2.clone()]);
+    let branch_a = Piece::Events(vec![x3a.clone(), w1.clone(), x4a.clone()]);
+    let b_only = replay(net, &[base, branch_b], &[0, 1])?;
+    assert_eq!(effective(&b_only, net, &[&x3b, &x4b])?, vec![true, true]);
+
+    let base = Piece::Events(vec![x1.clone(), x2.clone()]);
+    let branch_b = Piece::Events(vec![x3b.clone(), x4b.clone()]);
+    let both = converges(net, &[base, branch_a, branch_b])?;
+    assert_eq!(
+        effective(&both, net, &all)?,
+        vec![true, true, false, false, false, false, true]
+    );
+    assert!(both.has_conflicts_by(&net.network, &fleet.x.device_id()?)?);
+
+    let picked = revoke(&fleet, &net.state, &fleet.x, Some(&x4b))?;
+    let pieces = [
+        Piece::Events(vec![x1.clone(), x2.clone()]),
+        Piece::Events(vec![x3a.clone(), w1.clone(), x4a.clone()]),
+        Piece::Events(vec![x3b.clone(), x4b.clone()]),
+        Piece::Governance(picked),
+    ];
+    let reference = converges(net, &pieces)?;
+    assert_eq!(
+        effective(&reference, net, &all)?,
+        vec![true, true, false, false, true, true, true]
+    );
+    Ok(())
+}
+
+/// R3: a recovery retires x at (5, h5). Installed before or after x#1..#8, the same five count,
+/// and messages the replaced client signed still verify.
+#[test]
+fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result<()> {
+    use crate::identity::{Revocation, RootCheckpoint};
+    let fleet = fleet()?;
+    let net = &fleet.net;
+    let mut origin = store(net)?;
+    let created = created(&mut origin, net, &net.a)?;
+    let mut writes = vec![];
+    for i in 1..=8 {
+        writes.push(write(&mut origin, net, &fleet.x, &format!("x{i}"), 10 + i)?);
+    }
+    let replacement = LocalIdentity::generate();
+    let mut recovered = net.state.clone();
+    recovered.recover(RootCheckpoint::create(
+        &net.a.fixture_root(),
+        3,
+        vec![
+            Member::client(&replacement, "replacement", true)?,
+            Member::node(&net.a, "a")?,
+            Member::node(&net.b, "b")?,
+        ],
+        vec![Revocation::new(
+            &fleet.x.device_id()?,
+            Some((5, &writes[4].hash)),
+        )?],
+    )?)?;
+    let view = recovered.project()?;
+    assert!(view.client(&fleet.admin.device_id()?).is_err());
+    assert!(view.attester(&fleet.admin.device_id()?));
+
+    let mut late = store(net)?;
+    late.install_trust_bundle(&net.network, &recovered)?;
+    let (statuses, _) = late.ingest_events(
+        &net.network,
+        &[vec![created.clone()], writes.clone()].concat(),
+    )?;
+    assert!(
+        statuses.iter().all(|s| *s == IngestStatus::Accepted),
+        "{statuses:?}"
+    );
+
+    let pieces = [
+        Piece::Events([vec![created], writes.clone()].concat()),
+        Piece::Governance(recovered),
+    ];
+    let reference = converges(net, &pieces)?;
+    assert_eq!(
+        effective(
+            &reference,
+            net,
+            &[&writes[0], &writes[4], &writes[5], &writes[7]]
+        )?,
+        vec![true, true, false, false]
+    );
+    assert_eq!(dump(&late, &net.network)?, dump(&reference, &net.network)?);
+    Ok(())
+}
+
+/// A rebuild replaces projections only; scheduler jobs and every other local ledger stay as
+/// they were.
+#[test]
+fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
+    let fleet = fleet()?;
+    let net = &fleet.net;
+    let mut store = store(net)?;
+    conversation(&mut store, net)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "hi",
+        vec![],
+        true,
+        signature(net, "m1", "hi")?,
+        2,
+    )?;
+    write(&mut store, net, &fleet.x, "x1", 3)?;
+    let ledgers = |store: &Store| -> Result<Vec<String>> {
+        let derived = [
+            "events",
+            "event_blobs",
+            "log_heads",
+            "pending_events",
+            "networks",
+        ];
+        let tables: Vec<String> = store
+            .connection
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut rows = Vec::new();
+        for table in tables
+            .iter()
+            .filter(|t| !reduce::TABLES.contains(&t.as_str()) && !derived.contains(&t.as_str()))
+        {
+            let mut statement = store
+                .connection
+                .prepare(&format!("SELECT * FROM {table}"))?;
+            let columns = statement.column_count();
+            let mut found = statement
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?
+                .map(|row| Ok(format!("{table}: {:?}", row?)))
+                .collect::<Result<Vec<_>>>()?;
+            found.sort();
+            rows.extend(found);
+        }
+        Ok(rows)
+    };
+    let before = ledgers(&store)?;
+    assert!(before.iter().any(|row| row.starts_with("scheduler_jobs:")));
+    assert_eq!(store.messages(&net.network, "c")?.len(), 2);
+    assert!(
+        store.install_trust_bundle(&net.network, &revoke(&fleet, &net.state, &fleet.x, None)?)?
+    );
+    assert_eq!(store.messages(&net.network, "c")?.len(), 1);
+    assert_eq!(ledgers(&store)?, before);
+    Ok(())
 }

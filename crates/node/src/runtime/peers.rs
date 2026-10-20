@@ -831,13 +831,16 @@ impl Runtime {
     }
 
     async fn ingest(&self, network: &str, events: &[SignedEvent]) -> Result<()> {
-        let statuses = {
+        let (statuses, rebuilt) = {
             let mut store = self.store.lock().await;
-            let statuses = store.ingest_events(network, events)?;
+            let ingested = store.ingest_events(network, events)?;
             // The user's choice on an unverified result may have arrived from another entry.
             store.settle_local_works(network)?;
-            statuses
+            ingested
         };
+        if rebuilt {
+            self.publish_rebuilt(network);
+        }
         let mut scopes = BTreeSet::new();
         for (event, status) in events.iter().zip(&statuses) {
             match status {
@@ -850,7 +853,7 @@ impl Runtime {
                     tracing::debug!(hash = %event.hash, reason, "peer event rejected")
                 }
                 IngestStatus::Conflict => {
-                    tracing::warn!(hash = %event.hash, "conflicting event kept aside")
+                    tracing::warn!(hash = %event.hash, "forked event stored as evidence")
                 }
                 IngestStatus::Duplicate => {}
             }

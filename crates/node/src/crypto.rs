@@ -76,7 +76,7 @@ impl LocalIdentity {
         })
     }
     #[cfg(test)]
-    fn fixture_root(&self) -> Self {
+    pub(crate) fn fixture_root(&self) -> Self {
         Self {
             secret_key_hex: digest(
                 format!("vibeface:network-fixture-root:v1:{}", self.secret_key_hex).as_bytes(),

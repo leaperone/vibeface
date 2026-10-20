@@ -197,7 +197,8 @@ impl Runtime {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
             epoch == json!({"data_epoch":crate::config::DATA_EPOCH}),
-            "this Node requires an initialized data epoch 7 directory"
+            "this Node requires an initialized data epoch {} directory",
+            crate::config::DATA_EPOCH
         );
         let config = Config::load(dir)?;
         let entry_token = (config.public_entry || config.network.entry.is_some())
@@ -269,9 +270,15 @@ impl Runtime {
         if store.has_network()? {
             state = store.public_state()?.merge(&state)?;
         }
-        let view = state.project()?;
-        store.install_state(state)?;
+        let network = state.genesis.network_id.clone();
+        let (view, rebuilt) = store.install_state(state)?;
+        if rebuilt {
+            store.settle_local_works(&network)?;
+        }
         drop(store);
+        if rebuilt {
+            self.publish_rebuilt(&network);
+        }
         self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
         self.wake_sync_all();
@@ -367,6 +374,13 @@ impl Runtime {
         )?;
         self.publish_changed(network, scope, &event.hash);
         Ok(event)
+    }
+    /// Which events count changed, so every conversation may read differently now.
+    pub(crate) fn publish_rebuilt(&self, network: &str) {
+        let _ = self.events.send(Update {
+            network_id: network.into(),
+            payload: json!({"type":"changed"}),
+        });
     }
     fn publish_changed(&self, network: &str, scope: &str, event_hash: &str) {
         let _ = self.events.send(Update {
