@@ -953,13 +953,17 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
         .send()
         .await
         .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
-    ensure!(
-        response.status().is_success(),
-        "node tool rejected with HTTP {}; preserve call_ref {}",
-        response.status(),
-        call_id
-    );
-    serde_json::from_slice(&bounded_body(response).await?).context("invalid node tool response")
+    let status = response.status();
+    let body = bounded_body(response).await?;
+    if !status.is_success() {
+        // The Agent needs the reason to correct the call, not just the status.
+        let reason = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|error| error["error"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        bail!("node tool rejected with HTTP {status}: {reason}; preserve call_ref {call_id}");
+    }
+    serde_json::from_slice(&body).context("invalid node tool response")
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
