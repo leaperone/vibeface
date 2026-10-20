@@ -56,7 +56,6 @@ pub enum Executor {
 pub enum WorkPhase {
     Started,
     Running,
-    WaitingApproval,
     Interrupting,
     Finishing,
 }
@@ -73,15 +72,6 @@ pub enum WorkOutcome {
     Unverified,
     /// Its target was removed before reporting a result; written by the conversation's owner.
     Abandoned,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
-    Accept,
-    Decline,
-    Cancel,
-    Answered,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -163,19 +153,6 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    ApprovalRequested {
-        work_id: String,
-        request_id: String,
-        kind: String,
-        summary: String,
-    },
-    ApprovalAnswered {
-        work_id: String,
-        request_id: String,
-        decision: ApprovalDecision,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
-    },
     /// Written by the target. The user settles an `unverified` result through any entry Node,
     /// signed; the owner records `abandoned` after the target is removed.
     WorkFinished {
@@ -217,7 +194,6 @@ impl EventBody {
             | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
-            | Self::ApprovalAnswered { attestation, .. }
             | Self::AutonomySet { attestation, .. }
             | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
             _ => None,
@@ -227,8 +203,6 @@ impl EventBody {
         match self {
             Self::WorkDispatched { work_id, .. }
             | Self::WorkProgress { work_id, .. }
-            | Self::ApprovalRequested { work_id, .. }
-            | Self::ApprovalAnswered { work_id, .. }
             | Self::WorkFinished { work_id, .. } => Some(work_id),
             _ => None,
         }
@@ -381,22 +355,6 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
-    pub open_approvals: Vec<ApprovalProjection>,
-    /// Requests already answered, kept so the conversation shows who decided what.
-    pub answered_approvals: Vec<AnsweredApproval>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ApprovalProjection {
-    pub request_id: String,
-    pub kind: String,
-    pub summary: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AnsweredApproval {
-    pub request_id: String,
-    pub kind: String,
-    pub summary: String,
-    pub decision: ApprovalDecision,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Autonomy {

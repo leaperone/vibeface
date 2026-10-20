@@ -68,6 +68,37 @@ enum Action {
         #[arg(long)]
         call_ref: Option<String>,
     },
+    /// Talk to this device's Codex App Server directly.
+    Codex {
+        /// App Server socket; the coordination Agent gets it in VIBEFACE_CODEX_SOCKET.
+        #[arg(long, env = "VIBEFACE_CODEX_SOCKET")]
+        socket: PathBuf,
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodexCommand {
+    /// Call any App Server method and print its result.
+    Call { method: String, params: Option<String> },
+    /// Add a message to a thread: steer its running turn or start one. Reusing --id only reads back.
+    Send {
+        thread: String,
+        text: String,
+        /// Message ID (`clientUserMessageId`); keep it to retry an unknown result.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        /// Local image path or URL; repeat for more.
+        #[arg(long)]
+        image: Vec<String>,
+    },
+    /// Print the thread's notifications as JSON lines.
+    Watch { thread: String },
 }
 
 #[derive(Args)]
@@ -243,6 +274,26 @@ async fn main() -> Result<()> {
             json,
             call_ref,
         } => call_tool(name, json, call_ref).await,
+        Action::Codex { socket, command } => {
+            use vibeface::agent_cli::{Command, run};
+            let command = match command {
+                CodexCommand::Call { method, params } => Command::Call { method, params },
+                CodexCommand::Send { thread, text, id, model, effort, image } => {
+                    Command::Send(vibeface_bridge::codex::Outgoing {
+                        thread_id: thread,
+                        text,
+                        client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        model,
+                        effort,
+                        images: image,
+                        start_only: false,
+                        full_access: true,
+                    })
+                }
+                CodexCommand::Watch { thread } => Command::Watch { thread_id: thread },
+            };
+            run(&socket, command).await
+        }
     }
 }
 
@@ -698,6 +749,24 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         arguments["call_ref"] = json!(call_ref);
     }
     let call_id = call_ref.unwrap_or_default();
+    let result = if name == "dispatch_work" {
+        let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET")
+            .context("VIBEFACE_CODEX_SOCKET is required")?;
+        vibeface::agent_cli::dispatch(
+            &arguments,
+            |args| post_tool("track_work", args, &call_id),
+            |args| post_tool("bind_work", args, &call_id),
+            Path::new(&socket),
+        )
+        .await?
+    } else {
+        post_tool(&name, arguments, &call_id).await?
+    };
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value> {
     let url =
         origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
     ensure!(
@@ -722,10 +791,7 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         response.status(),
         call_id
     );
-    let result: Value = serde_json::from_slice(&bounded_body(response).await?)
-        .context("invalid node tool response")?;
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    serde_json::from_slice(&bounded_body(response).await?).context("invalid node tool response")
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
@@ -955,17 +1021,10 @@ mod tests {
         assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch_work", "--json", "{}"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "vibeface",
-                "codex",
-                "thread/read",
-                "--json",
-                "{}",
-                "--socket",
-                "/tmp/codex.sock",
-                "--watch"
+                "vibeface", "codex", "--socket", "/tmp/codex.sock", "send", "t", "hi", "--id", "m",
+                "--image", "a.png", "--image", "b.png"
             ])
-            .is_err(),
-            "no CLI holds the native Socket or answers native requests for an Agent"
+            .is_ok()
         );
     }
 

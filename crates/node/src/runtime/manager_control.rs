@@ -268,7 +268,7 @@ impl Runtime {
                     )
                     .await;
             }
-            self.probe_work(network, work_id).await?;
+            self.probe_work(network, work_id, true).await?;
             let record = self.store.lock().await.work_record(network, work_id)?;
             return Ok(
                 json!({"check_id":check_id,"pending":record.as_ref().is_none_or(|r| !r.state.finished()),"work":record}),

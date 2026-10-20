@@ -1,6 +1,5 @@
 //! Drives the work state machine from executor results and events. Every change goes through
 //! `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
-use super::executor::{Executor as _, request_text, validate_response};
 use super::*;
 use crate::scheduling::task_trigger;
 use crate::work::{
@@ -13,40 +12,29 @@ const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The user waits this long for the first stop attempt; a stop is idempotent, so retries are safe.
 const STOP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A plan as one line per step, the current step marked, for the persisted progress.
+fn plan_summary(params: &Value) -> String {
+    params["plan"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            let mark = match step["status"].as_str() {
+                Some("completed") => "✓",
+                Some("inProgress") => "→",
+                _ => "·",
+            };
+            format!("{mark} {}", step["step"].as_str().unwrap_or_default())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn live(record: &WorkRecord) -> bool {
     !matches!(
         record.state,
         WorkState::Finished { .. } | WorkState::Unverified { probe: false, .. }
     )
-}
-
-/// The first changed path outside `cwd`; relative paths start at `cwd` and `..` is resolved by name.
-fn escaped(changes: &Value, cwd: &str) -> Option<String> {
-    let inside = |path: &str| {
-        let mut resolved = std::path::PathBuf::new();
-        for part in Path::new(cwd).join(path).components() {
-            match part {
-                std::path::Component::ParentDir => {
-                    resolved.pop();
-                }
-                std::path::Component::CurDir => {}
-                part => resolved.push(part),
-            }
-        }
-        resolved.starts_with(cwd)
-    };
-    changes
-        .as_array()?
-        .iter()
-        .flat_map(|change| {
-            [
-                change["path"].as_str(),
-                change["kind"]["move_path"].as_str(),
-            ]
-        })
-        .flatten()
-        .find(|path| !inside(path))
-        .map(str::to_owned)
 }
 
 impl Runtime {
@@ -180,6 +168,10 @@ impl Runtime {
                 "a continuation keeps the original conversation and executor"
             );
         }
+        ensure!(
+            spec.executor == Executor::Agent || spec.dispatcher == spec.target,
+            "another device takes work only as a task for its assistant"
+        );
         if spec.executor == Executor::Agent {
             ensure!(
                 spec.dispatcher != spec.target,
@@ -194,13 +186,14 @@ impl Runtime {
         Ok(())
     }
 
-    /// Records the dispatch and starts it once. A retry of the same `work_id` returns the
-    /// existing record and never starts a second turn.
+    /// Records the dispatch. A Codex work is then started by the Agent that registered it; an
+    /// agent task is queued for this device's assistant. A retry of the same `work_id` returns the
+    /// existing record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
         network: &str,
         spec: WorkSpec,
-    ) -> Result<WorkRecord> {
+    ) -> Result<(WorkRecord, bool)> {
         if self
             .store
             .lock()
@@ -216,21 +209,10 @@ impl Runtime {
                 .await
                 .accept_work(&self.identity, network, spec, now_ms())?;
         self.publish_changed(network, &record.spec.conversation, &record.spec.work_id);
-        if created {
-            match record.spec.executor {
-                Executor::Codex => {
-                    let node = self.clone();
-                    let (network, work_id) = (network.to_owned(), record.spec.work_id.clone());
-                    tokio::spawn(async move {
-                        if let Err(error) = node.start_work(&network, &work_id).await {
-                            tracing::warn!(%error, work_id, "work start failed");
-                        }
-                    });
-                }
-                Executor::Agent => self.spawn_scheduler(network, &record.spec.conversation)?,
-            }
+        if created && record.spec.executor == Executor::Agent {
+            self.spawn_scheduler(network, &record.spec.conversation)?;
         }
-        Ok(record)
+        Ok((record, created))
     }
 
     /// Another Node's dispatch. The dispatcher may be ahead of this Node, so a refusal is retried
@@ -252,10 +234,10 @@ impl Runtime {
         );
         let first = self.accept_dispatch(network, spec.clone()).await;
         let record = match first {
-            Ok(record) => Ok(record),
+            Ok((record, _)) => Ok(record),
             Err(_) => {
                 self.sync_peer(network, origin).await?;
-                self.accept_dispatch(network, spec).await
+                self.accept_dispatch(network, spec).await.map(|(record, _)| record)
             }
         };
         Ok(match record {
@@ -308,7 +290,84 @@ impl Runtime {
         Ok(dispatch)
     }
 
-    async fn start_work(self: &Arc<Self>, network: &str, work_id: &str) -> Result<()> {
+    /// The Agent's report of its own send: the thread before `turn/start`, then the turn, a
+    /// refusal, or an unknown result that the Node settles by reading the thread.
+    pub(super) async fn bind_work(
+        self: &Arc<Self>,
+        network: &str,
+        scope: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let work_id = field(args, "work_id")?;
+        let record = self
+            .store
+            .lock()
+            .await
+            .work_record(network, work_id)?
+            .context("work not found on this device")?;
+        ensure!(
+            record.spec.conversation == scope && record.spec.executor == Executor::Codex,
+            "work belongs to another conversation"
+        );
+        let mut record = record;
+        if let Some(thread) = args["thread_id"].as_str() {
+            vibeface_protocol::validate_id(thread).map_err(anyhow::Error::msg)?;
+            if matches!(record.state, WorkState::Accepted) {
+                ensure!(
+                    now_ms() < record.send_by_ms,
+                    "the send window for this work is over; it will not start"
+                );
+                record = self
+                    .signal_work(network, work_id, Signal::ThreadCreated(thread.into()))
+                    .await?;
+            }
+            ensure!(
+                matches!(&record.state, WorkState::Starting { thread: Some(known) } if known == thread),
+                "this work is already bound to another thread or past starting"
+            );
+        }
+        if let Some(turn) = args["turn_id"].as_str() {
+            let signal = Signal::TurnStarted {
+                turn_id: turn.into(),
+                epoch: self.executor_epoch(),
+            };
+            record = self.signal_work(network, work_id, signal).await?;
+            // The turn may have ended before it was bound.
+            if let Some(handle) = record.state.handle().cloned()
+                && let Ok(probe @ Probe::Terminal { .. }) = self
+                    .executor
+                    .executor
+                    .probe(&handle.thread_id, Some(&handle.turn_id), work_id, handle.epoch)
+                    .await
+            {
+                record = self.signal_work(network, work_id, Signal::Probed(probe)).await?;
+            }
+        } else if let Some(reason) = args["failed"].as_str() {
+            record = self
+                .signal_work(network, work_id, Signal::StartRejected(reason.chars().take(2_000).collect()))
+                .await?;
+        } else if args["unknown"].is_string() {
+            if let Err(error) = self.probe_work(network, work_id, true).await {
+                tracing::debug!(%error, work_id, "unknown start waits for the next probe");
+            }
+            record = self
+                .store
+                .lock()
+                .await
+                .work_record(network, work_id)?
+                .context("work not found on this device")?;
+        }
+        Ok(json!({"work_id":work_id,"state":record.state}))
+    }
+
+    /// Reads the thread to settle a work's state; it never starts or resends anything. Before the
+    /// Agent's window is over only a found turn is applied, so a late send is never written off.
+    pub(super) async fn probe_work(
+        self: &Arc<Self>,
+        network: &str,
+        work_id: &str,
+        now: bool,
+    ) -> Result<()> {
         let record = self
             .store
             .lock()
@@ -318,123 +377,64 @@ impl Runtime {
         if record.spec.executor != Executor::Codex {
             return Ok(());
         }
-        let executor = &self.executor.executor;
-        // A finished work keeps its thread only in the shared history; dispatch already checked
-        // that the original ran on this device.
-        let continued = match &record.spec.continues {
-            Some(original) => self
-                .store
-                .lock()
-                .await
-                .works(network, &record.spec.conversation)?
-                .into_iter()
-                .find(|work| &work.work_id == original)
-                .and_then(|work| work.thread_id),
-            None => None,
-        };
-        let thread = match &record.state {
-            // A continuation starts a new turn on the original thread.
-            WorkState::Accepted if continued.is_some() => {
-                let thread = continued.expect("checked");
-                self.signal_work(network, work_id, Signal::ThreadCreated(thread.clone()))
-                    .await?;
-                thread
-            }
-            WorkState::Accepted => match executor.start_thread(&record.spec.cwd).await {
-                Ok(thread) => {
-                    self.signal_work(network, work_id, Signal::ThreadCreated(thread.clone()))
-                        .await?;
-                    thread
-                }
-                Err(error) if error.uncertain => {
-                    self.signal_work(network, work_id, Signal::StartUnknown(error.message))
-                        .await?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    self.signal_work(network, work_id, Signal::StartRejected(error.message))
-                        .await?;
-                    return Ok(());
-                }
-            },
-            WorkState::Starting {
-                thread: Some(thread),
-            } => thread.clone(),
-            _ => return Ok(()),
-        };
-        let epoch = self.executor_epoch();
-        let signal = match executor
-            .start_turn(&thread, &record.spec.cwd, &record.spec.prompt)
-            .await
-        {
-            Ok(turn_id) => Signal::TurnStarted { turn_id, epoch },
-            Err(error) if error.uncertain => match executor.probe(&thread, None, epoch).await {
-                Ok(probe) => Signal::Probed(probe),
-                Err(_) => Signal::StartUnknown(error.message),
-            },
-            Err(error) => Signal::StartRejected(error.message),
-        };
-        let record = self.signal_work(network, work_id, signal).await?;
-        // Requests and completions that arrived before the handle was journaled.
-        if let Some(handle) = record.state.handle().cloned() {
-            let snapshot = executor.snapshot().await;
-            for request in snapshot["pending_requests"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                if request["params"]["threadId"] == handle.thread_id.as_str()
-                    && request["params"]["turnId"] == handle.turn_id.as_str()
-                {
-                    self.route_turn_event(network, request.clone()).await?;
-                }
-            }
-            if let Ok(probe @ Probe::Terminal { .. }) = executor
-                .probe(&handle.thread_id, Some(&handle.turn_id), epoch)
-                .await
-            {
-                self.signal_work(network, work_id, Signal::Probed(probe))
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads the executor for one work; never starts or replays it.
-    pub(super) async fn probe_work(self: &Arc<Self>, network: &str, work_id: &str) -> Result<()> {
-        let record = self
-            .store
-            .lock()
-            .await
-            .work_record(network, work_id)?
-            .context("work not found")?;
-        if record.spec.executor != Executor::Codex {
+        let over = record.send_window_over(now_ms());
+        if !now && !over {
             return Ok(());
         }
         let epoch = self.executor_epoch();
         let executor = &self.executor.executor;
         let probe = match &record.state {
-            WorkState::Accepted => return self.start_work(network, work_id).await,
+            WorkState::Accepted | WorkState::Starting { thread: None } => {
+                if over {
+                    self.signal_work(
+                        network,
+                        work_id,
+                        Signal::StartRejected("协调 Agent 没有在时限内开始这项工作".into()),
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             WorkState::Starting {
                 thread: Some(thread),
-            } => executor.probe(thread, None, epoch).await,
+            } => executor.probe(thread, None, work_id, epoch).await,
             state => match state.handle() {
                 Some(handle) => {
                     executor
-                        .probe(&handle.thread_id, Some(&handle.turn_id), epoch)
+                        .probe(&handle.thread_id, Some(&handle.turn_id), work_id, epoch)
                         .await
                 }
                 None => return Ok(()),
             },
         };
         match probe {
+            Ok(Probe::NotStarted | Probe::Missing)
+                if !over && matches!(record.state, WorkState::Starting { .. }) =>
+            {
+                Ok(())
+            }
             Ok(probe) => {
                 self.signal_work(network, work_id, Signal::Probed(probe))
                     .await?;
                 Ok(())
             }
-            Err(error) => bail!("executor probe failed: {error}"),
+            Err(error) => bail!("App Server probe failed: {error}"),
         }
+    }
+
+    /// Settles works the Agent registered but did not finish starting within its window.
+    pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
+        let records = self.store.lock().await.work_records(network)?;
+        for record in records {
+            if matches!(record.state, WorkState::Accepted | WorkState::Starting { .. })
+                && record.spec.executor == Executor::Codex
+                && record.send_window_over(now_ms())
+                && let Err(error) = self.probe_work(network, &record.spec.work_id, false).await
+            {
+                tracing::debug!(%error, "work probe waits for the executor");
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn interrupt_work(
@@ -449,7 +449,7 @@ impl Runtime {
             .work_record(network, work_id)?
             .context("work not found")?;
         match &record.state {
-            WorkState::Running { handle } | WorkState::WaitingApproval { handle, .. } => {
+            WorkState::Running { handle } => {
                 self.executor
                     .executor
                     .interrupt(&handle.thread_id, &handle.turn_id)
@@ -595,119 +595,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// The user's answer; requests from an earlier executor epoch can no longer be answered.
-    pub(super) async fn answer_approval(
-        self: &Arc<Self>,
-        network: &str,
-        scope: &str,
-        work_id: &str,
-        request_id: &str,
-        response: &Value,
-        attestation: Attestation,
-    ) -> Result<Value> {
-        let local = self.store.lock().await.work_record(network, work_id)?;
-        let Some(record) = local else {
-            // The device that ran the work records the answer; this entry only carries it there.
-            let work = self
-                .store
-                .lock()
-                .await
-                .works(network, scope)?
-                .into_iter()
-                .find(|work| work.work_id == work_id)
-                .context("work not found in this conversation")?;
-            return self
-                .peer_request(
-                    network,
-                    &work.target_node,
-                    json!({"type":"answer_approval","conversation_id":scope,"work_id":work_id,
-                        "request_id":request_id,"response":response,"attestation":attestation}),
-                )
-                .await;
-        };
-        ensure!(
-            record.spec.conversation == scope,
-            "work belongs to another conversation"
-        );
-        let WorkState::WaitingApproval { handle, approvals } = &record.state else {
-            bail!("this work is not waiting for an answer");
-        };
-        let approval = approvals
-            .iter()
-            .find(|a| a.request_id == request_id)
-            .context("request was already answered or expired")?;
-        ensure!(
-            handle.epoch == self.executor_epoch(),
-            "the executor restarted; this request expired"
-        );
-        ensure!(!approval.answering, "an answer is already being sent");
-        let decision = validate_response(&approval.method, &approval.params, response)?;
-        // Checked before Codex hears the answer: a refused signature must not leave an unrecorded answer.
-        let recorded = EventBody::ApprovalAnswered {
-            work_id: work_id.into(),
-            request_id: request_id.into(),
-            decision,
-            attestation: Some(attestation.clone()),
-        };
-        crate::crypto::verify_attestation(network, scope, &recorded)?;
-        self.store
-            .lock()
-            .await
-            .authorize_attestation(network, &recorded)?;
-        let rpc_id = approval.rpc_id.clone();
-        self.signal_work(
-            network,
-            work_id,
-            Signal::ApprovalAnswering(request_id.into()),
-        )
-        .await?;
-        match self
-            .executor
-            .executor
-            .answer(rpc_id, response.clone())
-            .await
-        {
-            Ok(()) => {
-                self.signal_work(
-                    network,
-                    work_id,
-                    Signal::ApprovalAnswered {
-                        request_id: request_id.into(),
-                        decision,
-                        attestation,
-                    },
-                )
-                .await?;
-                Ok(json!({"work_id":work_id,"request_id":request_id,"answered":true}))
-            }
-            Err(error) => {
-                self.signal_work(
-                    network,
-                    work_id,
-                    Signal::ApprovalAnswerFailed(request_id.into()),
-                )
-                .await?;
-                bail!("answer was not delivered: {error}")
-            }
-        }
-    }
-
-    /// Answer forms of this Node's open requests for a work, for an entry that shows them.
-    pub(super) async fn approval_forms(&self, network: &str, work_id: &str) -> Result<Value> {
-        let record = self.store.lock().await.work_record(network, work_id)?;
-        let forms = match record.map(|record| record.state) {
-            Some(WorkState::WaitingApproval { approvals, .. }) => approvals
-                .iter()
-                .map(|approval| {
-                    json!({"request_id":approval.request_id,"answering":approval.answering,
-                        "form":executor::request_form(&approval.method, &approval.params)})
-                })
-                .collect(),
-            _ => vec![],
-        };
-        Ok(json!({ "approvals": forms }))
-    }
-
     /// Maps App Server notifications and requests onto the work that owns their thread and turn.
     pub(super) async fn route_executor_event(
         self: &Arc<Self>,
@@ -723,7 +610,7 @@ impl Runtime {
                 self.executor_epoch
                     .store(epoch, std::sync::atomic::Ordering::SeqCst);
                 for record in records.into_iter().filter(live) {
-                    if let Err(error) = self.probe_work(network, &record.spec.work_id).await {
+                    if let Err(error) = self.probe_work(network, &record.spec.work_id, false).await {
                         tracing::debug!(%error, "work probe after reconnect failed");
                     }
                 }
@@ -739,20 +626,8 @@ impl Runtime {
                 }
                 return Ok(());
             }
-            "serverRequest/resolved" => {
-                let rpc = params["requestId"].clone();
-                for record in records {
-                    if let WorkState::WaitingApproval { approvals, .. } = &record.state
-                        && approvals.iter().any(|a| a.rpc_id == rpc)
-                    {
-                        self.signal_work(
-                            network,
-                            &record.spec.work_id,
-                            Signal::ApprovalResolved(rpc.clone()),
-                        )
-                        .await?;
-                    }
-                }
+            "bridge.codex_replied" => {
+                tracing::info!(method = %params["method"], decision = %params["decision"], "answered an App Server request by policy");
                 return Ok(());
             }
             _ => {}
@@ -777,29 +652,30 @@ impl Runtime {
             return Ok(());
         };
         let work_id = record.spec.work_id.clone();
-        let item = &params["item"];
-        // Recorded only: writes outside the directory are allowed and never raise an alert.
-        if method == "item/completed"
-            && item["type"] == "fileChange"
-            && item["status"] == "completed"
-            && let Some(path) = escaped(&item["changes"], &record.spec.cwd)
-        {
-            tracing::info!(work_id, path, "work changed a file outside its directory");
-        }
         self.publish_progress(
             network,
             json!({"type":"native_progress","conversation_id":record.spec.conversation,"work_id":work_id,
                 "target_node":self.identity.device_id()?,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 "progress":observation::native_progress(&event)}),
         );
+        let item = &params["item"];
         let signal = match method {
-            "item/completed"
-                if params["item"]["type"] == "agentMessage"
-                    && (params["item"]["phase"].is_null()
-                        || params["item"]["phase"] == "final_answer") =>
-            {
-                Signal::Text(params["item"]["text"].as_str().unwrap_or_default().into())
+            "item/completed" if item["type"] == "agentMessage" && item["phase"] == "commentary" => {
+                Signal::Progress {
+                    summary: item["text"].as_str().unwrap_or_default().into(),
+                    at_ms: now_ms(),
+                }
             }
+            "item/completed"
+                if item["type"] == "agentMessage"
+                    && (item["phase"].is_null() || item["phase"] == "final_answer") =>
+            {
+                Signal::Text(item["text"].as_str().unwrap_or_default().into())
+            }
+            "turn/plan/updated" => Signal::Progress {
+                summary: plan_summary(params),
+                at_ms: now_ms(),
+            },
             "turn/completed" => Signal::TurnCompleted {
                 turn_id: turn.unwrap_or_default().into(),
                 status: params["turn"]["status"]
@@ -811,20 +687,6 @@ impl Runtime {
                     .as_str()
                     .map(str::to_owned),
             },
-            method
-                if event.get("id").is_some()
-                    && (method.ends_with("requestApproval")
-                        || method == "item/tool/requestUserInput") =>
-            {
-                Signal::ApprovalRequested {
-                    rpc_id: event["id"].clone(),
-                    method: method.into(),
-                    params: params.clone(),
-                    kind: method.rsplit('/').nth(1).unwrap_or(method).into(),
-                    summary: request_text(method, params),
-                    epoch: self.executor_epoch(),
-                }
-            }
             _ => return Ok(()),
         };
         self.signal_work(network, &work_id, signal).await?;
@@ -844,27 +706,5 @@ impl Runtime {
                 }
             }
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn changes_outside_the_work_directory_are_found() {
-        let changes = |path: &str| json!([{"path":"src/a.rs","kind":{"type":"add"}},{"path":path,"kind":{"type":"add"}}]);
-        assert_eq!(super::escaped(&changes("/p/b.rs"), "/p"), None);
-        assert_eq!(super::escaped(&changes("sub/../c.rs"), "/p"), None);
-        assert_eq!(
-            super::escaped(&changes("../q/x"), "/p").as_deref(),
-            Some("../q/x")
-        );
-        assert_eq!(
-            super::escaped(&changes("/pq/x"), "/p").as_deref(),
-            Some("/pq/x")
-        );
-        let moved = json!([{"path":"a","kind":{"type":"update","move_path":"/etc/x"}}]);
-        assert_eq!(super::escaped(&moved, "/p").as_deref(), Some("/etc/x"));
     }
 }

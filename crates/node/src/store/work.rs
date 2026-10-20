@@ -144,7 +144,7 @@ impl Store {
                         && other.spec.conversation == spec.conversation
                         && !other.state.finished()
                 });
-        let (mut record, event) = accept(spec);
+        let (mut record, event) = accept(spec, at);
         let work_id = record.spec.work_id.clone();
         local_save(&tx, network, &work_key(&work_id), &record)?;
         log::append_from(

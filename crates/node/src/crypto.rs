@@ -112,7 +112,6 @@ impl LocalIdentity {
             | EventBody::BotCreated { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
-            | EventBody::ApprovalAnswered { attestation, .. }
             | EventBody::AutonomySet { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
@@ -275,7 +274,6 @@ fn validate_attestation(event: &Event) -> Result<()> {
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
-        | EventBody::ApprovalAnswered { .. }
         | EventBody::AutonomySet { .. }
         | EventBody::NotificationAcked { .. } => UserSignature::Required,
         EventBody::WorkFinished {
@@ -409,10 +407,9 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 id(work)?;
             }
         }
-        EventBody::WorkProgress { work_id, .. }
-        | EventBody::WorkFinished { work_id, .. }
-        | EventBody::ApprovalRequested { work_id, .. }
-        | EventBody::ApprovalAnswered { work_id, .. } => id(work_id)?,
+        EventBody::WorkProgress { work_id, .. } | EventBody::WorkFinished { work_id, .. } => {
+            id(work_id)?
+        }
         EventBody::AutonomySet { version, .. } => {
             ensure!(*version > 0, "autonomy version starts at 1")
         }

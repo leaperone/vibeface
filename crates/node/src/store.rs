@@ -25,7 +25,7 @@ mod tests;
 pub(crate) mod work;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Whether this Node may append to its own log (design 5.7 and 5.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

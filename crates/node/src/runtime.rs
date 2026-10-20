@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 mod agent_tools;
 mod bots;
 mod chat_controls;
+pub mod decision;
 mod executor;
 mod followup;
 mod manager_control;
@@ -398,7 +399,6 @@ impl Runtime {
         Ok(())
     }
     async fn capabilities(&self) -> Value {
-        use executor::Executor as _;
         let settings = self.settings_snapshot();
         let manager =
             settings
@@ -418,7 +418,7 @@ impl Runtime {
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let write = !matches!(
             input["method"].as_str(),
-            Some("nodes" | "conversation" | "conversations" | "bots" | "notifications")
+            Some("nodes" | "conversation" | "conversations" | "bots" | "notifications" | "codex_state")
         );
         let _lease = self.manager_tool_lease(&access, write).await?;
         self.rpc_inner(access, input).await
@@ -532,23 +532,14 @@ impl Runtime {
             }
             "read_artifact" => self.read_artifact(&access, &input).await,
             "upload_attachment" => self.upload_attachment(&access, &input).await,
-            "answer_approval" | "interrupt_work" => {
-                ensure!(access.human, "only the user answers or stops work");
+            "interrupt_work" => {
+                ensure!(access.human, "only the user stops work");
                 let scope = scope.context("conversation_id is required")?;
-                let work_id = id(&input, "work_id")?;
-                if method == "interrupt_work" {
-                    self.stop_work(network, &scope, &work_id).await
-                } else {
-                    self.answer_approval(
-                        network,
-                        &scope,
-                        &work_id,
-                        &id(&input, "request_id")?,
-                        input.get("response").context("response is required")?,
-                        attestation(&input)?,
-                    )
-                    .await
-                }
+                self.stop_work(network, &scope, &id(&input, "work_id")?).await
+            }
+            "codex" | "codex_state" | "send_decision" => {
+                ensure!(access.human, "only the user reaches the App Server");
+                self.codex_rpc(network, method, &input).await
             }
             "bots" => self.bots(&access).await,
             "create_bot" => self.create_bot(&access, &input).await,

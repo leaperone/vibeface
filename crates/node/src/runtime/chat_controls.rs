@@ -158,14 +158,12 @@ impl Runtime {
             .filter(|record| record.spec.conversation == scope)
             .map(|record| (record.spec.work_id.clone(), record))
             .collect::<BTreeMap<_, _>>();
-        let local = self.identity.device_id()?;
         let stops = store
             .stop_requests(network)?
             .into_iter()
             .map(|stop| (stop.work_id.clone(), stop))
             .collect::<BTreeMap<_, _>>();
         let mut works = Vec::new();
-        let mut remote_forms = Vec::new();
         let unverified: BTreeSet<_> = store
             .works(network, scope)?
             .into_iter()
@@ -178,20 +176,6 @@ impl Runtime {
         for work in store.works(network, scope)? {
             let mut value = json!(work);
             let record = records.get(&work.work_id);
-            // Answer forms come from the target's journal; another target is asked below.
-            if let Some(WorkState::WaitingApproval { approvals, .. }) = record.map(|r| &r.state) {
-                for approval in value["open_approvals"].as_array_mut().into_iter().flatten() {
-                    if let Some(pending) = approvals
-                        .iter()
-                        .find(|p| approval["request_id"] == p.request_id)
-                    {
-                        approval["form"] = executor::request_form(&pending.method, &pending.params);
-                        approval["answering"] = json!(pending.answering);
-                    }
-                }
-            } else if work.target_node != local && !work.open_approvals.is_empty() {
-                remote_forms.push((works.len(), work.target_node.clone(), work.work_id.clone()));
-            }
             value["state"] = match record {
                 // An agent task runs as its device's coordination turn, without Codex phases.
                 _ if work.executor == Executor::Agent && work.outcome.is_none() => json!("running"),
@@ -200,7 +184,6 @@ impl Runtime {
                 // `Started` is written when the native turn starts, so it already means running.
                 None => json!(match (work.outcome, work.phase) {
                     (Some(_), _) => "finished",
-                    (None, _) if !work.open_approvals.is_empty() => "waiting_approval",
                     (None, Some(WorkPhase::Interrupting)) => "interrupting",
                     (None, Some(_)) => "running",
                     (None, None) => "accepted",
@@ -242,7 +225,7 @@ impl Runtime {
             works.push(json!({"work_id":spec.work_id,"conversation_id":scope,"target_node":spec.target,
                 "trigger":spec.trigger,"dispatcher":spec.dispatcher,"executor":spec.executor,"cwd":spec.cwd,
                 "prompt":spec.prompt,"phase":null,"summary":"","thread_id":null,"turn_id":null,"outcome":null,
-                "result_text":"","failure_reason":reason,"open_approvals":[],"answered_approvals":[],"state":state}));
+                "result_text":"","failure_reason":reason,"state":state}));
         }
         let conversation = store.conversation(network, scope)?;
         let bot = store.bot_for_conversation(network, scope)?;
@@ -257,31 +240,6 @@ impl Runtime {
         }
         let autonomy = store.autonomy(network, scope)?;
         drop(store);
-        for (index, target, work_id) in remote_forms {
-            let request = self.peer_request(
-                network,
-                &target,
-                json!({"type":"approval_forms","work_id":work_id}),
-            );
-            let Ok(Ok(reply)) = tokio::time::timeout(Duration::from_secs(3), request).await else {
-                continue;
-            };
-            for approval in works[index]["open_approvals"]
-                .as_array_mut()
-                .into_iter()
-                .flatten()
-            {
-                if let Some(remote) = reply["approvals"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|remote| remote["request_id"] == approval["request_id"])
-                {
-                    approval["form"] = remote["form"].clone();
-                    approval["answering"] = remote["answering"].clone();
-                }
-            }
-        }
         let settings = self.settings_snapshot();
         let manager = settings.manager.as_ref();
         Ok(json!({

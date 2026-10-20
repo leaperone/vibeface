@@ -6,40 +6,10 @@ use crate::work::Probe;
 use std::os::unix::process::CommandExt as _;
 use vibeface_bridge::codex::{CodexClient, CodexError};
 
-/// One executor kind. `start` is split so the thread ID is journaled before `turn/start`.
-pub(crate) trait Executor {
-    fn capability(&self) -> impl Future<Output = Value> + Send;
-    fn start_thread(&self, cwd: &str) -> impl Future<Output = Result<String, CodexError>> + Send;
-    fn start_turn(
-        &self,
-        thread: &str,
-        cwd: &str,
-        prompt: &str,
-    ) -> impl Future<Output = Result<String, CodexError>> + Send;
-    fn interrupt(
-        &self,
-        thread: &str,
-        turn: &str,
-    ) -> impl Future<Output = Result<(), CodexError>> + Send;
-    fn probe(
-        &self,
-        thread: &str,
-        turn: Option<&str>,
-        epoch: u64,
-    ) -> impl Future<Output = Result<Probe, CodexError>> + Send;
-    fn answer(
-        &self,
-        rpc_id: Value,
-        response: Value,
-    ) -> impl Future<Output = Result<(), CodexError>> + Send;
-}
-
+/// The Node's own connection to the App Server: it observes, probes and interrupts; the
+/// coordination Agent starts turns on its own connection.
 pub(crate) struct CodexExecutor {
     client: CodexClient,
-}
-
-fn confined(cwd: &str) -> Value {
-    json!({"cwd":cwd,"approvalPolicy":"on-request","approvalsReviewer":"user"})
 }
 
 fn last_answer(turn: &Value) -> String {
@@ -54,63 +24,43 @@ fn last_answer(turn: &Value) -> String {
         .into()
 }
 
+/// Whether a turn carries the user message the caller sent with this `clientUserMessageId`.
+pub(crate) fn sent_by(turn: &Value, client_id: &str) -> bool {
+    turn["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| item["type"] == "userMessage" && item["clientId"] == client_id)
+}
+
 impl CodexExecutor {
-    /// Threads the client re-subscribes after every reconnect.
+    pub(crate) fn client(&self) -> &CodexClient {
+        &self.client
+    }
+    /// Threads the client re-subscribes after every reconnect; requests on them are answered
+    /// by the method table.
     pub(crate) fn observe(&self, threads: Vec<String>) -> Result<(), CodexError> {
         self.client.set_observed_threads(threads)
     }
     pub(crate) async fn snapshot(&self) -> Value {
         self.client.snapshot().await
     }
-}
-
-impl Executor for CodexExecutor {
-    async fn capability(&self) -> Value {
+    pub(crate) async fn capability(&self) -> Value {
         json!({"executor":"codex","connected":self.client.snapshot().await["connection"]["state"] == "connected"})
     }
-    async fn start_thread(&self, cwd: &str) -> Result<String, CodexError> {
-        let mut params = confined(cwd);
-        params["sandbox"] = json!("workspace-write");
-        let reply = self.client.request("thread/start", params).await?;
-        reply["thread"]["id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| CodexError {
-                uncertain: true,
-                message: "thread/start returned no thread ID".into(),
-            })
-    }
-    async fn start_turn(
-        &self,
-        thread: &str,
-        cwd: &str,
-        prompt: &str,
-    ) -> Result<String, CodexError> {
-        let mut params = confined(cwd);
-        params["threadId"] = json!(thread);
-        params["input"] = json!([{"type":"text","text":prompt}]);
-        params["sandboxPolicy"] =
-            json!({"type":"workspaceWrite","writableRoots":[cwd],"networkAccess":false});
-        let reply = self.client.request("turn/start", params).await?;
-        reply["turn"]["id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| CodexError {
-                uncertain: true,
-                message: "turn/start returned no turn ID".into(),
-            })
-    }
-    async fn interrupt(&self, thread: &str, turn: &str) -> Result<(), CodexError> {
+    pub(crate) async fn interrupt(&self, thread: &str, turn: &str) -> Result<(), CodexError> {
         self.client
             .request("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
             .await
             .map(|_| ())
     }
-    /// Reads the journaled thread; it never starts or replays work.
-    async fn probe(
+    /// Reads the journaled thread; it never starts or replays work. Without a known turn, the
+    /// turn is the one whose user message carries `client_id`.
+    pub(crate) async fn probe(
         &self,
         thread: &str,
         turn: Option<&str>,
+        client_id: &str,
         epoch: u64,
     ) -> Result<Probe, CodexError> {
         let reply = match self
@@ -131,8 +81,10 @@ impl Executor for CodexExecutor {
             .unwrap_or_default();
         let found = match turn {
             Some(turn) => turns.iter().find(|t| t["id"] == turn),
-            None if turns.is_empty() => return Ok(Probe::NotStarted),
-            None => turns.last(),
+            None => match turns.iter().find(|t| sent_by(t, client_id)) {
+                Some(found) => Some(found),
+                None => return Ok(Probe::NotStarted),
+            },
         };
         let Some(found) = found else {
             return Ok(Probe::Missing);
@@ -149,150 +101,12 @@ impl Executor for CodexExecutor {
             None => Probe::Missing,
         })
     }
-    async fn answer(&self, rpc_id: Value, response: Value) -> Result<(), CodexError> {
-        self.client.respond(rpc_id, response).await
-    }
-}
-
-/// Checks a user's answer against what the request offers.
-pub(crate) fn validate_response(
-    method: &str,
-    params: &Value,
-    response: &Value,
-) -> Result<ApprovalDecision> {
-    match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            let decision = response["decision"]
-                .as_str()
-                .context("approval decision is required")?;
-            ensure!(
-                params["availableDecisions"]
-                    .as_array()
-                    .is_none_or(|allowed| allowed.iter().any(|a| a.as_str() == Some(decision))),
-                "the request does not offer that decision"
-            );
-            Ok(match decision {
-                "accept" => ApprovalDecision::Accept,
-                "decline" => ApprovalDecision::Decline,
-                "cancel" => ApprovalDecision::Cancel,
-                _ => bail!("unsupported approval decision"),
-            })
-        }
-        "item/tool/requestUserInput" => {
-            let answers = response["answers"]
-                .as_object()
-                .context("answers are required")?;
-            let questions = params["questions"]
-                .as_array()
-                .context("input questions are missing")?;
-            ensure!(
-                answers.len() == questions.len(),
-                "answer every question exactly once"
-            );
-            for question in questions {
-                let id = question["id"].as_str().context("question ID is missing")?;
-                let values = answers
-                    .get(id)
-                    .and_then(|answer| answer["answers"].as_array())
-                    .context("answer is missing")?;
-                ensure!(
-                    !values.is_empty() && values.iter().all(Value::is_string),
-                    "answers must be text"
-                );
-            }
-            Ok(ApprovalDecision::Answered)
-        }
-        _ => bail!("this request must be answered on the executing device"),
-    }
-}
-
-/// The text shown for a request; it never includes model credentials.
-pub(crate) fn request_text(method: &str, params: &Value) -> String {
-    let mut lines = vec![match method {
-        "item/commandExecution/requestApproval" => "执行器请求运行命令。".to_owned(),
-        "item/fileChange/requestApproval" => "执行器请求修改文件。".to_owned(),
-        "item/tool/requestUserInput" => "执行器需要你补充信息。".to_owned(),
-        _ => return "执行器发来暂不支持的请求，请到执行设备处理。".into(),
-    }];
-    if let Some(reason) = params["reason"].as_str().filter(|r| !r.trim().is_empty()) {
-        lines.push(reason.into());
-    }
-    if let Some(command) = params["command"].as_str() {
-        lines.push(format!("命令：{command}"));
-    } else if let Some(command) = params["command"].as_array() {
-        let parts: Vec<_> = command.iter().filter_map(Value::as_str).collect();
-        lines.push(format!("命令：{}", parts.join(" ")));
-    }
-    if let Some(cwd) = params["cwd"].as_str() {
-        lines.push(format!("目录：{cwd}"));
-    }
-    if let Some(root) = params["grantRoot"].as_str() {
-        lines.push(format!("允许修改的目录：{root}"));
-    }
-    if let Some(changes) = params["changes"].as_object() {
-        lines.push(format!(
-            "文件：{}",
-            changes.keys().cloned().collect::<Vec<_>>().join("、")
-        ));
-    }
-    lines.join("\n")
-}
-
-/// Answer choices and questions for the UI.
-pub(crate) fn request_form(method: &str, params: &Value) -> Value {
-    let mut form = json!({});
-    if method.ends_with("requestApproval") {
-        let offered = params["availableDecisions"].as_array();
-        form["choices"] = json!(
-            [
-                ("批准一次", "accept"),
-                ("拒绝", "decline"),
-                ("取消本轮", "cancel")
-            ]
-            .into_iter()
-            .filter(|(_, d)| offered.is_none_or(|a| a.iter().any(|v| v.as_str() == Some(*d))))
-            .map(|(label, d)| json!({"label":label,"response":{"decision":d}}))
-            .collect::<Vec<_>>()
-        );
-    }
-    // Structured copies so the web can lay out the command, place and files.
-    if let Some(reason) = params["reason"].as_str().filter(|r| !r.trim().is_empty()) {
-        form["reason"] = json!(reason);
-    }
-    let command = params["command"].as_str().map(str::to_owned).or_else(|| {
-        params["command"].as_array().map(|c| {
-            c.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-    });
-    if let Some(command) = command {
-        form["command"] = json!(command);
-    }
-    if let Some(cwd) = params["cwd"].as_str().or(params["grantRoot"].as_str()) {
-        form["cwd"] = json!(cwd);
-    }
-    if let Some(changes) = params["changes"].as_object() {
-        form["files"] = json!(changes.keys().collect::<Vec<_>>());
-    }
-    if let Some(questions) = params["questions"].as_array() {
-        form["questions"] = json!(
-            questions
-                .iter()
-                .filter(|q| q["id"].is_string() && q["question"].is_string())
-                .map(|q| json!({"id":q["id"],"header":q["header"],"question":q["question"],
-                    "is_secret":q["isSecret"].as_bool().unwrap_or(false),
-                    "options":q["options"].as_array().into_iter().flatten().filter(|o| o["label"].is_string())
-                        .map(|o| json!({"label":o["label"],"description":o["description"].as_str()})).collect::<Vec<_>>()}))
-                .collect::<Vec<_>>()
-        );
-    }
-    form
 }
 
 pub(crate) struct ExecutorHost {
     pub executor: CodexExecutor,
+    /// The App Server socket; the coordination Agent connects to it directly.
+    pub socket: PathBuf,
     managed: Option<Arc<Managed>>,
 }
 
@@ -451,8 +265,9 @@ impl ExecutorHost {
         };
         Ok(Self {
             executor: CodexExecutor {
-                client: CodexClient::start(socket, events),
+                client: CodexClient::start(socket.clone(), events),
             },
+            socket,
             managed,
         })
     }
@@ -476,35 +291,5 @@ impl ExecutorHost {
             kill_group(group);
         }
         let _ = std::fs::remove_file(&managed.pidfile);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn approval_forms_carry_command_place_and_files() {
-        let form = super::request_form(
-            "item/commandExecution/requestApproval",
-            &json!({"command":["npm","test"],"cwd":"/p","reason":"run tests","availableDecisions":["accept","decline"]}),
-        );
-        assert_eq!(
-            (
-                form["command"].as_str(),
-                form["cwd"].as_str(),
-                form["reason"].as_str()
-            ),
-            (Some("npm test"), Some("/p"), Some("run tests"))
-        );
-        assert_eq!(form["choices"].as_array().map(Vec::len), Some(2));
-        let form = super::request_form(
-            "item/fileChange/requestApproval",
-            &json!({"grantRoot":"/p","changes":{"a.ts":{}}}),
-        );
-        assert_eq!(
-            (form["cwd"].as_str(), &form["files"]),
-            (Some("/p"), &json!(["a.ts"]))
-        );
     }
 }

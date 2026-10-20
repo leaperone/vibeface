@@ -371,30 +371,18 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
             attestation: None,
         })
     };
-    let answer = |decision| EventBody::ApprovalAnswered {
-        work_id: "w".into(),
-        request_id: "r".into(),
-        decision,
-        attestation: None,
-    };
     let autonomy = |mode| EventBody::AutonomySet {
         mode,
         version: 3,
         attestation: None,
     };
-    let outcome = |store: &Store| -> Result<(Option<String>, AutonomyMode, String)> {
-        let decision = store.connection.query_row(
-            "SELECT decision FROM approvals WHERE network_id=? AND request_id='r'",
-            params![net.network],
-            |r| r.get(0),
-        )?;
+    let outcome = |store: &Store| -> Result<(Option<String>, AutonomyMode)> {
         Ok((
             store
                 .conversation(&net.network, "c")?
                 .context("conversation")?
                 .owner,
             store.autonomy(&net.network, "c")?.mode,
-            decision,
         ))
     };
     let mut at = 10;
@@ -412,8 +400,6 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
         owner(&net.b)?,
         autonomy(AutonomyMode::Off),
         autonomy(AutonomyMode::Continue),
-        answer(ApprovalDecision::Decline),
-        answer(ApprovalDecision::Accept),
     ] {
         originals.push(write(&mut store, &net.a, body)?);
     }
@@ -423,7 +409,6 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
         AutonomyMode::Off,
         "the stricter mode wins a same-version conflict"
     );
-    assert_eq!(settled.2, "decline", "a refusal outranks consent");
     let losing_owner = if settled.0 == Some(net.a.device_id()?) {
         &net.b
     } else {
@@ -435,12 +420,7 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
     for _ in 0..64 {
         let retry = write(&mut store, &net.b, owner(losing_owner)?)?;
         undercut |= retry < winning_owner;
-        for body in [
-            autonomy(AutonomyMode::Continue),
-            answer(ApprovalDecision::Accept),
-        ] {
-            write(&mut store, &net.b, body)?;
-        }
+        write(&mut store, &net.b, autonomy(AutonomyMode::Continue))?;
         assert_eq!(
             outcome(&store)?,
             settled,
@@ -634,56 +614,6 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         },
         6,
     )?;
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::ApprovalRequested {
-            rpc_id: serde_json::json!(7),
-            method: "item/commandExecution/requestApproval".into(),
-            params: serde_json::json!({}),
-            kind: "command".into(),
-            summary: "npm test".into(),
-            epoch: 1,
-        },
-        7,
-    )?;
-    let request_id = store.works(&net.network, "c")?[0].open_approvals[0]
-        .request_id
-        .clone();
-    let EventBody::ApprovalAnswered { attestation, .. } = net.a.fixture_admin().attest(
-        &net.network,
-        "c",
-        EventBody::ApprovalAnswered {
-            work_id: id.clone(),
-            request_id: request_id.clone(),
-            decision: ApprovalDecision::Accept,
-            attestation: None,
-        },
-    )?
-    else {
-        unreachable!()
-    };
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::ApprovalAnswered {
-            request_id: request_id.clone(),
-            decision: ApprovalDecision::Accept,
-            attestation: attestation.context("signed answer")?,
-        },
-        8,
-    )?;
-    let works = store.works(&net.network, "c")?;
-    assert!(works[0].open_approvals.is_empty());
-    assert_eq!(
-        (
-            works[0].answered_approvals[0].summary.as_str(),
-            works[0].answered_approvals[0].decision
-        ),
-        ("npm test", ApprovalDecision::Accept)
-    );
     let (_, receipt) = store.apply_work_signal(
         &net.a,
         &net.network,

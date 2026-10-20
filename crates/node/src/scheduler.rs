@@ -25,9 +25,9 @@ const PROMPT_LIMIT: usize = 60_000;
 const REPLY_LIMIT: usize = 60_000;
 const CONSTRAINTS: &[&str] = &[
     "Operate only inside this personal network and conversation.",
-    "Your SDK host Shell and file tools can read this device but not change it. Change code through dispatch_work; it starts one native Codex turn that the Node tracks, and its result comes back to you as a new turn.",
+    "Your Shell has full access to this device. Hand longer coding work to Codex through dispatch_work; it registers the work with the Node, starts one Codex turn with full access on this device's App Server, the Node watches it, and its result comes back to you as a new turn.",
     "Your turn ends after you dispatch. Do not wait or poll for work to finish; tell the user what was started.",
-    "dispatch_work runs on this device unless target_node names another of the user's devices. executor=codex starts a Codex turn there; executor=agent hands the task to that device's assistant. continues names an earlier work to follow up on the same thread.",
+    "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's assistant gets the task. continues names an earlier work to follow up on the same thread. In your Shell, `vibeface codex call <method> [json]` calls any App Server method, `vibeface codex send <thread> <text> --id <id>` adds a message to a thread (steering a running turn) and `vibeface codex watch <thread>` streams its events.",
     "Reuse call_ref only to retry the same dispatch; a retry never starts a second turn. An unknown outcome is settled by the Node, never by dispatching again.",
     "Use device names from nodes when talking about devices; Peer IDs belong in details.",
     "Never approve a request, grant authority or accept a deliverable for the human.",
@@ -210,6 +210,10 @@ pub async fn run(
                 ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
                 ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()),
                 ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
+                (
+                    "VIBEFACE_CODEX_SOCKET".into(),
+                    node.executor.socket.display().to_string(),
+                ),
             ]),
             process_started: Some(process_recorder(&node, &network, &attempt.id)),
         };
@@ -509,24 +513,6 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
                     standing.push(prefix(text, 300).to_owned());
                 }
             }
-            EventBody::ApprovalAnswered {
-                request_id,
-                decision,
-                ..
-            } => {
-                let asked = events.iter().find_map(|other| match &other.event.body {
-                    EventBody::ApprovalRequested {
-                        request_id: id,
-                        summary,
-                        ..
-                    } if id == request_id => Some(summary.as_str()),
-                    _ => None,
-                });
-                decisions.push(format!(
-                    "{}：{decision:?}",
-                    prefix(asked.unwrap_or(request_id), 200)
-                ));
-            }
             EventBody::WorkFinished {
                 work_id,
                 outcome,
@@ -563,7 +549,7 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
 fn work_row(work: &WorkProjection) -> Value {
     json!({"work_id":work.work_id,"target_node":work.target_node,"executor":work.executor,"cwd":work.cwd,
         "prompt":prefix(&work.prompt,500),"phase":work.phase,"progress":prefix(&work.summary,500),
-        "open_approvals":work.open_approvals,"outcome":work.outcome,"result":prefix(&work.result_text,1_000),
+        "outcome":work.outcome,"result":prefix(&work.result_text,1_000),
         "failure_reason":work.failure_reason})
 }
 
@@ -656,10 +642,12 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
         ),
         (
             "dispatch_work",
-            "Start work in cwd on target_node (default: this device). executor=codex (default) runs one native Codex turn, its approvals pinned to the user and its sandbox to cwd; executor=agent hands the task to another device's assistant. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up.",
+            "Start work in cwd on target_node (default: this device). On this device the CLI registers the work with the Node, then starts one Codex turn with full access through the App Server; on another device that device's assistant gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up. model, effort and images (local image paths) pass to the turn.",
             json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
                 "prompt":string(),"cwd":string(),"call_ref":string(),"target_node":string(),
-                "executor":{"type":"string","enum":["codex","agent"]},"parent":string(),"continues":string()}),
+                "parent":string(),"continues":string(),"model":string(),
+                "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]},
+                "images":{"type":"array","items":string(),"maxItems":8}}),
             vec!["title", "prompt", "cwd", "call_ref"],
         ),
         (

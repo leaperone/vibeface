@@ -45,15 +45,6 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
     Ok(crate::crypto::digest(&signed))
 }
 
-/// A refusal outranks consent, so concurrent conflicting answers settle the same way everywhere.
-fn answer_strictness(decision: ApprovalDecision) -> u8 {
-    match decision {
-        ApprovalDecision::Cancel => 0,
-        ApprovalDecision::Decline => 1,
-        ApprovalDecision::Accept | ApprovalDecision::Answered => 2,
-    }
-}
-
 pub(crate) fn strictness(mode: AutonomyMode) -> u8 {
     match mode {
         AutonomyMode::Continue => 0,
@@ -152,37 +143,6 @@ pub(crate) fn apply(
                 params![network, work_id, scope, serde_json::to_string(&event.body)?, rank, thread_id, turn_id],
             )?;
         }
-        EventBody::ApprovalRequested {
-            work_id,
-            request_id,
-            kind,
-            summary,
-        } => {
-            connection.execute(
-                "INSERT INTO approvals(network_id,request_id,work_id,kind,summary,request_rank) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET kind=excluded.kind,summary=excluded.summary,request_rank=excluded.request_rank WHERE request_rank IS NULL OR excluded.request_rank<request_rank",
-                params![network, request_id, work_id, kind, summary, rank],
-            )?;
-            notify(
-                connection,
-                network,
-                hash,
-                scope,
-                "needs_input",
-                summary,
-                rank,
-            )?;
-        }
-        EventBody::ApprovalAnswered {
-            work_id,
-            request_id,
-            decision,
-            ..
-        } => {
-            connection.execute(
-                "INSERT INTO approvals(network_id,request_id,work_id,decision,answer_key) VALUES(?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET decision=excluded.decision,answer_key=excluded.answer_key WHERE answer_key IS NULL OR excluded.answer_key<answer_key",
-                params![network, request_id, work_id, text(decision)?, format!("{}:{}", answer_strictness(*decision), request_key(network, event)?)],
-            )?;
-        }
         EventBody::WorkFinished {
             work_id,
             outcome,
@@ -278,9 +238,6 @@ pub(crate) fn works_from(
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let mut approvals = connection.prepare(
-        "SELECT request_id,kind,summary,decision FROM approvals WHERE network_id=? AND work_id=? AND request_rank IS NOT NULL ORDER BY request_rank",
-    )?;
     let mut works = Vec::with_capacity(rows.len());
     for (work_id, target_node, dispatch, progress, thread_id, turn_id, finish) in rows {
         let EventBody::WorkDispatched {
@@ -309,34 +266,6 @@ pub(crate) fn works_from(
                 }) => (Some(outcome), result_text, failure_reason),
                 _ => (None, String::new(), None),
             };
-        let mut open_approvals = Vec::new();
-        let mut answered_approvals = Vec::new();
-        let rows = approvals.query_map(params![network, work_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (request_id, kind, summary, decision) = row?;
-            match decision {
-                Some(decision) => answered_approvals.push(AnsweredApproval {
-                    request_id,
-                    kind,
-                    summary,
-                    decision: serde_json::from_value(serde_json::Value::String(decision))?,
-                }),
-                // A finished work has nothing left to answer.
-                None if outcome.is_none() => open_approvals.push(ApprovalProjection {
-                    request_id,
-                    kind,
-                    summary,
-                }),
-                None => {}
-            }
-        }
         works.push(WorkProjection {
             work_id,
             conversation_id: scope.into(),
@@ -354,8 +283,6 @@ pub(crate) fn works_from(
             outcome,
             result_text,
             failure_reason,
-            open_approvals,
-            answered_approvals,
         });
     }
     Ok(works)

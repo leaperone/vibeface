@@ -383,47 +383,6 @@ table "works" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "approvals" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "request_id" {
-    null = false
-    type = text
-  }
-  column "work_id" {
-    null = false
-    type = text
-  }
-  column "kind" {
-    null = true
-    type = text
-  }
-  column "summary" {
-    null = true
-    type = text
-  }
-  column "request_rank" {
-    null = true
-    type = text
-  }
-  column "decision" {
-    null = true
-    type = text
-  }
-  column "answer_key" {
-    null = true
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.request_id]
-  }
-  index "approvals_work" {
-    columns = [column.network_id, column.work_id]
-  }
-}
 table "autonomy" {
   schema = schema.main
   column "network_id" {
