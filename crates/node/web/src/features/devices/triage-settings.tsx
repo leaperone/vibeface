@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { BellOff, CircleCheck, CircleX, Copy, Inbox, KeyRound, Layers, Plus, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
+import { BellOff, CircleCheck, CircleX, Clock, Copy, Inbox, KeyRound, Layers, Plus, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, InlineError, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -102,7 +102,10 @@ export function TriageSettings() {
           })
         }}><BusyIcon busy={busy === "test"} icon={Zap} />测试</Button>
         {test ? <span role="status" className={cn("flex items-center gap-1 text-meta", test.ok ? "text-success" : "text-danger")}>{test.ok ? <CircleCheck aria-hidden="true" className="size-4" /> : <CircleX aria-hidden="true" className="size-4" />}{test.text}</span> : null}
-        <span className="ms-auto text-meta tabular-nums text-muted-foreground" title="待发 · 已送达 · 放弃">{pending} · {delivered} · {dead}</span>
+        {pending + delivered + dead ? <ul aria-label="发送记录" className="ms-auto flex items-center gap-3 text-meta tabular-nums text-muted-foreground">
+          {([[delivered, "已送达", CircleCheck, "text-success"], [pending, "待重试", Clock, ""], [dead, "失败", CircleX, "text-danger"]] as const).map(([count, label, Icon, tone]) =>
+            count ? <li key={label} className="flex items-center gap-1" title={label}><Icon aria-hidden="true" className={cn("size-4", tone)} /><span className="sr-only">{label} </span>{count}</li> : null)}
+        </ul> : null}
       </div>
     </form>
 
