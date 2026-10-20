@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, Laptop, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -191,14 +191,25 @@ function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string;
   // The reason wraps on its own line, so a phone shows why a task stopped.
   if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="block truncate">{title} · {device} · {taskLabel(task.state)}</span>{result ? <span className="block break-words">{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
     <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-    <span className="min-w-0 flex-1 truncate"><span className="font-medium">{title}</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} state={task.state} className="text-meta sm:text-base" /></span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
   </Link>
+}
+
+/** Device and state never yield to a long title: below `sm` they take their own line. */
+function TaskMeta({ device, state, className = '' }: { device: string; state: string; className?: string }) {
+  return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
+    <span aria-hidden="true" className="hidden sm:inline">·</span>
+    <Laptop aria-hidden="true" className="size-3.5 shrink-0" />
+    <span className="truncate">{device}</span>
+    <span aria-hidden="true">·</span>
+    <span className="shrink-0">{taskLabel(state)}</span>
+  </span>
 }
 
 function JobLine({ job }: { job: ManagerJob }) {
