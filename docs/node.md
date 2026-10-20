@@ -1,6 +1,6 @@
 # 部署与使用 Node
 
-本文使用 `vibeface` 管理自己的设备。HTTP 与同步协议见 [协议参考](node-protocol.md)。
+本文使用 `vibeface` 管理自己的设备。HTTP 与同步协议见 [协议参考](node-protocol.md)，出问题时见 [排障](troubleshooting.md)。
 
 ## 安装制品
 
@@ -44,7 +44,7 @@ bash scripts/build-web.sh
 
 `init` 创建本机独立密钥、配置及一次性本机接入材料，不注册网站账号，也不把个人根私钥放进 Node。在本机可信浏览器打开 `http://localhost:4790`，网页自动读取本机设置。填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建网络，无需终端接入链接。
 
-客户端独立生成个人根身份和自己的设备身份，签署首个成员目录。Node 验证一次性本机授权后安装该目录，日常连接使用客户端设备密钥。已有网络的节点提供当前入口；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或加密恢复包。本机恢复自动填入目标及所需初始化材料。已有个人网络时选择**使用节点邀请加入**，按 [添加自己的设备](#添加自己的设备) 完成双方确认。
+客户端独立生成个人根身份和自己的设备身份，签署首个成员目录。Node 验证一次性本机授权后安装该目录，日常连接使用客户端设备密钥。已有网络的节点提供当前入口；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或加密恢复包。本机恢复自动填入目标及所需初始化材料。要加入已有个人网络的 Node 不在网页上建网，用 `vibeface join` 加入，见 [添加自己的设备](#添加自己的设备)。
 
 `./vibeface access --data-dir "$HOME/.vibeface"` 保留为备用入口。不要公开它输出的初始化链接。后续连接自动核验设备编号和成员授权，不输入账号密码。个人根私钥留在可信客户端及加密恢复包，不作为节点间的长期共享密码。
 
@@ -64,7 +64,7 @@ bash scripts/build-web.sh
 
 ## 配置管理 Agent
 
-协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `codex` 工具启动原生 Codex 工作来修改本机代码，不持有 Codex App Server Socket。跨设备时，它发送任务给目标设备的协调 Agent，由目标设备本机执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
+协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `dispatch_work` 工具派发工作来修改代码：在本机或另一台设备的 Codex App Server 上开一个 turn，或把任务交给另一台设备的协调 Agent，由它在那台设备上执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
 
 通过 `manager.model` 选择账户实际可用的快模型。`auto` 或默认模型不是速度保证。2026-10-18 的独立 SDK 两轮对话测得首个模型输出约 7 至 10 秒，只验证了对应环境的模型对话与本机原生会话延续，不代表整个 Node、网页和后台任务的响应时间。
 
@@ -114,11 +114,11 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 每个 Node 和每个浏览器有独立密钥，设备编号就是设备公钥。本人设备列表来自已签名的成员目录，设备名称、IP 和中继返回的地址不证明所有权。
 
-在管理设备选择**添加设备**并点**生成链接**，得到一条 `https://<gateway>/join#vibeface1…` 加入链接。入口有公网 HTTPS 地址时同时显示二维码；只有本机或局域网地址时不出二维码，提示“只能本机打开”，按下文“配置公网入口”设置。链接含一次性 secret，只交给自己的设备。新浏览器打开链接，确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
+在管理设备选择**添加设备**并点**生成链接**，得到一条 `https://<gateway>/join#vibeface1…` 加入链接。入口有公网 HTTPS 地址时同时显示二维码；只有本机或局域网地址时不出二维码，提示“只能本机打开”，按下文“配置公共入口”设置。链接含一次性 secret，只交给自己的设备。新浏览器打开链接，确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
 
-没有任何可公网访问的 HTTPS 入口时，邀请界面不显示二维码，提示“只能本机打开”，见 [配置公网入口](#配置公网入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
+没有任何可公网访问的 HTTPS 入口时，邀请界面不显示二维码，提示“只能本机打开”，见 [配置公共入口](#配置公共入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
 
-添加另一台 Node 时，在新机器上执行：
+添加另一台 Node 时，在新机器上先用 `vibeface init` 初始化（不要在它的本机网页上建网），再执行：
 
 ```sh
 ./vibeface join --data-dir "$HOME/.vibeface" "https://gateway.example/join#vibeface1…"
@@ -149,16 +149,97 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 局域网 HTTP 页面能打开，不代表它能安全保存客户端私钥。浏览器不把普通 LAN HTTP 当作安全上下文。使用自己的可信 HTTPS 客户端或本机 localhost 页面连接 Node，不降低设备认证。HTTPS 页面访问远端时需要 HTTPS/WSS 入口，可通过可信的 HTTPS 中继建立该路径。端到端 Noise 保护业务通道，HTTPS 还保护网页代码的下载来源。
 
-## 配置公网入口
+## 配置公共入口
 
-手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。做法是在有公网地址的机器上运行一台 Node 作为 Gateway，用反向代理提供 HTTPS：
+手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有两种做法：
+
+- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它只提供网页、relay 和密文转发，不保存你的任何数据。家里的设备不需要入站端口。推荐用这种方式。
+- **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
+
+### 公共入口：PVE 加 nginx
+
+下面以 PVE 上的一台 Linux 虚拟机为公共入口，域名 `vb.example.com`，家里的 Mac 是个人网络里的 Node。
+
+1. 域名解析到 PVE 的公网地址，用 certbot 或其他方式为它签发证书。
+
+2. 在 PVE 上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
+
+   ```sh
+   vibeface init --data-dir "$HOME/.vibeface-entry" \
+   	--public-entry \
+   	--public-url https://vb.example.com \
+   	--relay-listen 127.0.0.1:3340
+   vibeface serve --data-dir "$HOME/.vibeface-entry"
+   ```
+
+   `init` 在数据目录生成运营者令牌 `entry-token`（权限 600）并打印它的路径。令牌决定谁能把设备挂到这台 relay 上，不要放进配置、聊天或代码仓库。确认能用后按 [作为后台应用运行](#作为后台应用运行) 安装服务。
+
+3. nginx 把 relay 的三个路径转给 relay 端口，其余转给网页端口，两者都允许 WebSocket 升级：
+
+   ```nginx
+   map $http_upgrade $connection_upgrade {
+   	default upgrade;
+   	''      close;
+   }
+
+   server {
+   	listen 443 ssl http2;
+   	server_name vb.example.com;
+   	ssl_certificate     /etc/letsencrypt/live/vb.example.com/fullchain.pem;
+   	ssl_certificate_key /etc/letsencrypt/live/vb.example.com/privkey.pem;
+
+   	location ~ ^/(relay|ping|generate_204)$ {
+   		proxy_pass http://127.0.0.1:3340;
+   		proxy_http_version 1.1;
+   		proxy_set_header Upgrade $http_upgrade;
+   		proxy_set_header Connection $connection_upgrade;
+   		proxy_set_header Host $host;
+   		proxy_read_timeout 1h;
+   	}
+
+   	location / {
+   		proxy_pass http://127.0.0.1:4790;
+   		proxy_http_version 1.1;
+   		proxy_set_header Upgrade $http_upgrade;
+   		proxy_set_header Connection $connection_upgrade;
+   		proxy_set_header Host $host;
+   		proxy_read_timeout 1h;
+   	}
+   }
+   ```
+
+   `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
+
+4. 把 PVE 上的 `entry-token` 复制到 Mac，例如 `scp pve:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
+
+5. 在 Mac 上初始化 Node 时指向公共入口，然后启动：
+
+   ```sh
+   vibeface init --data-dir "$HOME/.vibeface" \
+   	--root /absolute/path/to/projects \
+   	--entry https://vb.example.com \
+   	--relay-token-file "$HOME/vb-entry-token"
+   vibeface
+   ```
+
+   `init` 把令牌复制进 Mac 的数据目录，之后可以删掉 `~/vb-entry-token`。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
+
+6. 在 Mac 上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在 Mac 上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
+
+公共入口只搬运浏览器与 Mac 之间的 Noise 密文，看不到对话内容，也不保存事件或附件。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
+
+已经初始化的 Node 要改用公共入口，停掉它，在 `config.json` 的 `network` 中加入 `"entry": {"url": "https://vb.example.com", "relay": "https://vb.example.com"}`，把令牌放到数据目录的 `entry-token`（权限 600），再启动。
+
+### 成员 Gateway
+
+公网机器上的 Node 也可以作为普通成员提供网页：
 
 1. 准备域名并解析到这台机器，例如 `vibe.example.com`。
 2. 用 Caddy 或 nginx 签发证书，把 `https://vibe.example.com` 整站反代到本机 `127.0.0.1:4790`，并允许 WebSocket 升级。Caddy 只需一行：`vibe.example.com { reverse_proxy 127.0.0.1:4790 }`。
-3. 在这台 Node 的 `config.json` 设置 `"public_url": "https://vibe.example.com"`，重启。其他要嵌入此网页的 origin 加入 `allowed_origins`。
+3. 在这台 Node 的 `config.json` 设置 `"public_url": "https://vibe.example.com"`，重启。
 4. 用 `vibeface join` 让这台 Node 加入个人网络，之后管理设备生成邀请时会使用它的公网地址并显示二维码。
 
-反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。网页中的**配置公网入口**链接指向本节。
+成员 Gateway 保存个人网络的完整副本。反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。网页中的**怎么设置**链接指向本节。
 
 ## Node 之间的连接
 
@@ -188,7 +269,7 @@ vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 
 家里的 Mac mini 用 `--relay https://relay.example` 初始化，无需入站端口。邀请链接写明发出邀请的 Node 自己的 relay。relay 只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
 
-公网 Node 也是普通成员，可同时运行调度或执行。relay 不读取会话内容，也不给其他设备增加任何权限。
+公网 Node 也是普通成员，可同时运行调度或执行。relay 不读取会话内容，也不给其他设备增加任何权限。不想让公网机器保存个人网络数据时，改用 [公共入口](#配置公共入口)。
 
 历史按每台设备一条签名日志同步：双方交换版本向量，只拉对方缺的区间，入库前逐条验签并去重，中断后从已入库的位置续拉。对端重启后，它发来的同步请求带新的启动编号，本机随即关闭旧连接并重新同步，不等 QUIC 空闲超时。同步只写入历史和投影，不会重新执行历史中的操作；调度和执行只发生在被指定的 Node 上，见[事件 DAG 协议](node-protocol.md#事件-dag)。
 
@@ -212,7 +293,7 @@ vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 
 普通查询可以直接回答，本机工作使用 SDK 的宿主工具，远端工作通过 Agent 任务消息委派。日常操作不需要创建任务单、打开执行会话或选择调度器。进展、本人审批、补充输入和结果都回到原机器人的聊天。
 
-会话的调度设备由本人在建会话时签名指定，每次更换都写一条带本人签名、epoch 加一的负责人记录（`set_owner`，网页暂无入口）。新调度设备只按共享记录和上下文检查点重建上下文，不重放已经执行的工作。
+会话的调度设备由本人在建会话时签名指定，每次更换都写一条带本人签名、epoch 加一的负责人记录（`set_owner`）。调度设备离线而当前连接的设备能运行管理 Agent 时，聊天里出现“X 离线了，这个对话在等它”，点**交给这台设备处理**即可换过来，排队的消息在新设备上继续回复。新调度设备只按共享记录和上下文检查点重建上下文，不重放已经执行的工作。
 
 发送后先看状态。`pending_delivery` 表示入口已保存消息，正在投递给原调度设备；只有目标持久入队后才是 `queued`。排队不表示模型已开始，`running` 才表示已跨过 SDK 启动边界。目标离线、能力不满足或回执丢失时，保留原目标与消息身份核对，不自动改派另一台设备。
 
@@ -226,9 +307,9 @@ vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 
 Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 在停止时记录 CLI 进程树中的全部子进程及其进程组，逐组终止并确认这些进程都已退出后才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
 
-Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"prompt":"...","cwd":"...","target_node":"<设备编号>"}' --call-ref REF`。省略 `target_node` 时派发到本机。`executor` 默认为 `codex`，在目标 Node 的 Codex App Server 上开一个 turn；设为 `agent` 时把任务交给目标 Node 的管理 Agent，作为它的一轮执行，这一轮只能在目标本机启动 Codex 工作，不能再向其他设备派发。`continues` 填原工作编号时，在原工作的 thread 上继续。目标 Node 核对派发方仍是成员、触发这一轮的消息带本人签名或会话的“完成后”允许继续工作，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。Node 固定 `approvalPolicy=on-request`、`approvalsReviewer=user`，并把沙箱限定为该目录的 workspace-write、关闭网络。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。Agent 没有回答审批的入口，审批只能由本人在网页回答，任何入口的回答都转发到执行它的设备。
+Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机。`executor` 默认为 `codex`，在目标 Node 的 Codex App Server 上开一个 turn；设为 `agent` 时把任务交给目标 Node 的管理 Agent，作为它的一轮执行，这一轮只能在目标本机启动 Codex 工作，不能再向其他设备派发。`continues` 填原工作编号时，在原工作的 thread 上继续。目标 Node 核对派发方仍是成员、触发这一轮的消息带本人签名或会话的“完成后”允许继续工作，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。Node 固定 `approvalPolicy=on-request`、`approvalsReviewer=user`，并把沙箱限定为该目录的 workspace-write、关闭网络。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。Agent 没有回答审批的入口，审批只能由本人在网页回答，任何入口的回答都转发到执行它的设备。
 
-Node 托管本机的 `codex app-server`：未设置 `codex_socket` 时，Node 用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要连接自己管理的实例，在 `config.json` 设置 `codex_socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
+Node 托管本机的 `codex app-server`：未设置 `codex_socket` 时，Node 用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要连接自己管理的实例，在 `config.json` 设置 `codex_socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。工作改动了 `cwd` 之外的文件时，Node 只在 `node.log` 记一行，不拦截也不在网页告警。
 
 App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令，也不自动批准审批。重启前未回答的审批作废。读不到原 turn 的工作标为“待核对”，由本人附证据结清。
 
@@ -248,7 +329,7 @@ App Server 重启或重连后，Node 只读复查未结束的工作，不重发�
 
 管理 SDK 已返回明确结果时，Node 先将最终结果保存到本机。历史依赖暂未补齐或最终事件暂时写入失败时，只补发最终记录，不重新调用 SDK。
 
-管理轮重启或 SDK 进程退出无法确认时，原轮进入终态 `interrupted`，不重跑原触发，也不冻结会话。管理 SDK 的文件系统只读、网络仅限本机回环，但未确认退出的进程仍可能经回环访问本机服务；Node 工具权限已封存，原生工作经 `codex` 工具登记后单独观察。因此仍因此登记一条管理进程待核对，关联它的进程组、原生 turn 和 Agent 任务。原生 turn 结果未知时登记原生待核对。
+管理轮重启或 SDK 进程退出无法确认时，原轮进入终态 `interrupted`，不重跑原触发，也不冻结会话。管理 SDK 的文件系统只读、网络仅限本机回环，但未确认退出的进程仍可能经回环访问本机服务；Node 工具权限已封存，原生工作经 `dispatch_work` 登记后单独观察。因此仍登记一条管理进程待核对，关联它的进程组、原生 turn 和 Agent 任务。原生 turn 结果未知时登记原生待核对。同一工作只显示一条待核对：另一台设备代为执行的任务结果未知时，只显示该工作的一条，结清它时一并结清那一轮管理进程。
 
 每条待核对记录有三个选择：「不确定，再查一次」只读查询原设备，管理进程项只确认进程组是否已退出，原生项补查原 turn；「做完了」和「没做完」由本人检查实际进程、项目产物和外部副作用后提交，备注可选。工作的选择带本人签名，成为该工作的结果，其他入口看到同一结果。原 turn 的结果可读时直接显示。进程运行期间对本机服务的副作用只能由本人确认。模型不能结清待核对，确认也不重放原任务。失联不能证明远端进程已停止。
 
@@ -272,7 +353,7 @@ vibeface service status --data-dir "$HOME/.vibeface"
 
 每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略时使用 `$HOME/.vibeface`。管理其他数据目录时显式传入绝对路径。
 
-`status` 通过私有维护 socket 检查运行中的 Node，并核对 Peer ID，不要求安装服务。`status --json` 输出状态、Peer ID、监听地址、角色及运行版本，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。
+`status` 通过私有维护 socket 检查运行中的 Node，并核对设备编号，不要求安装服务。它输出设备编号、监听地址、运行版本、写入状态（`Writes`），以及每台其他成员 Node 最近一次同步是否连上、多久之前完成（`Peer`）。`status --json` 输出同样内容，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。各项含义见 [排障](troubleshooting.md)。
 
 ```sh
 vibeface status --json --data-dir "$HOME/.vibeface"
@@ -281,7 +362,7 @@ vibeface service start --data-dir "$HOME/.vibeface"
 vibeface service restart --data-dir "$HOME/.vibeface"
 ```
 
-macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `service.stdout.log` 和 `service.stderr.log`。Linux 使用 `systemd --user`，Node 日志由用户 journal 保存。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
+macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
 后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 和 sidecar 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
 
@@ -293,7 +374,7 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 
 ## 选择更新渠道
 
-自动更新需要完整发布包与受管安装目录。固定的 `current` 符号链接指向当前包，Node 用户服务也通过该路径启动。首次安装方式见 [构建与发布](releasing.md#首次安装更新器或手动更换程序)。
+自动更新需要完整发布包与受管安装目录。固定的 `current` 符号链接指向当前包，Node 用户服务也通过该路径启动。首次安装方式见 [构建与发布](releasing.md#首次安装)。
 
 选择 Stable 并开启自动更新：
 
@@ -343,8 +424,10 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 
 恢复根身份不会自动找回聊天正文、工程文件或执行器隐藏状态。业务历史仍需可达的授权副本或独立数据备份。缺少材料时明确停止，不创建看似相同的新身份替代原网络。
 
+从备份、快照或旧磁盘恢复的 Node 启动后先与其他成员 Node 对齐，确认自己没有漏掉以前写过的内容才开始写入；其他 Node 都连不上时保持只读，由本人在网页上确认“不是从备份恢复的”后才写。同一数据目录的两份副本都写了内容时，后发现的那份停止写入，需要移除后重新加入。处理方法见 [排障](troubleshooting.md#写入状态)。
+
 在**我的设备**中移除丢失设备。收到签名撤销记录的端点拒绝后续操作，已建立会话也重新验权。离线分区收到记录前不能立即生效，撤销不能抹除对方已经读过的数据，也不强制停止已运行的外部进程。被移除设备上还没有结果的工作由会话的调度设备记为“已放弃、未执行”，不会一直挂起。
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 6，数据库 `user_version` 为 6，直接初始化最终结构，不提供旧库迁移。部署此版本使用全新数据目录和同版本节点，不能把新程序直接接到旧库。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
+存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 7，数据库 `user_version` 为 6，直接初始化最终结构，不提供旧库迁移。部署此版本使用全新数据目录和同版本节点，不能把新程序直接接到旧库。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
