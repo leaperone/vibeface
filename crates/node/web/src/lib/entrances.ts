@@ -1,7 +1,12 @@
 import type { ConnectionEntry, MembershipView } from './node'
 
-/** A member Gateway this browser can connect through; `public` means reachable from other networks. */
-export type Entrance = { device_id: string; gateway_url: string; public: boolean; last_ok_ms: number }
+/**
+ * A member Gateway from its latest signed address record. `seq` is the highest record accepted, kept
+ * even when that record withdrew the web address (`gateway_url` null), so an older record never comes back.
+ * `public` means reachable from other networks.
+ */
+export type Entrance = { device_id: string; seq: number; gateway_url: string | null; public: boolean; last_ok_ms: number }
+export type OpenEntrance = Entrance & { gateway_url: string }
 export type SignedAddress = { payload: string; signature: string }
 type Check = (deviceId: string, payload: string, signature: string) => boolean
 
@@ -30,24 +35,33 @@ export function verifiedEntrances(records: unknown, view: MembershipView, check:
       const { payload, signature } = item as SignedAddress
       if (typeof payload !== 'string' || typeof signature !== 'string' || payload.length > 8192) continue
       const record = JSON.parse(payload) as Record<string, unknown>
-      const deviceId = record.device_id, gateway = record.gateway_url
-      if (record.version !== 1 || record.network_id !== view.network_id || typeof deviceId !== 'string' || !devicePattern.test(deviceId) || typeof gateway !== 'string') continue
+      const deviceId = record.device_id, gateway = record.gateway_url, seq = record.seq
+      if (record.version !== 1 || record.network_id !== view.network_id || typeof deviceId !== 'string' || !devicePattern.test(deviceId) || !Number.isSafeInteger(seq) || (seq as number) < 0 || (gateway !== null && typeof gateway !== 'string')) continue
       if (!nodes.has(deviceId) || !check(deviceId, payload, signature)) continue
+      if ((found.get(deviceId)?.seq ?? -1) >= (seq as number)) continue
+      if (gateway === null) { found.set(deviceId, { device_id: deviceId, seq: seq as number, gateway_url: null, public: false, last_ok_ms: 0 }); continue }
       const url = new URL(gateway)
       if (!['http:', 'https:'].includes(url.protocol) || url.pathname !== '/' || url.search || url.hash || url.username) continue
-      found.set(deviceId, { device_id: deviceId, gateway_url: url.origin, public: isPublicUrl(url.origin), last_ok_ms: 0 })
+      found.set(deviceId, { device_id: deviceId, seq: seq as number, gateway_url: url.origin, public: isPublicUrl(url.origin), last_ok_ms: 0 })
     } catch { /* an unreadable record is someone else's problem, not a reason to drop the rest */ }
   }
   return [...found.values()]
 }
 
-/** Fresh records replace addresses; success times and revocations carry over from what was saved. */
+/** A newer record replaces an address, an older one is ignored; success times carry over and revoked Nodes leave. */
 export function mergeEntrances(saved: Entrance[], fresh: Entrance[], view: MembershipView): Entrance[] {
   const nodes = members(view)
   const merged = new Map(saved.filter(item => nodes.has(item.device_id)).map(item => [item.device_id, item]))
-  for (const item of fresh) merged.set(item.device_id, { ...item, last_ok_ms: merged.get(item.device_id)?.last_ok_ms ?? 0 })
+  for (const item of fresh) {
+    const known = merged.get(item.device_id)
+    if (known && known.seq >= item.seq) continue
+    merged.set(item.device_id, { ...item, last_ok_ms: known?.last_ok_ms ?? 0 })
+  }
   return [...merged.values()]
 }
+
+/** Entrances whose latest record still names a web address. */
+export const openEntrances = (list: Entrance[]): OpenEntrance[] => list.filter((item): item is OpenEntrance => item.gateway_url !== null)
 
 export function markReached(list: Entrance[], entry: ConnectionEntry, at = Date.now()): Entrance[] {
   return list.map(item => item.device_id === entry.device_id && item.gateway_url === entry.address ? { ...item, last_ok_ms: at } : item)
@@ -55,7 +69,7 @@ export function markReached(list: Entrance[], entry: ConnectionEntry, at = Date.
 
 /** The entry that just failed first, then every other entrance from most to least recently reached. */
 export function candidates(list: Entrance[], current: ConnectionEntry): ConnectionEntry[] {
-  const others = list
+  const others = openEntrances(list)
     .filter(item => item.device_id !== current.device_id || item.gateway_url !== current.address)
     .sort((a, b) => b.last_ok_ms - a.last_ok_ms)
     .map(item => ({ address: item.gateway_url, device_id: item.device_id }))

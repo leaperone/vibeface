@@ -76,7 +76,7 @@ test('one tab leads and the next takes over when it closes', { skip: !globalThis
 
 const node = (id: string) => ({ device_id: id.repeat(64), kind: 'node' as const, name: id, manage: false })
 const view = { network_id: 'n'.repeat(64), epoch: 1, heads: [], members: [node('a'), node('b'), node('c'), { ...node('d'), kind: 'client' as const }], revoked: [{ device_id: 'c'.repeat(64), cutoff_seq: 0 }] }
-const address = (id: string, gateway: string, network = view.network_id) => ({ payload: JSON.stringify({ version: 1, network_id: network, device_id: id.repeat(64), seq: 1, endpoint: { id: id.repeat(64), addrs: [] }, gateway_url: gateway }), signature: `signed-by-${id}` })
+const address = (id: string, gateway: string | null, network = view.network_id, seq = 1) => ({ payload: JSON.stringify({ version: 1, network_id: network, device_id: id.repeat(64), seq, endpoint: { id: id.repeat(64), addrs: [] }, gateway_url: gateway }), signature: `signed-by-${id}` })
 const signedBySelf = (deviceId: string, _payload: string, signature: string) => signature === `signed-by-${deviceId[0]}`
 
 test('only entrance records signed by a current member Node of this network survive', () => {
@@ -92,15 +92,27 @@ test('only entrance records signed by a current member Node of this network surv
 
 test('switching tries the entry that dropped, then entrances by last success; revoked ones leave the list', () => {
   const saved = [
-    { device_id: 'a'.repeat(64), gateway_url: 'https://a.example.com', public: true, last_ok_ms: 5 },
-    { device_id: 'b'.repeat(64), gateway_url: 'https://b.example.com', public: true, last_ok_ms: 9 },
-    { device_id: 'c'.repeat(64), gateway_url: 'https://c.example.com', public: true, last_ok_ms: 99 },
+    { device_id: 'a'.repeat(64), seq: 1, gateway_url: 'https://a.example.com', public: true, last_ok_ms: 5 },
+    { device_id: 'b'.repeat(64), seq: 1, gateway_url: 'https://b.example.com', public: true, last_ok_ms: 9 },
+    { device_id: 'c'.repeat(64), seq: 1, gateway_url: 'https://c.example.com', public: true, last_ok_ms: 99 },
   ]
   const merged = markReached(mergeEntrances(saved, [], view), { address: 'https://a.example.com', device_id: 'a'.repeat(64) }, 1)
   assert.deepEqual(merged.map(item => [item.device_id[0], item.last_ok_ms]), [['a', 1], ['b', 9]], 'c was revoked')
   const order = candidates(merged, { address: 'http://127.0.0.1:5101', device_id: 'a'.repeat(64) })
   assert.deepEqual(order.map(entry => entry.address), ['http://127.0.0.1:5101', 'https://b.example.com', 'https://a.example.com'])
   for (const local of ['https://localhost', 'https://10.0.0.2', 'https://box.local', 'http://a.example.com', 'https://intranet']) assert.equal(isPublicUrl(local), false, local)
+})
+
+test('after a reload an older address record never replaces a newer one, withdrawn addresses included', () => {
+  const a = 'a'.repeat(64), b = 'b'.repeat(64)
+  const saved = mergeEntrances([], verifiedEntrances([address('a', 'https://new.example.com/', view.network_id, 7), address('b', null, view.network_id, 4)], view, signedBySelf), view)
+  const reloaded = JSON.parse(JSON.stringify(saved))
+  const stale = verifiedEntrances([address('a', 'https://old.example.com/', view.network_id, 6), address('b', 'https://withdrawn.example.com/', view.network_id, 3)], view, signedBySelf)
+  const merged = mergeEntrances(reloaded, stale, view)
+  assert.deepEqual(merged.map(item => [item.device_id[0], item.seq, item.gateway_url]), [['a', 7, 'https://new.example.com'], ['b', 4, null]])
+  assert.deepEqual(candidates(merged, { address: 'http://127.0.0.1:5101', device_id: a }).map(entry => entry.address), ['http://127.0.0.1:5101', 'https://new.example.com'], 'a withdrawn address is not tried')
+  const newer = mergeEntrances(merged, verifiedEntrances([address('b', 'https://back.example.com/', view.network_id, 5)], view, signedBySelf), view)
+  assert.equal(newer.find(item => item.device_id === b)?.gateway_url, 'https://back.example.com')
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {

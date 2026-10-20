@@ -12,8 +12,8 @@ import type { AuthenticationTrust } from '@/lib/secure'
 import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyState } from '@/lib/secure'
 import { nextLink } from '@/lib/link'
 import type { Link, LinkEvent } from '@/lib/link'
-import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@/lib/entrances'
-import type { Entrance } from '@/lib/entrances'
+import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '@/lib/entrances'
+import type { Entrance, OpenEntrance } from '@/lib/entrances'
 import { joinTabs } from '@/lib/tabs'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'ready'
@@ -31,7 +31,7 @@ export type TabMessage = { type: 'entrance'; networkId: string; entry: Connectio
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
 type DeviceContextValue = {
   connectionGeneration(): number
-  link: Link; entrances: Entrance[]; tabs: Tabs
+  link: Link; entrances: OpenEntrance[]; tabs: Tabs
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
@@ -143,7 +143,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const joiningRef = useRef<Joining | null>(null)
   const [link, setLinkState] = useState<Link>({ kind: 'booting' })
   const linkRef = useRef<Link>({ kind: 'booting' })
-  const [entrances, setEntrances] = useState<Entrance[]>([])
+  const [entrances, setEntrances] = useState<OpenEntrance[]>([])
   const seen = useRef<Vector>({})
   const switching = useRef(false)
   const leaderRef = useRef(true)
@@ -253,7 +253,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     try {
       const fresh = verifiedEntrances(record(await callSession(active, 'entrances')).entrances, view, verifyAddress)
       const merged = markReached(mergeEntrances(loadEntrances(view.network_id), fresh, view), active.entry)
-      store(`entrances.${view.network_id}`, merged); setEntrances(merged)
+      store(`entrances.${view.network_id}`, merged); setEntrances(openEntrances(merged))
     } catch { /* the saved list stays usable; the next connection refreshes it */ }
   }
   /** While the entry catches up with what this page already showed, ask again until it has. */
@@ -417,7 +417,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const route = connection.info.connection_entry ?? connection.entry
     // Any member Gateway forwards the join to this Node, so a public entrance beats the address in use.
     // The entry Node's own record names the public entry it is reached through, if it has one.
-    const known = loadEntrances(connection.principal.network_id)
+    const known = openEntrances(loadEntrances(connection.principal.network_id))
     const reachable = known.filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0] ?? known.find(item => item.device_id === entryId)
     // The Node's own public entry, when it has one, is what a phone's camera can open.
     const configured = typeof result.gateway_url === 'string' && isPublicUrl(result.gateway_url) ? result.gateway_url : undefined
