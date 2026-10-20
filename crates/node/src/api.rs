@@ -1,7 +1,4 @@
-use crate::{
-    identity::local::BootstrapCapability,
-    runtime::{Access, Runtime},
-};
+use crate::{identity::local::BootstrapCapability, runtime::Runtime};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -148,9 +145,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
     let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let tool_url = format!("http://{}", tools.local_addr()?);
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
-    node.tool_url
-        .set(tool_url)
-        .map_err(|_| anyhow::anyhow!("tool listener is already initialized"))?;
+    node.tools_ready(tool_url)?;
     tokio::try_join!(
         async {
             axum::serve(
@@ -406,14 +401,6 @@ fn one_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let token = one_header(headers, header::AUTHORIZATION.as_str())?.strip_prefix("Bearer ")?;
     (!token.is_empty() && token.trim() == token).then_some(token)
-}
-
-async fn bearer_access(app: &App, headers: &HeaderMap) -> ApiResult<Access> {
-    let token = bearer(headers).ok_or_else(ApiError::auth)?;
-    app.node
-        .authorize_bearer(token)
-        .await
-        .ok_or_else(ApiError::auth)
 }
 
 async fn info(State(app): State<App>) -> Json<Value> {
@@ -673,7 +660,12 @@ async fn tool(
     headers: HeaderMap,
     Json(input): Json<ToolCallback>,
 ) -> ApiResult<Json<Value>> {
-    let access = bearer_access(&app, &headers).await?;
+    let token = bearer(&headers).ok_or_else(ApiError::auth)?;
+    let access = app
+        .node
+        .tool_access(token, &input.agent_id)
+        .await
+        .ok_or_else(ApiError::auth)?;
     if !input.args.is_object() || input.agent_id.is_empty() || input.agent_id.len() > 256 {
         return Err(ApiError::bad(
             "args must be an object and agentId must be nonempty and bounded",

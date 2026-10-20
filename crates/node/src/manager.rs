@@ -7,6 +7,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -15,9 +16,7 @@ use tokio::{
     sync::watch,
 };
 pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
-use vibeface_bridge::agent::{
-    self, AgentResult, CustomToolConfig, SdkAgentConfig, ToolCallbackConfig,
-};
+use vibeface_bridge::agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn};
 
 const MAX_LINE: usize = 1_048_576;
 const MAX_STREAM: usize = 16_777_216;
@@ -43,14 +42,13 @@ pub struct ManagerConfig {
     pub codex_sdk_script: PathBuf,
     #[serde(default)]
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
-    pub tool_callback_url: Option<String>,
-    #[serde(skip)]
-    pub tool_callback_token: Option<String>,
     pub tool_cli: Option<PathBuf>,
     #[serde(skip)]
     pub tool_env: BTreeMap<String, String>,
     #[serde(skip)]
     pub process_started: Option<agent::ProcessStarted>,
+    #[serde(skip)]
+    pub cursor: Option<Arc<SdkBridge>>,
 }
 
 impl Default for ManagerConfig {
@@ -66,11 +64,10 @@ impl Default for ManagerConfig {
             codex_sdk_script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("sdk/codex-manager.mjs"),
             custom_tools: BTreeMap::new(),
-            tool_callback_url: None,
-            tool_callback_token: None,
             tool_cli: None,
             tool_env: BTreeMap::new(),
             process_started: None,
+            cursor: None,
         }
     }
 }
@@ -145,44 +142,45 @@ where
     }
     match config.kind {
         ManagerKind::CursorSdk => {
-            let callback = match (&config.tool_callback_url, &config.tool_callback_token) {
-                (Some(url), Some(token)) => Some(ToolCallbackConfig {
-                    url: url.clone(),
-                    auth_token: token.clone(),
-                }),
-                (None, None) => None,
-                _ => return Err(anyhow!("custom tool callback requires both URL and token")),
+            let not_started = |message: &str| ManagerError {
+                kind: ManagerFailure::Failed,
+                session_id: previous_session_id.map(str::to_owned),
+                message: message.into(),
             };
-            agent::run_sdk(
-                &SdkAgentConfig {
-                    executable: config.cursor_sdk_bin.clone(),
-                    workspace: config.workspace.clone(),
-                    timeout_secs: config.timeout_secs,
-                    model: config.model.clone(),
-                    tool_env: config.tool_env.clone(),
-                    custom_tools: config.custom_tools.clone(),
-                    tool_callback: callback,
-                    process_started: config.process_started.clone(),
-                },
-                prompt,
-                previous_session_id,
-                persist_session,
-                cancel,
-                progress,
-            )
-            .await
-            .map_err(|error| {
-                if let Some(sdk) = error.downcast_ref::<agent::AgentRunError>() {
+            let bridge = config
+                .cursor
+                .as_ref()
+                .ok_or_else(|| not_started("this Node has no Cursor SDK bridge yet"))?;
+            let api_key = std::env::var("CURSOR_API_KEY").map_err(|_| {
+                not_started("CURSOR_API_KEY is required for the Cursor SDK manager")
+            })?;
+            let turn = SdkTurn {
+                executable: config.cursor_sdk_bin.clone(),
+                workspace: config.workspace.clone(),
+                api_key,
+                model: config.model.clone(),
+                timeout_secs: config.timeout_secs,
+                custom_tools: config.custom_tools.clone(),
+                process_started: config.process_started.clone(),
+            };
+            bridge
+                .run(
+                    &turn,
+                    prompt,
+                    previous_session_id,
+                    persist_session,
+                    cancel,
+                    progress,
+                )
+                .await
+                .map_err(|error| {
                     ManagerError {
-                        kind: sdk.kind,
-                        session_id: sdk.session_id.clone(),
-                        message: sdk.to_string(),
+                        message: error.to_string(),
+                        kind: error.kind,
+                        session_id: error.session_id,
                     }
                     .into()
-                } else {
-                    error
-                }
-            })
+                })
         }
         ManagerKind::CodexSdk => {
             run_codex(
@@ -542,9 +540,6 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
         .filter(|value| value.len() >= 8)
         .cloned()
         .collect();
-    if let Some(token) = &config.tool_callback_token {
-        values.push(token.clone());
-    }
     values.extend(
         std::env::vars()
             .filter(|(key, value)| {
@@ -841,16 +836,15 @@ printf '%s\n' '{reply}'
     }
 
     #[test]
-    fn callback_credentials_are_not_serialized() {
+    fn tool_credentials_are_not_serialized() {
         let config = ManagerConfig {
-            tool_callback_token: Some("secret-token".into()),
             tool_env: BTreeMap::from([("TOKEN".into(), "other-secret".into())]),
             ..ManagerConfig::default()
         };
         let encoded = serde_json::to_string(&config).unwrap();
-        assert!(!encoded.contains("secret-token") && !encoded.contains("other-secret"));
+        assert!(!encoded.contains("other-secret"));
         assert_eq!(
-            redact(json!({"nested":["secret-token"]}), &secret_values(&config)),
+            redact(json!({"nested":["other-secret"]}), &secret_values(&config)),
             json!({"nested":["[redacted]"]})
         );
     }

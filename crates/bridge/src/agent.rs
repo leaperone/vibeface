@@ -4,17 +4,24 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
     future::Future,
+    hash::{BuildHasher, RandomState},
+    io::Write,
     net::IpAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        Arc, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::{Child, Command},
-    sync::{oneshot, watch},
+    sync::{Mutex, Notify, Semaphore, oneshot, watch},
     task::JoinHandle,
+    time::Instant,
 };
 
 const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -23,22 +30,22 @@ const MAX_RESULT_BYTES: usize = 65_536;
 const MAX_PROMPT_BYTES: usize = 86_016;
 const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Durably records an SDK process group before the agent can act.
 pub type ProcessStarted = std::sync::Arc<
     dyn Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
 >;
 
-/// Cursor SDK configuration for a local agent run.
-#[derive(Clone)]
-pub struct SdkAgentConfig {
+/// One Cursor SDK turn on the Node's resident bridge.
+pub struct SdkTurn {
     pub executable: PathBuf,
     pub workspace: PathBuf,
-    pub timeout_secs: u64,
+    pub api_key: String,
     pub model: String,
-    pub tool_env: BTreeMap<String, String>,
+    pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
-    pub tool_callback: Option<ToolCallbackConfig>,
     pub process_started: Option<ProcessStarted>,
 }
 
@@ -140,234 +147,662 @@ pub async fn terminate_process_group(child: &mut Child, group: u32) -> bool {
     false
 }
 
-/// Runs the supplied prompt with the explicitly configured tools.
-/// The callback commits the native ID before the first mutating Send request.
-pub async fn run_sdk<F, P, PF>(
-    config: &SdkAgentConfig,
-    prompt: &str,
-    previous_session_id: Option<&str>,
-    persist_session: impl FnOnce(String) -> F,
-    mut cancel: watch::Receiver<bool>,
-    mut progress: P,
-) -> Result<AgentResult>
-where
-    F: Future<Output = Result<()>>,
-    P: FnMut(Value) -> PF,
-    PF: Future<Output = Result<()>>,
-{
-    ensure!(
-        config.timeout_secs > 0,
-        "Cursor SDK timeout must be positive"
-    );
-    ensure!(
-        !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
-        "invalid management prompt"
-    );
-    ensure!(
-        !config.model.trim().is_empty(),
-        "Cursor SDK requires an explicit model"
-    );
-    validate_sdk_tools(config)?;
-    if let Some(id) = previous_session_id {
-        validate_sdk_id(id)?;
-    }
-    if *cancel.borrow() {
-        return Err(AgentRunError {
-            kind: AgentFailure::Cancelled,
-            session_id: previous_session_id.map(str::to_owned),
-            message: "Cursor SDK management cancelled before launch".into(),
+fn signal_group_now(group: u32, signal: &str) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args([signal, "--", &format!("-{group}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The Node's one resident `cursor-sdk-bridge`. It starts on first use and serves every
+/// turn; a dead or unresponsive bridge is replaced with backoff, and a bridge left holding
+/// an agent of unknown state is retired so its process group ends.
+pub struct SdkBridge {
+    env: BTreeMap<String, String>,
+    callback: ToolCallbackConfig,
+    hasher: RandomState,
+    slot: Mutex<Slot>,
+    processes: Arc<Processes>,
+}
+
+#[derive(Default)]
+struct Slot {
+    live: Option<Arc<Live>>,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl Slot {
+    /// Each failure doubles the wait before the next start, up to 30s; a bridge that ran for
+    /// a minute clears the earlier failures.
+    fn failed(&mut self, ran: Duration) {
+        if ran > Duration::from_secs(60) {
+            self.failures = 0;
         }
-        .into());
+        self.failures += 1;
+        let delay = (1u64 << (self.failures - 1).min(5)).min(30);
+        self.retry_at = Some(Instant::now() + Duration::from_secs(delay));
     }
-    let api_key = std::env::var("CURSOR_API_KEY")
-        .map_err(|_| anyhow!("CURSOR_API_KEY is required for the Cursor SDK manager"))?;
-    ensure!(
-        !api_key.trim().is_empty() && api_key.len() <= 4096,
-        "CURSOR_API_KEY is missing or invalid"
-    );
-    let startup = async {
-        prepare_sdk_workspace(&config.workspace).await?;
-        SdkProcess::start(config, &api_key).await
-    };
-    let (mut process, rpc) = tokio::select! {
-        result = startup => result?,
-        _ = wait_for_cancel(&mut cancel) => return Err(AgentRunError {
-            kind: AgentFailure::Cancelled,
-            session_id: previous_session_id.map(str::to_owned),
-            message: "Cursor SDK management cancelled before Send".into(),
-        }.into()),
-    };
-    let process_group = process.group.context("Cursor SDK process has no group")?;
-    if let Some(record) = &config.process_started {
-        record(process_group)
-            .await
-            .context("record Cursor SDK process group before sending")?;
+}
+
+struct Live {
+    key: u64,
+    group: u32,
+    rpc: Rpc,
+    agents: Option<Arc<Semaphore>>,
+    started: Instant,
+    turns: AtomicUsize,
+    retired: AtomicBool,
+    kill: Arc<Notify>,
+    exited: watch::Receiver<bool>,
+}
+
+impl Live {
+    fn exited(&self) -> bool {
+        *self.exited.borrow()
     }
-    let mut agent_id = previous_session_id.map(str::to_owned);
-    let mut state = RunState::default();
-    let mut send_started = false;
-    let operation = async {
-        let version = rpc.unary(CONTROL_SERVICE, "GetVersion", json!({})).await?;
-        ensure!(
-            version.get("protocolVersion").and_then(Value::as_str) == Some("sdk.v1"),
-            "unsupported Cursor SDK protocol version"
-        );
-        if let Some(callback) = &config.tool_callback {
-            rpc.unary(
-                CONTROL_SERVICE,
-                "SetToolCallback",
-                json!({"url":callback.url,"authToken":callback.auth_token}),
+
+    fn admit(self: &Arc<Self>) -> Admission {
+        self.turns.fetch_add(1, SeqCst);
+        Admission(self.clone())
+    }
+
+    /// Admits no new turn; the process ends with its last running turn.
+    fn retire(&self) {
+        self.retired.store(true, SeqCst);
+        if self.turns.load(SeqCst) == 0 {
+            self.kill.notify_one();
+        }
+    }
+
+    async fn healthy(&self) -> bool {
+        !self.exited()
+            && matches!(
+                tokio::time::timeout(
+                    PING_TIMEOUT,
+                    self.rpc.unary(CONTROL_SERVICE, "Ping", json!({}))
+                )
+                .await,
+                Ok(Ok(_))
             )
-            .await?;
+    }
+}
+
+struct Admission(Arc<Live>);
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if self.0.turns.fetch_sub(1, SeqCst) == 1 && self.0.retired.load(SeqCst) {
+            self.0.kill.notify_one();
         }
-        let options = sdk_options(config, &api_key)?;
-        let reply = if let Some(id) = previous_session_id {
-            rpc.unary(
-                AGENT_SERVICE,
-                "ResumeAgent",
-                json!({"agentId": id, "options": options}),
-            )
-            .await?
-        } else {
-            rpc.unary(AGENT_SERVICE, "CreateAgent", json!({"options": options}))
-                .await?
+    }
+}
+
+/// Kills a bridge whose startup did not finish, also when the waiting turn is cancelled.
+struct Abandon(Option<Arc<Notify>>);
+
+impl Drop for Abandon {
+    fn drop(&mut self) {
+        if let Some(kill) = self.0.take() {
+            kill.notify_one();
+        }
+    }
+}
+
+/// Bridge process groups still running, mirrored to the pidfile for `kill_orphan`.
+struct Processes {
+    pidfile: Option<PathBuf>,
+    running: std::sync::Mutex<BTreeMap<u32, Tracked>>,
+}
+
+struct Tracked {
+    executable: PathBuf,
+    kill: Arc<Notify>,
+    exited: watch::Receiver<bool>,
+}
+
+impl Processes {
+    fn track(&self, group: u32, tracked: Tracked) -> Result<()> {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.insert(group, tracked);
+        self.save(&running)
+            .context("record the Cursor SDK bridge process group")
+    }
+
+    fn forget(&self, group: u32) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.remove(&group);
+        let _ = self.save(&running);
+    }
+
+    fn save(&self, running: &BTreeMap<u32, Tracked>) -> std::io::Result<()> {
+        let Some(pidfile) = &self.pidfile else {
+            return Ok(());
         };
-        let id = reply
-            .get("agentId")
-            .and_then(Value::as_str)
-            .context("Cursor SDK returned no agent id")?;
-        validate_sdk_id(id)?;
-        if let Some(previous) = previous_session_id {
-            ensure!(previous == id, "Cursor SDK resumed a different agent");
+        if running.is_empty() {
+            return match std::fs::remove_file(pidfile) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            };
         }
-        agent_id = Some(id.to_owned());
-        persist_session(id.to_owned())
+        let lines: String = running
+            .iter()
+            .map(|(group, tracked)| format!("{group} {}\n", tracked.executable.display()))
+            .collect();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(pidfile)?
+            .write_all(lines.as_bytes())
+    }
+}
+
+impl SdkBridge {
+    /// `env` reaches every agent shell of the bridge, and the bridge calls `tool_callback`
+    /// for the custom tools of every turn.
+    pub fn new(
+        env: BTreeMap<String, String>,
+        tool_callback: ToolCallbackConfig,
+        pidfile: Option<PathBuf>,
+    ) -> Result<Self> {
+        validate_env(&env)?;
+        validate_callback(&tool_callback)?;
+        Ok(Self {
+            env,
+            callback: tool_callback,
+            hasher: RandomState::new(),
+            slot: Mutex::default(),
+            processes: Arc::new(Processes {
+                pidfile,
+                running: Default::default(),
+            }),
+        })
+    }
+
+    /// Starts the bridge before the first turn needs it.
+    pub async fn prewarm(&self, executable: &Path, workspace: &Path, api_key: &str) -> Result<()> {
+        validate_api_key(api_key)?;
+        self.admit(executable, workspace, api_key)
             .await
-            .context("persist Cursor SDK session before sending management prompt")?;
-        send_started = true;
-        let bearer = rpc.bearer.clone();
-        let mut secrets = vec![api_key.as_str(), bearer.as_str()];
-        secrets.extend(config.tool_env.values().map(String::as_str));
-        if let Some(callback) = &config.tool_callback {
-            secrets.push(callback.auth_token.as_str());
-        }
-        let mut pending_text = BTreeMap::new();
-        let mut emit_progress =
-            |value| progress(redact_stream_progress(value, &secrets, &mut pending_text));
-        rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
-        let mut result = state.finish(id)?;
-        result.output = match redact_progress(Value::String(result.output), &secrets) {
-            Value::String(output) => output,
-            _ => unreachable!("redacting an agent result must preserve its string type"),
-        };
-        result.usage = result.usage.map(|usage| redact_progress(usage, &secrets));
-        Ok(result)
-    };
-    let mut cancellation_requested = false;
-    let outcome = tokio::select! {
-        biased;
-        result = tokio::time::timeout(Duration::from_secs(config.timeout_secs), operation) => {
-            result.unwrap_or_else(|_| Err(anyhow!("Cursor SDK manager timed out; completion is unknown")))
-        }
-        _ = &mut process.stdout => Err(anyhow!("Cursor SDK stdout closed unexpectedly; completion is unknown")),
-        _ = &mut process.stderr => Err(anyhow!("Cursor SDK stderr closed unexpectedly; completion is unknown")),
-        _ = process.child.wait() => Err(anyhow!("Cursor SDK process exited unexpectedly; completion is unknown")),
-        _ = wait_for_cancel(&mut cancel) => {
-            cancellation_requested = true;
-            Err(anyhow!("Cursor SDK management cancellation requested"))
-        }
-    };
-    let mut native_terminal = None;
-    if outcome.is_err()
-        && let Some(run_id) = &state.run_id
-    {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            rpc.unary(
-                AGENT_SERVICE,
-                "CancelRun",
-                json!({"runId": run_id, "agentId": agent_id}),
-            ),
-        )
-        .await;
-        if cancellation_requested && let Some(agent_id) = &agent_id {
-            native_terminal = tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let reply = rpc
-                        .unary(AGENT_SERVICE, "GetRun", json!({"runId":run_id}))
-                        .await?;
-                    let snapshot = reply
-                        .get("run")
-                        .context("Cursor SDK returned no run snapshot")?;
-                    let mut identity = RunState {
-                        run_id: Some(run_id.clone()),
-                        ..RunState::default()
-                    };
-                    identity.identity(snapshot, agent_id, true)?;
-                    if cancelled(snapshot.get("status")) {
-                        return Ok::<AgentFailure, anyhow::Error>(AgentFailure::Cancelled);
-                    }
-                    if finished(snapshot.get("status")) {
-                        return Ok(AgentFailure::Unknown);
-                    }
-                    if failed(snapshot.get("status")) {
-                        return Ok(AgentFailure::Failed);
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+            .map(drop)
+            .map_err(|error| {
+                anyhow!(redact_text(
+                    format!("{error:#}"),
+                    &self.secrets(api_key, "")
+                ))
             })
-            .await
-            .ok()
-            .and_then(Result::ok);
+    }
+
+    /// Lets running turns finish on the current bridge, then ends it; the next turn starts anew.
+    pub async fn retire(&self) {
+        if let Some(live) = self.slot.lock().await.live.take() {
+            live.retire();
         }
     }
-    if let Some(id) = &agent_id {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            rpc.unary(AGENT_SERVICE, "CloseAgent", json!({"agentId": id})),
-        )
-        .await;
-    }
-    let _ = tokio::time::timeout(
-        Duration::from_secs(3),
-        rpc.unary(CONTROL_SERVICE, "Shutdown", json!({"graceSeconds": 0})),
-    )
-    .await;
-    let reaped = terminate_process_group(&mut process.child, process_group).await;
-    if reaped {
-        process.group = None;
-    }
-    outcome.map_err(|error| {
-        let mut message = error
-            .to_string()
-            .replace(&api_key, "[redacted]")
-            .replace(&rpc.bearer, "[redacted]");
-        for secret in config
-            .tool_env
+
+    /// Kills every bridge process group this Node started and removes the pidfile.
+    pub async fn stop(&self) {
+        let running: Vec<_> = self
+            .processes
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .values()
-            .chain(
-                config
-                    .tool_callback
-                    .iter()
-                    .map(|callback| &callback.auth_token),
-            )
-            .filter(|value| !value.is_empty())
-        {
-            message = message.replace(secret, "[redacted]");
+            .map(|tracked| (tracked.kill.clone(), tracked.exited.clone()))
+            .collect();
+        for (kill, mut exited) in running {
+            kill.notify_one();
+            let _ = exited.wait_for(|exited| *exited).await;
         }
-        AgentRunError {
-            kind: if cancellation_requested {
+        if let Some(pidfile) = &self.processes.pidfile {
+            let _ = std::fs::remove_file(pidfile);
+        }
+    }
+
+    /// Kills the bridge groups an earlier Node run recorded in `pidfile`, when the group leader
+    /// still runs the recorded program; a reused process id is left alone.
+    pub fn kill_orphan(pidfile: &Path) {
+        let Ok(recorded) = std::fs::read_to_string(pidfile) else {
+            return;
+        };
+        for line in recorded.lines() {
+            let Some((group, executable)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(group) = group.parse::<u32>().ok().filter(|group| *group > 1) else {
+                continue;
+            };
+            let command = std::process::Command::new("/bin/ps")
+                .args(["-o", "command=", "-p", &group.to_string()])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default();
+            if executable.is_empty() || !command.contains(executable) {
+                continue;
+            }
+            if signal_group_now(group, "-TERM") {
+                for _ in 0..30 {
+                    if !signal_group_now(group, "-0") {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                signal_group_now(group, "-KILL");
+            }
+        }
+        let _ = std::fs::remove_file(pidfile);
+    }
+
+    /// Runs the prompt with the turn's tools on the resident bridge.
+    /// The callback commits the native ID before the first mutating Send request.
+    pub async fn run<F, P, PF>(
+        &self,
+        turn: &SdkTurn,
+        prompt: &str,
+        previous_session_id: Option<&str>,
+        persist_session: impl FnOnce(String) -> F,
+        mut cancel: watch::Receiver<bool>,
+        mut progress: P,
+    ) -> Result<AgentResult, AgentRunError>
+    where
+        F: Future<Output = Result<()>>,
+        P: FnMut(Value) -> PF,
+        PF: Future<Output = Result<()>>,
+    {
+        let not_sent = |kind, message: String| AgentRunError {
+            kind,
+            session_id: previous_session_id.map(str::to_owned),
+            message: redact_text(message, &self.secrets(&turn.api_key, "")),
+        };
+        let cancelled_before_send = || {
+            not_sent(
+                AgentFailure::Cancelled,
+                "Cursor SDK management cancelled before Send".into(),
+            )
+        };
+        if let Err(error) = validate_turn(turn, prompt, previous_session_id) {
+            return Err(not_sent(AgentFailure::Failed, format!("{error:#}")));
+        }
+        if *cancel.borrow() {
+            return Err(cancelled_before_send());
+        }
+        let admission = tokio::select! {
+            admitted = self.admit(&turn.executable, &turn.workspace, &turn.api_key) => {
+                admitted.map_err(|error| not_sent(AgentFailure::Failed, format!("{error:#}")))?
+            }
+            _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
+        };
+        let live = &admission.0;
+        let _agent_slot = match live.agents.clone() {
+            Some(agents) => tokio::select! {
+                permit = agents.acquire_owned() => permit.ok(),
+                _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
+            },
+            None => None,
+        };
+        if let Some(record) = &turn.process_started
+            && let Err(error) = record(live.group).await
+        {
+            return Err(not_sent(
+                AgentFailure::Failed,
+                format!("record Cursor SDK process group before sending: {error:#}"),
+            ));
+        }
+        let rpc = &live.rpc;
+        let secrets = self.secrets(&turn.api_key, &rpc.bearer);
+        let mut agent_id = previous_session_id.map(str::to_owned);
+        let mut state = RunState::default();
+        let mut send_started = false;
+        let operation = async {
+            let options = sdk_options(turn)?;
+            let reply = if let Some(id) = previous_session_id {
+                rpc.unary(
+                    AGENT_SERVICE,
+                    "ResumeAgent",
+                    json!({"agentId": id, "options": options}),
+                )
+                .await?
+            } else {
+                rpc.unary(AGENT_SERVICE, "CreateAgent", json!({"options": options}))
+                    .await?
+            };
+            let id = reply
+                .get("agentId")
+                .and_then(Value::as_str)
+                .context("Cursor SDK returned no agent id")?;
+            validate_sdk_id(id)?;
+            if let Some(previous) = previous_session_id {
+                ensure!(previous == id, "Cursor SDK resumed a different agent");
+            }
+            agent_id = Some(id.to_owned());
+            persist_session(id.to_owned())
+                .await
+                .context("persist Cursor SDK session before sending management prompt")?;
+            send_started = true;
+            let mut pending_text = BTreeMap::new();
+            let mut emit_progress =
+                |value| progress(redact_stream_progress(value, &secrets, &mut pending_text));
+            rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
+            let mut result = state.finish(id)?;
+            result.output = redact_text(result.output, &secrets);
+            result.usage = result.usage.map(|usage| redact_progress(usage, &secrets));
+            Ok(result)
+        };
+        let mut cancellation_requested = false;
+        let mut exited = live.exited.clone();
+        let outcome = tokio::select! {
+            biased;
+            result = tokio::time::timeout(Duration::from_secs(turn.timeout_secs), operation) => {
+                result.unwrap_or_else(|_| Err(anyhow!("Cursor SDK manager timed out; completion is unknown")))
+            }
+            _ = exited.wait_for(|exited| *exited) => {
+                Err(anyhow!("Cursor SDK bridge exited unexpectedly; completion is unknown"))
+            }
+            _ = wait_for_cancel(&mut cancel) => {
+                cancellation_requested = true;
+                Err(anyhow!("Cursor SDK management cancellation requested"))
+            }
+        };
+        let mut native_terminal = None;
+        if outcome.is_err()
+            && let Some(run_id) = &state.run_id
+        {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                rpc.unary(
+                    AGENT_SERVICE,
+                    "CancelRun",
+                    json!({"runId": run_id, "agentId": agent_id}),
+                ),
+            )
+            .await;
+            if cancellation_requested && let Some(agent_id) = &agent_id {
+                native_terminal = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let reply = rpc
+                            .unary(AGENT_SERVICE, "GetRun", json!({"runId":run_id}))
+                            .await?;
+                        let snapshot = reply
+                            .get("run")
+                            .context("Cursor SDK returned no run snapshot")?;
+                        let mut identity = RunState {
+                            run_id: Some(run_id.clone()),
+                            ..RunState::default()
+                        };
+                        identity.identity(snapshot, agent_id, true)?;
+                        if cancelled(snapshot.get("status")) {
+                            return Ok::<AgentFailure, anyhow::Error>(AgentFailure::Cancelled);
+                        }
+                        if finished(snapshot.get("status")) {
+                            return Ok(AgentFailure::Unknown);
+                        }
+                        if failed(snapshot.get("status")) {
+                            return Ok(AgentFailure::Failed);
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .ok()
+                .and_then(Result::ok);
+            }
+        }
+        if let Some(id) = &agent_id {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                rpc.unary(AGENT_SERVICE, "CloseAgent", json!({"agentId": id})),
+            )
+            .await;
+        }
+        outcome.map_err(|error| {
+            let kind = if cancellation_requested {
                 provider_cancel_failure(native_terminal)
             } else if send_started {
                 AgentFailure::Unknown
             } else {
                 AgentFailure::Failed
-            },
-            session_id: agent_id,
-            message,
+            };
+            // The agent may still act; its pending check closes only once the bridge group ends.
+            if kind == AgentFailure::Unknown && !live.exited() {
+                live.retire();
+            }
+            AgentRunError {
+                kind,
+                session_id: agent_id,
+                message: redact_text(format!("{error:#}"), &secrets),
+            }
+        })
+    }
+
+    /// The live bridge for this program, workspace and key, started if none answers.
+    async fn admit(&self, executable: &Path, workspace: &Path, api_key: &str) -> Result<Admission> {
+        let key = self.hasher.hash_one((executable, workspace, api_key));
+        let mut slot = self.slot.lock().await;
+        if let Some(live) = slot.live.clone() {
+            // Counted before the retired check, so a concurrent retire cannot end it under this turn.
+            let admission = live.admit();
+            let current = live.key == key && !live.retired.load(SeqCst);
+            if current && live.healthy().await {
+                return Ok(admission);
+            }
+            slot.live = None;
+            if current {
+                slot.failed(live.started.elapsed());
+                live.kill.notify_one();
+            }
+            live.retire();
         }
-        .into()
-    })
+        if let Some(retry_at) = slot.retry_at {
+            tokio::time::sleep_until(retry_at).await;
+        }
+        match self.start(executable, workspace, api_key, key).await {
+            Ok(live) => {
+                let admission = live.admit();
+                slot.live = Some(live);
+                Ok(admission)
+            }
+            Err(error) => {
+                slot.failed(Duration::ZERO);
+                Err(error)
+            }
+        }
+    }
+
+    async fn start(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        api_key: &str,
+        key: u64,
+    ) -> Result<Arc<Live>> {
+        prepare_sdk_workspace(workspace).await?;
+        let mut command = Command::new(executable);
+        command
+            .arg("--workspace")
+            .arg(workspace)
+            .arg("--state-root")
+            .arg(workspace.join(".sdk"))
+            .args(["--host", "127.0.0.1", "--port", "0"])
+            .current_dir(workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("VIBEFACE_")
+                || name.starts_with("CURSOR_SDK_")
+                || matches!(
+                    name.as_ref(),
+                    "CURSOR_API_KEY"
+                        | "HTTP_PROXY"
+                        | "HTTPS_PROXY"
+                        | "ALL_PROXY"
+                        | "NO_PROXY"
+                        | "http_proxy"
+                        | "https_proxy"
+                        | "all_proxy"
+                        | "no_proxy"
+                )
+            {
+                command.env_remove(key);
+            }
+        }
+        command
+            .envs(&self.env)
+            .env("CURSOR_API_KEY", api_key)
+            .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
+        let mut child = command
+            .spawn()
+            .context("could not start cursor-sdk-bridge")?;
+        let group = child.id().context("Cursor SDK process has no group")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Cursor SDK stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Cursor SDK stderr unavailable")?;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let process = SdkProcess {
+            child,
+            group: Some(group),
+            stdout: tokio::spawn(drain(stdout)),
+            stderr: tokio::spawn(read_discovery(stderr, ready_tx)),
+        };
+        let kill = Arc::new(Notify::new());
+        let (exited_tx, exited) = watch::channel(false);
+        let tracked = self.processes.track(
+            group,
+            Tracked {
+                executable: executable.to_owned(),
+                kill: kill.clone(),
+                exited: exited.clone(),
+            },
+        );
+        tokio::spawn(supervise(
+            process,
+            kill.clone(),
+            exited_tx,
+            self.processes.clone(),
+        ));
+        let mut abandon = Abandon(Some(kill.clone()));
+        tracked?;
+        let mut died = exited.clone();
+        let (rpc, agents) = tokio::select! {
+            ready = tokio::time::timeout(STARTUP_TIMEOUT, self.connect(ready_rx)) => ready.map_err(|_| {
+                anyhow!(
+                    "Cursor SDK bridge did not start within {}s; the reply did not start",
+                    STARTUP_TIMEOUT.as_secs()
+                )
+            })??,
+            _ = died.wait_for(|exited| *exited) => bail!("Cursor SDK bridge exited during startup"),
+        };
+        abandon.0 = None;
+        Ok(Arc::new(Live {
+            key,
+            group,
+            rpc,
+            agents,
+            started: Instant::now(),
+            turns: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+            kill,
+            exited,
+        }))
+    }
+
+    /// Reads the discovery line, then sets the Node's tool callback once for the bridge's life.
+    async fn connect(
+        &self,
+        ready: oneshot::Receiver<Result<Discovery>>,
+    ) -> Result<(Rpc, Option<Arc<Semaphore>>)> {
+        let discovery = ready
+            .await
+            .context("Cursor SDK stopped before discovery")??;
+        let endpoint = discovery.endpoint()?;
+        let metadata = tokio::fs::symlink_metadata(&discovery.auth_token_file)
+            .await
+            .context("Cursor SDK token file unavailable")?;
+        ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.permissions().mode() & 0o777 == 0o600
+                && metadata.len() <= 4096,
+            "Cursor SDK token file must be a private 0600 file"
+        );
+        let bearer = tokio::fs::read_to_string(&discovery.auth_token_file)
+            .await
+            .map_err(|_| anyhow!("could not read Cursor SDK token file"))?;
+        let bearer = bearer.trim().to_owned();
+        ensure!(
+            !bearer.is_empty() && bearer.len() <= 4096,
+            "invalid Cursor SDK bridge authentication token"
+        );
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|_| anyhow!("could not create Cursor SDK HTTP client"))?;
+        let rpc = Rpc {
+            endpoint,
+            bearer,
+            client,
+        };
+        let version = rpc.unary(CONTROL_SERVICE, "GetVersion", json!({})).await?;
+        ensure!(
+            version.get("protocolVersion").and_then(Value::as_str) == Some("sdk.v1"),
+            "unsupported Cursor SDK protocol version"
+        );
+        rpc.unary(
+            CONTROL_SERVICE,
+            "SetToolCallback",
+            json!({"url": self.callback.url, "authToken": self.callback.auth_token}),
+        )
+        .await?;
+        let agents = discovery
+            .max_concurrent_agents
+            .filter(|limit| *limit > 0)
+            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))));
+        Ok((rpc, agents))
+    }
+
+    fn secrets<'a>(&'a self, api_key: &'a str, bearer: &'a str) -> Vec<&'a str> {
+        let mut secrets = vec![api_key, bearer, self.callback.auth_token.as_str()];
+        secrets.extend(self.env.values().map(String::as_str));
+        secrets.retain(|secret| !secret.is_empty());
+        secrets
+    }
+}
+
+/// Owns the bridge process: exit, closed output or a kill request ends its whole group.
+async fn supervise(
+    mut process: SdkProcess,
+    kill: Arc<Notify>,
+    exited: watch::Sender<bool>,
+    processes: Arc<Processes>,
+) {
+    tokio::select! {
+        _ = &mut process.stdout => {}
+        _ = &mut process.stderr => {}
+        _ = process.child.wait() => {}
+        _ = kill.notified() => {}
+    }
+    if let Some(group) = process.group {
+        if terminate_process_group(&mut process.child, group).await {
+            process.group = None;
+        }
+        processes.forget(group);
+    }
+    let _ = exited.send(true);
 }
 
 async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
@@ -385,12 +820,35 @@ async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_sdk_tools(config: &SdkAgentConfig) -> Result<()> {
+fn validate_turn(turn: &SdkTurn, prompt: &str, previous_session_id: Option<&str>) -> Result<()> {
+    ensure!(turn.timeout_secs > 0, "Cursor SDK timeout must be positive");
     ensure!(
-        config.tool_env.len() <= 64,
-        "too many tool environment entries"
+        !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
+        "invalid management prompt"
     );
-    for (key, value) in &config.tool_env {
+    ensure!(
+        !turn.model.trim().is_empty(),
+        "Cursor SDK requires an explicit model"
+    );
+    validate_api_key(&turn.api_key)?;
+    validate_tools(&turn.custom_tools)?;
+    if let Some(id) = previous_session_id {
+        validate_sdk_id(id)?;
+    }
+    Ok(())
+}
+
+fn validate_api_key(api_key: &str) -> Result<()> {
+    ensure!(
+        !api_key.trim().is_empty() && api_key.len() <= 4096,
+        "CURSOR_API_KEY is missing or invalid"
+    );
+    Ok(())
+}
+
+fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(env.len() <= 64, "too many tool environment entries");
+    for (key, value) in env {
         ensure!(
             !key.is_empty()
                 && key.len() <= 256
@@ -414,12 +872,37 @@ fn validate_sdk_tools(config: &SdkAgentConfig) -> Result<()> {
             "invalid or reserved tool environment entry"
         );
     }
-    ensure!(config.custom_tools.len() <= 32, "too many custom tools");
+    Ok(())
+}
+
+fn validate_callback(callback: &ToolCallbackConfig) -> Result<()> {
+    let url = reqwest::Url::parse(&callback.url).context("invalid custom tool callback URL")?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| anyhow!("custom tool callback must use a loopback IP"))?;
     ensure!(
-        config.custom_tools.is_empty() || config.tool_callback.is_some(),
-        "custom tools require a callback"
+        url.scheme() == "http"
+            && ip.is_loopback()
+            && url.port().is_some_and(|port| port > 0)
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "custom tool callback must be a local HTTP origin"
     );
-    for (name, tool) in &config.custom_tools {
+    ensure!(
+        (32..=4096).contains(&callback.auth_token.len())
+            && !callback.auth_token.chars().any(char::is_control),
+        "invalid custom tool callback token"
+    );
+    Ok(())
+}
+
+fn validate_tools(tools: &BTreeMap<String, CustomToolConfig>) -> Result<()> {
+    ensure!(tools.len() <= 32, "too many custom tools");
+    for (name, tool) in tools {
         ensure!(
             !name.is_empty()
                 && name.len() <= 64
@@ -438,41 +921,16 @@ fn validate_sdk_tools(config: &SdkAgentConfig) -> Result<()> {
             "custom tool definition is too large"
         );
     }
-    if let Some(callback) = &config.tool_callback {
-        let url = reqwest::Url::parse(&callback.url).context("invalid custom tool callback URL")?;
-        let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-        let ip: IpAddr = host
-            .parse()
-            .map_err(|_| anyhow!("custom tool callback must use a loopback IP"))?;
-        ensure!(
-            url.scheme() == "http"
-                && ip.is_loopback()
-                && url.port().is_some_and(|port| port > 0)
-                && url.path() == "/"
-                && url.query().is_none()
-                && url.fragment().is_none()
-                && url.username().is_empty()
-                && url.password().is_none(),
-            "custom tool callback must be a local HTTP origin"
-        );
-        ensure!(
-            (32..=4096).contains(&callback.auth_token.len())
-                && !callback.auth_token.chars().any(char::is_control),
-            "invalid custom tool callback token"
-        );
-    }
     Ok(())
 }
 
-fn sdk_options(config: &SdkAgentConfig, api_key: &str) -> Result<Value> {
-    validate_sdk_tools(config)?;
-    let workspace = config
+fn sdk_options(turn: &SdkTurn) -> Result<Value> {
+    let workspace = turn
         .workspace
         .to_str()
         .context("Cursor SDK workspace path must be UTF-8")?;
-    let options = json!({"apiKey":api_key,"model":{"id":config.model},
-        "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":{}});
-    Ok(options)
+    Ok(json!({"apiKey":turn.api_key,"model":{"id":turn.model},
+        "local":{"cwd":[workspace],"settingSources":[],"customTools":turn.custom_tools},"mcpServers":{}}))
 }
 
 fn validate_sdk_id(id: &str) -> Result<()> {
@@ -491,6 +949,8 @@ struct Discovery {
     protocol: String,
     url: String,
     auth_token_file: PathBuf,
+    /// Present only when the bridge was launched with `--max-concurrent-agents`.
+    max_concurrent_agents: Option<usize>,
 }
 
 impl Discovery {
@@ -531,115 +991,8 @@ impl Drop for SdkProcess {
         self.stdout.abort();
         self.stderr.abort();
         if let Some(group) = self.group.take() {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{group}")])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            signal_group_now(group, "-KILL");
         }
-    }
-}
-
-impl SdkProcess {
-    async fn start(config: &SdkAgentConfig, api_key: &str) -> Result<(Self, Rpc)> {
-        let mut command = Command::new(&config.executable);
-        command
-            .arg("--workspace")
-            .arg(&config.workspace)
-            .arg("--state-root")
-            .arg(config.workspace.join(".sdk"))
-            .args(["--host", "127.0.0.1", "--port", "0"])
-            .current_dir(&config.workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("VIBEFACE_")
-                || name.starts_with("CURSOR_SDK_")
-                || matches!(
-                    name.as_ref(),
-                    "CURSOR_API_KEY"
-                        | "HTTP_PROXY"
-                        | "HTTPS_PROXY"
-                        | "ALL_PROXY"
-                        | "NO_PROXY"
-                        | "http_proxy"
-                        | "https_proxy"
-                        | "all_proxy"
-                        | "no_proxy"
-                )
-            {
-                command.env_remove(key);
-            }
-        }
-        command
-            .envs(&config.tool_env)
-            .env("CURSOR_API_KEY", api_key)
-            .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
-        let mut child = command
-            .spawn()
-            .context("could not start cursor-sdk-bridge")?;
-        let group = child.id().context("Cursor SDK process has no group")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("Cursor SDK stdout unavailable")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Cursor SDK stderr unavailable")?;
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let stdout = tokio::spawn(drain(stdout));
-        let stderr = tokio::spawn(read_discovery(stderr, ready_tx));
-        let mut process = Self {
-            child,
-            group: Some(group),
-            stdout,
-            stderr,
-        };
-        let discovery = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(30), ready_rx) => {
-                result.context("Cursor SDK startup timed out")?.context("Cursor SDK stopped before discovery")??
-            }
-            _ = process.child.wait() => bail!("Cursor SDK process exited before discovery"),
-        };
-        let endpoint = discovery.endpoint()?;
-        let metadata = tokio::fs::symlink_metadata(&discovery.auth_token_file)
-            .await
-            .context("Cursor SDK token file unavailable")?;
-        ensure!(
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.permissions().mode() & 0o777 == 0o600
-                && metadata.len() <= 4096,
-            "Cursor SDK token file must be a private 0600 file"
-        );
-        let bearer = tokio::fs::read_to_string(&discovery.auth_token_file)
-            .await
-            .map_err(|_| anyhow!("could not read Cursor SDK token file"))?;
-        let bearer = bearer.trim().to_owned();
-        ensure!(
-            !bearer.is_empty() && bearer.len() <= 4096,
-            "invalid Cursor SDK bridge authentication token"
-        );
-        let client = reqwest::Client::builder()
-            .http1_only()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .map_err(|_| anyhow!("could not create Cursor SDK HTTP client"))?;
-        Ok((
-            process,
-            Rpc {
-                endpoint,
-                bearer,
-                client,
-            },
-        ))
     }
 }
 
@@ -1160,14 +1513,16 @@ fn safe_progress_event(kind: &str, event: &Value) -> Option<Value> {
     (output.len() > 1).then_some(Value::Object(output))
 }
 
+fn redact_text(mut text: String, secrets: &[&str]) -> String {
+    for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
+        text = text.replace(secret, "[redacted]");
+    }
+    text
+}
+
 fn redact_progress(value: Value, secrets: &[&str]) -> Value {
     match value {
-        Value::String(mut text) => {
-            for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
-                text = text.replace(secret, "[redacted]");
-            }
-            Value::String(text)
-        }
+        Value::String(text) => Value::String(redact_text(text, secrets)),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
@@ -1374,12 +1729,12 @@ mod tests {
 
     #[test]
     fn native_custom_tools_need_a_private_local_callback_and_no_mcp_server() {
-        let mut config = SdkAgentConfig {
+        let turn = SdkTurn {
             executable: "/sdk".into(),
             workspace: "/manager".into(),
+            api_key: "fixture-key".into(),
             timeout_secs: 5,
             model: "fixture-model".into(),
-            tool_env: BTreeMap::new(),
             process_started: None,
             custom_tools: BTreeMap::from([(
                 "context".into(),
@@ -1389,28 +1744,26 @@ mod tests {
                     output_schema: None,
                 },
             )]),
-            tool_callback: Some(ToolCallbackConfig {
-                url: "http://127.0.0.1:1234".into(),
-                auth_token: "x".repeat(32),
-            }),
         };
-        let options = sdk_options(&config, "fixture-key").unwrap();
+        let options = sdk_options(&turn).unwrap();
         assert_eq!(options["mcpServers"], json!({}));
         assert!(options.get("tools").is_none());
         assert_eq!(
             options["local"]["customTools"]["context"]["inputSchema"],
             json!({"type":"object"})
         );
-        assert!(options.to_string().find(&"x".repeat(32)).is_none());
-        config
-            .tool_env
-            .insert("CURSOR_API_KEY".into(), "override".into());
-        assert!(sdk_options(&config, "fixture-key").is_err());
-        config.tool_env.remove("CURSOR_API_KEY");
-        config.tool_callback.as_mut().unwrap().url = "http://192.0.2.1:1234".into();
-        assert!(sdk_options(&config, "fixture-key").is_err());
-        config.tool_callback = None;
-        assert!(sdk_options(&config, "fixture-key").is_err());
+        let callback = ToolCallbackConfig {
+            url: "http://127.0.0.1:1234".into(),
+            auth_token: "x".repeat(32),
+        };
+        assert!(SdkBridge::new(BTreeMap::new(), callback.clone(), None).is_ok());
+        let reserved = BTreeMap::from([("CURSOR_API_KEY".into(), "override".into())]);
+        assert!(SdkBridge::new(reserved, callback.clone(), None).is_err());
+        let remote = ToolCallbackConfig {
+            url: "http://192.0.2.1:1234".into(),
+            ..callback
+        };
+        assert!(SdkBridge::new(BTreeMap::new(), remote, None).is_err());
     }
 
     #[tokio::test]
@@ -1676,6 +2029,7 @@ mod tests {
             protocol: "connect".into(),
             url: "http://127.0.0.1:1234".into(),
             auth_token_file: "/token".into(),
+            max_concurrent_agents: None,
         };
         assert!(ready.endpoint().is_ok());
         for url in [

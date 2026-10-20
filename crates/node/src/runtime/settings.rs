@@ -160,10 +160,14 @@ impl Runtime {
         configuration.manager = settings.manager.clone();
         configuration.roots = settings.roots.clone();
         configuration.save(directory)?;
+        let manager_changed = self.settings_snapshot().manager != settings.manager;
         *self
             .settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
+        if manager_changed {
+            self.refresh_cursor();
+        }
         self.schedule_wakeup.notify_one();
         self.node_settings().await
     }

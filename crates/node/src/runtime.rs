@@ -20,6 +20,7 @@ mod agent_tools;
 mod bots;
 mod chat_controls;
 mod codex_server;
+mod cursor;
 pub mod decision;
 mod followup;
 mod manager_control;
@@ -134,6 +135,12 @@ pub struct Runtime {
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
+    /// The resident Cursor SDK bridge, created with the tool listener it calls back to.
+    pub(crate) cursor: std::sync::OnceLock<Arc<vibeface_bridge::agent::SdkBridge>>,
+    /// Shared by every Cursor turn, so it only proves the bridge called; the agent picks the attempt.
+    cursor_callback_token: String,
+    /// Cursor agent id → token of the attempt running it.
+    pub(crate) cursor_agents: Mutex<HashMap<String, String>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
     codex_epoch: std::sync::atomic::AtomicU64,
@@ -205,6 +212,7 @@ impl Runtime {
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
+        vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
         let codex = Arc::new(codex_server::CodexServer::open(
             &config, &identity, dir, tx,
         )?);
@@ -239,6 +247,9 @@ impl Runtime {
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
+            cursor: std::sync::OnceLock::new(),
+            cursor_callback_token: hex::encode(rand::random::<[u8; 32]>()),
+            cursor_agents: Mutex::new(HashMap::new()),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             codex_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -325,10 +336,13 @@ impl Runtime {
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
-    /// Stops the managed App Server; the Node calls this on SIGTERM before exiting.
+    /// Stops the managed App Server and Cursor bridge; the Node calls this on SIGTERM before exiting.
     pub async fn shutdown(&self) {
         self.stop_network().await;
         self.codex.stop().await;
+        if let Some(bridge) = self.cursor.get() {
+            bridge.stop().await;
+        }
     }
     pub async fn append(&self, network: &str, scope: &str, body: EventBody) -> Result<SignedEvent> {
         self.append_blobs(network, scope, body, vec![]).await
