@@ -469,11 +469,13 @@ impl Runtime {
                 let ours = self.hello(network).await?;
                 let theirs: BTreeMap<String, (u64, String)> =
                     serde_json::from_value(input["vector"].clone()).context("invalid vector")?;
-                let local: BTreeMap<String, (u64, String)> =
-                    serde_json::from_value(ours["vector"].clone())?;
-                let behind = theirs.iter().any(|(author, (seq, _))| {
-                    local.get(author).map(|head| head.0).unwrap_or(0) < *seq
-                });
+                // A head we lack is either further along or on another branch of that log.
+                let behind = {
+                    let store = self.store.lock().await;
+                    theirs.values().try_fold(false, |behind, (_, hash)| {
+                        anyhow::Ok(behind || store.event(network, hash)?.is_none())
+                    })?
+                };
                 let forks = input["forks"] != ours["forks"]
                     && self.note_forks(origin, &input["forks"], &ours["forks"]);
                 if behind || forks || input["membership"] != ours["membership"] {
