@@ -388,6 +388,7 @@ Attestation {
 | `WorkFinished` | `work_id`、`outcome`、`result_text`、`failure_reason?`，结果正文过长时放入 `blobs` | 目标 Node，`unverified` 的复核由入口 Node 写 | `outcome` 为 `completed`、`failed`、`interrupted` 或 `unverified` |
 | `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码 |
 | `NotificationAcked` | `notification_id`、`client_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
+| `AssistantChanged` | `change_id`、`cause`、`change` | 调度 Node | 本人在聊天里要求修改助手名称、说明、共用 skill 或例行任务，见 [在聊天中修改助手](assistant-config.md) |
 | `ContextCheckpoint` | `summary`、`covers: VersionVector` | 调度 Node | 保留现有类型，用于长会话的上下文压缩，`covered_heads` 改为版本向量 |
 
 `kind=codex` 表示本机协调 Agent 直连本机 App Server 发出、Node 观察的 Codex 回合，`kind=task` 表示把任务交给目标 Node 的协调 Agent。没有单独的执行层，见 `docs/design/agent-direct-app-server.md`。目标协调 Agent 在执行 `task` 时自己启动的 Codex 工作，记为一条 `parent_work` 指向原任务的新 `WorkDispatched`。

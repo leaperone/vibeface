@@ -1,5 +1,7 @@
 //! Incremental projections. Each event updates its rows once, as it is stored; every rule is
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
+//! Assistant settings, skills and routines keep the last change by rank; a removal is a `NULL`
+//! row, so an older change arriving later cannot bring it back.
 use crate::model::*;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -205,6 +207,43 @@ pub(crate) fn apply(
                 "INSERT INTO alert_resolutions(network_id,alert_id,resolution,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,alert_id) DO UPDATE SET resolution=excluded.resolution,rank=excluded.rank WHERE excluded.rank<rank",
                 params![network, alert_id, text(resolution)?, rank],
             )?;
+        }
+        EventBody::AssistantChanged {
+            change_id,
+            cause,
+            change,
+        } => {
+            connection.execute(
+                "INSERT INTO assistant_changes(network_id,change_id,conversation_id,event_hash,rank,cause,change,created_at_ms) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,change_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause,change=excluded.change,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
+                params![network, change_id, scope, hash, rank, cause, serde_json::to_string(change)?, event.created_at_ms],
+            )?;
+            match change {
+                AssistantChange::Profile { name, instructions } => {
+                    for (field, edit) in [("name", name), ("instructions", instructions)] {
+                        let Some(edit) = edit else { continue };
+                        connection.execute(
+                            "INSERT INTO assistant_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
+                            params![network, scope, field, edit.after, rank],
+                        )?;
+                    }
+                }
+                AssistantChange::Skill {
+                    skill_id, after, ..
+                } => {
+                    connection.execute(
+                        "INSERT INTO skills(network_id,skill_id,skill,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,skill_id) DO UPDATE SET skill=excluded.skill,rank=excluded.rank WHERE excluded.rank>rank",
+                        params![network, skill_id, after.as_ref().map(serde_json::to_string).transpose()?, rank],
+                    )?;
+                }
+                AssistantChange::Routine {
+                    routine_id, after, ..
+                } => {
+                    connection.execute(
+                        "INSERT INTO routines(network_id,routine_id,conversation_id,routine,rank,changed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,routine_id) DO UPDATE SET conversation_id=excluded.conversation_id,routine=excluded.routine,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE excluded.rank>rank",
+                        params![network, routine_id, scope, after.as_ref().map(serde_json::to_string).transpose()?, rank, event.created_at_ms],
+                    )?;
+                }
+            }
         }
         EventBody::ContextCheckpoint { .. } => {}
     }

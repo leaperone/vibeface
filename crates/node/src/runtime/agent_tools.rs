@@ -1,5 +1,9 @@
 use super::*;
-use crate::work::{Dispatch, DispatchState, WorkSpec};
+use crate::{
+    scheduler::SETTINGS_TOOLS,
+    store::assistant::{ChangeRequest, change_id},
+    work::{Dispatch, DispatchState, WorkSpec},
+};
 
 /// A dispatch to another device that has not shown up as work yet.
 fn dispatch_value(dispatch: &Dispatch) -> Value {
@@ -29,8 +33,9 @@ impl Runtime {
             .clone()
             .context("missing tool scope")?;
         let write = match name {
-            "nodes" | "context" | "work_status" | "call_lookup" => false,
+            "nodes" | "context" | "work_status" | "call_lookup" | "read_skill" => false,
             "track_work" | "bind_work" | "dispatch_work" | "interrupt_work" => true,
+            name if SETTINGS_TOOLS.contains(&name) => true,
             _ => bail!("unknown or unavailable coordination tool"),
         };
         ensure!(
@@ -65,18 +70,64 @@ impl Runtime {
                     .manager
                     .as_ref()
                     .context("call lookup requires an agent invocation")?;
-                let id = WorkSpec::id(&scope, &manager.trigger, field(&args, "call_ref")?);
-                let works = self.store.lock().await.works(network, &scope)?;
-                if let Some(work) = works.into_iter().find(|work| work.work_id == id) {
+                let call_ref = field(&args, "call_ref")?;
+                let id = WorkSpec::id(&scope, &manager.trigger, call_ref);
+                let store = self.store.lock().await;
+                if let Some(work) = store
+                    .works(network, &scope)?
+                    .into_iter()
+                    .find(|work| work.work_id == id)
+                {
                     return Ok(json!(work));
                 }
-                let dispatch = self
+                if let Some(dispatch) = store.dispatch(network, &id)? {
+                    return Ok(dispatch_value(&dispatch));
+                }
+                let change = store
+                    .assistant_change(network, &change_id(&scope, &manager.trigger, call_ref))?
+                    .context("nothing was dispatched or changed with this call_ref")?;
+                Ok(json!(change))
+            }
+            "read_skill" => {
+                let id = field(&args, "skill_id")?;
+                let skill = self
                     .store
                     .lock()
                     .await
-                    .dispatch(network, &id)?
-                    .context("no work was dispatched with this call_ref")?;
-                Ok(dispatch_value(&dispatch))
+                    .skill(network, id)?
+                    .with_context(|| format!("skill {id} not found"))?;
+                let mut value = json!(skill);
+                value["skill_id"] = json!(id);
+                Ok(value)
+            }
+            name if SETTINGS_TOOLS.contains(&name) => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("assistant changes require an agent invocation")?;
+                let call_ref = field(&args, "call_ref")?.to_owned();
+                let mut request = args;
+                let fields = request
+                    .as_object_mut()
+                    .context("tool arguments must be an object")?;
+                fields.remove("call_ref");
+                fields.insert("tool".into(), json!(name));
+                let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
+                    anyhow::anyhow!("{error}. Model, provider and folders change only in Settings")
+                })?;
+                let (record, written) = self.store.lock().await.change_assistant(
+                    &self.identity,
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    &call_ref,
+                    request,
+                    now_ms(),
+                )?;
+                if written {
+                    self.publish_changed(network, &scope, &record.event_hash);
+                }
+                Ok(json!(record))
             }
             "track_work" => self.track_work(&access, &scope, &args).await,
             "bind_work" => self.bind_work(network, &scope, &args).await,

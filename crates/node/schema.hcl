@@ -326,6 +326,128 @@ table "bots" {
     columns = [column.network_id, column.conversation_id]
   }
 }
+table "assistant_profiles" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "field" {
+    null = false
+    type = text
+  }
+  column "value" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.field]
+  }
+}
+table "skills" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "skill_id" {
+    null = false
+    type = text
+  }
+  column "skill" {
+    null = true
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.skill_id]
+  }
+}
+table "routines" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "routine_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "routine" {
+    null = true
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "changed_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.routine_id]
+  }
+  index "routines_conversation" {
+    columns = [column.network_id, column.conversation_id]
+  }
+}
+table "assistant_changes" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "change_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "event_hash" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "cause" {
+    null = false
+    type = text
+  }
+  column "change" {
+    null = false
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.change_id]
+  }
+  index "assistant_changes_order" {
+    columns = [column.network_id, column.conversation_id, column.rank]
+  }
+}
 table "works" {
   schema = schema.main
   column "network_id" {

@@ -46,6 +46,39 @@ impl Runtime {
                 }
             }
         });
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let _work = node.maintenance.enter_when_open().await;
+                if let Err(error) = node.fire_routines().await {
+                    tracing::warn!(%error, "routine runs are pending");
+                }
+            }
+        });
+    }
+
+    /// Queues the routines that are due in conversations this Node schedules.
+    async fn fire_routines(self: &Arc<Self>) -> Result<()> {
+        if !self.config.roles.contains(&NodeRole::Scheduler)
+            || self.settings_snapshot().manager.is_none()
+        {
+            return Ok(());
+        }
+        let networks = self.store.lock().await.networks()?;
+        for network in networks {
+            let admitted =
+                self.store
+                    .lock()
+                    .await
+                    .admit_due_routines(&self.identity, &network, now_ms())?;
+            for (scope, trigger) in admitted {
+                self.publish_changed(&network, &scope, &trigger);
+                self.schedule_wakeup.notify_one();
+            }
+        }
+        Ok(())
     }
 
     async fn schedule_tick(self: &Arc<Self>) -> Result<()> {

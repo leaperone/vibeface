@@ -898,7 +898,8 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let write = name == "dispatch_work";
+    let write =
+        name == "dispatch_work" || vibeface::scheduler::SETTINGS_TOOLS.contains(&name.as_str());
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
@@ -910,7 +911,7 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
     ensure!(
         !write || call_ref.is_some(),
-        "dispatch_work requires --call-ref; keep it and query call_lookup after any uncertain result"
+        "{name} requires --call-ref; keep it and query call_lookup after any uncertain result"
     );
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);

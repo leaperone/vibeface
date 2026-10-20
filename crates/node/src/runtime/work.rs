@@ -137,6 +137,20 @@ impl Runtime {
                     "the result this work follows has not reached this device"
                 );
             }
+            Some(("routine", _)) => {
+                ensure!(
+                    from_owner,
+                    "only the conversation's scheduling device dispatches its work"
+                );
+                let (routine_id, _) = crate::scheduling::parse_routine_trigger(&spec.trigger)
+                    .context("invalid work trigger")?;
+                ensure!(
+                    store.routine(network, routine_id)?.is_some_and(|entry| {
+                        entry.conversation_id == spec.conversation && entry.routine.enabled
+                    }),
+                    "the routine this work runs for is paused, deleted or has not reached this device"
+                );
+            }
             Some(("task", task)) => {
                 let task = store
                     .work_record(network, task)?

@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=7`，数据库 `user_version=6`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=7`，数据库 `user_version=7`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -72,7 +72,7 @@
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
 | `data-epoch.json` | `{"data_epoch":7}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=6` |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=7` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -156,11 +156,11 @@
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
 | `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq` 和能力；同步正在失败的 Node 直接记为离线，不等待探测 |
-| `bots` | 无 | 当前网络的机器人定义 |
+| `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改 |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |
-| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`、`autonomy`、`pending_checks`、`local_node` 和调度队列 |
+| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`、`autonomy`、`changes`、`assistant`、`pending_checks`、`local_node` 和调度队列 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `set_autonomy` | `conversation_id`、`mode`、`expected_version`、`attestation` | 设置该聊天的后续权限：`off`、`report` 或 `continue` |
@@ -180,11 +180,13 @@
 
 `read_artifact` 默认按 UTF-8 文本分页，返回 `{ blob_hash, text, offset, next_offset, size }`，`limit` 为 4 至 65536 字节，偏移必须位于字符边界。`binary: true` 时每页 512 KiB，只读取请求的区间，返回 `{ blob_hash, offset, size, next_offset, data }`，`data` 为 base64。`next_offset` 为 `null` 时结束。浏览器拼好全部字节后用 SHA-256 与 `blob_hash` 比对，一致才保存文件。附件随引用它的消息由同步按哈希拉到其他成员 Node，还没拉到的入口读取失败，稍后再试。
 
+`changes` 按 rank 列出本会话的助手修改，每项为 `{ change_id, cause, event_hash, created_at_ms, change }`，`change` 即 `AssistantChanged.change`。`assistant` 为 `{ skills: [{ skill_id, name, description }], routines: [{ routine_id, name, prompt, first_run_at_ms, every_minutes, enabled, next_run_at_ms }] }`，skill 是全网共用的库，routines 只列本会话的例行任务，暂停时 `next_run_at_ms` 为 `null`。
+
 `works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason` 和本机状态 `state`。网页以 `title` 为任务名，`prompt` 放在详细信息里。
 
 ## 可靠调度回执
 
-可靠调度版本为 `2`。调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>` 或 `work:<work_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
+可靠调度版本为 `2`。调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>`、`work:<work_id>`、`task:<work_id>` 或 `routine:<routine_id>:<slot_ms>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
 
 ```json
 {
@@ -198,7 +200,9 @@
 
 会话负责人由 `ConversationOwner` 决定。入口不是负责人时，消息写入入口自己的日志并留在本机 outbox，回执 `state=pending_delivery`，入口每 3 秒经 `vibeface/rpc/1` 的 `deliver` 投递一次，负责人按触发事件幂等接纳。投递时才解析负责人，所以换负责人后旧负责人尚未开始的 job 交给新负责人。浏览器收到入口回执即删除自己的 outbox 项。
 
-每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果。每轮按领取时固定的版本向量 `basis` 准备上下文。
+每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果和例行任务。每轮按领取时固定的版本向量 `basis` 准备上下文。
+
+负责人每 30 秒检查本机负责的会话中已启用的例行任务，只取不晚于当前时间的最近一个时刻 `slot_ms`，错过的不补跑。本机记下已触发的最近时刻；DAG 中已有该 trigger 的回复（`message_id` 由会话和 trigger 派生）或同一例行任务仍在排队时跳过。早于最近一次修改 5 分钟以上的时刻不运行，所以暂停后恢复不会补跑。例行任务轮可以派发工作，不提供修改助手的工具，回复的 `in_reply_to` 为该 trigger，由它派发的工作结果也回复这个 trigger。领取前例行任务已暂停或删除时 job 取消。换负责人时未开始的例行任务 job 直接丢弃，由新负责人按自己的检查运行。
 
 job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `interrupted`，后四种是终态。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。助手回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。
 
@@ -217,7 +221,9 @@ queued → claimed → running ─→ completed | failed
 
 ## 工作
 
-每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`；只读的结果汇报轮只得到查询工具。
+每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。
+
+修改助手的工具为 `update_profile { call_ref, name?, instructions? }`、`save_skill { call_ref, skill_id?, name, description, body }`、`remove_skill { call_ref, skill_id }`、`save_routine { call_ref, routine_id?, name, prompt, first_run_at_ms, every_minutes, enabled? }` 和 `remove_routine { call_ref, routine_id }`，只提供给本人消息触发的轮次。Node 再核对 trigger 是 `message:<id>` 且该消息是本会话的本人消息，`cause` 取自 trigger，`change_id` 由 `(会话, trigger, call_ref)` 派生，同一 `call_ref` 同内容返回原记录，换内容拒绝，`call_lookup` 也能查到修改。改前值取自投影，没有变化的修改被拒绝。参数不接受其他字段，模型、AI 服务和文件夹只能在设置里改。修改名称和说明需要会话有机器人；例行任务只能由创建它的会话修改。
 
 Node 接纳工作时核对派发方是成员 Node、触发消息带本人签名或会话 `AutonomySet` 为 `continue`，并核对 `cwd` 位于自己的 `roots` 内。本机工作（`kind=codex`）：`track_work` 写 `WorkDispatched` 并返回 `{work_id, call_ref, state, may_send, send_by_ms, cwd, thread_id?}`，只有第一次登记 `may_send=true`；CLI 用 `thread/start`（`approvalPolicy=never`、`danger-full-access`）开线程，`bind_work {work_id, thread_id}` 绑定后才发 `turn/start`，`clientUserMessageId` 为 `work_id`，再 `bind_work {work_id, turn_id | unknown | failed}`。`send_by_ms` 为登记后 60 秒，之后不再发送；再过 30 秒仍没有回合时 Node 按 `clientId` 复查线程，找不到就记为 `rejected`。`target_node` 是其他设备时，任务（`kind=task`）作为那台设备协调 Agent 的一轮执行，由它在本机直连派发。`continues` 在原工作的 thread 上开新 turn，原目标不可达时报错，不改派。
 
@@ -255,7 +261,10 @@ Event {
 | `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `autonomy_set` | `mode`、`version`、`attestation` | 入口 Node |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
+| `assistant_changed` | `change_id`、`cause`、`change` | 负责人 |
 | `context_checkpoint` | `covers`、`summary`、`standing_instructions`、`open_work`、`decisions` | 负责人 |
+
+`assistant_changed.change` 按 `kind` 区分：`profile { name?, instructions? }` 的每项为 `{ before, after }`；`skill { skill_id, before, after }` 与 `routine { routine_id, before, after }` 的 `after` 为 `null` 表示删除。skill 为 `{ name, description, body }`，名称最多 64 字符，说明最多 512 字节，正文最多 16 KiB；例行任务为 `{ name, prompt, first_run_at_ms, every_minutes, enabled }`，名称最多 120 字符，说明最多 8 KiB，`every_minutes` 为 5 至 40320。说明（instructions）最多 8192 字节。这个事件不带 `attestation`，入库时要求 `prev` 或 `deps` 中有同一会话、`message_id` 等于 `cause` 且带 `attestation` 的本人消息，否则拒绝。投影只比较 rank：名称和说明逐项后写者胜并合并进机器人定义，skill 全网按 `skill_id`、例行任务按 `routine_id` 后写者胜并保留删除，修改记录按 `change_id` 取 rank 最小者。
 
 通知由 `work_finished` 派生，通知 ID 即该事件 hash。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 

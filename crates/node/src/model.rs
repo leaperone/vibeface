@@ -109,6 +109,178 @@ pub struct Attestation {
     pub signature: String,
 }
 
+pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
+pub const MAX_SKILL_NAME_CHARS: usize = 64;
+pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 512;
+pub const MAX_SKILL_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_ROUTINE_NAME_CHARS: usize = 120;
+pub const MAX_ROUTINE_PROMPT_BYTES: usize = 8 * 1024;
+/// Every 5 minutes up to every 4 weeks; a day is 1440 and a week 10080.
+pub const ROUTINE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
+
+/// One setting's value before and after a change; `before` is what the writer saw.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Edit {
+    pub before: String,
+    pub after: String,
+}
+
+/// A saved workflow in the library every assistant of the network shares.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// A turn its assistant runs at `first_run_at_ms` and then every `every_minutes`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Routine {
+    pub name: String,
+    pub prompt: String,
+    pub first_run_at_ms: i64,
+    pub every_minutes: u32,
+    pub enabled: bool,
+}
+
+/// What a chat turn changed about its assistant. A `None` after removes the skill or routine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AssistantChange {
+    Profile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<Edit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<Edit>,
+    },
+    Skill {
+        skill_id: String,
+        before: Option<Skill>,
+        after: Option<Skill>,
+    },
+    Routine {
+        routine_id: String,
+        before: Option<Routine>,
+        after: Option<Routine>,
+    },
+}
+
+fn validate_line(value: &str, what: &str, max_chars: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.trim().is_empty()
+            && value.chars().count() <= max_chars
+            && !value.chars().any(char::is_control),
+        "{what} must be one line of 1-{max_chars} characters"
+    );
+    Ok(())
+}
+
+pub fn validate_bot_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.trim().is_empty() && name.len() <= 512 && !name.chars().any(char::is_control),
+        "invalid Bot name"
+    );
+    Ok(())
+}
+
+pub fn validate_instructions(instructions: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        instructions.len() <= MAX_INSTRUCTIONS_BYTES,
+        "Bot instructions must be at most {MAX_INSTRUCTIONS_BYTES} bytes"
+    );
+    Ok(())
+}
+
+impl Skill {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_line(&self.name, "a skill name", MAX_SKILL_NAME_CHARS)?;
+        anyhow::ensure!(
+            self.description.len() <= MAX_SKILL_DESCRIPTION_BYTES,
+            "a skill description must be at most {MAX_SKILL_DESCRIPTION_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            !self.body.trim().is_empty() && self.body.len() <= MAX_SKILL_BODY_BYTES,
+            "a skill body must be 1-{MAX_SKILL_BODY_BYTES} bytes"
+        );
+        Ok(())
+    }
+}
+
+impl Routine {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_line(&self.name, "a routine name", MAX_ROUTINE_NAME_CHARS)?;
+        anyhow::ensure!(
+            !self.prompt.trim().is_empty() && self.prompt.len() <= MAX_ROUTINE_PROMPT_BYTES,
+            "a routine prompt must be 1-{MAX_ROUTINE_PROMPT_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            self.first_run_at_ms >= 0,
+            "first_run_at_ms must be a Unix time in milliseconds"
+        );
+        anyhow::ensure!(
+            ROUTINE_MINUTES.contains(&self.every_minutes),
+            "every_minutes must be between {} and {}",
+            ROUTINE_MINUTES.start(),
+            ROUTINE_MINUTES.end()
+        );
+        Ok(())
+    }
+}
+
+impl AssistantChange {
+    /// Every change sets something new; a removal needs something to remove.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
+        match self {
+            Self::Profile { name, instructions } => {
+                anyhow::ensure!(
+                    name.is_some() || instructions.is_some(),
+                    "a profile change names a field"
+                );
+                if let Some(name) = name {
+                    validate_bot_name(&name.after)?;
+                    anyhow::ensure!(name.before != name.after, "the name is unchanged");
+                }
+                if let Some(instructions) = instructions {
+                    validate_instructions(&instructions.after)?;
+                    anyhow::ensure!(
+                        instructions.before != instructions.after,
+                        "the instructions are unchanged"
+                    );
+                }
+            }
+            Self::Skill {
+                skill_id,
+                before,
+                after,
+            } => {
+                id(skill_id)?;
+                anyhow::ensure!(
+                    (before.is_some() || after.is_some()) && before != after,
+                    "the skill is unchanged"
+                );
+                after.as_ref().map(Skill::validate).transpose()?;
+            }
+            Self::Routine {
+                routine_id,
+                before,
+                after,
+            } => {
+                id(routine_id)?;
+                anyhow::ensure!(
+                    (before.is_some() || after.is_some()) && before != after,
+                    "the routine is unchanged"
+                );
+                after.as_ref().map(Routine::validate).transpose()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventBody {
@@ -218,6 +390,13 @@ pub enum EventBody {
         resolution: AlertResolution,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
+    },
+    /// Written by the owner in a turn the user's message `cause` started; that message is one
+    /// of its parents. `change_id` derives from the turn and the tool's `call_ref`.
+    AssistantChanged {
+        change_id: String,
+        cause: String,
+        change: AssistantChange,
     },
     /// Written only by the owner in a read-only closing turn; covered events stay stored.
     ContextCheckpoint {
@@ -349,6 +528,34 @@ pub struct Bot {
     pub instructions: String,
     pub project: Option<BotProject>,
     pub event_hash: EventHash,
+}
+
+/// The earliest `AssistantChanged` of one `change_id`; the chat shows it as a card.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeRecord {
+    pub change_id: String,
+    pub cause: String,
+    pub event_hash: EventHash,
+    pub created_at_ms: i64,
+    pub change: AssistantChange,
+}
+
+/// Output only: `flatten` cannot read back a `deny_unknown_fields` struct.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub skill_id: String,
+    #[serde(flatten)]
+    pub skill: Skill,
+}
+
+/// A routine that is not removed; `changed_at_ms` is when its current definition was written.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoutineEntry {
+    pub routine_id: String,
+    pub conversation_id: ScopeId,
+    #[serde(flatten)]
+    pub routine: Routine,
+    pub changed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

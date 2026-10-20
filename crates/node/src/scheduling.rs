@@ -1,6 +1,9 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
 //! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
-use crate::{crypto::digest, model::VersionVector};
+use crate::{
+    crypto::digest,
+    model::{Routine, VersionVector},
+};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEDULING_VERSION: u32 = 2;
@@ -13,6 +16,8 @@ pub enum TriggerKind {
     WorkResult,
     /// A `task` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
     AgentTask,
+    /// A scheduled run of a routine the user set up in this conversation.
+    Routine,
 }
 
 pub fn message_trigger(message_id: &str) -> String {
@@ -25,6 +30,46 @@ pub fn work_trigger(work_id: &str) -> String {
 
 pub fn task_trigger(work_id: &str) -> String {
     format!("task:{work_id}")
+}
+
+/// One scheduled time of a routine. It also keys the job and is the reply's `in_reply_to`.
+pub fn routine_trigger(routine_id: &str, slot_ms: i64) -> String {
+    format!("routine:{routine_id}:{slot_ms}")
+}
+
+/// `(routine_id, slot_ms)` of a routine trigger in its single canonical spelling.
+pub fn parse_routine_trigger(trigger: &str) -> Option<(&str, i64)> {
+    let (routine_id, slot) = trigger.strip_prefix("routine:")?.split_once(':')?;
+    vibeface_protocol::validate_id(routine_id).ok()?;
+    let slot_ms: i64 = slot.parse().ok().filter(|slot| *slot >= 0)?;
+    (slot_ms.to_string() == slot).then_some((routine_id, slot_ms))
+}
+
+fn interval_ms(routine: &Routine) -> i64 {
+    i64::from(routine.every_minutes.max(1)) * 60_000
+}
+
+/// The newest scheduled time at or before `now`; earlier missed times are never run.
+pub fn latest_slot(routine: &Routine, now: i64) -> Option<i64> {
+    let since = now
+        .checked_sub(routine.first_run_at_ms)
+        .filter(|since| *since >= 0)?;
+    Some(routine.first_run_at_ms + since / interval_ms(routine) * interval_ms(routine))
+}
+
+/// The first scheduled time at or after `now`, or `None` while paused.
+pub fn next_run(routine: &Routine, now: i64) -> Option<i64> {
+    if !routine.enabled {
+        return None;
+    }
+    let Some(latest) = latest_slot(routine, now) else {
+        return Some(routine.first_run_at_ms);
+    };
+    Some(if latest == now {
+        latest
+    } else {
+        latest.saturating_add(interval_ms(routine))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,13 +150,14 @@ impl JobState {
 pub struct SchedulerJob {
     pub version: u32,
     pub conversation_id: String,
-    /// `message:<message_id>`, `work:<work_id>` or `task:<work_id>`.
+    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>` or `routine:<routine_id>:<slot_ms>`.
     pub trigger: String,
     pub kind: TriggerKind,
     pub sequence: u64,
     /// The version vector the turn reads; later events are not part of its prompt.
     pub basis: VersionVector,
-    /// The user message this turn ultimately answers; an agent task's own work ID.
+    /// The user message this turn ultimately answers, an agent task's own work ID, or a
+    /// routine run's trigger.
     pub reply_to: String,
     /// The assistant reply's message ID, fixed at admission so retries reuse it.
     pub message_id: String,

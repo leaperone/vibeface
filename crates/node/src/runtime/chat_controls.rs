@@ -238,6 +238,23 @@ impl Runtime {
             }
             messages.push(value);
         }
+        let changes = store.assistant_changes(network, scope)?;
+        let now = now_ms();
+        let skills: Vec<_> = store
+            .skills(network)?
+            .into_iter()
+            .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name,"description":entry.skill.description}))
+            .collect();
+        let routines: Vec<_> = store
+            .routines(network, scope)?
+            .into_iter()
+            .map(|entry| {
+                let mut value = json!(entry.routine);
+                value["routine_id"] = json!(entry.routine_id);
+                value["next_run_at_ms"] = json!(crate::scheduling::next_run(&entry.routine, now));
+                value
+            })
+            .collect();
         drop(store);
         let settings = self.settings_snapshot();
         let manager = settings.manager.as_ref();
@@ -246,6 +263,8 @@ impl Runtime {
             "bot":bot,
             "messages":messages,
             "works":works,
+            "changes":changes,
+            "assistant":{"skills":skills,"routines":routines},
             "pending_checks":pending_checks,
             "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
