@@ -44,7 +44,7 @@ export function Artifact({ hash, size, attachment = false }: { hash: string; siz
     <CardContent className="space-y-3 p-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="mr-auto flex items-center gap-1.5 text-sm">{attachment ? <Paperclip aria-hidden="true" className="size-4" /> : null}{attachment ? '附件' : '完整结果'} · {formatSize(size)}</span>
-        {!opened ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) })}>{attachment ? '打开' : '打开结果'}</ActionButton> : <Button type="button" variant="ghost" onClick={() => setOpened(false)}>收起结果</Button>}
+        {!opened ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) }, '打开')}>{attachment ? '打开' : '打开结果'}</ActionButton> : <Button type="button" variant="ghost" onClick={() => setOpened(false)}>收起结果</Button>}
         <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(async () => {
           const parts: Uint8Array<ArrayBuffer>[] = []
           let offset: number | null = 0
@@ -65,11 +65,11 @@ export function Artifact({ hash, size, attachment = false }: { hash: string; siz
           link.download = `${attachment ? 'attachment' : 'result'}-${hash.slice(0, 12)}.${extension(whole)}`
           link.click()
           window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-        })}>下载</ActionButton>
+        }, '下载')}>下载</ActionButton>
       </div>
       {opened ? <>
         <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-sm">{content || '结果为空。'}</pre>
-        {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext)}>读取后续内容</ActionButton> : <p className="text-xs text-muted-foreground">已读取完整结果。</p>}
+        {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext, '读取后续内容')}>读取后续内容</ActionButton> : <p className="text-xs text-muted-foreground">已读取完整结果。</p>}
       </> : null}
     </CardContent>
   </Card>

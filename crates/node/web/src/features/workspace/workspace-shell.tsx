@@ -71,7 +71,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     }
   }, [joins.map((join) => join.join_id).join()])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
-  useEffect(() => { if (workspace.error) toast(workspace.error, { tone: "danger" }) }, [workspace.error])
+  useEffect(() => { if (workspace.error) toast(workspace.error.text, { tone: "danger", action: workspace.error.retry ? { label: "重试", onClick: workspace.error.retry } : undefined }) }, [workspace.error])
 
   function openCreator() {
     creatorTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -184,9 +184,9 @@ function ConnectionCapsule() {
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
-      : workspace.readOnlyNotice
+      : workspace.readOnlyNotice && workspace.writeState.state !== "aligning"
       ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
-      : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.data && workspace.incomplete
+      : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.writeState.state === "aligning" || workspace.data && workspace.incomplete
         ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
         : { label: "在线", icon: Wifi, tone: "text-success" }
   return <Popover.Root>

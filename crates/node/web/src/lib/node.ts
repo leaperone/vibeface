@@ -148,7 +148,7 @@ export function canonical(value: unknown): string {
   throw new Error('待确认的内容格式不对。')
 }
 export function same(left: unknown, right: unknown): boolean { return canonical(left) === canonical(right) }
-export const messageOf = (error: unknown) => error instanceof Error ? humanError(error.message, (error as { code?: unknown }).code) : humanError(String(error))
+export const messageOf = (error: unknown, action?: string) => error instanceof Error ? humanError(error.message, (error as { code?: unknown }).code, action) : humanError(String(error), undefined, action)
 export function deviceName(value: string): string {
   const name = value.trim()
   if (!name || new TextEncoder().encode(name).length > 128 || /[\u0000-\u001f\u007f]/.test(name)) throw new Error('设备名称需要 1 至 128 字节，不能包含控制字符。')

@@ -571,12 +571,23 @@ async fn dispatch(
     }
     match method {
         "info" => {
-            let network_id = match node.has_membership().await? {
-                true => Some(node.membership_state().await?.genesis.network_id),
-                false => None,
+            let device_id = node.identity.device_id()?;
+            // A joining browser confirms the device by the name its owner gave it, not the host name.
+            let (network_id, name) = match node.has_membership().await? {
+                true => {
+                    let state = node.membership_state().await?;
+                    let name = state
+                        .project()?
+                        .members
+                        .into_iter()
+                        .find(|m| m.device_id == device_id)
+                        .map(|m| m.name);
+                    (Some(state.genesis.network_id), name)
+                }
+                false => (None, None),
             };
             Ok(
-                json!({"initialized":network_id.is_some(),"network_id":network_id,"device_id":node.identity.device_id()?,"name":crate::config::hostname(),"public_entry":node.config.public_entry,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
+                json!({"initialized":network_id.is_some(),"network_id":network_id,"device_id":device_id,"name":name.unwrap_or_else(crate::config::hostname),"public_entry":node.config.public_entry,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
             )
         }
         "authenticate" => {

@@ -9,14 +9,28 @@ const codes: Record<string, string> = {
 
 const patterns: [RegExp, string][] = [
   [/artifact is not UTF-8 text/i, '这个文件不是文字，下载后再打开。'],
-  [/log has forked/i, '这台设备的数据和另一份副本不一致，已停止写入。'],
-  [/read-only until you confirm/i, '这台设备现在只读，在待处理里确认后就能写。'],
-  [/aligning with other Nodes/i, '这台设备正在和你的其他设备对齐，稍后再试。'],
+  [/log has forked/i, '这台设备的数据被复制过，已暂停发送。去待处理看看。'],
+  [/read-only until you confirm/i, '这台设备暂时只读。去待处理确认一下就能发送。'],
+  [/aligning with other Nodes/i, '正在和你的其他设备同步，稍后就能发送。'],
   [/Cursor SDK bridge did not start within/i, 'Cursor 组件启动超时，这次回复没有开始。请稍后再发一次。'],
+  [/completion is unknown|reconcile its outcome/i, '助手中途断开，结果未知。先看看有没有回复，再决定要不要重发。'],
   [/outcome may be unknown|timed out/i, '设备没有及时回复，结果未知。请先确认结果，不要重复提交。'],
+  [/Cursor SDK requires (an explicit )?model/i, 'Cursor 还没选模型。去设备页的助手设置里选一个。'],
+  [/configured executable was not found|no configured management SDK/i, '这台设备上的助手程序找不到了。去设备页检查助手设置。'],
+  [/Cursor SDK|cursor-sdk-bridge/i, 'Cursor 没能完成这次回复。请再发一次；一直不行就去设备页检查 Cursor。'],
+  [/answered meanwhile|no App Server request is waiting/i, '这个请求已经回答过或已过期。'],
+  [/Codex SDK|Codex rejected|App Server/i, 'Codex 没能完成这次回复。请再发一次；一直不行就去设备页检查 Codex。'],
+  [/peer (did not answer|is unreachable|connection closed|closed the stream|stream failed)|target connection closed|client target refused/i, '另一台设备没有回应，可能关机或断网了。等它上线后再试。'],
+  [/client disconnected|client channel idle|membership state closed/i, '连接断开了，正在重新连接。'],
+  [/Failed to fetch|NetworkError|Load failed/i, '连不上设备，请检查网络后再试。'],
   [/network has not started|maintenance lease|another maintenance/i, '这台设备正在启动或维护，请稍后再试。'],
   [/another personal network|wrong personal network|wrong membership network|unknown network|network mismatch/i, '这台设备属于另一组设备。'],
-  [/not a member of the personal network|client identity missing/i, '这个浏览器还不在我的设备里。'],
+  [/not a member of (the|this) personal network|client identity missing/i, '这个浏览器还不在我的设备里。'],
+  [/too many devices are joining|too many pending invites/i, '同时加入的设备太多，请稍后再试。'],
+  [/has not confirmed its short code/i, '新设备还没显示安全码，等它显示后再比对。'],
+  [/only the manager that started the confirmation/i, '请在发出加入链接的那台设备上批准。'],
+  [/join request (not found|vanished|can no longer|is not waiting|belongs to another)|join completed with another grant|different nonce/i, '这个加入请求已处理或已过期。请重新生成加入链接。'],
+  [/this recovery removes this Node/i, '这次找回会移除你正连着的设备。请换一台要保留的设备打开。'],
   [/write needs the signature|signed by another device|client_id differs/i, '这个浏览器的身份校验没通过。请刷新页面后重试。'],
   [/conversation moved meanwhile/i, '这个对话刚换过负责的设备，已刷新。请确认后再试。'],
   [/management reply changed/i, '回复状态已变化，请刷新后再停止。'],
@@ -25,6 +39,10 @@ const patterns: [RegExp, string][] = [
   [/not waiting for an answer/i, '这个任务现在不需要回答。'],
   [/answer every question|answers? (is|are) (missing|required)|answers must be text/i, '请回答每个问题后再提交。'],
   [/message ID reused|work ID reused|conversation ID already exists/i, '这个编号已用于不同的内容，没有重复提交。'],
+  [/send window for this work is over/i, '这个任务等得太久，没有开始。需要的话请再发一次。'],
+  [/routine this work runs for is paused|the routine was deleted/i, '这个定时任务已暂停或删除。'],
+  [/has no assistant to take the task/i, '那台设备还没设置助手。'],
+  [/has not reached this device|not stored on this device|not on this device|not found on this device/i, '内容还没同步到这台设备，稍后再试。'],
   [/not reached the scheduling Node/i, '消息还没送到负责这个对话的设备，送到后会自动排队。'],
   [/conversation has no scheduling Node|does not schedule the conversation/i, '这个对话不由这台设备负责。'],
   [/conversation not found/i, '这台设备上还没有这个对话，可能还在同步。'],
@@ -33,6 +51,10 @@ const patterns: [RegExp, string][] = [
   [/scheduler inbox is full/i, '排队的消息太多，这条没有收下。请稍后再发。'],
   [/attachment|blob/i, '附件还没同步到这台设备，或校验没通过。'],
   [/artifact/i, '这个产物现在读不了。'],
+  [/outside (the execution Node's )?configured roots/i, '这个文件夹不在这台设备允许的文件夹里。去设备页添加。'],
+  [/set a webhook (URL|secret) first/i, '先填好 Webhook 地址和密钥。'],
+  [/webhook must use HTTPS/i, 'Webhook 地址要以 https 开头。'],
+  [/nothing to change|is unchanged/i, '内容没有变化。'],
   [/project root|execution path|workspace must be|workspace does not exist|manager workspace/i, '文件夹不存在，或不是这台设备上的绝对路径。'],
   [/coordination Agent|manager provider|manager program/i, '这台设备上的助手还没配置好。'],
   [/only the user|requires the user|agents cannot|Agent tokens/i, '只有你自己能做这个操作，助手不能代办。'],
@@ -49,11 +71,11 @@ const patterns: [RegExp, string][] = [
 
 const chinese = /[一-鿿]/
 
-/** Chinese stays as written; known backend text and codes are translated; the rest gets a plain sentence. */
-export function humanError(raw: string, code?: unknown): string {
+/** Chinese stays as written; known backend text and codes are translated; the rest names the failed action. */
+export function humanError(raw: string, code?: unknown, action = '这次操作'): string {
   if (typeof code === 'string' && codes[code]) return codes[code]
   if (chinese.test(raw)) return raw
-  return patterns.find(([pattern]) => pattern.test(raw))?.[1] ?? '设备没有完成这个操作。'
+  return patterns.find(([pattern]) => pattern.test(raw))?.[1] ?? `${action}没有成功，请再试一次。`
 }
 
 /** The untranslated text, for 详细信息; empty when the shown message already is the original. */

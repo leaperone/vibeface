@@ -53,10 +53,10 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, ch
   icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; menu?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
 }) {
   return <section className={cn("grid gap-3 rounded-xl border p-4", toneSurface[tone], className)}>
-    <header className="flex min-w-0 items-center gap-2">
+    <header className="flex min-w-0 flex-wrap items-center gap-2">
       <Icon aria-hidden="true" className={cn("size-5 shrink-0", toneText[tone])} />
       <h3 className="min-w-0 flex-1 text-heading font-semibold">{title}</h3>
-      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground">{meta}</span> : null}
+      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground max-sm:order-last max-sm:max-w-full max-sm:basis-full max-sm:ps-7">{meta}</span> : null}
       {menu}
     </header>
     {children ? <div className="grid min-w-0 gap-2">{children}</div> : null}

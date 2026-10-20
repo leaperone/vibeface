@@ -9,6 +9,7 @@ import { humanError } from '@/lib/errors'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
+import { AlertCard } from '@/features/workspace/alert-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
 import type { AssistantChangeRecord, ManagerJob, WorkRecord } from '@/features/workspace/types'
 import { placeChanges, routineName, routineTrigger } from '@/features/workspace/assistant'
@@ -106,6 +107,9 @@ export function ConversationScreen() {
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
     }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
+    // A decision a running task of this chat waits on shows here too, not only in 待处理.
+    ...workspace.alerts.filter((alert) => alert.resolution === null && works.some((work) => !work.outcome && work.target_node === alert.node && work.cwd === alert.cwd))
+      .map((alert) => <AlertCard key={alert.alert_id} alert={alert} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
@@ -216,6 +220,6 @@ function JobLine({ job }: { job: ManagerJob }) {
   return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-danger">
     <CircleX aria-hidden="true" className="size-4 shrink-0" />
     <span className="shrink-0">{replyStates[job.state] ?? '回复失败'}</span>
-    {job.error ? <span className="min-w-0 truncate" title={job.error}>{humanError(job.error.split('\n')[0])}</span> : null}
+    {job.error ? <span className="min-w-0 truncate" title={job.error}>{humanError(job.error.split('\n')[0], undefined, '这次回复')}</span> : null}
   </p>
 }

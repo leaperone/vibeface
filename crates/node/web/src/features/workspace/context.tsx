@@ -22,9 +22,9 @@ import type {
 
 /** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
-  aligning: "这台设备正在和你的其他设备对齐，对齐后就能写。",
-  read_only: "这台设备现在只读，在待处理里确认后就能写。",
-  forked: "这台设备的数据和另一份副本不一致，已停止写入。",
+  aligning: "正在和你的其他设备同步，稍后就能发送。",
+  read_only: "这台设备暂时只读。去待处理确认一下就能发送。",
+  forked: "这台设备的数据被复制过，已暂停发送。去待处理看看。",
 }
 
 export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
@@ -48,7 +48,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const attest = async (scope: string, body: Record<string, unknown>) =>
     ({ device_id: clientId, signature: await signClient("attestation", attestationPayload(networkId, scope, JSON.stringify(body))) })
   const [booted, setBooted] = useState(false)
-  const [error, setError] = useState("")
+  const [error, setError] = useState<{ text: string; retry?: () => void } | null>(null)
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
@@ -94,7 +94,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("请先选一个助手。")
     return requireContext(id)
   }
-  const showError = (caught: unknown) => { if (current()) setError(messageOf(caught)) }
+  const showError = (caught: unknown, action?: string, retry?: () => void) => { if (current()) setError({ text: messageOf(caught, action), retry }) }
+  /** A failed background read names itself and offers one more try. */
+  const showRefreshError = (caught: unknown) => showError(caught, "读取最新内容", () => { void refreshRef.current().catch(showRefreshError) })
   const requireWritable = () => {
     requireCurrent()
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
@@ -176,7 +178,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
           requireCurrent()
           notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
           setNotifications(notificationsRef.current)
-        } catch (caught) { showError(caught); break }
+        } catch (caught) { showError(caught, "标记已读"); break }
       }
     }
     return next
@@ -210,7 +212,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (!current() || refreshTimer.current !== null) return
     refreshTimer.current = window.setTimeout(() => {
       refreshTimer.current = null
-      void refreshRef.current().catch(showError)
+      void refreshRef.current().catch(showRefreshError)
     }, 350)
   }
   const refresh = async () => {
@@ -284,14 +286,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   useEffect(() => {
     alive.current = true
     inFlight.current = new Set()
-    setMessageBusy(false); setLiveProgress([]); setError(""); setNoticeText("")
+    setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
     try {
       const url = new URL(window.location.href)
       const routeBot = /^\/b\/([^/]+)/.exec(url.pathname)?.[1]
       if (routeBot) writeStorage(scoped("selected-bot"), decodeURIComponent(routeBot))
       activeId.current = ""
       setConversationId(activeId.current)
-      void loadPending().then(() => { if (alive.current) setBooted(true) }, showError)
+      void loadPending().then(() => { if (alive.current) setBooted(true) }, (caught) => showError(caught, "读取待发消息"))
     } catch (caught) { showError(caught) }
     const stop = tabs.listen((message) => { if (message.type === "outbox" && message.networkId === networkId) void syncPending().catch(() => {}) })
     return () => { alive.current = false; stop() }
@@ -299,7 +301,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
 
   useEffect(() => {
     if (!booted) return
-    void refreshRef.current().then(() => settleOutbox()).catch(showError)
+    void refreshRef.current().then(() => settleOutbox()).catch(showRefreshError)
     const unsubscribe = connection.subscribe((event) => {
       if (!current()) return
       if (event.type === "invalidate") { scheduleRefresh(); return }
@@ -328,10 +330,10 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     mutations.add(key)
     try { return await work() } finally { mutations.delete(key) }
   }
-  const clearMessages = () => { if (current()) { setError(""); setNoticeText("") } }
-  const run = async (action: () => Promise<void>) => {
+  const clearMessages = () => { if (current()) { setError(null); setNoticeText("") } }
+  const run = async (action: () => Promise<void>, label?: string) => {
     clearMessages()
-    try { await action() } catch (caught) { showError(caught) }
+    try { await action() } catch (caught) { showError(caught, label) }
   }
   const requireControlRefresh = () => {
     if (!current()) return
@@ -385,13 +387,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const receipt = await connection.rpc("message", item.params)
       requireCurrent()
       if (!isQueuedReceipt(receipt, prepared.pending)) {
-        if (activeId.current === id) await refreshRef.current().catch(showError)
+        if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
         return false
       }
       await outbox.delete(key)
       await outboxChanged()
       setNoticeText("")
-      if (activeId.current === id) await refreshRef.current().catch(showError)
+      if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
       return true
     } catch (caught) {
       if (current() && responded(caught)) {

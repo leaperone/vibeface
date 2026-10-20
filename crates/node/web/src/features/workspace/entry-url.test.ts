@@ -380,7 +380,7 @@ test("workspace preserves bot and message requests while routing native decision
         else write.reject(new Error("old response lost"))
         await rejected
         assert.equal(render().messageBusy, false)
-        assert.equal(render().error, "")
+        assert.equal(render().error, null)
         if (outcome === "success") {
           await new Promise(setImmediate)
           assert.equal(messages.length, before + 2, "the new entry's first complete read resubmits the unconfirmed message once")
@@ -560,7 +560,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], alerts: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
@@ -649,11 +649,12 @@ test("artifact reads retain their offset while old responses cannot append or un
   } finally { app.close() }
 })
 
-for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted fields before waiting and preserves replacement fields`, async () => {
-  let generation = 1, work = pendingResult(), resets = 0
+for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
+  let generation = 1, work = pendingResult()
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
   const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'device_id', 'relay'].map(name => [name, new Input()]))
-  const form = { elements: { namedItem: (name: string) => fields.get(name) }, reset() { resets++; for (const field of fields.values()) field.value = '' } }
+  const passwords = ['password', 'old_password', 'confirmation'].map(name => fields.get(name))
+  const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
     beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
   const app = componentHarness('../identity/recovery-controls.tsx', {
@@ -664,20 +665,22 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
   const submit = () => render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {}, currentTarget: form })
   try {
     render(); render(); submit()
-    assert.equal(resets, 1)
+    assert.ok(passwords.every(field => field?.value === ''))
+    assert.equal(fields.get('name')?.value, 'test-only-value')
+    assert.equal(fields.get('bundle')?.files.length, 1)
     const old = work
     generation++; render()
     const password = fields.get('password'); assert.ok(password); password.value = 'replacement test-only-value'
     old.reject(new Error('stale package failure')); await settleComponent()
     assert.equal(password.value, 'replacement test-only-value')
-    assert.equal(resets, 1)
     assert.equal(render().some(({ props }) => props.error), false)
-    work = pendingResult(); submit(); assert.equal(resets, 2)
+    work = pendingResult(); submit(); assert.equal(password.value, '')
     work.resolve(undefined); await settleComponent()
     assert.equal(render().find(({ type }) => type === 'fieldset')?.props.disabled, false)
     const bundle = fields.get('bundle'); assert.ok(bundle); bundle.files = []
+    password.value = 'another test-only-value'
     submit(); await settleComponent()
-    assert.equal(resets, 3)
+    assert.equal(password.value, '')
     assert.equal(render().find(({ props }) => props.error)?.props.error, '请选择恢复文件。')
   } finally { app.close() }
 })
@@ -686,7 +689,7 @@ test("conversation blocks sending until an online node can run the manager Agent
   let sent = 0
   const workspace = (nodes: unknown[]) => ({
     generation: 1, isCurrent: () => true, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], alerts: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
