@@ -44,8 +44,9 @@ impl LocalIdentity {
         })
     }
     pub fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        let message = payload_message(domain, payload)?;
-        Ok(hex::encode(self.key()?.sign(&message).to_bytes()))
+        vibeface_secure::Identity::from_secret_hex(&self.secret_key_hex)
+            .and_then(|identity| identity.sign(domain, payload))
+            .map_err(anyhow::Error::msg)
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
@@ -229,18 +230,7 @@ pub fn verify_payload(
     payload: &[u8],
     signature: &str,
 ) -> Result<()> {
-    verify(public_key, signature, &payload_message(domain, payload)?)
-}
-fn payload_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
-    ensure!(
-        !domain.is_empty()
-            && domain.len() <= 64
-            && domain
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-        "invalid signing domain"
-    );
-    Ok(format!("vibeface:message:v1:{domain}:{}", digest(payload)).into_bytes())
+    vibeface_secure::verify(public_key, domain, payload, signature).map_err(anyhow::Error::msg)
 }
 pub fn validate_event_shape(event: &Event) -> Result<()> {
     ensure!(event.version == WIRE_VERSION, "unsupported event version");
