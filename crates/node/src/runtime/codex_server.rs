@@ -1,16 +1,10 @@
-//! The executor host owns the Codex App Server process and the only client to it.
+//! The coordination runtime's App Server: the process, its socket and the Node's own client.
 //! A managed App Server runs in its own process group recorded in a pidfile, so a crash of
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
 use super::*;
 use crate::work::Probe;
 use std::os::unix::process::CommandExt as _;
 use vibeface_bridge::codex::{CodexClient, CodexError};
-
-/// The Node's own connection to the App Server: it observes, probes and interrupts; the
-/// coordination Agent starts turns on its own connection.
-pub(crate) struct CodexExecutor {
-    client: CodexClient,
-}
 
 fn last_answer(turn: &Value) -> String {
     turn["items"]
@@ -33,7 +27,7 @@ pub(crate) fn sent_by(turn: &Value, client_id: &str) -> bool {
         .any(|item| item["type"] == "userMessage" && item["clientId"] == client_id)
 }
 
-impl CodexExecutor {
+impl CodexServer {
     pub(crate) fn client(&self) -> &CodexClient {
         &self.client
     }
@@ -46,7 +40,7 @@ impl CodexExecutor {
         self.client.snapshot().await
     }
     pub(crate) async fn capability(&self) -> Value {
-        json!({"executor":"codex","connected":self.client.snapshot().await["connection"]["state"] == "connected"})
+        json!({"connected":self.client.snapshot().await["connection"]["state"] == "connected"})
     }
     pub(crate) async fn interrupt(&self, thread: &str, turn: &str) -> Result<(), CodexError> {
         self.client
@@ -103,8 +97,10 @@ impl CodexExecutor {
     }
 }
 
-pub(crate) struct ExecutorHost {
-    pub executor: CodexExecutor,
+/// The Node's own client observes, probes and interrupts; the coordination Agent sends turns on
+/// its own connection to the same socket.
+pub(crate) struct CodexServer {
+    client: CodexClient,
     /// The App Server socket; the coordination Agent connects to it directly.
     pub socket: PathBuf,
     managed: Option<Arc<Managed>>,
@@ -240,7 +236,7 @@ impl Managed {
     }
 }
 
-impl ExecutorHost {
+impl CodexServer {
     pub(super) fn open(
         config: &Config,
         identity: &LocalIdentity,
@@ -264,9 +260,7 @@ impl ExecutorHost {
             }
         };
         Ok(Self {
-            executor: CodexExecutor {
-                client: CodexClient::start(socket.clone(), events),
-            },
+            client: CodexClient::start(socket.clone(), events),
             socket,
             managed,
         })

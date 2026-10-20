@@ -15,7 +15,7 @@ pub struct WorkSpec {
     pub target: DeviceId,
     pub dispatcher: DeviceId,
     pub call_ref: String,
-    pub executor: Executor,
+    pub kind: WorkKind,
     pub cwd: String,
     pub title: String,
     pub prompt: String,
@@ -66,7 +66,7 @@ pub struct StopRequest {
 pub struct Handle {
     pub thread_id: String,
     pub turn_id: String,
-    /// The executor host epoch; requests from an older epoch can no longer be answered.
+    /// The App Server epoch; requests from an older epoch can no longer be answered.
     pub epoch: u64,
 }
 
@@ -95,7 +95,7 @@ pub enum WorkState {
     Finished {
         outcome: WorkOutcome,
     },
-    /// The real result cannot be proven. `probe` says a later executor probe may settle it;
+    /// The real result cannot be proven. `probe` says a later App Server probe may settle it;
     /// otherwise only the user does.
     Unverified {
         handle: Option<Handle>,
@@ -140,10 +140,10 @@ pub struct WorkRecord {
     pub progress_at_ms: i64,
 }
 
-/// What a probe of the executor found for the journaled thread.
+/// What a probe of the App Server found for the journaled thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Probe {
-    /// The turn exists and is still running under the current executor epoch.
+    /// The turn exists and is still running under the current App Server epoch.
     Running { turn_id: String, epoch: u64 },
     Terminal {
         turn_id: String,
@@ -186,7 +186,7 @@ pub enum Signal {
         text: String,
         error: Option<String>,
     },
-    /// The executor host restarted; live requests from the old epoch are gone.
+    /// The App Server restarted; live requests from the old epoch are gone.
     Disconnected,
     Probed(Probe),
     InterruptTimedOut,
@@ -206,7 +206,7 @@ pub fn accept(spec: WorkSpec, at: i64) -> (WorkRecord, EventBody) {
         trigger: spec.trigger.clone(),
         dispatcher: spec.dispatcher.clone(),
         call_ref: spec.call_ref.clone(),
-        executor: spec.executor,
+        kind: spec.kind,
         cwd: spec.cwd.clone(),
         title: spec.title.clone(),
         prompt: spec.prompt.clone(),
@@ -497,21 +497,24 @@ mod tests {
     use super::*;
 
     fn record() -> WorkRecord {
-        accept(WorkSpec {
-            work_id: "w".into(),
-            conversation: "c".into(),
-            trigger: "message:m".into(),
-            attempt: "a".into(),
-            target: "t".into(),
-            dispatcher: "t".into(),
-            call_ref: "r".into(),
-            executor: Executor::Codex,
-            cwd: "/tmp".into(),
-            title: "do".into(),
-            prompt: "do".into(),
-            continues: None,
-            parent: None,
-        }, 0)
+        accept(
+            WorkSpec {
+                work_id: "w".into(),
+                conversation: "c".into(),
+                trigger: "message:m".into(),
+                attempt: "a".into(),
+                target: "t".into(),
+                dispatcher: "t".into(),
+                call_ref: "r".into(),
+                kind: WorkKind::Codex,
+                cwd: "/tmp".into(),
+                title: "do".into(),
+                prompt: "do".into(),
+                continues: None,
+                parent: None,
+            },
+            0,
+        )
         .0
     }
 

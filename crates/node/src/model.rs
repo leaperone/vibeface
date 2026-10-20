@@ -46,9 +46,11 @@ pub enum AutonomyMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Executor {
+/// `codex`: a Codex turn this device's coordination Agent sent and the Node watches.
+/// `task`: work handed to a device's coordination Agent as a task turn.
+pub enum WorkKind {
     Codex,
-    Agent,
+    Task,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,7 +70,7 @@ pub enum WorkOutcome {
     Interrupted,
     /// Never started; retrying with the same `work_id` is safe.
     Rejected,
-    /// The executor's real result cannot be proven; only the user or a later probe settles it.
+    /// The real result cannot be proven; only the user or a later probe settles it.
     Unverified,
     /// Its target was removed before reporting a result; written by the conversation's owner.
     Abandoned,
@@ -134,9 +136,9 @@ pub enum EventBody {
         trigger: String,
         dispatcher: DeviceId,
         call_ref: String,
-        executor: Executor,
+        kind: WorkKind,
         cwd: String,
-        /// A short line for the user; `prompt` is what the executor gets.
+        /// A short line for the user; `prompt` is what the work gets.
         title: String,
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,7 +346,7 @@ pub struct WorkProjection {
     pub target_node: DeviceId,
     pub trigger: String,
     pub dispatcher: DeviceId,
-    pub executor: Executor,
+    pub kind: WorkKind,
     pub cwd: String,
     pub title: String,
     pub prompt: String,

@@ -136,11 +136,11 @@ impl Store {
             );
             return Ok((existing, false));
         }
-        let busy = spec.executor == Executor::Agent
+        let busy = spec.kind == WorkKind::Task
             && local_prefix::<WorkRecord>(&tx, network, "work:v1:")?
                 .iter()
                 .any(|other| {
-                    other.spec.executor == Executor::Agent
+                    other.spec.kind == WorkKind::Task
                         && other.spec.conversation == spec.conversation
                         && !other.state.finished()
                 });
@@ -172,7 +172,7 @@ impl Store {
                 at,
             )?
             .0;
-        } else if record.spec.executor == Executor::Agent {
+        } else if record.spec.kind == WorkKind::Task {
             scheduler::admit_from(
                 &tx,
                 network,

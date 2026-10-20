@@ -212,7 +212,7 @@ pub async fn run(
                 ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
                 (
                     "VIBEFACE_CODEX_SOCKET".into(),
-                    node.executor.socket.display().to_string(),
+                    node.codex.socket.display().to_string(),
                 ),
             ]),
             process_started: Some(process_recorder(&node, &network, &attempt.id)),
@@ -547,7 +547,7 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
 
 /// One work as the Agent reads it: target and place, latest progress, open questions, result.
 fn work_row(work: &WorkProjection) -> Value {
-    json!({"work_id":work.work_id,"target_node":work.target_node,"executor":work.executor,"cwd":work.cwd,
+    json!({"work_id":work.work_id,"target_node":work.target_node,"kind":work.kind,"cwd":work.cwd,
         "prompt":prefix(&work.prompt,500),"phase":work.phase,"progress":prefix(&work.summary,500),
         "outcome":work.outcome,"result":prefix(&work.result_text,1_000),
         "failure_reason":work.failure_reason})
@@ -658,7 +658,7 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
         ),
         (
             "interrupt_work",
-            "Ask the executor to stop a work and the works it started. It counts as stopped only when the executor confirms.",
+            "Ask the App Server to stop a work and the works it started. It counts as stopped only when the App Server confirms.",
             json!({"work_id":string()}),
             vec!["work_id"],
         ),
@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_has_no_executor_write_passthrough() {
+    fn tool_schema_has_no_app_server_write_passthrough() {
         let tools = tools();
         assert!(!tools.contains_key("codex"));
         assert!(tools.contains_key("dispatch_work"));

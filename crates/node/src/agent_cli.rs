@@ -91,7 +91,10 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
         }
         Command::Send(outgoing) => {
             let delivery = session.send(&outgoing).await;
-            println!("{}", json!({"client_id":outgoing.client_id,"delivery":delivery}));
+            println!(
+                "{}",
+                json!({"client_id":outgoing.client_id,"delivery":delivery})
+            );
         }
         Command::Watch { thread_id } => {
             session

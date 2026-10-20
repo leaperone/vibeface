@@ -243,7 +243,7 @@ pub(crate) fn works_from(
         let EventBody::WorkDispatched {
             trigger,
             dispatcher,
-            executor,
+            kind,
             cwd,
             title,
             prompt,
@@ -272,7 +272,7 @@ pub(crate) fn works_from(
             target_node,
             trigger,
             dispatcher,
-            executor,
+            kind,
             cwd,
             title,
             prompt,

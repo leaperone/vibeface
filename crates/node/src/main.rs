@@ -81,7 +81,10 @@ enum Action {
 #[derive(Subcommand)]
 enum CodexCommand {
     /// Call any App Server method and print its result.
-    Call { method: String, params: Option<String> },
+    Call {
+        method: String,
+        params: Option<String>,
+    },
     /// Add a message to a thread: steer its running turn or start one. Reusing --id only reads back.
     Send {
         thread: String,
@@ -278,18 +281,23 @@ async fn main() -> Result<()> {
             use vibeface::agent_cli::{Command, run};
             let command = match command {
                 CodexCommand::Call { method, params } => Command::Call { method, params },
-                CodexCommand::Send { thread, text, id, model, effort, image } => {
-                    Command::Send(vibeface_bridge::codex::Outgoing {
-                        thread_id: thread,
-                        text,
-                        client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        model,
-                        effort,
-                        images: image,
-                        start_only: false,
-                        full_access: true,
-                    })
-                }
+                CodexCommand::Send {
+                    thread,
+                    text,
+                    id,
+                    model,
+                    effort,
+                    image,
+                } => Command::Send(vibeface_bridge::codex::Outgoing {
+                    thread_id: thread,
+                    text,
+                    client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    model,
+                    effort,
+                    images: image,
+                    start_only: false,
+                    full_access: true,
+                }),
                 CodexCommand::Watch { thread } => Command::Watch { thread_id: thread },
             };
             run(&socket, command).await
@@ -1021,8 +1029,19 @@ mod tests {
         assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch_work", "--json", "{}"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "vibeface", "codex", "--socket", "/tmp/codex.sock", "send", "t", "hi", "--id", "m",
-                "--image", "a.png", "--image", "b.png"
+                "vibeface",
+                "codex",
+                "--socket",
+                "/tmp/codex.sock",
+                "send",
+                "t",
+                "hi",
+                "--id",
+                "m",
+                "--image",
+                "a.png",
+                "--image",
+                "b.png"
             ])
             .is_ok()
         );

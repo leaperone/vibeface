@@ -217,7 +217,7 @@ pub(super) fn native_progress(event: &Value) -> Value {
             Some("fileChange") => "file change",
             Some("mcpToolCall" | "dynamicToolCall") => "tool",
             Some("webSearch") => "web search",
-            _ => "executor",
+            _ => "codex",
         };
         return json!({"type":"tool","item_id":bounded_text(item_id,128),"name":name,"status":if method == "item/completed" {"completed"} else {"running"}});
     }
@@ -591,7 +591,7 @@ mod tests {
             Lease {
                 network: "mine".into(),
                 scope: "chat".into(),
-                targets: BTreeSet::from(["manager".into(), "executor".into()]),
+                targets: BTreeSet::from(["manager".into(), "codex".into()]),
                 expires: Instant::now() + LEASE,
             },
         );

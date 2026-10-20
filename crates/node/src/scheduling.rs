@@ -11,7 +11,7 @@ pub const MAX_PENDING_JOBS: usize = 256;
 pub enum TriggerKind {
     Human,
     WorkResult,
-    /// An `executor=agent` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
+    /// A `task` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
     AgentTask,
 }
 

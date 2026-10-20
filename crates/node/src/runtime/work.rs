@@ -1,4 +1,4 @@
-//! Drives the work state machine from executor results and events. Every change goes through
+//! Drives the work state machine from App Server results and events. Every change goes through
 //! `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
 use super::*;
 use crate::scheduling::task_trigger;
@@ -38,9 +38,8 @@ fn live(record: &WorkRecord) -> bool {
 }
 
 impl Runtime {
-    fn executor_epoch(&self) -> u64 {
-        self.executor_epoch
-            .load(std::sync::atomic::Ordering::SeqCst)
+    fn codex_epoch(&self) -> u64 {
+        self.codex_epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(super) async fn signal_work(
@@ -98,7 +97,7 @@ impl Runtime {
                 state => state.handle().map(|handle| handle.thread_id.clone()),
             })
             .collect();
-        let _ = self.executor.executor.observe(threads);
+        let _ = self.codex.observe(threads);
     }
 
     /// Every dispatch, local or from another Node, passes the same checks: the trigger chain
@@ -148,8 +147,8 @@ impl Runtime {
                     .context("agent task not found on this device")?;
                 ensure!(
                     spec.dispatcher == spec.target
-                        && spec.executor == Executor::Codex
-                        && task.spec.executor == Executor::Agent
+                        && spec.kind == WorkKind::Codex
+                        && task.spec.kind == WorkKind::Task
                         && task.spec.conversation == spec.conversation
                         && spec.parent.as_deref() == Some(task.spec.work_id.as_str())
                         && !task.state.finished(),
@@ -163,16 +162,15 @@ impl Runtime {
                 .work_record(network, original)?
                 .context("the work to continue is not on this device")?;
             ensure!(
-                original.spec.conversation == spec.conversation
-                    && original.spec.executor == spec.executor,
-                "a continuation keeps the original conversation and executor"
+                original.spec.conversation == spec.conversation && original.spec.kind == spec.kind,
+                "a continuation keeps the original conversation and kind"
             );
         }
         ensure!(
-            spec.executor == Executor::Agent || spec.dispatcher == spec.target,
+            spec.kind == WorkKind::Task || spec.dispatcher == spec.target,
             "another device takes work only as a task for its assistant"
         );
-        if spec.executor == Executor::Agent {
+        if spec.kind == WorkKind::Task {
             ensure!(
                 spec.dispatcher != spec.target,
                 "an agent task goes to another device"
@@ -209,7 +207,7 @@ impl Runtime {
                 .await
                 .accept_work(&self.identity, network, spec, now_ms())?;
         self.publish_changed(network, &record.spec.conversation, &record.spec.work_id);
-        if created && record.spec.executor == Executor::Agent {
+        if created && record.spec.kind == WorkKind::Task {
             self.spawn_scheduler(network, &record.spec.conversation)?;
         }
         Ok((record, created))
@@ -237,7 +235,9 @@ impl Runtime {
             Ok((record, _)) => Ok(record),
             Err(_) => {
                 self.sync_peer(network, origin).await?;
-                self.accept_dispatch(network, spec).await.map(|(record, _)| record)
+                self.accept_dispatch(network, spec)
+                    .await
+                    .map(|(record, _)| record)
             }
         };
         Ok(match record {
@@ -306,7 +306,7 @@ impl Runtime {
             .work_record(network, work_id)?
             .context("work not found on this device")?;
         ensure!(
-            record.spec.conversation == scope && record.spec.executor == Executor::Codex,
+            record.spec.conversation == scope && record.spec.kind == WorkKind::Codex,
             "work belongs to another conversation"
         );
         let mut record = record;
@@ -329,22 +329,32 @@ impl Runtime {
         if let Some(turn) = args["turn_id"].as_str() {
             let signal = Signal::TurnStarted {
                 turn_id: turn.into(),
-                epoch: self.executor_epoch(),
+                epoch: self.codex_epoch(),
             };
             record = self.signal_work(network, work_id, signal).await?;
             // The turn may have ended before it was bound.
             if let Some(handle) = record.state.handle().cloned()
                 && let Ok(probe @ Probe::Terminal { .. }) = self
-                    .executor
-                    .executor
-                    .probe(&handle.thread_id, Some(&handle.turn_id), work_id, handle.epoch)
+                    .codex
+                    .probe(
+                        &handle.thread_id,
+                        Some(&handle.turn_id),
+                        work_id,
+                        handle.epoch,
+                    )
                     .await
             {
-                record = self.signal_work(network, work_id, Signal::Probed(probe)).await?;
+                record = self
+                    .signal_work(network, work_id, Signal::Probed(probe))
+                    .await?;
             }
         } else if let Some(reason) = args["failed"].as_str() {
             record = self
-                .signal_work(network, work_id, Signal::StartRejected(reason.chars().take(2_000).collect()))
+                .signal_work(
+                    network,
+                    work_id,
+                    Signal::StartRejected(reason.chars().take(2_000).collect()),
+                )
                 .await?;
         } else if args["unknown"].is_string() {
             if let Err(error) = self.probe_work(network, work_id, true).await {
@@ -374,15 +384,15 @@ impl Runtime {
             .await
             .work_record(network, work_id)?
             .context("work not found")?;
-        if record.spec.executor != Executor::Codex {
+        if record.spec.kind != WorkKind::Codex {
             return Ok(());
         }
         let over = record.send_window_over(now_ms());
         if !now && !over {
             return Ok(());
         }
-        let epoch = self.executor_epoch();
-        let executor = &self.executor.executor;
+        let epoch = self.codex_epoch();
+        let codex = &self.codex;
         let probe = match &record.state {
             WorkState::Accepted | WorkState::Starting { thread: None } => {
                 if over {
@@ -397,10 +407,10 @@ impl Runtime {
             }
             WorkState::Starting {
                 thread: Some(thread),
-            } => executor.probe(thread, None, work_id, epoch).await,
+            } => codex.probe(thread, None, work_id, epoch).await,
             state => match state.handle() {
                 Some(handle) => {
-                    executor
+                    codex
                         .probe(&handle.thread_id, Some(&handle.turn_id), work_id, epoch)
                         .await
                 }
@@ -426,12 +436,14 @@ impl Runtime {
     pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
         let records = self.store.lock().await.work_records(network)?;
         for record in records {
-            if matches!(record.state, WorkState::Accepted | WorkState::Starting { .. })
-                && record.spec.executor == Executor::Codex
+            if matches!(
+                record.state,
+                WorkState::Accepted | WorkState::Starting { .. }
+            ) && record.spec.kind == WorkKind::Codex
                 && record.send_window_over(now_ms())
                 && let Err(error) = self.probe_work(network, &record.spec.work_id, false).await
             {
-                tracing::debug!(%error, "work probe waits for the executor");
+                tracing::debug!(%error, "work probe waits for the App Server");
             }
         }
         Ok(())
@@ -450,8 +462,7 @@ impl Runtime {
             .context("work not found")?;
         match &record.state {
             WorkState::Running { handle } => {
-                self.executor
-                    .executor
+                self.codex
                     .interrupt(&handle.thread_id, &handle.turn_id)
                     .await
                     .map_err(|error| anyhow::anyhow!("interrupt was not confirmed: {error}"))?;
@@ -459,7 +470,7 @@ impl Runtime {
                     .await?;
             }
             // An agent task stops with its coordination turn.
-            WorkState::Accepted if record.spec.executor == Executor::Agent => {
+            WorkState::Accepted if record.spec.kind == WorkKind::Task => {
                 let job = self.store.lock().await.request_manager_cancel(
                     &self.identity,
                     network,
@@ -596,7 +607,7 @@ impl Runtime {
     }
 
     /// Maps App Server notifications and requests onto the work that owns their thread and turn.
-    pub(super) async fn route_executor_event(
+    pub(super) async fn route_codex_event(
         self: &Arc<Self>,
         network: &str,
         event: Value,
@@ -606,11 +617,12 @@ impl Runtime {
         let records = self.store.lock().await.work_records(network)?;
         match method {
             "bridge.codex_connected" => {
-                let epoch = self.store.lock().await.next_executor_epoch()?;
-                self.executor_epoch
+                let epoch = self.store.lock().await.next_codex_epoch()?;
+                self.codex_epoch
                     .store(epoch, std::sync::atomic::Ordering::SeqCst);
                 for record in records.into_iter().filter(live) {
-                    if let Err(error) = self.probe_work(network, &record.spec.work_id, false).await {
+                    if let Err(error) = self.probe_work(network, &record.spec.work_id, false).await
+                    {
                         tracing::debug!(%error, "work probe after reconnect failed");
                     }
                 }
@@ -693,15 +705,15 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn start_executor(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<Value>) {
-        self.executor.start();
+    pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<Value>) {
+        self.codex.start();
         let node = self.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 let networks = node.store.lock().await.networks().unwrap_or_default();
                 for network in networks {
-                    if let Err(error) = node.route_executor_event(&network, event.clone()).await {
-                        tracing::warn!(%error, "could not apply an executor event");
+                    if let Err(error) = node.route_codex_event(&network, event.clone()).await {
+                        tracing::warn!(%error, "could not apply an App Server event");
                     }
                 }
             }

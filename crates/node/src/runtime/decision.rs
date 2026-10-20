@@ -97,7 +97,7 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
         };
         store.local_set(&network, &key(&req.decision_id), &json!(journal))?;
     }
-    let delivery = match DirectSession::connect(&rt.executor.socket).await {
+    let delivery = match DirectSession::connect(&rt.codex.socket).await {
         Ok(mut session) => {
             let delivery = session
                 .send(&Outgoing {
@@ -126,7 +126,7 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
 
 async fn read_back(rt: &Arc<Runtime>, req: &DecisionRequest) -> Delivery {
     let unknown = |reason: String| Delivery::Unknown { reason };
-    let mut session = match DirectSession::connect(&rt.executor.socket).await {
+    let mut session = match DirectSession::connect(&rt.codex.socket).await {
         Ok(session) => session,
         Err(error) => return unknown(error.message),
     };
@@ -137,12 +137,19 @@ async fn read_back(rt: &Arc<Runtime>, req: &DecisionRequest) -> Delivery {
             mode: "existing".into(),
             turn_id,
         },
-        Ok(None) => unknown("the message is not in the thread; send it again with a new decision ID".into()),
+        Ok(None) => {
+            unknown("the message is not in the thread; send it again with a new decision ID".into())
+        }
         Err(error) => unknown(error.message),
     }
 }
 
-async fn record(rt: &Arc<Runtime>, network: &str, req: &DecisionRequest, delivery: &Delivery) -> Result<()> {
+async fn record(
+    rt: &Arc<Runtime>,
+    network: &str,
+    req: &DecisionRequest,
+    delivery: &Delivery,
+) -> Result<()> {
     let journal = Journal {
         thread_id: req.thread_id.clone(),
         text: req.text.clone(),
@@ -185,7 +192,7 @@ impl Runtime {
                 "{name} is not available from the web"
             );
             let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
-            match self.executor.executor.client().request(name, params).await {
+            match self.codex.client().request(name, params).await {
                 Ok(result) => result,
                 Err(error) if error.uncertain => anyhow::bail!(
                     "{}; the result is unknown, read the state back before calling again",
@@ -194,7 +201,7 @@ impl Runtime {
                 Err(error) => anyhow::bail!(error.message),
             }
         } else {
-            let mut state = self.executor.executor.snapshot().await;
+            let mut state = self.codex.snapshot().await;
             if let Some(thread) = input["thread_id"].as_str() {
                 let one = state["threads"][thread].take();
                 state["threads"] = json!({thread: one});

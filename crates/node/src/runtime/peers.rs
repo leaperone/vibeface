@@ -343,7 +343,10 @@ impl Runtime {
                 self.interrupt_work(network, work_id).await
             }
             "codex" | "codex_state" | "send_decision" => {
-                ensure!(input["human"] == true, "the App Server answers the user only");
+                ensure!(
+                    input["human"] == true,
+                    "the App Server answers the user only"
+                );
                 self.codex_rpc(network, kind, input).await
             }
             "cancel_manager" | "reconcile" | "resolve" => {

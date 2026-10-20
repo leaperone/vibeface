@@ -5,7 +5,7 @@ use crate::work::{Dispatch, DispatchState, WorkSpec};
 fn dispatch_value(dispatch: &Dispatch) -> Value {
     let spec = &dispatch.spec;
     let mut value = json!({"work_id":spec.work_id,"call_ref":spec.call_ref,
-        "target_node":spec.target,"executor":spec.executor});
+        "target_node":spec.target,"kind":spec.kind});
     match &dispatch.state {
         DispatchState::Pending => value["state"] = json!("waiting_for_device"),
         DispatchState::Accepted => value["state"] = json!("accepted"),
@@ -84,7 +84,7 @@ impl Runtime {
             "bind_work" => self.bind_work(network, &scope, &args).await,
             // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
             "dispatch_work" => {
-                let socket = self.executor.socket.clone();
+                let socket = self.codex.socket.clone();
                 let (access, scope) = (&access, scope.as_str());
                 crate::agent_cli::dispatch(
                     &args,
@@ -158,10 +158,10 @@ impl Runtime {
             target: target.clone(),
             dispatcher: local.clone(),
             call_ref: call_ref.into(),
-            executor: if target == local {
-                Executor::Codex
+            kind: if target == local {
+                WorkKind::Codex
             } else {
-                Executor::Agent
+                WorkKind::Task
             },
             cwd: field(args, "cwd")?.into(),
             title: field(args, "title")?.chars().take(120).collect(),
@@ -185,7 +185,9 @@ impl Runtime {
                 .and_then(|work| work.thread_id),
             None => None,
         };
-        Ok(json!({"work_id":record.spec.work_id,"call_ref":call_ref,"state":record.state,
-            "may_send":created,"send_by_ms":record.send_by_ms,"cwd":record.spec.cwd,"thread_id":thread}))
+        Ok(
+            json!({"work_id":record.spec.work_id,"call_ref":call_ref,"state":record.state,
+            "may_send":created,"send_by_ms":record.send_by_ms,"cwd":record.spec.cwd,"thread_id":thread}),
+        )
     }
 }

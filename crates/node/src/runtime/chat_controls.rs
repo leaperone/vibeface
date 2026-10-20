@@ -178,7 +178,7 @@ impl Runtime {
             let record = records.get(&work.work_id);
             value["state"] = match record {
                 // An agent task runs as its device's coordination turn, without Codex phases.
-                _ if work.executor == Executor::Agent && work.outcome.is_none() => json!("running"),
+                _ if work.kind == WorkKind::Task && work.outcome.is_none() => json!("running"),
                 Some(record) => json!(record.state.name()),
                 // Another device runs it: its progress events say where it is.
                 // `Started` is written when the native turn starts, so it already means running.
@@ -223,7 +223,7 @@ impl Runtime {
                 DispatchState::Rejected { reason } => ("rejected", Some(reason.clone())),
             };
             works.push(json!({"work_id":spec.work_id,"conversation_id":scope,"target_node":spec.target,
-                "trigger":spec.trigger,"dispatcher":spec.dispatcher,"executor":spec.executor,"cwd":spec.cwd,
+                "trigger":spec.trigger,"dispatcher":spec.dispatcher,"kind":spec.kind,"cwd":spec.cwd,
                 "prompt":spec.prompt,"phase":null,"summary":"","thread_id":null,"turn_id":null,"outcome":null,
                 "result_text":"","failure_reason":reason,"state":state}));
         }

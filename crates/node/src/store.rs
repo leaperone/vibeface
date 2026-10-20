@@ -638,14 +638,14 @@ impl Store {
             .query_map([network_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
-    /// A host-wide counter, so request IDs of a restarted executor never repeat.
-    pub fn next_executor_epoch(&mut self) -> Result<u64> {
+    /// A host-wide counter, so request IDs of a restarted App Server never repeat.
+    pub fn next_codex_epoch(&mut self) -> Result<u64> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: u64 = tx
             .query_row(
-                "SELECT CAST(value AS INTEGER) FROM identity_meta WHERE key='executor_epoch'",
+                "SELECT CAST(value AS INTEGER) FROM identity_meta WHERE key='codex_epoch'",
                 [],
                 |r| r.get(0),
             )
@@ -653,7 +653,7 @@ impl Store {
             .unwrap_or(0);
         let next = current + 1;
         tx.execute(
-            "INSERT INTO identity_meta(key,value) VALUES('executor_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            "INSERT INTO identity_meta(key,value) VALUES('codex_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [next.to_string()],
         )?;
         tx.commit()?;
