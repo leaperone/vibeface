@@ -566,6 +566,11 @@ async fn dispatch(
             let principal = principal(node, session).await?;
             node.write_status(&principal.network_id).await
         }
+        "diagnostics" => {
+            node_operator(node, session).await?;
+            let principal = principal(node, session).await?;
+            node.diagnostics(&principal.network_id).await
+        }
         "confirm_writable" => {
             node_operator(node, session).await?;
             let principal = principal(node, session).await?;

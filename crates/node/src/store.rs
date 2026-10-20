@@ -28,7 +28,7 @@ const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sq
 pub const SCHEMA_VERSION: u32 = 6;
 
 /// Whether this Node may append to its own log (design 5.7 and 5.8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteState {
     /// Started with other member Nodes; waits for one to confirm it holds nothing newer of ours.
@@ -41,7 +41,7 @@ pub enum WriteState {
 }
 
 impl WriteState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Aligning => "aligning",
             Self::ReadOnly => "read_only",

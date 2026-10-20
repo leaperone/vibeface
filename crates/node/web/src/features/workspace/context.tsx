@@ -437,6 +437,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
+    diagnostics: () => { requireCurrent(); return connection.request("diagnostics") },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台设备上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,

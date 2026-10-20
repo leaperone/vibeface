@@ -185,10 +185,6 @@ struct Join {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
     let command = match cli.command {
         Some(command) => command,
@@ -203,6 +199,10 @@ async fn main() -> Result<()> {
             })
         }
     };
+    logging(match &command {
+        Action::Serve(options) => Some(&options.data.data_dir),
+        _ => None,
+    });
     match command {
         Action::Init(options) => {
             check_ports(options.listen, options.local_listen)?;
@@ -244,6 +244,36 @@ async fn main() -> Result<()> {
             call_ref,
         } => call_tool(name, json, call_ref).await,
     }
+}
+
+/// Logs at info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. A running
+/// Node also appends to `node.log` in its data directory and copies to stderr only on a terminal,
+/// so a service's own stderr file keeps just crashes.
+fn logging(data_dir: Option<&PathBuf>) {
+    use std::io::IsTerminal as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+    let file = data_dir.and_then(|dir| {
+        let path = dir.join("node.log");
+        // ponytail: one rollover at start; a long-running Node grows past it until the next start.
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 16 << 20) {
+            let _ = fs::rename(&path, dir.join("node.log.1"));
+        }
+        fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).ok()
+    });
+    let terminal = file.is_none() || std::io::stderr().is_terminal();
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("warn,vibeface=info,vibeface_bridge=info")),
+        )
+        .with(file.map(|file| {
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+        }))
+        .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
+        .init();
 }
 
 /// Fails before any file is written, so a busy port never leaves a half-made data directory.
@@ -307,6 +337,8 @@ async fn status(options: Access) -> Result<()> {
                 "status":state, "device_id":device_id, "data_dir":data,
                 "listen":configuration.listen, "roles":configuration.roles,
                 "version":health.as_ref().ok().map(|health| &health.version),
+                "write_state":health.as_ref().ok().and_then(|health| health.write_state),
+                "peers":health.as_ref().ok().map(|health| &health.peers),
                 "cli_version":env!("CARGO_PKG_VERSION"), "error":error,
             })
         );
@@ -318,6 +350,23 @@ async fn status(options: Access) -> Result<()> {
         );
         if let Ok(health) = &health {
             println!("Version: {}", health.version);
+            if let Some(state) = health.write_state {
+                println!("Writes: {}", state.as_str());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |now| now.as_millis() as i64);
+            for peer in &health.peers {
+                let link = match peer.reachable {
+                    Some(true) => "reachable",
+                    Some(false) => "unreachable",
+                    None => "not tried yet",
+                };
+                let synced = peer.synced_ms.map_or("never synced".into(), |at| {
+                    format!("synced {}s ago", now.saturating_sub(at) / 1000)
+                });
+                println!("Peer: {} ({}) {link}, {synced}", peer.name, peer.device_id);
+            }
         }
         if let Some(error) = error {
             println!("Detail: {error}");

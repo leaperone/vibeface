@@ -27,6 +27,7 @@ pub(super) struct PeerSync {
     running: bool,
     rerun: bool,
     boot: Option<String>,
+    synced_ms: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -512,6 +513,7 @@ impl Runtime {
                     match &result {
                         Ok(()) => {
                             entry.failures = 0;
+                            entry.synced_ms = Some(now_ms());
                             entry.due = Some(Instant::now() + HELLO_INTERVAL);
                         }
                         Err(error) => {
@@ -700,6 +702,59 @@ impl Runtime {
     }
 
     /// The write state, and the conflicts kept aside here, for the web.
+    /// Each other member Node with whether the last sync reached it and when one last finished.
+    pub(crate) async fn peer_health(&self) -> Vec<crate::maintenance::PeerHealth> {
+        let Ok(view) = self.membership_state().await.and_then(|state| state.project()) else {
+            return Vec::new();
+        };
+        let local = self.identity.device_id().unwrap_or_default();
+        let states = self.sync_peers.lock().expect("sync peers");
+        view.members
+            .iter()
+            .filter(|member| {
+                member.kind == IdentityKind::Node
+                    && member.device_id != local
+                    && view.cutoff(&member.device_id).is_none()
+            })
+            .map(|member| {
+                let state = states.get(&member.device_id);
+                crate::maintenance::PeerHealth {
+                    device_id: member.device_id.clone(),
+                    name: member.name.clone(),
+                    reachable: state
+                        .filter(|state| state.failures > 0 || state.synced_ms.is_some())
+                        .map(|state| state.failures == 0),
+                    synced_ms: state.and_then(|state| state.synced_ms),
+                }
+            })
+            .collect()
+    }
+
+    /// The troubleshooting export: versions, configuration (it holds no secrets), write and peer
+    /// state, and the end of this Node's logs with invites and the entry token blanked.
+    pub(crate) async fn diagnostics(&self, network: &str) -> Result<Value> {
+        let conflicts = self.store.lock().await.conflicts(network)?.len();
+        let logs: serde_json::Map<String, Value> = [("node.log", 400), ("service.stderr.log", 50)]
+            .into_iter()
+            .filter_map(|(name, keep)| {
+                let text = std::fs::read_to_string(self.data_dir.join(name)).ok()?;
+                let lines: Vec<&str> = text.lines().collect();
+                let tail = lines[lines.len().saturating_sub(keep)..]
+                    .iter()
+                    .map(|line| redact(line, self.entry_token.as_deref()))
+                    .collect();
+                Some((name.to_owned(), Value::Array(tail)))
+            })
+            .collect();
+        Ok(json!({
+            "generated_at_ms":now_ms(), "version":env!("CARGO_PKG_VERSION"),
+            "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
+            "device_id":self.identity.device_id()?, "config":self.config,
+            "write_state":*self.write_state.borrow(), "conflicts":conflicts,
+            "peers":self.peer_health().await, "logs":logs,
+        }))
+    }
+
     pub(crate) async fn write_status(&self, network: &str) -> Result<Value> {
         let state = *self.write_state.borrow();
         let conflicts = self.store.lock().await.conflicts(network)?;
@@ -1344,9 +1399,34 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Blanks the entry token and anything shaped like an invite ticket.
+fn redact(line: &str, token: Option<&str>) -> Value {
+    let mut line = match token {
+        Some(token) => line.replace(token, "[redacted]"),
+        None => line.to_owned(),
+    };
+    while let Some(start) = line.find("vibeface1") {
+        let end = line[start..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map_or(line.len(), |length| start + length);
+        line.replace_range(start..end, "[invite]");
+    }
+    Value::String(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_blank_tokens_and_invites() {
+        let token = "ab".repeat(32);
+        let line = format!("join https://e.example/join#vibeface1qq2ww3 failed; token {token}.");
+        assert_eq!(
+            redact(&line, Some(&token)),
+            "join https://e.example/join#[invite] failed; token [redacted]."
+        );
+    }
     use crate::{config, crypto::LocalIdentity};
 
     async fn node(identity: &LocalIdentity) -> Result<(Arc<Runtime>, PathBuf)> {

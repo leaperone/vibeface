@@ -167,6 +167,19 @@ impl Drop for MaintenanceGuard {
 pub struct Health {
     pub device_id: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_state: Option<crate::store::WriteState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerHealth>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerHealth {
+    pub device_id: String,
+    pub name: String,
+    /// `None` until the first sync attempt with this peer finishes.
+    pub reachable: Option<bool>,
+    pub synced_ms: Option<i64>,
 }
 #[derive(Debug)]
 #[must_use]
@@ -355,6 +368,8 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
     let health = Health {
         device_id: runtime.identity.device_id()?,
         version: env!("CARGO_PKG_VERSION").into(),
+        write_state: (!runtime.config.public_entry).then(|| *runtime.write_state.borrow()),
+        peers: runtime.peer_health().await,
     };
     let mut response = Response {
         protocol: PROTOCOL,
