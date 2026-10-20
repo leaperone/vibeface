@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatWhen, lineDiff, nextRun, placeChanges, routineFrequency, routineName, routineTrigger } from "./assistant.ts"
+import { formatWhen, lineDiff, placeChanges, routineFrequency, routineName, routineTrigger } from "./assistant.ts"
 import { parseConversation } from "./model.ts"
 import type { AssistantChangeRecord } from "./types.ts"
 
@@ -16,11 +16,7 @@ test("routine frequency reads as plain words in local time", () => {
   assert.equal(routineFrequency({ first_run_at_ms: first, every_minutes: 45 }), "每 45 分钟")
 })
 
-test("next run skips missed slots and dates read relative to today", () => {
-  const routine = { first_run_at_ms: at(18, 9), every_minutes: 1440 }
-  assert.equal(nextRun(routine, at(17, 12)), at(18, 9))
-  assert.equal(nextRun(routine, at(20, 9)), at(20, 9))
-  assert.equal(nextRun(routine, at(20, 9, 1)), at(21, 9))
+test("dates read relative to today", () => {
   assert.equal(formatWhen(at(20, 21, 30), at(20, 8)), "今天 21:30")
   assert.equal(formatWhen(at(21, 9), at(20, 23)), "明天 09:00")
   assert.equal(formatWhen(at(25, 9), at(20, 8)), "10月25日 09:00")

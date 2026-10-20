@@ -63,7 +63,7 @@ export function ConversationScreen() {
   // What a turn changed in the assistant shows after its reply, or after the message while no reply exists.
   const changes = data?.changes ?? []
   const placedChanges = placeChanges(data?.messages ?? [], changes)
-  const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} /> })
+  const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={data?.assistant?.routines ?? []} /> })
 
   const entries: ChatEntry[] = []
   for (const message of data?.messages ?? []) {

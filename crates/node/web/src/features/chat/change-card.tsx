@@ -2,8 +2,8 @@ import { useId, type ReactNode } from 'react'
 import { ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details } from '@/components/app/kit'
-import { formatWhen, lineDiff, nextRun, routineFrequency, type DiffLine } from '@/features/workspace/assistant'
-import type { AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill } from '@/features/workspace/types'
+import { formatWhen, lineDiff, routineFrequency, type DiffLine } from '@/features/workspace/assistant'
+import type { AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, RoutineView } from '@/features/workspace/types'
 
 function cardTitle(changes: AssistantChange[]) {
   const kind = changes[0]?.kind
@@ -15,8 +15,8 @@ function cardTitle(changes: AssistantChange[]) {
   return added ? '已设定例行任务' : removed ? '已删除例行任务' : '已更新例行任务'
 }
 
-/** What one turn of the conversation changed, item by item, before → after. */
-export function ChangeCard({ records }: { records: AssistantChangeRecord[] }) {
+/** What one turn of the conversation changed, item by item, before → after. `routines` are the conversation's routines now. */
+export function ChangeCard({ records, routines }: { records: AssistantChangeRecord[]; routines: readonly RoutineView[] }) {
   const id = useId()
   const changes = records.map((record) => record.change)
   return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card p-4">
@@ -25,18 +25,18 @@ export function ChangeCard({ records }: { records: AssistantChangeRecord[] }) {
       <h3 id={id} className="text-meta font-medium text-muted-foreground">{cardTitle(changes)}</h3>
     </header>
     <ul className="grid gap-4">
-      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} />)}
+      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} routines={routines} />)}
     </ul>
   </section>
 }
 
-function ChangeRows({ change }: { change: AssistantChange }) {
+function ChangeRows({ change, routines }: { change: AssistantChange; routines: readonly RoutineView[] }) {
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
-  return <RoutineRow before={change.before} after={change.after} />
+  return <RoutineRow before={change.before} after={change.after} current={routines.find((routine) => routine.routine_id === change.routine_id)} />
 }
 
 function Row({ icon: Icon, label, tag, removed, children }: { icon: LucideIcon; label: ReactNode; tag?: string; removed?: boolean; children?: ReactNode }) {
@@ -52,11 +52,11 @@ function Row({ icon: Icon, label, tag, removed, children }: { icon: LucideIcon; 
   </li>
 }
 
-/** "Old → new" on one line; stacked with a downward arrow on narrow screens. */
+/** "Old → new" inline, wrapping when long. */
 function BeforeAfter({ before, after, className }: { before: string; after: string; className?: string }) {
-  return <p className={cn('flex min-w-0 flex-col items-start gap-x-2 gap-y-0.5 [overflow-wrap:anywhere] sm:flex-row sm:flex-wrap sm:items-center', className)}>
+  return <p className={cn('flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 [overflow-wrap:anywhere]', className)}>
     <span className="text-muted-foreground">{before}</span>
-    <ArrowRight aria-hidden="true" className="size-4 shrink-0 rotate-90 text-muted-foreground sm:rotate-0" />
+    <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     <span className="sr-only">改为</span>
     <span>{after}</span>
   </p>
@@ -98,18 +98,21 @@ function SkillRow({ before, after }: { before: AssistantSkill | null; after: Ass
   </Row>
 }
 
-function RoutineRow({ before, after }: { before: AssistantRoutine | null; after: AssistantRoutine | null }) {
+/** The next run comes from the routine as it is now, so a card for a removed or paused routine shows none. */
+function RoutineRow({ before, after, current }: { before: AssistantRoutine | null; after: AssistantRoutine | null; current?: RoutineView }) {
   const routine = after ?? before!
   const tag = !before ? '新例行任务' : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
   if (!after) return <Row icon={Repeat} label={routine.name} tag={tag} removed />
   const frequency = routineFrequency(after), previous = before ? routineFrequency(before) : frequency
+  const next = current?.enabled ? current.next_run_at_ms : null
   return <Row icon={Repeat} label={after.name} tag={tag}>
     {before && before.name !== after.name ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
     {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
-    <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
+    {previous === frequency || !after.enabled || next !== null ? <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
       {previous === frequency ? <span>{frequency}</span> : null}
-      {after.enabled ? <span>下次 {formatWhen(nextRun(after))}</span> : <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>}
-    </p>
+      {!after.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
+        : next !== null ? <span>下次 {formatWhen(next)}</span> : null}
+    </p> : null}
     <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.prompt}</p></Details>
   </Row>
 }

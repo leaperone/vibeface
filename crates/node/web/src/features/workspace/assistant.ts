@@ -26,13 +26,6 @@ export function formatWhen(ms: number, now = Date.now()): string {
   return `${year}${date.getMonth() + 1}月${date.getDate()}日 ${clock(date)}`
 }
 
-/** The first slot at or after `now`; missed slots are not run, so they are skipped. */
-export function nextRun(routine: Pick<AssistantRoutine, "first_run_at_ms" | "every_minutes">, now = Date.now()): number {
-  const period = routine.every_minutes * 60_000
-  if (now <= routine.first_run_at_ms) return routine.first_run_at_ms
-  return routine.first_run_at_ms + Math.ceil((now - routine.first_run_at_ms) / period) * period
-}
-
 export type DiffLine = { kind: "removed" | "added"; text: string }
 
 /** Lines removed and added between two texts, in reading order; unchanged and blank lines are left out. */
