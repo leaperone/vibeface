@@ -116,6 +116,8 @@ pub struct Runtime {
     router: Mutex<Option<iroh::protocol::Router>>,
     relay: Mutex<Option<iroh_relay::server::Server>>,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
+    /// Changes with every process start, so peers can tell a restart from a quiet link.
+    boot: String,
     sync_wakeup: tokio::sync::Notify,
     have_wakeup: tokio::sync::Notify,
     outbox_wakeup: tokio::sync::Notify,
@@ -213,6 +215,7 @@ impl Runtime {
             router: Mutex::new(None),
             relay: Mutex::new(None),
             sync_peers: std::sync::Mutex::new(HashMap::new()),
+            boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),
             have_wakeup: tokio::sync::Notify::new(),
             outbox_wakeup: tokio::sync::Notify::new(),

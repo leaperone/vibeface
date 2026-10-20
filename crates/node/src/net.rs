@@ -6,7 +6,9 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::memory::MemoryLookup,
-    endpoint::{BindOpts, Connection, ReadExactError, RecvStream, SendStream, presets},
+    endpoint::{
+        BindOpts, Connection, PortmapperConfig, ReadExactError, RecvStream, SendStream, presets,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -222,6 +224,10 @@ impl Net {
         // iroh starts with wildcard sockets on random ports; replace them so a configured
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();
+        // A router mapping would publish an address the user did not configure.
+        if config.bind.is_some() || config.relay_paths_only {
+            builder = builder.portmapper_config(PortmapperConfig::Disabled);
+        }
         if !config.relay_paths_only {
             let invalid = |error| anyhow!("invalid QUIC bind address: {error}");
             builder = match config.bind {
@@ -270,15 +276,27 @@ impl Net {
     pub fn forget(&self, device_id: &str) {
         if let Ok(id) = endpoint_id(device_id) {
             self.lookup.remove_endpoint_info(id);
-            let mut connections = self.connections.lock().expect("connection cache");
-            connections.retain(|(peer, _), connection| {
-                let keep = *peer != id;
-                if !keep {
-                    connection.close(0u32.into(), b"revoked");
-                }
-                keep
-            });
+            self.close_connections(id, b"revoked");
         }
+    }
+
+    /// Drops connections to a peer that restarted. QUIC cannot tell they are dead until its
+    /// idle timeout, so requests on them would hang that long.
+    pub fn peer_restarted(&self, device_id: &str) {
+        if let Ok(id) = endpoint_id(device_id) {
+            self.close_connections(id, b"peer restarted");
+        }
+    }
+
+    fn close_connections(&self, id: EndpointId, reason: &[u8]) {
+        let mut connections = self.connections.lock().expect("connection cache");
+        connections.retain(|(peer, _), connection| {
+            let keep = *peer != id;
+            if !keep {
+                connection.close(0u32.into(), reason);
+            }
+            keep
+        });
     }
 
     pub fn connected(&self, device_id: &str) -> bool {

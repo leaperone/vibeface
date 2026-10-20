@@ -26,6 +26,7 @@ pub(super) struct PeerSync {
     failures: u32,
     running: bool,
     rerun: bool,
+    boot: Option<String>,
 }
 
 #[derive(Clone)]
@@ -332,11 +333,16 @@ impl Runtime {
     async fn hello(&self, network: &str) -> Result<Value> {
         let state = self.membership_state().await?;
         let heads = self.store.lock().await.heads(network)?;
-        Ok(json!({"type":"hello","network_id":network,"vector":heads,
-            "membership_epoch":state.epoch(),"membership":membership_digest(&state)?}))
+        Ok(
+            json!({"type":"hello","network_id":network,"vector":heads,"boot":self.boot,
+            "membership_epoch":state.epoch(),"membership":membership_digest(&state)?}),
+        )
     }
 
     async fn handle_sync(&self, network: &str, origin: &str, input: &Value) -> Result<Value> {
+        if let Some(boot) = input["boot"].as_str() {
+            self.note_boot(origin, boot);
+        }
         match field(input, "type")? {
             "hello" => {
                 let ours = self.hello(network).await?;
@@ -388,6 +394,24 @@ impl Runtime {
                 Ok(json!({}))
             }
             _ => bail!("unknown sync request"),
+        }
+    }
+
+    /// A peer announcing a new boot has restarted: requests on our old connections to it would
+    /// hang until QUIC's idle timeout, so drop them and sync again now.
+    fn note_boot(&self, peer: &str, boot: &str) {
+        let restarted = {
+            let mut peers = self.sync_peers.lock().expect("sync peers");
+            let known = &mut peers.entry(peer.to_owned()).or_default().boot;
+            let restarted = known.as_deref().is_some_and(|known| known != boot);
+            *known = Some(boot.to_owned());
+            restarted
+        };
+        if restarted {
+            if let Ok(net) = self.net() {
+                net.peer_restarted(peer);
+            }
+            self.wake_sync(peer);
         }
     }
 
@@ -617,7 +641,8 @@ impl Runtime {
             }
             announced = seq;
             let Ok(net) = self.net() else { continue };
-            let have = json!({"type":"have","network_id":view.network_id,"author":local,"seq":seq,"hash":hash});
+            let have = json!({"type":"have","network_id":view.network_id,"author":local,"seq":seq,
+                "hash":hash,"boot":self.boot});
             for member in view.members.iter().filter(|member| {
                 member.kind == IdentityKind::Node
                     && member.device_id != local
