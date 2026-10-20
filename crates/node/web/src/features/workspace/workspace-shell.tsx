@@ -173,7 +173,9 @@ function ConnectionCapsule() {
   const device = useDevice()
   const { link, entrances } = device
   const address = device.ready?.entry.address ?? ""
-  const name = addressName(address)
+  const entryId = device.ready?.entry.device_id
+  const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
+  const name = entryName ? `经 ${entryName}` : addressName(address)
   const state: { label: string; icon: LucideIcon; tone: string } = link.kind === "connecting"
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"

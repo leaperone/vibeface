@@ -121,18 +121,15 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   const [summary, setSummary] = useState("")
   const disabled = !workspace.writable || !workspace.selectedBot
   const native = check.kind === "work"
-  // ponytail: the Node records every confirmed check as interrupted; the choice travels in the evidence until phase 4 adds outcomes.
-  const answer = (choice: string) => async () => {
-    await workspace.resolveCheck(check, `用户在网页上选择：${choice}${note.trim() ? `。${note.trim()}` : ""}`)
-  }
+  const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note) }
   return <ActionCard
     icon={CircleQuestionMark}
     title={`需要确认 · ${native ? "任务被打断" : "上次回复被打断"}`}
-    meta={nodeName(workspace.data?.local_node, { nodes: workspace.nodes, directory })}
+    meta={nodeName(check.target_node ?? workspace.data?.local_node, { nodes: workspace.nodes, directory })}
     actions={<>
       <ActionButton variant="ghost" disabled={disabled} action={async () => { setSummary(""); setSummary(recheckSummary(await workspace.reconcileCheck(check))) }}>不确定，再查一次</ActionButton>
-      <ActionButton disabled={disabled} action={answer("没做完")}>没做完</ActionButton>
-      <ActionButton variant="default" disabled={disabled} action={answer("做完了")}>做完了</ActionButton>
+      <ActionButton disabled={disabled} action={answer("interrupted")}>没做完</ActionButton>
+      <ActionButton variant="default" disabled={disabled} action={answer("completed")}>做完了</ActionButton>
     </>}
   >
     <p>{checkReason(check)}{native ? "那个任务实际做完了吗？" : "那次要做的事实际做完了吗？"}</p>

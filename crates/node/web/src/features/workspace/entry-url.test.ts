@@ -57,7 +57,7 @@ test("works, approvals with decline, reply status and pending checks keep their 
   assert.equal(parsed.messages[0].in_reply_to, "one")
   assert.deepEqual(parsed.messages[0].blobs, [{ hash: "result", size: 20 }])
   assert.equal(parseConversation(context).scheduler, null)
-  for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified"]) {
+  for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
     assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome, open_approvals: [] }] }).works[0].outcome, outcome)
   }
   assert.equal(parseConversation({ ...context, works: [{ ...work, state: undefined }] }).works[0].state, null)
@@ -70,7 +70,8 @@ test("works, approvals with decline, reply status and pending checks keep their 
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, open_approvals: [{ ...input, form: { questions: [...input.form.questions, ...input.form.questions] } }] }] }))
   const check = { check_id: "manager:attempt", kind: "manager_process", detail: "进程退出未确认", process_groups: [42] }
   assert.deepEqual(parseConversation({ ...context, pending_checks: [check] }).pending_checks, [check])
-  assert.deepEqual(parseConversation({ ...context, pending_checks: [{ check_id: "work:w", kind: "work", detail: "无法证明结果" }] }).pending_checks[0].process_groups, [])
+  assert.deepEqual(parseConversation({ ...context, pending_checks: [{ check_id: "work:w", kind: "work", detail: "无法证明结果", work_id: "w", target_node: "worker" }] }).pending_checks[0], { check_id: "work:w", kind: "work", detail: "无法证明结果", process_groups: [], work_id: "w", target_node: "worker" })
+  assert.deepEqual(parseConversation({ ...context, works: [{ ...work, state: "waiting_for_device", stop: { waiting_for_device: true, timed_out: false } }] }).works[0].stop, { waiting_for_device: true, timed_out: false })
   assert.throws(() => parseConversation({ ...context, pending_checks: [{ ...check, kind: "native_turn" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], sequence: -1 }] } }))
 })
@@ -127,6 +128,7 @@ test("workspace preserves bot and message requests while routing native decision
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
   const signed: string[] = [], attestation = { device_id: "client", signature: "signature" }
+  const botBody = (pending: unknown) => ({ ...JSON.parse(JSON.stringify(parseCreateBot(pending))), scheduler_node: "gateway", owner_attestation: attestation, attestation })
   const outboxItems = new Map<string, { key: string }>()
   const memoryOutbox = {
     all: async () => [...outboxItems.values()].map((item) => structuredClone(item)),
@@ -190,14 +192,14 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: transcript, works: [work] }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
-        assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")))), attestation }, creations.at(-1))
+        assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
         if (createMode === "unknown") throw new Error("connection lost")
         if (createMode === "rejected") throw Object.assign(new Error("project unavailable"), { responded: true })
         const created = parseBot({ ...body, event_hash: "new-bot-event" })
         knownBots = [...knownBots.filter((item) => item.bot_id !== created.bot_id), created]
         return { bot: created }
       }
-      if (["interrupt_work", "answer_approval"].includes(method)) {
+      if (["interrupt_work", "answer_approval", "resolve"].includes(method)) {
         controls.push(JSON.parse(JSON.stringify({ method, ...body })))
         if (failControl) throw new Error("connection lost")
         return { accepted: true }
@@ -256,6 +258,9 @@ test("workspace preserves bot and message requests while routing native decision
       { method: "answer_approval", conversation_id: "chat", work_id: "work", request_id: "req", response: { decision: "decline" }, attestation },
     ])
     assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"approval_answered","work_id":"work","request_id":"req","decision":"decline"}')
+    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", process_groups: [], work_id: "work" }, "completed", " 设备上已看到结果 ")
+    assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
+    assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
     await assert.rejects(render().interruptWork("other-work"), /停不了/)
     await assert.rejects(render().answerApproval("work", "other", { decision: "accept" }), /找不到这个请求/)
     const beforeUnknown = controls.length
@@ -287,17 +292,17 @@ test("workspace preserves bot and message requests while routing native decision
     const originalCreation = creations[0]
     assert.equal(typeof originalCreation.bot_id, "string")
     assert.notEqual(originalCreation.bot_id, originalCreation.conversation_id)
-    assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), attestation }, originalCreation)
+    assert.deepEqual(botBody(render().pendingBot), originalCreation)
     await reload()
-    assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), attestation }, originalCreation)
+    assert.deepEqual(botBody(render().pendingBot), originalCreation)
     await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /内容已保留/)
     createMode = "rejected"
     await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
-    assert.deepEqual({ ...JSON.parse(JSON.stringify(parseCreateBot(render().pendingBot))), attestation }, originalCreation)
+    assert.deepEqual(botBody(render().pendingBot), originalCreation)
     assert.equal(render().pendingBot?.submission?.state, "unconfirmed")
     createMode = "success"
     await render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
-    assert.deepEqual(creations.slice(1), [originalCreation, originalCreation])
+    assert.deepEqual(creations.slice(1), [originalCreation, originalCreation, originalCreation], "the reload resubmits the unconfirmed creation from the outbox")
     assert.equal(render().pendingBot, null)
     createMode = "rejected"
     await assert.rejects(render().createBot({ name: "invalid project", instructions: "", project: { target_node: "executor", cwd: "/unavailable" } }), /确认没建成/)
@@ -492,7 +497,7 @@ test("approval risk names deletion, force push, permissions, downloads and folde
 })
 
 
-test("only the executing device stops a running task", async () => {
+test("any entrance stops an unfinished task once, even on another device", async () => {
   const stopped: string[] = []
   const data = { local_node: 'worker', works: [] as unknown[] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
@@ -501,11 +506,11 @@ test("only the executing device stops a running task", async () => {
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   try {
     const work = { work_id: 'work', target_node: 'worker', cwd: '/p', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, open_approvals: [], answered_approvals: [] }
-    data.works = [{ ...work, target_node: 'other' }]
-    assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined)
     data.works = [{ ...work, state: 'unverified' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined)
-    data.works = [work]
+    data.works = [{ ...work, target_node: 'other', stop: { waiting_for_device: true, timed_out: false } }]
+    assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined, "a stop already on its way is not sent twice")
+    data.works = [{ ...work, target_node: 'other' }]
     ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work'])

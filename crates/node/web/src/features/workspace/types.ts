@@ -15,8 +15,10 @@ export type HumanQuestion = { id: string; header: string; question: string; opti
 export type WorkApproval = { request_id: string; kind: string; summary: string; answering?: boolean; form?: { command?: string; cwd?: string; reason?: string; files?: string[]; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] } }
 /** An answered request stays as one line in the chat; the decision comes from the shared `ApprovalAnswered` event. */
 export type WorkAnswer = { request_id: string; kind: string; summary: string; decision: string }
-export type WorkState = "accepted" | "starting" | "running" | "waiting_approval" | "interrupting" | "finished" | "unverified"
-export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
+/** `waiting_for_device` and `rejected` are dispatches another device has not taken. */
+export type WorkState = "accepted" | "starting" | "running" | "waiting_approval" | "interrupting" | "finished" | "unverified" | "waiting_for_device" | "rejected"
+/** `abandoned`: the device was removed before it reported; the work did not run. */
+export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified" | "abandoned"
 export type WorkRecord = {
   work_id: string
   trigger: string
@@ -30,6 +32,8 @@ export type WorkRecord = {
   failure_reason: string | null
   open_approvals: WorkApproval[]
   answered_approvals: WorkAnswer[]
+  /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
+  stop?: { waiting_for_device: boolean; timed_out: boolean }
 }
 export type ManagerJob = {
   trigger: string
@@ -48,12 +52,17 @@ export type SchedulerSnapshot = {
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
 }
+/** An attachment by content: hex SHA-256 and byte size. */
+export type BlobRef = { hash: string; size: number }
 /** A started process or work whose outcome this Node cannot prove; nothing is resent. */
 export type PendingCheck = {
   check_id: string
   kind: "manager_process" | "work"
   detail: string
   process_groups: number[]
+  /** Set on a task check; the user's choice settles that task. */
+  work_id?: string
+  target_node?: string
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type AutonomyMode = "off" | "report" | "continue"

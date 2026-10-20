@@ -17,7 +17,7 @@ import {
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AutonomyMode, ConversationPayload, NodeInfo, NotificationRecord,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef,
 } from "./types"
 
 export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
@@ -216,6 +216,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
       const nextBots = parseBots(rawBots)
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots)
+      if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
       const bot = nextBots.find((item) => item.conversation_id === activeId.current) ?? nextBots.find((item) => item.bot_id === selected) ?? nextBots[0]
@@ -247,11 +248,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   /** Is this write already in the entry's history (or moot)? Asked by business ID before any resubmission. */
   const recorded = async (item: OutboxItem) => {
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
+    if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
     if (item.method === "answer_approval") return !context.works.some((work) => work.work_id === item.params.work_id && work.open_approvals.some((request) => request.request_id === item.params.request_id))
     if (item.method === "set_autonomy") return context.autonomy.version !== item.params.expected_version
+    if (item.method === "resolve") return !context.pending_checks.some((check) => check.check_id === item.params.check_id)
     return true
   }
   /** After a (re)connection: confirm what the entry has, resubmit the rest byte for byte, stop at an unknown. */
@@ -326,7 +329,23 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     scheduleRefresh()
   }
   /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
-  const submitMessage = async (text: string) => {
+  /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
+  const uploadAttachment = async (id: string, file: File): Promise<BlobRef> => {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    if (!bytes.length || bytes.length > 64 * 1024 * 1024) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+    let offset = 0
+    for (;;) {
+      requireCurrent()
+      const chunk = bytes.subarray(offset, offset + 1024 * 1024)
+      let binary = ""
+      for (let index = 0; index < chunk.length; index += 0x8000) binary += String.fromCharCode(...chunk.subarray(index, index + 0x8000))
+      const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash, size: bytes.length, offset, data: btoa(binary) }))
+      if (reply.complete === true) return { hash, size: bytes.length }
+      offset = Number(reply.offset)
+    }
+  }
+  const submitMessage = async (text: string, files: File[] = []) => {
     requireContext()
     const id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
@@ -336,8 +355,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     let item = prior ? (await outbox.all()).find((entry) => entry.key === key) : undefined
     if (!item) {
       const { body } = prepared
-      const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, report_results: body.report_results })
-      item = await enqueue(outbox, { key, method: "message", params: { ...body, attestation }, created_at_ms: Date.now() })
+      const uploaded: BlobRef[] = []
+      for (const file of files) uploaded.push(await uploadAttachment(id, file))
+      // Signed in the Node's order: by hash then size, without duplicates.
+      const attachments = uploaded.sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : a.size - b.size)
+        .filter((blob, index, all) => index === 0 || blob.hash !== all[index - 1].hash || blob.size !== all[index - 1].size)
+      const extra = attachments.length ? { attachments } : {}
+      const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, ...extra, report_results: body.report_results })
+      item = await enqueue(outbox, { key, method: "message", params: { ...body, ...extra, attestation }, created_at_ms: Date.now() })
     } else if (item.rejected !== undefined) {
       item = { ...item, rejected: undefined }
       await outbox.put(item)
@@ -386,11 +411,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     selectConversation(bot.conversation_id)
     await refreshRef.current()
   }
-  const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
+  const sendMessage = (input: string, files: File[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个助手。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
-    try { return await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
+    try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
   })
   const incomplete = !data
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
@@ -422,7 +447,10 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       botCreationRef.current = pending; setPendingBot(pending)
       let response: unknown
       const attestation = await attest(request.conversation_id, { type: "bot_created", bot_id: request.bot_id, name: request.name, instructions: request.instructions, ...(request.project ? { project: request.project } : {}) })
-      try { response = await connection.rpc("create_bot", { ...request, attestation }) }
+      // The entry first asked schedules the conversation, so a retry through any entry writes the same owner.
+      const scheduler = pending.submission?.entry_node ?? connection.entry.device_id
+      const owner_attestation = await attest(request.conversation_id, { type: "conversation_owner", scheduler_node: scheduler, epoch: 1 })
+      try { response = await signedWrite("bot", request.bot_id, "create_bot", { ...request, scheduler_node: scheduler, owner_attestation, attestation }) }
       catch (caught) {
         if (!prior && current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
           const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.device_id } }
@@ -475,11 +503,12 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
       const work = context.works.find((item) => item.work_id === workId)
-      if (!work || !["running", "waiting_approval"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
-      try { await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId }) }
+      if (!work || work.outcome || !["accepted", "starting", "running", "waiting_approval"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
+      let receipt: Record<string, unknown>
+      try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      setNoticeText("已请求停止任务。")
+      setNoticeText(receipt.waiting_for_device === true ? "已请求，等待设备确认。" : "已请求停止任务。")
       if (activeId.current === id) await refreshRef.current()
     }),
     answerApproval: (workId: string, requestId: string, response: unknown) => withMutation(`work-control:${workId}`, async () => {
@@ -504,11 +533,20 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       if (activeId.current === id) await refreshRef.current()
       return result
     }),
-    resolveCheck: (check: PendingCheck, evidence: string) => withMutation(`pending-check:${check.check_id}`, async () => {
+    /** A task check records the user's signed choice; a reply check keeps the written evidence. */
+    resolveCheck: (check: PendingCheck, choice: "completed" | "interrupted", note: string) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
-      if (new TextEncoder().encode(evidence.trim()).length < 12) throw new Error("说明太短了。")
-      await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id, evidence: evidence.trim() })
+      const text = note.trim()
+      if (check.work_id) {
+        if (new TextEncoder().encode(text).length > 4096) throw new Error("备注太长了。")
+        const attestation = await attest(id, { type: "work_finished", work_id: check.work_id, outcome: choice, result_text: text })
+        try { await signedWrite("resolve", check.check_id, "resolve", { conversation_id: id, check_id: check.check_id, outcome: choice, note: text, attestation }) }
+        catch (caught) { requireControlRefresh(); throw caught }
+      } else {
+        const evidence = `${choice === "completed" ? "用户确认已完成" : "用户确认没做完"}${text ? `：${text}` : "。"}`
+        await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id, evidence })
+      }
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),

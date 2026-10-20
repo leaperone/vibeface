@@ -8,7 +8,7 @@ import { useWorkspace } from "./context"
 import { approvalKind, decisionLabel, nodeName, progressLabel, shownState, taskActive, taskLabel } from "./labels"
 import { ApprovalCard } from "./task-activity"
 
-const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["unverified", "waiting_approval"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["unverified", "waiting_approval", "stop_unconfirmed"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 /** /b/:botId/work/:workId — desktop side panel beside the chat, full screen on phones. */
 export function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
@@ -20,8 +20,8 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   const state = work ? shownState(work) : ""
   const device = work?.target_node ?? ""
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
-  // Only the executing device holds the executor, so only it can stop the work.
-  const canStop = work && ["running", "waiting_approval"].includes(work.state ?? "") && work.target_node === workspace.data?.local_node
+  // Any entry forwards the stop; an unreachable device gets it when it is back.
+  const canStop = work && !work.outcome && !work.stop && ["accepted", "starting", "running", "waiting_approval"].includes(work.state ?? "")
   const navigate = useNavigate()
   const close = () => void navigate({ to: "/b/$botId", params: { botId } })
   useEffect(() => {
@@ -61,7 +61,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
         </p>)}
       </section> : null}
       {stop ? <div className="grid gap-2">
-        <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop, "已请求停止")}><Square aria-hidden="true" />停止任务</Button>
+        <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop)}><Square aria-hidden="true" />停止任务</Button>
         <InlineError error={action.error} />
       </div> : null}
       <Details>

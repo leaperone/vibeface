@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { Ban, Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
@@ -26,6 +26,7 @@ export function ConversationScreen() {
   const { directory } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
   const [sendError, setSendError] = useState<unknown>(null)
+  const [files, setFiles] = useState<File[]>([])
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const bot = workspace.selectedBot
@@ -145,10 +146,12 @@ export function ConversationScreen() {
         busy={messageBusy}
         onStop={stopJob && workspace.writable && bot ? () => { setSendError(null); workspace.cancelManager(stopJob.trigger).catch(setSendError) } : undefined}
         onChange={setText}
+        files={files}
+        onFiles={setFiles}
         onSubmit={() => {
           if (sendDisabled || !text.trim()) return
           setSendError(null)
-          workspace.sendMessage(text).then((sent) => { if (sent && workspace.isCurrent()) clearSentDraft(conversationId, text) }).catch(setSendError)
+          workspace.sendMessage(text, files).then((sent) => { if (sent && workspace.isCurrent()) { clearSentDraft(conversationId, text); setFiles([]) } }).catch(setSendError)
         }}
       >
         <InlineError error={sendError} />
@@ -175,9 +178,10 @@ type TaskRow = { id: string; state: string; device: string; summary: string; tri
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string; device: string; open: boolean }) {
   const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'rejected'
+  const result = (task.work.result_text || task.work.failure_reason || '').split('\n')[0]
   if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
-    {failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0 truncate">任务 · {device} · {taskLabel(task.state)}</span>
+    {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
+    <span className="min-w-0 truncate">任务 · {device} · {taskLabel(task.state)}{result ? ` · ${result}` : ''}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">

@@ -95,14 +95,14 @@ function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
 function workState(value: unknown): WorkState | null {
   switch (value) {
     case undefined: case null: return null
-    case "accepted": case "starting": case "running": case "waiting_approval": case "interrupting": case "finished": case "unverified": return value
+    case "accepted": case "starting": case "running": case "waiting_approval": case "interrupting": case "finished": case "unverified": case "waiting_for_device": case "rejected": return value
     default: throw new Error("任务状态无法识别。")
   }
 }
 function workOutcome(value: unknown): WorkOutcome | null {
   switch (value) {
     case undefined: case null: return null
-    case "completed": case "failed": case "interrupted": case "rejected": case "unverified": return value
+    case "completed": case "failed": case "interrupted": case "rejected": case "unverified": case "abandoned": return value
     default: throw new Error("任务结果无法识别。")
   }
 }
@@ -112,12 +112,13 @@ function work(value: unknown): WorkRecord {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
     failure_reason: data.failure_reason == null ? null : text(data.failure_reason), open_approvals: list(data.open_approvals).map(approval), answered_approvals: list(data.answered_approvals).map(answer),
+    ...(data.stop == null ? {} : { stop: { waiting_for_device: flag(record(data.stop).waiting_for_device), timed_out: flag(record(data.stop).timed_out) } }),
   }
 }
 function pendingCheck(value: unknown): PendingCheck {
   const data = record(value), kind = data.kind
   if (kind !== "manager_process" && kind !== "work") throw new Error("需要确认的事项无法识别。")
-  return { check_id: text(data.check_id), kind, detail: text(data.detail), process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number) }
+  return { check_id: text(data.check_id), kind, detail: text(data.detail), process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number), ...(kind === "work" ? { work_id: text(data.work_id), target_node: text(data.target_node) } : {}) }
 }
 function autonomyMode(value: unknown): AutonomyMode {
   switch (value) {
