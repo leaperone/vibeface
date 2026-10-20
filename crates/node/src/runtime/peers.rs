@@ -1070,6 +1070,7 @@ impl Runtime {
     }
 
     async fn fetch_blobs(&self, network: &str, peer: &str) -> Result<()> {
+        let _download = self.blob_fetch.lock().await;
         let missing = self.store.lock().await.missing_blobs(network)?;
         for blob in missing {
             self.fetch_blob(network, peer, &blob).await?;
@@ -1274,7 +1275,19 @@ mod tests {
             }
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
-            b.sync_peer(&network, &ia.device_id()?).await?;
+            let peer_a = ia.device_id()?;
+            let first = {
+                let (b, network, peer) = (b.clone(), network.clone(), peer_a.clone());
+                tokio::spawn(async move { b.sync_peer(&network, &peer).await })
+            };
+            while b.store.lock().await.committed_offset(&network, &blob.hash)? == 0
+                && !first.is_finished()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            // A second download of the same attachment waits instead of sharing its staging file.
+            b.fetch_blobs(&network, &peer_a).await?;
+            first.await??;
             let heads = a.store.lock().await.heads(&network)?;
             assert_eq!(b.store.lock().await.heads(&network)?, heads);
             assert!(b.store.lock().await.missing_blobs(&network)?.is_empty());
