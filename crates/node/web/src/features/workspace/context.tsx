@@ -12,13 +12,20 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage,
+  parseArtifactPage, parseWriteStatus,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AutonomyMode, ConversationPayload, NodeInfo, NotificationRecord,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus,
 } from "./types"
+
+/** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
+const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
+  aligning: "这台设备正在和你的其他设备对齐，对齐后就能写。",
+  read_only: "这台设备现在只读，在待处理里确认后就能写。",
+  forked: "这台设备的数据和另一份副本不一致，已停止写入。",
+}
 
 export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
 
@@ -45,6 +52,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
@@ -89,6 +97,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     requireCurrent()
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
+    if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
   /** Unconfirmed messages as the page shows them, read back from the outbox. */
@@ -209,13 +218,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawNotifications, rawBots] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"),
+      const [rawNodes, rawNotifications, rawBots, rawWrite] = await Promise.all([
+        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"),
       ])
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
       const nextBots = parseBots(rawBots)
-      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setWriteState(parseWriteStatus(rawWrite))
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
@@ -425,8 +434,10 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
-    writable: booted && current() && readConnection.current === connection,
+    writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
+    writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
+    confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台设备上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
     selectBot,

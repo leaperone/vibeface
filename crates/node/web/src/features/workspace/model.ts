@@ -2,7 +2,7 @@ import type { TranscriptMessage } from "../chat/types"
 import type { ReplyStatus } from "../chat/types"
 import type {
   AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
-  SchedulerSnapshot, HumanQuestion, WorkAnswer, WorkApproval, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
+  SchedulerSnapshot, HumanQuestion, ConflictVersion, WriteStatus, WorkAnswer, WorkApproval, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
 } from "./types"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -167,4 +167,21 @@ export function parsePendingBot(value: unknown): PendingBot {
   const data = record(value), submission = record(data.submission)
   if (submission.state !== "unconfirmed" && submission.state !== "rejected") throw new Error("机器人创建记录的提交状态无效。")
   return { ...parseCreateBot(value), submission: { state: submission.state, entry_node: text(submission.entry_node) } }
+}
+
+function conflictVersion(value: unknown): ConflictVersion {
+  const data = record(value)
+  return { hash: text(data.hash), scope_id: text(data.scope_id), created_at_ms: number(data.created_at_ms), body: record(data.body) }
+}
+export function parseWriteStatus(value: unknown): WriteStatus {
+  const data = record(value)
+  const state = data.state
+  if (state !== "aligning" && state !== "read_only" && state !== "writable" && state !== "forked") throw new Error("设备返回的写入状态不对。")
+  return {
+    state,
+    conflicts: list(data.conflicts).map((item) => {
+      const conflict = record(item)
+      return { author: text(conflict.author), seq: number(conflict.seq), kept: conflict.kept == null ? null : conflictVersion(conflict.kept), other: conflictVersion(conflict.other) }
+    }),
+  }
 }

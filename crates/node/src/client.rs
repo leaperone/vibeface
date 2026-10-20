@@ -562,6 +562,17 @@ async fn dispatch(
             let state = node.membership_state().await?;
             Ok(json!({"view":state.project()?,"state":state}))
         }
+        "write_state" => {
+            let principal = principal(node, session).await?;
+            node.write_status(&principal.network_id).await
+        }
+        "confirm_writable" => {
+            node_operator(node, session).await?;
+            let principal = principal(node, session).await?;
+            node.confirm_writable(&principal.network_id, &session.device_id)
+                .await?;
+            node.write_status(&principal.network_id).await
+        }
         "node_settings" => {
             node_operator(node, session).await?;
             node.node_settings().await
@@ -1258,7 +1269,7 @@ mod tests {
         config.roles = vec![NodeRole::Relay, NodeRole::Replica, NodeRole::Scheduler];
         config.codex_socket = Some(dir.join("unavailable-codex.sock"));
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -1486,7 +1497,7 @@ mod tests {
                 &dir.join("identity.json"),
                 &serde_json::to_vec(&LocalIdentity::generate())?,
             )?;
-            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+            crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
             let node = Arc::new(Runtime::open(dir).await?);
             let root = LocalIdentity::generate();
             node.install_membership(NetworkState::new(Genesis::create(
@@ -1695,7 +1706,7 @@ mod tests {
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
-        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        crate::config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);

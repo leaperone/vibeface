@@ -435,7 +435,7 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
     if let Some(token) = &entry_token {
         create_private(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
     }
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
     println!("Initialized device with Peer ID {}", identity.device_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     if configuration.public_entry {
@@ -493,7 +493,7 @@ async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":6}),
+        epoch == json!({"data_epoch":7}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;

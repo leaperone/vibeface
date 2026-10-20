@@ -928,7 +928,7 @@ mod tests {
         let mut config = Config::local(address, vec![], false);
         config.roles = vec![NodeRole::Relay];
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,

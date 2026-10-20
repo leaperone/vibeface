@@ -514,7 +514,7 @@ class Node:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds")
-        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 6},
+        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 7},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
         self.configure_network(bind=f"127.0.0.1:{self.port}")

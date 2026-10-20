@@ -8,6 +8,9 @@ const codes: Record<string, string> = {
 }
 
 const patterns: [RegExp, string][] = [
+  [/log has forked/i, '这台设备的数据和另一份副本不一致，已停止写入。'],
+  [/read-only until you confirm/i, '这台设备现在只读，在待处理里确认后就能写。'],
+  [/aligning with other Nodes/i, '这台设备正在和你的其他设备对齐，稍后再试。'],
   [/outcome may be unknown|timed out/i, '设备没有及时回复，结果未知。请先确认结果，不要重复提交。'],
   [/network has not started|maintenance lease|another maintenance/i, '这台设备正在启动或维护，请稍后再试。'],
   [/another personal network|wrong personal network|wrong membership network|unknown network|network mismatch/i, '这台设备属于另一组设备。'],

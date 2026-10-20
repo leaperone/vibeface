@@ -28,6 +28,59 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn hash_at(&self, network: &str, author: &str, seq: u64) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT hash FROM events WHERE network_id=? AND author=? AND seq=?",
+                params![network, author, seq],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn has_conflicts_by(&self, network: &str, author: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM log_conflicts WHERE network_id=? AND author=? LIMIT 1",
+                params![network, author],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// The first conflicts kept aside, each beside the event stored at the same place.
+    pub fn conflicts(&self, network: &str) -> Result<Vec<serde_json::Value>> {
+        let mut statement = self.connection.prepare(
+            "SELECT c.author,c.seq,c.envelope,e.envelope FROM log_conflicts c LEFT JOIN events e
+             ON e.network_id=c.network_id AND e.author=c.author AND e.seq=c.seq
+             WHERE c.network_id=? ORDER BY c.author,c.seq LIMIT 20",
+        )?;
+        let rows = statement.query_map([network], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let version = |envelope: &str| -> Result<serde_json::Value> {
+            let envelope: SignedEvent = serde_json::from_str(envelope)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            Ok(serde_json::json!({"hash":envelope.hash,"scope_id":event.scope_id,
+                "created_at_ms":event.created_at_ms,"body":event.body}))
+        };
+        let mut conflicts = Vec::new();
+        for row in rows {
+            let (author, seq, other, kept) = row?;
+            conflicts.push(serde_json::json!({"author":author,"seq":seq,
+                "kept":kept.as_deref().map(version).transpose()?,"other":version(&other)?}));
+        }
+        Ok(conflicts)
+    }
+
     /// One author's events from `from_seq` on, within the batch limits.
     pub fn events_from(
         &self,

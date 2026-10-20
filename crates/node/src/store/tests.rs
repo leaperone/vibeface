@@ -306,6 +306,45 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
         .map(|m| m.text)
         .collect();
     assert_eq!(texts, vec!["kept", "still works", "a continues"]);
+    assert!(target.has_conflicts_by(&net.network, &net.a.device_id()?)?);
+    assert!(!target.has_conflicts_by(&net.network, &net.b.device_id()?)?);
+    let conflicts = target.conflicts(&net.network)?;
+    assert_eq!(conflicts.len(), 2);
+    assert_eq!(conflicts[0]["other"]["body"]["text"], "forked");
+    assert_eq!(conflicts[0]["kept"]["body"]["text"], "kept");
+    Ok(())
+}
+
+#[test]
+fn the_write_gate_stops_local_appends_only() -> Result<()> {
+    let net = net()?;
+    let mut origin = store(&net)?;
+    let created = origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        EventBody::ConversationCreated { title: "t".into() },
+        vec![],
+        1,
+    )?;
+    let mut gated = store(&net)?;
+    for (state, refusal) in [
+        (WriteState::Aligning, "aligning"),
+        (WriteState::ReadOnly, "read-only"),
+        (WriteState::Forked, "forked"),
+    ] {
+        gated.set_write_state(state)?;
+        let error = gated
+            .append_event(&net.b, &net.network, "c", user(&net, "m1", "x"), vec![], 2)
+            .expect_err("a gated Node does not append");
+        assert!(error.to_string().contains(refusal), "{error}");
+    }
+    assert_eq!(
+        gated.ingest_events(&net.network, &[created])?,
+        vec![IngestStatus::Accepted]
+    );
+    gated.set_write_state(WriteState::Writable)?;
+    gated.append_event(&net.b, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
     Ok(())
 }
 

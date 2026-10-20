@@ -6,7 +6,7 @@ use crate::{
     identity::AuthorizationView,
     model::*,
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -270,6 +270,13 @@ pub(crate) fn append_from(
     blobs: Vec<BlobRef>,
     created_at_ms: i64,
 ) -> Result<SignedEvent> {
+    let gate: String = connection.query_row("SELECT state FROM temp.write_gate", [], |r| r.get(0))?;
+    match gate.as_str() {
+        "writable" => {}
+        "forked" => bail!("this Node's log has forked and it no longer writes"),
+        "read_only" => bail!("this Node is read-only until you confirm it was not restored from a backup"),
+        _ => bail!("this Node is aligning with other Nodes; try again shortly"),
+    }
     let author = identity.device_id()?;
     super::authorize_node_from(connection, network, &author)?;
     if let Some(attestation) = body.attestation() {

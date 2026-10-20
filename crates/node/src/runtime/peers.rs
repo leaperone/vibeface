@@ -486,6 +486,7 @@ impl Runtime {
                 })
                 .map(|member| member.device_id.clone())
                 .collect();
+            let members = Arc::new(peers.clone());
             for peer in peers {
                 {
                     let mut states = self.sync_peers.lock().expect("sync peers");
@@ -498,8 +499,13 @@ impl Runtime {
                 }
                 let node = self.clone();
                 let network = network.clone();
+                let members = members.clone();
                 tokio::spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
+                    if result.is_err() && node.unreachable(&members, &peer) {
+                        node.set_write_state(&network, &[WriteState::Aligning], WriteState::ReadOnly)
+                            .await;
+                    }
                     let mut states = node.sync_peers.lock().expect("sync peers");
                     let entry = states.entry(peer.clone()).or_default();
                     entry.running = false;
@@ -587,8 +593,134 @@ impl Runtime {
                 break;
             }
         }
+        self.check_own_log(network, peer, &vector).await?;
         if let Err(error) = self.fetch_blobs(network, peer).await {
             tracing::debug!(%peer, %error, "attachment download pending");
+        }
+        Ok(())
+    }
+
+    /// Whether every other member Node has failed since boot, counting this failure of `peer`.
+    fn unreachable(&self, members: &[String], peer: &str) -> bool {
+        let states = self.sync_peers.lock().expect("sync peers");
+        members.iter().all(|member| {
+            member == peer || states.get(member).is_some_and(|state| state.failures > 0)
+        })
+    }
+
+    /// Starting up with other member Nodes, this one waits to learn it holds every event it
+    /// wrote before (a restored backup may not); with none, it writes right away.
+    pub(super) async fn align_on_start(&self) -> Result<bool> {
+        if !self.has_membership().await? {
+            return Ok(true);
+        }
+        let (network, peers) = self.member_peers().await?;
+        let forked = self
+            .store
+            .lock()
+            .await
+            .has_conflicts_by(&network, &self.identity.device_id()?)?;
+        let state = match (forked, peers.is_empty()) {
+            (true, _) => WriteState::Forked,
+            (false, true) => WriteState::Writable,
+            (false, false) => WriteState::Aligning,
+        };
+        self.set_write_state(&network, &[WriteState::Writable], state).await;
+        Ok(state == WriteState::Writable)
+    }
+
+    /// Compares what `peer` holds of this device's log with ours. A different event at the
+    /// same sequence means another copy of this data directory wrote it: that copy is kept
+    /// aside beside ours, and this Node stops writing.
+    async fn check_own_log(
+        &self,
+        network: &str,
+        peer: &str,
+        vector: &BTreeMap<String, (u64, String)>,
+    ) -> Result<()> {
+        let own = self.identity.device_id()?;
+        let theirs = vector.get(&own);
+        let local = self.local_seq(network, &own).await?;
+        let ours = match theirs {
+            Some((seq, _)) if *seq <= local => self.store.lock().await.hash_at(network, &own, *seq)?,
+            _ => None,
+        };
+        if let Some((seq, hash)) = theirs
+            && *seq <= local
+            && ours.as_deref() != Some(hash)
+        {
+            let reply = self
+                .net()?
+                .request(
+                    peer,
+                    net::SYNC,
+                    &json!({"type":"pull","network_id":network,"author":own,"from_seq":seq,"limit":1}),
+                    PEER_TIMEOUT,
+                )
+                .await?;
+            let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
+            self.ingest(network, &events).await?;
+        }
+        if self.store.lock().await.has_conflicts_by(network, &own)? {
+            let from = [WriteState::Aligning, WriteState::ReadOnly, WriteState::Writable];
+            if self.set_write_state(network, &from, WriteState::Forked).await {
+                tracing::warn!(%peer, "another copy of this device wrote different events; writes stopped");
+            }
+        } else if theirs.is_none_or(|(seq, _)| *seq <= local) {
+            let from = [WriteState::Aligning, WriteState::ReadOnly];
+            self.set_write_state(network, &from, WriteState::Writable).await;
+        }
+        Ok(())
+    }
+
+    /// Moves to `to` from one of `from`; returns whether it did.
+    pub(crate) async fn set_write_state(
+        &self,
+        network: &str,
+        from: &[WriteState],
+        to: WriteState,
+    ) -> bool {
+        let mut store = self.store.lock().await;
+        let current = *self.write_state.borrow();
+        if current == to || !from.contains(&current) {
+            return false;
+        }
+        if let Err(error) = store.set_write_state(to) {
+            tracing::warn!(%error, "write state change pending");
+            return false;
+        }
+        self.write_state.send_replace(to);
+        drop(store);
+        tracing::info!(state = ?to, "write state changed");
+        let _ = self.events.send(Update {
+            network_id: network.into(),
+            payload: json!({"type":"write_state","state":to}),
+        });
+        true
+    }
+
+    /// The write state, and the conflicts kept aside here, for the web.
+    pub(crate) async fn write_status(&self, network: &str) -> Result<Value> {
+        let state = *self.write_state.borrow();
+        let conflicts = self.store.lock().await.conflicts(network)?;
+        Ok(json!({"state":state,"conflicts":conflicts}))
+    }
+
+    /// The user's word that this data directory was not restored from a backup. Recorded only
+    /// here, never in the shared log.
+    pub(crate) async fn confirm_writable(&self, network: &str, device: &str) -> Result<()> {
+        ensure!(
+            *self.write_state.borrow() != WriteState::Forked,
+            "this Node's log has forked and it no longer writes"
+        );
+        let from = [WriteState::Aligning, WriteState::ReadOnly];
+        if self.set_write_state(network, &from, WriteState::Writable).await {
+            self.store.lock().await.local_set(
+                network,
+                "write-confirmed",
+                &json!({"device":device,"at_ms":now_ms()}),
+            )?;
+            tracing::info!(device, "write confirmed without a backup check");
         }
         Ok(())
     }
@@ -1233,7 +1365,7 @@ mod tests {
         configuration.network = network;
         configuration.codex_socket = Some(dir.join("unavailable.sock"));
         configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }

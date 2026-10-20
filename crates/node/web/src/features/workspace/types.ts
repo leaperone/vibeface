@@ -78,6 +78,11 @@ export type ConversationPayload = {
 }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
 export type WorkspaceView = "chat" | "other"
+/** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */
+export type ConflictVersion = { hash: string; scope_id: string; created_at_ms: number; body: Record<string, unknown> }
+export type LogConflict = { author: string; seq: number; kept: ConflictVersion | null; other: ConflictVersion }
+export type WriteState = "aligning" | "read_only" | "writable" | "forked"
+export type WriteStatus = { state: WriteState; conflicts: LogConflict[] }
 export type { PendingMessage }
 
 export type BotProject = { target_node: string; cwd: string }

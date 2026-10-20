@@ -4,7 +4,7 @@ use crate::{
     identity::{AuthorizationView, GovernanceAction, IdentityKind, NetworkState},
     maintenance::Gate,
     model::*,
-    store::Store,
+    store::{Store, WriteState},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -138,6 +138,7 @@ pub struct Runtime {
     pub local_access: Arc<crate::local_access::LocalAccess>,
     /// Operator token of the public entry's relay: this entry's own, or the one it serves.
     pub(crate) entry_token: Option<String>,
+    pub(crate) write_state: tokio::sync::watch::Sender<WriteState>,
     _process_lock: Arc<std::fs::File>,
     executor_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
@@ -184,8 +185,8 @@ impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
-            epoch == json!({"data_epoch":6}),
-            "this Node requires an initialized data epoch 6 directory"
+            epoch == json!({"data_epoch":7}),
+            "this Node requires an initialized data epoch 7 directory"
         );
         let config = Config::load(dir)?;
         let entry_token = (config.public_entry || config.network.entry.is_some())
@@ -241,6 +242,7 @@ impl Runtime {
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             local_access,
             entry_token,
+            write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
             _process_lock: process_lock,
             executor_rx: Mutex::new(Some(rx)),
         };
@@ -286,10 +288,29 @@ impl Runtime {
         if self.config.public_entry {
             return self.start_network().await;
         }
+        if self.align_on_start().await? {
+            self.start_writers(events);
+        } else {
+            let node = self.clone();
+            tokio::spawn(async move {
+                let mut state = node.write_state.subscribe();
+                if state.wait_for(|state| *state == WriteState::Writable).await.is_ok() {
+                    node.start_writers(events);
+                    if let Ok(state) = node.membership_state().await {
+                        node.abandon_revoked_works(&state.genesis.network_id).await;
+                    }
+                }
+            });
+        }
+        self.start_network().await
+    }
+    /// Work, scheduling and observation append to the log, so they wait for `writable`.
+    /// ponytail: a Node that forks later keeps these running and its appends fail; stop them
+    /// if a forked device turns out to keep running work.
+    fn start_writers(self: &Arc<Self>, events: mpsc::UnboundedReceiver<Value>) {
         self.start_executor(events);
         self.start_schedule_delivery();
         self.start_observation_worker();
-        self.start_network().await
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         let store = self.store.lock().await;

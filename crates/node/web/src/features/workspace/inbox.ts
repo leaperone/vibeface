@@ -1,11 +1,12 @@
-import { CircleQuestionMark, Hand, MonitorSmartphone, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
+import { CircleQuestionMark, Copy, Hand, Lock, MonitorSmartphone, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@/features/identity/context"
 import type { JoinRequest } from "@/lib/node"
 import { useWorkspace } from "./context"
 import type { WorkApproval, WorkRecord } from "./types"
+import type { WriteCardKind } from "./write-card"
 
-export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "approval" | "confirm" | "join" | "setup" | "attention"; approval?: { work: WorkRecord; request: WorkApproval }; join?: JoinRequest }
+export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "approval" | "confirm" | "join" | "setup" | "attention" | "write"; approval?: { work: WorkRecord; request: WorkApproval }; join?: JoinRequest; write?: WriteCardKind }
 
 /**
  * Everything waiting on the person, newest kinds first.
@@ -19,6 +20,10 @@ export function useInbox(): InboxItem[] {
   const joins = useOpenJoins()
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
+  const write = workspace.writeState
+  if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这个设备的数据是从备份恢复的吗？", to: "/inbox", kind: "write", write: "read_only" })
+  if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据有两份副本", to: "/inbox", kind: "write", write: "forked" })
+  else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据有两份副本", to: "/inbox", kind: "write", write: "conflicts" })
   for (const work of data?.works ?? []) {
     for (const request of work.open_approvals) items.push({ key: `approval:${work.work_id}:${request.request_id}`, icon: Hand, title: "需要你同意", meta: bot?.name, to: chat, kind: "approval", approval: { work, request } })
   }

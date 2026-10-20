@@ -183,7 +183,7 @@ test("workspace preserves bot and message requests while routing native decision
     generation: 1, entry: { device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { device_id: "gateway", name: "gateway", version: "test", roles: ["gateway"], initialized: true, network_id: "network" },
-    isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async () => { throw new Error("unexpected request") },
+    isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: [] }
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }

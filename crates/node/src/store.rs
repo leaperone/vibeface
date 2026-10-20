@@ -27,6 +27,30 @@ pub(crate) mod work;
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
 pub const SCHEMA_VERSION: u32 = 6;
 
+/// Whether this Node may append to its own log (design 5.7 and 5.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteState {
+    /// Started with other member Nodes; waits for one to confirm it holds nothing newer of ours.
+    Aligning,
+    /// No other member Node answered; writable once the user confirms no backup was restored.
+    ReadOnly,
+    Writable,
+    /// Another copy of this device's log wrote different events at the same sequence.
+    Forked,
+}
+
+impl WriteState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Aligning => "aligning",
+            Self::ReadOnly => "read_only",
+            Self::Writable => "writable",
+            Self::Forked => "forked",
+        }
+    }
+}
+
 pub struct Store {
     pub(crate) connection: Connection,
     blob_dir: PathBuf,
@@ -161,9 +185,10 @@ impl Store {
                 .context("membership is missing")?
                 .project()?;
         }
-        store
-            .connection
-            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+        store.connection.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+            CREATE TEMP TABLE write_gate(state TEXT NOT NULL); INSERT INTO write_gate VALUES('writable');",
+        )?;
         Ok(store)
     }
     pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
@@ -507,6 +532,12 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(envelope)
+    }
+    /// Every local append checks this gate; it lives only as long as this connection.
+    pub fn set_write_state(&mut self, state: WriteState) -> Result<()> {
+        self.connection
+            .execute("UPDATE temp.write_gate SET state=?", [state.as_str()])?;
+        Ok(())
     }
     pub fn local_value(&self, network_id: &str, key: &str) -> Result<Option<Value>> {
         local_load(&self.connection, network_id, key)

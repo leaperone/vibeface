@@ -93,6 +93,7 @@ export function ConversationScreen() {
 
   const managerOffline = workspace.nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager)
   const hint = !workspace.connectionOnline ? '离线，恢复后可发送'
+    : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? '上一条消息还没确认送达'
     : needsConfirm ? '先处理上面这件事'
