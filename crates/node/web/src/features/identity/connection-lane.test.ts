@@ -473,7 +473,7 @@ test('switching away while a Node join request is pending prevents a stale revie
     app.render(); await settle()
     const hold = deferred(); app.holds.set('local_join:request', hold)
     const joining = app.render().pair(invitation, 'node'), rejected = assert.rejects(joining, /换了/)
-    await settle(); assert.ok(app.calls.includes('local_join:request'))
+    await until(() => app.calls.includes('local_join:request'))
     app.render().disconnect()
     hold.resolve(receipt); await rejected
     assert.equal(app.render().localJoin?.kind, 'idle')
@@ -638,7 +638,7 @@ for (const stage of ['bootstrap', 'subscribe']) test(`cancelSensitive during ${s
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
     const rejected = assert.rejects(confirming, /换了|取消/)
-    await settle(); assert.ok(app.calls.includes(stage))
+    await until(() => app.calls.includes(stage))
     app.render().cancelSensitive()
     hold.resolve({})
     await rejected; await settle()
@@ -662,7 +662,7 @@ for (const flow of ['pair', 'sensitive']) test(`cancelling ${flow} after subscri
     const hold = deferred(); app.holds.set('subscribe', hold)
     const checking = flow === 'pair' ? app.render().checkPair() : app.render().confirmBootstrap(true)
     const rejected = assert.rejects(checking, /换了|取消/)
-    await settle(); assert.ok(app.calls.includes('subscribe'))
+    await until(() => app.calls.includes('subscribe'))
     hold.resolve({})
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => {
       if (flow === 'pair') app.render().cancelPair(); else app.render().cancelSensitive()
