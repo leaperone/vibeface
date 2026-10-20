@@ -244,16 +244,6 @@ impl Store {
         }
         Ok(())
     }
-    pub fn save_local_identity(
-        &mut self,
-        network_id: &str,
-        identity: &LocalIdentity,
-    ) -> Result<()> {
-        let device_id = identity.device_id()?;
-        self.authorize_node(network_id, &device_id)?;
-        self.connection.execute("INSERT INTO local_identities(network_id,device_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,device_id) DO UPDATE SET identity=excluded.identity",params![network_id,device_id,serde_json::to_string(identity)?])?;
-        Ok(())
-    }
     /// Stores each event or reports why not; one bad event never aborts the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards.
     pub fn ingest_events(

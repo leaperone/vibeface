@@ -1,7 +1,5 @@
 -- Create "networks" table
 CREATE TABLE `networks` (`network_id` text NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
--- Create "local_identities" table
-CREATE TABLE `local_identities` (`network_id` text NOT NULL, `device_id` text NOT NULL, `identity` text NOT NULL, PRIMARY KEY (`network_id`, `device_id`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create "events" table
 CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, PRIMARY KEY (`network_id`, `author`, `seq`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create index "events_hash" to table: "events"

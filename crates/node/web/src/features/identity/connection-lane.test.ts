@@ -38,6 +38,13 @@ const deferred = () => {
 }
 const settle = () => new Promise(setImmediate)
 const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
+const until = async (ready: () => boolean) => {
+  const deadline = Date.now() + 5000
+  while (!ready()) {
+    if (Date.now() > deadline) throw new Error('condition not reached within 5s')
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+}
 
 const remote = '6'.repeat(64)
 function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>() } = {}) {
@@ -580,8 +587,7 @@ for (const stage of ['authenticate', 'subscribe']) test(`cancelJoin during ${sta
   const app = deviceHarness({ joining: 'joined' })
   const hold = deferred(); app.holds.set(stage, hold)
   try {
-    app.render(); await settle(); app.render()
-    assert.ok(app.calls.includes(stage))
+    app.render(); await until(() => { app.render(); return app.calls.includes(stage) })
     app.render().cancelJoin()
     hold.resolve({})
     await settle(); await settle()
@@ -602,7 +608,7 @@ for (const stage of ['recover', 'subscribe']) test(`cancelSensitive during ${sta
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
     const rejected = assert.rejects(confirming, /切换|取消/)
-    await settle(); assert.ok(app.calls.includes(stage))
+    await until(() => app.calls.includes(stage))
     app.render().cancelSensitive()
     hold.resolve({})
     await rejected; await settle()
@@ -627,7 +633,7 @@ for (const flow of ['join', 'sensitive']) test(`cancelling ${flow} after subscri
     const hold = deferred(); app.holds.set('subscribe', hold)
     const checking = flow === 'join' ? app.render().checkJoin() : app.render().confirmBootstrap(true)
     const rejected = assert.rejects(checking, /切换|取消/)
-    await settle(); assert.ok(app.calls.includes('subscribe'))
+    await until(() => app.calls.includes('subscribe'))
     hold.resolve({})
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => {
       if (flow === 'join') app.render().cancelJoin(); else app.render().cancelSensitive()
@@ -747,8 +753,7 @@ for (const original of ['auto-authenticate', 'join-poll', 'waiting-info']) test(
   try {
     const hold = deferred(), method = original === 'auto-authenticate' ? 'authenticate' : original === 'join-poll' ? 'join_status' : 'info'
     app.holds.set(method, hold)
-    app.render(); await settle(); app.render()
-    assert.ok(app.calls.includes(method))
+    app.render(); await until(() => { app.render(); return app.calls.includes(method) })
     app.render().disconnect()
     app.holds.delete(method)
     const replacement = { ...entry, device_id: 'f'.repeat(64) }

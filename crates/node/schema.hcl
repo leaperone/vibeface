@@ -16,30 +16,6 @@ table "networks" {
     columns = [column.network_id]
   }
 }
-table "local_identities" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "device_id" {
-    null = false
-    type = text
-  }
-  column "identity" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.device_id]
-  }
-  foreign_key "0" {
-    columns     = [column.network_id]
-    ref_columns = [table.networks.column.network_id]
-    on_update   = NO_ACTION
-    on_delete   = NO_ACTION
-  }
-}
 table "events" {
   schema = schema.main
   column "network_id" {
