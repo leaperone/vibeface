@@ -1057,11 +1057,6 @@ impl VerifiedMembership {
         serde_json::to_string(&self.view).map_err(|error| error.to_string())
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = historicalNodesJson))]
-    pub fn historical_nodes_json(&self) -> crate::Result<String> {
-        serde_json::to_string(&self.historical_nodes).map_err(|error| error.to_string())
-    }
-
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = stateJson))]
     pub fn state_json(&self) -> crate::Result<String> {
         serde_json::to_string(&self.state).map_err(|error| error.to_string())

@@ -241,17 +241,6 @@ impl Store {
         self.connection.execute("INSERT INTO local_identities(network_id,peer_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,peer_id) DO UPDATE SET identity=excluded.identity",params![network_id,peer_id,serde_json::to_string(identity)?])?;
         Ok(())
     }
-    pub fn local_identity(&self, network_id: &str, peer_id: &str) -> Result<Option<LocalIdentity>> {
-        optional_json(
-            self.connection
-                .query_row(
-                    "SELECT identity FROM local_identities WHERE network_id=? AND peer_id=?",
-                    params![network_id, peer_id],
-                    |r| r.get(0),
-                )
-                .optional()?,
-        )
-    }
     fn public_key(&self, network_id: &str, author: &str) -> Result<String> {
         self.connection
             .query_row(

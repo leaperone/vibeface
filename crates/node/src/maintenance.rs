@@ -60,9 +60,6 @@ impl Gate {
             changed: Notify::new(),
         }
     }
-    pub fn is_open(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).mode == Mode::Open
-    }
     pub fn enter(self: &Arc<Self>) -> Result<WorkGuard> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.mode != Mode::Open {
