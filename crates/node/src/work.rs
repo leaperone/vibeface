@@ -10,8 +10,6 @@ pub struct WorkSpec {
     pub conversation: String,
     /// The scheduler trigger whose turn dispatched this work.
     pub trigger: String,
-    /// The coordination attempt that dispatched it; only that attempt may retry the call.
-    pub attempt: String,
     pub target: DeviceId,
     pub dispatcher: DeviceId,
     pub call_ref: String,
@@ -127,9 +125,14 @@ impl WorkState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The target Node's execution state of one work. What the work is lives in the DAG; this keeps
+/// only what running and reconciling it needs: its thread and turn, the App Server epoch, the
+/// answer text so far and the send window.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkRecord {
-    pub spec: WorkSpec,
+    pub work_id: String,
+    pub conversation: String,
+    pub kind: WorkKind,
     pub state: WorkState,
     /// Latest final-answer text of the turn; reported once in `WorkFinished`.
     pub text: String,
@@ -192,6 +195,8 @@ pub enum Signal {
     InterruptTimedOut,
     /// The DAG already holds a settled result (the user's signed choice); no event is implied.
     Settled(WorkOutcome),
+    /// The coordination process of an unverified agent task is gone; its turn did not finish.
+    ProcessExited,
     /// An agent task's coordination turn ended; its reply is the result.
     Concluded {
         outcome: WorkOutcome,
@@ -215,7 +220,9 @@ pub fn accept(spec: WorkSpec, at: i64) -> (WorkRecord, EventBody) {
     };
     (
         WorkRecord {
-            spec,
+            work_id: spec.work_id,
+            conversation: spec.conversation,
+            kind: spec.kind,
             state: WorkState::Accepted,
             text: String::new(),
             send_by_ms: at + SEND_WINDOW_MS,
@@ -237,7 +244,7 @@ fn finish(
 ) -> Option<EventBody> {
     record.state = WorkState::Finished { outcome };
     Some(EventBody::WorkFinished {
-        work_id: record.spec.work_id.clone(),
+        work_id: record.work_id.clone(),
         outcome,
         result_text: bounded(&record.text),
         failure_reason: reason.map(|reason| bounded(&reason)),
@@ -259,7 +266,7 @@ fn unverified(
         probe,
     };
     Some(EventBody::WorkFinished {
-        work_id: record.spec.work_id.clone(),
+        work_id: record.work_id.clone(),
         outcome: WorkOutcome::Unverified,
         result_text: bounded(&record.text),
         failure_reason: Some(bounded(evidence)),
@@ -270,7 +277,7 @@ fn unverified(
 fn progress(record: &WorkRecord, phase: WorkPhase, summary: &str) -> Option<EventBody> {
     let handle = record.state.handle();
     Some(EventBody::WorkProgress {
-        work_id: record.spec.work_id.clone(),
+        work_id: record.work_id.clone(),
         phase,
         summary: summary.into(),
         thread_id: handle.map(|handle| handle.thread_id.clone()),
@@ -465,6 +472,11 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 )
             }
         },
+        (Unverified { handle: None, .. }, Signal::ProcessExited) => finish(
+            record,
+            WorkOutcome::Interrupted,
+            Some("助手进程已退出，任务没有做完".into()),
+        ),
         (Unverified { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
             None
@@ -502,7 +514,6 @@ mod tests {
                 work_id: "w".into(),
                 conversation: "c".into(),
                 trigger: "message:m".into(),
-                attempt: "a".into(),
                 target: "t".into(),
                 dispatcher: "t".into(),
                 call_ref: "r".into(),

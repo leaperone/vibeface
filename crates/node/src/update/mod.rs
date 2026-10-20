@@ -1016,7 +1016,7 @@ mod tests {
         assert!(manifest(&old).is_err());
         fs::write(
             old.join("BUILD-INFO.json"),
-            &format!(
+            format!(
                 r#"{{"version":"1.0.0","update_protocol":1,"data_epoch":{}}}"#,
                 crate::config::DATA_EPOCH
             ),

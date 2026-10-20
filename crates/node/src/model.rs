@@ -577,6 +577,9 @@ pub struct WorkProjection {
     pub cwd: String,
     pub title: String,
     pub prompt: String,
+    pub call_ref: String,
+    pub continues: Option<String>,
+    pub parent: Option<String>,
     pub phase: Option<WorkPhase>,
     pub summary: String,
     pub thread_id: Option<String>,
@@ -584,6 +587,32 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
+    pub state: WorkStatus,
+}
+
+/// Where a work stands, as every device reads it from the DAG.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStatus {
+    Accepted,
+    Running,
+    Interrupting,
+    Finished,
+    Unverified,
+}
+
+impl WorkStatus {
+    pub fn of(kind: WorkKind, phase: Option<WorkPhase>, outcome: Option<WorkOutcome>) -> Self {
+        match (outcome, phase) {
+            (Some(WorkOutcome::Unverified), _) => Self::Unverified,
+            (Some(_), _) => Self::Finished,
+            // An agent task runs as its device's coordination turn, without Codex phases.
+            (None, _) if kind == WorkKind::Task => Self::Running,
+            (None, Some(WorkPhase::Interrupting)) => Self::Interrupting,
+            (None, Some(_)) => Self::Running,
+            (None, None) => Self::Accepted,
+        }
+    }
 }
 
 /// Per-event result of ingest; a batch never aborts on one bad event.

@@ -587,7 +587,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 | 调度 job 队列和投递 outbox | 调度 Node 与入口 Node 的 SQLite 本机表 |
 | 待核对记录及其证据 | 产生不确定结果的 Node |
 | SDK 原生会话 ID 和已覆盖向量 | 调度 Node |
-| 工作状态机日志（thread、turn、App Server epoch、发送窗口） | 目标 Node 的 `local_values` |
+| 工作状态机日志（thread、turn、App Server epoch、发送窗口） | 目标 Node 的 `work_runs` 表（工作定义读 DAG） |
 | 流式文字、工具调用进度 | 内存，经 `vibeface/rpc/1` 推送 |
 | 附件暂存进度、每日预算 | 本机 |
 | 设备私钥、模型凭证 | 本机，不进入任何同步数据 |

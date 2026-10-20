@@ -84,11 +84,11 @@ impl Runtime {
             let mut store = self.store.lock().await;
             store.recover_scheduler_jobs(&self.identity, &network, crate::scheduler::boot_id())?;
             let mut abandoned = Vec::new();
-            for scope in store.pending_scheduler_conversations(&network)? {
+            for scope in store.pending_scheduler_conversations()? {
                 if workers.contains(&(network.clone(), scope.clone())) {
                     continue;
                 }
-                for job in store.scheduler_jobs(&network, &scope)? {
+                for job in store.scheduler_jobs(&scope)? {
                     if let JobState::Claimed { attempt }
                     | JobState::Running { attempt }
                     | JobState::Cancelling { attempt } = &job.state
@@ -122,7 +122,7 @@ impl Runtime {
                 .store
                 .lock()
                 .await
-                .pending_scheduler_conversations(&network)?;
+                .pending_scheduler_conversations()?;
             for scope in scopes {
                 self.start_schedule_consumer(network.clone(), scope).await;
             }
@@ -222,8 +222,8 @@ impl Runtime {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;
         store.recover_scheduler_jobs(&self.identity, network, crate::scheduler::boot_id())?;
-        let checks = store.pending_checks(network)?;
-        Ok(match store.scheduler_job(network, scope, trigger)? {
+        let checks = store.pending_checks()?;
+        Ok(match store.scheduler_job(scope, trigger)? {
             Some(job) => json!({"state":job.state.name(),"receipt":job.receipt(network),
                 "job":job_value(&job,&checks)?,"manager":self.scheduler_manager_metadata()}),
             None => json!({"state":"not_found","trigger":trigger}),
@@ -238,7 +238,7 @@ impl Runtime {
     ) -> Result<(Vec<Value>, Vec<PendingCheck>)> {
         let store = self.store.lock().await;
         let checks = store
-            .pending_checks(network)?
+            .pending_checks()?
             .into_iter()
             .filter(|check| check.conversation_id == scope)
             .collect::<Vec<_>>();
@@ -247,13 +247,13 @@ impl Runtime {
             .conversation(network, scope)?
             .and_then(|conversation| conversation.owner);
         let mut jobs = Vec::new();
-        for job in store.scheduler_jobs(network, scope)? {
+        for job in store.scheduler_jobs(scope)? {
             let mut value = job_value(&job, &checks)?;
             value["manager"] = manager.clone();
             jobs.push(value);
         }
         for entry in store
-            .scheduler_outbox(network)?
+            .scheduler_outbox()?
             .into_iter()
             .filter(|entry| entry.conversation_id == scope)
         {

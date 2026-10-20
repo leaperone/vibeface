@@ -74,7 +74,7 @@ impl Runtime {
                 {
                     return Ok(json!(work));
                 }
-                if let Some(dispatch) = store.dispatch(network, &id)? {
+                if let Some(dispatch) = store.dispatch(&id)? {
                     return Ok(dispatch_value(&dispatch));
                 }
                 let change = store
@@ -200,7 +200,6 @@ impl Runtime {
             work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
             conversation: scope.into(),
             trigger: manager.trigger.clone(),
-            attempt: manager.attempt_id.clone(),
             target: target.clone(),
             dispatcher: local.clone(),
             call_ref: call_ref.into(),
@@ -219,8 +218,10 @@ impl Runtime {
             let dispatch = self.send_dispatch(network, spec).await?;
             return Ok(dispatch_value(&dispatch));
         }
+        let cwd = spec.cwd.clone();
+        let continues = spec.continues.clone();
         let (record, created) = self.accept_dispatch(network, spec).await?;
-        let thread = match &record.spec.continues {
+        let thread = match &continues {
             Some(original) => self
                 .store
                 .lock()
@@ -232,8 +233,8 @@ impl Runtime {
             None => None,
         };
         Ok(
-            json!({"work_id":record.spec.work_id,"call_ref":call_ref,"state":record.state,
-            "may_send":created,"send_by_ms":record.send_by_ms,"cwd":record.spec.cwd,"thread_id":thread}),
+            json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
+            "may_send":created,"send_by_ms":record.send_by_ms,"cwd":cwd,"thread_id":thread}),
         )
     }
 }

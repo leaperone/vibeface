@@ -7,7 +7,7 @@ use super::{
 use crate::{
     model::*,
     net::{AddressRecord, SignedAddress},
-    scheduling::{AdmissionReceipt, SCHEDULING_VERSION, TriggerKind, scheduler_key},
+    scheduling::{AdmissionReceipt, SCHEDULING_VERSION, TriggerKind},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -148,15 +148,6 @@ impl Store {
             }
         }
         Ok(false)
-    }
-
-    pub fn remove_outbox(
-        &mut self,
-        network: &str,
-        conversation: &str,
-        trigger: &str,
-    ) -> Result<()> {
-        self.local_delete(network, &scheduler_key("outbox", conversation, trigger))
     }
 
     /// The owner admits a user message or a work result another Node holds. Idempotent by

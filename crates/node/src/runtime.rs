@@ -320,11 +320,7 @@ impl Runtime {
         self.start_triage();
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
-        let store = self.store.lock().await;
-        match store.network()? {
-            Some(network) => crate::scheduler::maintenance_idle(&store, &network),
-            None => Ok(()),
-        }
+        self.store.lock().await.scheduler_maintenance_idle()
     }
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
@@ -519,7 +515,7 @@ impl Runtime {
             "resolve_alert" => self.resolve_alert(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
-            "reconcile" | "resolve" => self.pending_check_control(&access, &input, method).await,
+            "resolve" => self.resolve_check(&access, &input).await,
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
             ),

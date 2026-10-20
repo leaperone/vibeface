@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
@@ -807,6 +807,18 @@ pub(crate) fn authorize_node_from(
     device_id: &str,
 ) -> Result<Member> {
     membership_from(connection, network_id)?.node(device_id)
+}
+
+/// A unit enum's serde name, for a text column.
+pub(crate) fn enum_text<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(text)) => text,
+        _ => unreachable!("a unit enum serializes to a string"),
+    }
+}
+
+pub(crate) fn enum_from<T: DeserializeOwned>(text: &str) -> Result<T> {
+    Ok(serde_json::from_value(Value::String(text.into()))?)
 }
 
 fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {

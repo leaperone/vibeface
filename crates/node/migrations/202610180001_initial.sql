@@ -65,5 +65,25 @@ CREATE TABLE `identity_meta` (`key` text NULL, `value` text NOT NULL, PRIMARY KE
 CREATE TABLE `invites` (`join_id` text NOT NULL, `invite_hash` text NOT NULL, `issuer` text NOT NULL, `epoch` integer NOT NULL, `expires_at_ms` integer NOT NULL, `record` text NOT NULL, `device_id` text NULL, `kind` text NULL, `name` text NULL, `commit_hash` text NULL, `status` text NULL, `admin_id` text NULL, `admin_nonce` text NULL, `joiner_nonce` text NULL, `reason` text NULL, `grant_hash` text NULL, PRIMARY KEY (`join_id`));
 -- Create index "invites_invite_hash" to table: "invites"
 CREATE UNIQUE INDEX `invites_invite_hash` ON `invites` (`invite_hash`);
+-- Create "scheduler_sessions" table
+CREATE TABLE `scheduler_sessions` (`conversation_id` text NOT NULL, `next_sequence` integer NOT NULL, `active` text NULL, `native_id` text NULL, `covers` text NOT NULL, `owner_epoch` integer NOT NULL, `sdk_config` text NULL, `permission_version` integer NOT NULL, PRIMARY KEY (`conversation_id`));
+-- Create "scheduler_jobs" table
+CREATE TABLE `scheduler_jobs` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, `kind` text NOT NULL, `sequence` integer NOT NULL, `basis` text NOT NULL, `reply_to` text NOT NULL, `message_id` text NOT NULL, `state` text NOT NULL, `attempt_id` text NULL, `attempt_boot` text NULL, `attempt_permission` integer NULL, `detail` text NULL, PRIMARY KEY (`conversation_id`, `trigger`));
+-- Create index "scheduler_jobs_state" to table: "scheduler_jobs"
+CREATE INDEX `scheduler_jobs_state` ON `scheduler_jobs` (`state`, `conversation_id`);
+-- Create "scheduler_outbox" table
+CREATE TABLE `scheduler_outbox` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, PRIMARY KEY (`conversation_id`, `trigger`));
+-- Create "routine_runs" table
+CREATE TABLE `routine_runs` (`conversation_id` text NOT NULL, `routine_id` text NOT NULL, `slot_ms` integer NOT NULL, PRIMARY KEY (`conversation_id`, `routine_id`));
+-- Create "pending_checks" table
+CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` text NOT NULL, `trigger` text NOT NULL, `detail` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`attempt_id`));
+-- Create "manager_processes" table
+CREATE TABLE `manager_processes` (`attempt_id` text NOT NULL, `process_group` integer NOT NULL, PRIMARY KEY (`attempt_id`, `process_group`));
+-- Create "work_runs" table
+CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `state` text NOT NULL, `thread_id` text NULL, `turn_id` text NULL, `codex_epoch` integer NULL, `outcome` text NULL, `evidence` text NULL, `probe` integer NULL, `result_text` text NOT NULL, `send_by_ms` integer NOT NULL, `progress` text NOT NULL, `progress_at_ms` integer NOT NULL, PRIMARY KEY (`work_id`));
+-- Create "work_dispatches" table
+CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `spec` text NOT NULL, `state` text NOT NULL, `reason` text NULL, PRIMARY KEY (`work_id`));
+-- Create "work_stops" table
+CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));
 
 PRAGMA user_version = 7;

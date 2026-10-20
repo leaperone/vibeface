@@ -1,119 +1,274 @@
 //! The owner's local scheduling state. A job is keyed by its trigger, and its reply is written
 //! in the same transaction that ends it, so nothing is published twice or lost.
-use super::{
-    Store, authorize_node_from, conversation_from, local_load, local_prefix, local_save, log,
-    message_from,
-};
+use super::{Store, authorize_node_from, conversation_from, log, message_from};
 use crate::{crypto::LocalIdentity, model::*, scheduling::*};
 use anyhow::{Context as _, Result, bail, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 
-fn job_key(conversation: &str, trigger: &str) -> String {
-    scheduler_key("job", conversation, trigger)
+const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail";
+
+type JobRow = (
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+);
+
+fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
+    let (conversation_id, trigger, kind, sequence, basis, reply_to, message_id, state, id, boot, permission, detail) =
+        row;
+    let attempt = match (id, boot, permission) {
+        (Some(id), Some(boot), Some(permission_version)) => Some(ManagerAttempt {
+            id,
+            boot,
+            permission_version,
+        }),
+        _ => None,
+    };
+    let attempt_or = || attempt.clone().context("scheduler job attempt missing");
+    let detail = detail.unwrap_or_default();
+    let state = match state.as_str() {
+        "queued" => JobState::Queued,
+        "claimed" => JobState::Claimed { attempt: attempt_or()? },
+        "running" => JobState::Running { attempt: attempt_or()? },
+        "cancelling" => JobState::Cancelling { attempt: attempt_or()? },
+        "completed" => JobState::Completed { attempt: attempt_or()? },
+        "failed" => JobState::Failed { attempt: attempt_or()?, detail },
+        "cancelled" => JobState::Cancelled { attempt, evidence: detail },
+        "interrupted" => JobState::Interrupted { attempt: attempt_or()?, detail },
+        other => bail!("unknown scheduler job state {other}"),
+    };
+    Ok(SchedulerJob {
+        conversation_id,
+        trigger,
+        kind: super::enum_from(&kind)?,
+        sequence,
+        basis: serde_json::from_str(&basis)?,
+        reply_to,
+        message_id,
+        state,
+    })
 }
 
-fn session_key(conversation: &str) -> String {
-    scheduler_key("session", conversation, "")
-}
-
-fn load_session(
+fn query_jobs(
     connection: &Connection,
-    network: &str,
-    conversation: &str,
-) -> Result<SchedulerSession> {
-    let session = local_load::<SchedulerSession>(connection, network, &session_key(conversation))?
-        .unwrap_or_else(|| SchedulerSession::new(conversation));
-    ensure!(
-        session.version == SCHEDULING_VERSION,
-        "unsupported scheduler session version"
-    );
-    Ok(session)
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<SchedulerJob>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM scheduler_jobs WHERE {filter} ORDER BY sequence"
+    ))?;
+    let rows = statement
+        .query_map(params, |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<JobRow>>>()?;
+    rows.into_iter().map(job_from_row).collect()
 }
 
-fn save_session(connection: &Connection, network: &str, session: &SchedulerSession) -> Result<()> {
-    local_save(
+fn load_job(connection: &Connection, conversation: &str, trigger: &str) -> Result<Option<SchedulerJob>> {
+    Ok(query_jobs(
         connection,
-        network,
-        &session_key(&session.conversation_id),
-        session,
+        "conversation_id=? AND trigger=?",
+        params![conversation, trigger],
+    )?
+    .pop())
+}
+
+/// Queued jobs are the conversation's inbox, oldest first.
+fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<SchedulerJob>> {
+    query_jobs(
+        connection,
+        "conversation_id=? AND state='queued'",
+        [conversation],
     )
 }
 
-fn load_job(
-    connection: &Connection,
-    network: &str,
-    conversation: &str,
-    trigger: &str,
-) -> Result<Option<SchedulerJob>> {
-    local_load(connection, network, &job_key(conversation, trigger))
+fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
+    let attempt = job.state.attempt();
+    let detail = match &job.state {
+        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => Some(detail),
+        JobState::Cancelled { evidence, .. } => Some(evidence),
+        _ => None,
+    };
+    connection.execute(
+        &format!("INSERT OR REPLACE INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"),
+        params![
+            job.conversation_id,
+            job.trigger,
+            super::enum_text(&job.kind),
+            job.sequence,
+            serde_json::to_string(&job.basis)?,
+            job.reply_to,
+            job.message_id,
+            job.state.name(),
+            attempt.map(|a| &a.id),
+            attempt.map(|a| &a.boot),
+            attempt.map(|a| a.permission_version),
+            detail,
+        ],
+    )?;
+    Ok(())
 }
 
-fn save_job(connection: &Connection, network: &str, job: &SchedulerJob) -> Result<()> {
-    local_save(
-        connection,
-        network,
-        &job_key(&job.conversation_id, &job.trigger),
-        job,
+const SESSION_COLUMNS: &str =
+    "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version";
+
+fn query_sessions(
+    connection: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<SchedulerSession>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {SESSION_COLUMNS} FROM scheduler_sessions WHERE {filter} ORDER BY conversation_id"
+    ))?;
+    let rows = statement
+        .query_map(params, |r| {
+            Ok((
+                SchedulerSession {
+                    conversation_id: r.get(0)?,
+                    next_sequence: r.get(1)?,
+                    active: r.get(2)?,
+                    native_id: r.get(3)?,
+                    covers: VersionVector::new(),
+                    owner_epoch: r.get(5)?,
+                    sdk_config: r.get(6)?,
+                    permission_version: r.get(7)?,
+                },
+                r.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(session, covers)| {
+            Ok(SchedulerSession {
+                covers: serde_json::from_str(&covers)?,
+                ..session
+            })
+        })
+        .collect()
+}
+
+fn load_session(connection: &Connection, conversation: &str) -> Result<SchedulerSession> {
+    Ok(
+        query_sessions(connection, "conversation_id=?", [conversation])?
+            .pop()
+            .unwrap_or_else(|| SchedulerSession::new(conversation)),
     )
 }
 
-fn sessions(connection: &Connection, network: &str) -> Result<Vec<SchedulerSession>> {
-    local_prefix(connection, network, "scheduler:v2:session:")
+fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<()> {
+    connection.execute(
+        &format!("INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?)"),
+        params![
+            session.conversation_id,
+            session.next_sequence,
+            session.active,
+            session.native_id,
+            serde_json::to_string(&session.covers)?,
+            session.owner_epoch,
+            session.sdk_config,
+            session.permission_version,
+        ],
+    )?;
+    Ok(())
 }
 
-fn process_key(attempt_id: &str) -> String {
-    format!("manager-process:v2:{attempt_id}")
+pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<PendingCheck>> {
+    let mut statement = connection.prepare(
+        "SELECT c.attempt_id,c.conversation_id,c.trigger,c.detail,c.created_at_ms,
+            (SELECT json_group_array(process_group) FROM manager_processes p WHERE p.attempt_id=c.attempt_id)
+         FROM pending_checks c ORDER BY c.created_at_ms",
+    )?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(attempt_id, conversation_id, trigger, detail, created_at_ms, groups)| {
+            Ok(PendingCheck {
+                check_id: PendingCheck::id(&attempt_id),
+                conversation_id,
+                trigger,
+                attempt_id,
+                detail,
+                process_groups: serde_json::from_str(&groups)?,
+                created_at_ms,
+            })
+        })
+        .collect()
 }
 
-pub(crate) fn pending_checks_from(
-    connection: &Connection,
-    network: &str,
-) -> Result<Vec<PendingCheck>> {
-    let mut checks: Vec<PendingCheck> = local_prefix(connection, network, "scheduler:v2:pending:")?;
-    checks.sort_by_key(|check| check.created_at_ms);
-    Ok(checks)
-}
-
+/// The attempt's process groups stay recorded until its check is resolved.
 fn save_pending_check(
     connection: &Connection,
-    network: &str,
     job: &SchedulerJob,
     attempt: &ManagerAttempt,
     detail: &str,
     at: i64,
 ) -> Result<()> {
-    let process_groups =
-        local_load::<Vec<u32>>(connection, network, &process_key(&attempt.id))?.unwrap_or_default();
-    local_save(
-        connection,
-        network,
-        &scheduler_key("pending", &job.conversation_id, &job.trigger),
-        &PendingCheck {
-            version: SCHEDULING_VERSION,
-            check_id: PendingCheck::id(&attempt.id),
-            conversation_id: job.conversation_id.clone(),
-            trigger: job.trigger.clone(),
-            attempt_id: attempt.id.clone(),
-            detail: detail.into(),
-            process_groups,
-            created_at_ms: at,
-        },
-    )
+    connection.execute(
+        "INSERT OR REPLACE INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,?,?,?,?)",
+        params![attempt.id, job.conversation_id, job.trigger, detail, at],
+    )?;
+    Ok(())
 }
 
-fn forget_process(
-    connection: &Connection,
-    network: &str,
-    attempt: Option<&ManagerAttempt>,
-) -> Result<()> {
-    if let Some(attempt) = attempt {
-        connection.execute(
-            "DELETE FROM local_values WHERE network_id=? AND key=?",
-            params![network, process_key(&attempt.id)],
-        )?;
-    }
+fn forget_process(connection: &Connection, attempt_id: &str) -> Result<()> {
+    connection.execute(
+        "DELETE FROM manager_processes WHERE attempt_id=?",
+        [attempt_id],
+    )?;
     Ok(())
+}
+
+fn outbox_entry(
+    connection: &Connection,
+    conversation: &str,
+    trigger: &str,
+) -> Result<Option<OutboxEntry>> {
+    Ok(connection
+        .query_row(
+            "SELECT conversation_id,trigger FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+            params![conversation, trigger],
+            |r| {
+                Ok(OutboxEntry {
+                    conversation_id: r.get(0)?,
+                    trigger: r.get(1)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 fn fence(session: &mut SchedulerSession) -> Result<()> {
@@ -141,16 +296,15 @@ pub(crate) fn admit_from(
     kind: TriggerKind,
     reply_to: &str,
 ) -> Result<AdmissionReceipt> {
-    if let Some(job) = load_job(connection, network, conversation, trigger)? {
+    if let Some(job) = load_job(connection, conversation, trigger)? {
         return Ok(job.receipt(network));
     }
-    let mut session = load_session(connection, network, conversation)?;
+    let mut session = load_session(connection, conversation)?;
     ensure!(
-        session.pending.len() < MAX_PENDING_JOBS,
+        queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
         "scheduler inbox is full; trigger was not admitted"
     );
     let job = SchedulerJob {
-        version: SCHEDULING_VERSION,
         conversation_id: conversation.into(),
         trigger: trigger.into(),
         kind,
@@ -164,9 +318,8 @@ pub(crate) fn admit_from(
         .next_sequence
         .checked_add(1)
         .context("scheduler queue sequence overflow")?;
-    session.pending.push(trigger.into());
-    save_job(connection, network, &job)?;
-    save_session(connection, network, &session)?;
+    save_job(connection, &job)?;
+    save_session(connection, &session)?;
     Ok(job.receipt(network))
 }
 
@@ -208,21 +361,28 @@ fn admit_due_routines_from(
             continue;
         };
         let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
-        let key = scheduler_key("routine", conversation, &entry.routine_id);
-        if owner.as_deref() != Some(local)
-            || local_load::<i64>(connection, network, &key)?.is_some_and(|fired| fired >= slot)
-        {
+        let fired: Option<i64> = connection
+            .query_row(
+                "SELECT slot_ms FROM routine_runs WHERE conversation_id=? AND routine_id=?",
+                params![conversation, entry.routine_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(local) || fired.is_some_and(|fired| fired >= slot) {
             continue;
         }
-        let session = load_session(connection, network, conversation)?;
-        if session.pending.len() >= MAX_PENDING_JOBS
-            || session.pending.iter().any(|trigger| {
-                parse_routine_trigger(trigger).is_some_and(|(id, _)| id == entry.routine_id)
+        let queued = queued_jobs(connection, conversation)?;
+        if queued.len() >= MAX_PENDING_JOBS
+            || queued.iter().any(|job| {
+                parse_routine_trigger(&job.trigger).is_some_and(|(id, _)| id == entry.routine_id)
             })
         {
             continue;
         }
-        local_save(connection, network, &key, &slot)?;
+        connection.execute(
+            "INSERT OR REPLACE INTO routine_runs(conversation_id,routine_id,slot_ms) VALUES(?,?,?)",
+            params![conversation, entry.routine_id, slot],
+        )?;
         let trigger = routine_trigger(&entry.routine_id, slot);
         // Another owner already ran this time before the conversation moved here.
         if message_from(
@@ -255,21 +415,15 @@ pub(crate) fn queue_delivery_from(
     conversation: &str,
     trigger: &str,
 ) -> Result<AdmissionReceipt> {
-    let key = scheduler_key("outbox", conversation, trigger);
-    let entry = match local_load::<OutboxEntry>(connection, network, &key)? {
-        Some(entry) => entry,
-        None => {
-            let entry = OutboxEntry {
-                version: SCHEDULING_VERSION,
-                network_id: network.into(),
-                conversation_id: conversation.into(),
-                trigger: trigger.into(),
-            };
-            local_save(connection, network, &key, &entry)?;
-            entry
-        }
-    };
-    Ok(entry.receipt())
+    connection.execute(
+        "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
+        params![conversation, trigger],
+    )?;
+    Ok(OutboxEntry {
+        conversation_id: conversation.into(),
+        trigger: trigger.into(),
+    }
+    .receipt(network))
 }
 
 /// The user message a work ultimately answers, followed through the DAG's dispatch chain, so
@@ -363,6 +517,7 @@ fn end_job_from(
         .attempt()
         .context("scheduler attempt missing")?
         .clone();
+    let attempt_id = attempt.id.clone();
     let (status, fallback) = reply_status(&outcome);
     let text = if text.trim().is_empty() {
         fallback
@@ -428,7 +583,7 @@ fn end_job_from(
         } => {
             fence(session)?;
             if process_unconfirmed {
-                save_pending_check(connection, network, &job, &attempt, &detail, at)?;
+                save_pending_check(connection, &job, &attempt, &detail, at)?;
             }
             JobState::Interrupted { attempt, detail }
         }
@@ -436,9 +591,15 @@ fn end_job_from(
     if session.active.as_deref() == Some(job.trigger.as_str()) {
         session.active = None;
     }
-    forget_process(connection, network, job.state.attempt())?;
-    save_job(connection, network, &job)?;
-    save_session(connection, network, session)?;
+    if !matches!(&job.state, JobState::Interrupted { .. })
+        || pending_checks_from(connection)?
+            .iter()
+            .all(|check| check.attempt_id != attempt_id)
+    {
+        forget_process(connection, &attempt_id)?;
+    }
+    save_job(connection, &job)?;
+    save_session(connection, session)?;
     Ok(job)
 }
 
@@ -453,8 +614,8 @@ fn recover_session(
     let Some(trigger) = session.active.clone() else {
         return Ok(());
     };
-    let mut job = load_job(connection, network, &session.conversation_id, &trigger)?
-        .context("missing active scheduler job")?;
+    let mut job =
+        load_job(connection, &session.conversation_id, &trigger)?.context("missing active scheduler job")?;
     let Some(attempt) = job.state.attempt().cloned() else {
         bail!("active scheduler job has no attempt");
     };
@@ -464,11 +625,8 @@ fn recover_session(
     match job.state {
         JobState::Claimed { .. } => {
             job.state = JobState::Queued;
-            if !session.pending.contains(&trigger) {
-                session.pending.push(trigger);
-            }
             session.active = None;
-            save_job(connection, network, &job)?;
+            save_job(connection, &job)?;
         }
         JobState::Running { .. } | JobState::Cancelling { .. } => {
             end_job_from(
@@ -585,11 +743,10 @@ impl Store {
 
     pub fn scheduler_job(
         &self,
-        network: &str,
         conversation: &str,
         trigger: &str,
     ) -> Result<Option<SchedulerJob>> {
-        load_job(&self.connection, network, conversation, trigger)
+        load_job(&self.connection, conversation, trigger)
     }
 
     pub fn scheduler_status(
@@ -598,37 +755,45 @@ impl Store {
         conversation: &str,
         trigger: &str,
     ) -> Result<Option<AdmissionReceipt>> {
-        if let Some(job) = self.scheduler_job(network, conversation, trigger)? {
+        if let Some(job) = self.scheduler_job(conversation, trigger)? {
             return Ok(Some(job.receipt(network)));
         }
-        Ok(local_load::<OutboxEntry>(
-            &self.connection,
-            network,
-            &scheduler_key("outbox", conversation, trigger),
-        )?
-        .map(|entry| entry.receipt()))
+        Ok(outbox_entry(&self.connection, conversation, trigger)?.map(|entry| entry.receipt(network)))
     }
 
-    pub fn scheduler_jobs(&self, network: &str, conversation: &str) -> Result<Vec<SchedulerJob>> {
-        let mut jobs: Vec<SchedulerJob> = local_prefix(
-            &self.connection,
-            network,
-            &scheduler_prefix("job", conversation),
+    pub fn scheduler_jobs(&self, conversation: &str) -> Result<Vec<SchedulerJob>> {
+        query_jobs(&self.connection, "conversation_id=?", [conversation])
+    }
+
+    pub fn scheduler_outbox(&self) -> Result<Vec<OutboxEntry>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT conversation_id,trigger FROM scheduler_outbox ORDER BY conversation_id,trigger")?;
+        Ok(statement
+            .query_map([], |r| {
+                Ok(OutboxEntry {
+                    conversation_id: r.get(0)?,
+                    trigger: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn remove_outbox(&mut self, conversation: &str, trigger: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+            params![conversation, trigger],
         )?;
-        jobs.sort_by_key(|job| job.sequence);
-        Ok(jobs)
+        Ok(())
     }
 
-    pub fn scheduler_outbox(&self, network: &str) -> Result<Vec<OutboxEntry>> {
-        local_prefix(&self.connection, network, "scheduler:v2:outbox:")
-    }
-
-    pub fn pending_scheduler_conversations(&self, network: &str) -> Result<Vec<String>> {
-        Ok(sessions(&self.connection, network)?
-            .into_iter()
-            .filter(|s| !s.pending.is_empty())
-            .map(|s| s.conversation_id)
-            .collect())
+    pub fn pending_scheduler_conversations(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT conversation_id FROM scheduler_jobs WHERE state='queued' ORDER BY conversation_id",
+        )?;
+        Ok(statement
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn recover_scheduler_jobs(
@@ -640,9 +805,9 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for mut session in sessions(&tx, network)? {
+        for mut session in query_sessions(&tx, "active IS NOT NULL", [])? {
             recover_session(&tx, &self.blob_dir, identity, network, &mut session, boot)?;
-            save_session(&tx, network, &session)?;
+            save_session(&tx, &session)?;
         }
         tx.commit()?;
         Ok(())
@@ -660,10 +825,10 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, network, conversation)?;
+        let mut session = load_session(&tx, conversation)?;
         recover_session(&tx, &self.blob_dir, identity, network, &mut session, boot)?;
         if session.active.is_some() {
-            save_session(&tx, network, &session)?;
+            save_session(&tx, &session)?;
             tx.commit()?;
             return Ok(None);
         }
@@ -671,24 +836,17 @@ impl Store {
         let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
         let owned = current.and_then(|c| c.owner) == Some(identity.device_id()?);
         let mut queued = Vec::new();
-        for trigger in session.pending.clone() {
-            let job = load_job(&tx, network, conversation, &trigger)?
-                .context("missing queued scheduler job")?;
-            ensure!(
-                matches!(job.state, JobState::Queued),
-                "pending scheduler job is not queued"
-            );
+        for job in queued_jobs(&tx, conversation)? {
             // The user moved the conversation: what never started goes to the new owner, which
             // runs routines on its own schedule.
             if !owned && job.kind != TriggerKind::AgentTask {
                 tx.execute(
-                    "DELETE FROM local_values WHERE network_id=? AND key=?",
-                    params![network, job_key(conversation, &trigger)],
+                    "DELETE FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
+                    params![conversation, job.trigger],
                 )?;
                 if job.kind != TriggerKind::Routine {
-                    queue_delivery_from(&tx, network, conversation, &trigger)?;
+                    queue_delivery_from(&tx, network, conversation, &job.trigger)?;
                 }
-                session.pending.retain(|pending| pending != &trigger);
                 continue;
             }
             queued.push(job);
@@ -707,15 +865,14 @@ impl Store {
                     attempt: None,
                     evidence: evidence.into(),
                 };
-                session.pending.retain(|pending| pending != &job.trigger);
-                save_job(&tx, network, &job)?;
+                save_job(&tx, &job)?;
                 continue;
             }
             selected = Some(job);
             break;
         }
         let Some(mut job) = selected else {
-            save_session(&tx, network, &session)?;
+            save_session(&tx, &session)?;
             tx.commit()?;
             return Ok(None);
         };
@@ -741,10 +898,9 @@ impl Store {
                 permission_version: session.permission_version,
             },
         };
-        session.pending.retain(|trigger| trigger != &job.trigger);
         session.active = Some(job.trigger.clone());
-        save_job(&tx, network, &job)?;
-        save_session(&tx, network, &session)?;
+        save_job(&tx, &job)?;
+        save_session(&tx, &session)?;
         tx.commit()?;
         Ok(Some(ClaimedJob {
             job,
@@ -755,7 +911,6 @@ impl Store {
 
     fn update_attempt(
         &mut self,
-        network: &str,
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
@@ -764,9 +919,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, network, conversation)?;
-        let mut job =
-            load_job(&tx, network, conversation, trigger)?.context("scheduler job missing")?;
+        let mut session = load_session(&tx, conversation)?;
+        let mut job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
         ensure!(
             job.state
                 .attempt()
@@ -774,20 +928,19 @@ impl Store {
             "scheduler attempt does not match"
         );
         update(&mut job, &mut session)?;
-        save_job(&tx, network, &job)?;
-        save_session(&tx, network, &session)?;
+        save_job(&tx, &job)?;
+        save_session(&tx, &session)?;
         tx.commit()?;
         Ok(job)
     }
 
     pub fn mark_started(
         &mut self,
-        network: &str,
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
     ) -> Result<SchedulerJob> {
-        self.update_attempt(network, conversation, trigger, attempt_id, |job, _| {
+        self.update_attempt(conversation, trigger, attempt_id, |job, _| {
             let JobState::Claimed { attempt } = &job.state else {
                 bail!("scheduler job is not claimed");
             };
@@ -800,14 +953,12 @@ impl Store {
 
     pub fn save_scheduler_native_id(
         &mut self,
-        network: &str,
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
         native_id: &str,
     ) -> Result<()> {
         self.update_attempt(
-            network,
             conversation,
             trigger,
             attempt_id,
@@ -840,8 +991,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, network, conversation)?;
-        let Some(mut job) = load_job(&tx, network, conversation, trigger)? else {
+        let mut session = load_session(&tx, conversation)?;
+        let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(None);
         };
         if matches!(job.state, JobState::Queued) {
@@ -862,7 +1013,6 @@ impl Store {
                 attempt: None,
                 evidence,
             };
-            session.pending.retain(|pending| pending != trigger);
         } else if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
             ensure!(
                 session.active.as_deref() == Some(trigger),
@@ -873,21 +1023,19 @@ impl Store {
             };
             fence(&mut session)?;
         }
-        save_job(&tx, network, &job)?;
-        save_session(&tx, network, &session)?;
+        save_job(&tx, &job)?;
+        save_session(&tx, &session)?;
         tx.commit()?;
         Ok(Some(job))
     }
 
     pub(crate) fn fence_manager_permission(
         &mut self,
-        network: &str,
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
     ) -> Result<()> {
         self.update_attempt(
-            network,
             conversation,
             trigger,
             attempt_id,
@@ -907,13 +1055,12 @@ impl Store {
 
     pub fn manager_attempt_allowed(
         &self,
-        network: &str,
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
     ) -> Result<bool> {
-        let session = load_session(&self.connection, network, conversation)?;
-        let Some(job) = self.scheduler_job(network, conversation, trigger)? else {
+        let session = load_session(&self.connection, conversation)?;
+        let Some(job) = self.scheduler_job(conversation, trigger)? else {
             return Ok(false);
         };
         let Some(attempt) = job.state.attempt() else {
@@ -947,9 +1094,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, network, conversation)?;
-        let job =
-            load_job(&tx, network, conversation, trigger)?.context("scheduler job missing")?;
+        let mut session = load_session(&tx, conversation)?;
+        let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
         ensure!(
             job.state
                 .attempt()
@@ -978,78 +1124,47 @@ impl Store {
         Ok(job)
     }
 
-    pub fn record_manager_process(
-        &mut self,
-        network: &str,
-        attempt_id: &str,
-        process_group: u32,
-    ) -> Result<()> {
-        let key = process_key(attempt_id);
-        let mut groups =
-            local_load::<Vec<u32>>(&self.connection, network, &key)?.unwrap_or_default();
-        if !groups.contains(&process_group) {
-            groups.push(process_group);
-        }
-        local_save(&self.connection, network, &key, &groups)
+    pub fn record_manager_process(&mut self, attempt_id: &str, process_group: u32) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO manager_processes(attempt_id,process_group) VALUES(?,?)",
+            params![attempt_id, process_group],
+        )?;
+        Ok(())
     }
 
-    pub fn pending_checks(&self, network: &str) -> Result<Vec<PendingCheck>> {
-        pending_checks_from(&self.connection, network)
+    pub fn pending_checks(&self) -> Result<Vec<PendingCheck>> {
+        pending_checks_from(&self.connection)
     }
 
-    pub fn pending_check(&self, network: &str, check_id: &str) -> Result<Option<PendingCheck>> {
-        Ok(self
-            .pending_checks(network)?
-            .into_iter()
-            .find(|check| check.check_id == check_id))
-    }
-
-    /// Runtime verifies the user and the stopped process before this.
-    pub fn resolve_pending_check(
-        &mut self,
-        network: &str,
-        check_id: &str,
-        evidence: &str,
-    ) -> Result<PendingCheck> {
-        ensure!(
-            !evidence.trim().is_empty(),
-            "reconciliation evidence is required"
-        );
+    pub fn resolve_pending_check(&mut self, attempt_id: &str) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let check = pending_checks_from(&tx, network)?
-            .into_iter()
-            .find(|check| check.check_id == check_id)
-            .context("pending check not found")?;
-        tx.execute(
-            "DELETE FROM local_values WHERE network_id=? AND key=?",
-            params![
-                network,
-                scheduler_key("pending", &check.conversation_id, &check.trigger)
-            ],
-        )?;
+        tx.execute("DELETE FROM pending_checks WHERE attempt_id=?", [attempt_id])?;
+        forget_process(&tx, attempt_id)?;
         tx.commit()?;
-        Ok(check)
+        Ok(())
     }
 
-    pub fn scheduler_maintenance_idle(&self, network: &str) -> Result<()> {
-        for session in sessions(&self.connection, network)? {
-            ensure!(
-                session.pending.is_empty() && session.active.is_none(),
-                crate::maintenance::Busy(
-                    "scheduler invocation requires completion or reconciliation".into()
-                )
-            );
-        }
+    pub fn scheduler_maintenance_idle(&self) -> Result<()> {
+        let busy: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduler_jobs WHERE state='queued')
+                OR EXISTS(SELECT 1 FROM scheduler_sessions WHERE active IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
         ensure!(
-            self.pending_checks(network)?.is_empty(),
+            !busy,
+            crate::maintenance::Busy(
+                "scheduler invocation requires completion or reconciliation".into()
+            )
+        );
+        ensure!(
+            self.pending_checks()?.is_empty(),
             crate::maintenance::Busy("an interrupted invocation awaits reconciliation".into())
         );
         ensure!(
-            self.work_records(network)?
-                .iter()
-                .all(|work| work.state.finished()),
+            self.work_records()?.iter().all(|work| work.state.finished()),
             crate::maintenance::Busy("a dispatched work has not finished".into())
         );
         Ok(())

@@ -1,5 +1,5 @@
 use super::*;
-use crate::work::{DispatchState, WorkState};
+use crate::work::DispatchState;
 
 const ARTIFACT_PAGE: usize = 65_536;
 /// Raw bytes per upload request, well inside the client channel's message limit.
@@ -144,88 +144,42 @@ impl Runtime {
         let network = &access.network_id;
         let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
         let store = self.store.lock().await;
-        let mut pending_checks = checks
+        let works = store.works(network, scope)?;
+        // One card per work: an unverified agent task's coordination check is answered by its work card.
+        let unverified: BTreeSet<_> = works
             .iter()
-            .map(|check| {
-                let mut value = json!(check);
-                value["kind"] = json!("manager_process");
-                value
-            })
-            .collect::<Vec<_>>();
-        let records = store
-            .work_records(network)?
-            .into_iter()
-            .filter(|record| record.spec.conversation == scope)
-            .map(|record| (record.spec.work_id.clone(), record))
-            .collect::<BTreeMap<_, _>>();
-        let stops = store
-            .stop_requests(network)?
-            .into_iter()
-            .map(|stop| (stop.work_id.clone(), stop))
-            .collect::<BTreeMap<_, _>>();
-        let mut works = Vec::new();
-        let unverified: BTreeSet<_> = store
-            .works(network, scope)?
-            .into_iter()
-            .filter(|work| work.outcome == Some(WorkOutcome::Unverified))
+            .filter(|work| work.state == WorkStatus::Unverified)
             .map(|work| crate::scheduling::task_trigger(&work.work_id))
             .collect();
-        // One card per work: an agent task's coordination check is answered by its work card.
-        pending_checks
-            .retain(|check| !unverified.contains(check["trigger"].as_str().unwrap_or_default()));
-        for work in store.works(network, scope)? {
-            let mut value = json!(work);
-            let record = records.get(&work.work_id);
-            value["state"] = match record {
-                // An agent task runs as its device's coordination turn, without Codex phases.
-                _ if work.kind == WorkKind::Task && work.outcome.is_none() => json!("running"),
-                Some(record) => json!(record.state.name()),
-                // Another device runs it: its progress events say where it is.
-                // `Started` is written when the native turn starts, so it already means running.
-                None => json!(match (work.outcome, work.phase) {
-                    (Some(_), _) => "finished",
-                    (None, Some(WorkPhase::Interrupting)) => "interrupting",
-                    (None, Some(_)) => "running",
-                    (None, None) => "accepted",
-                }),
-            };
-            if work.outcome == Some(WorkOutcome::Unverified) {
-                value["state"] = json!("unverified");
-                let (detail, probe) = match record.map(|r| &r.state) {
-                    Some(WorkState::Unverified {
-                        evidence, probe, ..
-                    }) => (evidence.clone(), *probe),
-                    _ => (work.failure_reason.clone().unwrap_or_default(), false),
-                };
-                pending_checks.push(
-                    json!({"check_id":format!("work:{}",work.work_id),"kind":"work",
-                    "conversation_id":scope,"work_id":work.work_id,"target_node":work.target_node,
-                    "detail":detail,"probe":probe}),
-                );
-            }
-            if let Some(stop) = stops.get(&work.work_id) {
-                value["stop"] =
-                    json!({"waiting_for_device":!stop.timed_out,"timed_out":stop.timed_out});
-            }
-            works.push(value);
-        }
-        // Dispatches another device has not taken yet show as work waiting for it.
-        for dispatch in store.dispatches(network)? {
+        let checks: Vec<_> = checks
+            .into_iter()
+            .filter(|check| !unverified.contains(&check.trigger))
+            .collect();
+        // Requests this device still carries to another one; the DAG learns of them only once
+        // the target answers.
+        let mut deliveries = Vec::new();
+        for dispatch in store.dispatches()? {
             let spec = &dispatch.spec;
-            if spec.conversation != scope
-                || works.iter().any(|w| w["work_id"] == spec.work_id.as_str())
-            {
+            let state = match &dispatch.state {
+                DispatchState::Accepted => continue,
+                DispatchState::Pending => "dispatch_waiting",
+                DispatchState::Rejected { .. } => "dispatch_rejected",
+            };
+            if spec.conversation != scope || works.iter().any(|w| w.work_id == spec.work_id) {
                 continue;
             }
-            let (state, reason) = match &dispatch.state {
-                DispatchState::Pending => ("waiting_for_device", None),
-                DispatchState::Accepted => ("accepted", None),
-                DispatchState::Rejected { reason } => ("rejected", Some(reason.clone())),
+            let reason = match &dispatch.state {
+                DispatchState::Rejected { reason } => Some(reason),
+                _ => None,
             };
-            works.push(json!({"work_id":spec.work_id,"conversation_id":scope,"target_node":spec.target,
-                "trigger":spec.trigger,"dispatcher":spec.dispatcher,"kind":spec.kind,"cwd":spec.cwd,
-                "prompt":spec.prompt,"phase":null,"summary":"","thread_id":null,"turn_id":null,"outcome":null,
-                "result_text":"","failure_reason":reason,"state":state}));
+            deliveries.push(json!({"work_id":spec.work_id,"target_node":spec.target,"state":state,
+                "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":reason}));
+        }
+        for stop in store.stop_requests()? {
+            if stop.conversation == scope {
+                deliveries.push(json!({"work_id":stop.work_id,"target_node":stop.target,
+                    "state":if stop.timed_out {"stop_timed_out"} else {"stop_waiting"}}));
+            }
         }
         let conversation = store.conversation(network, scope)?;
         let bot = store.bot_for_conversation(network, scope)?;
@@ -263,9 +217,10 @@ impl Runtime {
             "bot":bot,
             "messages":messages,
             "works":works,
+            "deliveries":deliveries,
             "changes":changes,
             "assistant":{"skills":skills,"routines":routines},
-            "pending_checks":pending_checks,
+            "checks":checks,
             "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
                 "capabilities":manager.map(|m| m.provider.capabilities())},

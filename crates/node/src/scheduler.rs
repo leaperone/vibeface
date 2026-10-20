@@ -42,10 +42,6 @@ pub(crate) fn boot_id() -> &'static str {
     BOOT.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-pub(crate) fn maintenance_idle(store: &Store, network: &str) -> Result<()> {
-    store.scheduler_maintenance_idle(network)
-}
-
 fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
     let mut value = serde_json::to_value(job).expect("scheduler job serializes");
     value["network_id"] = json!(network);
@@ -65,7 +61,7 @@ pub async fn status(
     let _work = node.maintenance.enter()?;
     let mut store = node.store.lock().await;
     store.recover_scheduler_jobs(&node.identity, network, boot_id())?;
-    Ok(match store.scheduler_job(network, conversation, trigger)? {
+    Ok(match store.scheduler_job(conversation, trigger)? {
         Some(job) => invocation_value(&job, network),
         None => json!({"state":"not_found","trigger":trigger}),
     })
@@ -219,7 +215,7 @@ pub async fn run(
                     node.data_dir.display().to_string(),
                 ),
             ]),
-            process_started: Some(process_recorder(&node, &network, &attempt.id)),
+            process_started: Some(process_recorder(&node, &attempt.id)),
         };
         if matches!(job.kind, TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Routine) {
             node.store.lock().await.reserve_budget(
@@ -232,13 +228,13 @@ pub async fn run(
             .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger)
             .await?;
         registered = true;
-        let (persist_node, persist_network, persist_conversation, persist_trigger, persist_attempt) =
-            (node.clone(), network.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
+        let (persist_node, persist_conversation, persist_trigger, persist_attempt) =
+            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
         let (progress_node, progress_network, progress_conversation, progress_trigger, progress_attempt) =
             (node.clone(), network.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
         let progress_text = partial.clone();
         let progress_sequence = std::sync::atomic::AtomicU64::new(0);
-        node.store.lock().await.mark_started(&network, &conversation, &trigger, &attempt.id)?;
+        node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
         started = true;
         sdk_live = true;
         let result = manager::run_manager(
@@ -247,7 +243,6 @@ pub async fn run(
             claimed.previous_native_id.as_deref(),
             move |id| async move {
                 persist_node.store.lock().await.save_scheduler_native_id(
-                    &persist_network,
                     &persist_conversation,
                     &persist_trigger,
                     &persist_attempt,
@@ -307,7 +302,7 @@ pub async fn run(
             .store
             .lock()
             .await
-            .scheduler_job(&network, &conversation, &trigger)?
+            .scheduler_job(&conversation, &trigger)?
             .context("scheduler job missing")?;
         let stopped = matches!(current.state, JobState::Cancelling { .. });
         // Stopping a reply ends only this turn; dispatched work keeps its own tracking.
@@ -342,23 +337,17 @@ pub async fn run(
     final_result.map(Some)
 }
 
-fn process_recorder(
-    node: &Arc<Runtime>,
-    network: &str,
-    attempt: &str,
-) -> vibeface_bridge::agent::ProcessStarted {
+fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agent::ProcessStarted {
     let node = node.clone();
-    let network = network.to_owned();
     let attempt = attempt.to_owned();
     Arc::new(move |group| {
         let node = node.clone();
-        let network = network.clone();
         let attempt = attempt.clone();
         Box::pin(async move {
             node.store
                 .lock()
                 .await
-                .record_manager_process(&network, &attempt, group)
+                .record_manager_process(&attempt, group)
         })
     })
 }

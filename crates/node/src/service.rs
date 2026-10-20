@@ -210,7 +210,7 @@ mod tests {
         std::fs::write(package.join("scripts/install-node-service.sh"), b"script").unwrap();
         std::fs::write(
             package.join("BUILD-INFO.json"),
-            &format!(
+            format!(
                 r#"{{"version":"1.2.3-nightly.20261019.1","update_protocol":2,"data_epoch":{}}}"#,
                 crate::config::DATA_EPOCH
             ),

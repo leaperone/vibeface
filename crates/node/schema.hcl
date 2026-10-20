@@ -733,5 +733,294 @@ table "invites" {
     columns = [column.invite_hash]
   }
 }
+table "scheduler_sessions" {
+  schema = schema.main
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "next_sequence" {
+    null = false
+    type = integer
+  }
+  column "active" {
+    null = true
+    type = text
+  }
+  column "native_id" {
+    null = true
+    type = text
+  }
+  column "covers" {
+    null = false
+    type = text
+  }
+  column "owner_epoch" {
+    null = false
+    type = integer
+  }
+  column "sdk_config" {
+    null = true
+    type = text
+  }
+  column "permission_version" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.conversation_id]
+  }
+}
+table "scheduler_jobs" {
+  schema = schema.main
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "trigger" {
+    null = false
+    type = text
+  }
+  column "kind" {
+    null = false
+    type = text
+  }
+  column "sequence" {
+    null = false
+    type = integer
+  }
+  column "basis" {
+    null = false
+    type = text
+  }
+  column "reply_to" {
+    null = false
+    type = text
+  }
+  column "message_id" {
+    null = false
+    type = text
+  }
+  column "state" {
+    null = false
+    type = text
+  }
+  column "attempt_id" {
+    null = true
+    type = text
+  }
+  column "attempt_boot" {
+    null = true
+    type = text
+  }
+  column "attempt_permission" {
+    null = true
+    type = integer
+  }
+  column "detail" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.conversation_id, column.trigger]
+  }
+  index "scheduler_jobs_state" {
+    columns = [column.state, column.conversation_id]
+  }
+}
+table "scheduler_outbox" {
+  schema = schema.main
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "trigger" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.conversation_id, column.trigger]
+  }
+}
+table "routine_runs" {
+  schema = schema.main
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "routine_id" {
+    null = false
+    type = text
+  }
+  column "slot_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.conversation_id, column.routine_id]
+  }
+}
+table "pending_checks" {
+  schema = schema.main
+  column "attempt_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "trigger" {
+    null = false
+    type = text
+  }
+  column "detail" {
+    null = false
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.attempt_id]
+  }
+}
+table "manager_processes" {
+  schema = schema.main
+  column "attempt_id" {
+    null = false
+    type = text
+  }
+  column "process_group" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.attempt_id, column.process_group]
+  }
+}
+table "work_runs" {
+  schema = schema.main
+  column "work_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "kind" {
+    null = false
+    type = text
+  }
+  column "state" {
+    null = false
+    type = text
+  }
+  column "thread_id" {
+    null = true
+    type = text
+  }
+  column "turn_id" {
+    null = true
+    type = text
+  }
+  column "codex_epoch" {
+    null = true
+    type = integer
+  }
+  column "outcome" {
+    null = true
+    type = text
+  }
+  column "evidence" {
+    null = true
+    type = text
+  }
+  column "probe" {
+    null = true
+    type = integer
+  }
+  column "result_text" {
+    null = false
+    type = text
+  }
+  column "send_by_ms" {
+    null = false
+    type = integer
+  }
+  column "progress" {
+    null = false
+    type = text
+  }
+  column "progress_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.work_id]
+  }
+}
+table "work_dispatches" {
+  schema = schema.main
+  column "work_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "target_node" {
+    null = false
+    type = text
+  }
+  column "spec" {
+    null = false
+    type = text
+  }
+  column "state" {
+    null = false
+    type = text
+  }
+  column "reason" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.work_id]
+  }
+}
+table "work_stops" {
+  schema = schema.main
+  column "work_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "target_node" {
+    null = false
+    type = text
+  }
+  column "requested_at_ms" {
+    null = false
+    type = integer
+  }
+  column "deadline_ms" {
+    null = false
+    type = integer
+  }
+  column "timed_out" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.work_id]
+  }
+}
 schema "main" {
 }

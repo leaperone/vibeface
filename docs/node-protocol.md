@@ -159,7 +159,7 @@
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |
-| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`、`changes`、`assistant`、`pending_checks`、`local_node` 和调度队列 |
+| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`assistant`、`checks`、`local_node` 和调度队列 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作 |
@@ -167,8 +167,7 @@
 | `codex` | `method`、可选 `params`、`node` | 调用 App Server 名单里非 `hidden` 的方法，结果经 `sanitize`；`node` 为其他设备时经成员连接转发 |
 | `codex_state` | 可选 `node` | App Server 状态摘要 `{connection, threads: [{thread_id, name, status, cwd, plan, reasoning, token_usage}], rate_limits}`；网页不调用 App Server 方法 |
 | `send_decision` | `thread_id`、`decision_id`、可选 `text`、`alert_id`、`choice`、`node`、`model`、`effort`、`images` | 把本人的决定送进会话：回合进行中时插话，否则开新回合；`choice` 选中挂住服务端请求的卡片选项时改为回答该请求（`mode=answer`）。送达后卡片记为 `decided`。同一 `decision_id` 不重发，结果不明后只回读 |
-| `reconcile` | `conversation_id`、`check_id` | 只读复查一条待核对 |
-| `resolve` | `conversation_id`、`check_id`、选择与可选备注 | 本人结清待核对，工作项写一条带本人签名的 `WorkFinished`，不重做原触发 |
+| `resolve` | `conversation_id`、`check_id`、工作项另带 `outcome` 与可选备注 | 本人一键结清：管理进程确认已停止；工作项写一条带本人签名的 `WorkFinished`。不重做原触发 |
 | `upload_attachment` | `conversation_id`、`hash`、`size`、`offset`、`data` | 按 1 MiB 分块上传附件，返回已落盘的偏移 |
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit`、`binary` | 分页读取该会话实际引用的附件 |
 | `notifications` | `client_id` | 该客户端尚未确认的通知 |
@@ -211,7 +210,7 @@ queued → claimed → running ─→ completed | failed
              └ 重启时 running / cancelling ─→ interrupted（登记待核对）
 ```
 
-待核对统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `work`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
+Node 每隔几秒用 signal 0 检查待核对记下的进程组。全部退出时自动结清，相应的 agent 任务记为中断；仍有进程组存活时，`conversation.checks` 才列出这条，等本人一键确认。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
 
 负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。
 
@@ -335,7 +334,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `dispatch_work` | 派发方请求目标接纳工作 |
 | `interrupt_work` | 停止目标上的工作 |
 | `codex_state`、`send_decision` | 转发本人读状态和送决定，要求 `human: true` |
-| `cancel_manager`、`reconcile`、`resolve` | 转发本人的管理控制，要求 `human: true` |
+| `cancel_manager`、`resolve` | 转发本人的管理控制，要求 `human: true` |
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 
 ### Relay 与公共入口

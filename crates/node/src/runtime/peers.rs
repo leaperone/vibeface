@@ -337,10 +337,10 @@ impl Runtime {
                     .store
                     .lock()
                     .await
-                    .work_record(network, work_id)?
+                    .work_record(work_id)?
                     .context("work not found on this device")?;
                 ensure!(
-                    record.spec.conversation == scope,
+                    record.conversation == scope,
                     "work belongs to another conversation"
                 );
                 self.interrupt_work(network, work_id).await
@@ -352,7 +352,7 @@ impl Runtime {
                 );
                 self.codex_rpc(network, kind, input).await
             }
-            "cancel_manager" | "reconcile" | "resolve" => {
+            "cancel_manager" | "resolve" => {
                 ensure!(
                     input["human"] == true,
                     "management control requires the user"
@@ -365,7 +365,7 @@ impl Runtime {
                 };
                 match kind {
                     "cancel_manager" => self.cancel_manager(&access, input).await,
-                    _ => self.pending_check_control(&access, input, kind).await,
+                    _ => self.resolve_check(&access, input).await,
                 }
             }
             _ => bail!("unknown peer request"),
@@ -1035,7 +1035,7 @@ impl Runtime {
             }
             Err(error) => tracing::warn!(%error, "abandoning work on removed devices is pending"),
         }
-        if let Err(error) = self.store.lock().await.drop_requests_to(network, &removed) {
+        if let Err(error) = self.store.lock().await.drop_requests_to(&removed) {
             tracing::warn!(%error, "dropping requests to removed devices is pending");
         }
     }
@@ -1189,10 +1189,14 @@ impl Runtime {
             {
                 tracing::debug!(%error, "work requests wait for their devices");
             }
-            if let Ok(state) = self.membership_state().await
-                && let Err(error) = self.reconcile_works(&state.genesis.network_id).await
-            {
-                tracing::debug!(%error, "work reconciliation pending");
+            if let Ok(state) = self.membership_state().await {
+                let network = &state.genesis.network_id;
+                if let Err(error) = self.reconcile_works(network).await {
+                    tracing::debug!(%error, "work reconciliation pending");
+                }
+                if let Err(error) = self.reconcile_checks(network).await {
+                    tracing::debug!(%error, "pending check reconciliation pending");
+                }
             }
         }
     }
@@ -1204,7 +1208,7 @@ impl Runtime {
             return Ok(());
         };
         let local = self.identity.device_id()?;
-        let entries = self.store.lock().await.scheduler_outbox(&network)?;
+        let entries = self.store.lock().await.scheduler_outbox()?;
         for entry in entries {
             let owner = self
                 .store
@@ -1226,9 +1230,7 @@ impl Runtime {
             };
             match delivered {
                 Ok(reply) if reply["receipt"].is_object() => {
-                    self.store.lock().await.remove_outbox(
-                        &network,
-                        &entry.conversation_id,
+                    self.store.lock().await.remove_outbox(&entry.conversation_id,
                         &entry.trigger,
                     )?;
                     self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
@@ -1584,8 +1586,8 @@ mod tests {
             let heads = a.store.lock().await.heads(&network)?;
             assert_eq!(b.store.lock().await.heads(&network)?, heads);
             assert!(b.store.lock().await.missing_blobs(&network)?.is_empty());
-            assert!(b.store.lock().await.scheduler_jobs(&network, "c")?.is_empty());
-            assert!(b.store.lock().await.scheduler_outbox(&network)?.is_empty());
+            assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());
+            assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
 
             for id in ["m2", "m3"] {
                 a.store.lock().await.accept_message(&ia, &network, "c", id, id, vec![], true,
@@ -1595,7 +1597,7 @@ mod tests {
             b.sync_peer(&network, &ia.device_id()?).await?;
             assert_eq!(b.store.lock().await.heads(&network)?, a.store.lock().await.heads(&network)?);
             assert_eq!(b.store.lock().await.messages(&network, "c")?.len(), 3);
-            assert!(b.store.lock().await.scheduler_jobs(&network, "c")?.is_empty());
+            assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());
             assert!(
                 a.store.lock().await.address_book(&network)?.iter().any(|signed| signed
                     .open(&network)
@@ -1606,17 +1608,17 @@ mod tests {
 
             b.store.lock().await.accept_message(&ib, &network, "c", "m4", "m4", vec![], true,
                 user(&ia, &network, "m4")?, now_ms())?;
-            assert_eq!(b.store.lock().await.scheduler_outbox(&network)?.len(), 1);
+            assert_eq!(b.store.lock().await.scheduler_outbox()?.len(), 1);
             b.deliver_outbox().await?;
-            assert!(b.store.lock().await.scheduler_outbox(&network)?.is_empty());
+            assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
             let trigger = crate::scheduling::message_trigger("m4");
-            a.store.lock().await.scheduler_job(&network, "c", &trigger)?
+            a.store.lock().await.scheduler_job("c", &trigger)?
                 .context("the owner admitted the delivered message")?;
             let again = b.peer_request(&network, &ia.device_id()?,
                 json!({"type":"deliver","conversation_id":"c","trigger":trigger})).await?;
             assert_eq!(again["receipt"]["trigger"], trigger.as_str());
             assert_eq!(
-                a.store.lock().await.scheduler_jobs(&network, "c")?.iter().filter(|job| job.trigger == trigger).count(),
+                a.store.lock().await.scheduler_jobs("c")?.iter().filter(|job| job.trigger == trigger).count(),
                 1,
                 "a repeated delivery returns the original admission"
             );

@@ -1,9 +1,6 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
 //! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
-use crate::{
-    crypto::digest,
-    model::{Routine, VersionVector},
-};
+use crate::model::{Routine, VersionVector};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEDULING_VERSION: u32 = 2;
@@ -148,7 +145,6 @@ impl JobState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerJob {
-    pub version: u32,
     pub conversation_id: String,
     /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>` or `routine:<routine_id>:<slot_ms>`.
     pub trigger: String,
@@ -168,7 +164,7 @@ pub struct SchedulerJob {
 impl SchedulerJob {
     pub fn receipt(&self, network: &str) -> AdmissionReceipt {
         AdmissionReceipt {
-            version: self.version,
+            version: SCHEDULING_VERSION,
             network_id: network.into(),
             conversation_id: self.conversation_id.clone(),
             trigger: self.trigger.clone(),
@@ -191,17 +187,15 @@ pub struct AdmissionReceipt {
 /// receipt for its trigger. The owner is read at delivery time, so a switch redirects it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
-    pub version: u32,
-    pub network_id: String,
     pub conversation_id: String,
     pub trigger: String,
 }
 
 impl OutboxEntry {
-    pub fn receipt(&self) -> AdmissionReceipt {
+    pub fn receipt(&self, network: &str) -> AdmissionReceipt {
         AdmissionReceipt {
-            version: self.version,
-            network_id: self.network_id.clone(),
+            version: SCHEDULING_VERSION,
+            network_id: network.into(),
             conversation_id: self.conversation_id.clone(),
             trigger: self.trigger.clone(),
             state: "pending_delivery".into(),
@@ -230,12 +224,10 @@ pub enum JobOutcome {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct SchedulerSession {
-    pub version: u32,
     pub conversation_id: String,
     pub next_sequence: u64,
-    pub pending: Vec<String>,
     pub active: Option<String>,
     /// The SDK's own session, cached for this conversation on this Node only. `covers` is the
     /// basis it has seen and `owner_epoch` the ownership it was built under.
@@ -249,10 +241,8 @@ pub(crate) struct SchedulerSession {
 impl SchedulerSession {
     pub fn new(conversation: &str) -> Self {
         Self {
-            version: SCHEDULING_VERSION,
             conversation_id: conversation.into(),
             next_sequence: 1,
-            pending: Vec::new(),
             active: None,
             native_id: None,
             covers: VersionVector::new(),
@@ -263,10 +253,10 @@ impl SchedulerSession {
     }
 }
 
-/// A coordination process whose exit this Node cannot prove. Only the user resolves it, with evidence.
+/// A coordination process whose exit this Node has not seen. The runtime resolves it once every
+/// recorded process group is gone; only a group that stays alive needs the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingCheck {
-    pub version: u32,
     pub check_id: String,
     pub conversation_id: String,
     pub trigger: String,
@@ -280,18 +270,4 @@ impl PendingCheck {
     pub fn id(attempt_id: &str) -> String {
         format!("manager:{attempt_id}")
     }
-}
-
-/// `scheduler:v2:<kind>:<conversation digest>:<trigger digest>`, so one conversation's
-/// entries form an index range.
-pub(crate) fn scheduler_key(kind: &str, conversation: &str, trigger: &str) -> String {
-    format!(
-        "{}{}",
-        scheduler_prefix(kind, conversation),
-        digest(trigger.as_bytes())
-    )
-}
-
-pub(crate) fn scheduler_prefix(kind: &str, conversation: &str) -> String {
-    format!("scheduler:v2:{kind}:{}:", digest(conversation.as_bytes()))
 }
