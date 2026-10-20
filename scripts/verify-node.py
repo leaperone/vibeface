@@ -8,8 +8,9 @@ outage and an entrance switch. Host work uses a controlled SDK sidecar, never a 
 --artifacts with private permissions. The script prints no credentials.
 --phase1 checks durable Manager queues, scoped tools and cross-entry progress
 using a controlled sidecar. It does not verify real provider model behavior.
---chat-agent checks Agent tasks, host commands and native event recovery
-with real Node processes and controlled provider protocol fixtures.
+--chat-agent checks direct App Server work through the Agent's Shell CLIs, request
+handling, triage, webhooks and decisions, and native event recovery with real Node
+processes and controlled provider protocol fixtures.
 --web-only checks packaged Web resources through one isolated Node process.
 --auto-route checks the entry: joins, origins, revocation, unknown writes, recovery and forwarding
 through another member Gateway.
@@ -2544,8 +2545,9 @@ def committed_blob_offset(node, network, digest):
 def phase4_acceptance(options):
     """Phase-4 coordination acceptance with real Node processes and fixture SDKs.
 
-    A and B each run a fixture Agent and a fixture Codex App Server; P is the public Node (relay and
-    Gateway); C runs only Codex and is revoked while offline. One browser identity uses every entrance.
+    A, B and C each run a fixture coordination Agent and a fixture Codex App Server; P is the public
+    Node (relay and Gateway); C takes an agent task and is revoked while offline. One browser identity
+    uses every entrance.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
     options.artifacts.mkdir(parents=True, exist_ok=True)
@@ -2558,8 +2560,8 @@ def phase4_acceptance(options):
     helper.chmod(0o600)
     nodes, clients, roots = [], [], {}
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "four real Node processes over iroh (A, B with fixture Agent + Codex App Server, public P, "
-                          "Codex-only C); WASM browser client on every entrance",
+              "coverage": "four real Node processes over iroh (A, B and C each with a fixture coordination Agent and "
+                          "fixture App Server, public P); WASM browser client on every entrance",
               "not_checked": ["real provider models", "rendered browser UI (see the browser screenshots)",
                               "a model-written checkpoint summary (phase 4 writes deterministic excerpts)"]}
 
@@ -2626,7 +2628,7 @@ def phase4_acceptance(options):
             root.mkdir(mode=0o700)
             node.configure(timeout_secs=600, daily_decision_limit=100,
                            codex_bin=str(fixture_wrapper(root, "fixture-codex", "--fixture-codex")),
-                           manager=fixture_manager_settings(root, workspace) if node is not c else None)
+                           manager=fixture_manager_settings(root, workspace))
             node.configure_network(relays=[relay_url])
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.start()
@@ -2718,34 +2720,36 @@ def phase4_acceptance(options):
         task_dir = folder("p4-task")
         task_directive = {"label": "p4-task", "gate": str(task_dir / "task-release"),
                           "dispatch": {"label": "p4-task-child", "cwd": str(task_dir),
-                                       "native": {"gate": str(task_dir / "release"), "approval": True}},
+                                       "native": {"gate": str(task_dir / "release"), "request": "item/commandExecution/requestApproval",
+                                                  "request_mode": "card"}},
                           "tools": [{"name": "answer_approval", "arguments": {"work_id": "any", "request_id": "any"},
-                                     "accepted": False, "rejection": "unknown or unavailable"},
-                                    {"name": "dispatch_work", "arguments": {"title": "bounce", "prompt": "bounce", "cwd": str(task_dir), "call_ref": "bounce",
-                                                                            "executor": "agent", "target_node": a.device_id},
-                                     "accepted": False, "rejection": "only starts Codex work on its own device"}]}
-        r3 = send(a.client, "p4-m3", {"label": "p4-m3", "dispatch": {"label": "p4-task", "cwd": str(task_dir), "executor": "agent",
+                                     "accepted": False, "rejection": "unknown or unavailable"}]}
+        r3 = send(a.client, "p4-m3", {"label": "p4-m3", "dispatch": {"label": "p4-task", "cwd": str(task_dir),
                                                                      "target_node": b.device_id, "native": task_directive}})
         task = dispatched(a, "p4-task")
         turn(a, r3["trigger"])
         child = dispatched(b, "p4-task-child")
-        waiting = wait_for("A shows B's native approval with its form", lambda: (lambda row: row if row and row["open_approvals"]
-                           and row["open_approvals"][0].get("form") else None)(work_in(a.client, child, "waiting_approval")), timeout=60)
-        task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
-        require(task_turn["kind"] == "agent_task" and not task_turn["read_only"], "B's own Agent runs the task")
-        refused = [row for row in records(b, "manager-tool-errors.jsonl") if row["trigger"] == "task:" + task]
-        require(len(refused) == 2, "B's Agent can neither answer an approval nor hand the task on")
-        a.client.rpc("answer_approval", conversation_id=conversation, work_id=child,
-                     request_id=waiting["open_approvals"][0]["request_id"], response={"decision": "accept"})
         (task_dir / "release").touch()
-        wait_for("the approved child finishes", lambda: work_in(a.client, child, "finished"), timeout=60)
+        card = wait_for("A shows the decision card B's Agent raised for its App Server request", lambda: next(
+            (row for row in a.client.rpc("alerts")["alerts"] if row["node"] == b.device_id and row.get("request_id")
+             and row["resolution"] is None), None), timeout=90)
+        task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
+        require(task_turn["kind"] == "agent_task", "B's own Agent runs the task")
+        refused = [row for row in records(b, "manager-tool-errors.jsonl") if row["trigger"] == "task:" + task]
+        require(len(refused) == 1, "B's Agent has no tool to answer for the user")
+        decision = {"node": b.device_id, "thread_id": card["thread_id"], "decision_id": "p4-decision",
+                    "alert_id": card["alert_id"], "choice": 0}
+        decided = a.client.rpc("send_decision", **decision)
+        require(decided["status"] == "delivered" and decided["mode"] == "answer"
+                and a.client.rpc("send_decision", **decision) == decided, "A's choice answers B's held request once")
+        wait_for("the decided child finishes", lambda: work_in(a.client, child, "finished"), timeout=60)
         answers = [row for row in records(b, "codex-rpc.jsonl") if "method" not in row["message"]
-                   and str(row["message"].get("id", "")).startswith("approval-")]
+                   and str(row["message"].get("id", "")).startswith("req-")]
         require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"},
-                "the user's answer at entrance A reaches B's App Server once")
+                "the user's choice at entrance A reaches B's App Server once")
         starts = [row for row in codex_rpc(b, "thread/start") if row["message"]["params"]["cwd"] == str(task_dir)]
-        require(len(starts) == 1 and starts[0]["message"]["params"].get("approvalPolicy") == "on-request",
-                "B starts the child under native approval")
+        require(len(starts) == 1 and starts[0]["message"]["params"].get("approvalPolicy") == "never",
+                "B's Agent starts the child itself with full access")
         (task_dir / "task-release").touch()
         finished = wait_for("the task finishes on B", lambda: work_in(a.client, task, "finished"), timeout=60)
         require(finished["outcome"] == "completed" and "p4-task:complete" in finished["result_text"], "the task reports B's Agent result")
@@ -2754,30 +2758,29 @@ def phase4_acceptance(options):
         # B also entered the user's own signed message p4-m2; everything else it wrote is work.
         by_b = {event["body"]["type"] for event in scope_events(a, network, conversation) if event["author"] == b.device_id
                 and not (event["body"]["type"] == "message_posted" and event["body"]["role"] == "user")}
-        require(by_b and by_b <= {"work_dispatched", "work_progress", "approval_requested", "approval_answered", "work_finished"},
+        require(by_b and by_b <= {"work_dispatched", "work_progress", "work_finished"},
                 "B's Agent writes only work events to the conversation")
-        passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b))
+        passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b), card=card["alert_id"],
+               decision=decided["mode"])
 
         r4 = send(a.client, "p4-m4", {"label": "p4-m4", "tools": [
             {"name": "dispatch_work", "arguments": {"title": "outside", "prompt": "outside", "cwd": str(run), "call_ref": "outside-codex"},
              "accepted": False, "rejection": "outside configured roots"},
             {"name": "dispatch_work", "arguments": {"title": "outside", "prompt": "outside", "cwd": str(run), "call_ref": "outside-agent",
-                                                    "executor": "agent", "target_node": b.device_id}}]})
+                                                    "target_node": b.device_id}}]})
         turn(a, r4["trigger"])
         remote = next(row for row in records(a, "manager-tools.jsonl") if row["call_ref"] == "outside-agent")["result"]
         require(remote["state"] == "rejected" and "outside configured roots" in remote["reason"], "B refuses an agent task outside its roots")
         send(a.client, "p4-unsigned", "no signature", unsigned=True, status=400)
-        read_only = [row for row in records(a, "manager-tool-errors.jsonl") if row["trigger"].startswith("work:") and "read-only" in row["error"]]
-        require(read_only, "result turns in report mode cannot dispatch")
-        passed("authority-checks", codex="outside configured roots", agent=remote["reason"][:80],
-               unsigned="rejected", report_mode_dispatch_refusals=len(read_only))
+        passed("authority-checks", codex="outside configured roots", agent=remote["reason"][:80], unsigned="rejected")
 
         revoked_dir = folder("p4-revoked")
         r5 = send(a.client, "p4-m5", {"label": "p4-m5", "dispatch": {"label": "p4-revoked", "cwd": str(revoked_dir),
-                                                                     "target_node": c.device_id, "native": {"gate": str(revoked_dir / "release")}}})
+                                                                     "target_node": c.device_id, "native": {"label": "p4-revoked-task",
+                                                                                                            "gate": str(revoked_dir / "release")}}})
         lost = dispatched(a, "p4-revoked")
         turn(a, r5["trigger"])
-        wait_for("C runs the work", lambda: work_in(a.client, lost, "running"), timeout=60)
+        wait_for("C's Agent runs the task", lambda: work_in(a.client, lost, "running"), timeout=60)
         c.stop(crash=True)
         stop = a.client.rpc("interrupt_work", conversation_id=conversation, work_id=lost)
         require(stop.get("waiting_for_device") and not stop["confirmed"], "a stop to an offline device waits for it")
@@ -3023,6 +3026,27 @@ def public_entry_acceptance(options):
         clients.append(direct)
         require(direct.connect(x.device_id, check=False).get("ok"), "X itself is running")
         passed("relay-refuses-a-wrong-token", error=str(outcome.get("error", ""))[:200])
+
+        work_dir = workspace / "pe-work"
+        work_dir.mkdir()
+        (work_dir / "release").touch()
+        phone.rpc("message", conversation_id=conversation, message_id="pe-3", text=json.dumps({"label": "pe-3", "dispatch": {
+            "label": "pe-work", "cwd": str(work_dir), "native": {"gate": str(work_dir / "release")}}}))
+        thread_id = wait_for("M's Agent starts a Codex thread", lambda: next((thread_id for thread_id, thread in json.loads(
+            (fixture / "fixture-codex-state.json").read_text())["threads"].items() if thread["cwd"] == str(work_dir)), None)
+            if (fixture / "fixture-codex-state.json").exists() else None, timeout=60)
+        token = m.client.call("create_decision_token", {"label": "grok"})["token"]
+        decision = {"device_id": m.device_id, "thread_id": thread_id, "decision_id": "pe-decision", "text": "经入口送达的决定"}
+        sent = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
+        again = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
+        p.client.request("/api/decision", {**decision, "decision_id": "pe-forged"}, origin=False,
+                         headers={"Authorization": "Bearer vfd_" + "0" * 64}, status=401, timeout=60)
+        sends = [row for row in fixture_records(fixture, "codex-rpc.jsonl") if row["message"].get("method") in ("turn/start", "turn/steer")
+                 and row["message"]["params"].get("clientUserMessageId") == "pe-decision"]
+        require(sent["status"] == "delivered" and again == sent and len(sends) == 1,
+                "a decision token's POST through P reaches M's thread once; a wrong token gets 401")
+        require(token not in (p.directory / "process.log").read_text(errors="replace"), "P does not log the token")
+        passed("decision-through-the-public-entry", mode=sent["mode"], thread=thread_id[:24])
 
         rows = entry_rows(p.directory / "node.sqlite3")
         require(all(count == 0 for count in rows.values()), "P stores no events, conversations or logs")
@@ -3444,10 +3468,10 @@ if __name__ == "__main__":
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
-        modes.add_argument("--chat-agent", action="store_true", help="run Agent delegation, host effects, cancellation and native observation process checks")
+        modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
-        modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards to a member Node through its relay")
+        modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards browsers and decisions to a member Node through its relay")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         arguments = parser.parse_args()
         try:
