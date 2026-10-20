@@ -40,6 +40,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
+/// Anyone can open `/api/client`, so a Gateway relays a bounded number of sessions at once.
+static FORWARDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
+/// Sessions from devices that are not members yet (joining, recovering) share a few slots and
+/// close after `GUEST_LIFETIME`, longer than an invite lives.
+static GUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+const GUEST_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 type NativeSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -295,6 +301,11 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     if target == node.identity.device_id()? && !node.config.public_entry {
         return serve_session(node, socket, None).await;
     }
+    let Ok(_slot) = FORWARDS.try_acquire() else {
+        let refusal = json!({"type":"error","code":"gateway_busy","error":"this Gateway relays too many sessions"});
+        let _ = socket.send(Message::Text(refusal.to_string().into())).await;
+        bail!("gateway forwarding budget exhausted");
+    };
     let forwarded = match open_forward(&node, &target).await {
         Ok(forwarded) => forwarded,
         Err((code, error)) => {
@@ -442,6 +453,17 @@ async fn serve_session(
         subscribed: false,
         observation: None,
     };
+    let opened = Instant::now();
+    let mut guest = if session.cookie.is_none() && principal(&node, &session).await.is_err() {
+        Some(
+            GUESTS
+                .try_acquire()
+                .map_err(|_| anyhow!("too many devices are joining this Node; try again later"))?,
+        )
+    } else {
+        None
+    };
+    let mut membership = node.membership.subscribe();
     let mut events = node.events.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -487,8 +509,17 @@ async fn serve_session(
                 ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
                 if session.subscribed || session.observation.is_some() { principal(&node, &session).await?; }
+                if guest.is_some() {
+                    if principal(&node, &session).await.is_ok() { guest = None; }
+                    else { ensure!(opened.elapsed() < GUEST_LIFETIME, "a device that is not a member may stay connected for 15 minutes"); }
+                }
                 if let Some(observation) = &session.observation { observation.refresh(); }
                 tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await.context("client heartbeat send timed out")??;
+            }
+            changed = membership.changed() => {
+                changed.context("membership state closed")?;
+                // A removed device loses its subscription at once, not at the next heartbeat.
+                if session.subscribed || session.observation.is_some() { principal(&node, &session).await?; }
             }
             changed = local_changes.changed(), if session.cookie.is_some() => {
                 changed.context("local access state closed")?;
@@ -1807,13 +1838,16 @@ mod tests {
             assert_eq!(manager.call("approve", json!({"join_id":refused_id,"reject":true})).await?["status"], "rejected");
             assert!(manager.call("approve", json!({"join_id":refused_id,"admin_nonce":"66".repeat(32)})).await.is_err());
 
-            // Revocation takes effect on the open session.
+            // Revocation takes effect on the open session, and a subscription ends with it.
+            let mut watching = connect(phone.clone()).await?;
+            watching.call("subscribe", json!({})).await?;
             let view = node.membership_state().await?.project()?;
             let revoke = GovernanceEvent::revoke(&admin, &view, &phone.device_id()?, 0)?;
             assert!(joiner.call("revoke", json!({"event":revoke})).await.is_err(), "issuer must be the session");
             manager.call("revoke", json!({"event":revoke})).await?;
             assert!(joiner.call("directory", json!({})).await.is_err());
             assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);
+            assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
 
             // Root recovery from a device that holds only the recovery key.
             let replacement = LocalIdentity::generate();

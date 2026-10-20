@@ -218,6 +218,7 @@ impl Runtime {
                 return Err(error);
             }
         };
+        self.close_when_removed(connection.clone(), remote.clone());
         if alpn == net::BLOB {
             self.serve_blobs(connection, network, remote).await;
             return Ok(());
@@ -245,6 +246,27 @@ impl Runtime {
         })
         .await;
         Ok(())
+    }
+
+    /// Ends an accepted connection once its Node leaves the directory; each request is checked
+    /// anyway, this also stops the streams already open on it.
+    fn close_when_removed(self: &Arc<Self>, connection: Connection, remote: String) {
+        let node = Arc::downgrade(self);
+        let mut membership = self.membership.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = connection.closed() => return,
+                    changed = membership.changed() => {
+                        let Some(node) = node.upgrade() else { return };
+                        if changed.is_err() || node.member_node(&remote).await.is_err() {
+                            connection.close(1u32.into(), b"no longer a member Node");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// A request to another member Node over `vibeface/rpc/1`.

@@ -139,6 +139,8 @@ pub struct Runtime {
     /// Operator token of the public entry's relay: this entry's own, or the one it serves.
     pub(crate) entry_token: Option<String>,
     pub(crate) write_state: tokio::sync::watch::Sender<WriteState>,
+    /// Bumped on every membership change, so open sessions and connections recheck their peer.
+    pub(crate) membership: tokio::sync::watch::Sender<u64>,
     _process_lock: Arc<std::fs::File>,
     executor_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
@@ -243,6 +245,7 @@ impl Runtime {
             local_access,
             entry_token,
             write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
+            membership: tokio::sync::watch::Sender::new(0),
             _process_lock: process_lock,
             executor_rx: Mutex::new(Some(rx)),
         };
@@ -261,6 +264,7 @@ impl Runtime {
             store.save_local_identity(&view.network_id, &self.identity)?;
         }
         drop(store);
+        self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
         self.wake_sync_all();
         Ok(view)
