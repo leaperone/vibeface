@@ -118,10 +118,10 @@ Codex SDK sidecar 的权限配置加入对 App Server socket 的 Unix socket 授
 |---|---|
 | Codex hook | `Stop`、`PermissionRequest` 调用 `vibeface hook codex` |
 | Claude Code hook | `Stop`、`StopFailure`、`Notification` 调用 `vibeface hook claude` |
-| App Server | Node 订阅的线程：回合结束、失败、等待输入 |
+| App Server | 本机 App Server 报告的所有线程的 `turn/completed`（完成、失败、中断） |
 | 会话扫描 | 每 5 分钟扫 `$CODEX_HOME/sessions` 下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
 
-`vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 头的 JSON 请求，浏览器跨站请求一律拒绝。Node 不在线时写入数据目录的 `hook-spool/`，Node 下次扫描时读入。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
+`vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 头的 JSON 请求，浏览器跨站请求一律拒绝。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
 
 统一事件格式（schema_version 1）：
 
@@ -136,18 +136,38 @@ Codex SDK sidecar 的权限配置加入对 App Server socket 的 Unix socket 授
 
 ### 4.2 判断
 
-调度层每 20 秒把新事件（最多 20 条）交给本机协调 Agent 判断一次，只读、无工具、新会话。Agent 对每条事件给出 `needs_human`、`severity`（`info`、`attention`、`urgent`）、一句话 `summary` 和 `matter`（同一件事的键）。没有配置 Agent 时用规则：失败为 `urgent`，等待输入为 `attention`，其余不打扰。`test=true` 的事件不进入判断。
+判断留在协调 Agent 里，Node 不写规则。Node 只做不花 token 的确定性工作：收事件、去重、排队、按 Agent 的决定路由和投递。
 
-同一 `matter` 在 30 分钟内再次出现时合并：计数加一，只有严重度升高才再次送出。`needs_human=false` 的事件只记在本机，不送出。
+- 新事件进入本机待处理队列。每 20 秒最多唤醒一次本机协调 Agent，把它还没见过的事件（最多 20 条）交给它，新会话，带完整 Shell。`test=true` 的事件只确认收到，不入队。
+- Agent 用 Shell 命令回答：
+  - `vibeface triage events [--since <毫秒>]`：列出待处理事件（JSON）。
+  - `vibeface triage raise --event-id <ID> --severity info|attention|urgent --summary <一句话> --matter <键>`：需要本人看。
+  - `vibeface triage dismiss --event-id <ID>`：静默处理。
+- 命令走本机监听器的 `/api/triage`，边界与 `/api/hooks` 相同。唤醒时 Node 把本机监听器地址放进 `VIBEFACE_TRIAGE_URL`。
+- 没有配置协调 Agent 时，事件留在本机队列，不转发；7 天后与去重记录一起过期。
+
+`raise` 和 `dismiss` 按 `event_id` 幂等，重复调用返回第一次的结果。同一 `matter` 在 30 分钟内再次 `raise` 时只把计数加一，严重度升高才再次送出，这是确定性去重，不是判断。
 
 ### 4.3 出口
 
 出口按项目选择：`config.json` 的 `triage.projects` 按 `cwd` 前缀匹配，最长前缀优先，没有匹配时用 `triage.default_outlet`。取值为 `record`、`webhook`、`both`、`off`。
 
 - **record**：写一条 `AttentionRaised` 事件，作用域为 `attention`，随 DAG 同步到所有设备，网页的“待处理”显示成卡片。本人发送决定或忽略后，浏览器签名写 `AttentionResolved`。
-- **webhook**：HMAC 签名 POST 到 `triage.webhook_url`。请求头 `X-Vibeface-Event-Id`、`X-Vibeface-Timestamp`（Unix 秒）、`X-Vibeface-Signature: v1=<hex>`，签名为 `HMAC-SHA256(key, timestamp + "." + body)`。接收方拒绝 5 分钟以外的时间戳，并按 `event_id` 去重。发件箱是本机 SQLite 表：2xx 记为已送达；408、429 和 5xx 退避重试（10 秒起翻倍），最多 8 次后进入死信；其他 4xx 直接死信。同一 `event_id` 只入队一次。
+- **webhook**：HMAC 签名 POST 到 `triage.webhook_url`。请求头 `X-Vibeface-Event-Id`、`X-Vibeface-Timestamp`（Unix 秒）、`X-Vibeface-Signature: v1=<hex>`，签名为 `HMAC-SHA256(key, timestamp + "." + body)`。正文含 `event_id`、`alert_id`、`matter`、`severity`、`summary`、`count`、完整事件，以及 Codex 会话的 `decision: {url, device_id, thread_id}`。接收方应拒绝 5 分钟以外的时间戳，并按 `event_id` 去重。发件箱存在本机 SQLite（不同步）：2xx 记为已送达；408、429 和 5xx 退避重试（10 秒起翻倍），最多 8 次后进入死信；其他 4xx 直接死信。同一 `event_id` 只入队一次。
 
 密钥只存在数据目录的 `triage-webhook.key`（0600），不进 `config.json`、DAG、日志和诊断包。网页只能设置或清除，读不回来。
+
+设置是本机的，只有管理设备或本机会话能改，经浏览器会话的方法调用：
+
+| 方法 | 参数 | 返回 |
+|---|---|---|
+| `triage_settings` | 无 | `{default_outlet, projects, webhook_url, scan_codex_sessions, webhook_secret_set, decision_url, device_id, decision_tokens: [{token_id, label, created_ms}], outbox: {pending, delivered, dead}}` |
+| `configure_triage` | `{default_outlet, projects: [{prefix, outlet}], webhook_url, scan_codex_sessions, webhook_secret?}`；`webhook_secret` 为字符串时设置，`null` 时清除，缺省时保留 | 同 `triage_settings` |
+| `test_webhook` | 无 | `{ok, status, error}`，立即发一条签名的测试事件，不进发件箱 |
+| `create_decision_token` | `{label}` | `{token_id, token, label, created_ms}`，`token` 只在这里出现一次 |
+| `revoke_decision_token` | `{token_id}` | `{revoked}` |
+
+卡片经 `rpc` 读写：`alerts` 返回 `{alerts: [{alert_id, matter, agent, session_id, turn_id?, cwd, severity, summary, count, node, created_at_ms, resolution}]}`，未处理的在前；`resolve_alert {alert_id, resolution: decided|dismissed, attestation}` 写 `AttentionResolved`，签名的作用域是 `attention`。
 
 ## 5. 送决定回会话
 
@@ -160,19 +180,20 @@ Codex SDK sidecar 的权限配置加入对 App Server socket 的 Unix socket 授
 
 发送结果不明时返回 `unknown`，再次调用同一 `decision_id` 只回读，不重发。
 
-Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, thread_id, text, decision_id}`。公共入口不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备通过 `--entry` 连在入口的 relay 上）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理或转发。
+Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, thread_id, text, decision_id}`。公共入口不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备通过 `--entry` 连在入口的 relay 上）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机会话，其他设备的转给目标。令牌错误返回 401。
 
 这替代了 Leo 方案里的 `codex-ws-proxy` 和 frpc。原方案把 App Server 的控制 socket 以明文 `ws://` 暴露在公网，持有 Bearer 的一方能调用 App Server 的全部方法。现在公网只有 TLS 之后的一个窄接口，令牌只能送决定；上行改为 Node 签名推送，Grok Bot 不再需要本机 Shell 读 jsonl 和每 3 小时巡检。
 
 ## 6. 安装 hook
 
 ```sh
-vibeface hooks install --data-dir <数据目录> [--dry-run]
+vibeface hooks install --data-dir <数据目录> [--home <目录>] [--dry-run]
+vibeface hooks status --data-dir <数据目录> [--home <目录>]
 vibeface hooks test --data-dir <数据目录>
-vibeface hooks uninstall --data-dir <数据目录>
+vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 ```
 
-`install` 修改 `~/.codex/hooks.json` 和 `~/.claude/settings.json`。先把原文件备份为 `<文件>.bak-vibeface-<时间>`，只追加本工具的条目，不改动其他 hook（如 orca、paseo），重复执行不会重复添加。`--dry-run` 只打印将要追加的内容。`test` 发送一条 `test=true` 的事件，确认 Node 收到。Codex 还要求 `config.toml` 的 `[features] hooks = true`，未开启时 `install` 只提示，不改该文件；新 hook 第一次运行前 Codex 会请求信任。已经在跑的会话要重启或 resume 后才会触发 hook。
+`install` 修改 `~/.codex/hooks.json` 和 `~/.claude/settings.json`。先把原文件备份为 `<文件>.bak-vibeface-<时间>`，只追加本工具的条目，不改动其他 hook（如 orca、paseo），重复执行不会重复添加；写回时 JSON 键按字母排序，内容不变。`uninstall` 只删本工具的条目。未给 `--home` 时 Codex 的目录取 `$CODEX_HOME`。`--dry-run` 只打印将要追加的内容。`test` 发送一条 `test=true` 的事件，确认 Node 收到。Codex 还要求 `config.toml` 的 `[features] hooks = true`，未开启时 `install` 只提示，不改该文件；新 hook 第一次运行前 Codex 会请求信任。已经在跑的会话要重启或 resume 后才会触发 hook。
 
 ## 7. 删除清单
 
