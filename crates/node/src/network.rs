@@ -4419,11 +4419,7 @@ mod tests {
         for sequence in 0..messages {
             let mut payload = vec![sequence as u8; 60_000];
             payload[..8].copy_from_slice(&sequence.to_le_bytes());
-            encrypted.extend(
-                client_crypto
-                    .seal_message(&payload)
-                    .map_err(anyhow::Error::msg)?,
-            );
+            encrypted.extend(client_crypto.seal_message(&payload)?);
         }
         let flood = tokio::spawn(async move {
             for record in encrypted {
@@ -4433,19 +4429,13 @@ mod tests {
         });
         wait_continuous_backpressure(&mut flows).await?;
         let reverse_started = Instant::now();
-        for record in target_crypto
-            .seal_message(b"reverse while TCP reader paused")
-            .map_err(anyhow::Error::msg)?
-        {
+        for record in target_crypto.seal_message(b"reverse while TCP reader paused")? {
             send_frame_sink(&mut target_write, Message::Binary(record.into())).await?;
         }
         let reverse =
             tokio::time::timeout(Duration::from_secs(2), next_binary(&mut caller_read)).await??;
         assert_eq!(
-            client_crypto
-                .open_record(&reverse)
-                .map_err(anyhow::Error::msg)?
-                .unwrap(),
+            client_crypto.open_record(&reverse)?.unwrap(),
             b"reverse while TCP reader paused"
         );
         assert!(reverse_started.elapsed() < CONNECT_TIMEOUT);
@@ -4515,10 +4505,7 @@ mod tests {
         for sequence in 0..messages {
             let received = loop {
                 let record = next_binary(&mut stopped_read).await?;
-                if let Some(message) = target_crypto
-                    .open_record(&record)
-                    .map_err(anyhow::Error::msg)?
-                {
+                if let Some(message) = target_crypto.open_record(&record)? {
                     break message;
                 }
             };
@@ -4563,43 +4550,20 @@ mod tests {
             &caller_identity.secret_key_hex,
             Some(target_identity.peer_id()?),
             b"test:directory",
-        )
-        .map_err(anyhow::Error::msg)?;
+        )?;
         let mut server = Handshake::new(
             false,
             &target_identity.secret_key_hex,
             Some(caller_identity.peer_id()?),
             b"test:directory",
-        )
-        .map_err(anyhow::Error::msg)?;
-        send_frame(
-            caller,
-            Message::Binary(client.write(&[]).map_err(anyhow::Error::msg)?.into()),
-        )
-        .await?;
-        server
-            .read(&next_binary(target).await?)
-            .map_err(anyhow::Error::msg)?;
-        send_frame(
-            target,
-            Message::Binary(server.write(&[]).map_err(anyhow::Error::msg)?.into()),
-        )
-        .await?;
-        client
-            .read(&next_binary(caller).await?)
-            .map_err(anyhow::Error::msg)?;
-        send_frame(
-            caller,
-            Message::Binary(client.write(&[]).map_err(anyhow::Error::msg)?.into()),
-        )
-        .await?;
-        server
-            .read(&next_binary(target).await?)
-            .map_err(anyhow::Error::msg)?;
-        Ok((
-            client.finish().map_err(anyhow::Error::msg)?,
-            server.finish().map_err(anyhow::Error::msg)?,
-        ))
+        )?;
+        send_frame(caller, Message::Binary(client.write(&[])?.into())).await?;
+        server.read(&next_binary(target).await?)?;
+        send_frame(target, Message::Binary(server.write(&[])?.into())).await?;
+        client.read(&next_binary(caller).await?)?;
+        send_frame(caller, Message::Binary(client.write(&[])?.into())).await?;
+        server.read(&next_binary(target).await?)?;
+        Ok((client.finish()?, server.finish()?))
     }
 
     async fn noise_round_trip(
@@ -4619,30 +4583,18 @@ mod tests {
         caller: &mut NetworkSocket,
         target: &mut NetworkSocket,
     ) -> Result<()> {
-        for encrypted in client
-            .seal_message(b"fixed-target canary")
-            .map_err(anyhow::Error::msg)?
-        {
+        for encrypted in client.seal_message(b"fixed-target canary")? {
             send_frame(caller, Message::Binary(encrypted.into())).await?;
         }
         assert_eq!(
-            server
-                .open_record(&next_binary(target).await?)
-                .map_err(anyhow::Error::msg)?
-                .unwrap(),
+            server.open_record(&next_binary(target).await?)?.unwrap(),
             b"fixed-target canary"
         );
-        for encrypted in server
-            .seal_message(b"complete")
-            .map_err(anyhow::Error::msg)?
-        {
+        for encrypted in server.seal_message(b"complete")? {
             send_frame(target, Message::Binary(encrypted.into())).await?;
         }
         assert_eq!(
-            client
-                .open_record(&next_binary(caller).await?)
-                .map_err(anyhow::Error::msg)?
-                .unwrap(),
+            client.open_record(&next_binary(caller).await?)?.unwrap(),
             b"complete"
         );
         Ok(())
@@ -4669,30 +4621,15 @@ mod tests {
                     &caller_identity.secret_key_hex,
                     Some(target_identity.peer_id()?),
                     domain,
-                )
-                .map_err(anyhow::Error::msg)?;
+                )?;
+                send_frame(&mut socket, Message::Binary(handshake.write(&[])?.into())).await?;
+                assert!(handshake.read(&next_binary(&mut socket).await?)?.is_empty());
                 send_frame(
                     &mut socket,
-                    Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                    Message::Binary(handshake.write(b"authenticated caller")?.into()),
                 )
                 .await?;
-                assert!(
-                    handshake
-                        .read(&next_binary(&mut socket).await?)
-                        .map_err(anyhow::Error::msg)?
-                        .is_empty()
-                );
-                send_frame(
-                    &mut socket,
-                    Message::Binary(
-                        handshake
-                            .write(b"authenticated caller")
-                            .map_err(anyhow::Error::msg)?
-                            .into(),
-                    ),
-                )
-                .await?;
-                Ok::<_, anyhow::Error>((socket, handshake.finish().map_err(anyhow::Error::msg)?))
+                Ok::<_, anyhow::Error>((socket, handshake.finish()?))
             }
             .await;
             result.map_err(AuthenticationFailure::Path)
@@ -4708,26 +4645,22 @@ mod tests {
                 &target_identity.secret_key_hex,
                 Some(caller_identity.peer_id()?),
                 domain,
-            )
-            .map_err(anyhow::Error::msg)?;
+            )?;
             assert!(
                 handshake
-                    .read(&next_binary(&mut accepted.socket).await?)
-                    .map_err(anyhow::Error::msg)?
+                    .read(&next_binary(&mut accepted.socket).await?)?
                     .is_empty()
             );
             send_frame(
                 &mut accepted.socket,
-                Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                Message::Binary(handshake.write(&[])?.into()),
             )
             .await?;
             assert_eq!(
-                handshake
-                    .read(&next_binary(&mut accepted.socket).await?)
-                    .map_err(anyhow::Error::msg)?,
+                handshake.read(&next_binary(&mut accepted.socket).await?)?,
                 b"authenticated caller"
             );
-            Ok::<_, anyhow::Error>((accepted, handshake.finish().map_err(anyhow::Error::msg)?))
+            Ok::<_, anyhow::Error>((accepted, handshake.finish()?))
         };
         let ((socket, client), (accepted, server)) = tokio::try_join!(dial, accept)?;
         Ok((socket, client, accepted, server))
@@ -6537,7 +6470,7 @@ mod tests {
         assert_ne!(relay_identity.peer_id()?, caller_identity.peer_id()?);
 
         let canary = b"private context canary across an unrelated relay";
-        for encrypted in client.seal_message(canary).map_err(anyhow::Error::msg)? {
+        for encrypted in client.seal_message(canary)? {
             assert!(
                 !encrypted
                     .windows(canary.len())
@@ -6546,27 +6479,12 @@ mod tests {
             send_frame(&mut caller_socket, Message::Binary(encrypted.into())).await?;
         }
         let encrypted = next_binary(&mut incoming.socket).await?;
-        assert_eq!(
-            server
-                .open_record(&encrypted)
-                .map_err(anyhow::Error::msg)?
-                .unwrap(),
-            canary
-        );
-        for encrypted in server
-            .seal_message(b"complete")
-            .map_err(anyhow::Error::msg)?
-        {
+        assert_eq!(server.open_record(&encrypted)?.unwrap(), canary);
+        for encrypted in server.seal_message(b"complete")? {
             send_frame(&mut incoming.socket, Message::Binary(encrypted.into())).await?;
         }
         let encrypted = next_binary(&mut caller_socket).await?;
-        assert_eq!(
-            client
-                .open_record(&encrypted)
-                .map_err(anyhow::Error::msg)?
-                .unwrap(),
-            b"complete"
-        );
+        assert_eq!(client.open_record(&encrypted)?.unwrap(), b"complete");
         assert_eq!(
             publication_gate.available_permits(),
             0,
@@ -6608,14 +6526,11 @@ mod tests {
                     &wrong_identity.secret_key_hex,
                     None,
                     b"test:directory",
-                )
-                .map_err(anyhow::Error::msg)?;
-                handshake
-                    .read(&next_binary(&mut accepted.socket).await?)
-                    .map_err(anyhow::Error::msg)?;
+                )?;
+                handshake.read(&next_binary(&mut accepted.socket).await?)?;
                 send_frame(
                     &mut accepted.socket,
-                    Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                    Message::Binary(handshake.write(&[])?.into()),
                 )
                 .await?;
                 let _ = wrong_done.send(());
@@ -6772,19 +6687,17 @@ mod tests {
                     &server_identity.secret_key_hex,
                     Some(server_owner.peer_id()?),
                     b"vibeface:peer:v1",
-                )
-                .map_err(anyhow::Error::msg)?;
+                )?;
                 assert!(
                     handshake
-                        .read(&next_binary(&mut accepted.socket).await?)
-                        .map_err(anyhow::Error::msg)?
+                        .read(&next_binary(&mut accepted.socket).await?)?
                         .is_empty()
                 );
                 let _ = entered.send(());
                 gate.await?;
                 send_frame(
                     &mut accepted.socket,
-                    Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into()),
+                    Message::Binary(handshake.write(&[])?.into()),
                 )
                 .await?;
                 let rejected_before_third = next_binary(&mut accepted.socket).await.is_err();
@@ -7165,16 +7078,16 @@ mod tests {
             let result = async {
                 let mut accepted = bad_incoming.recv().await.context("malformed Hello path missing")?;
                 let mut handshake = Handshake::new(false, &bad_identity.secret_key_hex,
-                    Some(bad_owner.peer_id()?), b"vibeface:peer:v1").map_err(anyhow::Error::msg)?;
-                assert!(handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?.is_empty());
-                send_frame(&mut accepted.socket, Message::Binary(handshake.write(&[]).map_err(anyhow::Error::msg)?.into())).await?;
-                let hello: serde_json::Value = serde_json::from_slice(&handshake.read(&next_binary(&mut accepted.socket).await?).map_err(anyhow::Error::msg)?)?;
+                    Some(bad_owner.peer_id()?), b"vibeface:peer:v1")?;
+                assert!(handshake.read(&next_binary(&mut accepted.socket).await?)?.is_empty());
+                send_frame(&mut accepted.socket, Message::Binary(handshake.write(&[])?.into())).await?;
+                let hello: serde_json::Value = serde_json::from_slice(&handshake.read(&next_binary(&mut accepted.socket).await?)?)?;
                 assert_eq!(hello["peer_id"], bad_owner.peer_id()?);
-                let mut channel = handshake.finish().map_err(anyhow::Error::msg)?;
+                let mut channel = handshake.finish()?;
                 let malformed = serde_json::to_vec(&serde_json::json!({
                     "version":crate::model::WIRE_VERSION,"network_id":bad_network,"peer_id":untrusted.peer_id()?
                 }))?;
-                for record in channel.seal_message(&malformed).map_err(anyhow::Error::msg)? {
+                for record in channel.seal_message(&malformed)? {
                     send_frame(&mut accepted.socket, Message::Binary(record.into())).await?;
                 }
                 ensure!(next_binary(&mut accepted.socket).await.is_err(), "wrong Hello path was not rejected");

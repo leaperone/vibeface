@@ -121,20 +121,20 @@ impl Client {
         target: &str,
     ) -> Result<Self> {
         let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            let mut handshake = secure(Handshake::new(
+            let mut handshake = Handshake::new(
                 true,
                 &identity.secret_key_hex,
                 Some(target.to_owned()),
                 b"vibeface:client:v1",
-            ))?;
-            send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
+            )?;
+            send_frame(&mut socket, handshake.write(&[])?).await?;
             let second = next_binary(&mut socket).await?;
             ensure!(
-                secure(handshake.read(&second))?.is_empty(),
+                handshake.read(&second)?.is_empty(),
                 "unexpected client handshake payload"
             );
-            send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
-            secure(handshake.finish())
+            send_frame(&mut socket, handshake.write(&[])?).await?;
+            Ok(handshake.finish()?)
         })
         .await
         .context("client handshake timed out")??;
@@ -182,26 +182,26 @@ async fn serve_session(
 ) -> Result<()> {
     let mut local_changes = node.local_access.subscribe();
     let (mut channel, subject_id, public_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let mut handshake = secure(Handshake::new(
+        let mut handshake = Handshake::new(
             false,
             &node.identity.secret_key_hex,
             None,
             b"vibeface:client:v1",
-        ))?;
+        )?;
         ensure!(
-            secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
+            handshake.read(&next_binary(&mut socket).await?)?.is_empty(),
             "unexpected first client payload"
         );
-        send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
+        send_frame(&mut socket, handshake.write(&[])?).await?;
         ensure!(
-            secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
+            handshake.read(&next_binary(&mut socket).await?)?.is_empty(),
             "unexpected final client payload"
         );
         let subject_id = handshake.remote_id().context("client identity missing")?;
         let public_key = handshake
             .remote_public_key()
             .context("client public key missing")?;
-        Ok::<_, anyhow::Error>((secure(handshake.finish())?, subject_id, public_key))
+        Ok::<_, anyhow::Error>((handshake.finish()?, subject_id, public_key))
     })
     .await
     .context("client handshake timed out")??;
@@ -244,7 +244,7 @@ async fn serve_session(
                 received = Instant::now();
                 match frame.context("client disconnected")?? {
                     Message::Binary(bytes) => {
-                        if let Some(plaintext) = secure(channel.open_record(&bytes))? {
+                        if let Some(plaintext) = channel.open_record(&bytes)? {
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
@@ -1185,9 +1185,6 @@ fn sort_roles(roles: &mut [crate::model::NodeRole]) -> Result<()> {
     );
     Ok(())
 }
-fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
-    result.map_err(anyhow::Error::msg)
-}
 fn validate_request(request: &Request) -> Result<()> {
     ensure!(
         !request.id.is_empty()
@@ -1231,14 +1228,14 @@ async fn send_value<T: Serialize>(
     value: &T,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    for record in secure(channel.seal_message(&bytes))? {
+    for record in channel.seal_message(&bytes)? {
         send_frame(socket, record).await?;
     }
     Ok(())
 }
 async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Result<Vec<u8>> {
     loop {
-        if let Some(value) = secure(channel.open_record(&next_binary(socket).await?))? {
+        if let Some(value) = channel.open_record(&next_binary(socket).await?)? {
             return Ok(value);
         }
     }
@@ -1757,21 +1754,21 @@ mod tests {
                             json!({"type":"ready"}).to_string().into(),
                         ))
                         .await?;
-                    let mut handshake = secure(Handshake::new(
+                    let mut handshake = Handshake::new(
                         false,
                         &destination.secret_key_hex,
                         None,
                         b"vibeface:client:v1",
-                    ))?;
+                    )?;
                     let first = socket.next().await.context("missing first handshake")??;
-                    assert!(secure(handshake.read(&first.into_data()))?.is_empty());
+                    assert!(handshake.read(&first.into_data())?.is_empty());
                     socket
-                        .send(NativeMessage::Binary(secure(handshake.write(&[]))?.into()))
+                        .send(NativeMessage::Binary(handshake.write(&[])?.into()))
                         .await?;
                     if correct_target {
                         let third = socket.next().await.context("missing final handshake")??;
-                        assert!(secure(handshake.read(&third.into_data()))?.is_empty());
-                        secure(handshake.finish())?;
+                        assert!(handshake.read(&third.into_data())?.is_empty());
+                        handshake.finish()?;
                     }
                     return Ok::<_, anyhow::Error>(());
                 }

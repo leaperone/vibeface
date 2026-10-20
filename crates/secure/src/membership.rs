@@ -28,7 +28,7 @@ impl MembershipSigner for Identity {
     }
 
     fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        self.sign(domain, payload).map_err(anyhow::Error::msg)
+        Ok(self.sign(domain, payload)?)
     }
 }
 
@@ -37,11 +37,11 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn fingerprint(public_key: &str) -> Result<String> {
-    Ok(digest(&decode32(public_key).map_err(anyhow::Error::msg)?))
+    Ok(digest(&decode32(public_key)?))
 }
 
 fn verify_payload(public_key: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
-    crate::verify(public_key, domain, payload, signature).map_err(anyhow::Error::msg)
+    Ok(crate::verify(public_key, domain, payload, signature)?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1033,7 +1033,7 @@ pub fn verify_membership(
             historical_nodes,
         })
     }
-    verify(state_json, expected_network, owner_public_key).map_err(|error| format!("{error:#}"))
+    Ok(verify(state_json, expected_network, owner_public_key)?)
 }
 
 #[derive(Deserialize)]
@@ -1054,19 +1054,17 @@ struct RecoverySigning {
 impl VerifiedMembership {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = viewJson))]
     pub fn view_json(&self) -> crate::Result<String> {
-        serde_json::to_string(&self.view).map_err(|error| error.to_string())
+        Ok(serde_json::to_string(&self.view)?)
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = stateJson))]
     pub fn state_json(&self) -> crate::Result<String> {
-        serde_json::to_string(&self.state).map_err(|error| error.to_string())
+        Ok(serde_json::to_string(&self.state)?)
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = genesisHash))]
     pub fn genesis_hash(&self) -> crate::Result<String> {
-        canonical_json(&self.state.genesis)
-            .map(|bytes| digest(&bytes))
-            .map_err(|error| error.to_string())
+        Ok(digest(&canonical_json(&self.state.genesis)?))
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = createRecoveryCheckpoint))]
@@ -1123,8 +1121,13 @@ impl VerifiedMembership {
             expected.verify(&verified.state.genesis)?;
             serde_json::to_string(&expected).map_err(Into::into)
         }
-        create(self, root, members_json, backup_epoch, prepared_json)
-            .map_err(|error| format!("{error:#}"))
+        Ok(create(
+            self,
+            root,
+            members_json,
+            backup_epoch,
+            prepared_json,
+        )?)
     }
 }
 
@@ -1134,7 +1137,7 @@ mod tests {
 
     #[test]
     fn peer_id_certificate_uses_only_the_current_field() -> Result<()> {
-        let device = Identity::from_secret_hex(&"01".repeat(32)).map_err(anyhow::Error::msg)?;
+        let device = Identity::from_secret_hex(&"01".repeat(32))?;
         assert_eq!(
             device.peer_id(),
             "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
@@ -1479,8 +1482,7 @@ mod tests {
         )?)?;
         let state_json = serde_json::to_string(&state)?;
         let network = &state.genesis.network_id;
-        let verified = verify_membership(&state_json, network, &root.public_key_hex())
-            .map_err(anyhow::Error::msg)?;
+        let verified = verify_membership(&state_json, network, &root.public_key_hex())?;
         assert!(verify_membership(&state_json, &"0".repeat(64), &root.public_key_hex()).is_err());
         assert!(verify_membership(&state_json, network, &admin.public_key_hex()).is_err());
         let mut forged_state = state.clone();
@@ -1501,9 +1503,12 @@ mod tests {
             "checkpoint": unsigned,
             "signing": { "domain": "identity-recovery", "payload": String::from_utf8(unsigned.signing_bytes()?)? }
         });
-        let signed = verified
-            .create_recovery_checkpoint(&root, &members_json, 4.0, &prepared.to_string())
-            .map_err(anyhow::Error::msg)?;
+        let signed = verified.create_recovery_checkpoint(
+            &root,
+            &members_json,
+            4.0,
+            &prepared.to_string(),
+        )?;
         let checkpoint: RootCheckpoint = serde_json::from_str(&signed)?;
         checkpoint.verify(&state.genesis)?;
         assert_eq!(checkpoint.epoch, 5);

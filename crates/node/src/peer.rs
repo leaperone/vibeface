@@ -582,28 +582,28 @@ impl PeerHub {
         &self,
         socket: &mut NetworkSocket,
     ) -> Result<(String, String, Channel)> {
-        let mut handshake = secure(Handshake::new(
+        let mut handshake = Handshake::new(
             false,
             &self.identity.secret_key_hex,
             None,
             b"vibeface:peer:v1",
-        ))?;
+        )?;
         let first = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
         ensure!(
-            secure(handshake.read(&first))?.is_empty(),
+            handshake.read(&first)?.is_empty(),
             "unexpected first peer payload"
         );
-        let response = secure(handshake.write(&[]))?;
+        let response = handshake.write(&[])?;
         send_binary(socket, response).await?;
         let third = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
-        let plaintext = secure(handshake.read(&third))?;
+        let plaintext = handshake.read(&third)?;
         let initiator: Hello = serde_json::from_slice(&plaintext)?;
         self.check_hello(&initiator, None).await?;
         ensure!(
             handshake.remote_id().as_deref() == Some(&initiator.peer_id),
             "peer Noise identity mismatch"
         );
-        let mut channel = secure(handshake.finish())?;
+        let mut channel = handshake.finish()?;
         let responder = self.hello(&initiator.network_id)?;
         send_secure(socket, &mut channel, &serde_json::to_vec(&responder)?).await?;
         Ok((initiator.network_id, initiator.peer_id, channel))
@@ -615,27 +615,23 @@ impl PeerHub {
         network: &str,
         target: Option<String>,
     ) -> Result<(PeerId, Channel)> {
-        let mut handshake = secure(Handshake::new(
+        let mut handshake = Handshake::new(
             true,
             &self.identity.secret_key_hex,
             target,
             b"vibeface:peer:v1",
-        ))?;
-        send_binary(socket, secure(handshake.write(&[]))?).await?;
+        )?;
+        send_binary(socket, handshake.write(&[])?).await?;
         let second = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
         ensure!(
-            secure(handshake.read(&second))?.is_empty(),
+            handshake.read(&second)?.is_empty(),
             "unexpected peer responder payload"
         );
         let remote = handshake.remote_id().context("peer omitted its identity")?;
         self.authorize(network, &remote).await?;
         let hello = self.hello(network)?;
-        send_binary(
-            socket,
-            secure(handshake.write(&serde_json::to_vec(&hello)?))?,
-        )
-        .await?;
-        let mut channel = secure(handshake.finish())?;
+        send_binary(socket, handshake.write(&serde_json::to_vec(&hello)?)?).await?;
+        let mut channel = handshake.finish()?;
         let responder: Hello = serde_json::from_slice(
             &receive_secure(socket, &mut channel, MAX_HANDSHAKE_BYTES).await?,
         )?;
@@ -772,7 +768,7 @@ impl PeerHub {
                     received = Instant::now();
                     match frame {
                         AxumMessage::Binary(bytes) => {
-                            if let Some(plaintext) = secure(channel.open_record(&bytes))? {
+                            if let Some(plaintext) = channel.open_record(&bytes)? {
                                 partial_started = None;
                                 ensure!(plaintext.len() <= MAX_PACKET_BYTES, "peer packet too large");
                                 let packet: Packet = serde_json::from_slice(&plaintext).context("invalid peer packet")?;
@@ -1210,9 +1206,6 @@ fn validate_body(body: &Body, now: i64) -> Result<()> {
     Ok(())
 }
 
-fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
-    result.map_err(anyhow::Error::msg)
-}
 async fn send_binary(socket: &mut NetworkSocket, bytes: Vec<u8>) -> Result<()> {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
@@ -1239,7 +1232,7 @@ async fn send_secure(
     channel: &mut Channel,
     value: &[u8],
 ) -> Result<()> {
-    for record in secure(channel.seal_message(value))? {
+    for record in channel.seal_message(value)? {
         send_binary(socket, record).await?;
     }
     Ok(())
@@ -1251,7 +1244,7 @@ async fn receive_secure(
 ) -> Result<Vec<u8>> {
     loop {
         if let Some(value) =
-            secure(channel.open_record(&receive_binary(socket, MAX_PACKET_BYTES).await?))?
+            channel.open_record(&receive_binary(socket, MAX_PACKET_BYTES).await?)?
         {
             ensure!(value.len() <= limit, "peer message too large");
             return Ok(value);
