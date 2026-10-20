@@ -47,6 +47,7 @@ fn device_id(value: &str) -> Result<()> {
 pub const IDENTITY_VERSION: u32 = 1;
 pub const MAX_MEMBERS: usize = 1024;
 pub const MAX_GOVERNANCE_EVENTS: usize = 1024;
+pub const MAX_CHECKPOINTS: usize = 64;
 const MAX_PARENTS: usize = 64;
 const MAX_MANAGEMENT_DEPTH: usize = 128;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -200,6 +201,9 @@ pub struct RootCheckpoint {
     pub network_id: String,
     pub epoch: u64,
     pub members: Vec<Member>,
+    /// The final write bound of every earlier Node this checkpoint does not keep. A former Node
+    /// listed in neither has no write that counts.
+    pub retired: Vec<Revocation>,
     pub signature: String,
 }
 
@@ -208,13 +212,16 @@ impl RootCheckpoint {
         root: &impl MembershipSigner,
         epoch: u64,
         mut members: Vec<Member>,
+        mut retired: Vec<Revocation>,
     ) -> Result<Self> {
         members.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        retired.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         let mut checkpoint = Self {
             version: IDENTITY_VERSION,
             network_id: root.device_id()?,
             epoch,
             members,
+            retired,
             signature: String::new(),
         };
         checkpoint.validate_shape()?;
@@ -235,6 +242,23 @@ impl RootCheckpoint {
         );
         device_id(&self.network_id)?;
         validate_members(&self.members)?;
+        ensure!(
+            self.retired.len() <= MAX_MEMBERS
+                && self
+                    .retired
+                    .windows(2)
+                    .all(|pair| pair[0].device_id < pair[1].device_id),
+            "duplicate or noncanonical retired devices"
+        );
+        for revocation in &self.retired {
+            revocation.validate()?;
+            ensure!(
+                self.members
+                    .binary_search_by(|member| member.device_id.cmp(&revocation.device_id))
+                    .is_err(),
+                "a retired device cannot stay a member"
+            );
+        }
         ensure_not_root(&self.network_id, self.members.iter())
     }
 
@@ -274,11 +298,62 @@ fn validate_members(members: &[Member]) -> Result<()> {
     Ok(())
 }
 
+/// A device's final write bound: its log counts up to `cutoff_seq`, along the branch that ends
+/// at `cutoff_hash` if the log forked.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Revocation {
+    pub device_id: String,
+    pub cutoff_seq: u64,
+    pub cutoff_hash: Option<String>,
+}
+
+impl Revocation {
+    /// `cutoff` is the last event that counts, `None` when none does.
+    pub fn new(device_id: &str, cutoff: Option<(u64, &str)>) -> Result<Self> {
+        let revocation = Self {
+            device_id: device_id.into(),
+            cutoff_seq: cutoff.map_or(0, |(seq, _)| seq),
+            cutoff_hash: cutoff.map(|(_, hash)| hash.into()),
+        };
+        revocation.validate()?;
+        Ok(revocation)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        device_id(&self.device_id)?;
+        ensure!(
+            self.cutoff_seq <= MAX_SAFE_INTEGER
+                && (self.cutoff_seq > 0) == self.cutoff_hash.is_some(),
+            "invalid cutoff"
+        );
+        if let Some(hash) = &self.cutoff_hash {
+            validate_hash(hash)?;
+        }
+        Ok(())
+    }
+
+    fn bound(&self) -> (u64, Option<&str>) {
+        (self.cutoff_seq, self.cutoff_hash.as_deref())
+    }
+}
+
+/// Concurrent revocations of one device keep the widest bound, the same on every replica.
+fn widen(revoked: &mut BTreeMap<String, Revocation>, revocation: &Revocation) {
+    match revoked.get_mut(&revocation.device_id) {
+        Some(known) if known.bound() >= revocation.bound() => {}
+        Some(known) => *known = revocation.clone(),
+        None => {
+            revoked.insert(revocation.device_id.clone(), revocation.clone());
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovernanceAction {
     Grant { member: Member },
-    Revoke { device_id: String, cutoff_seq: u64 },
+    Revoke(Revocation),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,13 +381,7 @@ impl GovernanceEvent {
         );
         match &action {
             GovernanceAction::Grant { member } => member.validate()?,
-            GovernanceAction::Revoke {
-                device_id: id,
-                cutoff_seq,
-            } => {
-                device_id(id)?;
-                ensure!(*cutoff_seq <= MAX_SAFE_INTEGER, "invalid cutoff sequence");
-            }
+            GovernanceAction::Revoke(revocation) => revocation.validate()?,
         }
         Ok(Self {
             version: IDENTITY_VERSION,
@@ -341,14 +410,14 @@ impl GovernanceEvent {
     pub fn revoke(
         admin: &impl MembershipSigner,
         view: &AuthorizationView,
-        device_id: &str,
-        cutoff_seq: u64,
+        revocation: Revocation,
     ) -> Result<Self> {
-        let action = GovernanceAction::Revoke {
-            device_id: device_id.into(),
-            cutoff_seq,
-        };
-        Self::unsigned(view, &admin.device_id()?, action)?.sign(admin)
+        Self::unsigned(
+            view,
+            &admin.device_id()?,
+            GovernanceAction::Revoke(revocation),
+        )?
+        .sign(admin)
     }
 
     pub fn sign(mut self, admin: &impl MembershipSigner) -> Result<Self> {
@@ -367,20 +436,25 @@ impl GovernanceEvent {
     }
 }
 
+/// The whole governance history: every root recovery and every epoch's events, so a replica
+/// that joins after a recovery can still check who could write before it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkState {
     pub genesis: Genesis,
-    pub checkpoint: Option<RootCheckpoint>,
+    /// In increasing epochs; the last one is the current directory.
+    pub checkpoints: Vec<RootCheckpoint>,
+    /// Sorted by `(epoch, hash)`.
     pub events: Vec<GovernanceEvent>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Revocation {
-    pub device_id: String,
-    /// The largest log sequence of this device that replicas still accept.
-    pub cutoff_seq: u64,
+/// How much of a device's log counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteBound<'a> {
+    /// A current member Node.
+    Unlimited,
+    /// A former Node, up to its final bound.
+    Cutoff(&'a Revocation),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -390,7 +464,11 @@ pub struct AuthorizationView {
     pub epoch: u64,
     pub heads: Vec<String>,
     pub members: Vec<Member>,
+    /// Every former device with its final write bound: this epoch's revocations and the ones
+    /// the last recovery retired.
     pub revoked: Vec<Revocation>,
+    /// Every device that was a client in any epoch; their signatures on history stay valid.
+    pub attesters: Vec<String>,
 }
 
 impl AuthorizationView {
@@ -425,10 +503,54 @@ impl AuthorizationView {
     }
 
     pub fn cutoff(&self, device: &str) -> Option<u64> {
+        self.revocation(device)
+            .map(|revocation| revocation.cutoff_seq)
+    }
+
+    pub fn revocation(&self, device: &str) -> Option<&Revocation> {
         self.revoked
             .iter()
             .find(|revoked| revoked.device_id == device)
-            .map(|revoked| revoked.cutoff_seq)
+    }
+
+    /// `None` when nothing `device` wrote can count here.
+    pub fn write_bound(&self, device: &str) -> Option<WriteBound<'_>> {
+        match self.revocation(device) {
+            Some(revocation) => Some(WriteBound::Cutoff(revocation)),
+            None => self.node(device).ok().map(|_| WriteBound::Unlimited),
+        }
+    }
+
+    pub fn attester(&self, device: &str) -> bool {
+        self.attesters
+            .binary_search_by(|known| known.as_str().cmp(device))
+            .is_ok()
+    }
+
+    /// The `retired` list of a recovery keeping `kept`: former devices keep their bound, and each
+    /// current Node left out ends at the head this replica holds of it.
+    pub fn retire(
+        &self,
+        kept: &[Member],
+        heads: &BTreeMap<String, (u64, String)>,
+    ) -> Result<Vec<Revocation>> {
+        let stays = |device: &str| kept.iter().any(|member| member.device_id == device);
+        let mut retired: Vec<Revocation> = self
+            .revoked
+            .iter()
+            .filter(|revocation| !stays(&revocation.device_id))
+            .cloned()
+            .collect();
+        for member in &self.members {
+            if member.kind == IdentityKind::Node && !stays(&member.device_id) {
+                let head = heads
+                    .get(&member.device_id)
+                    .filter(|(seq, _)| *seq > 0)
+                    .map(|(seq, hash)| (*seq, hash.as_str()));
+                retired.push(Revocation::new(&member.device_id, head)?);
+            }
+        }
+        Ok(retired)
     }
 }
 
@@ -438,12 +560,20 @@ struct ValidEvent {
     depth: usize,
 }
 
+/// One epoch's directory after its events.
+struct EpochView {
+    heads: Vec<String>,
+    members: BTreeMap<String, Member>,
+    revoked: BTreeMap<String, Revocation>,
+    granted_clients: Vec<String>,
+}
+
 impl NetworkState {
     pub fn new(genesis: Genesis) -> Result<Self> {
         genesis.verify()?;
         Ok(Self {
             genesis,
-            checkpoint: None,
+            checkpoints: vec![],
             events: vec![],
         })
     }
@@ -453,8 +583,8 @@ impl NetworkState {
     }
 
     pub fn epoch(&self) -> u64 {
-        self.checkpoint
-            .as_ref()
+        self.checkpoints
+            .last()
             .map_or(1, |checkpoint| checkpoint.epoch)
     }
 
@@ -467,82 +597,136 @@ impl NetworkState {
         {
             return Ok(false);
         }
-        let mut next = self.clone();
-        next.events.push(event);
-        next.project()?;
-        *self = next;
+        let mut incoming = self.clone();
+        incoming.events = vec![event];
+        *self = self.merge(&incoming)?;
         Ok(true)
     }
 
-    /// Returns false when this exact checkpoint is already current.
+    /// Returns false when this exact checkpoint is already current. Earlier history is kept.
     pub fn recover(&mut self, checkpoint: RootCheckpoint) -> Result<bool> {
         checkpoint.verify(&self.genesis)?;
-        if self.checkpoint.as_ref() == Some(&checkpoint) {
+        if self.checkpoints.last() == Some(&checkpoint) {
             return Ok(false);
         }
         ensure!(
             checkpoint.epoch > self.epoch(),
             "recovery epoch rollback or conflict"
         );
-        self.checkpoint = Some(checkpoint);
-        self.events.clear();
+        let mut next = self.clone();
+        next.checkpoints.push(checkpoint);
+        next.project()?;
+        *self = next;
         Ok(true)
     }
 
+    /// The union of both histories: commutative, associative and idempotent.
     pub fn merge(&self, incoming: &Self) -> Result<Self> {
-        self.project()?;
-        incoming.project()?;
         ensure!(
             self.genesis == incoming.genesis,
             "different personal-network genesis"
         );
-        ensure!(
-            incoming.epoch() >= self.epoch(),
-            "recovery epoch rollback rejected"
-        );
-        if incoming.epoch() > self.epoch() {
-            return Ok(incoming.clone());
+        let mut checkpoints: BTreeMap<u64, &RootCheckpoint> = BTreeMap::new();
+        for checkpoint in self.checkpoints.iter().chain(&incoming.checkpoints) {
+            if let Some(known) = checkpoints.insert(checkpoint.epoch, checkpoint) {
+                ensure!(known == checkpoint, "conflicting recovery checkpoint");
+            }
         }
-        ensure!(
-            self.checkpoint == incoming.checkpoint,
-            "conflicting recovery checkpoint"
-        );
-        let mut events: BTreeMap<String, GovernanceEvent> = BTreeMap::new();
+        let mut events = BTreeMap::new();
         for event in self.events.iter().chain(&incoming.events) {
-            events.insert(event.hash()?, event.clone());
+            events.insert((event.epoch, event.hash()?), event.clone());
         }
         let merged = Self {
             genesis: self.genesis.clone(),
-            checkpoint: self.checkpoint.clone(),
+            checkpoints: checkpoints.into_values().cloned().collect(),
             events: events.into_values().collect(),
         };
         merged.project()?;
         Ok(merged)
     }
 
-    fn base(&self) -> Vec<Member> {
-        self.checkpoint
-            .as_ref()
-            .map_or_else(|| self.genesis.members(), |c| c.members.clone())
-    }
-
+    /// Checks every epoch against its own base and returns the current directory.
     pub fn project(&self) -> Result<AuthorizationView> {
         self.genesis.verify()?;
-        if let Some(checkpoint) = &self.checkpoint {
-            checkpoint.verify(&self.genesis)?;
+        ensure!(
+            self.checkpoints.len() <= MAX_CHECKPOINTS
+                && self
+                    .checkpoints
+                    .windows(2)
+                    .all(|pair| pair[0].epoch < pair[1].epoch),
+            "invalid recovery history"
+        );
+        let mut keys = Vec::with_capacity(self.events.len());
+        for event in &self.events {
+            keys.push((event.epoch, event.hash()?));
         }
         ensure!(
-            self.events.len() <= MAX_GOVERNANCE_EVENTS,
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "duplicate or noncanonical management events"
+        );
+        let mut attesters = BTreeSet::from([self.genesis.first_client.device_id.clone()]);
+        let mut bases = vec![(1, self.genesis.members(), &[][..])];
+        for checkpoint in &self.checkpoints {
+            checkpoint.verify(&self.genesis)?;
+            attesters.extend(
+                checkpoint
+                    .members
+                    .iter()
+                    .filter(|member| member.kind == IdentityKind::Client)
+                    .map(|member| member.device_id.clone()),
+            );
+            bases.push((
+                checkpoint.epoch,
+                checkpoint.members.clone(),
+                &checkpoint.retired[..],
+            ));
+        }
+        let mut checked = 0;
+        let mut current = None;
+        for (epoch, base, retired) in &bases {
+            let events: Vec<_> = self
+                .events
+                .iter()
+                .filter(|event| event.epoch == *epoch)
+                .collect();
+            checked += events.len();
+            let view = self.project_epoch(*epoch, base, retired, &events)?;
+            attesters.extend(view.granted_clients.iter().cloned());
+            current = Some(view);
+        }
+        ensure!(
+            checked == self.events.len(),
+            "management event epoch has no recovery checkpoint"
+        );
+        let current = current.expect("epoch 1 always exists");
+        Ok(AuthorizationView {
+            network_id: self.genesis.network_id.clone(),
+            epoch: self.epoch(),
+            heads: current.heads,
+            members: current.members.into_values().collect(),
+            revoked: current.revoked.into_values().collect(),
+            attesters: attesters.into_iter().collect(),
+        })
+    }
+
+    fn project_epoch(
+        &self,
+        epoch: u64,
+        base: &[Member],
+        retired: &[Revocation],
+        events: &[&GovernanceEvent],
+    ) -> Result<EpochView> {
+        ensure!(
+            events.len() <= MAX_GOVERNANCE_EVENTS,
             "too many management events"
         );
-        let base = self.base();
-        let epoch = self.epoch();
         let mut pending = BTreeMap::new();
         let mut kinds: BTreeMap<&str, IdentityKind> = base
             .iter()
             .map(|member| (member.device_id.as_str(), member.kind))
             .collect();
-        for event in &self.events {
+        let mut granted_clients = Vec::new();
+        for event in events {
             ensure!(
                 event.version == IDENTITY_VERSION
                     && event.network_id == self.genesis.network_id
@@ -568,19 +752,13 @@ impl NetworkState {
                             "device cannot change between Node and client"
                         );
                     }
+                    if member.kind == IdentityKind::Client {
+                        granted_clients.push(member.device_id.clone());
+                    }
                 }
-                GovernanceAction::Revoke {
-                    device_id: id,
-                    cutoff_seq,
-                } => {
-                    device_id(id)?;
-                    ensure!(*cutoff_seq <= MAX_SAFE_INTEGER, "invalid cutoff sequence");
-                }
+                GovernanceAction::Revoke(revocation) => revocation.validate()?,
             }
-            ensure!(
-                pending.insert(event.hash()?, event.clone()).is_none(),
-                "duplicate management event"
-            );
+            pending.insert(event.hash()?, (*event).clone());
         }
         let mut validated: BTreeMap<String, ValidEvent> = BTreeMap::new();
         while !pending.is_empty() {
@@ -608,7 +786,7 @@ impl NetworkState {
                     "management history is too deep"
                 );
                 // ponytail: re-projects the ancestor set per event, O(n²) over at most 1024 events.
-                let (members, revoked) = project_members(&base, &validated, &ancestors);
+                let (members, revoked) = project_members(base, retired, &validated, &ancestors);
                 ensure!(
                     !revoked.contains_key(&event.issuer)
                         && members.get(&event.issuer).is_some_and(Member::is_manager),
@@ -631,7 +809,7 @@ impl NetworkState {
             }
         }
         let all = validated.keys().cloned().collect();
-        let (members, revoked) = project_members(&base, &validated, &all);
+        let (members, revoked) = project_members(base, retired, &validated, &all);
         ensure!(members.len() <= MAX_MEMBERS, "too many current members");
         let mut heads: BTreeSet<String> = validated.keys().cloned().collect();
         for entry in validated.values() {
@@ -643,18 +821,11 @@ impl NetworkState {
             heads.len() <= MAX_PARENTS,
             "too many concurrent management heads"
         );
-        Ok(AuthorizationView {
-            network_id: self.genesis.network_id.clone(),
-            epoch,
+        Ok(EpochView {
             heads: heads.into_iter().collect(),
-            members: members.into_values().collect(),
-            revoked: revoked
-                .into_iter()
-                .map(|(device_id, cutoff_seq)| Revocation {
-                    device_id,
-                    cutoff_seq,
-                })
-                .collect(),
+            members,
+            revoked,
+            granted_clients,
         })
     }
 }
@@ -662,24 +833,22 @@ impl NetworkState {
 /// Revocation wins over any grant; concurrent grants keep the narrower permission.
 fn project_members(
     base: &[Member],
+    retired: &[Revocation],
     events: &BTreeMap<String, ValidEvent>,
     basis: &BTreeSet<String>,
-) -> (BTreeMap<String, Member>, BTreeMap<String, u64>) {
+) -> (BTreeMap<String, Member>, BTreeMap<String, Revocation>) {
     let mut members: BTreeMap<String, Member> = base
         .iter()
         .map(|member| (member.device_id.clone(), member.clone()))
         .collect();
-    let mut revoked: BTreeMap<String, u64> = BTreeMap::new();
+    let mut revoked: BTreeMap<String, Revocation> = retired
+        .iter()
+        .map(|revocation| (revocation.device_id.clone(), revocation.clone()))
+        .collect();
     let mut candidates: BTreeMap<String, Vec<&String>> = BTreeMap::new();
     for hash in basis {
         match &events[hash].event.action {
-            GovernanceAction::Revoke {
-                device_id,
-                cutoff_seq,
-            } => {
-                let cutoff = revoked.entry(device_id.clone()).or_default();
-                *cutoff = (*cutoff).max(*cutoff_seq);
-            }
+            GovernanceAction::Revoke(revocation) => widen(&mut revoked, revocation),
             GovernanceAction::Grant { member } => {
                 candidates
                     .entry(member.device_id.clone())
@@ -838,12 +1007,15 @@ impl VerifiedMembership {
         })())
     }
 
-    /// Signs a checkpoint with an epoch above both this state and the backup's.
+    /// Signs a checkpoint with an epoch above both this state and the backup's. `heads_json` is
+    /// `{device: [seq, hash]}` from a Node's log; each current Node left out keeps what it wrote
+    /// up to there.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = createRecoveryCheckpoint))]
     pub fn create_recovery_checkpoint(
         &self,
         root: &Identity,
         members_json: &str,
+        heads_json: &str,
         backup_epoch: f64,
     ) -> crate::Result<String> {
         js((|| {
@@ -858,8 +1030,11 @@ impl VerifiedMembership {
                 "invalid backup recovery epoch"
             );
             let epoch = self.view.epoch.max(backup_epoch as u64) + 1;
-            let checkpoint =
-                RootCheckpoint::create(root, epoch, serde_json::from_str(members_json)?)?;
+            let members: Vec<Member> = serde_json::from_str(members_json)?;
+            let retired = self
+                .view
+                .retire(&members, &serde_json::from_str(heads_json)?)?;
+            let checkpoint = RootCheckpoint::create(root, epoch, members, retired)?;
             checkpoint.verify(&self.state.genesis)?;
             Ok(serde_json::to_string(&checkpoint)?)
         })())
@@ -888,6 +1063,16 @@ mod tests {
 
     fn id(identity: &Identity) -> String {
         identity.device_id()
+    }
+
+    fn hash(n: u64) -> String {
+        format!("{n:064x}")
+    }
+
+    fn cut(device: &Identity, seq: u64) -> Revocation {
+        let hash = hash(seq);
+        Revocation::new(&id(device), (seq > 0).then_some((seq, hash.as_str())))
+            .expect("valid test revocation")
     }
 
     #[test]
@@ -992,8 +1177,7 @@ mod tests {
         right.append(GovernanceEvent::revoke(
             &a,
             &right.project()?,
-            &id(&node),
-            7,
+            cut(&node, 7),
         )?)?;
         let mut merged = left.merge(&right)?;
         assert_eq!(merged.project()?, right.merge(&left)?.project()?);
@@ -1002,10 +1186,16 @@ mod tests {
         merged.append(GovernanceEvent::revoke(
             &a,
             &merged.project()?,
-            &id(&node),
-            3,
+            cut(&node, 3),
         )?)?;
         assert_eq!(merged.project()?.cutoff(&id(&node)), Some(7));
+        let same_seq = Revocation::new(&id(&node), Some((7, &"f".repeat(64))))?;
+        merged.append(GovernanceEvent::revoke(
+            &a,
+            &merged.project()?,
+            same_seq.clone(),
+        )?)?;
+        assert_eq!(merged.project()?.revocation(&id(&node)), Some(&same_seq));
         merged.append(GovernanceEvent::grant(
             &a,
             &merged.project()?,
@@ -1013,10 +1203,10 @@ mod tests {
         )?)?;
         assert!(merged.project()?.node(&id(&node)).is_err());
         // A manager may revoke another manager and itself; later events by them fail.
-        merged.append(GovernanceEvent::revoke(&b, &merged.project()?, &id(&a), 0)?)?;
+        merged.append(GovernanceEvent::revoke(&b, &merged.project()?, cut(&a, 0))?)?;
         let view = merged.project()?;
-        assert!(GovernanceEvent::revoke(&a, &view, &id(&b), 0).is_err());
-        merged.append(GovernanceEvent::revoke(&b, &view, &id(&b), 0)?)?;
+        assert!(GovernanceEvent::revoke(&a, &view, cut(&b, 0)).is_err());
+        merged.append(GovernanceEvent::revoke(&b, &view, cut(&b, 0))?)?;
         assert!(merged.project()?.members.iter().all(|m| !m.manage));
         Ok(())
     }
@@ -1079,7 +1269,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(RootCheckpoint::create(&root, 2, vec![Member::client(&root, "r", true)?]).is_err());
+        assert!(
+            RootCheckpoint::create(&root, 2, vec![Member::client(&root, "r", true)?], vec![])
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1092,33 +1285,50 @@ mod tests {
             Member::client(&recovered, "recovered", true)?,
             Member::node(&node, "node")?,
         ];
-        let checkpoint = RootCheckpoint::create(&root, 2, members.clone())?;
+        let checkpoint = RootCheckpoint::create(&root, 2, members.clone(), vec![])?;
         assert!(state.recover(checkpoint.clone())?);
         assert!(!state.recover(checkpoint)?);
         assert!(state.project()?.manager(&id(&recovered)).is_ok());
         assert!(state.project()?.client(&id(&a)).is_err());
-        assert!(state.merge(&original).is_err());
+        assert_eq!(state.merge(&original)?, state);
         assert_eq!(original.merge(&state)?, state);
         let mut conflict = original.clone();
         conflict.recover(RootCheckpoint::create(
             &root,
             2,
             vec![Member::client(&a, "conflicting", true)?],
+            vec![],
         )?)?;
         assert!(state.merge(&conflict).is_err());
         assert!(
             state
-                .recover(RootCheckpoint::create(&identity(), 3, members.clone())?)
+                .recover(RootCheckpoint::create(
+                    &identity(),
+                    3,
+                    members.clone(),
+                    vec![]
+                )?)
                 .is_err()
         );
-        assert!(RootCheckpoint::create(&root, 3, vec![Member::node(&node, "n")?]).is_err());
+        assert!(RootCheckpoint::create(&root, 3, vec![Member::node(&node, "n")?], vec![]).is_err());
+        assert!(
+            RootCheckpoint::create(&root, 3, members.clone(), vec![cut(&node, 2)]).is_err(),
+            "a retired device cannot stay a member"
+        );
+        let mut renamed = members;
+        renamed[0].name = "renamed".into();
+        assert!(
+            state
+                .recover(RootCheckpoint::create(&root, 2, renamed, vec![])?)
+                .is_err()
+        );
         Ok(())
     }
 
     #[test]
     fn missing_parents_wrong_epoch_and_tampering_fail_closed() -> Result<()> {
         let (_, a, node, mut state) = setup()?;
-        let valid = GovernanceEvent::revoke(&a, &state.project()?, &id(&node), 1)?;
+        let valid = GovernanceEvent::revoke(&a, &state.project()?, cut(&node, 1))?;
         let mut missing = valid.clone();
         missing.parents = vec!["0".repeat(64)];
         assert!(state.append(missing.sign(&a)?).is_err());
@@ -1126,10 +1336,7 @@ mod tests {
         epoch.epoch += 1;
         assert!(state.append(epoch.sign(&a)?).is_err());
         let mut tampered = valid.clone();
-        tampered.action = GovernanceAction::Revoke {
-            device_id: id(&a),
-            cutoff_seq: 1,
-        };
+        tampered.action = GovernanceAction::Revoke(cut(&a, 1));
         assert!(state.append(tampered).is_err());
         let mut changed = state.genesis.clone();
         changed.first_client.name = "other".into();
@@ -1160,7 +1367,18 @@ mod tests {
         forged.genesis.signature = "00".repeat(64);
         assert!(verify_membership(&serde_json::to_string(&forged)?, &id(&root)).is_err());
 
-        let action = serde_json::json!({"type":"revoke","device_id":id(&node),"cutoff_seq":4});
+        let action = serde_json::json!({"type":"revoke","device_id":id(&node),
+            "cutoff_seq":4,"cutoff_hash":hash(4)});
+        assert_eq!(
+            serde_json::to_value(GovernanceAction::Revoke(cut(&node, 4)))?,
+            action
+        );
+        let unhashed = serde_json::json!({"type":"revoke","device_id":id(&node),"cutoff_seq":4});
+        assert!(
+            verified
+                .governance_template(&id(&a), &unhashed.to_string())
+                .is_err()
+        );
         let template = verified.governance_template(&id(&a), &action.to_string())?;
         assert!(
             verified
@@ -1176,18 +1394,23 @@ mod tests {
         assert_eq!(next.project()?.cutoff(&id(&node)), Some(4));
 
         let members = serde_json::to_string(&vec![Member::client(&a, "a", true)?])?;
-        let signed = verified.create_recovery_checkpoint(&root, &members, 4.0)?;
+        let heads = serde_json::json!({ id(&node): [9, hash(9)] }).to_string();
+        let signed = verified.create_recovery_checkpoint(&root, &members, &heads, 4.0)?;
         let checkpoint: RootCheckpoint = serde_json::from_str(&signed)?;
         checkpoint.verify(&state.genesis)?;
         assert_eq!(checkpoint.epoch, 5);
+        assert_eq!(checkpoint.retired, vec![cut(&node, 9)]);
+        let signed = verified.create_recovery_checkpoint(&root, &members, "{}", 4.0)?;
+        let checkpoint: RootCheckpoint = serde_json::from_str(&signed)?;
+        assert_eq!(checkpoint.retired, vec![cut(&node, 0)]);
         assert!(
             verified
-                .create_recovery_checkpoint(&a, &members, 4.0)
+                .create_recovery_checkpoint(&a, &members, &heads, 4.0)
                 .is_err()
         );
         assert!(
             verified
-                .create_recovery_checkpoint(&root, &members, 4.5)
+                .create_recovery_checkpoint(&root, &members, &heads, 4.5)
                 .is_err()
         );
         let genesis = create_genesis(
@@ -1196,6 +1419,142 @@ mod tests {
             &serde_json::to_string(&Member::node(&node, "n")?)?,
         )?;
         serde_json::from_str::<Genesis>(&genesis)?.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn merge_is_a_union_in_any_order() -> Result<()> {
+        let (root, a, node, base) = setup()?;
+        let b = identity();
+        let c = identity();
+        let mut granted = base.clone();
+        granted.append(GovernanceEvent::grant(
+            &a,
+            &granted.project()?,
+            Member::client(&b, "b", true)?,
+        )?)?;
+        let mut revoked = base.clone();
+        revoked.append(GovernanceEvent::revoke(
+            &a,
+            &revoked.project()?,
+            cut(&node, 2),
+        )?)?;
+        let mut recovered = base.clone();
+        recovered.recover(RootCheckpoint::create(
+            &root,
+            2,
+            vec![Member::client(&a, "a", true)?, Member::node(&node, "node")?],
+            vec![],
+        )?)?;
+        recovered.append(GovernanceEvent::grant(
+            &a,
+            &recovered.project()?,
+            Member::client(&c, "c", false)?,
+        )?)?;
+        let parts = [&base, &granted, &revoked, &recovered];
+        let mut results = Vec::new();
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1], [1, 3, 0, 2]] {
+            let mut state = parts[order[0]].clone();
+            for index in &order[1..] {
+                state = state.merge(parts[*index])?;
+            }
+            assert_eq!(state.merge(&state)?, state);
+            results.push(state);
+        }
+        assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+        let state = &results[0];
+        assert_eq!(state.epoch(), 2);
+        assert_eq!(state.events.len(), 3);
+        let view = state.project()?;
+        // The racing epoch-1 grant and revoke stay history; epoch 2 starts from the checkpoint.
+        assert!(view.client(&id(&b)).is_err() && view.attester(&id(&b)));
+        assert_eq!(view.write_bound(&id(&node)), Some(WriteBound::Unlimited));
+        assert!(view.client(&id(&c)).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_keeps_history_retires_left_out_nodes_and_old_events_cannot_widen() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let b = identity();
+        let kept = identity();
+        let left = identity();
+        let gone = identity();
+        for member in [
+            Member::client(&b, "b", false)?,
+            Member::node(&kept, "kept")?,
+            Member::node(&left, "left")?,
+            Member::node(&gone, "gone")?,
+        ] {
+            state.append(GovernanceEvent::grant(&a, &state.project()?, member)?)?;
+        }
+        state.append(GovernanceEvent::revoke(
+            &a,
+            &state.project()?,
+            cut(&gone, 3),
+        )?)?;
+        let epoch_one = state.clone();
+        let recovered = identity();
+        let members = vec![
+            Member::client(&recovered, "recovered", true)?,
+            Member::node(&kept, "kept")?,
+        ];
+        let heads = serde_json::json!({ id(&left): [5, hash(5)], id(&kept): [8, hash(8)] });
+        let verified = verify_membership(&serde_json::to_string(&state)?, &id(&root))?;
+        let checkpoint: RootCheckpoint =
+            serde_json::from_str(&verified.create_recovery_checkpoint(
+                &root,
+                &serde_json::to_string(&members)?,
+                &heads.to_string(),
+                1.0,
+            )?)?;
+        assert_eq!(checkpoint.retired, {
+            let mut retired = vec![cut(&gone, 3), cut(&left, 5), cut(&node, 0)];
+            retired.sort_by(|x, y| x.device_id.cmp(&y.device_id));
+            retired
+        });
+        state.recover(checkpoint)?;
+        assert_eq!(state.events.len(), 5);
+        assert_eq!(state.checkpoints.len(), 1);
+        let view = state.project()?;
+        assert_eq!(view.epoch, 2);
+        assert_eq!(view.write_bound(&id(&kept)), Some(WriteBound::Unlimited));
+        assert_eq!(
+            view.write_bound(&id(&left)),
+            Some(WriteBound::Cutoff(&cut(&left, 5)))
+        );
+        assert_eq!(
+            view.write_bound(&id(&gone)),
+            Some(WriteBound::Cutoff(&cut(&gone, 3)))
+        );
+        assert_eq!(view.write_bound(&id(&identity())), None);
+        for client in [&a, &b, &recovered] {
+            assert!(view.attester(&id(client)));
+        }
+        assert!(!view.attester(&id(&kept)));
+        assert!(view.client(&id(&a)).is_err());
+
+        // A retired Node granted again in the new epoch stays bounded.
+        state.append(GovernanceEvent::grant(
+            &recovered,
+            &view,
+            Member::node(&left, "back")?,
+        )?)?;
+        assert!(state.project()?.node(&id(&left)).is_err());
+
+        // An old manager can still sign epoch-1 history, but it no longer moves current bounds.
+        let mut late = epoch_one.clone();
+        late.append(GovernanceEvent::revoke(
+            &a,
+            &late.project()?,
+            cut(&left, 9),
+        )?)?;
+        let merged = state.merge(&late)?;
+        assert_eq!(merged, late.merge(&state)?);
+        assert_eq!(
+            merged.project()?.revocation(&id(&left)),
+            Some(&cut(&left, 5))
+        );
         Ok(())
     }
 }

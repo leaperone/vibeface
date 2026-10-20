@@ -37,13 +37,12 @@ pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    for member in bundle.genesis.members().iter().chain(
-        bundle
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.members.as_slice())
-            .unwrap_or(&[]),
-    ) {
+    for member in bundle
+        .genesis
+        .members()
+        .iter()
+        .chain(bundle.checkpoints.iter().flat_map(|c| &c.members))
+    {
         if member.kind == IdentityKind::Node {
             names.insert(member.device_id.clone(), member.name.clone());
         }
@@ -62,7 +61,7 @@ fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
 mod node_display_names_tests {
     use super::node_display_names;
     use crate::crypto::LocalIdentity;
-    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState};
+    use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, Revocation};
     use anyhow::Result;
 
     #[test]
@@ -84,8 +83,7 @@ mod node_display_names_tests {
         state.append(GovernanceEvent::revoke(
             &admin,
             &state.project()?,
-            &node.device_id()?,
-            0,
+            Revocation::new(&node.device_id()?, None)?,
         )?)?;
         let names = node_display_names(&state);
         assert_eq!(

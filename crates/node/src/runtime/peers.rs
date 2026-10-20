@@ -80,16 +80,9 @@ impl iroh_relay::server::AccessControl for RelayAccess {
     }
 }
 
+/// Merged states are canonical, so equal histories encode equally.
 fn membership_digest(state: &NetworkState) -> Result<String> {
-    let mut hashes = state
-        .events
-        .iter()
-        .map(|event| event.hash())
-        .collect::<Result<Vec<_>>>()?;
-    hashes.sort();
-    Ok(crate::crypto::digest(
-        serde_json::to_string(&(state.epoch(), &state.checkpoint, hashes))?.as_bytes(),
-    ))
+    Ok(crate::crypto::digest(&serde_json::to_vec(state)?))
 }
 
 impl Runtime {

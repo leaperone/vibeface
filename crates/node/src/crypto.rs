@@ -163,7 +163,7 @@ impl LocalIdentity {
         let epoch = revision
             .checked_add(1)
             .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create(&root, epoch, members)?)?;
+        state.recover(RootCheckpoint::create(&root, epoch, members, vec![])?)?;
         Ok(state)
     }
 }
