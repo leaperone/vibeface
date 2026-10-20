@@ -398,7 +398,12 @@ impl Runtime {
             return Ok(());
         }
         let over = record.send_window_over(now_ms());
-        if !now && !over {
+        // A bound turn is read any time; only an unsent work waits for the Agent's window.
+        let unsent = matches!(
+            record.state,
+            WorkState::Accepted | WorkState::Starting { .. }
+        );
+        if !now && !over && unsent {
             return Ok(());
         }
         let epoch = self.codex_epoch();
