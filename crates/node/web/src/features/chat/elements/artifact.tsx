@@ -1,10 +1,12 @@
+import { Paperclip } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { useWorkspace } from '@/features/workspace/context'
 import { ActionButton } from '@/features/workspace/present'
 
-export function Artifact({ hash, size }: { hash: string; size: number }) {
+/** A long result, or a file the user attached (`attachment`). */
+export function Artifact({ hash, size, attachment = false }: { hash: string; size: number; attachment?: boolean }) {
   const workspace = useWorkspace()
   const [content, setContent] = useState('')
   const [nextOffset, setNextOffset] = useState<number | null>(0)
@@ -31,8 +33,8 @@ export function Artifact({ hash, size }: { hash: string; size: number }) {
   return <Card className="w-full min-w-0 gap-0 py-0">
     <CardContent className="space-y-3 p-3">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="mr-auto text-sm">完整结果 · {size.toLocaleString()} 字节</span>
-        {!opened ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) })}>打开结果</ActionButton> : <Button type="button" variant="ghost" onClick={() => setOpened(false)}>收起结果</Button>}
+        <span className="mr-auto flex items-center gap-1.5 text-sm">{attachment ? <Paperclip aria-hidden="true" className="size-4" /> : null}{attachment ? '附件' : '完整结果'} · {size.toLocaleString()} 字节</span>
+        {!opened ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) })}>{attachment ? '打开' : '打开结果'}</ActionButton> : <Button type="button" variant="ghost" onClick={() => setOpened(false)}>收起结果</Button>}
         <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(async () => {
           const parts: string[] = []
           let offset: number | null = 0

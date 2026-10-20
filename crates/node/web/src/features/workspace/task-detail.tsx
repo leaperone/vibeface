@@ -61,7 +61,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
         </p>)}
       </section> : null}
       {stop ? <div className="grid gap-2">
-        <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop)}><Square aria-hidden="true" />停止任务</Button>
+        <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop)}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "停止任务"}</Button>
         <InlineError error={action.error} />
       </div> : null}
       <Details>

@@ -508,7 +508,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      setNoticeText(receipt.waiting_for_device === true ? "已请求，等待设备确认。" : "已请求停止任务。")
+      setNoticeText(receipt.waiting_for_device === true ? "已请求、等待设备确认。" : "已请求停止任务。")
       if (activeId.current === id) await refreshRef.current()
     }),
     answerApproval: (workId: string, requestId: string, response: unknown) => withMutation(`work-control:${workId}`, async () => {

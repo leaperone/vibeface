@@ -14,7 +14,7 @@ export function Message({ message }: { message: ChatMessage }) {
   if (user) return <div className="flex justify-end" data-message-id={messageKey(message)}>
     <div className="grid min-w-0 max-w-[85%] gap-2">
       <div className="min-w-0 rounded-2xl bg-muted px-4 py-2.5 [overflow-wrap:anywhere]"><span className="sr-only">你：</span><PlainText text={message.text} />{time}</div>
-      {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
+      {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} attachment />)}
     </div>
   </div>
   return <div className="grid min-w-0 gap-2" data-message-id={messageKey(message)}>
