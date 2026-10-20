@@ -122,6 +122,15 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
     let listener = TcpListener::bind(node.config.listen).await?;
+    if node.config.public_entry {
+        return axum::serve(
+            listener,
+            browser_router(node.clone(), sites, false)
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(Into::into);
+    }
     let local_listen = node.config.local_listen;
     let local_listener = TcpListener::bind(local_listen).await.with_context(|| {
         format!(
@@ -556,6 +565,12 @@ async fn local_setup(
     headers: HeaderMap,
     Json(_): Json<LocalSetupRequest>,
 ) -> ApiResult<Json<LocalSetup>> {
+    if app.node.config.public_entry {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "a public entry has no local setup".into(),
+        ));
+    }
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
     let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     if app.node.has_membership().await.map_err(ApiError::bad)? {

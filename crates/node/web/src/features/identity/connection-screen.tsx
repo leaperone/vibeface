@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, ShieldAlert, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, QrCode, ShieldAlert, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -42,8 +42,23 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   return <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 }
 
+/** A public entry only forwards to people's own devices, so its page only opens join links. */
+function usePublicEntry() {
+  const [publicEntry, setPublicEntry] = useState(false)
+  useEffect(() => {
+    let live = true
+    if (typeof fetch === 'function') fetch('/api/info', { cache: 'no-store', credentials: 'omit' })
+      .then(response => response.ok ? response.json() : null)
+      .then(info => { if (live) setPublicEntry(info?.public_entry === true) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [])
+  return publicEntry
+}
+
 export function ConnectionScreen() {
   const device = useDevice()
+  const publicEntry = usePublicEntry()
   const generation = device.connectionGeneration()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
@@ -119,7 +134,7 @@ export function ConnectionScreen() {
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
-  else body = <Panel icon={Link2} title="加入我的设备">
+  else body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '打开加入链接' : '加入我的设备'}>
     <form className="grid gap-4" onSubmit={submitInvitation}>
       <fieldset disabled={linking || !usable} className="grid gap-4">
         {purpose === 'empty' || purpose === 'invalid' ? <>
@@ -134,7 +149,9 @@ export function ConnectionScreen() {
         <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button>
       </fieldset>
     </form>
-    <p className="text-meta text-muted-foreground">加入一台电脑：在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p>
+    {publicEntry
+      ? <p className="text-meta text-muted-foreground">在已加入的设备上点“添加设备”，用手机相机扫二维码，或把链接粘贴到这里。</p>
+      : <p className="text-meta text-muted-foreground">加入一台电脑：在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p>}
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">

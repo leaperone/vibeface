@@ -292,7 +292,7 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     };
     let Connect::Connect { target } =
         serde_json::from_str(&text).context("invalid connect frame")?;
-    if target == node.identity.device_id()? {
+    if target == node.identity.device_id()? && !node.config.public_entry {
         return serve_session(node, socket, None).await;
     }
     let forwarded = match open_forward(&node, &target).await {
@@ -310,11 +310,28 @@ async fn open_forward(
     node: &Runtime,
     target: &str,
 ) -> std::result::Result<ClientSocket, (&'static str, anyhow::Error)> {
-    let member = async {
-        let network = node.membership_state().await?.genesis.network_id;
-        node.store.lock().await.authorize_node(&network, target)
-    };
-    member.await.map_err(|error| ("target_not_member", error))?;
+    if node.config.public_entry {
+        // It holds no address book: the target must be on this entry's relay, which only
+        // token holders reach.
+        let reach = async {
+            let relay = node
+                .config
+                .network
+                .own_relay()?
+                .context("a public entry runs a relay")?;
+            let addr =
+                EndpointAddr::from_parts(net::endpoint_id(target)?, [TransportAddr::Relay(relay)]);
+            node.net()?.learn(&addr).await;
+            Ok::<_, anyhow::Error>(())
+        };
+        reach.await.map_err(|error| ("target_unreachable", error))?;
+    } else {
+        let member = async {
+            let network = node.membership_state().await?.genesis.network_id;
+            node.store.lock().await.authorize_node(&network, target)
+        };
+        member.await.map_err(|error| ("target_not_member", error))?;
+    }
     let opened = async {
         let connection = node.net()?.connect(target, net::CLIENT).await?;
         let (send, recv) = connection
@@ -993,7 +1010,15 @@ impl JoinLink {
             .entry
             .relay_url
             .iter()
-            .map(|url| Ok((net::relay_url(url)?, Some(token.clone()))))
+            .map(|url| {
+                let url = net::relay_url(url)?;
+                // A public entry's relay knows no invites; it admits its operator token.
+                let token = match (&node.config.network.entry, &node.entry_token) {
+                    (Some(entry), Some(own)) if net::relay_url(&entry.relay)? == url => own.clone(),
+                    _ => token.clone(),
+                };
+                Ok((url, Some(token)))
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut addrs: Vec<TransportAddr> = relays
             .iter()

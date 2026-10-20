@@ -51,12 +51,62 @@ pub struct NetworkConfig {
     /// The relay's URL as other Nodes reach it; defaults to `http://<relay_listen>`.
     #[serde(default)]
     pub relay_url: Option<String>,
+    /// A public entry outside the personal network that browsers come through. Its operator
+    /// token is the data directory's `entry-token` file.
+    #[serde(default)]
+    pub entry: Option<PublicEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicEntry {
+    /// Web origin browsers open; this Node's signed address names it as its Gateway.
+    pub url: String,
+    /// The entry's relay; the same origin when a reverse proxy routes `/relay` to it.
+    pub relay: String,
+}
+
+/// File holding the operator token of a public entry's relay, on the entry and on its Nodes.
+pub const ENTRY_TOKEN_FILE: &str = "entry-token";
+
+pub fn read_token_file(path: &std::path::Path) -> Result<String> {
+    let token =
+        std::fs::read_to_string(path).context("the public entry token file is unreadable")?;
+    let token = token.trim();
+    ensure!(
+        token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the public entry token file is invalid"
+    );
+    Ok(token.to_owned())
+}
+
+/// Compares in time independent of where the inputs differ.
+pub fn same_token(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.relays.len() <= MAX_RELAYS, "too many relays");
         for url in self.relays.iter().chain(&self.relay_url) {
             relay_url(url)?;
+        }
+        if let Some(entry) = &self.entry {
+            relay_url(&entry.relay)?;
+            let url = reqwest::Url::parse(&entry.url).context("invalid public entry URL")?;
+            ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                "the public entry URL must be an HTTP(S) origin"
+            );
         }
         ensure!(
             self.relay_url.is_none() || self.relay_listen.is_some(),

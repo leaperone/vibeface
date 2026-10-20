@@ -50,7 +50,8 @@ impl ProtocolHandler for Inbound {
     }
 }
 
-/// The personal network's relay admits member Nodes and joiners holding an open invite.
+/// A member Node's relay admits member Nodes and joiners holding an open invite; a public
+/// entry's relay admits Nodes holding its operator token.
 #[derive(Clone)]
 struct RelayAccess(Weak<Runtime>);
 impl std::fmt::Debug for RelayAccess {
@@ -70,9 +71,9 @@ impl iroh_relay::server::AccessControl for RelayAccess {
         if allowed {
             iroh_relay::server::Access::Allow
         } else {
-            tracing::debug!(endpoint = %request.endpoint_id().fmt_short(), "relay refused a non-member");
+            tracing::debug!(endpoint = %request.endpoint_id().fmt_short(), "relay refused an endpoint");
             iroh_relay::server::Access::Deny {
-                reason: Some("not a member of this personal network".into()),
+                reason: Some("not allowed on this relay".into()),
             }
         }
     }
@@ -96,12 +97,18 @@ impl Runtime {
     }
 
     pub(super) async fn start_network(self: &Arc<Self>) -> Result<()> {
+        let relays = match (&self.config.network.entry, &self.entry_token) {
+            (Some(entry), Some(token)) => {
+                vec![(net::relay_url(&entry.relay)?, Some(token.clone()))]
+            }
+            _ => vec![],
+        };
         let net = Arc::new(
             Net::bind(
                 &self.identity.secret_key_hex,
                 &self.config.network,
                 self.config.listen.port(),
-                vec![],
+                relays,
             )
             .await?,
         );
@@ -120,8 +127,11 @@ impl Runtime {
         *self.router.lock().await = Some(router.spawn());
         if let Some(listen) = self.config.network.relay_listen {
             let relay = net::spawn_relay(listen, Arc::new(RelayAccess(weak))).await?;
-            tracing::info!(%listen, "personal network relay started");
+            tracing::info!(%listen, "relay started");
             *self.relay.lock().await = Some(relay);
+        }
+        if self.config.public_entry {
+            return Ok(());
         }
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
@@ -154,6 +164,13 @@ impl Runtime {
 
     async fn relay_allows(&self, request: &iroh_relay::server::ClientRequest) -> bool {
         let device = net::device_id(&request.endpoint_id());
+        if self.config.public_entry {
+            return self.identity.device_id().is_ok_and(|own| own == device)
+                || request
+                    .auth_token()
+                    .zip(self.entry_token.as_deref())
+                    .is_some_and(|(token, own)| net::same_token(&token, own));
+        }
         if self.member_node(&device).await.is_ok() {
             return true;
         }
@@ -181,8 +198,16 @@ impl Runtime {
         connection: Connection,
     ) -> Result<()> {
         let remote = net::device_id(&connection.remote_id());
+        if self.config.public_entry {
+            connection.close(1u32.into(), b"a public entry accepts no connections");
+            bail!("a public entry accepts no connections");
+        }
         if alpn == net::JOIN {
             return crate::client::serve_join(self, connection, remote).await;
+        }
+        // Any device may forward a client session: it ends here, and Noise proves the browser.
+        if alpn == net::CLIENT {
+            return crate::client::serve_forwarded(self, connection).await;
         }
         let network = match self.member_node(&remote).await {
             Ok(network) => network,
@@ -192,9 +217,6 @@ impl Runtime {
                 return Err(error);
             }
         };
-        if alpn == net::CLIENT {
-            return crate::client::serve_forwarded(self, connection).await;
-        }
         if alpn == net::BLOB {
             self.serve_blobs(connection, network, remote).await;
             return Ok(());
@@ -789,11 +811,14 @@ impl Runtime {
         let net = self.net()?;
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
-        let gateway_url = self
-            .config
-            .roles
-            .contains(&NodeRole::Gateway)
-            .then(|| self.config.public_url.clone());
+        let gateway_url = match &self.config.network.entry {
+            Some(entry) => Some(entry.url.clone()),
+            None => self
+                .config
+                .roles
+                .contains(&NodeRole::Gateway)
+                .then(|| self.config.public_url.clone()),
+        };
         let mut store = self.store.lock().await;
         let previous = store
             .address_book(network)?

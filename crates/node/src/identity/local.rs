@@ -536,7 +536,7 @@ fn now_ms() -> i64 {
         .as_millis()
         .min(i64::MAX as u128) as i64
 }
-pub(crate) fn random_hex(bytes: usize) -> String {
+pub fn random_hex(bytes: usize) -> String {
     let mut data = vec![0_u8; bytes];
     OsRng.fill_bytes(&mut data);
     hex::encode(data)

@@ -390,7 +390,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (entryId !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
     const route = connection.info.connection_entry ?? connection.entry
     // Any member Gateway forwards the join to this Node, so a public entrance beats the address in use.
-    const reachable = loadEntrances(connection.principal.network_id).filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0]
+    // The entry Node's own record names the public entry it is reached through, if it has one.
+    const known = loadEntrances(connection.principal.network_id)
+    const reachable = known.filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0] ?? known.find(item => item.device_id === entryId)
     const origin = reachable?.gateway_url ?? (route.device_id === entryId ? route.address : connection.entry.address)
     const entry = result.entry && typeof result.entry === 'object' ? record(result.entry) : {}
     const relay = typeof entry.relay_url === 'string' ? entry.relay_url : undefined

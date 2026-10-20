@@ -457,12 +457,12 @@ class Client:
                              action={"type": "revoke", "device_id": device_id, "cutoff_seq": cutoff_seq})
         return self.call("revoke", {"event": event})
 
-    def join(self, owner, name, *, manage=False, reveal=None):
+    def join(self, owner, name, *, manage=False, reveal=None, via=None):
         """Joins through a ticket from `owner` (a Node or a managing Client); approval follows matching short codes."""
         owner = getattr(owner, "client", owner)
         link = owner.invite()
         ticket = self.command("ticket", ticket=link.split("#", 1)[1])
-        self.url = link.split("/join#", 1)[0]
+        self.url = via or link.split("/join#", 1)[0]
         self.connect(ticket["entry_id"])
         me = self.own_id()
         nonce = uuid.uuid4().hex + uuid.uuid4().hex
@@ -495,7 +495,7 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, fixture, helper, module):
+    def __init__(self, run, name, binary, workspace, fixture, helper, module, *, init_args=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
@@ -509,7 +509,7 @@ class Node:
             result = subprocess.run(
                 [str(binary), "init", "--data-dir", str(self.directory),
                  "--listen", f"127.0.0.1:{self.port}", "--local-listen", f"127.0.0.1:{self.local_port}",
-                 "--root", str(workspace)],
+                 *(init_args if init_args is not None else ["--root", str(workspace)])],
                 capture_output=True, timeout=45)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
@@ -984,10 +984,13 @@ def fixture_manager(arguments):
              rejection=action.get("rejection", "read-only"))
     sequence = 0
     gate = directive.get("gate")
+    # Screens show these replies, so only an explicit test label is echoed back.
+    explicit = directive.get("label")
+    spoken = "已看过任务结果" if autonomous else "收到，已处理"
     while True:
         sequence += 1
         emit({"type": "event", "event": {"type": "item.updated", "item": {
-            "id": "fixture-text", "type": "agent_message", "text": label + ":" + str(sequence)}}})
+            "id": "fixture-text", "type": "agent_message", "text": f"{explicit}:{sequence}" if explicit else spoken}}})
         if not gate or Path(gate).exists():
             break
         if select.select([sys.stdin], [], [], 0.2)[0]:
@@ -1000,7 +1003,7 @@ def fixture_manager(arguments):
                           "confirmation": "managed_processes_exited"})
                 return
     emit({"type": "result", "session_id": native,
-          "final_response": "x" * directive.get("result_size", 0) or label + ":complete"})
+          "final_response": "x" * directive.get("result_size", 0) or (f"{explicit}:complete" if explicit else spoken + "。")})
 
 
 def javascript_dependencies(content):
@@ -2378,6 +2381,129 @@ def phase4_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
+def public_entry_acceptance(options):
+    """A public entry P that is no member: web, relay and forwarding only. M is the only member Node and
+    is reachable only through P's relay; a browser opens P's origin, joins M and chats with it."""
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("public-entry-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    nodes, clients = [], []
+    report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
+              "coverage": "public entry P (not a member) with its relay; member M on relay paths only; "
+                          "Node X holding a wrong relay token; WASM browser client on P's origin",
+              "not_checked": ["real NAT and TLS reverse proxy (loopback ports stand in for nginx paths)",
+                              "rendered browser UI (see the browser screenshots)"]}
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS " + name, flush=True)
+
+    def entry_rows(path):
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            return {table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                    for table in ("networks", "events", "conversations", "log_heads")}
+
+    try:
+        relay_port = available_port()
+        relay_url = f"http://127.0.0.1:{relay_port}"
+        p = Node(run, "P", binary, workspace, None, helper, module,
+                 init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}"])
+        nodes.append(p)
+        token = p.directory / "entry-token"
+        require(token.stat().st_mode & 0o077 == 0 and len(token.read_text().strip()) == 64,
+                "the public entry keeps a private operator token")
+        require(not (p.directory / "bootstrap.json").exists(), "a public entry has no network setup capability")
+        wrong = run / "wrong-token"
+        wrong.write_text(uuid.uuid4().hex + uuid.uuid4().hex)
+        wrong.chmod(0o600)
+        fixture = run / "fixture-M"
+        fixture.mkdir(mode=0o700)
+        m = Node(run, "M", binary, workspace, None, helper, module, init_args=[
+            "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(token)])
+        x = Node(run, "X", binary, workspace, None, helper, module, init_args=[
+            "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(wrong)])
+        nodes += [m, x]
+        for node in (m, x):
+            node.configure_network(relay_paths_only=True)
+        m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
+                    codex_bin=str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex")))
+        for node in nodes:
+            node.start()
+        info = p.client.request("/api/info")
+        require(info["public_entry"] is True, "the entry says it is a public entry")
+        p.client.request("/api/local/setup", {}, status=404)
+        passed("public-entry-starts-without-a-network", device=p.device_id, relay=relay_url)
+
+        network = m.bootstrap()
+        x.bootstrap()
+        m.client.call("subscribe")
+        listed = wait_for("M advertises the public entry as its Gateway", lambda: next(
+            (row for row in m.client.call("entrances")["entrances"]
+             if json.loads(row["payload"])["device_id"] == m.device_id
+             and json.loads(row["payload"]).get("gateway_url") == p.url), None), timeout=60)
+        require(listed, "M's signed address names P")
+        passed("member-names-the-public-entry", gateway_url=p.url)
+
+        phone = Client(p.url, helper, module, identity_file=run / "phone-identity.json")
+        clients.append(phone)
+        started = time.monotonic()
+        phone.join(m.client, "phone", via=p.url)
+        require(phone.url == p.url, "the phone joined through P's origin")
+        passed("browser-joins-the-member-through-the-public-entry", elapsed_ms=round((time.monotonic() - started) * 1000))
+
+        conversation = "public-entry-chat"
+        phone.rpc("create_conversation", conversation_id=conversation, title="经公共入口")
+        phone.rpc("message", conversation_id=conversation, message_id="pe-1", text="你好")
+        wait_for("M answers the phone", lambda: any(row["role"] == "assistant" for row in
+                 phone.rpc("conversation", conversation_id=conversation)["messages"]), timeout=60)
+        passed("browser-chats-through-the-public-entry")
+
+        phone.close()
+        p.stop()
+        p.start()
+        wait_for("the phone reconnects through the restarted entry", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
+        phone.authenticate(network)
+        phone.rpc("message", conversation_id=conversation, message_id="pe-2", text="又来了")
+        wait_for("M answers after the reconnect", lambda: sum(row["role"] == "assistant" for row in
+                 phone.rpc("conversation", conversation_id=conversation)["messages"]) >= 2, timeout=60)
+        passed("browser-reconnects-after-the-entry-restarts")
+
+        refused = Client(p.url, helper, module, identity_file=run / "outsider-identity.json")
+        clients.append(refused)
+        outcome = refused.connect(x.device_id, check=False)
+        require(not outcome.get("ok"), "P cannot reach a Node whose relay token is wrong")
+        direct = Client(x.url, helper, module, identity_file=run / "outsider-identity.json")
+        clients.append(direct)
+        require(direct.connect(x.device_id, check=False).get("ok"), "X itself is running")
+        passed("relay-refuses-a-wrong-token", error=str(outcome.get("error", ""))[:200])
+
+        rows = entry_rows(p.directory / "node.sqlite3")
+        require(all(count == 0 for count in rows.values()), "P stores no events, conversations or logs")
+        require(not any((p.directory / "blobs").rglob("*")) if (p.directory / "blobs").exists() else True,
+                "P stores no attachments")
+        passed("public-entry-stores-nothing", **rows)
+        report["status"] = "passed"
+    except BaseException as error:
+        report["status"] = "failed"
+        report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        for client in reversed(clients):
+            client.close()
+        for node in reversed(nodes):
+            node.client.close()
+            node.stop()
+        stop_fixture_processes(run / "fixture-M") if (run / "fixture-M").exists() else None
+        private_json(run / "report.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+
+
 def upgrade_status(node, path, origin):
     """The status of a WebSocket upgrade to `path` sent as a page on `origin` would send it."""
     connection = http.client.HTTPConnection("127.0.0.1", node.port, timeout=5)
@@ -2600,9 +2726,12 @@ if __name__ == "__main__":
         modes.add_argument("--chat-agent", action="store_true", help="run Agent delegation, host effects, cancellation and native observation process checks")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
+        modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards to a member Node through its relay")
         arguments = parser.parse_args()
         try:
-            if arguments.phase4:
+            if arguments.public_entry:
+                public_entry_acceptance(arguments)
+            elif arguments.phase4:
                 phase4_acceptance(arguments)
             elif arguments.auto_route:
                 auto_route_acceptance(arguments)

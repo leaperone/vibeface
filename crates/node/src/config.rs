@@ -38,6 +38,8 @@ pub struct Config {
     pub allow_insecure_lan: bool,
     pub local_auto_access: bool,
     pub roles: Vec<NodeRole>,
+    /// Serves only the web app, the relay and ciphertext forwarding; never joins a network.
+    pub public_entry: bool,
     pub roots: Vec<PathBuf>,
     pub network: crate::net::NetworkConfig,
     pub manager: Option<ManagerSettings>,
@@ -71,6 +73,7 @@ impl Config {
                 NodeRole::Replica,
                 NodeRole::Scheduler,
             ],
+            public_entry: false,
             roots,
             network: crate::net::NetworkConfig::default(),
             manager: None,
@@ -115,6 +118,15 @@ impl Config {
             ensure!(
                 root.is_absolute() && root.is_dir(),
                 "project root must be an existing absolute directory"
+            );
+        }
+        if self.public_entry {
+            ensure!(
+                self.network.relay_listen.is_some()
+                    && self.network.entry.is_none()
+                    && self.manager.is_none()
+                    && self.roots.is_empty(),
+                "a public entry runs a relay and nothing else"
             );
         }
         if let Some(m) = &self.manager {

@@ -136,6 +136,8 @@ pub struct Runtime {
     executor_epoch: std::sync::atomic::AtomicU64,
     progress_sequence: std::sync::atomic::AtomicU64,
     pub local_access: Arc<crate::local_access::LocalAccess>,
+    /// Operator token of the public entry's relay: this entry's own, or the one it serves.
+    pub(crate) entry_token: Option<String>,
     _process_lock: Arc<std::fs::File>,
     executor_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
@@ -186,6 +188,9 @@ impl Runtime {
             "this Node requires an initialized data epoch 6 directory"
         );
         let config = Config::load(dir)?;
+        let entry_token = (config.public_entry || config.network.entry.is_some())
+            .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
+            .transpose()?;
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
@@ -235,6 +240,7 @@ impl Runtime {
             executor_epoch: std::sync::atomic::AtomicU64::new(0),
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             local_access,
+            entry_token,
             _process_lock: process_lock,
             executor_rx: Mutex::new(Some(rx)),
         };
@@ -268,7 +274,7 @@ impl Runtime {
     pub fn info(&self) -> Value {
         let manager_available = self.config.roles.contains(&NodeRole::Scheduler)
             && self.settings_snapshot().manager.is_some();
-        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available})
+        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available,"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self
@@ -277,6 +283,9 @@ impl Runtime {
             .await
             .take()
             .context("runtime already started")?;
+        if self.config.public_entry {
+            return self.start_network().await;
+        }
         self.start_executor(events);
         self.start_schedule_delivery();
         self.start_observation_worker();

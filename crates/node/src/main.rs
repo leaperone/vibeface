@@ -15,10 +15,11 @@ use vibeface::{
     api,
     config::{self, Config, ManagerSettings},
     crypto::LocalIdentity,
-    identity::local::BootstrapCapability,
+    identity::local::{BootstrapCapability, random_hex},
     local_access::Launcher,
     maintenance,
-    net::NetworkConfig,
+    model::NodeRole,
+    net::{self, NetworkConfig, PublicEntry},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -148,6 +149,19 @@ struct Init {
     /// Reach other Nodes only through relays, as behind a strict NAT.
     #[arg(long)]
     relay_paths_only: bool,
+    /// Serve only the web app, a relay and ciphertext forwarding for other people's Nodes;
+    /// this Node never joins a personal network.
+    #[arg(long, requires = "relay_listen", conflicts_with_all = ["manager", "roots", "entry"])]
+    public_entry: bool,
+    /// Public entry that browsers use to reach this Node, e.g. `https://vb.example`.
+    #[arg(long, value_name = "URL", requires = "relay_token_file")]
+    entry: Option<String>,
+    /// The public entry's relay when it is not on the entry's own origin.
+    #[arg(long, value_name = "URL", requires = "entry")]
+    entry_relay: Option<String>,
+    /// File holding the public entry's operator token (`entry-token` in its data directory).
+    #[arg(long, value_name = "PATH", requires = "entry")]
+    relay_token_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -198,8 +212,9 @@ async fn main() -> Result<()> {
             let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
             runtime.start().await?;
             eprintln!("Web: {}", runtime.config.public_url);
-            if runtime.config.listen.ip().is_loopback()
-                || runtime.config.listen.ip().is_unspecified()
+            if !runtime.config.public_entry
+                && (runtime.config.listen.ip().is_loopback()
+                    || runtime.config.listen.ip().is_unspecified())
             {
                 eprintln!(
                     "Local setup: http://localhost:{}",
@@ -253,7 +268,7 @@ fn prepare_start(dir: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if empty {
-        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false))?;
+        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false), None)?;
     }
     Ok(())
 }
@@ -329,12 +344,31 @@ fn init(options: Init) -> Result<()> {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     }
     configuration.allowed_origins = options.allowed_origins;
+    let entry = match options.entry {
+        Some(url) => {
+            let url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
+            Some(PublicEntry {
+                relay: options.entry_relay.unwrap_or_else(|| url.clone()),
+                url,
+            })
+        }
+        None => None,
+    };
     configuration.network = NetworkConfig {
         relays: options.relays,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
         relay_paths_only: options.relay_paths_only,
+        entry,
         ..NetworkConfig::default()
+    };
+    configuration.public_entry = options.public_entry;
+    if options.public_entry {
+        configuration.roles = vec![NodeRole::Relay];
+    }
+    let entry_token = match &options.relay_token_file {
+        Some(path) => Some(net::read_token_file(path)?),
+        None => options.public_entry.then(|| random_hex(32)),
     };
     if let Some(manager) = options.manager {
         let workspace = options
@@ -363,10 +397,10 @@ fn init(options: Init) -> Result<()> {
             },
         });
     }
-    initialize(dir, configuration)
+    initialize(dir, configuration, entry_token)
 }
 
-fn initialize(dir: &Path, configuration: Config) -> Result<()> {
+fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
         "node already initialized; existing identity and configuration were preserved"
@@ -391,14 +425,25 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
     create_private(&dir.join("identity.json"), &encoded_identity)?;
     create_private(&dir.join("config.json"), &encoded_configuration)?;
     let store = Store::open(dir.join("node.sqlite3"))?;
-    let capability = store.bootstrap_capability()?;
-    create_private(
-        &dir.join("bootstrap.json"),
-        &serde_json::to_vec(&capability)?,
-    )?;
+    if !configuration.public_entry {
+        let capability = store.bootstrap_capability()?;
+        create_private(
+            &dir.join("bootstrap.json"),
+            &serde_json::to_vec(&capability)?,
+        )?;
+    }
+    if let Some(token) = &entry_token {
+        create_private(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
+    }
     create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":6}"#)?;
     println!("Initialized device with Peer ID {}", identity.device_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
+    if configuration.public_entry {
+        println!(
+            "Relay token: {} (copy it to your Node and pass --relay-token-file)",
+            dir.join(net::ENTRY_TOKEN_FILE).display()
+        );
+    }
     Ok(())
 }
 
@@ -453,6 +498,17 @@ async fn access(options: Access) -> Result<()> {
     );
     let configuration = Config::load(dir)?;
     let identity = config::identity(dir)?;
+    if configuration.public_entry {
+        if options.json {
+            println!(
+                "{}",
+                json!({"url":configuration.public_url,"device_id":identity.device_id()?,"public_entry":true})
+            );
+        } else {
+            println!("{}", configuration.public_url);
+        }
+        return Ok(());
+    }
     let store = Store::open_readonly(dir.join("node.sqlite3"))?;
     let initialized = store.has_network()?;
     let capability = if initialized {
