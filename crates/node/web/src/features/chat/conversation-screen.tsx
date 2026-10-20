@@ -47,7 +47,7 @@ export function ConversationScreen() {
 
   // Tasks and the approvals answered inside them sit right after the message that started them.
   const works = data?.works ?? []
-  const tasks: TaskRow[] = works.map((work) => ({ id: work.work_id, state: shownState(work), device: work.target_node, summary: work.summary || work.prompt, trigger: work.trigger, work }))
+  const tasks: TaskRow[] = works.map((work) => ({ id: work.work_id, state: shownState(work), device: work.target_node, summary: work.summary, trigger: work.trigger, work }))
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'unverified')
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
@@ -180,14 +180,16 @@ type TaskRow = { id: string; state: string; device: string; summary: string; tri
 function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string; device: string; open: boolean }) {
   const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'rejected'
   const result = (task.work.result_text || task.work.failure_reason || '').split('\n')[0]
-  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+  const title = task.work.title || '任务'
+  // The reason wraps on its own line, so a phone shows why a task stopped.
+  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0 truncate">任务 · {device} · {taskLabel(task.state)}{result ? ` · ${result}` : ''}</span>
+    <span className="min-w-0"><span className="block truncate">{title} · {device} · {taskLabel(task.state)}</span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
     <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-    <span className="min-w-0 flex-1 truncate"><span className="font-medium">任务</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
+    <span className="min-w-0 flex-1 truncate"><span className="font-medium">{title}</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
   </Link>
 }

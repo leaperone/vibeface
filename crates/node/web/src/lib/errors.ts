@@ -8,6 +8,7 @@ const codes: Record<string, string> = {
 }
 
 const patterns: [RegExp, string][] = [
+  [/artifact is not UTF-8 text/i, '这个文件不是文字，下载后再打开。'],
   [/log has forked/i, '这台设备的数据和另一份副本不一致，已停止写入。'],
   [/read-only until you confirm/i, '这台设备现在只读，在待处理里确认后就能写。'],
   [/aligning with other Nodes/i, '这台设备正在和你的其他设备对齐，稍后再试。'],

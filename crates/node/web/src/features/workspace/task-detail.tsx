@@ -44,12 +44,12 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   return <aside aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background md:static md:z-auto md:w-[420px] md:shrink-0 md:border-l">
     <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
       <ListChecks aria-hidden="true" className="size-5 text-muted-foreground" />
-      <h2 className="min-w-0 flex-1 truncate text-heading font-semibold">任务{device ? ` · ${nodeName(device, lookup)}` : ""}</h2>
+      <h2 className="min-w-0 flex-1 truncate text-heading font-semibold">{work?.title || "任务"}</h2>
       {state ? <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
       <Button asChild variant="ghost" size="icon"><Link to="/b/$botId" params={{ botId }} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
-      <p className="whitespace-pre-wrap break-words">{work.prompt}</p>
+      {device ? <p className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</p> : null}
       {progress?.status && taskActive(state) && state !== "waiting_approval" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
       {work.open_approvals.map((request) => <ApprovalCard key={request.request_id} work={work} request={request} stoppable={false} />)}
@@ -65,6 +65,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
         <InlineError error={action.error} />
       </div> : null}
       <Details>
+        <DetailRow label="交给执行器的说明" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} />
         <DetailRow label="任务编号" value={work.work_id} mono />
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
         {device ? <DetailRow label="设备编号" value={device} mono /> : null}

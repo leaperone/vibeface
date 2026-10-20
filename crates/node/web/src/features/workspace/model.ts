@@ -109,7 +109,7 @@ function workOutcome(value: unknown): WorkOutcome | null {
 function work(value: unknown): WorkRecord {
   const data = record(value)
   return {
-    work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), prompt: text(data.prompt),
+    work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
     failure_reason: data.failure_reason == null ? null : text(data.failure_reason), open_approvals: list(data.open_approvals).map(approval), answered_approvals: list(data.answered_approvals).map(answer),
     ...(data.stop == null ? {} : { stop: { waiting_for_device: flag(record(data.stop).waiting_for_device), timed_out: flag(record(data.stop).timed_out) } }),
@@ -142,6 +142,23 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     local_node: text(data.local_node),
   }
 }
+export function parseBinaryPage(value: unknown, hash: string, offset: number) {
+  const data = record(value)
+  const size = number(data.size)
+  const bytes = Uint8Array.from(atob(text(data.data)), (char) => char.charCodeAt(0))
+  const next_offset = data.next_offset === null ? null : number(data.next_offset)
+  if (data.blob_hash !== hash || data.offset !== offset || bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
+  return { bytes, next_offset, size }
+}
+
+/** 1536 → "1.5 KB"; decimal units, as file managers show them. */
+export function formatSize(bytes: number) {
+  const units = ["字节", "KB", "MB", "GB"]
+  let value = bytes, unit = 0
+  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1 }
+  return unit === 0 ? `${bytes} 字节` : `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
+}
+
 export function parseArtifactPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
   const size = number(data.size), content = text(data.text)

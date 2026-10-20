@@ -5,6 +5,9 @@ const ARTIFACT_PAGE: usize = 65_536;
 /// Raw bytes per upload request, well inside the client channel's message limit.
 const UPLOAD_CHUNK: usize = 1024 * 1024;
 
+/// Raw pages for downloads; base64 of 512 KiB stays under one forwarded frame.
+const BINARY_PAGE: usize = 512 * 1024;
+
 fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Value> {
     ensure!(
         (4..=ARTIFACT_PAGE as u64).contains(&limit),
@@ -37,6 +40,14 @@ impl Runtime {
             .lock()
             .await
             .read_blob(&access.network_id, scope, hash)?;
+        if input["binary"] == true {
+            use base64::Engine as _;
+            let start = usize::try_from(input["offset"].as_u64().unwrap_or(0))?.min(bytes.len());
+            let end = start.saturating_add(BINARY_PAGE).min(bytes.len());
+            return Ok(json!({"blob_hash":hash,"offset":start,"size":bytes.len(),
+                "next_offset":(end < bytes.len()).then_some(end),
+                "data":base64::engine::general_purpose::STANDARD.encode(&bytes[start..end])}));
+        }
         artifact_page(
             hash,
             &bytes,

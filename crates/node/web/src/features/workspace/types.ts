@@ -24,6 +24,8 @@ export type WorkRecord = {
   trigger: string
   target_node: string
   cwd: string
+  /** A few words for the user; `prompt` is the executor's instructions. */
+  title: string
   prompt: string
   state: WorkState | null
   summary: string

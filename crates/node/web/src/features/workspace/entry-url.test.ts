@@ -8,7 +8,7 @@ import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
 import { approvalKind, approvalRisk, nodeName } from "./labels.ts"
-import { inputText, parseArtifactPage, parseConversation, parseNodes, parseCreateBot, parseBot } from "./model.ts"
+import { inputText, parseArtifactPage, parseConversation, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
@@ -41,7 +41,7 @@ test("capabilities parse the actual provider name and reject malformed node list
   assert.throws(() => parseNodes({ nodes: [{ device_id: "n" }] }))
 })
 test("works, approvals with decline, reply status and pending checks keep their exact shape", () => {
-  const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", prompt: "检查项目", state: "waiting_approval", summary: "等待决定", outcome: null, result_text: "", failure_reason: null,
+  const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "waiting_approval", summary: "等待决定", outcome: null, result_text: "", failure_reason: null,
     open_approvals: [{ request_id: "req", kind: "commandExecution", summary: "运行命令", form: { command: "npm test", cwd: "/project", files: ["a.ts"], choices: [{ label: "拒绝", response: { decision: "decline" } }] } }],
     answered_approvals: [{ request_id: "old", kind: "commandExecution", summary: "运行命令", decision: "accept" }] }
   const scheduler = { jobs: [{ trigger: "message:one", state: "queued", kind: "human", sequence: 0, message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false } }
@@ -162,7 +162,7 @@ test("workspace preserves bot and message requests while routing native decision
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event" }
-  const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", prompt: "工作", state: "waiting_approval", summary: "", outcome: null, result_text: "", failure_reason: null,
+  const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "waiting_approval", summary: "", outcome: null, result_text: "", failure_reason: null,
     open_approvals: [{ request_id: "req", kind: "fileChange", summary: "允许修改吗？", form: { choices: [{ label: "拒绝", response: { decision: "decline" } }] } }], answered_approvals: [] }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
@@ -505,7 +505,7 @@ test("any entrance stops an unfinished task once, even on another device", async
   const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', decisionLabel: () => '', approvalKind: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   try {
-    const work = { work_id: 'work', target_node: 'worker', cwd: '/p', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, open_approvals: [], answered_approvals: [] }
+    const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, open_approvals: [], answered_approvals: [] }
     data.works = [{ ...work, state: 'unverified' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined)
     data.works = [{ ...work, target_node: 'other', stop: { waiting_for_device: true, timed_out: false } }]
@@ -629,7 +629,7 @@ test("artifact reads retain their offset while old responses cannot append or un
   const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, connectionOnline: true,
     readArtifact: (_hash: string, offset: number) => { offsets.push(offset); return work.promise }, run: async (action: () => Promise<void>) => { try { await action() } catch {} } } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/elements/artifact.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace } })
+  const app = componentHarness('../chat/elements/artifact.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/workspace/model': { formatSize } })
   const render = () => app.render('Artifact', { hash: 'result', size: 5 })
   const open = () => render().find(({ props }) => props.children === '打开结果')?.props
   try {

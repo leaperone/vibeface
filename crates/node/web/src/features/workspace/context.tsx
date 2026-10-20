@@ -12,7 +12,7 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, parseWriteStatus,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
@@ -562,6 +562,12 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
+    readArtifactBytes: async (hash: string, offset = 0) => {
+      requireCurrent()
+      const result = parseBinaryPage(await connection.rpc("read_artifact", { conversation_id: activeId.current, blob_hash: hash, offset, binary: true }), hash, offset)
+      requireCurrent()
+      return result
+    },
     readArtifact: async (hash: string, offset = 0) => {
       const id = activeId.current
       requireCurrent()
