@@ -281,6 +281,33 @@ impl Runtime {
         };
         let note = input["note"].as_str().unwrap_or("").trim();
         ensure!(note.len() <= 4096, "note must be at most 4096 bytes");
+        // An agent task's coordination process has its own check here; the work card answers both.
+        let manager = self
+            .store
+            .lock()
+            .await
+            .pending_checks(network)?
+            .into_iter()
+            .find(|check| check.trigger == crate::scheduling::task_trigger(work_id));
+        if let Some(check) = manager {
+            let running = process_groups(&check.process_groups)
+                .await
+                .into_iter()
+                .filter(|group| group["exited"] != true)
+                .filter_map(|group| group["process_group"].as_u64())
+                .collect::<Vec<_>>();
+            ensure!(
+                running.is_empty(),
+                "process groups {running:?} are still running or cannot be checked; stop them before confirming"
+            );
+            self.fence_manager_attempt(&check.attempt_id).await?;
+            let evidence = format!("{outcome:?}: {note}");
+            self.store.lock().await.resolve_pending_check(
+                network,
+                &check.check_id,
+                if note.is_empty() { "settled with the work's own check" } else { &evidence },
+            )?;
+        }
         let receipt = self.store.lock().await.settle_work(
             &self.identity,
             network,

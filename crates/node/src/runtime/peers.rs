@@ -602,6 +602,12 @@ impl Runtime {
         Ok(())
     }
 
+    /// Whether the last sync with `peer` failed.
+    pub(crate) fn sync_failing(&self, peer: &str) -> bool {
+        let states = self.sync_peers.lock().expect("sync peers");
+        states.get(peer).is_some_and(|state| state.failures > 0)
+    }
+
     /// Whether every other member Node has failed since boot, counting this failure of `peer`.
     fn unreachable(&self, members: &[String], peer: &str) -> bool {
         let states = self.sync_peers.lock().expect("sync peers");

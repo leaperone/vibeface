@@ -468,6 +468,10 @@ impl Runtime {
                     if member.device_id == local {
                         return self.capabilities().await;
                     }
+                    // A Node the sync loop cannot reach would hold this answer for the timeout.
+                    if self.sync_failing(&member.device_id) {
+                        return Value::Null;
+                    }
                     tokio::time::timeout(
                         Duration::from_secs(3),
                         self.peer_request(
