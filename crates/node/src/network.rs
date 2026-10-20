@@ -12,7 +12,6 @@ use futures_util::{
     stream::{self, BoxStream, FuturesUnordered},
 };
 use mdns_sd::{DaemonEvent, DaemonStatus, IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -823,7 +822,7 @@ impl NetworkHub {
             .source()
             .context("network socket has no TCP source")?;
         let mut socket = NetworkSocket::Limited(Box::new(NetworkSocket::server(socket)), admission);
-        let nonce = random_token();
+        let nonce = crate::crypto::random_hex(32);
         send_control(
             &mut socket,
             &Control::Welcome {
@@ -1404,7 +1403,7 @@ impl NetworkHub {
         peer_id: String,
         public_key: String,
     ) -> Result<()> {
-        let id = random_token();
+        let id = crate::crypto::random_hex(32);
         let source = socket
             .admitted()?
             .source()
@@ -1538,7 +1537,7 @@ impl NetworkHub {
             pending: None,
             _admission: admission,
         };
-        let token = random_token();
+        let token = crate::crypto::random_hex(32);
         let circuit_tag = generation_tag(&token);
         let (send, receive) = oneshot::channel();
         let generation = {
@@ -2547,11 +2546,6 @@ fn now_secs() -> Result<i64> {
         .as_secs()
         .try_into()?)
 }
-fn random_token() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
 
 #[cfg(test)]
 mod tests {
@@ -2769,7 +2763,7 @@ mod tests {
                     send_control(
                         &mut socket,
                         &Control::Welcome {
-                            nonce: random_token(),
+                            nonce: crate::crypto::random_hex(32),
                         },
                     )
                     .await?;
@@ -2888,7 +2882,7 @@ mod tests {
                     send_control(
                         &mut socket,
                         &Control::Welcome {
-                            nonce: random_token(),
+                            nonce: crate::crypto::random_hex(32),
                         },
                     )
                     .await?;
@@ -6080,7 +6074,7 @@ mod tests {
                     send_control(
                         &mut socket,
                         &Control::Welcome {
-                            nonce: random_token(),
+                            nonce: crate::crypto::random_hex(32),
                         },
                     )
                     .await?;

@@ -13,7 +13,6 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -483,7 +482,7 @@ async fn dispatch(
         }
         "prepare_invite" => {
             let view = manager_view(node, session).await?;
-            let capability = random_hex();
+            let capability = crate::crypto::random_hex(32);
             let kind: IdentityKind = from_field(&params, "kind")?;
             let mut roles: Vec<crate::model::NodeRole> = params
                 .get("node_roles")
@@ -1034,7 +1033,7 @@ async fn recovery_challenge(
         subject_id: session.subject_id.clone(),
         target_peer_id: node.identity.peer_id()?,
         genesis_hash: crypto::digest(&identity::canonical_json(&genesis)?),
-        nonce: random_hex(),
+        nonce: crate::crypto::random_hex(32),
         expires_at_ms: crate::runtime::now_ms() + 90_000,
     };
     let signing = signing(
@@ -1185,11 +1184,6 @@ fn sort_roles(roles: &mut [crate::model::NodeRole]) -> Result<()> {
         "duplicate node roles"
     );
     Ok(())
-}
-fn random_hex() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(anyhow::Error::msg)

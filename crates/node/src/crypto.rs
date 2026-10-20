@@ -1,7 +1,7 @@
 use crate::model::*;
 use anyhow::{Context as _, Result, ensure};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -151,6 +151,12 @@ impl vibeface_secure::membership::MembershipSigner for LocalIdentity {
     fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
         LocalIdentity::sign_payload(self, domain, payload)
     }
+}
+
+pub fn random_hex(bytes: usize) -> String {
+    let mut data = vec![0_u8; bytes];
+    OsRng.fill_bytes(&mut data);
+    hex::encode(data)
 }
 
 pub fn digest(bytes: &[u8]) -> String {

@@ -7,11 +7,10 @@ use super::{AuthorizationView, IdentityKind, Member, NetworkState};
 use crate::crypto;
 use crate::model::NodeRole;
 use crate::store::Store;
+use crate::{crypto::random_hex, runtime::now_ms};
 use anyhow::{Context, Result, bail, ensure};
-use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const INVITE_TTL_MS: i64 = 10 * 60_000;
 
@@ -667,18 +666,6 @@ fn validate_text(value: &str, max: usize) -> Result<()> {
         "invalid text"
     );
     Ok(())
-}
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
-fn random_hex(bytes: usize) -> String {
-    let mut data = vec![0_u8; bytes];
-    OsRng.fill_bytes(&mut data);
-    hex::encode(data)
 }
 fn random_id() -> String {
     random_hex(16)
