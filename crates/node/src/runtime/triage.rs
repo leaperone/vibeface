@@ -310,13 +310,14 @@ impl Runtime {
         Ok(outcome)
     }
 
-    /// Requests past their deadline, or whose card the user dismissed, get the fallback answer.
+    /// Requests past their deadline, or whose card was resolved without answering them (dismissed,
+    /// or decided by text), get the fallback answer.
     async fn expire_codex_requests(&self) -> Result<()> {
         let now = now_ms();
         let requests: Vec<CodexRequest> = lock(&self.triage.requests).values().cloned().collect();
         let network = self.network_id().await.ok();
         for request in requests {
-            let dismissed = match (&request.alert_id, &network) {
+            let resolved = match (&request.alert_id, &network) {
                 (Some(alert_id), Some(network)) => self
                     .store
                     .lock()
@@ -327,10 +328,10 @@ impl Runtime {
                         rusqlite::params![network, alert_id],
                         |row| row.get::<_, String>(0),
                     )
-                    .is_ok_and(|resolution| resolution == "dismissed"),
+                    .is_ok(),
                 _ => false,
             };
-            if dismissed || request.answer_by_ms.is_some_and(|by| by <= now) {
+            if resolved || request.answer_by_ms.is_some_and(|by| by <= now) {
                 self.answer_codex_request(&request.request_id, None, "fallback")
                     .await?;
             }
