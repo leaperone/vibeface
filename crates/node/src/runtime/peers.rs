@@ -938,19 +938,24 @@ impl Runtime {
         }
     }
 
-    /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
-    async fn refresh_own_address(&self, network: &str) -> Result<bool> {
-        let net = self.net()?;
-        let device_id = self.identity.device_id()?;
-        let endpoint = net.addr();
-        let gateway_url = match &self.config.network.entry {
+    /// Where browsers reach this Node: its public entry, else its own Gateway.
+    pub(crate) fn gateway_url(&self) -> Option<String> {
+        match &self.config.network.entry {
             Some(entry) => Some(entry.url.clone()),
             None => self
                 .config
                 .roles
                 .contains(&NodeRole::Gateway)
                 .then(|| self.config.public_url.clone()),
-        };
+        }
+    }
+
+    /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
+    async fn refresh_own_address(&self, network: &str) -> Result<bool> {
+        let net = self.net()?;
+        let device_id = self.identity.device_id()?;
+        let endpoint = net.addr();
+        let gateway_url = self.gateway_url();
         let mut store = self.store.lock().await;
         let previous = store
             .address_book(network)?

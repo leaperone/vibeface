@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, QrCode, ShieldAlert, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, QrCode, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -13,6 +13,7 @@ import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from './connection-lane'
 import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
+import { joinTicket } from '../../../transport.js'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
@@ -20,7 +21,43 @@ const value = (form: HTMLFormElement, key: string) => { const field = form.eleme
 
 function purposeOf(invitation: string): Purpose {
   if (!invitation.trim()) return 'empty'
-  try { const url = new URL(invitation.trim()); return url.pathname === '/join' && url.hash.startsWith('#vibeface1') ? 'link' : 'invalid' } catch { return 'invalid' }
+  return joinTicket(invitation) ? 'link' : 'invalid'
+}
+
+type Detector = { detect(source: HTMLVideoElement): Promise<Array<{ rawValue: string }>> }
+const detectorClass = () => (globalThis as { BarcodeDetector?: new (options: { formats: string[] }) => Detector }).BarcodeDetector
+const canScan = () => typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia) && Boolean(detectorClass())
+
+/** Reads a join QR code with the camera; only the ticket is kept, any address in it is ignored. */
+function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCancel(): void }) {
+  const video = useRef<HTMLVideoElement>(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let live = true, stream: MediaStream | null = null, timer: ReturnType<typeof setTimeout> | undefined
+    const Detector = detectorClass()!
+    const detector = new Detector({ formats: ['qr_code'] })
+    const tick = async () => {
+      if (!live || !video.current) return
+      try {
+        for (const code of await detector.detect(video.current)) {
+          const found = joinTicket(code.rawValue)
+          if (found) { onTicket(found.ticket); return }
+        }
+      } catch {}
+      timer = setTimeout(() => void tick(), 250)
+    }
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }).then(async (media) => {
+      if (!live || !video.current) { media.getTracks().forEach(track => track.stop()); return }
+      stream = media; video.current.srcObject = media
+      await video.current.play()
+      void tick()
+    }).catch(() => { if (live) setError('没能打开相机。请允许使用相机，或把链接粘贴到这里。') })
+    return () => { live = false; clearTimeout(timer); stream?.getTracks().forEach(track => track.stop()) }
+  }, [])
+  return <div className="grid gap-3">
+    {error ? <p role="alert" className="text-meta text-danger">{error}</p> : <video ref={video} className="aspect-square w-full rounded-lg bg-black object-cover" playsInline muted aria-label="对准二维码" />}
+    <Button type="button" variant="ghost" className="w-fit" onClick={onCancel}>不扫了，粘贴链接</Button>
+  </div>
 }
 
 
@@ -67,6 +104,8 @@ export function ConnectionScreen() {
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(null)
   const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
+  const [scanning, setScanning] = useState(false)
+  const scannable = canScan()
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup) })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
@@ -134,23 +173,24 @@ export function ConnectionScreen() {
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
-  else body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '打开加入链接' : '加入我的设备'}>
-    <form className="grid gap-4" onSubmit={submitInvitation}>
+  else body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : '加入我的设备'}>
+    {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
       <fieldset disabled={linking || !usable} className="grid gap-4">
+        {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
         {purpose === 'empty' || purpose === 'invalid' ? <>
-          <Field label="加入链接"><Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
+          <Field label={scannable ? '或粘贴加入链接' : '加入链接'}><Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
           {purpose === 'invalid' ? <p role="alert" className="text-meta text-danger">这不是有效的加入链接</p> : null}
         </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
           <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
-          <span className="min-w-0 flex-1 truncate">已读取加入链接</span>
+          <span className="min-w-0 flex-1 truncate">{invitation.trim().startsWith('vibeface1') ? '已读取二维码' : '已读取加入链接'}</span>
           <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
         </p>}
         <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
-        <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button>
+        {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
-    </form>
+    </form>}
     {publicEntry
-      ? <p className="text-meta text-muted-foreground">在已加入的设备上点“添加设备”，用手机相机扫二维码，或把链接粘贴到这里。</p>
+      ? <p className="text-meta text-muted-foreground">在你的电脑上打开 vibeface，点“添加设备”，再扫它显示的二维码。</p>
       : <p className="text-meta text-muted-foreground">加入一台电脑：在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p>}
   </Panel>
 
@@ -243,6 +283,7 @@ function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
+    {device.info ? <p className="flex items-center gap-2 text-success"><ShieldCheck aria-hidden="true" className="size-4 shrink-0" />已确认是你的设备「{device.info.name}」</p> : null}
     <p className="text-muted-foreground">在管理设备上比对安全码</p>
     {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}

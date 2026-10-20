@@ -176,10 +176,14 @@ function ConnectionCapsule() {
   const entryId = device.ready?.entry.device_id
   const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
   const name = entryName ? `经 ${entryName}` : addressName(address)
+  // Devices of another network this browser opened before; the current network fails over by itself.
+  const others = device.entries.filter((item) => !item.local && !device.directory?.members.some((member) => member.device_id === item.device_id))
   const state: { label: string; icon: LucideIcon; tone: string } = link.kind === "connecting"
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
+      : workspace.readOnlyNotice
+      ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
       : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.data && workspace.incomplete
         ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
         : { label: "在线", icon: Wifi, tone: "text-success" }
@@ -197,6 +201,16 @@ function ConnectionCapsule() {
         <p className="break-all text-muted-foreground">{address}</p>
         {link.kind === "offline" ? <p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
           : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><ShieldCheck aria-hidden="true" className="size-4" />端到端加密，已验证设备</p> : null}
+        {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}
+        {others.length ? <>
+          <p className="mt-1 font-medium">换一台设备</p>
+          <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={`${item.address}:${item.device_id}`}>
+            <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
+              <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(item.address)}</span>
+              <ArrowRightLeft aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+            </button>
+          </li>)}</ul>
+        </> : null}
         {entrances.length > 1 ? <>
           <p className="mt-1 font-medium">可切换的访问地址</p>
           <ul className="grid gap-1" aria-label="可切换的访问地址">{entrances.map((item) => <li key={item.device_id} className="flex min-w-0 items-center gap-2">
@@ -210,15 +224,19 @@ function ConnectionCapsule() {
 }
 
 /** Same layout as the workspace, shown while the browser loads its keys and connects. */
-export function ShellSkeleton() {
+export function ShellSkeleton({ retry = null, onLeave }: { retry?: number | null; onLeave?: () => void } = {}) {
+  const status = retry === null
+    ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
+    : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
   return <div className="flex h-dvh" aria-busy="true">
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
       <span className="text-heading font-semibold">vibeface</span>
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
-      <div className="mt-auto flex items-center gap-2 px-2 text-meta text-info" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</div>
+      <div className={cn("mt-auto flex items-center gap-2 px-2 text-meta", retry === null ? "text-info" : "text-muted-foreground")} role="status">{status}</div>
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex h-14 items-center gap-3 border-b px-4"><Skeleton className="h-5 w-32" /><span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</span></div>
+      <div className="flex h-14 items-center gap-3 border-b px-4"><Skeleton className="h-5 w-32" /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
+      {retry !== null && onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
       <ChatSkeleton />
     </div>
   </div>

@@ -24,8 +24,8 @@ type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 /** This browser's own join request; `nonce` stays here until the manager has committed its nonce. */
 export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; code?: string; reason?: string | null }
-/** A fresh invitation; without a public HTTPS entry the link only works on this computer. */
-export type Invitation = { link: string; publicEntry: boolean; expiresAt: number }
+/** A fresh invitation; without a public HTTPS entry a phone scans `ticket` from its public entry's page. */
+export type Invitation = { link: string; ticket: string; publicEntry: boolean; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
 export type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
@@ -35,7 +35,7 @@ type DeviceContextValue = {
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
-  connect(entry: ConnectionEntry): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
@@ -66,6 +66,18 @@ function loadAuthenticated(): AuthenticatedEntry | null {
     const v = record(value)
     return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId) }
   } catch { return null }
+}
+/** The last authenticated target first, then saved ones from most to least recently authenticated. */
+function resumeTargets(): Reconnect[] {
+  if (load('stay-disconnected') === true) return []
+  const last = loadAuthenticated()
+  const targets: Reconnect[] = last && !last.entry.local ? [{ ...last, attempt: 0 }] : []
+  for (const entry of savedEntries().reverse()) {
+    const networkId = load(`network-for.${entry.device_id}`)
+    if (entry.local || typeof networkId !== 'string' || targets.some(item => entryKey(item.entry) === entryKey(entry))) continue
+    try { targets.push({ entry, networkId: validTarget(networkId), attempt: 0 }) } catch {}
+  }
+  return targets
 }
 function loadJoining(): Joining | null {
   try {
@@ -124,6 +136,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const sensitive = useRef<Sensitive | null>(null)
   const listeners = useRef(new Set<(event: ChangedEvent) => void>())
   const reconnect = useRef<Reconnect | null>(null)
+  /** Older saved targets to try at page load when the newer one is gone, most recent first. */
+  const resumeQueue = useRef<Reconnect[]>([])
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const identityRef = useRef<PublicIdentity | null>(null)
   const joiningRef = useRef<Joining | null>(null)
@@ -152,6 +166,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }, [])
   const resetConnection = useCallback(() => {
     reconnect.current = null
+    resumeQueue.current = []
     if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
     reconnectTimer.current = null
     generation.current += 1
@@ -165,7 +180,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }, [releaseSensitive])
   const disconnect = useCallback(() => {
     resetConnection()
-    try { store('last-authenticated', null); store('pending-join', null) } catch (cause) { setError(messageOf(cause)) }
+    try { store('last-authenticated', null); store('pending-join', null); store('stay-disconnected', true) } catch (cause) { setError(messageOf(cause)) }
   }, [resetConnection])
   const cancelSensitive = disconnect
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
@@ -213,9 +228,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (principal.source === 'membership' && active.entry.local) active.entry = { ...active.entry, local: false }
     setLocalAutoAccessState(typeof verified.auth.local_auto_access === 'boolean' ? verified.auth.local_auto_access : null)
     store(`network-for.${active.entry.device_id}`, principal.network_id)
+    store(`name-for.${active.entry.device_id}`, active.info.name)
+    resumeQueue.current = []
     saveEntry(active.entry)
     store('last-authenticated', { entry: active.entry, networkId: principal.network_id } satisfies AuthenticatedEntry)
-    store('pending-join', null)
+    store('pending-join', null); store('stay-disconnected', null)
     active.networkId = principal.network_id
     reconnect.current = { entry: active.entry, networkId: principal.network_id, attempt: 0 }
     const connection: ReadyConnection = {
@@ -254,14 +271,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (reconnect.current !== target) return
       switching.current = true
       step({ type: 'connect' })
-      let done = false
+      let done: boolean | 'next' = false
       try { done = await reconnectThrough(target) } finally { switching.current = false }
+      if (done === 'next') { scheduleReconnect(true); return }
       if (done || reconnect.current !== target) return
       step({ type: 'lost', reason: '所有访问地址都连不上。' })
       setPhase('reconnecting'); scheduleReconnect()
     }, delay)
   }
-  async function reconnectThrough(target: Reconnect): Promise<boolean> {
+  async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {
     if (target.entry.local) {
       const local = identityRef.current && await localBrowserEntry(identityRef.current, null)
       if (reconnect.current !== target) return true
@@ -284,6 +302,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       } catch (cause) {
         if (reconnect.current !== target) return true
         if (candidate === target.entry && (isResponseError(cause) || cause instanceof AuthenticationError)) {
+          const next = resumeQueue.current.shift()
+          if (next) {
+            // A saved target this browser can no longer use, such as an old device at the same address, is dropped.
+            if (active && session.current === active) { generation.current += 1; session.current = null; active.channel.close() }
+            removeEntry(target.entry)
+            reconnect.current = { ...next, attempt: 0 }
+            return 'next'
+          }
           resetConnection(); setPhase('unpaired')
           let detail = messageOf(cause)
           try { store('last-authenticated', null) } catch (storageError) { detail += ` ${messageOf(storageError)}` }
@@ -393,13 +419,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     // The entry Node's own record names the public entry it is reached through, if it has one.
     const known = loadEntrances(connection.principal.network_id)
     const reachable = known.filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0] ?? known.find(item => item.device_id === entryId)
-    const origin = reachable?.gateway_url ?? (route.device_id === entryId ? route.address : connection.entry.address)
+    // The Node's own public entry, when it has one, is what a phone's camera can open.
+    const configured = typeof result.gateway_url === 'string' && isPublicUrl(result.gateway_url) ? result.gateway_url : undefined
+    const origin = configured ?? reachable?.gateway_url ?? (route.device_id === entryId ? route.address : connection.entry.address)
     const entry = result.entry && typeof result.entry === 'object' ? record(result.entry) : {}
     const relay = typeof entry.relay_url === 'string' ? entry.relay_url : undefined
     const direct = array(entry.direct_addrs).filter((value): value is string => typeof value === 'string')
-    const link = `${origin}/join#${ticketEncode(entryId, hex(secret), relay, direct)}`
+    const ticket = ticketEncode(entryId, hex(secret), relay, direct)
     secret.fill(0)
-    return { link, publicEntry: isPublicUrl(origin), expiresAt }
+    return { link: `${origin}/join#${ticket}`, ticket, publicEntry: isPublicUrl(origin), expiresAt }
   }
   async function startApproval(joinId: string) {
     managing()
@@ -447,7 +475,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function join(linkText: string, nameValue: string) {
     const name = deviceName(nameValue)
     const link: JoinLink = await parseJoinLink(linkText)
-    const active = await open({ address: link.origin, device_id: link.entryId })
+    // This page's own entry first: a scanned code's address is only a hint, the device key is the check.
+    const addresses = [...new Set([location.origin, ...link.origin ? [link.origin] : []])]
+    let active: Session | null = null
+    for (const [index, address] of addresses.entries()) {
+      try { active = await open({ address, device_id: link.entryId }) }
+      catch (cause) { if (index === addresses.length - 1 || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
+      if (active) break
+    }
+    if (!active) throw new Error('连不上这台设备。')
     const me = own().deviceId
     const nonce = randomHex()
     let response: ReturnType<typeof parseJoinRequest>
@@ -615,7 +651,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (!mounted) return
       identityRef.current = me; setIdentity(me)
       if (version !== generation.current) return
-      setPhase('disconnected')
+      // A browser that was in its network resumes it; the join page must not flash in between.
+      setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
       if (!invitation) {
         const local = await localBrowserEntry(me, localLaunch)
         if (!mounted || version !== generation.current) return
@@ -634,16 +671,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         catch (cause) { if (mounted && version === generation.current) setError(messageOf(cause)) }
         if (!mounted || version !== generation.current) return
         setLocalSetup(local)
-        if (local?.kind === 'uninitialized') return
+        if (local?.kind === 'uninitialized') { setPhase('disconnected'); return }
         if (local?.kind === 'initialized') {
           const opening = connect(local.entry); version = generation.current
           void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
           return
         }
-        const last = loadAuthenticated()
-        if (last && !last.entry.local) {
+        const [first, ...rest] = resumeTargets()
+        if (first) {
           // Resume this browser's network through its entrances, starting with the last one used.
-          reconnect.current = { entry: last.entry, networkId: last.networkId, attempt: 0 }
+          reconnect.current = first; resumeQueue.current = rest
           setPhase('reconnecting'); scheduleReconnect(true)
           return
         }
@@ -698,7 +735,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
-    connect, disconnect, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },

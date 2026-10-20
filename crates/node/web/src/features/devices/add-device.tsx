@@ -16,8 +16,9 @@ type Share = Invitation & { qr: string | null }
 
 function share(invitation: Invitation): Share {
   let qr: string | null = null
-  // A phone can only use a public HTTPS address; anything else would scan into a dead page.
-  if (invitation.publicEntry) { try { const code = qrcode(0, "M"); code.addData(invitation.link); code.make(); qr = code.createDataURL(4, 16) } catch {} }
+  // A phone's camera opens a public HTTPS link; any other address would scan into a dead page,
+  // so the code then carries only the ticket, read by the scanner on the public entry's page.
+  try { const code = qrcode(0, "M"); code.addData(invitation.publicEntry ? invitation.link : invitation.ticket); code.make(); qr = code.createDataURL(4, 16) } catch {}
   return { ...invitation, qr }
 }
 
@@ -71,9 +72,11 @@ export function AddDevice() {
           <JoinRequests issuing={result !== null} />
           {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} />生成链接</Button> : null}
           {result ? <div className="grid gap-3">
-            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用新设备扫码打开" /> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
-              <p className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />{local ? "手机连不上本机地址，只能本机打开" : "没有 HTTPS 访问地址，只能本机打开"}</p>
-              <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置访问地址</Link></Button>
+            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在你的公网网页里扫码"} /> : null}
+            {result.publicEntry ? <p className="text-meta text-muted-foreground">用手机相机扫码，或在你的公网网页里扫码</p> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
+              <p>用手机打开你的公网网页，点“扫码”扫这个二维码</p>
+              <p className="flex items-center gap-1.5 text-muted-foreground"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{local ? "手机相机打不开本机地址" : "还没设置公网地址，手机相机打不开"}</p>
+              <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置公网地址</Link></Button>
             </div>}
             <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button>
             <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p>

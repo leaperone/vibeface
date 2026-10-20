@@ -667,7 +667,9 @@ async fn dispatch(
                 json!({"relay_url":own_relay.or_else(|| addr.relay_urls().next().cloned()),
                     "direct_addrs":addr.ip_addrs().take(8).collect::<Vec<_>>()})
             });
-            Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry}))
+            Ok(
+                json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry,"gateway_url":node.gateway_url()}),
+            )
         }
         "entrances" => {
             let principal = principal(node, session).await?;

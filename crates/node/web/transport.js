@@ -23,15 +23,27 @@ export function validEndpoint(value) {
   return url.origin;
 }
 
-/** `https://<gateway>/join#vibeface1…` → the Gateway origin and the decoded ticket. */
+/** The ticket in a join QR code or link: `vibeface1…` alone or `https://<entry>/join#vibeface1…`. */
+export function joinTicket(value) {
+  const input = value.trim();
+  if (input.startsWith("vibeface1")) return { ticket: input, origin: null };
+  try {
+    const url = new URL(input);
+    if (url.pathname === "/join" && url.hash.startsWith("#vibeface1")) return { ticket: url.hash.slice(1), origin: url.origin };
+  } catch {}
+  return null;
+}
+
+/** Trust comes from the ticket's device key; the address in a link is only a hint. */
 export async function parseJoinLink(value) {
   await init();
-  const input = value.trim();
-  if (input.length > 8192) throw new Error("邀请链接过长。请重新复制管理设备上的链接。");
-  const url = new URL(input);
-  if (url.pathname !== "/join" || !url.hash.startsWith("#vibeface1")) throw new Error("这不是 Vibeface 邀请链接。");
-  const ticket = JSON.parse(ticketDecode(url.hash.slice(1)));
-  return { origin: validEndpoint(url.origin), entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret };
+  if (value.trim().length > 8192) throw new Error("邀请链接过长。请重新复制管理设备上的链接。");
+  const found = joinTicket(value);
+  if (!found) throw new Error("这不是 Vibeface 邀请链接。");
+  const ticket = JSON.parse(ticketDecode(found.ticket));
+  let origin = null;
+  try { origin = found.origin && validEndpoint(found.origin); } catch {}
+  return { origin, entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret };
 }
 
 function database() {

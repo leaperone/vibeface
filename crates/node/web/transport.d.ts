@@ -3,7 +3,7 @@ export type DeviceChannel = {
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
   close(): void
 }
-export type JoinLink = { origin: string; entryId: string; inviteId: string; inviteHash: string; secret: string }
+export type JoinLink = { origin: string | null; entryId: string; inviteId: string; inviteHash: string; secret: string }
 export function initClient(options?: { replaceLostKey?: boolean }): Promise<{ deviceId: string }>
 export function connectDevice(entry: { address: string; device_id: string; local?: boolean }, options?: {
   onEvent?: (event: unknown) => void
@@ -14,5 +14,6 @@ export function connectDevice(entry: { address: string; device_id: string; local
 }): Promise<DeviceChannel>
 export function validTarget(value: unknown): string
 export function validEndpoint(value: string): string
+export function joinTicket(value: string): { ticket: string; origin: string | null } | null
 export function parseJoinLink(value: string): Promise<JoinLink>
 export function signClient(domain: string, payload: string | Uint8Array): Promise<string>

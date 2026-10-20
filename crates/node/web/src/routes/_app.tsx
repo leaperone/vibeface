@@ -12,9 +12,12 @@ const Onboarding = lazy(() => import('@/features/identity/onboarding').then((mod
 export const Route = createFileRoute('/_app')({ component: AppLayout })
 
 function AppLayout() {
-  const { ready, phase, entries, initialInvitation, tabs } = useDevice()
+  const { ready, phase, entries, initialInvitation, tabs, joining, link, disconnect } = useDevice()
   const navigate = useNavigate()
   const onboarding = useOnboarding()
+  // Reopening the page goes back to the workspace; the join page is only for a browser not in a network.
+  const resuming = !ready && phase === 'reconnecting' && !joining
+  if (resuming) return <ShellSkeleton retry={link.kind === 'offline' ? Math.ceil(link.retryInMs / 1000) : null} onLeave={disconnect} />
   if (!ready && (phase === 'initializing' || phase === 'connecting' && entries.length > 0 && !initialInvitation)) return <ShellSkeleton />
   if (!ready) return <Suspense fallback={<ShellSkeleton />}><ConnectionScreen /></Suspense>
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
