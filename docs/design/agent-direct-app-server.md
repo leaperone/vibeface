@@ -7,10 +7,12 @@
 - Agent 直连 `codex app-server --listen unix://...`，保留 Unix socket，不改 stdio，不加 socket 令牌。
 - 默认 `approvalPolicy=never`、`sandbox=danger-full-access`。删除审批转发和审批表单，网页不提示风险。
 - Node 继续负责跨设备派活、进展观察、记录和重启对账。跨设备派发要求目标设备配置了调度 Agent。
-- 执行层客户端覆盖 App Server 的全部方法。执行的命令、命令输出、diff 和改动文件列表只进状态，不在网页显示。
+- 每台设备只有一个完整的协调角色：协调 Agent 加确定性的运行时。没有单独的执行层，也没有 `executor` 角色。
+- 协调 Agent 的 Shell 完全访问（`danger-full-access`、`approvalPolicy=never`），能写状态、跑 git 和 gh，直接经 socket 驱动本机 Codex。Node 不替它包装方法、不限制路径。
+- App Server 客户端覆盖全部方法。执行的命令、命令输出、diff 和改动文件列表只进状态，不在网页显示。
 - 分诊在 Node 完成，目的是节省 Grok Bot 额度。网页和 Grok Bot 可以互相替代。
 
-## 1. 执行层：App Server 客户端
+## 1. App Server 客户端
 
 `vibeface-bridge` 的 Codex 客户端按一张方法表工作。方法名单来自 `crates/bridge/schema/app-server-methods.json`，由 `scripts/codex-schema.py` 从已安装的 Codex 生成（当前 0.163.0：105 个客户端请求、1 个客户端通知、10 个服务端请求、85 个服务端通知）。逐方法的处理方式见 `docs/codex-app-server.md`。测试比较三者，名单里有而表里或文档里没有的方法会让 CI 失败。
 
@@ -41,11 +43,32 @@
 
 Node 只回复自己工作线程上的请求。终端里打开的会话、别的客户端发起的回合，即使 Node 订阅了观察，也留给原客户端回答。每次回复写入 `node.log` 一行（方法和决定，不含命令文本）。
 
-## 2. 调度 Agent 直连
+## 2. 协调 Agent 直连
 
-### 2.1 派发流程
+### 2.1 分工
 
-协调 Agent 通过 `vibeface tool` 命令使用工具。`dispatch_work` 在本机派发时由 CLI 进程自己连 App Server：
+| 归属 | 内容 |
+|---|---|
+| 协调 Agent（Shell 完全访问） | 经 `vibeface codex` 直接调用 App Server 的任意方法；本机派发时自己开线程、发回合 |
+| 运行时（Node 进程，`runtime/codex_server.rs`） | App Server 进程与 socket 的生命周期；工作登记与绑定；`thread/resume` 订阅并把进展写成事件；重启和超时对账；跨设备派发；同步、身份与网页；webhook 发件箱（第 4 节）；送决定（第 5 节） |
+
+Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的路径、审批转发和逐方法包装。工作只分两类，记在 `WorkDispatched.kind`：`codex` 是本机协调 Agent 发出、Node 观察的 Codex 回合；`task` 是交给某台设备协调 Agent 的一轮任务。
+
+### 2.2 薄 CLI
+
+`vibeface codex` 直接连 `VIBEFACE_CODEX_SOCKET`（Node 把 App Server socket 放进协调 Agent 的工具环境），不经 Node：
+
+| 命令 | 作用 |
+|---|---|
+| `vibeface codex call <method> [json]` | 调用名单里的任意方法，原样打印结果；写方法结果不明时报错并提示先回读 |
+| `vibeface codex send <thread> <text> [--id ID] [--model M] [--effort E] [--image PATH]...` | `thread/resume` 后先按 `clientId` 回读；回合进行中时 `turn/steer`，否则 `turn/start`；再回读确认。输出 `{client_id, delivery}` |
+| `vibeface codex watch <thread>` | `thread/resume` 后逐行打印通知 |
+
+`send` 与 Node 的 `send_decision` 是同一个函数（`DirectSession::send`）。同一 `--id` 再次执行先回读，消息已在线程里时返回 `existing`，不会发第二次。CLI 自身无状态：回读不到时会再发一次，所以结果不明时要先 `vibeface codex call thread/read` 确认；Node 的 `send_decision` 有本机日志，结果不明后只回读。
+
+### 2.3 派发流程
+
+`vibeface tool dispatch_work` 在本机派发时由 CLI 进程自己连 App Server：
 
 ```mermaid
 sequenceDiagram
@@ -53,60 +76,63 @@ sequenceDiagram
 	participant N as Node
 	participant X as App Server
 	A->>N: track_work（title、prompt、cwd、call_ref…）
-	N-->>A: work_id、may_send、send_by_ms、socket
+	N-->>A: work_id、may_send、send_by_ms、cwd、thread_id?
 	A->>X: initialize、thread/start（never、danger-full-access）
 	A->>N: bind_work（thread_id）
 	A->>X: turn/start（clientUserMessageId=work_id）
-	A->>N: bind_work（turn_id）
+	A->>N: bind_work（turn_id | unknown | failed）
 	N->>X: thread/resume 订阅，观察进展
 ```
 
-- `track_work` 在发送前登记。Node 校验授权（与原 `authorize_dispatch` 相同），写入 `WorkDispatched` 和本机日志。只有第一次登记返回 `may_send=true`；同一 `call_ref` 的重试拿到原工作的状态，CLI 不再发送。
-- `continues` 指向原工作时，`track_work` 直接返回原 thread，CLI 先 `thread/resume` 再 `turn/start`。
+- `track_work` 在发送前登记。Node 校验授权，写入 `WorkDispatched` 和本机日志。只有第一次登记返回 `may_send=true`；同一 `call_ref` 的重试拿到原工作的状态，CLI 不再发送。
+- `continues` 指向原工作时，`track_work` 返回原 thread，CLI 跳过 `thread/start`。
 - CLI 在 `send_by_ms`（登记后 60 秒）之后不再发送。线程在发 `turn/start` 之前绑定，绑定失败就不发送。
-- `turn/start` 带 `clientUserMessageId=work_id`。回合里的 `userMessage.clientId` 因此能证明这次发送，对账靠它，不靠“最后一个回合”。
-- 可选参数 `model`、`effort`、`images`（本机图片路径）原样进入 `turn/start`。
+- `turn/start` 带 `clientUserMessageId=work_id`。回合里的 `userMessage.clientId` 证明这次发送，对账靠它，不靠“最后一个回合”。
+- 可选参数 `model`、`effort`、`images`（本机图片路径或 URL）原样进入 `turn/start`。
+- `target_node` 是另一台设备时，Node 把任务作为签名的 `WorkDispatched`（`kind=task`）交给那台设备的协调 Agent，由它在本机直连派发。目标设备必须启用协调 Agent。
+- Cursor SDK 没有 Shell CLI 路径，它的 `dispatch_work` 回调在 Node 进程里执行同一个 `agent_cli::dispatch`。
 
-### 2.2 状态机
+### 2.4 状态机
 
 `WorkState` 删除 `WaitingApproval`。状态为 `accepted`、`starting`、`running`、`interrupting`、`finished`、`unverified`。
 
 | 情况 | 结果 |
 |---|---|
-| `send_by_ms` 加 30 秒后仍是 `accepted`（没有绑定线程） | `rejected`，没有回合可能开始 |
-| `starting` 超时，线程里找不到 `clientId=work_id` 的回合 | `rejected` |
+| `send_by_ms` 加 30 秒后仍是 `accepted` 或没有线程的 `starting` | `rejected`，没有回合可能开始 |
+| 窗口结束后线程里找不到 `clientId=work_id` 的回合 | `rejected` |
 | 找到该回合 | 按回合状态进入 `running` 或结束 |
-| CLI 报告 `turn/start` 结果不明 | 立即按 `clientId` 对账一次，读不到线程时 `unverified` 并等下次对账 |
-| App Server 重连 | 与原来相同：新 epoch，按线程和回合对账，不重发 |
+| CLI 报告 `turn/start` 结果不明 | 立即按 `clientId` 对账一次；窗口内找不到时保持 `starting`，窗口结束再定 |
+| App Server 重连 | 新 epoch，按线程和回合对账，不重发 |
 
-### 2.3 Node 的观察和记录
+### 2.5 观察和记录
 
-Node 对每个未结束工作的线程保持 `thread/resume` 订阅（重连后自动恢复）。进展写成 `WorkProgress` 事件，手机离线后也能看到：计划更新、阶段性说明和回合结束时写入，同一工作两次写入至少间隔 5 秒，摘要不变时不写。事件只含计划和说明文字，不含命令、输出和 diff。
+Node 对每个未结束工作的线程保持 `thread/resume` 订阅（重连后自动恢复），并只回复这些线程上的服务端请求（1.2）。进展写成 `WorkProgress` 事件，手机离线后也能看到：计划更新和阶段性说明写入，同一工作两次写入至少间隔 5 秒，摘要不变时不写。事件只含计划和说明文字，不含命令、输出和 diff。
 
-`interrupt_work` 仍由 Node 发 `turn/interrupt`，停止按钮不变。
+`interrupt_work` 由 Node 发 `turn/interrupt`，停止按钮不变。
 
-### 2.4 其他工具
+### 2.6 工具
 
 | 工具 | 运行位置 | 作用 |
 |---|---|---|
-| `dispatch_work` | CLI | 本机直连派发；`target_node` 是另一台设备时，交给 Node 发成那台设备的 Agent 任务 |
-| `steer_work` | CLI | 给本会话正在运行的工作插话：`turn/steer`，带 `expectedTurnId` 和 `clientUserMessageId` |
-| `codex` | CLI | 直接调用 App Server 的任意方法；`thread/start`、`turn/start`、`turn/steer` 必须走上面两个工具，以便 Node 先登记 |
+| `dispatch_work` | CLI（Cursor 为 Node 回调） | 本机：登记、开线程、发回合、绑定；其他设备：交给那台设备的协调 Agent |
+| `track_work`、`bind_work` | Node | `dispatch_work` 内部使用的登记和绑定 |
 | `nodes`、`context`、`work_status`、`interrupt_work`、`call_lookup` | Node | 不变 |
 
-跨设备只剩 Agent 任务一种形式：目标设备必须启用调度 Agent，由它在本机直连派发。只装了 App Server 的设备不再接收工作。Cursor SDK 的工具走 Node 回调，回调在 Node 进程里执行同一套直连流程。
+其余 App Server 操作（插话、读线程、模型列表、review、fork 等）都用 `vibeface codex`，Node 不再提供 `codex`、`steer_work` 这类包装工具。
 
-Codex SDK sidecar 的权限配置加入对 App Server socket 的 Unix socket 授权，`VIBEFACE_CODEX_SOCKET` 进入工具环境。协调 Agent 自身的 Shell 仍是只读文件系统。
+Codex SDK sidecar 的协调回合用 `sandboxMode=danger-full-access`、`approvalPolicy=never`，不再用 `vibeface_manager` 权限配置。只读的结果汇报回合保留该配置（只读文件系统、仅回环网络）。
 
 ## 3. 网页的会话控制
 
-网页通过所连 Node 的 RPC 操作任一设备上的 Codex，`node` 参数指向另一台设备时，Node 经成员连接转发。
+网页通过所连 Node 的 RPC 操作任一设备上的 Codex，`node` 参数指向另一台设备时，Node 经成员连接转发（对方要求 `human=true`）。三者都只接受本人令牌。
 
 | RPC | 作用 |
 |---|---|
-| `codex {node?, method, params}` | 调用表中非 `hidden` 的客户端请求，结果经 `sanitize` |
-| `codex_state {node?, thread_id?}` | 观察状态快照，经 `sanitize` |
-| `send_decision {node?, thread_id, text, decision_id, model?, effort?, images?}` | 见第 5 节 |
+| `codex {node?, method, params}` | 调用表中非 `hidden` 的客户端请求，结果经 `sanitize`；写方法结果不明时报错，不重发 |
+| `codex_state {node?, thread_id?}` | 观察状态快照，经 `sanitize`；给 `thread_id` 时 `threads` 只含该线程 |
+| `send_decision {node?, thread_id, text, decision_id, model?, effort?, images?}` | 见第 5 节；返回 `{decision_id, thread_id, status, mode?, turn_id?, reason?}`，`status` 为 `delivered`、`unknown` 或 `rejected` |
+
+`codex_state` 的键：`connection`、`threads`、`pending_requests`、`account`、`rate_limits`、`mcp`、`apps`、`skills_changed_at_ms`、`warnings`、`events`、`hidden`、`reads`、`replies`。
 
 页面提供：续接已有会话（`thread/list`、`thread/read`）、插话、选模型和推理强度、附图片、计划和推理摘要、token 用量与额度、review、fork、回退、压缩、重命名、归档，以及技能、插件、MCP 的状态与管理。
 
@@ -179,9 +205,10 @@ vibeface hooks uninstall --data-dir <数据目录>
 - `WorkState::WaitingApproval`、`PendingApproval`、`Signal::Approval*`、`work::request_id`。
 - 事件 `ApprovalRequested`、`ApprovalAnswered`，`approvals` 表，`ApprovalDecision`，`WorkProjection.open_approvals` 与 `answered_approvals`。
 - RPC `answer_approval`、`approval_forms`，`executor::validate_response`、`request_text`、`request_form`。
-- Node 的 `start_work`、`Executor::start_thread`、`start_turn`、`answer`。
-- 网页的审批卡片和表单。
-- `executor=codex` 的跨设备派发。
+- 执行层：`Executor` trait、`CodexExecutor`、`ExecutorHost`（改为 `runtime/codex_server.rs` 的 `CodexServer`）、Node 的 `start_work`、`start_thread`、`start_turn`、`answer`、路径限制。
+- `model::Executor` 改为 `WorkKind { codex, task }`，工作字段 `executor` 改为 `kind`；节点能力里的 `executor` 改为 `codex`。
+- 网页的审批卡片和表单（网页另行处理）。
+- 到“执行层”的跨设备派发：跨设备只有协调 Agent 之间的 `task`。
 
 ## 8. 验证
 
