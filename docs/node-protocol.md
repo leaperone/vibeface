@@ -111,10 +111,11 @@
 - `target` 是本 Node 且本 Node 不是公共入口时，Noise 在这里终止。
 - `target` 是其他成员 Node 时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。目标不是成员时回 `{"type":"error","code":"target_not_member"}`，连不上时回 `target_unreachable`，随后关闭。
 - 公共入口没有地址簿，它把目标当作挂在自己 relay 上的设备去连接。只有持有入口令牌的 Node 能连上这台 relay，其他目标得到 `target_unreachable`。
+- 每台网关同时最多转发 256 个会话，超出时回 `gateway_busy` 并关闭。`connect` 首帧须在 10 秒内到达。
 
-随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。网关和它前面的 TLS 终止方只能看到 Noise 密文。
+随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。转发会话的网关、它前面的 TLS 终止方和 relay 只能看到 Noise 密文。提供网页的 origin 不在此列：它分发浏览器运行的代码，必须是本人自己的 Gateway 或本人自己服务器上的公共入口。
 
-握手后的应用消息均为二进制加密记录，大消息分片重组。解密后的请求为 `{ id, method, params }`，响应为 `{ id, result, error? }`。请求 ID 只用于匹配响应，写入去重依靠业务 ID。连接每 20 秒心跳，90 秒无数据关闭，单次调用 120 秒超时，超时的写操作结果未知，需要按业务 ID 对账。
+握手后的应用消息均为二进制加密记录，大消息分片重组。解密后的请求为 `{ id, method, params }`，响应为 `{ id, result, error? }`。请求 ID 只用于匹配响应，写入去重依靠业务 ID。Noise 握手须在 10 秒内完成。连接每 20 秒心跳，90 秒无数据关闭，单次调用 120 秒超时，超时的写操作结果未知，需要按业务 ID 对账。每台 Node 同时最多保留 32 个未加入设备的会话，超出时回 `too many devices are joining this Node; try again later`；未加入设备的会话最长 15 分钟，加入后不再计入。
 
 | method | params | 用途 |
 | --- | --- | --- |
@@ -138,11 +139,11 @@
 | `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的两分钟签名读取当前目录 |
 | `recover` | `genesis`、`checkpoint`、`capability` | 空 Node 安装根签目录，已建网 Node 安装更高 epoch checkpoint |
 
-未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`confirm_writable`、`diagnostics`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
+未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证 `RootCheckpoint` 的根签名并要求 epoch 更高，验证前没有副作用。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
 
-加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
+加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
-浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、`ApprovalAnswered`、本人结清的 `WorkFinished`、`AutonomySet` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`。签名覆盖网络、会话和去掉 `attestation` 的 body 规范 JSON，domain 为 `attestation`。签名设备必须是未撤销的客户端成员。Node 和协调 Agent 不能代写这些事件。
+浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、`ApprovalAnswered`、本人结清的 `WorkFinished`、`AutonomySet` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。Node 和协调 Agent 不能代写这些事件。
 
 恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`，加密正文包含根私钥、`genesis`、`recovery_epoch` 和解密材料，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文根私钥不发给 Node。根恢复默认保留现有管理设备。业务正文和项目文件不在恢复包中。
 
@@ -241,7 +242,7 @@ Event {
 }
 ```
 
-每台 Node 在网络中只有一条日志：`seq` 从 1 连续递增，`prev` 为同一作者 `seq - 1` 的 hash。`deps` 引用写入时依据的其他作者事件。`created_at_ms` 只用于展示。浏览器不写日志，它发起的写入由所连 Node 作为作者写入并附 `attestation`。
+每台 Node 在网络中只有一条日志：`seq` 从 1 连续递增，`prev` 为同一作者 `seq - 1` 的 hash。`deps` 引用写入时依据的其他作者事件。`created_at_ms` 用于展示，排序时只在 `lamport` 相同时作为第二键。浏览器不写日志，它发起的写入由所连 Node 作为作者写入并附 `attestation`。
 
 | 类型 | 主要字段 | 作者 |
 |---|---|---|
@@ -260,9 +261,9 @@ Event {
 
 通知由 `approval_requested` 和 `work_finished` 派生，通知 ID 即该事件 hash。执行层内部的命令、diff、推理和工具输出不进入 DAG。
 
-入库逐个检查 hash、网络、作者成员资格与 `cutoff_seq`、签名与 `attestation`、`seq` 与 `prev` 的连续性，以及 `deps` 是否已入库。签名只在入库时验证一次。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；同作者同序号不同内容写入 `log_conflicts`，不锁住会话；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。`log_heads` 保存每个作者的 `max_seq` 和 `head_hash`，即本机版本向量。
+入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者成员资格与 `cutoff_seq`，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会写入 `log_conflicts`，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；同作者同序号不同内容写入 `log_conflicts`，不锁住会话；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。`log_heads` 保存每个作者的 `max_seq` 和 `head_hash`，即本机版本向量。
 
-入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者，相同时取 hash 较小者；`AutonomySet` 取 `version` 最大者，同版本取更严格的模式；工作状态只前进。
+入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者；`AutonomySet` 取 `version` 最大者，同版本取更严格的模式；同一审批的回答取更严格的决定；工作状态只前进。这三类同级再相同时取请求身份较小者，请求身份为 `SHA256(attestation 签名输入 ‖ 签名设备)`。同一份已签名请求经不同入口重试时请求身份相同，外层事件 hash 不参与仲裁，重试不会改变结果。
 
 事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限 64 MiB，正文是 `blobs/sha256/<前两位>/<hash>` 文件，按网络和会话引用授权读取。
 
@@ -297,7 +298,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `vibeface/client/1` | 网关转发的浏览器 Noise 会话，每条流一个会话 | 任意设备，会话本身由 Noise 认证 |
 | `vibeface/join/1` | 只开放 `join` 和 `join_status` | 任意设备 |
 
-`sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。连接接受时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝。公共入口不接受任何入站 iroh 连接。
+`sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。连接接受时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝；成员目录变化时已接受的连接重新核对，对端不再是成员就关闭。撤销还会关闭到被撤销 Node 的出站连接并删除它的地址。公共入口不接受任何入站 iroh 连接。
 
 ### 同步
 
@@ -310,7 +311,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### 地址簿
 
-每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在配置了 `network.entry` 时取入口 URL，否则在启用 `gateway` 时取 `public_url`。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
+每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在配置了 `network.entry` 时取入口 URL，否则在启用 `gateway` 时取 `public_url`。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。浏览器为每台 Node 保存已接受记录的 `seq` 高水位，撤回地址的记录也保存，刷新后不接受更旧的记录。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
 
 ### 附件
 
@@ -335,7 +336,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### Relay 与公共入口
 
-启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。个人网络里的 relay 只接纳当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请。
+启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。个人网络里的 relay 只接纳当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
 公共入口（`init --public-entry`）不加入个人网络。它的 relay 只接纳持有 `entry-token` 的设备，它不运行调度、执行和同步，不保存业务数据，本机设置路径回 404。成员 Node 用 `--entry URL --relay-token-file PATH` 指向它：把入口的 relay 加为自己的 relay 并带上令牌，地址记录的 `gateway_url` 写入口 URL，于是邀请链接和二维码打开的是入口的 origin。浏览器经入口的 `/api/client` 连到成员 Node，入口只搬运 Noise 密文。部署步骤见 [配置公共入口](node.md#配置公共入口)。
 
