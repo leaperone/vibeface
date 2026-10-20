@@ -1551,7 +1551,7 @@ fn effective(store: &Store, net: &Net, events: &[&SignedEvent]) -> Result<Vec<bo
         .collect()
 }
 
-/// R2: P holds x#1..#10 and Q only #1..#7 when the revocation that counts up to #7 arrives.
+/// P holds x#1..#10 and Q only #1..#7 when the revocation that counts up to #7 arrives.
 /// After they sync, both count the same events, however the evidence arrived.
 #[test]
 fn a_revocation_cutoff_converges_whatever_arrived_first() -> Result<()> {
@@ -1668,7 +1668,7 @@ fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
     Ok(())
 }
 
-/// R5: x forks at seq 3. Once a replica holds both branches nothing of x from seq 3 counts, while
+/// x forks at seq 3. Once a replica holds both branches nothing of x from seq 3 counts, while
 /// b's event that depends on branch a does. A later revocation naming b#4 makes branch b count.
 #[test]
 fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
@@ -1728,7 +1728,7 @@ fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
     Ok(())
 }
 
-/// R3: a recovery retires x at (5, h5). Installed before or after x#1..#8, the same five count,
+/// A recovery retires x at (5, h5). Installed before or after x#1..#8, the same five count,
 /// and messages the replaced client signed still verify.
 #[test]
 fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result<()> {
