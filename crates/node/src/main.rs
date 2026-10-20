@@ -105,6 +105,12 @@ enum CodexCommand {
         /// Local image path or URL; repeat for more.
         #[arg(long)]
         image: Vec<String>,
+        /// Directory of the send log that keeps each --id to one send; defaults to
+        /// `codex-sends` in the Node data directory named by VIBEFACE_DATA_DIR.
+        #[arg(long)]
+        log: Option<PathBuf>,
+        #[arg(long, env = "VIBEFACE_DATA_DIR", hide = true)]
+        data_dir: Option<PathBuf>,
     },
     /// Print the thread's notifications as JSON lines.
     Watch { thread: String },
@@ -407,19 +413,29 @@ async fn main() -> Result<()> {
                     model,
                     effort,
                     image,
+                    log,
+                    data_dir,
                 } => {
+                    let log = log
+                        .or_else(|| data_dir.map(|dir| dir.join("codex-sends")))
+                        .context(
+                            "--log or VIBEFACE_DATA_DIR is required to keep each --id to one send",
+                        )?;
                     run(
                         &socket()?,
-                        Command::Send(vibeface_bridge::codex::Outgoing {
-                            thread_id: thread,
-                            text,
-                            client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                            model,
-                            effort,
-                            images: image,
-                            start_only: false,
-                            full_access: true,
-                        }),
+                        Command::Send(
+                            log,
+                            vibeface_bridge::codex::Outgoing {
+                                thread_id: thread,
+                                text,
+                                client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                                model,
+                                effort,
+                                images: image,
+                                start_only: false,
+                                full_access: true,
+                            },
+                        ),
                     )
                     .await
                 }

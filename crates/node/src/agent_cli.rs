@@ -89,10 +89,7 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
                 Err(error) => bail!(error.message),
             }
         }
-        Command::Send(outgoing) => {
-            // ponytail: the log lives beside the socket in its private /tmp directory, which a
-            // reboot clears; move it into the Node store if sends must survive reboots.
-            let log = socket.with_file_name("sends");
+        Command::Send(log, outgoing) => {
             let delivery = match claim(&log, &outgoing)? {
                 Claim::Done(delivery) => delivery,
                 Claim::ReadBack => {
@@ -207,7 +204,8 @@ pub enum Command {
         method: String,
         params: Option<String>,
     },
-    Send(Outgoing),
+    /// The send log directory, then the message.
+    Send(std::path::PathBuf, Outgoing),
     Watch {
         thread_id: String,
     },

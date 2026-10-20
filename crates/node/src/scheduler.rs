@@ -236,6 +236,10 @@ pub async fn run(
                     "VIBEFACE_CODEX_SOCKET".into(),
                     node.codex.socket.display().to_string(),
                 ),
+                (
+                    "VIBEFACE_DATA_DIR".into(),
+                    node.data_dir.display().to_string(),
+                ),
             ]),
             process_started: Some(process_recorder(&node, &network, &attempt.id)),
         };

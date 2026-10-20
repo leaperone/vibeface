@@ -507,6 +507,10 @@ impl Runtime {
                     "VIBEFACE_CODEX_SOCKET".to_owned(),
                     self.codex.socket.display().to_string(),
                 ),
+                (
+                    "VIBEFACE_DATA_DIR".to_owned(),
+                    self.data_dir.display().to_string(),
+                ),
             ]
             .into(),
             ..Default::default()
