@@ -97,7 +97,20 @@ def maintenance(node, command):
         raise
 
 
+_port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
+
+
 def available_port():
+    """A free loopback port; VIBEFACE_PORT_BASE pins runs to a known range."""
+    while _port_base[0]:
+        port = _port_base[0]
+        _port_base[0] += 1
+        with socket.socket() as stream:
+            try:
+                stream.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
     with socket.socket() as stream:
         stream.bind(("127.0.0.1", 0))
         return stream.getsockname()[1]
@@ -350,11 +363,21 @@ class Client:
             arguments.setdefault("report_results", True)
             body = {"type": "message_posted", "message_id": arguments["message_id"], "role": "user",
                     "text": arguments["text"], "report_results": arguments["report_results"]}
+            if arguments.get("attachments"):
+                arguments["attachments"] = sorted({(blob["hash"], blob["size"]) for blob in arguments["attachments"]})
+                arguments["attachments"] = [{"hash": hash_, "size": size} for hash_, size in arguments["attachments"]]
+                body = {**{key: body[key] for key in ("type", "message_id", "role", "text")},
+                        "attachments": arguments["attachments"], "report_results": body["report_results"]}
         elif method == "create_bot":
             body = {"type": "bot_created", "bot_id": arguments["bot_id"], "name": arguments["name"],
                     "instructions": arguments.get("instructions", "")}
             if arguments.get("project") is not None:
                 body["project"] = arguments["project"]
+        elif method == "set_owner":
+            body = {"type": "conversation_owner", "scheduler_node": arguments["scheduler_node"], "epoch": arguments["epoch"]}
+        elif method == "resolve" and arguments["check_id"].startswith("work:"):
+            body = {"type": "work_finished", "work_id": arguments["check_id"].removeprefix("work:"),
+                    "outcome": arguments["outcome"], "result_text": arguments.get("note", "").strip()}
         elif method == "set_autonomy":
             body = {"type": "autonomy_set", "mode": arguments["mode"], "version": arguments["expected_version"] + 1}
         elif method == "answer_approval":
@@ -366,6 +389,12 @@ class Client:
         return self.command("attest", network_id=self.network_id, scope_id=arguments["conversation_id"], body=body)
 
     def rpc(self, method, *, status=200, unsigned=False, **arguments):
+        if method in ("create_conversation", "create_bot") and not unsigned:
+            # The browser names the first scheduling Node, so a retry through any entry writes the same owner.
+            arguments.setdefault("scheduler_node", self.device_id)
+            arguments.setdefault("owner_attestation", self.command(
+                "attest", network_id=self.network_id, scope_id=arguments["conversation_id"],
+                body={"type": "conversation_owner", "scheduler_node": arguments["scheduler_node"], "epoch": 1}))
         attestation = None if unsigned else self.attestation(method, arguments)
         if attestation:
             arguments["attestation"] = attestation
@@ -800,6 +829,9 @@ def fixture_codex(arguments):
                         subscribed.add(thread_id)
                     elif method in {"thread/read", "thread/resume", "thread/turns/list", "turn/start", "turn/interrupt"}:
                         thread_id = params["threadId"]
+                        if thread_id not in state["threads"]:
+                            websocket_send(stream, {"id": message["id"], "error": {"code": -32600, "message": "thread not found: " + thread_id}})
+                            continue
                         thread = state["threads"][thread_id]
                         if method == "turn/start":
                             thread["directive"] = json.loads(params["input"][0]["text"])
@@ -842,13 +874,13 @@ def fixture_manager(arguments):
     start = prompt.rfind("\n\n{")
     require(start >= 0, "fixture receives explicit management context")
     context, _ = json.JSONDecoder().raw_decode(prompt[start + 2:])
-    trigger = context["trigger"]
-    body = (context.get("trigger_event") or {}).get("body", {})
-    autonomous = context["trigger_kind"] == "work_result"
+    trigger, kind = context["trigger"]["trigger"], context["trigger"]["kind"]
+    body = (context["trigger"].get("event") or {}).get("body", {})
+    autonomous = kind == "work_result"
     directive = {}
     if not autonomous:
         try:
-            candidate = json.loads(body.get("text", ""))
+            candidate = json.loads(body.get("prompt" if kind == "agent_task" else "text", ""))
             if isinstance(candidate, dict):
                 directive = candidate
         except ValueError:
@@ -865,9 +897,13 @@ def fixture_manager(arguments):
                 "fixture waits for durable native session ACK")
     record = {"conversation_id": context["conversation_id"], "trigger": trigger, "label": label,
               "native_session_id": native, "resumed": bool(initial.get("session_id")),
-              "autonomous": autonomous, "read_only": read_only, "pid": os.getpid(),
+              "autonomous": autonomous, "read_only": read_only, "pid": os.getpid(), "kind": kind,
               "work_id": body.get("work_id"), "outcome": body.get("outcome"),
-              "bot": context.get("configured_bot"), "bot_prompt_markers": [marker for marker in
+              "resumed_session": context["conversation"]["resumed_session"],
+              "checkpoint": context["conversation"]["checkpoint"] is not None,
+              "messages": [row["text"][:200] for row in context["conversation"]["messages"]],
+              "works": [row["work_id"] for row in context["works"]] if isinstance(context["works"], list) else None,
+              "bot": context["assistant"].get("configured_bot"), "bot_prompt_markers": [marker for marker in
                   ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in prompt],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
@@ -932,8 +968,8 @@ def fixture_manager(arguments):
                        "outcome": body.get("outcome"), "status_outcome": status["outcome"]})
     dispatch = directive.get("dispatch")
     if dispatch:
-        arguments = {"prompt": json.dumps(dispatch["native"]), "cwd": dispatch["cwd"],
-                     "call_ref": "work-" + dispatch["label"], **({"parent": dispatch["parent"]} if "parent" in dispatch else {})}
+        arguments = {"prompt": json.dumps(dispatch["native"]), "cwd": dispatch["cwd"], "call_ref": "work-" + dispatch["label"],
+                     **{key: dispatch[key] for key in ("parent", "target_node", "executor", "continues") if key in dispatch}}
         for index in range(dispatch.get("repeat", 1)):
             work = tool("dispatch_work", arguments, discard=dispatch.get("discard_first", False) and index == 0)
         found = tool("call_lookup", {"call_ref": arguments["call_ref"]})
@@ -1362,15 +1398,15 @@ def work_checks(run, workspace, a, network, passed):
     a.client.authenticate()
     lost = wait_for("an unreadable turn becomes unverified", lambda: in_state(name, work_id, "unverified"))
     check_id = "work:" + work_id
-    require(any(check["check_id"] == check_id and check["kind"] == "work" for check in snapshot(name)["pending_checks"]),
-            "the unverified work lists one pending check")
+    wait_for("the unverified work lists one pending check", lambda: any(
+        check["check_id"] == check_id and check["kind"] == "work" for check in snapshot(name)["pending_checks"]))
     require_quiet("an unverified work never reports or reruns", lambda:
         scheduler_record(a, network, "work:" + work_id) is None
         and len([row for row in rpc("turn/start") if row["message"]["params"]["cwd"] == str(directory)]) == 1)
     reconciled = a.client.rpc("reconcile", conversation_id=name, check_id=check_id)
     require(reconciled["pending"], "reconcile keeps an unreadable turn pending")
-    a.client.rpc("resolve", conversation_id=name, check_id=check_id,
-                 evidence="Fixture thread was deleted; no file in the work directory changed.")
+    a.client.rpc("resolve", conversation_id=name, check_id=check_id, outcome="interrupted",
+                 note="Fixture thread was deleted; no file in the work directory changed.")
     resolved = wait_for("the user's evidence settles the work", lambda: in_state(name, work_id, "finished"))
     require(not any(check["check_id"] == check_id for check in snapshot(name)["pending_checks"]),
             "resolution clears the pending check")
@@ -1959,6 +1995,389 @@ def acceptance(options):
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
 
+def scope_events(node, network, scope):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        rows = connection.execute("SELECT envelope FROM events WHERE network_id=? ORDER BY lamport, hash", (network,)).fetchall()
+    events = [json.loads(json.loads(row[0])["canonical_body"]) for row in rows]
+    return [event for event in events if event["scope_id"] == scope]
+
+
+def committed_blob_offset(node, network, digest):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        row = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key=?",
+                                 (network, "blob-partial:" + digest)).fetchone()
+    return json.loads(row[0]) if row else 0
+
+
+def phase4_acceptance(options):
+    """Phase-4 coordination acceptance with real Node processes and fixture SDKs.
+
+    A and B each run a fixture Agent and a fixture Codex App Server; P is the public Node (relay and
+    Gateway); C runs only Codex and is revoked while offline. One browser identity uses every entrance.
+    """
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("phase4-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    nodes, clients, roots = [], [], {}
+    report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
+              "coverage": "four real Node processes over iroh (A, B with fixture Agent + Codex App Server, public P, "
+                          "Codex-only C); WASM browser client on every entrance",
+              "not_checked": ["real provider models", "rendered browser UI (see the browser screenshots)",
+                              "a model-written checkpoint summary (phase 4 writes deterministic excerpts)"]}
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS " + name, flush=True)
+
+    def browser(node):
+        client = Client(node.url, helper, module, identity_file=a.client.identity_file)
+        client.network_id = network
+        clients.append(client)
+        client.connect(node.device_id)
+        wait_for(f"the browser is known at {node.name}", lambda: client.authenticate())
+        return client
+
+    def records(node, filename="manager-invocations.jsonl"):
+        return fixture_records(roots[node.name], filename)
+
+    def turn(node, trigger):
+        wait_for(f"{node.name} completes {trigger}", lambda:
+                 (scheduler_record(node, network, trigger) or {}).get("state") == "completed", timeout=60)
+        return next(row for row in records(node) if row["trigger"] == trigger)
+
+    def works(client):
+        return {row["work_id"]: row for row in client.rpc("conversation", conversation_id=conversation)["works"]}
+
+    def work_in(client, work_id, *states):
+        row = works(client).get(work_id)
+        return row if row and row["state"] in states else None
+
+    def dispatched(node, label):
+        return wait_for(f"{node.name} dispatches {label}", lambda: next(
+            (row for row in records(node, "manager-native-work.jsonl") if row["label"] == label), None), timeout=60)["work_id"]
+
+    def codex_rpc(node, method):
+        return [row for row in records(node, "codex-rpc.jsonl") if row["message"].get("method") == method]
+
+    def send(client, message_id, directive, **extra):
+        text = directive if isinstance(directive, str) else json.dumps(directive)
+        return client.rpc("message", conversation_id=conversation, message_id=message_id, text=text, **extra)
+
+    def folder(name, *, released=False):
+        path = workspace / name
+        path.mkdir()
+        if released:
+            (path / "release").touch()
+        return path
+
+    def restart(node):
+        node.stop()
+        node.start()
+        node.client.connect()
+        node.client.authenticate()
+
+    try:
+        relay_port = available_port()
+        relay_url = f"http://127.0.0.1:{relay_port}"
+        for name in ("A", "P", "B", "C"):
+            nodes.append(Node(run, name, binary, workspace, None, helper, module))
+        a, p, b, c = nodes
+        for node in (a, b, c):
+            root = roots[node.name] = run / ("fixture-" + node.name)
+            root.mkdir(mode=0o700)
+            node.configure(timeout_secs=600, daily_decision_limit=100,
+                           codex_bin=str(fixture_wrapper(root, "fixture-codex", "--fixture-codex")),
+                           manager=fixture_manager_settings(root, workspace) if node is not c else None)
+            node.configure_network(relays=[relay_url])
+        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+        a.start()
+        network = a.bootstrap()
+        p.pair(a)
+        p.start()
+        at_p = browser(p)
+        b.pair(a)
+        b.start()
+
+        link = at_p.invite()
+        log_path = run / "join-C.log"
+        with open(log_path, "wb") as log:
+            joining = subprocess.Popen([str(binary), "join", "--data-dir", str(c.directory), "--name", "Node C", link],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+            try:
+                listed = wait_for("A lists the join request P holds", lambda: a.client.pending_join(c.device_id))
+                require(listed["status"] == "pending", "the request is still pending at its holder")
+                a.client.start_approval(listed["join_id"])
+                reviewed = wait_for("the joiner's nonce reaches A through P", lambda: (lambda item: item if item and item.get(
+                    "joiner_nonce") else None)(a.client.pending_join(c.device_id)))
+                code = a.client.command("short_code", request=reviewed)
+                wait_for("the CLI shows the same short code", lambda: code.encode() in log_path.read_bytes())
+                a.client.grant(reviewed)
+                joining.wait(timeout=40)
+                require(joining.returncode == 0, "C joins after an approval made at another entrance")
+            finally:
+                if joining.poll() is None:
+                    joining.kill()
+                    joining.wait(timeout=5)
+        c.start()
+        members = (a, p, b, c)
+        passed("join-across-entrances", holder="P", approved_at="A")
+
+        conversation = "p4-conversation"
+        definition = {"bot_id": "p4-bot", "conversation_id": conversation, "name": "第四期助手", "instructions": "",
+                      "project": {"target_node": a.device_id, "cwd": str(workspace)}}
+        request = {"method": "create_bot", **definition, "scheduler_node": a.device_id,
+                   "owner_attestation": a.client.command("attest", network_id=network, scope_id=conversation, body={
+                       "type": "conversation_owner", "scheduler_node": a.device_id, "epoch": 1}),
+                   "attestation": a.client.attestation("create_bot", dict(definition))}
+        at_p.command("drop", method="rpc", params=request)
+        at_p.connect(p.device_id)
+        at_p.authenticate()
+        at_b = browser(b)
+        wait_for("P's creation, whose answer was lost, reaches B", lambda: any(
+            bot["bot_id"] == "p4-bot" for bot in at_b.rpc("bots")["bots"]), timeout=60)
+        retried = at_b.call("rpc", request)["bot"]
+        original = next(bot for bot in at_p.rpc("bots")["bots"] if bot["bot_id"] == "p4-bot")
+        require(retried == original, "the same signed creation through another entrance returns the original")
+        wait_for("the conversation reaches A", lambda: converged(members, network), timeout=60)
+        owners = {client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] for client in (a.client, at_b, at_p)}
+        require(owners == {a.device_id}, "every entrance records the owner the browser signed")
+        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A")
+
+        first_dir = folder("p4-first", released=True)
+        side_effect = workspace / "p4-side-effect.txt"
+        r1 = send(a.client, "p4-m1", {"label": "p4-m1", "host_command": "printf once >> p4-side-effect.txt",
+                                      "host_cwd": str(workspace), "dispatch": {"label": "p4-first", "cwd": str(first_dir),
+                                                                               "native": {"gate": str(first_dir / "release")}}})
+        first = dispatched(a, "p4-first")
+        t1 = turn(a, r1["trigger"])
+        seen_at_b = wait_for("entrance B shows the work A finished", lambda: work_in(at_b, first, "finished"), timeout=60)
+        require(seen_at_b["outcome"] == "completed", "B shows A's result")
+        turn(a, "work:" + first)
+        r2 = send(at_b, "p4-m2", {"label": "p4-m2", "dispatch": {"label": "p4-continued", "cwd": str(first_dir),
+                                                                 "continues": first, "native": {"gate": str(first_dir / "release")}}})
+        require(r2["state"] == "pending_delivery", "entrance B keeps the message for owner A")
+        continued = dispatched(a, "p4-continued")
+        t2 = turn(a, r2["trigger"])
+        done = wait_for("the continued work finishes", lambda: work_in(at_b, continued, "finished"), timeout=60)
+        rows = works(a.client)
+        require(done["thread_id"] == rows[first]["thread_id"], "the follow-up continues the original native thread")
+        require(len([row for row in codex_rpc(a, "thread/start") if row["message"]["params"]["cwd"] == str(first_dir)]) == 1,
+                "the follow-up starts no second thread")
+        require(t2["resumed"] and t2["native_session_id"] == t1["native_session_id"],
+                "a message through entrance B continues the owner's native Agent session")
+        require(any("p4-m2" in text for text in t2["messages"]), "the turn reads the message sent through B")
+        wait_for("all entrances converge", lambda: converged(members, network), timeout=60)
+        views = {name: [(row["message_id"], row["text"]) for row in client.rpc("conversation", conversation_id=conversation)["messages"]]
+                 for name, client in (("A", a.client), ("B", at_b), ("P", at_p))}
+        require(views["A"] == views["B"] == views["P"], "every entrance shows the same conversation")
+        passed("cross-entrance-context", messages=len(views["A"]), native_session=t1["native_session_id"][:24],
+               thread=done["thread_id"][:24], resumed=t2["resumed"])
+
+        task_dir = folder("p4-task")
+        task_directive = {"label": "p4-task", "gate": str(task_dir / "task-release"),
+                          "dispatch": {"label": "p4-task-child", "cwd": str(task_dir),
+                                       "native": {"gate": str(task_dir / "release"), "approval": True}},
+                          "tools": [{"name": "answer_approval", "arguments": {"work_id": "any", "request_id": "any"},
+                                     "accepted": False, "rejection": "unknown or unavailable"},
+                                    {"name": "dispatch_work", "arguments": {"prompt": "bounce", "cwd": str(task_dir), "call_ref": "bounce",
+                                                                            "executor": "agent", "target_node": a.device_id},
+                                     "accepted": False, "rejection": "only starts Codex work on its own device"}]}
+        r3 = send(a.client, "p4-m3", {"label": "p4-m3", "dispatch": {"label": "p4-task", "cwd": str(task_dir), "executor": "agent",
+                                                                     "target_node": b.device_id, "native": task_directive}})
+        task = dispatched(a, "p4-task")
+        turn(a, r3["trigger"])
+        child = dispatched(b, "p4-task-child")
+        waiting = wait_for("A shows B's native approval with its form", lambda: (lambda row: row if row and row["open_approvals"]
+                           and row["open_approvals"][0].get("form") else None)(work_in(a.client, child, "waiting_approval")), timeout=60)
+        task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
+        require(task_turn["kind"] == "agent_task" and not task_turn["read_only"], "B's own Agent runs the task")
+        refused = [row for row in records(b, "manager-tool-errors.jsonl") if row["trigger"] == "task:" + task]
+        require(len(refused) == 2, "B's Agent can neither answer an approval nor hand the task on")
+        a.client.rpc("answer_approval", conversation_id=conversation, work_id=child,
+                     request_id=waiting["open_approvals"][0]["request_id"], response={"decision": "accept"})
+        (task_dir / "release").touch()
+        wait_for("the approved child finishes", lambda: work_in(a.client, child, "finished"), timeout=60)
+        answers = [row for row in records(b, "codex-rpc.jsonl") if "method" not in row["message"]
+                   and str(row["message"].get("id", "")).startswith("approval-")]
+        require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"},
+                "the user's answer at entrance A reaches B's App Server once")
+        starts = [row for row in codex_rpc(b, "thread/start") if row["message"]["params"]["cwd"] == str(task_dir)]
+        require(len(starts) == 1 and starts[0]["message"]["params"].get("approvalPolicy") == "on-request",
+                "B starts the child under native approval")
+        (task_dir / "task-release").touch()
+        finished = wait_for("the task finishes on B", lambda: work_in(a.client, task, "finished"), timeout=60)
+        require(finished["outcome"] == "completed" and "p4-task:complete" in finished["result_text"], "the task reports B's Agent result")
+        turn(a, "work:" + task)
+        wait_for("B's events reach A", lambda: converged(members, network), timeout=60)
+        # B also entered the user's own signed message p4-m2; everything else it wrote is work.
+        by_b = {event["body"]["type"] for event in scope_events(a, network, conversation) if event["author"] == b.device_id
+                and not (event["body"]["type"] == "message_posted" and event["body"]["role"] == "user")}
+        require(by_b and by_b <= {"work_dispatched", "work_progress", "approval_requested", "approval_answered", "work_finished"},
+                "B's Agent writes only work events to the conversation")
+        passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b))
+
+        r4 = send(a.client, "p4-m4", {"label": "p4-m4", "tools": [
+            {"name": "dispatch_work", "arguments": {"prompt": "outside", "cwd": str(run), "call_ref": "outside-codex"},
+             "accepted": False, "rejection": "outside configured roots"},
+            {"name": "dispatch_work", "arguments": {"prompt": "outside", "cwd": str(run), "call_ref": "outside-agent",
+                                                    "executor": "agent", "target_node": b.device_id}}]})
+        turn(a, r4["trigger"])
+        remote = next(row for row in records(a, "manager-tools.jsonl") if row["call_ref"] == "outside-agent")["result"]
+        require(remote["state"] == "rejected" and "outside configured roots" in remote["reason"], "B refuses an agent task outside its roots")
+        send(a.client, "p4-unsigned", "no signature", unsigned=True, status=400)
+        read_only = [row for row in records(a, "manager-tool-errors.jsonl") if row["trigger"].startswith("work:") and "read-only" in row["error"]]
+        require(read_only, "result turns in report mode cannot dispatch")
+        passed("authority-checks", codex="outside configured roots", agent=remote["reason"][:80],
+               unsigned="rejected", report_mode_dispatch_refusals=len(read_only))
+
+        revoked_dir = folder("p4-revoked")
+        r5 = send(a.client, "p4-m5", {"label": "p4-m5", "dispatch": {"label": "p4-revoked", "cwd": str(revoked_dir),
+                                                                     "target_node": c.device_id, "native": {"gate": str(revoked_dir / "release")}}})
+        lost = dispatched(a, "p4-revoked")
+        turn(a, r5["trigger"])
+        wait_for("C runs the work", lambda: work_in(a.client, lost, "running"), timeout=60)
+        c.stop(crash=True)
+        stop = a.client.rpc("interrupt_work", conversation_id=conversation, work_id=lost)
+        require(stop.get("waiting_for_device") and not stop["confirmed"], "a stop to an offline device waits for it")
+        require(works(a.client)[lost].get("stop") == {"waiting_for_device": True, "timed_out": False}, "the work shows the waiting stop")
+        timed = wait_for("the stop request times out", lambda: (lambda row: row if row.get("stop", {}).get("timed_out") else None)(
+            works(a.client)[lost]), timeout=60)
+        a.client.revoke(c.device_id, heads(a, network).get(c.device_id, 0))
+        abandoned = wait_for("A abandons the revoked device's work", lambda: (lambda row: row if row["outcome"] == "abandoned" else None)(
+            works(a.client)[lost]), timeout=60)
+        require("stop" not in abandoned, "the abandoned work drops its stop request")
+        passed("offline-stop-and-revoke", stop=timed["stop"], outcome=abandoned["outcome"])
+
+        check_dir = folder("p4-check")
+        r6a = send(a.client, "p4-m6a", {"label": "p4-m6a", "dispatch": {"label": "p4-check-done", "cwd": str(check_dir),
+                                                                       "native": {"gate": str(check_dir / "release")}}})
+        r6b = send(a.client, "p4-m6b", {"label": "p4-m6b", "dispatch": {"label": "p4-check-not", "cwd": str(check_dir),
+                                                                       "native": {"gate": str(check_dir / "release")}}})
+        done_id, not_id = dispatched(a, "p4-check-done"), dispatched(a, "p4-check-not")
+        turn(a, r6a["trigger"])
+        turn(a, r6b["trigger"])
+        threads = [wait_for("the check work runs", lambda: work_in(a.client, work_id, "running"))["thread_id"] for work_id in (done_id, not_id)]
+        a.stop(crash=True)
+        state_path = roots["A"] / "fixture-codex-state.json"
+        state = json.loads(state_path.read_text())
+        for thread in threads:
+            del state["threads"][thread]
+        private_json(state_path, state)
+        a.start()
+        a.client.connect()
+        a.client.authenticate()
+        turns_before = len(codex_rpc(a, "turn/start"))
+        for work_id in (done_id, not_id):
+            wait_for("B hears of the unreadable work soon after A restarts", lambda: work_in(at_b, work_id, "unverified"), timeout=20)
+        checks = {row["check_id"] for row in at_b.rpc("conversation", conversation_id=conversation)["pending_checks"]}
+        require({"work:" + done_id, "work:" + not_id} <= checks, "entrance B lists both checks")
+        again = at_b.rpc("reconcile", conversation_id=conversation, check_id="work:" + done_id)
+        require(again["pending"], "checking again on the device stays undecided")
+        at_b.rpc("resolve", conversation_id=conversation, check_id="work:" + done_id, outcome="completed", note="设备上已看到结果")
+        a.client.rpc("resolve", conversation_id=conversation, check_id="work:" + not_id, outcome="interrupted")
+        done_row = wait_for("the done choice settles", lambda: work_in(a.client, done_id, "finished"), timeout=60)
+        not_row = wait_for("the not-done choice settles", lambda: work_in(a.client, not_id, "finished"), timeout=60)
+        require(done_row["outcome"] == "completed" and done_row["result_text"] == "设备上已看到结果"
+                and not_row["outcome"] == "interrupted", "each choice becomes the work's outcome")
+        settled = [event for event in scope_events(a, network, conversation) if event["body"]["type"] == "work_finished"
+                   and event["body"]["work_id"] in (done_id, not_id) and event["body"].get("attestation")]
+        require({event["body"]["attestation"]["device_id"] for event in settled} == {a.client.own_id()},
+                "both settlements carry the user's signature")
+        require({event["author"] for event in settled} == {a.device_id, b.device_id}, "each entrance writes the choice made there")
+        require(len(codex_rpc(a, "turn/start")) == turns_before, "settling a check never reruns the work")
+        passed("pending-check-choices", recheck="pending", completed=done_id, interrupted=not_id)
+
+        for index in range(6):
+            send(a.client, f"p4-pad-{index}", f"p4-pad-{index} " + "背景资料" * 1200, report_results=False)
+        for index in range(6):
+            turn(a, f"message:p4-pad-{index}")
+        wait_for("A condenses the long history into a checkpoint", lambda: any(
+            event["body"]["type"] == "context_checkpoint" for event in scope_events(a, network, conversation)), timeout=90)
+        wait_for("the checkpoint reaches B", lambda: any(
+            event["body"]["type"] == "context_checkpoint" for event in scope_events(b, network, conversation)), timeout=60)
+        a_calls, b_calls = len(records(a)), len(records(b))
+        at_b.rpc("set_owner", conversation_id=conversation, scheduler_node=b.device_id, epoch=2)
+        wait_for("every entrance moves the conversation to B", lambda: all(
+            client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] == b.device_id
+            for client in (a.client, at_p)), timeout=60)
+        r7 = send(a.client, "p4-m7", {"label": "p4-m7"})
+        t7 = turn(b, r7["trigger"])
+        require(not t7["resumed"] and t7["checkpoint"] and any("p4-m7" in text for text in t7["messages"]),
+                "the new owner starts fresh from the checkpoint and the newer messages")
+        require_quiet("the switch replays nothing", lambda: side_effect.read_text() == "once"
+                      and len(records(a)) == a_calls
+                      and [row["trigger"] for row in records(b)[b_calls:]] == [r7["trigger"]])
+        passed("owner-switch-without-replay", owner="B", epoch=2, checkpoint=t7["checkpoint"],
+               messages_in_prompt=len(t7["messages"]), host_effects=side_effect.read_text())
+
+        payload = run / "attachment.bin"
+        with open(payload, "wb") as out:
+            for _ in range(64):
+                out.write(os.urandom(1024 * 1024))
+        size, digest = payload.stat().st_size, file_sha256(payload)
+        offset, restarted_at, sent_after = 0, None, 0
+        with open(payload, "rb") as source:
+            while True:
+                source.seek(offset)
+                chunk = source.read(1024 * 1024)
+                reply = a.client.rpc("upload_attachment", conversation_id=conversation, hash=digest, size=size,
+                                     offset=offset, data=base64.b64encode(chunk).decode())
+                if restarted_at is not None:
+                    sent_after += len(chunk)
+                if reply["complete"]:
+                    break
+                offset = reply["offset"]
+                if restarted_at is None and offset >= 24 * 1024 * 1024:
+                    restart(a)
+                    restarted_at, offset = offset, 0
+        require(restarted_at and sent_after <= size - restarted_at + 1024 * 1024, "the upload resumes after a restart")
+        b.stop()
+        receipt = send(a.client, "p4-attachment", "请看附件", attachments=[{"hash": digest, "size": size}], report_results=False)
+        partial = b.directory / "blobs" / "partial" / (digest + ".part")
+        b.start()
+        wait_for("B starts downloading", lambda: partial.exists() and partial.stat().st_size >= 4 * 1024 * 1024
+                 and committed_blob_offset(b, network, digest) > 0, timeout=60)
+        b.stop(crash=True)
+        kept = committed_blob_offset(b, network, digest)
+        b.start()
+        stored = b.directory / "blobs" / "sha256" / digest[:2] / digest
+        wait_for("B finishes the attachment", lambda: stored.exists() and stored.stat().st_size == size, timeout=120)
+        require(file_sha256(stored) == digest and 0 < kept < size, "B resumes the download and verifies its hash")
+        at_b.connect(b.device_id)
+        wait_for("the browser reconnects to the restarted B", lambda: at_b.authenticate())
+        shown = next(row for row in at_b.rpc("conversation", conversation_id=conversation)["messages"] if row["message_id"] == "p4-attachment")
+        require(shown["blobs"] == [{"hash": digest, "size": size}], "the message carries its attachment on every entrance")
+        payload.unlink()
+        passed("attachment-64mib-restart-resume", size=size, upload_restart_at=restarted_at, download_kept=kept,
+               message=receipt["message_id"])
+
+        require(file_sha256(binary) == report["binary_sha256"], "one immutable binary completes acceptance")
+        report["status"] = "passed"
+    except BaseException as error:
+        report.update(status="failed", failure=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
+        raise
+    finally:
+        for client in clients:
+            client.close()
+        for node in reversed(nodes):
+            node.client.close()
+            try:
+                node.stop()
+            except subprocess.TimeoutExpired:
+                report.setdefault("slow_stop", []).append(node.name)
+        for root in roots.values():
+            stop_fixture_processes(root)
+        report["cleanup"] = {"remaining_nodes": sum(node.process is not None and node.process.poll() is None for node in nodes)}
+        private_json(run / "report.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+
+
 def upgrade_status(node, path, origin):
     """The status of a WebSocket upgrade to `path` sent as a page on `origin` would send it."""
     connection = http.client.HTTPConnection("127.0.0.1", node.port, timeout=5)
@@ -2180,9 +2599,12 @@ if __name__ == "__main__":
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run Agent delegation, host effects, cancellation and native observation process checks")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
+        modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
         arguments = parser.parse_args()
         try:
-            if arguments.auto_route:
+            if arguments.phase4:
+                phase4_acceptance(arguments)
+            elif arguments.auto_route:
                 auto_route_acceptance(arguments)
             elif arguments.web_only:
                 web_acceptance(arguments)
