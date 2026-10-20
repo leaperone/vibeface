@@ -30,7 +30,7 @@ const localLaunch = { url: 'http://127.0.0.1:49781', device_id: target, token: '
 const genesis = { version: 1, network_id: network, first_client: { device_id: subject, kind: 'client', name: 'browser', manage: true }, first_node: { device_id: target, kind: 'node', name: 'node', manage: false }, signature: 's' }
 const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1 }
 const inviteId = '1'.repeat(32), joinNonce = '9'.repeat(64)
-const joinRequest = (status: string, extra: Record<string, unknown> = {}) => ({ join_id: 'join', status, network_id: network, invite_id: inviteId, device_id: subject, kind: 'client', name: 'browser', admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 60000, ...extra })
+const joinRequest = (status: string, extra: Record<string, unknown> = {}) => ({ join_id: 'join', status, network_id: network, invite_id: inviteId, device_id: subject, kind: 'client', name: 'browser', commit: 'd'.repeat(64), admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 60000, ...extra })
 const deferred = () => {
   let resolve: (value: unknown) => void = () => {}, reject: (reason: Error) => void = () => {}
   const promise = new Promise<unknown>((yes, no) => { resolve = yes; reject = no })
@@ -47,6 +47,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinStatus = { value: joining ? joinRequest(joining) : joinRequest('pending') } as { value: Record<string, unknown> }
+  const managed = { value: [] as Record<string, unknown>[] }
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
   const sessionEntry: ConnectionEntry = { address: 'https://node.example', device_id: target, local: true }
@@ -70,7 +71,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
       })
     },
   }
-  if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry, join_id: 'join', invite_id: inviteId, nonce: joinNonce, name: 'browser' }))
+  if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry, join_id: 'join', invite_id: inviteId, nonce: joinNonce, name: 'browser', pinned: { network_id: network, admin_id: target, admin_nonce: '2'.repeat(64) } }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
@@ -92,6 +93,9 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'authenticate' && localSession) return { principal: { network_id: network } }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'join') return joinRequest('pending')
+        if (method === 'join_status' && !params.join_id) return { requests: managed.value }
+        if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
+        if (method === 'directory') return { state: { genesis }, view: secure.verifiedView() }
         if (method === 'join_status') return params.reveal ? { ...joinStatus.value, joiner_nonce: params.reveal } : joinStatus.value.status === 'joined' ? { ...joinStatus.value, state: { genesis } } : joinStatus.value
         if (method === 'recovery_state' || method === 'directory') return { state: { genesis }, view: membership }
         return {}
@@ -158,7 +162,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, calls, requests, setupRequests, joinStatus, holds, sockets, stored, timers, location, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -395,6 +399,41 @@ test('a pending join survives reload without resubmitting', async () => {
     app.render(); await settle()
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status'])
     assert.equal(app.render().joining?.join_id, 'join')
+  } finally { app.close() }
+})
+
+test('a joiner keeps the manager nonce it saw before revealing and stops when the entry changes it', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    const nonce = JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null').nonce
+    app.joinStatus.value = joinRequest('confirming', { admin_id: target, admin_nonce: '2'.repeat(64) })
+    await app.render().checkJoin()
+    assert.equal(app.render().joining?.code, '123456')
+    assert.equal(JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null').pinned.admin_nonce, '2'.repeat(64))
+    app.joinStatus.value = joinRequest('confirming', { admin_id: target, admin_nonce: '3'.repeat(64), joiner_nonce: nonce })
+    await assert.rejects(app.render().checkJoin(), /改动了加入请求/)
+    assert.equal(app.render().joining, null)
+  } finally { app.close() }
+})
+
+test('a manager shows the short code only for its own nonce and the commitment it saw before sending it', async () => {
+  const app = deviceHarness({ management: true, saved: true })
+  try {
+    app.render(); await settle(); app.render()
+    app.managed.value = [joinRequest('pending', { device_id: remote })]
+    await app.render().refreshDirectory(); app.render()
+    await app.render().startApproval('join')
+    const sent = app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce)
+    const revealed = { device_id: remote, admin_id: subject, admin_nonce: sent[0], joiner_nonce: joinNonce }
+    for (const [change, code] of [[{}, '123456'], [{ commit: 'e'.repeat(64) }, undefined], [{ admin_nonce: '3'.repeat(64) }, undefined], [{ device_id: '7'.repeat(64) }, undefined]] as const) {
+      app.managed.value = [joinRequest('confirming', { ...revealed, ...change })]
+      await app.render().refreshDirectory()
+      assert.equal(app.render().joins[0]?.code, code)
+    }
+    await app.render().startApproval('join')
+    assert.deepEqual(app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce), [sent[0], sent[0]])
   } finally { app.close() }
 })
 

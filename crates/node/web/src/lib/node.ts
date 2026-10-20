@@ -25,7 +25,7 @@ export type MembershipView = { network_id: string; epoch: number; heads: string[
 export type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'expired'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
-  join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string
+  join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
   admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; device_id: string; token: string } }
@@ -105,7 +105,7 @@ export function parseJoinRequest(value: unknown): JoinRequest {
   if (typeof v.invite_id !== 'string' || !/^[a-f0-9]{32}$/.test(v.invite_id)) throw new Error('邀请编号无效。')
   return {
     join_id: text(v.join_id), status: v.status as JoinStatus, network_id: validTarget(v.network_id), invite_id: v.invite_id, device_id: validTarget(v.device_id),
-    kind: v.kind, name: text(v.name), admin_id: hex32(v.admin_id), admin_nonce: hex32(v.admin_nonce), joiner_nonce: hex32(v.joiner_nonce),
+    kind: v.kind, name: text(v.name), commit: validTarget(v.commit), admin_id: hex32(v.admin_id), admin_nonce: hex32(v.admin_nonce), joiner_nonce: hex32(v.joiner_nonce),
     reason: typeof v.reason === 'string' ? v.reason : null, expires_at_ms: integer(v.expires_at_ms),
   }
 }

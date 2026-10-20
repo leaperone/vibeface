@@ -1043,6 +1043,9 @@ struct PendingJoin {
     link: String,
     name: String,
     nonce: String,
+    /// `(network_id, admin_id, admin_nonce)` fixed before this Node reveals its nonce; the short code and the
+    /// joined network come from these, never from a later answer of the entry.
+    pinned: Option<(String, String, String)>,
 }
 
 /// The joining Node's side of `vibeface/join/1`, through the ticket's addresses. The relay
@@ -1114,12 +1117,13 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
         "this Node already belongs to a personal network"
     );
     let path = dir.join("join.json");
-    let pending = match std::fs::read(&path) {
+    let mut pending = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice::<PendingJoin>(&bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingJoin {
             link: link.trim().to_owned(),
             name: name.to_owned(),
             nonce: crate::identity::local::random_hex(32),
+            pinned: None,
         },
         Err(error) => return Err(error.into()),
     };
@@ -1138,8 +1142,9 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
             )
             .await?,
     )?;
+    let invite = invite_id(&ticket.invite_hash()).map_err(anyhow::Error::msg)?;
     ensure!(
-        request.invite_id == invite_id(&ticket.invite_hash()).map_err(anyhow::Error::msg)?,
+        request.invite_id == invite,
         "entry answered for another invite"
     );
     let join_id = request.join_id;
@@ -1159,7 +1164,9 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
             JoinStatus::Joined => {
                 let state: NetworkState = from_field(&status, "state")?;
                 ensure!(
-                    state.genesis.network_id == request.network_id,
+                    pending.pinned.as_ref().map(|pin| pin.0.as_str())
+                        == Some(request.network_id.as_str())
+                        && state.genesis.network_id == request.network_id,
                     "entry returned another personal network"
                 );
                 state.project()?.node(&device)?;
@@ -1180,14 +1187,25 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
                 );
             }
             JoinStatus::Confirming if !shown => {
-                let (admin, admin_nonce) = request
-                    .admin_id
-                    .as_deref()
-                    .zip(request.admin_nonce.as_deref())
-                    .context("entry omitted the manager nonce")?;
+                let seen = (
+                    request.network_id,
+                    request.admin_id.context("entry omitted the manager")?,
+                    request
+                        .admin_nonce
+                        .context("entry omitted the manager nonce")?,
+                );
+                if pending.pinned.is_none() {
+                    pending.pinned = Some(seen.clone());
+                    crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
+                }
+                let (network, admin, admin_nonce) = pending.pinned.as_ref().context("pinned")?;
+                ensure!(
+                    *network == seen.0 && *admin == seen.1 && *admin_nonce == seen.2,
+                    "the entry changed the join after the short code was fixed; delete join.json and ask for a new link"
+                );
                 let code = short_code(
-                    &request.network_id,
-                    &request.invite_id,
+                    network,
+                    &invite,
                     &device,
                     admin,
                     admin_nonce,

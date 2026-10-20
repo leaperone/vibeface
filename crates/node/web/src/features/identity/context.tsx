@@ -22,8 +22,14 @@ type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: bo
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
 type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
-/** This browser's own join request; `nonce` stays here until the manager has committed its nonce. */
-export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; code?: string; reason?: string | null }
+/**
+ * This browser's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
+ * network, manager and manager nonce seen before the reveal; the short code uses only these.
+ */
+export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; reason?: string | null }
+type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
+/** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
+type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 /** A fresh invitation; without a public HTTPS entry a phone scans `ticket` from its public entry's page. */
 export type Invitation = { link: string; ticket: string; publicEntry: boolean; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
@@ -82,14 +88,23 @@ function resumeTargets(): Reconnect[] {
 function loadJoining(): Joining | null {
   try {
     const v = record(load('pending-join'))
-    return { entry: parseEntry(v.entry), join_id: String(v.join_id), invite_id: String(v.invite_id), nonce: validTarget(v.nonce), name: deviceName(String(v.name)), status: 'pending' }
+    const pin = v.pinned ? record(v.pinned) : null
+    const pinned = pin ? { network_id: validTarget(pin.network_id), admin_id: validTarget(pin.admin_id), admin_nonce: validTarget(pin.admin_nonce) } : undefined
+    return { entry: parseEntry(v.entry), join_id: String(v.join_id), invite_id: String(v.invite_id), nonce: validTarget(v.nonce), name: deviceName(String(v.name)), status: 'pending', pinned }
   } catch { return null }
 }
 function publicIdentity({ deviceId }: { deviceId: string }): PublicIdentity { return { deviceId } }
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
-function withCode(request: JoinRequest): JoinRequest {
-  if (!request.admin_id || !request.admin_nonce || !request.joiner_nonce) return request
-  return { ...request, code: shortCode(request.network_id, request.invite_id, request.device_id, request.admin_id, request.admin_nonce, request.joiner_nonce) }
+function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
+/**
+ * The manager's short code (design 3.4): only from its own network, its own nonce and the request it saw before
+ * sending that nonce, and only once the revealed nonce opens the commitment it saw. A lying entry gets no code.
+ */
+function managerCode(request: JoinRequest, networkId: string, me: string): JoinRequest {
+  const pin = approvalPins()[request.join_id]
+  if (!pin || !request.joiner_nonce || request.admin_id !== me || request.admin_nonce !== pin.nonce || request.device_id !== pin.device_id || request.invite_id !== pin.invite_id || request.commit !== pin.commit) return request
+  if (joinCommit(pin.device_id, request.joiner_nonce) !== pin.commit) return request
+  return { ...request, code: shortCode(networkId, pin.invite_id, pin.device_id, me, pin.nonce, request.joiner_nonce) }
 }
 async function discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | null> {
   const url = new URL(location.href)
@@ -162,7 +177,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const releaseSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
   const setJoin = useCallback((next: Joining | null) => {
     joiningRef.current = next; setJoining(next)
-    store('pending-join', next && { entry: next.entry, join_id: next.join_id, invite_id: next.invite_id, nonce: next.nonce, name: next.name })
+    store('pending-join', next && { entry: next.entry, join_id: next.join_id, invite_id: next.invite_id, nonce: next.nonce, name: next.name, pinned: next.pinned })
   }, [])
   const resetConnection = useCallback(() => {
     reconnect.current = null
@@ -386,7 +401,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const response = record(await request('directory'))
     const view = verifiedView(response.state, ready.principal.network_id)
     if (!same(response.view, view)) throw new Error('设备列表校验失败，已停止使用。')
-    const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(withCode) : []
+    const me = own().deviceId
+    const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
     setDirectory(view); setJoins(pending)
   }
@@ -431,7 +447,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   async function startApproval(joinId: string) {
     managing()
-    const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: randomHex() }))
+    const pins = approvalPins()
+    const seen = joins.find(item => item.join_id === joinId)
+    if (!pins[joinId]) {
+      if (seen?.status !== 'pending') throw new Error('加入请求已失效。请让对方重新使用邀请。')
+      // Kept across reloads and retries, so a repeated start sends the same nonce.
+      pins[joinId] = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
+      store('approval-pins', Object.fromEntries(Object.entries(pins).slice(-16)))
+    }
+    const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pins[joinId].nonce }))
     if (request.status !== 'confirming') throw new Error('加入请求已失效。请让对方重新使用邀请。')
     await refreshDirectory()
   }
@@ -500,10 +524,22 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const active = current(), request = scoped(active)
     let status = parseJoinRequest(await request('join_status', { join_id: pending.join_id }))
     if (joiningRef.current !== pending) return
-    if (status.status === 'confirming' && !status.joiner_nonce) status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
-    if (joiningRef.current !== pending) return
+    let mine = pending
+    if (status.status === 'confirming' && !status.joiner_nonce && status.admin_id && status.admin_nonce) {
+      // Fix the manager's nonce before revealing ours, so the entry cannot pick it after seeing our nonce.
+      if (!mine.pinned) { mine = { ...mine, pinned: { network_id: status.network_id, admin_id: status.admin_id, admin_nonce: status.admin_nonce } }; setJoin(mine) }
+      status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
+    }
+    if (joiningRef.current !== mine) return
     if (status.device_id !== own().deviceId || status.invite_id !== pending.invite_id) throw new Error('加入状态与此浏览器不一致。')
+    const pin = mine.pinned
+    if (pin && status.admin_id && (status.network_id !== pin.network_id || status.admin_id !== pin.admin_id || status.admin_nonce !== pin.admin_nonce)) {
+      const failure = new Error('连接的设备改动了加入请求，已停止。请重新生成加入链接。')
+      setJoin(null); setError(failure.message)
+      throw failure
+    }
     if (status.status === 'joined') {
+      if (pin?.network_id !== status.network_id) throw new Error('加入结果与核对安全码时的个人网络不一致。')
       const state = record(await request('join_status', { join_id: pending.join_id })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error('加入结果没有包含此浏览器。') })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
@@ -515,8 +551,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       setJoin(null); setError(failure.message)
       throw failure
     }
-    const code = status.joiner_nonce && status.admin_id && status.admin_nonce ? withCode(status).code : undefined
-    const next = { ...pending, status: status.status, code }
+    const code = pin && status.joiner_nonce ? shortCode(pin.network_id, pending.invite_id, own().deviceId, pin.admin_id, pin.admin_nonce, pending.nonce) : undefined
+    const next = { ...mine, status: status.status, code }
     joiningRef.current = next; setJoining(next)
   }
   const cancelJoin = disconnect
