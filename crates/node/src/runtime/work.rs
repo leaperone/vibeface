@@ -57,7 +57,7 @@ impl Runtime {
         )?;
         self.publish_changed(network, &record.spec.conversation, work_id);
         if receipt.is_some() {
-            self.spawn_scheduler(network, &record.spec.conversation)?;
+            self.wake_scheduler()?;
         }
         if matches!(record.state, WorkState::Interrupting { .. }) {
             let node = self.clone();
@@ -186,8 +186,7 @@ impl Runtime {
                 "an agent task goes to another device"
             );
             ensure!(
-                self.config.roles.contains(&NodeRole::Scheduler)
-                    && self.settings_snapshot().manager.is_some(),
+                self.settings_snapshot().manager.is_some(),
                 "this device has no assistant to take the task"
             );
         }
@@ -218,7 +217,7 @@ impl Runtime {
                 .accept_work(&self.identity, network, spec, now_ms())?;
         self.publish_changed(network, &record.spec.conversation, &record.spec.work_id);
         if created && record.spec.kind == WorkKind::Task {
-            self.spawn_scheduler(network, &record.spec.conversation)?;
+            self.wake_scheduler()?;
         }
         Ok((record, created))
     }
@@ -729,11 +728,11 @@ impl Runtime {
                     _ => {}
                 }
                 node.triage_app_server(&event);
-                let networks = node.store.lock().await.networks().unwrap_or_default();
-                for network in networks {
-                    if let Err(error) = node.route_codex_event(&network, event.clone()).await {
-                        tracing::warn!(%error, "could not apply an App Server event");
-                    }
+                let network = node.store.lock().await.network().ok().flatten();
+                if let Some(network) = network
+                    && let Err(error) = node.route_codex_event(&network, event).await
+                {
+                    tracing::warn!(%error, "could not apply an App Server event");
                 }
             }
         });

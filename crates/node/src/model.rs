@@ -454,27 +454,6 @@ pub struct SignedEvent {
     pub signature: String,
 }
 
-/// A capability this Node declares in its own `config.json`; membership never carries roles.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeRole {
-    Gateway,
-    Relay,
-    Replica,
-    Scheduler,
-}
-
-pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        roles.contains(&NodeRole::Replica)
-            || !roles
-                .iter()
-                .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler)),
-        "gateway and scheduler roles require replica"
-    );
-    Ok(())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HashedEvent {
     pub hash: EventHash,
@@ -605,12 +584,6 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BudgetUsage {
-    pub day: String,
-    pub used: u64,
-    pub limit: u64,
 }
 
 /// Per-event result of ingest; a batch never aborts on one bad event.

@@ -4,7 +4,7 @@
 use super::{Access, Runtime, now_ms};
 use crate::{
     config,
-    manager::{self, ManagerConfig, ManagerKind},
+    manager::{self, ManagerConfig},
     model::{ATTENTION_SCOPE, AlertResolution, EventBody},
     net,
     store::{local_load, local_prefix, local_save},
@@ -486,10 +486,7 @@ impl Runtime {
         let program = std::env::current_exe()?;
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
-            kind: match settings.provider.as_str() {
-                "codex_sdk" => ManagerKind::CodexSdk,
-                _ => ManagerKind::CursorSdk,
-            },
+            kind: settings.provider,
             workspace: settings.workspace,
             model: settings.model,
             timeout_secs: self.config.timeout_secs,
@@ -1179,7 +1176,6 @@ mod tests {
         config::Config,
         crypto::LocalIdentity,
         identity::{Genesis, Member, NetworkState},
-        model::NodeRole,
     };
 
     async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
@@ -1188,7 +1184,6 @@ mod tests {
             .join(format!("triage-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
-        configuration.roles = vec![NodeRole::Relay, NodeRole::Replica];
         // A unix socket path must stay short; nothing listens unless a test binds it.
         let socket = format!(
             "/tmp/vf-{}.sock",
@@ -1196,7 +1191,10 @@ mod tests {
         );
         configuration.codex_socket = Some(socket.into());
         configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -1214,7 +1212,7 @@ mod tests {
 
     fn with_agent(node: &Runtime) {
         node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-            provider: "codex_sdk".into(),
+            provider: crate::manager::ManagerKind::CodexSdk,
             workspace: "/tmp".into(),
             model: "fixture".into(),
             cursor_sdk_bin: "/nonexistent".into(),

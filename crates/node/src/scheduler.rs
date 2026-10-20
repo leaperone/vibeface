@@ -3,14 +3,15 @@
 //! as its own `work:` trigger, so nothing waits on background work here.
 use crate::{
     crypto::digest,
-    manager::{self, ManagerConfig, ManagerError, ManagerKind},
+    manager::{self, ManagerConfig, ManagerError},
     model::{
-        Context, Event, EventBody, HashedEvent, OpenWork, ROUTINE_MINUTES, Role, RoutineEntry,
-        VersionVector, WorkProjection,
+        Context, Event, EventBody, HashedEvent, OpenWork, Role, RoutineEntry, VersionVector,
+        WorkProjection,
     },
     runtime::{Access, Runtime, Update},
     scheduling::{JobOutcome, JobState, SchedulerJob, TriggerKind},
     store::Store,
+    tools::{Effect, Tool},
 };
 use anyhow::{Context as _, Result, ensure};
 use futures_util::FutureExt;
@@ -18,7 +19,6 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use vibeface_bridge::agent::CustomToolConfig;
 
@@ -36,21 +36,6 @@ const CONSTRAINTS: &[&str] = &[
     "Model, provider and folders change only in Settings; no tool changes them. Tell the user so when they ask.",
     "assistant.skills lists the skills every assistant in this network shares; read one with read_skill before following it.",
 ];
-
-/// Tools that change the assistant itself. Only a turn the user's own message started gets them.
-pub const SETTINGS_TOOLS: &[&str] = &[
-    "update_profile",
-    "save_skill",
-    "remove_skill",
-    "save_routine",
-    "remove_routine",
-];
-
-/// Whether a turn of this kind is offered the tool. Read-only turns only read; settings tools
-/// need the user's own message as the trigger.
-fn offered(name: &str, kind: TriggerKind) -> bool {
-    !SETTINGS_TOOLS.contains(&name) || kind == TriggerKind::Human
-}
 
 pub(crate) fn boot_id() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
@@ -149,11 +134,7 @@ pub async fn run(
     let settings = local_settings
         .manager
         .context("this Node has no configured management SDK")?;
-    let kind = match settings.provider.as_str() {
-        "cursor_sdk" => ManagerKind::CursorSdk,
-        "codex_sdk" => ManagerKind::CodexSdk,
-        _ => anyhow::bail!("unknown management SDK"),
-    };
+    let kind = settings.provider;
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
     // Claiming before the tool listener exists would turn a startup race into a failed job.
     node.tool_url
@@ -204,10 +185,7 @@ pub async fn run(
             materialize(&context, &job, &works, assistant, routine.as_ref(), &local_settings.roots, claimed.covers.as_ref())?
         };
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        let custom_tools = tools()
-            .into_iter()
-            .filter(|(name, _)| offered(name, job.kind))
-            .collect();
+        let custom_tools = tools(job.kind);
         let config = ManagerConfig {
             kind,
             workspace: settings.workspace,
@@ -246,7 +224,6 @@ pub async fn run(
         if matches!(job.kind, TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Routine) {
             node.store.lock().await.reserve_budget(
                 &network,
-                &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
                 1,
                 node.config.daily_decision_limit,
             )?;
@@ -703,121 +680,23 @@ fn materialize(
     Ok(prompt)
 }
 
-pub fn tools() -> BTreeMap<String, CustomToolConfig> {
-    let string = || json!({"type":"string","minLength":1});
-    let specs = [
-        (
-            "nodes",
-            "List personal Nodes, device names and allowed roots.",
-            json!({}),
-            vec![],
-        ),
-        (
-            "context",
-            "Read conversation events in their shared order, or an attachment. offset counts events, or bytes for blobs; blob limit counts KiB.",
-            json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100},"blob_hash":string()}),
-            vec![],
-        ),
-        (
-            "dispatch_work",
-            "Start work in cwd on target_node (default: this device). On this device the CLI registers the work with the Node, then starts one Codex turn with full access through the App Server; on another device that device's assistant gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up. model, effort and images (local image paths) pass to the turn.",
-            json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
-                "prompt":string(),"cwd":string(),"call_ref":string(),"target_node":string(),
-                "parent":string(),"continues":string(),"model":string(),
-                "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]},
-                "images":{"type":"array","items":string(),"maxItems":8}}),
-            vec!["title", "prompt", "cwd", "call_ref"],
-        ),
-        (
-            "work_status",
-            "Read the state and result of this conversation's works, or of one work_id.",
-            json!({"work_id":string()}),
-            vec![],
-        ),
-        (
-            "interrupt_work",
-            "Ask the App Server to stop a work and the works it started. It counts as stopped only when the App Server confirms.",
-            json!({"work_id":string()}),
-            vec!["work_id"],
-        ),
-        (
-            "call_lookup",
-            "Find the work this turn dispatched, or the assistant change it made, with call_ref.",
-            json!({"call_ref":string()}),
-            vec!["call_ref"],
-        ),
-        (
-            "update_profile",
-            "Rename this assistant or replace its standing instructions because the user's own message asked. Apply it right away, without asking to confirm; the chat shows the change. instructions replaces the whole text, so keep what should stay. Reuse call_ref only to retry the same change.",
-            json!({"call_ref":string(),"name":string(),"instructions":{"type":"string"}}),
-            vec!["call_ref"],
-        ),
-        (
-            "save_skill",
-            "Save a reusable skill to the library every assistant in this network shares, because the user's own message asked. Omit skill_id to add one; pass it to replace that skill. Apply it right away, without asking to confirm. body holds the complete steps.",
-            json!({"call_ref":string(),"skill_id":string(),"name":string(),"description":{"type":"string"},"body":string()}),
-            vec!["call_ref", "name", "description", "body"],
-        ),
-        (
-            "remove_skill",
-            "Remove a skill from the shared library because the user's own message asked.",
-            json!({"call_ref":string(),"skill_id":string()}),
-            vec!["call_ref", "skill_id"],
-        ),
-        (
-            "save_routine",
-            "Create or replace a routine of this assistant because the user's own message asked: prompt runs as a new turn of this conversation at first_run_at_ms, then every every_minutes; missed runs are skipped. Apply it right away, without asking to confirm. Compute first_run_at_ms (Unix ms) from assistant.now_ms in the user's time zone; if they never said it, use this device's local time zone and say which one you used. Write prompt as a standalone instruction: its inputs, the expected result, its boundaries and what to do when a source is missing. In your reply restate the name, the schedule in the user's time zone, the next run and what it will do. Omit routine_id to add one; pass it to replace that routine. enabled=false pauses it.",
-            json!({"call_ref":string(),"routine_id":string(),"name":string(),"prompt":string(),
-                "first_run_at_ms":{"type":"integer","minimum":0},
-                "every_minutes":{"type":"integer","minimum":*ROUTINE_MINUTES.start(),"maximum":*ROUTINE_MINUTES.end()},
-                "enabled":{"type":"boolean"}}),
-            vec![
-                "call_ref",
-                "name",
-                "prompt",
-                "first_run_at_ms",
-                "every_minutes",
-            ],
-        ),
-        (
-            "remove_routine",
-            "Delete a routine of this assistant because the user's own message asked.",
-            json!({"call_ref":string(),"routine_id":string()}),
-            vec!["call_ref", "routine_id"],
-        ),
-        (
-            "read_skill",
-            "Read a shared skill's complete steps by skill_id.",
-            json!({"skill_id":string()}),
-            vec!["skill_id"],
-        ),
-    ];
-    specs
+/// The tools a turn of this kind is offered; settings tools need the user's own message.
+pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
+    Tool::ALL
         .into_iter()
-        .map(|(name, description, properties, required)| {
-            (
-                name.into(),
+        .filter(|tool| tool.effect() != Effect::Settings || kind == TriggerKind::Human)
+        .filter_map(|tool| {
+            let (description, properties, required) = tool.schema()?;
+            Some((
+                tool.name().into(),
                 CustomToolConfig {
                     description: Some(description.into()),
                     input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
                     output_schema: None,
                 },
-            )
+            ))
         })
         .collect()
-}
-
-fn utc_day(seconds: u64) -> String {
-    let days = (seconds / 86_400) as i64 + 719_468;
-    let era = days.div_euclid(146_097);
-    let doe = days - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    format!("{:04}-{month:02}-{day:02}", year + i64::from(month <= 2))
 }
 
 #[cfg(test)]
@@ -836,7 +715,7 @@ mod tests {
 
     #[test]
     fn tool_schema_has_no_app_server_write_passthrough() {
-        let tools = tools();
+        let tools = tools(TriggerKind::Human);
         assert!(!tools.contains_key("codex"));
         assert!(tools.contains_key("dispatch_work"));
         assert!(
@@ -848,31 +727,27 @@ mod tests {
 
     #[test]
     fn settings_tools_need_the_users_own_turn() {
+        let settings = || {
+            Tool::ALL
+                .into_iter()
+                .filter(|tool| tool.effect() == Effect::Settings)
+        };
         for kind in [
             TriggerKind::WorkResult,
             TriggerKind::AgentTask,
             TriggerKind::Routine,
         ] {
-            assert!(!SETTINGS_TOOLS.iter().any(|name| offered(name, kind)));
-            assert!(offered("dispatch_work", kind) && offered("read_skill", kind));
+            let tools = tools(kind);
+            assert!(!settings().any(|tool| tools.contains_key(tool.name())));
+            assert!(tools.contains_key("dispatch_work") && tools.contains_key("read_skill"));
         }
-        assert!(
-            SETTINGS_TOOLS
-                .iter()
-                .all(|name| offered(name, TriggerKind::Human))
-        );
-        let tools = tools();
-        assert!(SETTINGS_TOOLS.iter().all(|name| tools.contains_key(*name)));
+        let tools = tools(TriggerKind::Human);
+        assert!(settings().all(|tool| tools.contains_key(tool.name())));
+        assert!(!tools.contains_key("track_work") && !tools.contains_key("bind_work"));
         assert!(
             tools
                 .values()
                 .all(|tool| tool.input_schema["additionalProperties"] == false)
         );
-    }
-
-    #[test]
-    fn utc_day_formats_civil_dates() {
-        assert_eq!(utc_day(0), "1970-01-01");
-        assert_eq!(utc_day(951_782_400), "2000-02-29");
     }
 }

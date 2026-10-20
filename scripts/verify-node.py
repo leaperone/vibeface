@@ -510,7 +510,7 @@ class Node:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds: {result.stderr.decode(errors='replace')[-300:]}")
-        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 7},
+        require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
         self.configure_network(bind=f"127.0.0.1:{self.port}")
@@ -733,6 +733,8 @@ def websocket_send(stream, value):
     websocket_send_frame(stream, json.dumps(value).encode())
 
 
+DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
+                           (Path(__file__).resolve().parents[1] / "crates/node/src/config.rs").read_text(), re.M)[1])
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"
 # Methods whose answer depends on fixture thread state; every other client request gets a canned answer.
 FIXTURE_STATEFUL = {"initialize", "thread/start", "thread/resume", "thread/read", "thread/turns/list", "thread/list",
@@ -1120,13 +1122,13 @@ def fixture_manager(arguments):
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
         environment = initial["tool_env"]
         request = urllib.request.Request(
-            environment["VIBEFACE_NODE_URL"] + "/api/tools",
-            json.dumps({"name": name, "arguments": arguments}).encode(),
+            environment["VIBEFACE_NODE_URL"] + "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+            json.dumps({"toolName": name, "args": arguments, "agentId": "fixture"}).encode(),
             {"Content-Type": "application/json", "Authorization": "Bearer " + environment["VIBEFACE_TOOL_TOKEN"]})
         started = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                value = None if discard else json.load(response)
+                value = None if discard else json.load(response)["result"]
             accepted = True
         except urllib.error.HTTPError as error:
             raw_error = error.read(16385)

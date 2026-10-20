@@ -311,7 +311,7 @@ impl Runtime {
         )?;
         self.publish_changed(network, scope, work_id);
         if receipt.is_some() {
-            self.spawn_scheduler(network, scope)?;
+            self.wake_scheduler()?;
         }
         Ok(json!({"check_id":check_id,"resolved":true}))
     }

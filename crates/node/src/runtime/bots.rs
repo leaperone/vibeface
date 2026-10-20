@@ -7,8 +7,6 @@ impl Runtime {
         input: &Value,
     ) -> Result<Value> {
         ensure!(access.human, "only the user creates Bots");
-        self.require_role(&access.network_id, NodeRole::Gateway)
-            .await?;
         let bot_id = id(input, "bot_id")?;
         let scope = id(input, "conversation_id")?;
         if let Some(allowed) = &access.conversation_id {
@@ -97,8 +95,7 @@ impl Runtime {
         );
         if project.target_node == self.identity.device_id()? {
             ensure!(
-                self.config.roles.contains(&NodeRole::Scheduler)
-                    && self.settings_snapshot().manager.is_some(),
+                self.settings_snapshot().manager.is_some(),
                 "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;

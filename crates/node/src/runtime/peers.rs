@@ -1040,15 +1040,11 @@ impl Runtime {
         }
     }
 
-    /// Where browsers reach this Node: its public entry, else its own Gateway.
-    pub(crate) fn gateway_url(&self) -> Option<String> {
+    /// Where browsers reach this Node: its public entry, else its own URL.
+    pub(crate) fn gateway_url(&self) -> String {
         match &self.config.network.entry {
-            Some(entry) => Some(entry.url.clone()),
-            None => self
-                .config
-                .roles
-                .contains(&NodeRole::Gateway)
-                .then(|| self.config.public_url.clone()),
+            Some(entry) => entry.url.clone(),
+            None => self.config.public_url.clone(),
         }
     }
 
@@ -1057,7 +1053,7 @@ impl Runtime {
         let net = self.net()?;
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
-        let gateway_url = self.gateway_url();
+        let gateway_url = Some(self.gateway_url());
         let mut store = self.store.lock().await;
         let previous = store
             .address_book(network)?
@@ -1204,45 +1200,45 @@ impl Runtime {
     /// Hands each waiting message or result to the conversation's current owner. The owner admits
     /// by trigger, so a retry after an unknown outcome is harmless.
     async fn deliver_outbox(self: &Arc<Self>) -> Result<()> {
-        let networks = self.store.lock().await.networks()?;
+        let Some(network) = self.store.lock().await.network()? else {
+            return Ok(());
+        };
         let local = self.identity.device_id()?;
-        for network in networks {
-            let entries = self.store.lock().await.scheduler_outbox(&network)?;
-            for entry in entries {
-                let owner = self
-                    .store
+        let entries = self.store.lock().await.scheduler_outbox(&network)?;
+        for entry in entries {
+            let owner = self
+                .store
+                .lock()
+                .await
+                .conversation(&network, &entry.conversation_id)?
+                .and_then(|conversation| conversation.owner)
+                .context("conversation has no scheduling Node")?;
+            let delivered = if owner == local {
+                self.store
                     .lock()
                     .await
-                    .conversation(&network, &entry.conversation_id)?
-                    .and_then(|conversation| conversation.owner)
-                    .context("conversation has no scheduling Node")?;
-                let delivered = if owner == local {
-                    self.store
-                        .lock()
-                        .await
-                        .admit_delivery(&local, &network, &entry.conversation_id, &entry.trigger)
-                        .map(|receipt| json!({ "receipt": receipt }))
-                } else {
-                    let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
+                    .admit_delivery(&local, &network, &entry.conversation_id, &entry.trigger)
+                    .map(|receipt| json!({ "receipt": receipt }))
+            } else {
+                let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
                         "trigger":entry.trigger});
-                    self.peer_request(&network, &owner, request).await
-                };
-                match delivered {
-                    Ok(reply) if reply["receipt"].is_object() => {
-                        self.store.lock().await.remove_outbox(
-                            &network,
-                            &entry.conversation_id,
-                            &entry.trigger,
-                        )?;
-                        self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
-                        self.schedule_wakeup.notify_one();
-                    }
-                    Ok(_) => {
-                        tracing::debug!(%owner, "delivery answer had no receipt")
-                    }
-                    Err(error) => {
-                        tracing::debug!(%owner, %error, "scheduler delivery pending")
-                    }
+                self.peer_request(&network, &owner, request).await
+            };
+            match delivered {
+                Ok(reply) if reply["receipt"].is_object() => {
+                    self.store.lock().await.remove_outbox(
+                        &network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                    )?;
+                    self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
+                    self.schedule_wakeup.notify_one();
+                }
+                Ok(_) => {
+                    tracing::debug!(%owner, "delivery answer had no receipt")
+                }
+                Err(error) => {
+                    tracing::debug!(%owner, %error, "scheduler delivery pending")
                 }
             }
         }
@@ -1502,7 +1498,10 @@ mod tests {
         configuration.network = network;
         configuration.codex_socket = Some(dir.join("unavailable.sock"));
         configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }

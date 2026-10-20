@@ -191,7 +191,7 @@ impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
-            epoch == json!({"data_epoch":7}),
+            epoch == json!({"data_epoch":crate::config::DATA_EPOCH}),
             "this Node requires an initialized data epoch 7 directory"
         );
         let config = Config::load(dir)?;
@@ -277,9 +277,8 @@ impl Runtime {
         self.store.lock().await.public_state()
     }
     pub fn info(&self) -> Value {
-        let manager_available = self.config.roles.contains(&NodeRole::Scheduler)
-            && self.settings_snapshot().manager.is_some();
-        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":manager_available,"public_entry":self.config.public_entry})
+        let manager_available = self.settings_snapshot().manager.is_some();
+        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self
@@ -322,10 +321,10 @@ impl Runtime {
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         let store = self.store.lock().await;
-        for network in store.networks()? {
-            crate::scheduler::maintenance_idle(&store, &network)?;
+        match store.network()? {
+            Some(network) => crate::scheduler::maintenance_idle(&store, &network),
+            None => Ok(()),
         }
-        Ok(())
     }
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
@@ -390,35 +389,11 @@ impl Runtime {
             hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
-    async fn require_role(&self, network: &str, role: NodeRole) -> Result<()> {
-        let state = self.membership_state().await?;
-        ensure!(
-            state.genesis.network_id == network,
-            "wrong personal network"
-        );
-        ensure!(
-            self.config.roles.contains(&role),
-            "node capability is disabled"
-        );
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, &self.identity.device_id()?)?;
-        Ok(())
-    }
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
-        let manager =
-            settings
-                .manager
-                .as_ref()
-                .and_then(|settings| match settings.provider.as_str() {
-                    "cursor_sdk" => Some(crate::manager::ManagerKind::CursorSdk),
-                    "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk),
-                    _ => None,
-                });
-        json!({"roots":settings.roots,"roles":self.config.roles,
-            "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
+        let manager = settings.manager.as_ref().map(|m| m.provider);
+        json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
+            "manager":manager,
             "manager_capabilities":manager.map(|kind|kind.capabilities()),
             "codex":self.codex.capability().await})
     }
@@ -492,13 +467,12 @@ impl Runtime {
                 for (member, capabilities) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
                     let live = !capabilities.is_null();
-                    let roles = capabilities.get("roles").cloned().unwrap_or(json!([]));
                     let seq = max_seq.get(&member.device_id).copied().unwrap_or(0);
-                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"roles":roles,"revoked":false,"local":here,"online":live,"max_seq":seq,"capabilities":capabilities}));
+                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"capabilities":capabilities}));
                 }
                 for revoked in view.revoked {
                     if let Some(name) = display_names.get(&revoked.device_id) {
-                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"roles":[],"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"capabilities":Value::Null}));
+                        nodes.push(json!({"device_id":revoked.device_id,"name":name,"revoked":true,"local":false,"online":false,"max_seq":revoked.cutoff_seq,"capabilities":Value::Null}));
                     }
                 }
                 Ok(json!({"nodes":nodes}))
@@ -577,16 +551,6 @@ impl Runtime {
             }
             _ => bail!("unknown method"),
         }
-    }
-    pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
-        let _work = self.maintenance.enter()?;
-        ensure!(!access.human, "tool endpoint requires a scoped Agent token");
-        let scope = access
-            .conversation_id
-            .as_deref()
-            .context("missing tool scope")?;
-        self.require_scope(&access, scope).await?;
-        self.agent_tool(access, name, args).await
     }
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
         let path = std::fs::canonicalize(path).context("execution path does not exist")?;

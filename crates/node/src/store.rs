@@ -26,7 +26,7 @@ mod tests;
 pub(crate) mod work;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;
 
 /// Whether this Node may append to its own log (design 5.7 and 5.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -180,7 +180,7 @@ impl Store {
             blob_dir: blob_dir_for(path),
             process_lock: None,
         };
-        for network in store.networks()? {
+        if let Some(network) = store.network()? {
             store
                 .trust_bundle(&network)?
                 .context("membership is missing")?
@@ -556,31 +556,8 @@ impl Store {
             .map(|row| Ok(row?))
             .collect()
     }
-    pub fn budget_usage(&self, network_id: &str, day: &str, limit: u64) -> Result<BudgetUsage> {
-        validate_day(day)?;
-        let used = self
-            .connection
-            .query_row(
-                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
-                params![network_id, day],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        Ok(BudgetUsage {
-            day: day.into(),
-            used,
-            limit,
-        })
-    }
-    pub fn reserve_budget(
-        &mut self,
-        network_id: &str,
-        day: &str,
-        units: u64,
-        limit: u64,
-    ) -> Result<BudgetUsage> {
-        validate_day(day)?;
+    /// Counts one more model run against today's UTC limit, or refuses it.
+    pub fn reserve_budget(&mut self, network_id: &str, units: u64, limit: u64) -> Result<()> {
         ensure!(
             units > 0 && limit <= i64::MAX as u64,
             "invalid budget units/limit"
@@ -588,31 +565,23 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let used: u64 = tx
-            .query_row(
-                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
-                params![network_id, day],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
+        let (day, used): (String, u64) = tx.query_row(
+            "SELECT date('now'), COALESCE((SELECT used FROM budget_days WHERE network_id=?1 AND day=date('now')), 0)",
+            [network_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let next = used.checked_add(units).context("budget overflow")?;
         ensure!(next <= limit, "daily model budget exhausted");
         tx.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",params![network_id,day,next])?;
         tx.commit()?;
-        Ok(BudgetUsage {
-            day: day.into(),
-            used: next,
-            limit,
-        })
+        Ok(())
     }
-    pub fn networks(&self) -> Result<Vec<NetworkId>> {
-        let mut statement = self
+    /// A Node belongs to at most one network.
+    pub fn network(&self) -> Result<Option<NetworkId>> {
+        Ok(self
             .connection
-            .prepare("SELECT network_id FROM networks ORDER BY network_id")?;
-        Ok(statement
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .query_row("SELECT network_id FROM networks", [], |r| r.get(0))
+            .optional()?)
     }
     pub fn scopes(&self, network_id: &str) -> Result<Vec<ScopeId>> {
         let mut statement = self.connection.prepare(
@@ -842,19 +811,6 @@ pub(crate) fn authorize_node_from(
 
 fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {
     value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
-}
-
-fn validate_day(day: &str) -> Result<()> {
-    ensure!(
-        day.len() == 10
-            && day.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 {
-                b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }),
-        "day must be YYYY-MM-DD"
-    );
-    Ok(())
 }
 
 pub(crate) fn context_from(

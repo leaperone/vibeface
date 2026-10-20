@@ -1,6 +1,6 @@
 use super::Runtime;
 use crate::config::{Config, ManagerSettings};
-use crate::model::NodeRole;
+use crate::manager::ManagerKind;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,10 +37,6 @@ impl Runtime {
 
     pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
-        let view = self.membership_state().await?.project()?;
-        let peer = self.identity.device_id()?;
-        let scheduler_available =
-            self.config.roles.contains(&NodeRole::Scheduler) && view.node(&peer).is_ok();
         let defaults = json!({
             "workspace":self.data_dir.canonicalize()?.join("manager-workspace"),
             "cursor_sdk_bin":"cursor-sdk-bridge",
@@ -49,7 +45,7 @@ impl Runtime {
         });
         let mut missing = Vec::new();
         if let Some(manager) = &settings.manager {
-            if manager.provider == "cursor_sdk" {
+            if manager.provider == ManagerKind::CursorSdk {
                 if !executable(&manager.cursor_sdk_bin) {
                     missing.push("Cursor SDK Bridge");
                 }
@@ -72,15 +68,13 @@ impl Runtime {
         }
         let readiness = if settings.manager.is_none() {
             "disabled"
-        } else if !scheduler_available {
-            "role_unavailable"
         } else if missing.is_empty() {
             "authentication_unverified"
         } else {
             "missing_prerequisites"
         };
         Ok(
-            json!({"settings":settings,"defaults":defaults,"readiness":{"manager":readiness,"missing":missing,"scheduler_available":scheduler_available}}),
+            json!({"settings":settings,"defaults":defaults,"readiness":{"manager":readiness,"missing":missing}}),
         )
     }
 
@@ -128,15 +122,11 @@ impl Runtime {
                 "manager workspace must be an existing absolute directory"
             );
             ensure!(
-                matches!(manager.provider.as_str(), "cursor_sdk" | "codex_sdk"),
-                "unknown manager provider"
-            );
-            ensure!(
                 manager.model.len() <= 256 && !manager.model.chars().any(char::is_control),
                 "invalid manager model"
             );
             ensure!(
-                manager.provider != "cursor_sdk" || !manager.model.trim().is_empty(),
+                manager.provider != ManagerKind::CursorSdk || !manager.model.trim().is_empty(),
                 "Cursor SDK requires a model"
             );
             for path in [

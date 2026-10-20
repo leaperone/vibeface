@@ -6,7 +6,7 @@ import { Details, DetailRow, EmptyState, InlineError, Skeleton, StatusPill, toas
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "@/features/workspace/context"
-import { isLoopback, roleNames } from "@/features/workspace/labels"
+import { isLoopback } from "@/features/workspace/labels"
 import { docs } from "./assistant-settings"
 import type { NodeInfo } from "@/features/workspace/types"
 import type { Member } from "@/lib/node"
@@ -147,7 +147,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     <Details>
       <DetailRow label="设备编号" value={row.id} mono />
-      {row.node?.roles?.length ? <DetailRow label="设备能力" value={row.node.roles.map((role) => roleNames[role] ?? role).join("、")} /> : null}
+      {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行助手" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
     </Details>
 
     {canManage && row.member && !row.admin && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">

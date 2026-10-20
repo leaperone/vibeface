@@ -6,8 +6,7 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  roles: string[]
-  capabilities?: { manager: string | null; roots: string[] }
+  capabilities?: { manager: string | null; relay: boolean; roots: string[] }
 }
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** `waiting_for_device` and `rejected` are dispatches another device has not taken. */

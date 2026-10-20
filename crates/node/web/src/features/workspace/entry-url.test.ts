@@ -27,13 +27,13 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
 })
 test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
-  assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
+  assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false }] }), "Mac Studio")
   assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [] } }), "工作机")
   assert.equal(nodeName(id), "另一台设备")
 })
 
 test("capabilities parse the actual provider name and reject malformed node lists", () => {
-  const nodes = parseNodes({ nodes: [{ device_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", roots: ["/project"] } }] })
+  const nodes = parseNodes({ nodes: [{ device_id: "n", name: "本机", local: true, online: true, revoked: false, capabilities: { manager: "cursor_agent", roots: ["/project"] } }] })
   assert.equal(nodes[0]?.name, "本机")
   assert.equal(nodes[0]?.capabilities?.manager, "cursor_agent")
   assert.throws(() => parseNodes({ nodes: [{ device_id: "n" }] }))
@@ -183,7 +183,7 @@ test("workspace preserves bot and message requests while routing native decision
   const connection: ReadyConnection = {
     generation: 1, entry: { device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
-    info: { device_id: "gateway", name: "gateway", version: "test", roles: ["gateway"], initialized: true, network_id: "network" },
+    info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: [] }
@@ -509,7 +509,7 @@ test("any entrance stops an unfinished task once, even on another device", async
 })
 
 test("bot projects use online manager capabilities and preserve device names", () => {
-  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, roles: ['scheduler'], capabilities: { manager: 'codex', roots: ['/project'] } }
+  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/project'] } }
   const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
@@ -734,10 +734,10 @@ test("device id boundaries require the device_id field", () => {
     assert.equal(entry.device_id, id)
     assert.equal(Object.hasOwn(entry, "relay"), false)
   }
-  assert.equal(parsers.parseInfo({ name: "node", version: "1", roles: ["replica"], initialized: true, network_id: other, device_id: id }).device_id, id)
-  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], device_id: id }] })[0].device_id, id)
+  assert.equal(parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, device_id: id }).device_id, id)
+  assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, device_id: id }] })[0].device_id, id)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备编号无效/)
-  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", roles: ["replica"], initialized: true, network_id: other, node_id: id }), /设备编号无效/)
+  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备编号无效/)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备编号无效/)
-  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id }] }), /缺少文字/)
+  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, node_id: id }] }), /缺少文字/)
 })

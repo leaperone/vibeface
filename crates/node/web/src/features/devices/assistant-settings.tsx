@@ -95,7 +95,6 @@ export function AssistantSettings({ onboarding = false }: { onboarding?: boolean
     {draft.provider !== "disabled" ? <div className="grid gap-2">
       {busy && draft.provider !== savedProvider ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在检查</p>
         : draft.provider !== savedProvider ? null
-        : response.readiness.manager === "role_unavailable" ? <p className="flex items-center gap-2 text-meta text-warning"><CircleX aria-hidden="true" className="size-4 shrink-0" />这台设备不能运行助手</p>
         : missing.length ? <ul className="grid gap-1.5">{missing.map((item) => <li key={item.key} className="flex min-w-0 items-center gap-2 text-meta">
           <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
           <span className="min-w-0 truncate">{item.label}</span>

@@ -111,7 +111,7 @@ RootCheckpoint {
 NetworkState { genesis, checkpoint: Option<RootCheckpoint>, events: Vec<GovernanceEvent> }
 ```
 
-成员目录仍是独立的小 DAG，与业务日志分开同步，上限仍为 1024 个成员。与现状相比有三处变化。`Member` 删除 `node_roles`，Node 的角色只取它自己的 `config.json`，加入时不选，由 Node 在连接后用设备密钥签名声明。`subject_id` 改为 `device_id`。`Revoke` 增加 `cutoff_seq`，表示签发者当时已知的该设备最大日志序号。
+成员目录仍是独立的小 DAG，与业务日志分开同步，上限仍为 1024 个成员。与现状相比有三处变化。`Member` 删除 `node_roles`，成员 Node 不分角色，是否运行 relay 只取它自己的 `config.json`。`subject_id` 改为 `device_id`。`Revoke` 增加 `cutoff_seq`，表示签发者当时已知的该设备最大日志序号。
 
 授权规则如下：
 
@@ -304,7 +304,7 @@ SQLite 表不再需要 `network_id` 列，跨网络读取在结构上不可能�
 
 ### 4.5 固定客户端 origin 与入口切换
 
-本人的某台 Gateway 离线时，浏览器要能自动换到同一个人网络中另一台启用 `gateway` 的 Node，设备身份不变，继续读写同一份会话。浏览器设备的 CryptoKey 按 origin 隔离，换一个 origin 就是另一台设备。所以网页应用固定在一个客户端 origin 下，切换的只是 WebSocket 连接的入口。
+本人的某台 Gateway 离线时，浏览器要能自动换到同一个人网络中另一台成员 Node，设备身份不变，继续读写同一份会话。浏览器设备的 CryptoKey 按 origin 隔离，换一个 origin 就是另一台设备。所以网页应用固定在一个客户端 origin 下，切换的只是 WebSocket 连接的入口。
 
 **客户端 origin。** 每台 Gateway 仍内嵌并提供完整网页，任何成员 Gateway 的 `public_url` 都可以作为客户端 origin，不需要另外的静态托管。浏览器设备的客户端 origin 就是它加入时打开的 ticket 链接的 origin（3.3 节）。管理端生成邀请链接时从入口列表中选一个 `gateway_url`，默认取上次选用的那个。加入时页面连接同源 Gateway 的 `/api/client`，以 ticket 中的 `entry.id` 为目标，入口不是这台 Gateway 时由它经 iroh 转发。加入后，这个浏览器只在这个 origin 下使用，CryptoKey、入口列表和待确认写入都存在这个 origin 的 IndexedDB 中。直接打开另一台 Gateway 的 origin 得到的是一台没有密钥的新浏览器，需要重新加入。本机会话（3.6 节）的 origin 是 loopback 地址，只连接本机 Node，不参与入口切换。
 

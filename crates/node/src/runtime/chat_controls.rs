@@ -268,10 +268,7 @@ impl Runtime {
             "pending_checks":pending_checks,
             "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
-                "capabilities":manager.and_then(|m| match m.provider.as_str() {
-                    "codex_sdk"=>Some(crate::manager::ManagerKind::CodexSdk.capabilities()),
-                    "cursor_sdk"=>Some(crate::manager::ManagerKind::CursorSdk.capabilities()),
-                    _=>None})},
+                "capabilities":manager.map(|m| m.provider.capabilities())},
         }))
     }
 }

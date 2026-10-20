@@ -45,8 +45,8 @@ export function parseNodes(value: unknown): NodeInfo[] {
     return {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
-      local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked), roles: texts(data.roles),
-      capabilities: capabilities ? { manager: capabilities.manager === null ? null : text(capabilities.manager), roots: texts(capabilities.roots) } : undefined,
+      local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
+      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), relay: capabilities.relay === true, roots: texts(capabilities.roots) } : undefined,
     }
   })
 }

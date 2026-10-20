@@ -8,7 +8,7 @@
 
 个人网络使用 `NetworkState { genesis, checkpoint, events }`。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
 
-`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 能做什么由本机 `config.json` 的 `roles` 声明，不写入成员目录。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 单独决定是否运行 relay；`public_entry` 是不入网的公共入口。
 
 管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq`，接收方只接受被撤销设备 `seq <= cutoff_seq` 的事件。并发的授予与撤销冲突时撤销优先。根恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
 
@@ -22,11 +22,10 @@
 |---|---|
 | `listen` | HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡；iroh 默认在同一端口号上监听 UDP |
 | `local_listen` | 本机会话的固定回环地址，默认 `127.0.0.1:4791`，让本机 origin 和浏览器存储跨重启不变 |
-| `public_url` | 本 Node 的网页 origin，公网为 HTTPS；启用 `gateway` 时作为地址记录的 `gateway_url` |
+| `public_url` | 本 Node 的网页 origin，公网为 HTTPS；没有公共入口时作为地址记录的 `gateway_url` |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
-| `roles` | 本机启用的角色：`gateway`、`relay`、`replica`、`scheduler`；`gateway` 和 `scheduler` 依赖 `replica` |
 | `public_entry` | `true` 表示本进程是公共入口，只提供网页、relay 和密文转发，不加入个人网络 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
@@ -95,10 +94,10 @@
 | `/`、`/assets/*`、`/transport.js` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
-| `/api/info` | GET | `device_id`、`version`、`roles`、`manager_available` 和 `public_entry` |
+| `/api/info` | GET | `device_id`、`version`、`manager_available` 和 `public_entry` |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
-| `/api/tools`、`/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，供本机管理 SDK 调用协调工具 |
+| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}` |
 
 网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，已有网络时返回 `{ kind: "initialized", entry, local_launch? }`。该响应不授予成员资格。
 
@@ -147,7 +146,7 @@
 
 恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`，加密正文包含根私钥、`genesis`、`recovery_epoch` 和解密材料，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文根私钥不发给 Node。根恢复默认保留现有管理设备。业务正文和项目文件不在恢复包中。
 
-`/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话，不能添加或撤销设备或修改后续授权。
+协调工具入口只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话，不能添加或撤销设备或修改后续授权。
 
 ## RPC 方法
 
@@ -328,7 +327,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 | type | 用途 |
 |---|---|
-| `capabilities` | 角色、版本和管理 Agent 是否可用 |
+| `capabilities` | 项目目录、是否运行 relay、管理 Agent 类型与能力，以及 Codex 状态 |
 | `addresses` | 交换签名地址记录 |
 | `deliver` | 入口 outbox 向负责人投递消息或 job |
 | `manager_status` | 查询某个触发在负责人上的状态 |

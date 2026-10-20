@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    scheduler::SETTINGS_TOOLS,
     store::assistant::{ChangeRequest, change_id},
+    tools::{Effect, Tool},
     work::{Dispatch, DispatchState, WorkSpec},
 };
 
@@ -22,24 +22,18 @@ fn dispatch_value(dispatch: &Dispatch) -> Value {
 }
 
 impl Runtime {
-    pub(super) async fn agent_tool(
-        self: &Arc<Self>,
-        access: Access,
-        name: &str,
-        args: Value,
-    ) -> Result<Value> {
+    /// The one entry for coordination tools: the Cursor SDK callback and `vibeface tool` both land here.
+    pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
+        ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access
             .conversation_id
             .clone()
             .context("missing tool scope")?;
-        let write = match name {
-            "nodes" | "context" | "work_status" | "call_lookup" | "read_skill" => false,
-            "track_work" | "bind_work" | "dispatch_work" | "interrupt_work" => true,
-            name if SETTINGS_TOOLS.contains(&name) => true,
-            _ => bail!("unknown or unavailable coordination tool"),
-        };
+        self.require_scope(&access, &scope).await?;
+        let tool = Tool::parse(name).context("unknown or unavailable coordination tool")?;
         ensure!(
-            !write || access.manager.is_some(),
+            tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
         let _lease =
@@ -47,13 +41,13 @@ impl Runtime {
                 .await
                 .context("agent tool admission timed out")??;
         let network = access.network_id.as_str();
-        match name {
-            "nodes" => {
+        match tool {
+            Tool::Nodes => {
                 self.rpc_inner(access.clone(), json!({"method":"nodes"}))
                     .await
             }
-            "context" => self.agent_context(network, &scope, &args).await,
-            "work_status" => {
+            Tool::Context => self.agent_context(network, &scope, &args).await,
+            Tool::WorkStatus => {
                 let works = self.store.lock().await.works(network, &scope)?;
                 Ok(match args["work_id"].as_str() {
                     Some(id) => json!(
@@ -65,7 +59,7 @@ impl Runtime {
                     None => json!({ "works": works }),
                 })
             }
-            "call_lookup" => {
+            Tool::CallLookup => {
                 let manager = access
                     .manager
                     .as_ref()
@@ -88,7 +82,7 @@ impl Runtime {
                     .context("nothing was dispatched or changed with this call_ref")?;
                 Ok(json!(change))
             }
-            "read_skill" => {
+            Tool::ReadSkill => {
                 let id = field(&args, "skill_id")?;
                 let skill = self
                     .store
@@ -100,7 +94,11 @@ impl Runtime {
                 value["skill_id"] = json!(id);
                 Ok(value)
             }
-            name if SETTINGS_TOOLS.contains(&name) => {
+            Tool::UpdateProfile
+            | Tool::SaveSkill
+            | Tool::RemoveSkill
+            | Tool::SaveRoutine
+            | Tool::RemoveRoutine => {
                 let manager = access
                     .manager
                     .as_ref()
@@ -129,10 +127,10 @@ impl Runtime {
                 }
                 Ok(json!(record))
             }
-            "track_work" => self.track_work(&access, &scope, &args).await,
-            "bind_work" => self.bind_work(network, &scope, &args).await,
+            Tool::TrackWork => self.track_work(&access, &scope, &args).await,
+            Tool::BindWork => self.bind_work(network, &scope, &args).await,
             // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
-            "dispatch_work" => {
+            Tool::DispatchWork => {
                 let socket = self.codex.socket.clone();
                 let (access, scope) = (&access, scope.as_str());
                 crate::agent_cli::dispatch(
@@ -143,11 +141,10 @@ impl Runtime {
                 )
                 .await
             }
-            "interrupt_work" => {
+            Tool::InterruptWork => {
                 let id = field(&args, "work_id")?;
                 self.stop_work(network, &scope, id).await
             }
-            _ => unreachable!(),
         }
     }
 

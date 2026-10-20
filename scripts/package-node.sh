@@ -65,7 +65,9 @@ name="vibeface-$version-$target"
 package="$staging/$name"
 mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface"
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":7}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
+[[ -n "$data_epoch" ]] || { echo 'DATA_EPOCH not found in crates/node/src/config.rs' >&2; exit 1; }
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":%s}\n' "$version" "$target" "$source_commit" "$data_epoch" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
@@ -78,7 +80,7 @@ done < <(find "$repo/crates/node/sdk" -maxdepth 1 -type f \( -name '*.mjs' -o -n
 cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 # Runtime requirements
 
-The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the corresponding node roles.
+The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the assistant.
 
 - Codex SDK work and native App Server access need the `codex` CLI and its authenticated account.
 - The Codex SDK sidecar needs Node.js 18 or newer. Run `npm ci --omit=dev` in `sidecars/` before using it.
