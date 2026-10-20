@@ -2554,6 +2554,13 @@ mod tests {
     use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
     use vibeface_secure::Handshake;
 
+    fn relay_config() -> NetworkConfig {
+        NetworkConfig {
+            relay_enabled: true,
+            ..Default::default()
+        }
+    }
+
     enum DirectoryObservation {
         Request(Control),
         Closed,
@@ -3173,13 +3180,7 @@ mod tests {
     async fn a2_new_challenge_preserves_ready_circuit_during_blocked_directory_publication()
     -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -3297,13 +3298,7 @@ mod tests {
     #[tokio::test]
     async fn a2_outer_abort_drops_an_attached_socket_waiting_in_the_receiver() -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -3366,13 +3361,7 @@ mod tests {
     #[tokio::test]
     async fn a2_reserved_send_failure_drops_the_lease_and_handoff_ticket() -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -3418,13 +3407,7 @@ mod tests {
     async fn a2_real_full_source_and_global_handoff_uses_a_full_logical_table_fixture() -> Result<()>
     {
         let mut tasks = JoinSet::new();
-        let (relay, mut incoming) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, mut incoming) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (url, mut denied) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -3535,13 +3518,7 @@ mod tests {
     async fn a2_cross_ip_handoff_preserves_the_old_generation_when_the_new_source_is_full()
     -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, mut incoming) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, mut incoming) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (v4, _) = serve_observed(
             relay.clone(),
@@ -3683,13 +3660,7 @@ mod tests {
     {
         for finish in [true, false] {
             let mut tasks = JoinSet::new();
-            let (relay, _) = NetworkHub::new(
-                LocalIdentity::generate(),
-                NetworkConfig {
-                    relay_enabled: true,
-                    ..Default::default()
-                },
-            );
+            let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
             let (observed, mut accepts) = mpsc::unbounded_channel();
             let (url, _) =
                 serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -3918,13 +3889,7 @@ mod tests {
     #[tokio::test]
     async fn x1_two_real_writers_share_the_production_rate_and_total_byte_limit() -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -4048,13 +4013,7 @@ mod tests {
     -> Result<()> {
         for stage in ["rate_abort", "write_abort", "write_timeout"] {
             let mut tasks = JoinSet::new();
-            let (relay, _) = NetworkHub::new(
-                LocalIdentity::generate(),
-                NetworkConfig {
-                    relay_enabled: true,
-                    ..Default::default()
-                },
-            );
+            let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
             let (observed, mut accepts) = mpsc::unbounded_channel();
             let (url, _) =
                 serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -4208,13 +4167,7 @@ mod tests {
     async fn x1_each_silent_endpoint_expires_despite_continuous_opposite_traffic() -> Result<()> {
         for silent in 0..2 {
             let mut tasks = JoinSet::new();
-            let (relay, _) = NetworkHub::new(
-                LocalIdentity::generate(),
-                NetworkConfig {
-                    relay_enabled: true,
-                    ..Default::default()
-                },
-            );
+            let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
             let (observed, mut accepts) = mpsc::unbounded_channel();
             let (url, _) =
                 serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -4358,13 +4311,7 @@ mod tests {
     #[tokio::test]
     async fn x1_stopped_tcp_reader_keeps_reverse_noise_and_other_target_progress() -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (observed, mut accepts) = mpsc::unbounded_channel();
         let (url, _) =
             serve_observed(relay.clone(), "127.0.0.1:0", &mut tasks, Some(observed)).await?;
@@ -4809,13 +4756,7 @@ mod tests {
     async fn waiting_attach_circuits_bound_real_sources_and_targets_and_leave_lookup_capacity()
     -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (hub, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (hub, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let (v4, mut v4_denied) = serve_at(hub.clone(), "127.0.0.1:0", &mut tasks).await?;
         let (v6, mut v6_denied) = serve_at(hub.clone(), "[::1]:0", &mut tasks).await?;
         let target_a = LocalIdentity::generate();
@@ -5359,13 +5300,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_bootstrap_resolves_publishes_and_reserves_without_restart() -> Result<()> {
-        let (directory, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..NetworkConfig::default()
-            },
-        );
+        let (directory, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let mut tasks = JoinSet::new();
         let url = serve(directory.clone(), &mut tasks).await?;
         let (target, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
@@ -6159,13 +6094,7 @@ mod tests {
     async fn reservation_rejects_publish_and_public_full_publish_is_not_acknowledged() -> Result<()>
     {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         for _ in 0..MAX_RECORDS {
             let record = signed_record(&LocalIdentity::generate(), now_secs()?)?;
             assert_eq!(relay.publish(record).await?, PublishOutcome::Accepted);
@@ -6217,13 +6146,7 @@ mod tests {
     async fn full_data_capacity_refuses_only_the_incoming_and_recovers_on_the_same_reservation()
     -> Result<()> {
         let mut tasks = JoinSet::new();
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let url = serve(relay.clone(), &mut tasks).await?;
         let identity = LocalIdentity::generate();
         let target_id = identity.peer_id()?;
@@ -6368,13 +6291,7 @@ mod tests {
         let relay_identity = LocalIdentity::generate();
         let target_identity = LocalIdentity::generate();
         let caller_identity = LocalIdentity::generate();
-        let (relay, _) = NetworkHub::new(
-            relay_identity.clone(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(relay_identity.clone(), relay_config());
         let relay_url = serve(relay.clone(), &mut tasks).await?;
         let publication_gate = Arc::new(Semaphore::new(0));
         let (slow_directory, mut slow_publications) =
@@ -6535,13 +6452,7 @@ mod tests {
         let (slow, mut slow_incoming) =
             NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
         let slow_url = serve(slow, &mut tasks).await?;
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let relay_url = serve(relay.clone(), &mut tasks).await?;
         let (target, mut target_incoming) = NetworkHub::new(
             target_identity.clone(),
@@ -6927,13 +6838,7 @@ mod tests {
             stalled_urls.push(serve(hub, &mut tasks).await?);
             stalled_receivers.push(receive);
         }
-        let (relay, _) = NetworkHub::new(
-            LocalIdentity::generate(),
-            NetworkConfig {
-                relay_enabled: true,
-                ..Default::default()
-            },
-        );
+        let (relay, _) = NetworkHub::new(LocalIdentity::generate(), relay_config());
         let relay_url = serve(relay.clone(), &mut tasks).await?;
         let (target, mut incoming) = NetworkHub::new(
             target_identity.clone(),
