@@ -59,6 +59,12 @@ enum Action {
     Update(Update),
     /// Join a personal network with an invite link from a management device.
     Join(Join),
+    /// Forward a Codex or Claude Code hook's stdin to this device's Node; always exits 0.
+    Hook(Hook),
+    /// Install, remove, check or test this Node's Codex and Claude Code hooks.
+    Hooks(Hooks),
+    /// The coordination Agent's triage answers: list pending events, raise or dismiss one.
+    Triage(Triage),
     /// Call a node tool from a locally managed SDK process.
     Tool {
         name: String,
@@ -164,6 +170,91 @@ struct Init {
     relay_token_file: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum HookAgent {
+    Codex,
+    Claude,
+}
+
+#[derive(Args)]
+struct LocalNode {
+    #[command(flatten)]
+    data: DataDir,
+    /// This device's local Node; defaults to `$VIBEFACE_TRIAGE_URL`, then the configured local listener.
+    #[arg(long, value_name = "URL")]
+    node: Option<String>,
+}
+
+#[derive(Args)]
+struct Hook {
+    #[arg(value_enum)]
+    agent: HookAgent,
+    #[command(flatten)]
+    local: LocalNode,
+    /// Send a test event instead of reading stdin.
+    #[arg(long)]
+    test: bool,
+    /// Print the normalized event without sending it.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HooksAction {
+    Install,
+    Uninstall,
+    Status,
+    Test,
+}
+
+#[derive(Args)]
+struct Hooks {
+    #[arg(value_enum)]
+    action: HooksAction,
+    #[command(flatten)]
+    local: LocalNode,
+    /// Home directory holding `.codex` and `.claude`; defaults to `$HOME` (and `$CODEX_HOME`).
+    #[arg(long, value_name = "DIR")]
+    home: Option<PathBuf>,
+    /// Show what would change without writing.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct Triage {
+    #[command(subcommand)]
+    action: TriageAction,
+    #[command(flatten)]
+    local: LocalNode,
+}
+
+#[derive(Subcommand)]
+enum TriageAction {
+    /// Pending events as JSON.
+    Events {
+        #[arg(long, value_name = "MS")]
+        since: Option<i64>,
+    },
+    /// The user should look: record the card and send it to the project's outlet.
+    Raise {
+        #[arg(long)]
+        event_id: String,
+        #[arg(long, value_parser = ["info", "attention", "urgent"])]
+        severity: String,
+        #[arg(long)]
+        summary: String,
+        /// Same key for events about the same matter.
+        #[arg(long)]
+        matter: String,
+    },
+    /// Handled silently.
+    Dismiss {
+        #[arg(long)]
+        event_id: String,
+    },
+}
+
 #[derive(Args)]
 struct Access {
     #[command(flatten)]
@@ -243,6 +334,14 @@ async fn main() -> Result<()> {
             json,
             call_ref,
         } => call_tool(name, json, call_ref).await,
+        Action::Hook(options) => {
+            if let Err(error) = hook(options).await {
+                eprintln!("vibeface hook: {error:#}");
+            }
+            Ok(())
+        }
+        Action::Hooks(options) => hooks(options).await,
+        Action::Triage(options) => triage(options).await,
     }
 }
 
@@ -737,6 +836,272 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn local_node_url(local: &LocalNode) -> Result<Url> {
+    let url = match &local.node {
+        Some(url) => url.clone(),
+        None => match std::env::var(vibeface::runtime::TRIAGE_URL_ENV) {
+            Ok(url) => url,
+            Err(_) => format!(
+                "http://{}",
+                Config::load(&local.data.data_dir)
+                    .map_or(config::DEFAULT_LOCAL_LISTEN, |c| c.local_listen)
+            ),
+        },
+    };
+    let url = origin(&url)?;
+    ensure!(
+        is_loopback(&url),
+        "the local Node URL must be a loopback address"
+    );
+    Ok(url)
+}
+
+async fn post_local(url: &Url, path: &str, body: &Value, total: Duration) -> Result<Value> {
+    let response = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(total)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(url.join(path)?)
+        .json(body)
+        .send()
+        .await
+        .context("the local Node is unreachable")?;
+    let status = response.status();
+    let value: Value =
+        serde_json::from_slice(&bounded_body(response).await?).unwrap_or(Value::Null);
+    ensure!(
+        status.is_success(),
+        "the Node refused it (HTTP {status}): {}",
+        value["error"].as_str().unwrap_or_default()
+    );
+    Ok(value)
+}
+
+fn git(cwd: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !text.is_empty()).then_some(text)
+}
+
+async fn hook(options: Hook) -> Result<()> {
+    use vibeface::triage::{self, AgentEvent};
+    let mut event = if options.test {
+        AgentEvent {
+            source: triage::Source::Test,
+            session_id: "test".into(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            cwd: std::env::current_dir()?.to_string_lossy().into(),
+            test: true,
+            ..Default::default()
+        }
+    } else {
+        let mut input = Vec::new();
+        std::io::stdin().take(1 << 20).read_to_end(&mut input)?;
+        let input: Value = serde_json::from_slice(&input).context("hook input is not JSON")?;
+        let event = match options.agent {
+            HookAgent::Codex => triage::from_codex_hook(&input),
+            HookAgent::Claude => triage::from_claude_hook(
+                &input,
+                input["transcript_path"]
+                    .as_str()
+                    .and_then(|path| fs::metadata(path).ok())
+                    .map_or(0, |metadata| metadata.len()),
+            ),
+        };
+        let Some(event) = event else { return Ok(()) };
+        event
+    };
+    event.agent = match options.agent {
+        HookAgent::Codex => triage::Agent::Codex,
+        HookAgent::Claude => triage::Agent::Claude,
+    };
+    if !event.cwd.is_empty() {
+        let top = git(&event.cwd, &["rev-parse", "--show-toplevel"]);
+        event.repo = top.and_then(|top| {
+            Path::new(&top)
+                .file_name()
+                .map(|n| n.to_string_lossy().into())
+        });
+        event.git_branch = git(&event.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        event.git_head = git(&event.cwd, &["rev-parse", "HEAD"]);
+    }
+    let body = serde_json::to_value(&event)?;
+    if options.dry_run {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let sent = async {
+        post_local(
+            &local_node_url(&options.local)?,
+            "api/hooks",
+            &body,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+    .await;
+    match sent {
+        Ok(result) if options.test => println!("{result}"),
+        Ok(_) => {}
+        Err(error) => {
+            let spool = options
+                .local
+                .data
+                .data_dir
+                .join(vibeface::runtime::HOOK_SPOOL);
+            config::private_dir(&spool)?;
+            config::private_write(
+                &spool.join(format!("{}.json", uuid::Uuid::new_v4())),
+                &serde_json::to_vec(&body)?,
+            )?;
+            return Err(error.context("spooled for the Node's next scan"));
+        }
+    }
+    Ok(())
+}
+
+async fn hooks(options: Hooks) -> Result<()> {
+    use vibeface::triage;
+    if let HooksAction::Test = options.action {
+        let result = post_local(
+            &local_node_url(&options.local)?,
+            "api/hooks",
+            &json!({"source":"test","session_id":"test","turn_id":uuid::Uuid::new_v4().to_string(),"test":true}),
+            Duration::from_secs(5),
+        )
+        .await?;
+        ensure!(
+            result["status"] == "accepted",
+            "unexpected answer: {result}"
+        );
+        println!("Node received the test event {}", result["event_id"]);
+        return Ok(());
+    }
+    let home = match &options.home {
+        Some(home) => home.clone(),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?),
+    };
+    let codex_home = match &options.home {
+        Some(_) => None,
+        None => std::env::var_os("CODEX_HOME").map(PathBuf::from),
+    };
+    let program = std::env::current_exe()?;
+    let data_dir = match options.local.data.data_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => options.local.data.data_dir.clone(),
+    };
+    let stamp = vibeface::runtime::now_ms();
+    for file in triage::hook_files(&home, codex_home.as_deref()) {
+        let mut settings: Value = match fs::read(&file.path) {
+            Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
+            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+                format!("{} is not valid JSON; left unchanged", file.path.display())
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+            Err(error) => return Err(error.into()),
+        };
+        let command = triage::hook_command(&program, file.agent, &data_dir);
+        let changed = match options.action {
+            HooksAction::Install => triage::add_hooks(&mut settings, &file, &command)?,
+            HooksAction::Uninstall => triage::remove_hooks(&mut settings, &file),
+            HooksAction::Status | HooksAction::Test => {
+                let events = triage::installed(&settings, &file);
+                println!(
+                    "{}: {}",
+                    file.path.display(),
+                    if events.is_empty() {
+                        "not installed".into()
+                    } else {
+                        events.join(", ")
+                    }
+                );
+                continue;
+            }
+        };
+        if changed.is_empty() {
+            println!("{}: unchanged", file.path.display());
+            continue;
+        }
+        if options.dry_run {
+            println!(
+                "{}: would change {} with `{command}`",
+                file.path.display(),
+                changed.join(", ")
+            );
+            continue;
+        }
+        if file.path.exists() {
+            let backup = file.path.with_file_name(format!(
+                "{}.bak-vibeface-{stamp}",
+                file.path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            fs::copy(&file.path, &backup)?;
+            println!("{}: backed up to {}", file.path.display(), backup.display());
+        } else if let Some(parent) = file.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file.path, serde_json::to_vec_pretty(&settings)?)?;
+        println!("{}: changed {}", file.path.display(), changed.join(", "));
+    }
+    if let HooksAction::Install = options.action {
+        let config = codex_home
+            .unwrap_or_else(|| home.join(".codex"))
+            .join("config.toml");
+        let enabled = fs::read_to_string(&config)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .is_some_and(|table| {
+                table
+                    .get("features")
+                    .and_then(|f| f.get("hooks"))
+                    .and_then(|h| h.as_bool())
+                    == Some(true)
+            });
+        if !enabled {
+            println!(
+                "Codex runs hooks only with `[features] hooks = true` in {}; this command does not edit it.",
+                config.display()
+            );
+        }
+        println!(
+            "Codex asks to trust a new hook before its first run; sessions already open pick hooks up after a restart or resume."
+        );
+    }
+    Ok(())
+}
+
+async fn triage(options: Triage) -> Result<()> {
+    let body = match options.action {
+        TriageAction::Events { since } => json!({"action":"events","since":since}),
+        TriageAction::Raise {
+            event_id,
+            severity,
+            summary,
+            matter,
+        } => {
+            json!({"action":"raise","event_id":event_id,"severity":severity,"summary":summary,"matter":matter})
+        }
+        TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
+    };
+    let result = post_local(
+        &local_node_url(&options.local)?,
+        "api/triage",
+        &body,
+        Duration::from_secs(30),
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
 }
 
 #[cfg(test)]
