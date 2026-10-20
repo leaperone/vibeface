@@ -434,18 +434,7 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn origin(value: &str) -> Result<Url> {
-    let url = Url::parse(value).context("invalid node URL")?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.path() == "/",
-        "node URL must be an HTTP(S) origin without credentials, a path, query, or fragment"
-    );
-    Ok(url)
+    config::http_origin(value).context("invalid node URL")
 }
 
 fn is_loopback(url: &Url) -> bool {
