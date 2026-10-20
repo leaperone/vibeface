@@ -20,6 +20,30 @@ fn live(record: &WorkRecord) -> bool {
     )
 }
 
+/// The first changed path outside `cwd`; relative paths start at `cwd` and `..` is resolved by name.
+fn escaped(changes: &Value, cwd: &str) -> Option<String> {
+    let inside = |path: &str| {
+        let mut resolved = std::path::PathBuf::new();
+        for part in Path::new(cwd).join(path).components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                std::path::Component::CurDir => {}
+                part => resolved.push(part),
+            }
+        }
+        resolved.starts_with(cwd)
+    };
+    changes
+        .as_array()?
+        .iter()
+        .flat_map(|change| [change["path"].as_str(), change["kind"]["move_path"].as_str()])
+        .flatten()
+        .find(|path| !inside(path))
+        .map(str::to_owned)
+}
+
 impl Runtime {
     fn executor_epoch(&self) -> u64 {
         self.executor_epoch
@@ -748,6 +772,15 @@ impl Runtime {
             return Ok(());
         };
         let work_id = record.spec.work_id.clone();
+        let item = &params["item"];
+        // Recorded only: writes outside the directory are allowed and never raise an alert.
+        if method == "item/completed"
+            && item["type"] == "fileChange"
+            && item["status"] == "completed"
+            && let Some(path) = escaped(&item["changes"], &record.spec.cwd)
+        {
+            tracing::info!(work_id, path, "work changed a file outside its directory");
+        }
         self.publish_progress(
             network,
             json!({"type":"native_progress","conversation_id":record.spec.conversation,"work_id":work_id,
@@ -806,5 +839,21 @@ impl Runtime {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn changes_outside_the_work_directory_are_found() {
+        let changes = |path: &str| json!([{"path":"src/a.rs","kind":{"type":"add"}},{"path":path,"kind":{"type":"add"}}]);
+        assert_eq!(super::escaped(&changes("/p/b.rs"), "/p"), None);
+        assert_eq!(super::escaped(&changes("sub/../c.rs"), "/p"), None);
+        assert_eq!(super::escaped(&changes("../q/x"), "/p").as_deref(), Some("../q/x"));
+        assert_eq!(super::escaped(&changes("/pq/x"), "/p").as_deref(), Some("/pq/x"));
+        let moved = json!([{"path":"a","kind":{"type":"update","move_path":"/etc/x"}}]);
+        assert_eq!(super::escaped(&moved, "/p").as_deref(), Some("/etc/x"));
     }
 }
