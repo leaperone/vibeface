@@ -2082,6 +2082,7 @@ def phase4_acceptance(options):
     def restart(node):
         node.stop()
         node.start()
+        wait_for(f"{node.name} aligns after its restart", lambda: node_status(node).get("write_state") == "writable", timeout=60)
         node.client.connect()
         node.client.authenticate()
 
