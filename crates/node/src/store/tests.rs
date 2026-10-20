@@ -356,6 +356,107 @@ fn conversation(store: &mut Store, net: &Net) -> Result<()> {
     Ok(())
 }
 
+/// A signed decision that another entry Node wraps again after a failover is the same decision:
+/// whatever outer hash the retry gets, it never overturns a conflict the original lost.
+#[test]
+fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let client = net.a.fixture_admin();
+    let owner = |node: &LocalIdentity| -> Result<EventBody> {
+        Ok(EventBody::ConversationOwner {
+            scheduler_node: node.device_id()?,
+            epoch: 2,
+            attestation: None,
+        })
+    };
+    let answer = |decision| EventBody::ApprovalAnswered {
+        work_id: "w".into(),
+        request_id: "r".into(),
+        decision,
+        attestation: None,
+    };
+    let autonomy = |mode| EventBody::AutonomySet {
+        mode,
+        version: 3,
+        attestation: None,
+    };
+    let outcome = |store: &Store| -> Result<(Option<String>, AutonomyMode, String)> {
+        let decision = store.connection.query_row(
+            "SELECT decision FROM approvals WHERE network_id=? AND request_id='r'",
+            params![net.network],
+            |r| r.get(0),
+        )?;
+        Ok((
+            store
+                .conversation(&net.network, "c")?
+                .context("conversation")?
+                .owner,
+            store.autonomy(&net.network, "c")?.mode,
+            decision,
+        ))
+    };
+    let mut at = 10;
+    let mut write =
+        |store: &mut Store, author: &LocalIdentity, body: EventBody| -> Result<String> {
+            at += 1;
+            let signed = client.attest(&net.network, "c", body)?;
+            Ok(store
+                .append_event(author, &net.network, "c", signed, vec![], at)?
+                .hash)
+        };
+    let mut originals = vec![];
+    for body in [
+        owner(&net.a)?,
+        owner(&net.b)?,
+        autonomy(AutonomyMode::Off),
+        autonomy(AutonomyMode::Continue),
+        answer(ApprovalDecision::Decline),
+        answer(ApprovalDecision::Accept),
+    ] {
+        originals.push(write(&mut store, &net.a, body)?);
+    }
+    let settled = outcome(&store)?;
+    assert_eq!(
+        settled.1,
+        AutonomyMode::Off,
+        "the stricter mode wins a same-version conflict"
+    );
+    assert_eq!(settled.2, "decline", "a refusal outranks consent");
+    let losing_owner = if settled.0 == Some(net.a.device_id()?) {
+        &net.b
+    } else {
+        &net.a
+    };
+    let winning_owner =
+        originals[usize::from(losing_owner.device_id()? == net.a.device_id()?)].clone();
+    let mut undercut = false;
+    for _ in 0..64 {
+        let retry = write(&mut store, &net.b, owner(losing_owner)?)?;
+        undercut |= retry < winning_owner;
+        for body in [
+            autonomy(AutonomyMode::Continue),
+            answer(ApprovalDecision::Accept),
+        ] {
+            write(&mut store, &net.b, body)?;
+        }
+        assert_eq!(
+            outcome(&store)?,
+            settled,
+            "a retry changed a settled decision"
+        );
+        if undercut {
+            break;
+        }
+    }
+    assert!(
+        undercut,
+        "a retry hashed below the winner, so an outer-hash tie-break would have flipped the owner"
+    );
+    Ok(())
+}
+
 #[test]
 fn the_same_message_id_queues_one_job() -> Result<()> {
     let net = net()?;

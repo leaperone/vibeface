@@ -31,6 +31,29 @@ fn text(value: impl serde::Serialize) -> Result<String> {
     })
 }
 
+/// The same signed request has the same key wherever an entry Node wraps it, so a retry through
+/// another entry cannot win a tie the original lost.
+fn request_key(network: &str, event: &Event) -> Result<String> {
+    let signer = event
+        .body
+        .attestation()
+        .map_or(event.author.as_str(), |attestation| {
+            attestation.device_id.as_str()
+        });
+    let mut signed = crate::crypto::attestation_payload(network, &event.scope_id, &event.body)?;
+    signed.extend_from_slice(signer.as_bytes());
+    Ok(crate::crypto::digest(&signed))
+}
+
+/// A refusal outranks consent, so concurrent conflicting answers settle the same way everywhere.
+fn answer_strictness(decision: ApprovalDecision) -> u8 {
+    match decision {
+        ApprovalDecision::Cancel => 0,
+        ApprovalDecision::Decline => 1,
+        ApprovalDecision::Accept | ApprovalDecision::Answered => 2,
+    }
+}
+
 pub(crate) fn strictness(mode: AutonomyMode) -> u8 {
     match mode {
         AutonomyMode::Continue => 0,
@@ -60,8 +83,8 @@ pub(crate) fn apply(
             ..
         } => {
             connection.execute(
-                "INSERT INTO conversations(network_id,conversation_id,owner,owner_epoch,owner_hash) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET owner=excluded.owner,owner_epoch=excluded.owner_epoch,owner_hash=excluded.owner_hash WHERE owner IS NULL OR excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.owner_hash<owner_hash)",
-                params![network, scope, scheduler_node, epoch, hash],
+                "INSERT INTO conversations(network_id,conversation_id,owner,owner_epoch,owner_key) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET owner=excluded.owner,owner_epoch=excluded.owner_epoch,owner_key=excluded.owner_key WHERE owner IS NULL OR excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.owner_key<owner_key)",
+                params![network, scope, scheduler_node, epoch, request_key(network, event)?],
             )?;
         }
         EventBody::BotCreated {
@@ -156,8 +179,8 @@ pub(crate) fn apply(
             ..
         } => {
             connection.execute(
-                "INSERT INTO approvals(network_id,request_id,work_id,decision,answer_rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET decision=excluded.decision,answer_rank=excluded.answer_rank WHERE answer_rank IS NULL OR excluded.answer_rank<answer_rank",
-                params![network, request_id, work_id, text(decision)?, rank],
+                "INSERT INTO approvals(network_id,request_id,work_id,decision,answer_key) VALUES(?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET decision=excluded.decision,answer_key=excluded.answer_key WHERE answer_key IS NULL OR excluded.answer_key<answer_key",
+                params![network, request_id, work_id, text(decision)?, format!("{}:{}", answer_strictness(*decision), request_key(network, event)?)],
             )?;
         }
         EventBody::WorkFinished {
@@ -205,8 +228,8 @@ pub(crate) fn apply(
         }
         EventBody::AutonomySet { mode, version, .. } => {
             connection.execute(
-                "INSERT INTO autonomy(network_id,conversation_id,mode,strictness,version,event_hash) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET mode=excluded.mode,strictness=excluded.strictness,version=excluded.version,event_hash=excluded.event_hash WHERE excluded.version>version OR (excluded.version=version AND (excluded.strictness>strictness OR (excluded.strictness=strictness AND excluded.event_hash<event_hash)))",
-                params![network, scope, text(mode)?, strictness(*mode), version, hash],
+                "INSERT INTO autonomy(network_id,conversation_id,mode,strictness,version,request_key) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET mode=excluded.mode,strictness=excluded.strictness,version=excluded.version,request_key=excluded.request_key WHERE excluded.version>version OR (excluded.version=version AND (excluded.strictness>strictness OR (excluded.strictness=strictness AND excluded.request_key<request_key)))",
+                params![network, scope, text(mode)?, strictness(*mode), version, request_key(network, event)?],
             )?;
         }
         EventBody::NotificationAcked {

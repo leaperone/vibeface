@@ -25,7 +25,7 @@ CREATE TABLE `log_conflicts` (`network_id` text NOT NULL, `hash` text NOT NULL, 
 -- Create index "log_conflicts_author" to table: "log_conflicts"
 CREATE INDEX `log_conflicts_author` ON `log_conflicts` (`network_id`, `author`, `seq`);
 -- Create "conversations" table
-CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_hash` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
+CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
 CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `blobs` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
 -- Create index "messages_order" to table: "messages"
@@ -37,11 +37,11 @@ CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conv
 -- Create index "works_conversation" to table: "works"
 CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
 -- Create "approvals" table
-CREATE TABLE `approvals` (`network_id` text NOT NULL, `request_id` text NOT NULL, `work_id` text NOT NULL, `kind` text NULL, `summary` text NULL, `request_rank` text NULL, `decision` text NULL, `answer_rank` text NULL, PRIMARY KEY (`network_id`, `request_id`));
+CREATE TABLE `approvals` (`network_id` text NOT NULL, `request_id` text NOT NULL, `work_id` text NOT NULL, `kind` text NULL, `summary` text NULL, `request_rank` text NULL, `decision` text NULL, `answer_key` text NULL, PRIMARY KEY (`network_id`, `request_id`));
 -- Create index "approvals_work" to table: "approvals"
 CREATE INDEX `approvals_work` ON `approvals` (`network_id`, `work_id`);
 -- Create "autonomy" table
-CREATE TABLE `autonomy` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `mode` text NOT NULL, `strictness` integer NOT NULL, `version` integer NOT NULL, `event_hash` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
+CREATE TABLE `autonomy` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `mode` text NOT NULL, `strictness` integer NOT NULL, `version` integer NOT NULL, `request_key` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "notifications" table
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table

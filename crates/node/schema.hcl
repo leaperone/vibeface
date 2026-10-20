@@ -242,7 +242,7 @@ table "conversations" {
     type    = integer
     default = 0
   }
-  column "owner_hash" {
+  column "owner_key" {
     null    = false
     type    = text
     default = ""
@@ -437,7 +437,7 @@ table "approvals" {
     null = true
     type = text
   }
-  column "answer_rank" {
+  column "answer_key" {
     null = true
     type = text
   }
@@ -470,7 +470,7 @@ table "autonomy" {
     null = false
     type = integer
   }
-  column "event_hash" {
+  column "request_key" {
     null = false
     type = text
   }
