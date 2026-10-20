@@ -19,6 +19,7 @@ const BLOB_SYNC_BYTES: u64 = 1024 * 1024;
 const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_OBJECTS: usize = 64;
 const MAX_ADDRESS_RECORDS: usize = 256;
+const MAX_FORK_PAGES: usize = 64;
 
 #[derive(Default)]
 pub(super) struct PeerSync {
@@ -28,6 +29,9 @@ pub(super) struct PeerSync {
     rerun: bool,
     boot: Option<String>,
     synced_ms: Option<i64>,
+    /// The last pair of differing fork digests that woke a sync, so evidence one side cannot
+    /// store does not keep both waking each other.
+    forks: Option<String>,
 }
 
 #[derive(Clone)]
@@ -83,6 +87,52 @@ impl iroh_relay::server::AccessControl for RelayAccess {
 /// Merged states are canonical, so equal histories encode equally.
 fn membership_digest(state: &NetworkState) -> Result<String> {
     Ok(crate::crypto::digest(&serde_json::to_vec(state)?))
+}
+
+/// Fetches what the peer holds of one author's log past a fork. Range pulls only extend the
+/// chain from our head, so a branch that left it earlier never arrives that way. Unless the
+/// peer's head is already here, this walks back from the shorter head in doubling steps to the
+/// newest of the peer's events held here, then ingests the peer's chain from there. Returns
+/// whether it fetched anything.
+pub(crate) async fn reconcile_log<H, P, I>(
+    our_max: u64,
+    (their_max, their_head): (u64, &str),
+    mut holds: impl FnMut(String) -> H,
+    mut pull: impl FnMut(u64, usize) -> P,
+    mut ingest: impl FnMut(Vec<SignedEvent>) -> I,
+) -> Result<bool>
+where
+    H: Future<Output = Result<bool>>,
+    P: Future<Output = Result<Vec<SignedEvent>>>,
+    I: Future<Output = Result<()>>,
+{
+    if their_max == 0 || holds(their_head.to_owned()).await? {
+        return Ok(false);
+    }
+    let mut held = our_max.min(their_max);
+    if held == their_max {
+        held -= 1;
+    }
+    let mut step = 1;
+    while held > 0 {
+        if let Some(event) = pull(held, 1).await?.first()
+            && holds(event.hash.clone()).await?
+        {
+            break;
+        }
+        held = held.saturating_sub(step);
+        step = step.saturating_mul(2);
+    }
+    let mut from = held + 1;
+    while from <= their_max {
+        let events = pull(from, crate::store::MAX_PULL_EVENTS).await?;
+        let Some(last) = events.last() else { break };
+        let next = serde_json::from_str::<Event>(&last.canonical_body)?.seq + 1;
+        ensure!(next > from, "peer answered a log range out of order");
+        ingest(events).await?;
+        from = next;
+    }
+    Ok(true)
 }
 
 impl Runtime {
@@ -367,11 +417,45 @@ impl Runtime {
 
     async fn hello(&self, network: &str) -> Result<Value> {
         let state = self.membership_state().await?;
-        let heads = self.store.lock().await.heads(network)?;
+        let (heads, forks) = {
+            let store = self.store.lock().await;
+            (store.heads(network)?, store.fork_digest(network)?)
+        };
         Ok(
             json!({"type":"hello","network_id":network,"vector":heads,"boot":self.boot,
-            "membership_epoch":state.epoch(),"membership":membership_digest(&state)?}),
+            "membership_epoch":state.epoch(),"membership":membership_digest(&state)?,"forks":forks}),
         )
+    }
+
+    /// Whether differing fork digests are new for `peer`; remembers them if so.
+    fn note_forks(&self, peer: &str, theirs: &Value, ours: &Value) -> bool {
+        let pair = Some(format!("{theirs}/{ours}"));
+        let mut peers = self.sync_peers.lock().expect("sync peers");
+        let known = &mut peers.entry(peer.to_owned()).or_default().forks;
+        let new = *known != pair;
+        *known = pair;
+        new
+    }
+
+    async fn pull(
+        &self,
+        network: &str,
+        peer: &str,
+        author: &str,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SignedEvent>> {
+        let reply = self
+            .net()?
+            .request(
+                peer,
+                net::SYNC,
+                &json!({"type":"pull","network_id":network,"author":author,
+                    "from_seq":from_seq,"limit":limit}),
+                PEER_TIMEOUT,
+            )
+            .await?;
+        Ok(serde_json::from_value(reply["events"].clone())?)
     }
 
     async fn handle_sync(&self, network: &str, origin: &str, input: &Value) -> Result<Value> {
@@ -388,7 +472,9 @@ impl Runtime {
                 let behind = theirs.iter().any(|(author, (seq, _))| {
                     local.get(author).map(|head| head.0).unwrap_or(0) < *seq
                 });
-                if behind || input["membership"] != ours["membership"] {
+                let forks = input["forks"] != ours["forks"]
+                    && self.note_forks(origin, &input["forks"], &ours["forks"]);
+                if behind || forks || input["membership"] != ours["membership"] {
                     self.wake_sync(origin);
                 }
                 Ok(ours)
@@ -400,10 +486,19 @@ impl Runtime {
                     incoming.genesis.network_id == network,
                     "wrong membership network"
                 );
-                if incoming.epoch() >= self.membership_state().await?.epoch() {
-                    self.install_membership(incoming).await?;
-                }
+                self.install_membership(incoming).await?;
                 Ok(json!({"state":self.membership_state().await?}))
+            }
+            "forks" => {
+                let after: Option<(String, u64, String)> =
+                    serde_json::from_value(input["after"].clone())
+                        .context("invalid fork cursor")?;
+                let events = self
+                    .store
+                    .lock()
+                    .await
+                    .fork_events(network, after.as_ref())?;
+                Ok(json!({"events":events}))
             }
             "pull" => {
                 let author = field(input, "author")?;
@@ -570,9 +665,7 @@ impl Runtime {
                 )
                 .await?;
             let incoming: NetworkState = serde_json::from_value(reply["state"].clone())?;
-            if incoming.epoch() >= state.epoch() {
-                self.install_membership(incoming).await?;
-            }
+            self.install_membership(incoming).await?;
         }
         if let Err(error) = self.exchange_addresses(network, peer).await {
             tracing::debug!(%peer, %error, "address book exchange pending");
@@ -587,16 +680,15 @@ impl Runtime {
                     if local >= *seq {
                         break;
                     }
-                    let reply = net
-                        .request(
+                    let events = self
+                        .pull(
+                            network,
                             peer,
-                            net::SYNC,
-                            &json!({"type":"pull","network_id":network,"author":author,
-                                "from_seq":local + 1,"limit":crate::store::MAX_PULL_EVENTS}),
-                            PEER_TIMEOUT,
+                            author,
+                            local + 1,
+                            crate::store::MAX_PULL_EVENTS,
                         )
                         .await?;
-                    let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
                     if events.is_empty() {
                         break;
                     }
@@ -609,6 +701,35 @@ impl Runtime {
             }
             if !progressed {
                 break;
+            }
+        }
+        for (author, head) in &vector {
+            let our_max = self.local_seq(network, author).await?;
+            reconcile_log(
+                our_max,
+                (head.0, &head.1),
+                |hash| async move { Ok(self.store.lock().await.event(network, &hash)?.is_some()) },
+                |from, limit| self.pull(network, peer, author, from, limit),
+                |events| async move { self.ingest(network, &events).await },
+            )
+            .await?;
+        }
+        if theirs["forks"] != json!(self.store.lock().await.fork_digest(network)?) {
+            let mut after: Option<(String, u64, String)> = None;
+            for _ in 0..MAX_FORK_PAGES {
+                let reply = net
+                    .request(
+                        peer,
+                        net::SYNC,
+                        &json!({"type":"forks","network_id":network,"after":after}),
+                        PEER_TIMEOUT,
+                    )
+                    .await?;
+                let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
+                let Some(last) = events.last() else { break };
+                let event: Event = serde_json::from_str(&last.canonical_body)?;
+                after = Some((event.author, event.seq, last.hash.clone()));
+                self.ingest(network, &events).await?;
             }
         }
         self.check_own_log(network, peer, &vector).await?;
@@ -1523,6 +1644,99 @@ mod tests {
             .attestation()
             .cloned()
             .context("signed message")
+    }
+
+    /// Each side's copy of x's log split at seq 3. Walking back from the peer's head finds the
+    /// fork, and after one pass each way both hold the same evidence and count the same events.
+    #[tokio::test]
+    async fn diverged_logs_walk_back_to_the_fork_and_converge() -> Result<()> {
+        use std::sync::Mutex;
+        let (ia, ix) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ix.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let author = ix.device_id()?;
+        let replica = || -> Result<Store> {
+            let mut store = Store::open(":memory:")?;
+            store.install_trust_bundle(&network, &state)?;
+            Ok(store)
+        };
+        let message = |id: &str| -> Result<EventBody> {
+            Ok(EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                attestation: Some(user(&ia, &network, id)?),
+            })
+        };
+        let (mut p, mut q) = (replica()?, replica()?);
+        let created = EventBody::ConversationCreated { title: "t".into() };
+        let shared = vec![
+            p.append_event(&ix, &network, "c", created, vec![], 1)?,
+            p.append_event(&ix, &network, "c", message("x2")?, vec![], 2)?,
+        ];
+        for id in ["a3", "a4", "a5"] {
+            p.append_event(&ix, &network, "c", message(id)?, vec![], 3)?;
+        }
+        q.ingest_events(&network, &shared)?;
+        for id in ["b3", "b4", "b5", "b6"] {
+            q.append_event(&ix, &network, "c", message(id)?, vec![], 3)?;
+        }
+        let (p, q) = (Mutex::new(p), Mutex::new(q));
+        let pulls = Mutex::new(0);
+        let network = network.as_str();
+        let fetch = async |to: &Mutex<Store>, from: &Mutex<Store>| -> Result<bool> {
+            let their = from.lock().unwrap().heads(network)?[&author].clone();
+            let our_max = to.lock().unwrap().heads(network)?[&author].0;
+            reconcile_log(
+                our_max,
+                (their.0, &their.1),
+                |hash| async move { Ok(to.lock().unwrap().event(network, &hash)?.is_some()) },
+                |seq, limit| {
+                    *pulls.lock().unwrap() += 1;
+                    let events = from
+                        .lock()
+                        .unwrap()
+                        .events_from(network, &author, seq, limit);
+                    async move { events }
+                },
+                |events| async move {
+                    to.lock().unwrap().ingest_events(network, &events)?;
+                    Ok(())
+                },
+            )
+            .await
+        };
+        assert!(fetch(&q, &p).await?);
+        assert!(
+            *pulls.lock().unwrap() <= 4,
+            "walk-back probes in doubling steps"
+        );
+        assert!(fetch(&p, &q).await?);
+        assert!(!fetch(&q, &p).await? && !fetch(&p, &q).await?);
+        let evidence = |store: &Mutex<Store>| -> Result<(Vec<String>, Vec<String>, String)> {
+            let store = store.lock().unwrap();
+            let hashes = |sql: &str| -> Result<Vec<String>> {
+                Ok(store
+                    .connection
+                    .prepare(sql)?
+                    .query_map([network], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            };
+            Ok((
+                hashes("SELECT hash FROM events WHERE network_id=? ORDER BY hash")?,
+                hashes("SELECT hash FROM events WHERE network_id=? AND effective=1 ORDER BY hash")?,
+                store.fork_digest(network)?,
+            ))
+        };
+        let (stored, effective, forks) = evidence(&p)?;
+        assert_eq!((stored.len(), effective.len()), (9, 2));
+        assert!(!forks.is_empty());
+        assert_eq!(evidence(&q)?, (stored, effective, forks));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

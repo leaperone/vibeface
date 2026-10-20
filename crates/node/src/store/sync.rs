@@ -109,6 +109,74 @@ impl Store {
         Ok(events)
     }
 
+    /// `(author, seq, hash)` of every event from each forked author's first fork on, on every
+    /// branch: the fork evidence two Nodes compare. Which branch is main differs by replica, so
+    /// it is left out.
+    fn fork_keys(&self, network: &str) -> Result<Vec<(String, u64, String)>> {
+        let forks: Vec<(String, u64)> = self
+            .connection
+            .prepare(
+                "SELECT author,min(seq) FROM events WHERE network_id=? AND main=0 GROUP BY author",
+            )?
+            .query_map([network], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut keys = Vec::new();
+        for sql in [
+            "SELECT seq,hash FROM events WHERE network_id=? AND author=? AND seq>=? AND main=1",
+            "SELECT seq,hash FROM events WHERE network_id=? AND author=? AND seq>=? AND main=0",
+        ] {
+            let mut statement = self.connection.prepare(sql)?;
+            for (author, fork) in &forks {
+                for row in statement.query_map(params![network, author, fork], |r| {
+                    Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))
+                })? {
+                    let (seq, hash) = row?;
+                    keys.push((author.clone(), seq, hash));
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Empty without forks; otherwise differs whenever two Nodes hold different fork evidence.
+    pub fn fork_digest(&self, network: &str) -> Result<String> {
+        let keys = self.fork_keys(network)?;
+        if keys.is_empty() {
+            return Ok(String::new());
+        }
+        let hashes: Vec<&str> = keys.iter().map(|(_, _, hash)| hash.as_str()).collect();
+        Ok(crate::crypto::digest(hashes.join(",").as_bytes()))
+    }
+
+    /// The fork evidence after `after` in `(author, seq, hash)` order, within the batch limits.
+    pub fn fork_events(
+        &self,
+        network: &str,
+        after: Option<&(String, u64, String)>,
+    ) -> Result<Vec<SignedEvent>> {
+        let mut events = Vec::new();
+        let mut bytes = 0;
+        for (_, _, hash) in self
+            .fork_keys(network)?
+            .iter()
+            .filter(|key| after.is_none_or(|after| *key > after))
+            .take(MAX_PULL_EVENTS)
+        {
+            let envelope: String = self.connection.query_row(
+                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |r| r.get(0),
+            )?;
+            bytes += envelope.len();
+            if bytes > MAX_PULL_BYTES && !events.is_empty() {
+                break;
+            }
+            events.push(serde_json::from_str(&envelope)?);
+        }
+        Ok(events)
+    }
+
     pub fn address_book(&self) -> Result<Vec<SignedAddress>> {
         let mut statement = self
             .connection
