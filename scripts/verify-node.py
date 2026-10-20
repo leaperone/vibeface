@@ -2521,9 +2521,8 @@ def scope_events(node, network, scope):
 
 def committed_blob_offset(node, network, digest):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        row = connection.execute("SELECT value FROM local_values WHERE network_id=? AND key=?",
-                                 (network, "blob-partial:" + digest)).fetchone()
-    return json.loads(row[0]) if row else 0
+        row = connection.execute("SELECT committed FROM blob_offsets WHERE hash=?", (digest,)).fetchone()
+    return row[0] if row else 0
 
 
 def phase4_acceptance(options):

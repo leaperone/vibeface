@@ -1253,10 +1253,7 @@ fn a_routine_runs_its_latest_time_once() -> Result<()> {
             .is_none()
     );
     assert!(matches!(
-        store
-            .scheduler_job("c", &next[0].1)?
-            .context("job")?
-            .state,
+        store.scheduler_job("c", &next[0].1)?.context("job")?.state,
         JobState::Cancelled { .. }
     ));
     assert!(
@@ -1282,7 +1279,6 @@ fn append_path_uses_indexes_only() -> Result<()> {
         "SELECT 1 FROM log_conflicts WHERE network_id=?1 AND hash=?2",
         "SELECT hash FROM events WHERE network_id=?1 AND author=?2 AND seq=1",
         "SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id='c' AND message_id=?2",
-        "SELECT value FROM local_values WHERE network_id=?1 AND key>=?2 AND key<'z'",
     ];
     for sql in statements {
         let mut plan = store

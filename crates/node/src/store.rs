@@ -525,19 +525,6 @@ impl Store {
         })
         .collect()
     }
-    pub fn local_value(&self, network_id: &str, key: &str) -> Result<Option<Value>> {
-        local_load(&self.connection, network_id, key)
-    }
-    pub fn local_set(&mut self, network_id: &str, key: &str, value: &Value) -> Result<()> {
-        local_save(&self.connection, network_id, key, value)
-    }
-    pub fn local_delete(&mut self, network_id: &str, key: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM local_values WHERE network_id=? AND key=?",
-            params![network_id, key],
-        )?;
-        Ok(())
-    }
     pub fn pending_notifications(
         &self,
         network_id: &str,
@@ -738,47 +725,6 @@ pub(crate) fn message_from(
         )
         .optional()?
         .transpose()
-}
-
-pub(crate) fn local_load<T: DeserializeOwned>(
-    connection: &Connection,
-    network: &str,
-    key: &str,
-) -> Result<Option<T>> {
-    optional_json(
-        connection
-            .query_row(
-                "SELECT value FROM local_values WHERE network_id=? AND key=?",
-                params![network, key],
-                |r| r.get(0),
-            )
-            .optional()?,
-    )
-}
-
-pub(crate) fn local_save(
-    connection: &Connection,
-    network: &str,
-    key: &str,
-    value: &impl serde::Serialize,
-) -> Result<()> {
-    connection.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value", params![network,key,serde_json::to_string(value)?])?;
-    Ok(())
-}
-
-/// Values whose key starts with `prefix`, through an index range rather than a table scan.
-pub(crate) fn local_prefix<T: DeserializeOwned>(
-    connection: &Connection,
-    network: &str,
-    prefix: &str,
-) -> Result<Vec<T>> {
-    let mut end = prefix.to_owned();
-    end.push(char::MAX);
-    let mut statement = connection.prepare(
-        "SELECT value FROM local_values WHERE network_id=? AND key>=? AND key<? ORDER BY key",
-    )?;
-    let rows = statement.query_map(params![network, prefix, end], |r| r.get::<_, String>(0))?;
-    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
 pub(crate) fn membership_from(

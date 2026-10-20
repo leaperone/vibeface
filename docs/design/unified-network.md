@@ -744,7 +744,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 - 写入状态为 `aligning`、`read_only`、`writable` 和 `forked`，把 5.8 节“其他 Node 都不可达时保持只读”单独列为 `read_only`。闸门放在 `log::append_from`，这是本机追加事件的唯一入口：Node 的存储连接上有一张 TEMP 表 `write_gate`，状态变化在存储锁内写入它，状态不是 `writable` 时追加失败，错误说明对齐中、只读或已分叉。调度和执行在进入 `writable` 后才启动；读取、同步和入库其他作者的事件不受影响。
 - 启动时成员目录里还有其他 Node 则进入 `aligning`，已记录本机作者冲突的直接进入 `forked`。每次与对端 Hello 时比较对方记录的本机作者 `max_seq` 和 `head_hash`：对方不多于本机且同序号 hash 相同时进入 `writable`；对方更多时照常拉回自己的日志，下一次 Hello 再判断；同序号 hash 不同时拉回对方那一条，写入 `log_conflicts` 后进入 `forked`，并在 `node.log` 记一条警告。对齐中所有其他 Node 都同步失败时进入 `read_only`。
-- 与 5.8 节的差异：对齐期间本人发的消息直接被拒绝并提示稍后再试，没有先放进入口 outbox 再写；“没有从备份恢复”的确认由管理设备的加密会话或本机会话调用 `confirm_writable`，不另带 `Attestation`，只写本机 `local_values`，不进入 DAG，对 `forked` 无效。分叉设备按第 9 节决定 9 处理：网页列出两份内容，引导到设备页移除后用新数据目录重新加入。
+- 与 5.8 节的差异：对齐期间本人发的消息直接被拒绝并提示稍后再试，没有先放进入口 outbox 再写；“没有从备份恢复”的确认由管理设备的加密会话或本机会话调用 `confirm_writable`，不另带 `Attestation`，只写本机 `identity_meta`，不进入 DAG，对 `forked` 无效。分叉设备按第 9 节决定 9 处理：网页列出两份内容，引导到设备页移除后用新数据目录重新加入。
 - 网页：不能写时连接胶囊显示“只读”，弹出框和输入框旁说明是在对齐、等待确认还是已分叉；待处理里出现“这个设备的数据是从备份恢复的吗？”卡片（“是，先同步”和“不是，继续使用”），以及“这台设备的数据有两份副本”或“X 的数据有两份副本”的冲突卡片，两份内容放在详细信息里。`data_epoch` 改为 7，数据库 `user_version` 仍为 6；安装器和更新器只接受 epoch 7 的包。
 - 日志：默认过滤为 `warn,vibeface=info,vibeface_bridge=info`，`RUST_LOG` 可覆盖。`serve` 把日志追加到数据目录的 `node.log`（0600），启动时超过 16 MiB 轮转为 `node.log.1`；只有标准错误是终端时才同时输出，所以服务的 stderr 文件只剩崩溃信息。日志不写邀请、secret、入口令牌和本机启动 token。`status` 输出 `Writes` 和每台其他成员 Node 的 `Peer` 行（最近一次同步是否连上、完成于多久之前），`--json` 带 `write_state` 和 `peers`。
 - 排障：设置页“排障”只有一个“导出诊断包”，管理设备或本机会话可用。诊断包含版本、平台、设备编号、`config.json`、写入状态、冲突数、对端连通、`node.log` 最后 400 行和 `service.stderr.log` 最后 50 行，邀请链接片段替换为 `[invite]`，入口令牌替换为 `[redacted]`。排障说明在 `docs/troubleshooting.md`。

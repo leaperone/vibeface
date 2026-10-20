@@ -137,7 +137,7 @@ impl Runtime {
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
             let view = self.membership_state().await?.project()?;
-            for signed in self.store.lock().await.address_book(&network)? {
+            for signed in self.store.lock().await.address_book()? {
                 if let Ok(record) = signed.open(&network)
                     && view.node(&record.device_id).is_ok()
                 {
@@ -311,7 +311,7 @@ impl Runtime {
                 let records: Vec<SignedAddress> =
                     serde_json::from_value(input["records"].clone()).unwrap_or_default();
                 self.merge_addresses(network, records).await?;
-                Ok(json!({"records":self.store.lock().await.address_book(network)?}))
+                Ok(json!({"records":self.store.lock().await.address_book()?}))
             }
             "deliver" => self.accept_delivery(network, origin, input).await,
             "manager_status" => {
@@ -817,10 +817,9 @@ impl Runtime {
             .set_write_state(network, &from, WriteState::Writable)
             .await
         {
-            self.store.lock().await.local_set(
-                network,
-                "write-confirmed",
-                &json!({"device":device,"at_ms":now_ms()}),
+            self.store.lock().await.connection.execute(
+                "INSERT INTO identity_meta(key,value) VALUES('write-confirmed',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [json!({"device":device,"at_ms":now_ms()}).to_string()],
             )?;
             tracing::info!(device, "write confirmed without a backup check");
         }
@@ -991,11 +990,7 @@ impl Runtime {
             if let Ok(net) = self.net() {
                 net.forget(&revoked.device_id);
             }
-            let _ = self
-                .store
-                .lock()
-                .await
-                .forget_address(&view.network_id, &revoked.device_id);
+            let _ = self.store.lock().await.forget_address(&revoked.device_id);
         }
         self.abandon_revoked_works(&view.network_id).await;
     }
@@ -1056,7 +1051,7 @@ impl Runtime {
         let gateway_url = Some(self.gateway_url());
         let mut store = self.store.lock().await;
         let previous = store
-            .address_book(network)?
+            .address_book()?
             .into_iter()
             .filter_map(|signed| signed.open(network).ok())
             .find(|record| record.device_id == device_id);
@@ -1089,7 +1084,7 @@ impl Runtime {
     }
 
     async fn exchange_addresses(&self, network: &str, peer: &str) -> Result<()> {
-        let records = self.store.lock().await.address_book(network)?;
+        let records = self.store.lock().await.address_book()?;
         let reply = self
             .net()?
             .request(
@@ -1143,7 +1138,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .address_book(network)?
+            .address_book()?
             .into_iter()
             .filter(|signed| {
                 signed.open(network).is_ok_and(|record| {
@@ -1230,9 +1225,10 @@ impl Runtime {
             };
             match delivered {
                 Ok(reply) if reply["receipt"].is_object() => {
-                    self.store.lock().await.remove_outbox(&entry.conversation_id,
-                        &entry.trigger,
-                    )?;
+                    self.store
+                        .lock()
+                        .await
+                        .remove_outbox(&entry.conversation_id, &entry.trigger)?;
                     self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
                     self.schedule_wakeup.notify_one();
                 }
@@ -1354,7 +1350,7 @@ impl Runtime {
             (
                 store.partial_blob_file(&blob.hash)?,
                 store.blob_file(&blob.hash)?,
-                store.committed_offset(network, &blob.hash)?,
+                store.committed_offset(&blob.hash)?,
             )
         };
         let dir = part.parent().context("partial directory")?;
@@ -1403,7 +1399,7 @@ impl Runtime {
                 self.store
                     .lock()
                     .await
-                    .commit_offset(network, &blob.hash, Some(offset))?;
+                    .commit_offset(&blob.hash, Some(offset))?;
                 unsynced = 0;
             }
         }
@@ -1411,24 +1407,18 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .commit_offset(network, &blob.hash, Some(offset))?;
+            .commit_offset(&blob.hash, Some(offset))?;
         ensure!(offset == blob.size, "attachment stream ended early");
         drop(file);
         let bytes = tokio::fs::read(&part).await?;
         if crate::crypto::digest(&bytes) != blob.hash {
             let _ = tokio::fs::remove_file(&part).await;
-            self.store
-                .lock()
-                .await
-                .commit_offset(network, &blob.hash, None)?;
+            self.store.lock().await.commit_offset(&blob.hash, None)?;
             bail!("downloaded attachment failed its hash check");
         }
         tokio::fs::create_dir_all(target.parent().context("blob directory")?).await?;
         tokio::fs::rename(&part, &target).await?;
-        self.store
-            .lock()
-            .await
-            .commit_offset(network, &blob.hash, None)?;
+        self.store.lock().await.commit_offset(&blob.hash, None)?;
         Ok(())
     }
 }
@@ -1575,7 +1565,7 @@ mod tests {
                 let (b, network, peer) = (b.clone(), network.clone(), peer_a.clone());
                 tokio::spawn(async move { b.sync_peer(&network, &peer).await })
             };
-            while b.store.lock().await.committed_offset(&network, &blob.hash)? == 0
+            while b.store.lock().await.committed_offset(&blob.hash)? == 0
                 && !first.is_finished()
             {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1599,7 +1589,7 @@ mod tests {
             assert_eq!(b.store.lock().await.messages(&network, "c")?.len(), 3);
             assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());
             assert!(
-                a.store.lock().await.address_book(&network)?.iter().any(|signed| signed
+                a.store.lock().await.address_book()?.iter().any(|signed| signed
                     .open(&network)
                     .is_ok_and(|record| record.device_id == ib.device_id().unwrap_or_default())),
                 "the pulled Node learned the puller's signed address"
@@ -1630,11 +1620,11 @@ mod tests {
             seeded[0] ^= 1;
             seeded.extend_from_slice(b"bytes after the last synced offset");
             std::fs::write(&part, &seeded)?;
-            b.store.lock().await.commit_offset(&network, &blob.hash, Some(1024 * 1024))?;
+            b.store.lock().await.commit_offset(&blob.hash, Some(1024 * 1024))?;
             let corrupted = b.fetch_blob(&network, &ia.device_id()?, &blob).await;
             assert!(corrupted.is_err() && !part.exists(), "resumed bytes keep the synced prefix and fail the hash check");
             std::fs::write(&part, &content[..1024 * 1024])?;
-            b.store.lock().await.commit_offset(&network, &blob.hash, Some(1024 * 1024))?;
+            b.store.lock().await.commit_offset(&blob.hash, Some(1024 * 1024))?;
             b.fetch_blob(&network, &ia.device_id()?, &blob).await?;
             assert_eq!(std::fs::read(&target)?, content);
             assert!(!part.exists());

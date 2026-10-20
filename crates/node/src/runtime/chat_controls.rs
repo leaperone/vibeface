@@ -72,7 +72,6 @@ impl Runtime {
         ensure!(access.human, "only the user sends attachments");
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
-        let network = &access.network_id;
         let blob = BlobRef {
             hash: field(input, "hash")?.into(),
             size: input["size"].as_u64().context("size is required")?,
@@ -89,7 +88,7 @@ impl Runtime {
             store.partial_blob_file(&blob.hash)?,
             store.blob_file(&blob.hash)?,
         );
-        let committed = store.committed_offset(network, &blob.hash)?;
+        let committed = store.committed_offset(&blob.hash)?;
         let offset = input["offset"].as_u64().context("offset is required")?;
         if offset != committed {
             return Ok(json!({"offset":committed,"complete":false}));
@@ -117,7 +116,7 @@ impl Runtime {
         file.write_all(&data)?;
         file.sync_data()?;
         let offset = committed + data.len() as u64;
-        store.commit_offset(network, &blob.hash, Some(offset))?;
+        store.commit_offset(&blob.hash, Some(offset))?;
         if offset < blob.size {
             return Ok(json!({"offset":offset,"complete":false}));
         }
@@ -125,12 +124,12 @@ impl Runtime {
         // ponytail: hashes the whole file under the store lock once per attachment (<= 64 MiB).
         if crate::crypto::digest(&std::fs::read(&part)?) != blob.hash {
             let _ = std::fs::remove_file(&part);
-            store.commit_offset(network, &blob.hash, None)?;
+            store.commit_offset(&blob.hash, None)?;
             bail!("attachment failed its hash check; send it again");
         }
         std::fs::create_dir_all(target.parent().context("blob directory")?)?;
         std::fs::rename(&part, &target)?;
-        store.commit_offset(network, &blob.hash, None)?;
+        store.commit_offset(&blob.hash, None)?;
         Ok(json!({"offset":offset,"complete":true}))
     }
 
@@ -172,8 +171,10 @@ impl Runtime {
                 DispatchState::Rejected { reason } => Some(reason),
                 _ => None,
             };
-            deliveries.push(json!({"work_id":spec.work_id,"target_node":spec.target,"state":state,
-                "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":reason}));
+            deliveries.push(
+                json!({"work_id":spec.work_id,"target_node":spec.target,"state":state,
+                "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":reason}),
+            );
         }
         for stop in store.stop_requests()? {
             if stop.conversation == scope {

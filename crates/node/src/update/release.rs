@@ -1002,7 +1002,9 @@ mod tests {
             .unwrap();
             assert!(verify_build(&package, &release).is_err());
         }
-        for unsupported_epoch in [1, 2, 3, 4, 5, 6, 8] {
+        for unsupported_epoch in
+            (1..=crate::config::DATA_EPOCH + 1).filter(|epoch| *epoch != crate::config::DATA_EPOCH)
+        {
             let mut unsupported_build = build.clone();
             unsupported_build["data_epoch"] = serde_json::json!(unsupported_epoch);
             fs::write(

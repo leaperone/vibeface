@@ -7,11 +7,11 @@ use crate::{
     manager::{self, ManagerConfig},
     model::{ATTENTION_SCOPE, AlertResolution, EventBody},
     net,
-    store::{local_load, local_prefix, local_save},
     triage::{self, AgentEvent, Card, Delivery, Matter, OutboxEntry, Severity, TriageConfig},
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -101,24 +101,6 @@ fn describe(method: &str, params: &Value) -> String {
     .to_string()
 }
 
-#[derive(Serialize, Deserialize)]
-struct Seen {
-    event_id: String,
-    ts_ms: i64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Handled {
-    event_id: String,
-    ts_ms: i64,
-    result: Value,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ScanMark {
-    offset: usize,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 struct DecisionToken {
     token_id: String,
@@ -141,16 +123,87 @@ struct DecisionInput {
     choice: Option<usize>,
 }
 
-fn queue_key(event: &AgentEvent) -> String {
-    format!("triage.queue.{:013}.{}", event.ts_ms.max(0), event.event_id)
+fn name(value: impl Serialize) -> Result<String> {
+    Ok(serde_json::to_value(value)?
+        .as_str()
+        .context("not a unit variant")?
+        .to_owned())
 }
 
-fn delete(connection: &rusqlite::Connection, network: &str, key: &str) -> Result<()> {
+fn from_name<T: DeserializeOwned>(name: String) -> Result<T> {
+    Ok(serde_json::from_value(Value::String(name))?)
+}
+
+fn queued(connection: &Connection) -> Result<Vec<AgentEvent>> {
+    let mut statement =
+        connection.prepare("SELECT event FROM triage_queue ORDER BY ts_ms,event_id")?;
+    let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
     connection.execute(
-        "DELETE FROM local_values WHERE network_id=? AND key=?",
-        rusqlite::params![network, key],
+        "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
+        params![event.ts_ms.max(0), event.event_id],
     )?;
     Ok(())
+}
+
+fn matter_from(connection: &Connection, key: &str) -> Result<Option<Matter>> {
+    let row = connection
+        .query_row(
+            "SELECT alert_id,severity,count,last_ms FROM triage_matters WHERE key=?",
+            [key],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(alert_id, severity, count, last_ms)| {
+        Ok(Matter {
+            key: key.into(),
+            alert_id,
+            severity: from_name(severity)?,
+            count,
+            last_ms,
+        })
+    })
+    .transpose()
+}
+
+fn outbox_from(connection: &Connection) -> Result<Vec<OutboxEntry>> {
+    let mut statement = connection.prepare(
+        "SELECT event_id,body,state,attempts,next_ms,created_ms,last_error FROM triage_outbox ORDER BY event_id",
+    )?;
+    let rows = statement.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (event_id, body, state, attempts, next_ms, created_ms, last_error) = row?;
+        Ok(OutboxEntry {
+            event_id,
+            body,
+            state: from_name(state)?,
+            attempts,
+            next_ms,
+            created_ms,
+            last_error,
+        })
+    })
+    .collect()
 }
 
 fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -183,25 +236,29 @@ impl Runtime {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
         }
-        let network = self.network_id().await?;
+        // Nothing is triaged before the Node joins a network.
+        self.network_id().await?;
         if self.settings_snapshot().manager.is_none() {
             return Ok(json!({"status":"dropped","event_id":event.event_id}));
         }
         let store = self.store.lock().await;
-        let seen = format!("triage.seen.{}", event.event_id);
-        if local_load::<Seen>(&store.connection, &network, &seen)?.is_some() {
+        let first = store.connection.execute(
+            "INSERT INTO triage_seen(event_id,ts_ms) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING",
+            params![event.event_id, now_ms()],
+        )?;
+        if first == 0 {
             return Ok(json!({"status":"duplicate","event_id":event.event_id}));
         }
-        local_save(
-            &store.connection,
-            &network,
-            &seen,
-            &Seen {
-                event_id: event.event_id.clone(),
-                ts_ms: now_ms(),
-            },
+        store.connection.execute(
+            "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)
+             ON CONFLICT(ts_ms,event_id) DO UPDATE SET request_id=excluded.request_id,event=excluded.event",
+            params![
+                event.ts_ms.max(0),
+                event.event_id,
+                event.request_id,
+                serde_json::to_string(&event)?
+            ],
         )?;
-        local_save(&store.connection, &network, &queue_key(&event), &event)?;
         Ok(json!({"status":"accepted","event_id":event.event_id}))
     }
 
@@ -299,14 +356,11 @@ impl Runtime {
             }
             answered.insert(request_id.into(), outcome.clone());
         }
-        if let Ok(network) = self.network_id().await {
-            let store = self.store.lock().await;
-            for event in local_prefix::<AgentEvent>(&store.connection, &network, "triage.queue.")? {
-                if event.request_id.as_deref() == Some(request_id) {
-                    delete(&store.connection, &network, &queue_key(&event))?;
-                }
-            }
-        }
+        self.store
+            .lock()
+            .await
+            .connection
+            .execute("DELETE FROM triage_queue WHERE request_id=?", [request_id])?;
         Ok(outcome)
     }
 
@@ -340,17 +394,24 @@ impl Runtime {
     }
 
     /// The choices and request a card was raised with; they stay on this Node.
-    pub(crate) async fn decision_card(
-        &self,
-        network: &str,
-        alert_id: &str,
-    ) -> Result<Option<Card>> {
+    pub(crate) async fn decision_card(&self, alert_id: &str) -> Result<Option<Card>> {
         let store = self.store.lock().await;
-        local_load(
-            &store.connection,
-            network,
-            &format!("triage.card.{alert_id}"),
-        )
+        let row = store
+            .connection
+            .query_row(
+                "SELECT thread_id,request_id,choices FROM triage_cards WHERE alert_id=?",
+                [alert_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?)),
+            )
+            .optional()?;
+        row.map(|(thread_id, request_id, choices)| {
+            Ok(Card {
+                thread_id,
+                request_id,
+                choices: serde_json::from_str(&choices)?,
+            })
+        })
+        .transpose()
     }
 
     /// The connection that carried the held requests is gone, and so are they.
@@ -461,9 +522,8 @@ impl Runtime {
         });
     }
 
-    async fn pending_events(&self, network: &str) -> Result<Vec<AgentEvent>> {
-        let store = self.store.lock().await;
-        local_prefix(&store.connection, network, "triage.queue.")
+    async fn pending_events(&self) -> Result<Vec<AgentEvent>> {
+        queued(&self.store.lock().await.connection)
     }
 
     /// Hands waiting events to one turn of the coordination Agent. It answers through
@@ -473,9 +533,8 @@ impl Runtime {
         let Some(settings) = self.settings_snapshot().manager else {
             return Ok(());
         };
-        let network = self.network_id().await?;
         let fresh: Vec<AgentEvent> = self
-            .pending_events(&network)
+            .pending_events()
             .await?
             .into_iter()
             .take(BATCH)
@@ -522,11 +581,11 @@ impl Runtime {
             |_| async { Ok(()) },
         )
         .await;
-        self.settle_offered(&network, &fresh).await?;
+        self.settle_offered(&fresh).await?;
         turn.map(|_| ())
     }
 
-    async fn settle_offered(&self, network: &str, offered: &[AgentEvent]) -> Result<()> {
+    async fn settle_offered(&self, offered: &[AgentEvent]) -> Result<()> {
         for event in offered {
             if let Some(request_id) = &event.request_id {
                 let unattended = lock(&self.triage.requests)
@@ -537,8 +596,7 @@ impl Runtime {
                         .await?;
                 }
             }
-            let store = self.store.lock().await;
-            delete(&store.connection, network, &queue_key(event))?;
+            dequeue(&self.store.lock().await.connection, event)?;
         }
         Ok(())
     }
@@ -562,7 +620,7 @@ impl Runtime {
         if action == "events" {
             let since = input["since"].as_i64().unwrap_or(0);
             let events: Vec<_> = self
-                .pending_events(&network)
+                .pending_events()
                 .await?
                 .into_iter()
                 .filter(|event| event.ts_ms >= since)
@@ -570,16 +628,22 @@ impl Runtime {
             return Ok(json!({"events":events}));
         }
         let event_id = super::id(&input, "event_id")?;
-        let handled_key = format!("triage.handled.{event_id}");
         {
             let store = self.store.lock().await;
-            if let Some(handled) = local_load::<Handled>(&store.connection, &network, &handled_key)?
-            {
-                return Ok(handled.result);
+            let handled: Option<String> = store
+                .connection
+                .query_row(
+                    "SELECT result FROM triage_handled WHERE event_id=?",
+                    [&event_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(handled) = handled {
+                return Ok(serde_json::from_str(&handled)?);
             }
         }
         let event = self
-            .pending_events(&network)
+            .pending_events()
             .await?
             .into_iter()
             .find(|event| event.event_id == event_id)
@@ -625,17 +689,12 @@ impl Runtime {
             _ => bail!("unknown triage action"),
         };
         let store = self.store.lock().await;
-        local_save(
-            &store.connection,
-            &network,
-            &handled_key,
-            &Handled {
-                event_id: event_id.clone(),
-                ts_ms: now_ms(),
-                result: result.clone(),
-            },
+        store.connection.execute(
+            "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?)
+             ON CONFLICT(event_id) DO UPDATE SET ts_ms=excluded.ts_ms,result=excluded.result",
+            params![event_id, now_ms(), result.to_string()],
         )?;
-        delete(&store.connection, &network, &queue_key(&event))?;
+        dequeue(&store.connection, &event)?;
         Ok(result)
     }
 
@@ -651,21 +710,36 @@ impl Runtime {
         card: Card,
     ) -> Result<Value> {
         let key = triage::matter_key(&event.node, matter);
-        let matter_key = format!("triage.matter.{key}");
         let (matter, emit) = {
             let store = self.store.lock().await;
-            let previous: Option<Matter> = local_load(&store.connection, network, &matter_key)?;
+            let previous = matter_from(&store.connection, &key)?;
             // A card that holds a request always goes out on its own: the user must answer it.
             let previous = previous.filter(|_| card.request_id.is_none());
             let (matter, emit) =
                 triage::merge(previous.as_ref(), &key, &event.event_id, severity, now_ms());
-            local_save(&store.connection, network, &matter_key, &matter)?;
+            store.connection.execute(
+                "INSERT INTO triage_matters(key,alert_id,severity,count,last_ms) VALUES(?,?,?,?,?)
+                 ON CONFLICT(key) DO UPDATE SET alert_id=excluded.alert_id,severity=excluded.severity,
+                 count=excluded.count,last_ms=excluded.last_ms",
+                params![
+                    key,
+                    matter.alert_id,
+                    name(matter.severity)?,
+                    matter.count,
+                    matter.last_ms
+                ],
+            )?;
             if emit {
-                local_save(
-                    &store.connection,
-                    network,
-                    &format!("triage.card.{}", matter.alert_id),
-                    &card,
+                store.connection.execute(
+                    "INSERT INTO triage_cards(alert_id,thread_id,request_id,choices) VALUES(?,?,?,?)
+                     ON CONFLICT(alert_id) DO UPDATE SET thread_id=excluded.thread_id,
+                     request_id=excluded.request_id,choices=excluded.choices",
+                    params![
+                        matter.alert_id,
+                        card.thread_id,
+                        card.request_id,
+                        serde_json::to_string(&card.choices)?
+                    ],
                 )?;
             }
             (matter, emit)
@@ -731,17 +805,20 @@ impl Runtime {
                     "url":self.decision_url(), "device_id":event.node, "thread_id":thread,
                     "alert_id":matter.alert_id})),
             });
-            let store = self.store.lock().await;
-            let outbox_key = format!("triage.outbox.{}", event.event_id);
-            if local_load::<OutboxEntry>(&store.connection, network, &outbox_key)?.is_none() {
-                local_save(
-                    &store.connection,
-                    network,
-                    &outbox_key,
-                    &OutboxEntry::new(&event.event_id, body.to_string(), now_ms()),
-                )?;
-            }
-            drop(store);
+            let entry = OutboxEntry::new(&event.event_id, body.to_string(), now_ms());
+            self.store.lock().await.connection.execute(
+                "INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms,created_ms,last_error)
+                 VALUES(?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING",
+                params![
+                    entry.event_id,
+                    entry.body,
+                    name(entry.state)?,
+                    entry.attempts,
+                    entry.next_ms,
+                    entry.created_ms,
+                    entry.last_error
+                ],
+            )?;
             self.triage.outbox.notify_one();
             result["queued_webhook"] = json!(true);
         }
@@ -769,11 +846,7 @@ impl Runtime {
         let Some(secret) = self.webhook_secret()? else {
             return Ok(());
         };
-        let network = self.network_id().await?;
-        let entries: Vec<OutboxEntry> = {
-            let store = self.store.lock().await;
-            local_prefix(&store.connection, &network, "triage.outbox.")?
-        };
+        let entries = outbox_from(&self.store.lock().await.connection)?;
         for mut entry in entries {
             if entry.state != Delivery::Pending || entry.next_ms > now_ms() {
                 continue;
@@ -787,12 +860,15 @@ impl Runtime {
                     "webhook delivery dead-lettered"
                 );
             }
-            let store = self.store.lock().await;
-            local_save(
-                &store.connection,
-                &network,
-                &format!("triage.outbox.{}", entry.event_id),
-                &entry,
+            self.store.lock().await.connection.execute(
+                "UPDATE triage_outbox SET state=?,attempts=?,next_ms=?,last_error=? WHERE event_id=?",
+                params![
+                    name(entry.state)?,
+                    entry.attempts,
+                    entry.next_ms,
+                    entry.last_error,
+                    entry.event_id
+                ],
             )?;
         }
         Ok(())
@@ -814,29 +890,17 @@ impl Runtime {
                 let _ = std::fs::remove_file(path);
             }
         }
-        let network = self.network_id().await?;
+        // Scan marks advance only once scanned events can be queued, which needs a network.
+        self.network_id().await?;
         {
             let store = self.store.lock().await;
             let cutoff = now_ms() - SEEN_TTL_MS;
-            for seen in local_prefix::<Seen>(&store.connection, &network, "triage.seen.")? {
-                if seen.ts_ms < cutoff {
-                    delete(
-                        &store.connection,
-                        &network,
-                        &format!("triage.seen.{}", seen.event_id),
-                    )?;
-                }
-            }
-            for handled in local_prefix::<Handled>(&store.connection, &network, "triage.handled.")?
-            {
-                if handled.ts_ms < cutoff {
-                    delete(
-                        &store.connection,
-                        &network,
-                        &format!("triage.handled.{}", handled.event_id),
-                    )?;
-                }
-            }
+            store
+                .connection
+                .execute("DELETE FROM triage_seen WHERE ts_ms<?", [cutoff])?;
+            store
+                .connection
+                .execute("DELETE FROM triage_handled WHERE ts_ms<?", [cutoff])?;
         }
         if !self.triage.config().scan_codex_sessions {
             return Ok(());
@@ -847,19 +911,23 @@ impl Runtime {
             .context("no home directory")?
             .join("sessions");
         for path in rollouts(&root, now_ms() - SCAN_WINDOW_MS) {
-            let key = format!(
-                "triage.scan.{}",
-                crate::crypto::digest(path.to_string_lossy().as_bytes())
-            );
-            let mark: Option<ScanMark> = {
-                let store = self.store.lock().await;
-                local_load(&store.connection, &network, &key)?
-            };
+            let rollout = crate::crypto::digest(path.to_string_lossy().as_bytes());
+            let mark: Option<usize> = self
+                .store
+                .lock()
+                .await
+                .connection
+                .query_row(
+                    "SELECT scanned_to FROM triage_scans WHERE rollout=?",
+                    [&rollout],
+                    |r| r.get(0),
+                )
+                .optional()?;
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
             let offset = match mark {
-                Some(mark) => mark.offset,
+                Some(mark) => mark,
                 // History from before this Node started is not news.
                 None if modified_ms(&path) < self.triage.started_ms => text.len(),
                 None => 0,
@@ -870,8 +938,11 @@ impl Runtime {
                     tracing::debug!(%error, "scanned turn was not triaged");
                 }
             }
-            let store = self.store.lock().await;
-            local_save(&store.connection, &network, &key, &ScanMark { offset: end })?;
+            self.store.lock().await.connection.execute(
+                "INSERT INTO triage_scans(rollout,scanned_to) VALUES(?,?)
+                 ON CONFLICT(rollout) DO UPDATE SET scanned_to=excluded.scanned_to",
+                params![rollout, end],
+            )?;
         }
         Ok(())
     }
@@ -886,13 +957,16 @@ impl Runtime {
             .map(|t| json!({"token_id":t.token_id,"label":t.label,"created_ms":t.created_ms}))
             .collect();
         let mut outbox = json!({"pending":0,"delivered":0,"dead":0});
-        if let Ok(network) = self.network_id().await {
+        {
             let store = self.store.lock().await;
-            for entry in local_prefix::<OutboxEntry>(&store.connection, &network, "triage.outbox.")?
-            {
-                let state = serde_json::to_value(entry.state)?;
-                let state = state.as_str().unwrap_or_default();
-                outbox[state] = json!(outbox[state].as_u64().unwrap_or(0) + 1);
+            let mut statement = store
+                .connection
+                .prepare("SELECT state,COUNT(*) FROM triage_outbox GROUP BY state")?;
+            let rows =
+                statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?;
+            for row in rows {
+                let (state, count) = row?;
+                outbox[state] = json!(count);
             }
         }
         Ok(json!({

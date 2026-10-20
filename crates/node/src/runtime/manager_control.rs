@@ -82,7 +82,8 @@ impl Runtime {
                 .manager
                 .as_ref()
                 .context("manager metadata missing")?;
-            self.store.lock().await.fence_manager_permission(active
+            self.store.lock().await.fence_manager_permission(
+                active
                     .access
                     .conversation_id
                     .as_deref()
@@ -146,10 +147,7 @@ impl Runtime {
             .as_deref()
             .context("missing management scope")?;
         ensure!(
-            store.manager_attempt_allowed(scope,
-                &manager.trigger,
-                &manager.attempt_id,
-            )?,
+            store.manager_attempt_allowed(scope, &manager.trigger, &manager.attempt_id,)?,
             "management invocation permission is no longer valid"
         );
         Ok(())
@@ -189,9 +187,14 @@ impl Runtime {
             }
             self.close_check(network, &check).await?;
             if let Some(work_id) = check.trigger.strip_prefix("task:")
-                && self.store.lock().await.work_record(work_id)?.is_some_and(|record| {
-                    matches!(record.state, WorkState::Unverified { handle: None, .. })
-                })
+                && self
+                    .store
+                    .lock()
+                    .await
+                    .work_record(work_id)?
+                    .is_some_and(|record| {
+                        matches!(record.state, WorkState::Unverified { handle: None, .. })
+                    })
             {
                 self.signal_work(network, work_id, Signal::ProcessExited)
                     .await?;
@@ -212,7 +215,11 @@ impl Runtime {
 
     /// The user's one tap on a card the Node could not settle: a coordination process they
     /// confirm is stopped, or the signed result of an unverified work.
-    pub(super) async fn resolve_check(self: &Arc<Self>, access: &Access, input: &Value) -> Result<Value> {
+    pub(super) async fn resolve_check(
+        self: &Arc<Self>,
+        access: &Access,
+        input: &Value,
+    ) -> Result<Value> {
         ensure!(access.human, "only the user resolves pending checks");
         let scope = super::field(input, "conversation_id")?;
         let check_id = super::field(input, "check_id")?;

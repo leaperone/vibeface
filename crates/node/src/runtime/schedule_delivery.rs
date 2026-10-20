@@ -118,11 +118,7 @@ impl Runtime {
             self.publish_changed(&network, &scope, &trigger);
         }
         if self.settings_snapshot().manager.is_some() {
-            let scopes = self
-                .store
-                .lock()
-                .await
-                .pending_scheduler_conversations()?;
+            let scopes = self.store.lock().await.pending_scheduler_conversations()?;
             for scope in scopes {
                 self.start_schedule_consumer(network.clone(), scope).await;
             }

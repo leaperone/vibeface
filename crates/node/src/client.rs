@@ -775,12 +775,7 @@ async fn dispatch(
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
-                result["addresses"] = json!(
-                    node.store
-                        .lock()
-                        .await
-                        .address_book(&state.genesis.network_id)?
-                );
+                result["addresses"] = json!(node.store.lock().await.address_book()?);
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)

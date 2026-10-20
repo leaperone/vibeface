@@ -265,10 +265,9 @@ impl Runtime {
         spec: WorkSpec,
     ) -> Result<Dispatch> {
         let dispatch = self.store.lock().await.save_dispatch(&Dispatch {
-                spec,
-                state: DispatchState::Pending,
-            },
-        )?;
+            spec,
+            state: DispatchState::Pending,
+        })?;
         if dispatch.state != DispatchState::Pending {
             return Ok(dispatch);
         }
@@ -504,7 +503,9 @@ impl Runtime {
             let mut children = Vec::new();
             for work in store.works(network, &record.conversation)? {
                 if work.parent.as_deref() == Some(work_id)
-                    && store.work_record(&work.work_id)?.is_some_and(|child| live(&child))
+                    && store
+                        .work_record(&work.work_id)?
+                        .is_some_and(|child| live(&child))
                 {
                     children.push(work.work_id);
                 }
@@ -549,10 +550,7 @@ impl Runtime {
             Ok(Ok(reply)) => Ok(reply),
             failed => {
                 tracing::debug!(?failed, "stop request waits for its device");
-                self.store
-                    .lock()
-                    .await
-                    .save_stop_request(&request)?;
+                self.store.lock().await.save_stop_request(&request)?;
                 self.publish_changed(network, scope, work_id);
                 Ok(
                     json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_device":true}),
@@ -609,10 +607,7 @@ impl Runtime {
                     .forget_stop_request(&request.work_id)?;
             } else if now_ms() >= request.deadline_ms {
                 request.timed_out = true;
-                self.store
-                    .lock()
-                    .await
-                    .save_stop_request(&request)?;
+                self.store.lock().await.save_stop_request(&request)?;
             } else {
                 continue;
             }
@@ -635,8 +630,7 @@ impl Runtime {
                 self.codex_epoch
                     .store(epoch, std::sync::atomic::Ordering::SeqCst);
                 for record in records.into_iter().filter(live) {
-                    if let Err(error) = self.probe_work(network, &record.work_id, false).await
-                    {
+                    if let Err(error) = self.probe_work(network, &record.work_id, false).await {
                         tracing::debug!(%error, "work probe after reconnect failed");
                     }
                 }
