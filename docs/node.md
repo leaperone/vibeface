@@ -92,6 +92,8 @@ bash scripts/build-web.sh
 
 Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不启动 MCP Server，也不要求 Bot 或浏览器支持 MCP。协调工具限定到当前个人网络及机器人聊天，本机工作使用 SDK 宿主工具。Agent 不能替本人授权自动后续。
 
+Node 只常驻一个 Cursor SDK Bridge 进程供各轮回复复用。已设置 `CURSOR_API_KEY` 时，Node 启动或保存 Cursor 设置后立即预热。Bridge 退出或无响应时，下一轮按 1 至 30 秒退避重启；某一轮结果未知时，Bridge 等其余轮次结束后退出，下一轮换新进程。启动超过 60 秒时这一轮不会开始，稍后再发即可。
+
 ### 使用 Codex SDK
 
 Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它，需要 Node.js 18+、已安装的锁定 npm 依赖和已登录的 Codex CLI。

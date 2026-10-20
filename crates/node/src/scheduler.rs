@@ -3,7 +3,7 @@
 //! as its own `work:` trigger, so nothing waits on background work here.
 use crate::{
     crypto::digest,
-    manager::{self, ManagerConfig, ManagerError},
+    manager::{self, ManagerConfig, ManagerError, ManagerKind},
     model::{
         Context, Event, EventBody, HashedEvent, OpenWork, Role, RoutineEntry, VersionVector,
         WorkProjection,
@@ -181,7 +181,16 @@ pub async fn run(
             materialize(&context, &job, &works, assistant, routine.as_ref(), &local_settings.roots, claimed.covers.as_ref())?
         };
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        let custom_tools = tools(job.kind);
+        let mut tool_env = node.agent_env();
+        // The `vibeface tool` CLI of the Codex path reads its turn from here; Cursor calls back.
+        tool_env.extend([
+            ("VIBEFACE_NODE_URL".into(), local_url),
+            ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
+            ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
+            ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
+            ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()),
+            ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
+        ]);
         let config = ManagerConfig {
             kind,
             workspace: settings.workspace,
@@ -191,31 +200,11 @@ pub async fn run(
             node_bin: settings.node_bin,
             codex_bin: node.config.codex_bin.clone(),
             codex_sdk_script: settings.codex_sdk_script,
-            custom_tools,
-            tool_callback_url: Some(local_url.clone()),
-            tool_callback_token: Some(token.clone()),
+            custom_tools: tools(job.kind),
             tool_cli: Some(std::env::current_exe()?),
-            tool_env: BTreeMap::from([
-                (
-                    crate::runtime::TRIAGE_URL_ENV.into(),
-                    format!("http://{}", node.config.local_listen),
-                ),
-                ("VIBEFACE_NODE_URL".into(), local_url),
-                ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
-                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
-                ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
-                ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()),
-                ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
-                (
-                    "VIBEFACE_CODEX_SOCKET".into(),
-                    node.codex.socket.display().to_string(),
-                ),
-                (
-                    "VIBEFACE_DATA_DIR".into(),
-                    node.data_dir.display().to_string(),
-                ),
-            ]),
+            tool_env,
             process_started: Some(process_recorder(&node, &attempt.id)),
+            cursor: node.cursor.get().cloned(),
         };
         if matches!(job.kind, TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Routine) {
             node.store.lock().await.reserve_budget(
@@ -228,8 +217,8 @@ pub async fn run(
             .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger)
             .await?;
         registered = true;
-        let (persist_node, persist_conversation, persist_trigger, persist_attempt) =
-            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
+        let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
+            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
         let (progress_node, progress_network, progress_conversation, progress_trigger, progress_attempt) =
             (node.clone(), network.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
         let progress_text = partial.clone();
@@ -247,7 +236,11 @@ pub async fn run(
                     &persist_trigger,
                     &persist_attempt,
                     &id,
-                )
+                )?;
+                if kind == ManagerKind::CursorSdk {
+                    persist_node.cursor_agents.lock().await.insert(id, persist_token);
+                }
+                Ok(())
             },
             cancel,
             move |progress| {

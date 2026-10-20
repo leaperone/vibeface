@@ -54,7 +54,7 @@ pub struct Config {
     #[serde(default)]
     pub triage: crate::triage::TriageConfig,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
     pub provider: crate::manager::ManagerKind,

@@ -554,21 +554,8 @@ impl Runtime {
             codex_bin: self.config.codex_bin.clone(),
             codex_sdk_script: settings.codex_sdk_script,
             tool_cli: Some(program),
-            tool_env: [
-                (
-                    TRIAGE_URL_ENV.to_owned(),
-                    format!("http://{}", self.config.local_listen),
-                ),
-                (
-                    "VIBEFACE_CODEX_SOCKET".to_owned(),
-                    self.codex.socket.display().to_string(),
-                ),
-                (
-                    "VIBEFACE_DATA_DIR".to_owned(),
-                    self.data_dir.display().to_string(),
-                ),
-            ]
-            .into(),
+            tool_env: self.agent_env(),
+            cursor: self.cursor.get().cloned(),
             ..Default::default()
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);

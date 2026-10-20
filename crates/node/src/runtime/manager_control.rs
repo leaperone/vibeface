@@ -76,7 +76,7 @@ impl Runtime {
         let active = self.manager_controls.lock().await.get(attempt_id).cloned();
         if let Some(active) = active {
             active.fenced.store(true, Ordering::Release);
-            self.agent_tokens.lock().await.remove(&active.token);
+            self.revoke_tool_token(&active.token).await;
             let manager = active
                 .access
                 .manager
@@ -101,10 +101,18 @@ impl Runtime {
         let active = self.manager_controls.lock().await.get(attempt_id).cloned();
         if let Some(active) = active {
             active.fenced.store(true, Ordering::Release);
-            self.agent_tokens.lock().await.remove(&active.token);
+            self.revoke_tool_token(&active.token).await;
             let _drained = active.admission.clone().write_owned().await;
             self.manager_controls.lock().await.remove(attempt_id);
         }
+    }
+
+    pub(super) async fn revoke_tool_token(&self, token: &str) {
+        self.agent_tokens.lock().await.remove(token);
+        self.cursor_agents
+            .lock()
+            .await
+            .retain(|_, attempt| attempt != token);
     }
 
     pub(super) async fn manager_tool_lease(
