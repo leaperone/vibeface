@@ -150,7 +150,14 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
 }
 /// The client's signature over the event body this write produces; checked when the event is signed.
 fn attestation(v: &Value) -> Result<Attestation> {
-    serde_json::from_value(v["attestation"].clone())
+    signed(v, "attestation")
+}
+/// The signature over the conversation's first `ConversationOwner`, which names this entry Node.
+fn owner_attestation(v: &Value) -> Result<Attestation> {
+    signed(v, "owner_attestation")
+}
+fn signed(v: &Value, key: &str) -> Result<Attestation> {
+    serde_json::from_value(v[key].clone())
         .context("this write needs the signature of your device; reload the page and retry")
 }
 fn id(v: &Value, key: &str) -> Result<String> {
@@ -462,6 +469,7 @@ impl Runtime {
                     network,
                     &scope,
                     title,
+                    owner_attestation(&input)?,
                     now_ms(),
                 )?;
                 self.publish_changed(network, &scope, &scope);
@@ -469,6 +477,10 @@ impl Runtime {
             }
             "conversation" => self.conversation_snapshot(&access, &input).await,
             "message" => self.accept_chat_message(&access, &input).await,
+            "set_owner" => {
+                let scope = scope.context("conversation_id is required")?;
+                self.set_owner(&access, &scope, &input).await
+            }
             "set_autonomy" => {
                 let scope = scope.context("conversation_id is required")?;
                 let result = self.set_autonomy(&access, &scope, &input).await?;
@@ -481,16 +493,7 @@ impl Runtime {
                 let scope = scope.context("conversation_id is required")?;
                 let work_id = id(&input, "work_id")?;
                 if method == "interrupt_work" {
-                    ensure!(
-                        self.store
-                            .lock()
-                            .await
-                            .works(network, &scope)?
-                            .iter()
-                            .any(|work| work.work_id == work_id),
-                        "work not found in this conversation"
-                    );
-                    self.interrupt_work(network, &work_id).await
+                    self.stop_work(network, &scope, &work_id).await
                 } else {
                     self.answer_approval(
                         network,

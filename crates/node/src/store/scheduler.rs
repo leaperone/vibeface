@@ -170,28 +170,70 @@ pub(crate) fn admit_from(
     Ok(job.receipt(network))
 }
 
-/// A finished work reports back through its own trigger, unless the user opted out on the
-/// message that started the chain. Unverified results wait for the user or a probe.
+/// Keeps a trigger for the conversation's owner until it returns a receipt.
+pub(crate) fn queue_delivery_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+) -> Result<AdmissionReceipt> {
+    let key = scheduler_key("outbox", conversation, trigger);
+    let entry = match local_load::<OutboxEntry>(connection, network, &key)? {
+        Some(entry) => entry,
+        None => {
+            let entry = OutboxEntry {
+                version: SCHEDULING_VERSION,
+                network_id: network.into(),
+                conversation_id: conversation.into(),
+                trigger: trigger.into(),
+            };
+            local_save(connection, network, &key, &entry)?;
+            entry
+        }
+    };
+    Ok(entry.receipt())
+}
+
+/// The user message a work ultimately answers, followed through the DAG's dispatch chain, so
+/// any owner can report a result whose turn ran on another Node.
+fn origin_message(connection: &Connection, network: &str, work_id: &str) -> Result<Option<String>> {
+    let mut work_id = work_id.to_owned();
+    for _ in 0..64 {
+        let Some(work) = super::reduce::work_from(connection, network, &work_id)? else {
+            return Ok(None);
+        };
+        match work.trigger.split_once(':') {
+            Some(("message", message)) => return Ok(Some(message.into())),
+            Some(("work" | "task", parent)) => work_id = parent.into(),
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// A finished work reports back to the owner through its own trigger, unless the user opted out
+/// on the message that started the chain. Unverified results wait for the user or a probe.
+/// Another Node's result waits in the outbox for the owner.
 pub(crate) fn admit_work_result_from(
     connection: &Connection,
     network: &str,
     local: &str,
     conversation: &str,
     work_id: &str,
-    dispatch_trigger: &str,
     outcome: WorkOutcome,
 ) -> Result<Option<AdmissionReceipt>> {
     if outcome == WorkOutcome::Unverified {
         return Ok(None);
     }
+    let trigger = work_trigger(work_id);
     let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
     if owner.as_deref() != Some(local) {
-        return Ok(None);
+        return queue_delivery_from(connection, network, conversation, &trigger).map(Some);
     }
-    let Some(origin) = load_job(connection, network, conversation, dispatch_trigger)? else {
+    let Some(reply_to) = origin_message(connection, network, work_id)? else {
         return Ok(None);
     };
-    let report = message_from(connection, network, conversation, &origin.reply_to)?
+    let report = message_from(connection, network, conversation, &reply_to)?
         .and_then(|message| message.report_results)
         .unwrap_or(true);
     if !report {
@@ -201,9 +243,9 @@ pub(crate) fn admit_work_result_from(
         connection,
         network,
         conversation,
-        &work_trigger(work_id),
+        &trigger,
         TriggerKind::WorkResult,
-        &origin.reply_to,
+        &reply_to,
     )
     .map(Some)
 }
@@ -247,7 +289,18 @@ fn end_job_from(
     } else {
         text.to_owned()
     };
-    if message_from(connection, network, &job.conversation_id, &job.message_id)?.is_none() {
+    if job.kind == TriggerKind::AgentTask {
+        super::work::finish_agent_work_from(
+            connection,
+            blob_dir,
+            identity,
+            network,
+            &job.reply_to,
+            &outcome,
+            &text,
+            at,
+        )?;
+    } else if message_from(connection, network, &job.conversation_id, &job.message_id)?.is_none() {
         log::append_from(
             connection,
             blob_dir,
@@ -258,6 +311,7 @@ fn end_job_from(
                 message_id: job.message_id.clone(),
                 role: Role::Assistant,
                 text,
+                attachments: vec![],
                 report_results: None,
                 in_reply_to: Some(job.reply_to.clone()),
                 status: Some(status),
@@ -266,6 +320,21 @@ fn end_job_from(
             vec![],
             at,
         )?;
+        // ponytail: reads the whole conversation per turn; index message sizes if this shows up.
+        let context = super::context_from(connection, network, &job.conversation_id, None)?;
+        let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
+        if let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
+            log::append_from(
+                connection,
+                blob_dir,
+                identity,
+                network,
+                &job.conversation_id,
+                checkpoint,
+                vec![],
+                at,
+            )?;
+        }
     }
     job.state = match outcome {
         JobOutcome::Completed => JobState::Completed { attempt },
@@ -392,6 +461,7 @@ impl Store {
                     message_id: message_id.into(),
                     role: Role::User,
                     text: text.into(),
+                    attachments: blobs.clone(),
                     report_results: Some(report_results),
                     in_reply_to: None,
                     status: None,
@@ -412,22 +482,7 @@ impl Store {
                 message_id,
             )?
         } else {
-            let key = scheduler_key("outbox", conversation, &trigger);
-            let entry = match local_load::<OutboxEntry>(&tx, network, &key)? {
-                Some(entry) => entry,
-                None => {
-                    let entry = OutboxEntry {
-                        version: SCHEDULING_VERSION,
-                        network_id: network.into(),
-                        conversation_id: conversation.into(),
-                        trigger,
-                        owner,
-                    };
-                    local_save(&tx, network, &key, &entry)?;
-                    entry
-                }
-            };
-            entry.receipt()
+            queue_delivery_from(&tx, network, conversation, &trigger)?
         };
         let message =
             message_from(&tx, network, conversation, message_id)?.context("message missing")?;
@@ -520,14 +575,27 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         }
+        let current = conversation_from(&tx, network, conversation)?;
+        let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
+        let owned = current.and_then(|c| c.owner) == Some(identity.device_id()?);
         let mut queued = Vec::new();
-        for trigger in &session.pending {
-            let job = load_job(&tx, network, conversation, trigger)?
+        for trigger in session.pending.clone() {
+            let job = load_job(&tx, network, conversation, &trigger)?
                 .context("missing queued scheduler job")?;
             ensure!(
                 matches!(job.state, JobState::Queued),
                 "pending scheduler job is not queued"
             );
+            // The user moved the conversation: what never started goes to the new owner.
+            if !owned && job.kind != TriggerKind::AgentTask {
+                tx.execute(
+                    "DELETE FROM local_values WHERE network_id=? AND key=?",
+                    params![network, job_key(conversation, &trigger)],
+                )?;
+                queue_delivery_from(&tx, network, conversation, &trigger)?;
+                session.pending.retain(|pending| pending != &trigger);
+                continue;
+            }
             queued.push(job);
         }
         queued.sort_by_key(|job| (job.kind != TriggerKind::Human, job.sequence));
@@ -551,16 +619,23 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        if session.sdk_config.as_deref() != Some(sdk_config) {
+        if session.sdk_config.as_deref() != Some(sdk_config) || session.owner_epoch != owner_epoch {
             session.native_id = None;
+            session.covers.clear();
             session.sdk_config = Some(sdk_config.into());
+            session.owner_epoch = owner_epoch;
         }
         let read_only = job.kind == TriggerKind::WorkResult && mode == AutonomyMode::Report;
-        let previous_native_id = if read_only {
-            None
-        } else {
-            session.native_id.clone()
-        };
+        // Reused only under the same ownership and when this basis contains what it saw.
+        let resumable = !read_only
+            && job.kind != TriggerKind::AgentTask
+            && session.native_id.is_some()
+            && session
+                .covers
+                .iter()
+                .all(|(author, seq)| job.basis.get(author).is_some_and(|have| have >= seq));
+        let previous_native_id = resumable.then(|| session.native_id.clone()).flatten();
+        let covers = resumable.then(|| session.covers.clone());
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -577,6 +652,7 @@ impl Store {
         Ok(Some(ClaimedJob {
             job,
             previous_native_id,
+            covers,
         }))
     }
 
@@ -651,8 +727,10 @@ impl Store {
                     .attempt()
                     .context("scheduler attempt missing")?
                     .read_only
+                    && job.kind != TriggerKind::AgentTask
                 {
                     session.native_id = Some(native_id.into());
+                    session.covers = job.basis.clone();
                 }
                 Ok(())
             },
@@ -662,6 +740,7 @@ impl Store {
 
     pub fn request_manager_cancel(
         &mut self,
+        identity: &LocalIdentity,
         network: &str,
         conversation: &str,
         trigger: &str,
@@ -674,9 +753,22 @@ impl Store {
             return Ok(None);
         };
         if matches!(job.state, JobState::Queued) {
+            let evidence = "用户在开始前取消".to_owned();
+            if job.kind == TriggerKind::AgentTask {
+                super::work::finish_agent_work_from(
+                    &tx,
+                    &self.blob_dir,
+                    identity,
+                    network,
+                    &job.reply_to,
+                    &JobOutcome::Cancelled(evidence.clone()),
+                    "",
+                    crate::runtime::now_ms(),
+                )?;
+            }
             job.state = JobState::Cancelled {
                 attempt: None,
-                evidence: "用户在开始前取消".into(),
+                evidence,
             };
             session.pending.retain(|pending| pending != trigger);
         } else if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {

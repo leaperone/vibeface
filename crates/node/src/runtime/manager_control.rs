@@ -1,6 +1,7 @@
-use super::{Access, Runtime};
+use super::{Access, Runtime, now_ms};
+use crate::model::WorkOutcome;
 use crate::scheduling::{JobState, PendingCheck};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -180,7 +181,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .request_manager_cancel(network, scope, trigger)?
+            .request_manager_cancel(&self.identity, network, scope, trigger)?
             .context("this reply is scheduled on another device; stop it there")?;
         if let JobState::Cancelling { attempt } = &job.state {
             self.fence_manager_attempt(&attempt.id).await?;
@@ -207,16 +208,9 @@ impl Runtime {
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
         if let Some(work_id) = check_id.strip_prefix("work:") {
-            if kind == "reconcile" {
-                self.probe_work(network, work_id).await?;
-                let record = self.store.lock().await.work_record(network, work_id)?;
-                return Ok(
-                    json!({"check_id":check_id,"pending":record.as_ref().is_none_or(|r| !r.state.finished()),"work":record}),
-                );
-            }
-            let evidence = evidence(input)?;
-            self.resolve_work(network, scope, work_id, evidence).await?;
-            return Ok(json!({"check_id":check_id,"resolved":true}));
+            return self
+                .work_check_control(network, scope, work_id, input, kind)
+                .await;
         }
         let check = self.local_pending_check(network, scope, check_id).await?;
         let processes = process_groups(&check.process_groups).await;
@@ -242,6 +236,65 @@ impl Runtime {
             .await
             .resolve_pending_check(network, check_id, evidence)?;
         self.publish_changed(network, scope, &check.trigger);
+        Ok(json!({"check_id":check_id,"resolved":true}))
+    }
+
+    /// An unverified work result is checked again on the device that ran it; the user's choice
+    /// is signed and written by whichever entry they use.
+    async fn work_check_control(
+        self: &Arc<Self>,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+        input: &Value,
+        kind: &str,
+    ) -> Result<Value> {
+        let check_id = format!("work:{work_id}");
+        let work = self
+            .store
+            .lock()
+            .await
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == work_id)
+            .context("work not found in this conversation")?;
+        if kind == "reconcile" {
+            if work.target_node != self.identity.device_id()? {
+                return self
+                    .peer_request(
+                        network,
+                        &work.target_node,
+                        json!({"type":"reconcile","conversation_id":scope,"check_id":check_id,"human":true}),
+                    )
+                    .await;
+            }
+            self.probe_work(network, work_id).await?;
+            let record = self.store.lock().await.work_record(network, work_id)?;
+            return Ok(
+                json!({"check_id":check_id,"pending":record.as_ref().is_none_or(|r| !r.state.finished()),"work":record}),
+            );
+        }
+        let outcome = match super::field(input, "outcome")? {
+            "completed" => WorkOutcome::Completed,
+            "interrupted" => WorkOutcome::Interrupted,
+            _ => bail!("choose completed or interrupted"),
+        };
+        let note = input["note"].as_str().unwrap_or("").trim();
+        ensure!(note.len() <= 4096, "note must be at most 4096 bytes");
+        let receipt = self.store.lock().await.settle_work(
+            &self.identity,
+            network,
+            scope,
+            work_id,
+            outcome,
+            note,
+            super::attestation(input)?,
+            now_ms(),
+        )?;
+        self.publish_changed(network, scope, work_id);
+        if receipt.is_some() {
+            self.spawn_scheduler(network, scope)?;
+        }
         Ok(json!({"check_id":check_id,"resolved":true}))
     }
 

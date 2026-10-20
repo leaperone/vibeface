@@ -11,6 +11,8 @@ pub const MAX_PENDING_JOBS: usize = 256;
 pub enum TriggerKind {
     Human,
     WorkResult,
+    /// An `executor=agent` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
+    AgentTask,
 }
 
 pub fn message_trigger(message_id: &str) -> String {
@@ -19,6 +21,10 @@ pub fn message_trigger(message_id: &str) -> String {
 
 pub fn work_trigger(work_id: &str) -> String {
     format!("work:{work_id}")
+}
+
+pub fn task_trigger(work_id: &str) -> String {
+    format!("task:{work_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,13 +106,13 @@ impl JobState {
 pub struct SchedulerJob {
     pub version: u32,
     pub conversation_id: String,
-    /// `message:<message_id>` or `work:<work_id>`.
+    /// `message:<message_id>`, `work:<work_id>` or `task:<work_id>`.
     pub trigger: String,
     pub kind: TriggerKind,
     pub sequence: u64,
     /// The version vector the turn reads; later events are not part of its prompt.
     pub basis: VersionVector,
-    /// The user message this turn ultimately answers.
+    /// The user message this turn ultimately answers; an agent task's own work ID.
     pub reply_to: String,
     /// The assistant reply's message ID, fixed at admission so retries reuse it.
     pub message_id: String,
@@ -136,15 +142,14 @@ pub struct AdmissionReceipt {
     pub state: String,
 }
 
-/// A user message whose conversation owner is another Node, kept until the owner returns a
-/// receipt for its trigger.
+/// A user message or work result for the conversation's owner, kept until the owner returns a
+/// receipt for its trigger. The owner is read at delivery time, so a switch redirects it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
     pub version: u32,
     pub network_id: String,
     pub conversation_id: String,
     pub trigger: String,
-    pub owner: String,
 }
 
 impl OutboxEntry {
@@ -163,6 +168,8 @@ impl OutboxEntry {
 pub struct ClaimedJob {
     pub job: SchedulerJob,
     pub previous_native_id: Option<String>,
+    /// What the resumed native session has already seen; the prompt carries only the rest.
+    pub covers: Option<VersionVector>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,7 +192,11 @@ pub(crate) struct SchedulerSession {
     pub next_sequence: u64,
     pub pending: Vec<String>,
     pub active: Option<String>,
+    /// The SDK's own session, cached for this conversation on this Node only. `covers` is the
+    /// basis it has seen and `owner_epoch` the ownership it was built under.
     pub native_id: Option<String>,
+    pub covers: VersionVector,
+    pub owner_epoch: u64,
     pub sdk_config: Option<String>,
     pub permission_version: u64,
 }
@@ -199,6 +210,8 @@ impl SchedulerSession {
             pending: Vec::new(),
             active: None,
             native_id: None,
+            covers: VersionVector::new(),
+            owner_epoch: 0,
             sdk_config: None,
             permission_version: 1,
         }

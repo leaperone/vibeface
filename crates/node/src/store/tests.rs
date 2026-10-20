@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    crypto::LocalIdentity,
     scheduling::{JobOutcome, JobState, TriggerKind, message_trigger, work_trigger},
     work::{Signal, WorkSpec},
 };
@@ -40,6 +41,7 @@ fn user(net: &Net, id: &str, text: &str) -> EventBody {
                 message_id: id.into(),
                 role: Role::User,
                 text: text.into(),
+                attachments: vec![],
                 report_results: Some(true),
                 in_reply_to: None,
                 status: None,
@@ -308,7 +310,10 @@ fn a_log_conflict_keeps_the_conversation_appendable() -> Result<()> {
 }
 
 fn conversation(store: &mut Store, net: &Net) -> Result<()> {
-    store.create_conversation(&net.a, &net.network, "c", "t", 1)?;
+    let owner = net
+        .a
+        .owner_fixture(&net.network, "c", &net.a.device_id()?)?;
+    store.create_conversation(&net.a, &net.network, "c", "t", owner, 1)?;
     Ok(())
 }
 
@@ -392,7 +397,7 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started(&net.network, "c", &claimed.job.trigger, &attempt)?;
-    store.request_manager_cancel(&net.network, "c", &claimed.job.trigger)?;
+    store.request_manager_cancel(&net.a, &net.network, "c", &claimed.job.trigger)?;
     store.finish_job(
         &net.a,
         &net.network,
@@ -562,6 +567,250 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
     assert_eq!(
         (works.len(), works[0].outcome, works[0].result_text.as_str()),
         (1, Some(WorkOutcome::Completed), "done")
+    );
+    Ok(())
+}
+
+/// A removed target's open work is abandoned by the owner, a late real result still wins, and
+/// only the user's signature settles an unverified result.
+#[test]
+fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    let trigger = message_trigger("m1");
+    let spec = |call: &str, target: &LocalIdentity| -> Result<WorkSpec> {
+        Ok(WorkSpec {
+            work_id: WorkSpec::id("c", &trigger, call),
+            conversation: "c".into(),
+            trigger: trigger.clone(),
+            attempt: "attempt".into(),
+            target: target.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: call.into(),
+            executor: Executor::Codex,
+            cwd: "/tmp".into(),
+            prompt: "p".into(),
+            continues: None,
+            parent: None,
+        })
+    };
+    let outcome = |store: &Store, id: &str| -> Result<Option<WorkOutcome>> {
+        Ok(store
+            .works(&net.network, "c")?
+            .into_iter()
+            .find(|w| w.work_id == id)
+            .context("work")?
+            .outcome)
+    };
+    let remote = spec("remote", &net.b)?;
+    store.accept_work(&net.b, &net.network, remote.clone(), 3)?;
+    let abandoned = store.abandon_works(&net.a, &net.network, &[net.b.device_id()?], 4)?;
+    assert_eq!(abandoned, vec![("c".to_owned(), remote.work_id.clone())]);
+    assert_eq!(
+        outcome(&store, &remote.work_id)?,
+        Some(WorkOutcome::Abandoned)
+    );
+    assert!(
+        store
+            .abandon_works(&net.a, &net.network, &[net.b.device_id()?], 5)?
+            .is_empty()
+    );
+    let concluded = |outcome| Signal::Concluded {
+        outcome,
+        text: "late".into(),
+        reason: Some("lost".into()),
+    };
+    store.apply_work_signal(
+        &net.b,
+        &net.network,
+        &remote.work_id,
+        concluded(WorkOutcome::Completed),
+        6,
+    )?;
+    assert_eq!(
+        outcome(&store, &remote.work_id)?,
+        Some(WorkOutcome::Completed),
+        "a real result beats abandonment"
+    );
+
+    let local = spec("local", &net.a)?;
+    store.accept_work(&net.a, &net.network, local.clone(), 7)?;
+    let (_, receipt) = store.apply_work_signal(
+        &net.a,
+        &net.network,
+        &local.work_id,
+        concluded(WorkOutcome::Unverified),
+        8,
+    )?;
+    assert!(receipt.is_none(), "an unverified result waits for the user");
+    let unsigned = EventBody::WorkFinished {
+        work_id: local.work_id.clone(),
+        outcome: WorkOutcome::Completed,
+        result_text: String::new(),
+        failure_reason: None,
+        attestation: None,
+    };
+    store.append_event(&net.b, &net.network, "c", unsigned, vec![], 9)?;
+    assert_eq!(
+        outcome(&store, &local.work_id)?,
+        Some(WorkOutcome::Unverified),
+        "only the target or the user settles"
+    );
+    let EventBody::WorkFinished {
+        attestation: Some(signed),
+        ..
+    } = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::WorkFinished {
+            work_id: local.work_id.clone(),
+            outcome: WorkOutcome::Completed,
+            result_text: "checked".into(),
+            failure_reason: None,
+            attestation: None,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    store
+        .settle_work(
+            &net.b,
+            &net.network,
+            "c",
+            &local.work_id,
+            WorkOutcome::Completed,
+            "checked",
+            signed.clone(),
+            10,
+        )?
+        .context("the settled result reports back")?;
+    assert_eq!(
+        outcome(&store, &local.work_id)?,
+        Some(WorkOutcome::Completed)
+    );
+    assert!(
+        store
+            .work_record(&net.network, &local.work_id)?
+            .context("record")?
+            .state
+            .finished()
+    );
+    assert!(
+        store
+            .settle_work(
+                &net.b,
+                &net.network,
+                "c",
+                &local.work_id,
+                WorkOutcome::Completed,
+                "checked",
+                signed,
+                11
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+/// Messages past the prompt budget condense into one checkpoint covering a prefix of the shared
+/// order; the newest messages stay verbatim and a covered history needs no second checkpoint.
+#[test]
+fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let text = "x".repeat(2_000);
+    for i in 0..20 {
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            user(&net, &format!("m{i}"), &text),
+            vec![],
+            10 + i,
+        )?;
+    }
+    let context = store.context(&net.network, "c", None)?;
+    let works = store.works(&net.network, "c")?;
+    let checkpoint =
+        crate::scheduler::checkpoint(&context, &works).context("history is over budget")?;
+    let EventBody::ContextCheckpoint {
+        covers,
+        standing_instructions,
+        ..
+    } = &checkpoint
+    else {
+        unreachable!()
+    };
+    let flags: Vec<bool> = context
+        .events
+        .iter()
+        .map(|e| e.event.seq <= covers.get(&e.event.author).copied().unwrap_or(0))
+        .collect();
+    assert!(
+        flags.windows(2).all(|pair| pair[0] >= pair[1]),
+        "covers is a prefix"
+    );
+    assert!(flags.iter().any(|f| *f) && flags.iter().any(|f| !*f));
+    assert!(!standing_instructions.is_empty());
+    store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 100)?;
+    let context = store.context(&net.network, "c", None)?;
+    assert!(crate::scheduler::checkpoint(&context, &works).is_none());
+    Ok(())
+}
+
+/// After the user moves a conversation, a turn that never started leaves the old owner's queue
+/// for the outbox, which delivers it to the new owner by its trigger.
+#[test]
+fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    let moved = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::ConversationOwner {
+            scheduler_node: net.b.device_id()?,
+            epoch: 2,
+            attestation: None,
+        },
+    )?;
+    store.append_event(&net.a, &net.network, "c", moved, vec![], 3)?;
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    let trigger = message_trigger("m1");
+    assert!(store.scheduler_job(&net.network, "c", &trigger)?.is_none());
+    let outbox = store.scheduler_outbox(&net.network)?;
+    assert_eq!(
+        outbox.iter().map(|e| e.trigger.clone()).collect::<Vec<_>>(),
+        vec![trigger]
     );
     Ok(())
 }

@@ -71,6 +71,8 @@ pub enum WorkOutcome {
     Rejected,
     /// The executor's real result cannot be proven; only the user or a later probe settles it.
     Unverified,
+    /// Its target was removed before reporting a result; written by the conversation's owner.
+    Abandoned,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +109,8 @@ pub enum EventBody {
     ConversationOwner {
         scheduler_node: DeviceId,
         epoch: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     BotCreated {
         bot_id: String,
@@ -117,11 +121,14 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// `report_results` belongs to user messages; `in_reply_to` and `status` to assistant replies.
+    /// `report_results` and `attachments` belong to user messages; `in_reply_to` and `status` to
+    /// assistant replies. `attachments` repeats the event's blobs so the user's signature covers them.
     MessagePosted {
         message_id: String,
         role: Role,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<BlobRef>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         report_results: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,12 +174,16 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    /// Written by the target. The user settles an `unverified` result through any entry Node,
+    /// signed; the owner records `abandoned` after the target is removed.
     WorkFinished {
         work_id: String,
         outcome: WorkOutcome,
         result_text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
     },
     AutonomySet {
         mode: AutonomyMode,
@@ -200,8 +211,10 @@ impl EventBody {
     /// Present on writes that need the user's own device signature; see `crypto::validate_event_shape`.
     pub fn attestation(&self) -> Option<&Attestation> {
         match self {
-            Self::BotCreated { attestation, .. }
+            Self::ConversationOwner { attestation, .. }
+            | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
+            | Self::WorkFinished { attestation, .. }
             | Self::ApprovalAnswered { attestation, .. }
             | Self::AutonomySet { attestation, .. }
             | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
@@ -296,6 +309,7 @@ pub struct BotCreateSpec {
     pub instructions: String,
     pub project: Option<BotProject>,
     pub attestation: Attestation,
+    pub owner_attestation: Attestation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

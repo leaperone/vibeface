@@ -1537,9 +1537,14 @@ mod tests {
             assert!(node.configure_node(node.settings_snapshot(), &browser.device_id()?, Some(&"0".repeat(64))).await.is_err());
             assert_eq!(std::fs::read(dir.join("config.json"))?, before);
             let conversation = uuid::Uuid::new_v4().to_string();
-            local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser"})).await?;
+            let network = node.membership_state().await?.genesis.network_id;
+            let owner = browser.attest(&network, &conversation, crate::model::EventBody::ConversationOwner {
+                scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None })?;
+            let created = local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser",
+                "owner_attestation":owner.attestation()})).await;
+            assert!(created.is_err(), "a local session's key is not a member's signature");
             let conversations = local.call("rpc", json!({"method":"conversations"})).await?;
-            assert!(conversations["conversations"].as_array().context("conversations missing")?.iter().any(|item| item["conversation_id"] == conversation && item["title"] == "Local browser"));
+            assert!(conversations["conversations"].is_array());
             let mut wrong_key = connect_local(&launcher.origin, &launcher.node_id, &cookies[0], &LocalIdentity::generate()).await?;
             assert!(wrong_key.call("authenticate", json!({})).await.is_err());
             let mut signed = connect_local(&launcher.origin, &launcher.node_id, &cookies[1], &manager).await?;

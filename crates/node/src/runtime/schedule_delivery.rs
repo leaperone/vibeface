@@ -225,6 +225,9 @@ impl Runtime {
             .filter(|check| check.conversation_id == scope)
             .collect::<Vec<_>>();
         let manager = self.scheduler_manager_metadata();
+        let owner = store
+            .conversation(network, scope)?
+            .and_then(|conversation| conversation.owner);
         let mut jobs = Vec::new();
         for job in store.scheduler_jobs(network, scope)? {
             let mut value = job_value(&job, &checks)?;
@@ -237,7 +240,7 @@ impl Runtime {
             .filter(|entry| entry.conversation_id == scope)
         {
             jobs.push(
-                json!({"trigger":entry.trigger,"owner":entry.owner,"conversation_id":scope,
+                json!({"trigger":entry.trigger,"owner":owner,"conversation_id":scope,
                 "state":"pending_delivery","message_id":entry.trigger.strip_prefix("message:")}),
             );
         }

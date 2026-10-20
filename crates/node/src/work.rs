@@ -33,6 +33,35 @@ impl WorkSpec {
     }
 }
 
+/// A dispatch to another Node, kept by the dispatcher until the target answers. Only the target
+/// writes `WorkDispatched`, so the DAG never names work the target did not accept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Dispatch {
+    pub spec: WorkSpec,
+    #[serde(flatten)]
+    pub state: DispatchState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DispatchState {
+    Pending,
+    Accepted,
+    Rejected { reason: String },
+}
+
+/// A stop request for another Node's work that has not reached it yet. It is retried until the
+/// target confirms, the work ends, or `deadline_ms` passes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StopRequest {
+    pub work_id: String,
+    pub conversation: String,
+    pub target: DeviceId,
+    pub requested_at_ms: i64,
+    pub deadline_ms: i64,
+    pub timed_out: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Handle {
     pub thread_id: String,
@@ -178,7 +207,14 @@ pub enum Signal {
     Disconnected,
     Probed(Probe),
     InterruptTimedOut,
-    UserResolved(String),
+    /// The DAG already holds a settled result (the user's signed choice); no event is implied.
+    Settled(WorkOutcome),
+    /// An agent task's coordination turn ended; its reply is the result.
+    Concluded {
+        outcome: WorkOutcome,
+        text: String,
+        reason: Option<String>,
+    },
 }
 
 pub fn accept(spec: WorkSpec) -> (WorkRecord, EventBody) {
@@ -218,6 +254,7 @@ fn finish(
         outcome,
         result_text: bounded(&record.text),
         failure_reason: reason.map(|reason| bounded(&reason)),
+        attestation: None,
     })
 }
 
@@ -237,6 +274,7 @@ fn unverified(
         outcome: WorkOutcome::Unverified,
         result_text: bounded(&record.text),
         failure_reason: Some(bounded(evidence)),
+        attestation: None,
     })
 }
 
@@ -534,11 +572,29 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 )
             }
         },
-        (Unverified { .. }, Signal::UserResolved(evidence)) => finish(
-            record,
-            WorkOutcome::Interrupted,
-            Some(format!("用户核对确认：{evidence}")),
-        ),
+        (Unverified { .. }, Signal::Settled(outcome)) => {
+            record.state = Finished { outcome };
+            None
+        }
+        (
+            Accepted,
+            Signal::Concluded {
+                outcome,
+                text,
+                reason,
+            },
+        ) => {
+            record.text = bounded(&text);
+            match outcome {
+                WorkOutcome::Unverified => unverified(
+                    record,
+                    None,
+                    reason.as_deref().unwrap_or("助手进程没有确认退出"),
+                    false,
+                ),
+                outcome => finish(record, outcome, reason),
+            }
+        }
         _ => None,
     }
 }
@@ -634,13 +690,13 @@ mod tests {
         };
         assert_eq!(outcome, WorkOutcome::Unverified);
         assert!(transition(&mut work, Signal::Probed(Probe::Missing)).is_none());
-        assert!(matches!(
-            transition(&mut work, Signal::UserResolved("checked".into())),
-            Some(EventBody::WorkFinished {
-                outcome: WorkOutcome::Interrupted,
-                ..
-            })
-        ));
+        assert!(transition(&mut work, Signal::Settled(WorkOutcome::Completed)).is_none());
+        assert_eq!(
+            work.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Completed
+            }
+        );
 
         let mut work = running();
         transition(&mut work, Signal::InterruptRequested);

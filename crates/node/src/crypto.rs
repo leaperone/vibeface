@@ -101,14 +101,30 @@ impl LocalIdentity {
             signature,
         });
         match &mut body {
-            EventBody::BotCreated { attestation, .. }
+            EventBody::ConversationOwner { attestation, .. }
+            | EventBody::BotCreated { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
+            | EventBody::WorkFinished { attestation, .. }
             | EventBody::ApprovalAnswered { attestation, .. }
             | EventBody::AutonomySet { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
+    }
+    /// The fixture client's signature making `node` the first owner of conversation `scope`.
+    #[cfg(test)]
+    pub fn owner_fixture(&self, network: &str, scope: &str, node: &str) -> Result<Attestation> {
+        let body = EventBody::ConversationOwner {
+            scheduler_node: node.into(),
+            epoch: 1,
+            attestation: None,
+        };
+        self.fixture_admin()
+            .attest(network, scope, body)?
+            .attestation()
+            .cloned()
+            .context("signed owner")
     }
     /// A recovered network whose members are a fixture admin client and `nodes`.
     #[cfg(test)]
@@ -233,24 +249,39 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -
 }
 
 /// The user's own writes must carry their device signature; nothing else may carry one.
+enum UserSignature {
+    Required,
+    /// The user's settlement of an unverified work result.
+    Optional,
+    Forbidden,
+}
+
 fn validate_attestation(event: &Event) -> Result<()> {
-    let required = match &event.body {
-        EventBody::MessagePosted { role, .. } => *role == Role::User,
-        EventBody::BotCreated { .. }
+    let rule = match &event.body {
+        EventBody::MessagePosted {
+            role: Role::User, ..
+        }
+        | EventBody::ConversationOwner { .. }
+        | EventBody::BotCreated { .. }
         | EventBody::ApprovalAnswered { .. }
         | EventBody::AutonomySet { .. }
-        | EventBody::NotificationAcked { .. } => true,
-        _ => false,
+        | EventBody::NotificationAcked { .. } => UserSignature::Required,
+        EventBody::WorkFinished {
+            outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
+            ..
+        } => UserSignature::Optional,
+        _ => UserSignature::Forbidden,
     };
-    if event.body.attestation().is_none() {
-        ensure!(!required, "this write needs the user's device signature");
-        return Ok(());
+    match (rule, event.body.attestation()) {
+        (UserSignature::Required, None) => {
+            anyhow::bail!("this write needs the user's device signature")
+        }
+        (UserSignature::Forbidden, Some(_)) => {
+            anyhow::bail!("only the user's own writes carry a device signature")
+        }
+        (_, None) => Ok(()),
+        _ => verify_attestation(&event.network_id, &event.scope_id, &event.body),
     }
-    ensure!(
-        required,
-        "only the user's own writes carry a device signature"
-    );
-    verify_attestation(&event.network_id, &event.scope_id, &event.body)
 }
 
 pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) -> Result<()> {
@@ -312,6 +343,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         EventBody::MessagePosted {
             message_id,
             role,
+            attachments,
             report_results,
             in_reply_to,
             status,
@@ -320,12 +352,15 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(message_id)?;
             match role {
                 Role::User => ensure!(
-                    report_results.is_some() && in_reply_to.is_none() && status.is_none(),
-                    "a user message carries only its reporting choice"
+                    report_results.is_some()
+                        && in_reply_to.is_none()
+                        && status.is_none()
+                        && *attachments == event.blobs,
+                    "a user message carries only its reporting choice and its signed attachments"
                 ),
                 Role::Assistant => {
                     ensure!(
-                        report_results.is_none() && status.is_some(),
+                        report_results.is_none() && status.is_some() && attachments.is_empty(),
                         "an assistant reply carries its turn status"
                     );
                     in_reply_to.as_deref().map(id).transpose()?;
@@ -335,6 +370,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         EventBody::ConversationOwner {
             scheduler_node,
             epoch,
+            ..
         } => {
             decode32(scheduler_node)?;
             ensure!(*epoch > 0, "owner epoch starts at 1");
@@ -350,7 +386,10 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => {
             id(work_id)?;
             let (kind, trigger_id) = trigger.split_once(':').unwrap_or_default();
-            ensure!(matches!(kind, "message" | "work"), "invalid work trigger");
+            ensure!(
+                matches!(kind, "message" | "work" | "task"),
+                "invalid work trigger"
+            );
             id(trigger_id)?;
             id(call_ref)?;
             decode32(dispatcher)?;
@@ -429,6 +468,7 @@ mod tests {
             message_id: "m-1".into(),
             role,
             text: "hi".into(),
+            attachments: vec![],
             report_results,
             in_reply_to: None,
             status,

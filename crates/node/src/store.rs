@@ -299,6 +299,7 @@ impl Store {
         network: &str,
         scope: &str,
         title: &str,
+        owner: Attestation,
         created_at_ms: i64,
     ) -> Result<Conversation> {
         let tx = self
@@ -319,6 +320,7 @@ impl Store {
             network,
             scope,
             title,
+            owner,
             created_at_ms,
         )?;
         let conversation =
@@ -351,39 +353,7 @@ impl Store {
         scope_id: &str,
         basis: Option<&VersionVector>,
     ) -> Result<Context> {
-        let basis = match basis {
-            Some(basis) => basis.clone(),
-            None => self.version_vector(network_id)?,
-        };
-        let mut statement = self.connection.prepare(
-            "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY lamport,created_at_ms,hash",
-        )?;
-        let rows = statement.query_map(params![network_id, scope_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, u64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut events = Vec::new();
-        for row in rows {
-            let (author, seq, hash, envelope) = row?;
-            if seq > basis.get(&author).copied().unwrap_or(0) {
-                continue;
-            }
-            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
-            events.push(HashedEvent {
-                hash,
-                event: serde_json::from_str(&envelope.canonical_body)?,
-            });
-        }
-        Ok(Context {
-            network_id: network_id.into(),
-            scope_id: scope_id.into(),
-            basis,
-            events,
-        })
+        context_from(&self.connection, network_id, scope_id, basis)
     }
 
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
@@ -453,11 +423,7 @@ impl Store {
     }
 
     pub fn conversations(&self, network_id: &str) -> Result<Vec<Conversation>> {
-        let mut statement = self.connection.prepare("SELECT conversation_id,title,owner,owner_epoch FROM conversations WHERE network_id=? AND title IS NOT NULL ORDER BY conversation_id")?;
-        statement
-            .query_map([network_id], conversation_row)?
-            .map(|row| Ok(row?))
-            .collect()
+        conversations_from(&self.connection, network_id)
     }
     pub fn conversation(&self, network_id: &str, scope_id: &str) -> Result<Option<Conversation>> {
         conversation_from(&self.connection, network_id, scope_id)
@@ -643,6 +609,7 @@ impl Store {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "the conversation and its signed first owner")]
 pub(crate) fn create_conversation_from(
     connection: &Connection,
     blob_dir: &Path,
@@ -650,6 +617,7 @@ pub(crate) fn create_conversation_from(
     network: &str,
     scope: &str,
     title: &str,
+    owner: Attestation,
     created_at_ms: i64,
 ) -> Result<()> {
     log::append_from(
@@ -673,6 +641,7 @@ pub(crate) fn create_conversation_from(
         EventBody::ConversationOwner {
             scheduler_node: identity.device_id()?,
             epoch: 1,
+            attestation: Some(owner),
         },
         vec![],
         created_at_ms,
@@ -687,6 +656,17 @@ fn conversation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
         owner: r.get(2)?,
         owner_epoch: r.get(3)?,
     })
+}
+
+pub(crate) fn conversations_from(
+    connection: &Connection,
+    network_id: &str,
+) -> Result<Vec<Conversation>> {
+    let mut statement = connection.prepare("SELECT conversation_id,title,owner,owner_epoch FROM conversations WHERE network_id=? AND title IS NOT NULL ORDER BY conversation_id")?;
+    statement
+        .query_map([network_id], conversation_row)?
+        .map(|row| Ok(row?))
+        .collect()
 }
 
 pub(crate) fn conversation_from(
@@ -859,4 +839,45 @@ fn validate_day(day: &str) -> Result<()> {
         "day must be YYYY-MM-DD"
     );
     Ok(())
+}
+
+pub(crate) fn context_from(
+    connection: &Connection,
+    network_id: &str,
+    scope_id: &str,
+    basis: Option<&VersionVector>,
+) -> Result<Context> {
+    let basis = match basis {
+        Some(basis) => basis.clone(),
+        None => log::version_vector_from(connection, network_id)?,
+    };
+    let mut statement = connection.prepare(
+        "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY lamport,created_at_ms,hash",
+    )?;
+    let rows = statement.query_map(params![network_id, scope_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, u64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (author, seq, hash, envelope) = row?;
+        if seq > basis.get(&author).copied().unwrap_or(0) {
+            continue;
+        }
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        events.push(HashedEvent {
+            hash,
+            event: serde_json::from_str(&envelope.canonical_body)?,
+        });
+    }
+    Ok(Context {
+        network_id: network_id.into(),
+        scope_id: scope_id.into(),
+        basis,
+        events,
+    })
 }

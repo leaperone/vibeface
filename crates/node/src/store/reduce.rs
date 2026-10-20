@@ -2,7 +2,7 @@
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
 use crate::model::*;
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 
 fn bounded(text: &str) -> String {
     text.chars().take(200).collect()
@@ -57,6 +57,7 @@ pub(crate) fn apply(
         EventBody::ConversationOwner {
             scheduler_node,
             epoch,
+            ..
         } => {
             connection.execute(
                 "INSERT INTO conversations(network_id,conversation_id,owner,owner_epoch,owner_hash) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET owner=excluded.owner,owner_epoch=excluded.owner_epoch,owner_hash=excluded.owner_hash WHERE owner IS NULL OR excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.owner_hash<owner_hash)",
@@ -163,10 +164,31 @@ pub(crate) fn apply(
             work_id,
             outcome,
             result_text,
+            attestation,
             ..
         } => {
-            // A proven outcome beats an unverified one regardless of order.
-            let finish_rank = format!("{}:{rank}", u8::from(*outcome == WorkOutcome::Unverified));
+            // Besides the target, only the user's signed settlement or the owner's abandonment counts.
+            let target: Option<String> = connection
+                .query_row(
+                    "SELECT target_node FROM works WHERE network_id=? AND work_id=?",
+                    params![network, work_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            if target.as_deref() != Some(event.author.as_str())
+                && attestation.is_none()
+                && *outcome != WorkOutcome::Abandoned
+            {
+                return Ok(());
+            }
+            // A proven outcome beats an unverified one, and both beat an abandonment, in any order.
+            let precedence = match outcome {
+                WorkOutcome::Unverified => 1,
+                WorkOutcome::Abandoned => 2,
+                _ => 0,
+            };
+            let finish_rank = format!("{precedence}:{rank}");
             connection.execute(
                 "INSERT INTO works(network_id,work_id,conversation_id,finish,finish_rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,work_id) DO UPDATE SET finish=excluded.finish,finish_rank=excluded.finish_rank WHERE finish_rank IS NULL OR excluded.finish_rank<finish_rank",
                 params![network, work_id, scope, serde_json::to_string(&event.body)?, finish_rank],
@@ -312,4 +334,25 @@ pub(crate) fn works_from(
         });
     }
     Ok(works)
+}
+
+/// One work's projection, wherever its conversation is.
+pub(crate) fn work_from(
+    connection: &Connection,
+    network: &str,
+    work_id: &str,
+) -> Result<Option<WorkProjection>> {
+    let scope: Option<String> = connection
+        .query_row(
+            "SELECT conversation_id FROM works WHERE network_id=? AND work_id=? AND dispatch IS NOT NULL",
+            params![network, work_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    Ok(works_from(connection, network, &scope)?
+        .into_iter()
+        .find(|work| work.work_id == work_id))
 }

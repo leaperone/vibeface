@@ -2,9 +2,14 @@
 //! `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
 use super::executor::{Executor as _, request_text, validate_response};
 use super::*;
-use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};
+use crate::scheduling::task_trigger;
+use crate::work::{
+    Dispatch, DispatchState, Probe, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
+};
 
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a stop request for an unreachable device keeps retrying before it shows as unconfirmed.
+const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn live(record: &WorkRecord) -> bool {
     !matches!(
@@ -77,18 +82,103 @@ impl Runtime {
         let _ = self.executor.executor.observe(threads);
     }
 
-    /// Records the dispatch and starts the turn once. A retry of the same `work_id` returns the
+    /// Every dispatch, local or from another Node, passes the same checks: the trigger chain
+    /// carries the user's signed message or their permission to continue, the directory is in
+    /// this Node's roots, and an agent task has an Agent to run it.
+    async fn authorize_dispatch(&self, network: &str, spec: &WorkSpec) -> Result<()> {
+        self.allowed_path(&spec.cwd)?;
+        let store = self.store.lock().await;
+        let conversation = store
+            .conversation(network, &spec.conversation)?
+            .context("conversation not found")?;
+        let from_owner = conversation.owner.as_deref() == Some(spec.dispatcher.as_str());
+        match spec.trigger.split_once(':') {
+            Some(("message", message_id)) => {
+                ensure!(
+                    from_owner,
+                    "only the conversation's scheduling device dispatches its work"
+                );
+                let message = store
+                    .message(network, &spec.conversation, message_id)?
+                    .context("the user's message has not reached this device")?;
+                ensure!(
+                    message.role == Role::User,
+                    "work must follow the user's own message"
+                );
+            }
+            Some(("work", previous)) => {
+                ensure!(
+                    from_owner,
+                    "only the conversation's scheduling device dispatches its work"
+                );
+                ensure!(
+                    store.autonomy(network, &spec.conversation)?.mode == AutonomyMode::Continue,
+                    "continuing after a result needs the user's permission in this conversation"
+                );
+                ensure!(
+                    store
+                        .works(network, &spec.conversation)?
+                        .iter()
+                        .any(|work| work.work_id == previous && work.outcome.is_some()),
+                    "the result this work follows has not reached this device"
+                );
+            }
+            Some(("task", task)) => {
+                let task = store
+                    .work_record(network, task)?
+                    .context("agent task not found on this device")?;
+                ensure!(
+                    spec.dispatcher == spec.target
+                        && spec.executor == Executor::Codex
+                        && task.spec.executor == Executor::Agent
+                        && task.spec.conversation == spec.conversation
+                        && spec.parent.as_deref() == Some(task.spec.work_id.as_str())
+                        && !task.state.finished(),
+                    "an agent task only starts Codex work on its own device"
+                );
+            }
+            _ => bail!("invalid work trigger"),
+        }
+        if let Some(original) = &spec.continues {
+            let original = store
+                .work_record(network, original)?
+                .context("the work to continue is not on this device")?;
+            ensure!(
+                original.spec.conversation == spec.conversation
+                    && original.spec.executor == spec.executor,
+                "a continuation keeps the original conversation and executor"
+            );
+        }
+        if spec.executor == Executor::Agent {
+            ensure!(
+                spec.dispatcher != spec.target,
+                "an agent task goes to another device"
+            );
+            ensure!(
+                self.config.roles.contains(&NodeRole::Scheduler)
+                    && self.settings_snapshot().manager.is_some(),
+                "this device has no assistant to take the task"
+            );
+        }
+        Ok(())
+    }
+
+    /// Records the dispatch and starts it once. A retry of the same `work_id` returns the
     /// existing record and never starts a second turn.
-    pub(super) async fn dispatch_work(
+    pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
         network: &str,
         spec: WorkSpec,
     ) -> Result<WorkRecord> {
-        ensure!(
-            spec.target == self.identity.device_id()?,
-            "dispatching to another device arrives with cross-device delivery"
-        );
-        self.allowed_path(&spec.cwd)?;
+        if self
+            .store
+            .lock()
+            .await
+            .work_record(network, &spec.work_id)?
+            .is_none()
+        {
+            self.authorize_dispatch(network, &spec).await?;
+        }
         let (record, created) =
             self.store
                 .lock()
@@ -96,15 +186,95 @@ impl Runtime {
                 .accept_work(&self.identity, network, spec, now_ms())?;
         self.publish_changed(network, &record.spec.conversation, &record.spec.work_id);
         if created {
-            let node = self.clone();
-            let (network, work_id) = (network.to_owned(), record.spec.work_id.clone());
-            tokio::spawn(async move {
-                if let Err(error) = node.start_work(&network, &work_id).await {
-                    tracing::warn!(%error, work_id, "work start failed");
+            match record.spec.executor {
+                Executor::Codex => {
+                    let node = self.clone();
+                    let (network, work_id) = (network.to_owned(), record.spec.work_id.clone());
+                    tokio::spawn(async move {
+                        if let Err(error) = node.start_work(&network, &work_id).await {
+                            tracing::warn!(%error, work_id, "work start failed");
+                        }
+                    });
                 }
-            });
+                Executor::Agent => self.spawn_scheduler(network, &record.spec.conversation)?,
+            }
         }
         Ok(record)
+    }
+
+    /// Another Node's dispatch. The dispatcher may be ahead of this Node, so a refusal is retried
+    /// once after syncing from it; a second refusal is final and the dispatcher reports it.
+    pub(super) async fn accept_remote_dispatch(
+        self: &Arc<Self>,
+        network: &str,
+        origin: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let spec: WorkSpec = serde_json::from_value(input["spec"].clone())?;
+        ensure!(
+            spec.dispatcher == origin && spec.target == self.identity.device_id()?,
+            "a dispatch names its sender and this device"
+        );
+        ensure!(
+            spec.work_id == WorkSpec::id(&spec.conversation, &spec.trigger, &spec.call_ref),
+            "work ID does not match its call"
+        );
+        let first = self.accept_dispatch(network, spec.clone()).await;
+        let record = match first {
+            Ok(record) => Ok(record),
+            Err(_) => {
+                self.sync_peer(network, origin).await?;
+                self.accept_dispatch(network, spec).await
+            }
+        };
+        Ok(match record {
+            Ok(record) => {
+                json!({"work_id":record.spec.work_id,"state":record.state.name()})
+            }
+            Err(error) => json!({"rejected":error.to_string()}),
+        })
+    }
+
+    /// A dispatch to another Node waits in this Node's journal until the target answers; an
+    /// unknown answer is retried with the same `work_id`, which the target accepts at most once.
+    pub(super) async fn send_dispatch(
+        self: &Arc<Self>,
+        network: &str,
+        spec: WorkSpec,
+    ) -> Result<Dispatch> {
+        let dispatch = self.store.lock().await.save_dispatch(
+            network,
+            &Dispatch {
+                spec,
+                state: DispatchState::Pending,
+            },
+        )?;
+        if dispatch.state != DispatchState::Pending {
+            return Ok(dispatch);
+        }
+        let request = json!({"type":"dispatch_work","spec":dispatch.spec});
+        let state = match self
+            .peer_request(network, &dispatch.spec.target, request)
+            .await
+        {
+            Ok(reply) if reply["work_id"] == dispatch.spec.work_id.as_str() => {
+                DispatchState::Accepted
+            }
+            Ok(reply) => DispatchState::Rejected {
+                reason: reply["rejected"]
+                    .as_str()
+                    .unwrap_or("the device refused the work")
+                    .into(),
+            },
+            Err(error) => {
+                tracing::debug!(%error, "dispatch waits for its target");
+                return Ok(dispatch);
+            }
+        };
+        let dispatch = Dispatch { state, ..dispatch };
+        self.store.lock().await.save_dispatch(network, &dispatch)?;
+        self.publish_changed(network, &dispatch.spec.conversation, &dispatch.spec.work_id);
+        Ok(dispatch)
     }
 
     async fn start_work(self: &Arc<Self>, network: &str, work_id: &str) -> Result<()> {
@@ -114,8 +284,30 @@ impl Runtime {
             .await
             .work_record(network, work_id)?
             .context("work not found")?;
+        if record.spec.executor != Executor::Codex {
+            return Ok(());
+        }
         let executor = &self.executor.executor;
+        let continued = match &record.spec.continues {
+            Some(original) => self
+                .store
+                .lock()
+                .await
+                .work_record(network, original)?
+                .and_then(|original| match original.state {
+                    WorkState::Starting { thread } => thread,
+                    state => state.handle().map(|handle| handle.thread_id.clone()),
+                }),
+            None => None,
+        };
         let thread = match &record.state {
+            // A continuation starts a new turn on the original thread.
+            WorkState::Accepted if continued.is_some() => {
+                let thread = continued.expect("checked");
+                self.signal_work(network, work_id, Signal::ThreadCreated(thread.clone()))
+                    .await?;
+                thread
+            }
             WorkState::Accepted => match executor.start_thread(&record.spec.cwd).await {
                 Ok(thread) => {
                     self.signal_work(network, work_id, Signal::ThreadCreated(thread.clone()))
@@ -184,6 +376,9 @@ impl Runtime {
             .await
             .work_record(network, work_id)?
             .context("work not found")?;
+        if record.spec.executor != Executor::Codex {
+            return Ok(());
+        }
         let epoch = self.executor_epoch();
         let executor = &self.executor.executor;
         let probe = match &record.state {
@@ -221,16 +416,32 @@ impl Runtime {
             .await
             .work_record(network, work_id)?
             .context("work not found")?;
-        if let WorkState::Running { handle } | WorkState::WaitingApproval { handle, .. } =
-            &record.state
-        {
-            self.executor
-                .executor
-                .interrupt(&handle.thread_id, &handle.turn_id)
-                .await
-                .map_err(|error| anyhow::anyhow!("interrupt was not confirmed: {error}"))?;
-            self.signal_work(network, work_id, Signal::InterruptRequested)
-                .await?;
+        match &record.state {
+            WorkState::Running { handle } | WorkState::WaitingApproval { handle, .. } => {
+                self.executor
+                    .executor
+                    .interrupt(&handle.thread_id, &handle.turn_id)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("interrupt was not confirmed: {error}"))?;
+                self.signal_work(network, work_id, Signal::InterruptRequested)
+                    .await?;
+            }
+            // An agent task stops with its coordination turn.
+            WorkState::Accepted if record.spec.executor == Executor::Agent => {
+                let job = self.store.lock().await.request_manager_cancel(
+                    &self.identity,
+                    network,
+                    &record.spec.conversation,
+                    &task_trigger(work_id),
+                )?;
+                if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
+                    job.map(|job| job.state)
+                {
+                    self.fence_manager_attempt(&attempt.id).await?;
+                }
+                self.publish_changed(network, &record.spec.conversation, work_id);
+            }
+            _ => {}
         }
         // Stopping a work stops what it delegated.
         let children: Vec<String> = self
@@ -248,6 +459,106 @@ impl Runtime {
         Ok(json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false}))
     }
 
+    /// Stops a work wherever it runs. A target that cannot be reached keeps the request here,
+    /// retried until it confirms, the work ends or the request times out.
+    pub(super) async fn stop_work(
+        self: &Arc<Self>,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+    ) -> Result<Value> {
+        let work = self
+            .store
+            .lock()
+            .await
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == work_id)
+            .context("work not found in this conversation")?;
+        if work.target_node == self.identity.device_id()? {
+            return self.interrupt_work(network, work_id).await;
+        }
+        let request = StopRequest {
+            work_id: work_id.into(),
+            conversation: scope.into(),
+            target: work.target_node,
+            requested_at_ms: now_ms(),
+            deadline_ms: now_ms() + STOP_DELIVERY_TIMEOUT.as_millis() as i64,
+            timed_out: false,
+        };
+        match self.deliver_stop(network, &request).await {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                tracing::debug!(%error, "stop request waits for its device");
+                self.store
+                    .lock()
+                    .await
+                    .save_stop_request(network, &request)?;
+                self.publish_changed(network, scope, work_id);
+                Ok(
+                    json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_device":true}),
+                )
+            }
+        }
+    }
+
+    async fn deliver_stop(&self, network: &str, request: &StopRequest) -> Result<Value> {
+        self.peer_request(
+            network,
+            &request.target,
+            json!({"type":"interrupt_work","conversation_id":request.conversation,
+                "work_id":request.work_id,"human":true}),
+        )
+        .await
+    }
+
+    /// Retries waiting dispatches and stop requests; a stop request past its deadline stays
+    /// listed as unconfirmed until the work ends.
+    pub(super) async fn deliver_work_requests(self: &Arc<Self>, network: &str) -> Result<()> {
+        let dispatches = self.store.lock().await.dispatches(network)?;
+        for dispatch in dispatches {
+            if dispatch.state == DispatchState::Pending {
+                self.send_dispatch(network, dispatch.spec).await?;
+            }
+        }
+        let requests = self.store.lock().await.stop_requests(network)?;
+        for mut request in requests {
+            let ended = self
+                .store
+                .lock()
+                .await
+                .works(network, &request.conversation)?
+                .iter()
+                .any(|work| work.work_id == request.work_id && work.outcome.is_some());
+            if ended {
+                self.store
+                    .lock()
+                    .await
+                    .forget_stop_request(network, &request.work_id)?;
+                continue;
+            }
+            if request.timed_out {
+                continue;
+            }
+            if self.deliver_stop(network, &request).await.is_ok() {
+                self.store
+                    .lock()
+                    .await
+                    .forget_stop_request(network, &request.work_id)?;
+            } else if now_ms() >= request.deadline_ms {
+                request.timed_out = true;
+                self.store
+                    .lock()
+                    .await
+                    .save_stop_request(network, &request)?;
+            } else {
+                continue;
+            }
+            self.publish_changed(network, &request.conversation, &request.work_id);
+        }
+        Ok(())
+    }
+
     /// The user's answer; requests from an earlier executor epoch can no longer be answered.
     pub(super) async fn answer_approval(
         self: &Arc<Self>,
@@ -258,12 +569,26 @@ impl Runtime {
         response: &Value,
         attestation: Attestation,
     ) -> Result<Value> {
-        let record = self
-            .store
-            .lock()
-            .await
-            .work_record(network, work_id)?
-            .context("work not found")?;
+        let local = self.store.lock().await.work_record(network, work_id)?;
+        let Some(record) = local else {
+            // The device that ran the work records the answer; this entry only carries it there.
+            let work = self
+                .store
+                .lock()
+                .await
+                .works(network, scope)?
+                .into_iter()
+                .find(|work| work.work_id == work_id)
+                .context("work not found in this conversation")?;
+            return self
+                .peer_request(
+                    network,
+                    &work.target_node,
+                    json!({"type":"answer_approval","conversation_id":scope,"work_id":work_id,
+                        "request_id":request_id,"response":response,"attestation":attestation}),
+                )
+                .await;
+        };
         ensure!(
             record.spec.conversation == scope,
             "work belongs to another conversation"
@@ -331,30 +656,20 @@ impl Runtime {
         }
     }
 
-    pub(super) async fn resolve_work(
-        self: &Arc<Self>,
-        network: &str,
-        scope: &str,
-        work_id: &str,
-        evidence: &str,
-    ) -> Result<()> {
-        let record = self
-            .store
-            .lock()
-            .await
-            .work_record(network, work_id)?
-            .context("work not found")?;
-        ensure!(
-            record.spec.conversation == scope,
-            "work belongs to another conversation"
-        );
-        ensure!(
-            matches!(record.state, WorkState::Unverified { .. }),
-            "only unverified work needs confirmation"
-        );
-        self.signal_work(network, work_id, Signal::UserResolved(evidence.into()))
-            .await?;
-        Ok(())
+    /// Answer forms of this Node's open requests for a work, for an entry that shows them.
+    pub(super) async fn approval_forms(&self, network: &str, work_id: &str) -> Result<Value> {
+        let record = self.store.lock().await.work_record(network, work_id)?;
+        let forms = match record.map(|record| record.state) {
+            Some(WorkState::WaitingApproval { approvals, .. }) => approvals
+                .iter()
+                .map(|approval| {
+                    json!({"request_id":approval.request_id,"answering":approval.answering,
+                        "form":executor::request_form(&approval.method, &approval.params)})
+                })
+                .collect(),
+            _ => vec![],
+        };
+        Ok(json!({ "approvals": forms }))
     }
 
     /// Maps App Server notifications and requests onto the work that owns their thread and turn.

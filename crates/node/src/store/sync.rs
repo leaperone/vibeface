@@ -1,12 +1,13 @@
 //! Reads and local records for Node-to-Node sync: log ranges, heads, the signed address book,
 //! scheduler deliveries and resumable attachment downloads.
 use super::{
-    Store, local_load, local_prefix, local_save, log, message_from, scheduler::admit_from,
+    Store, local_load, local_prefix, local_save, log, message_from,
+    scheduler::{admit_from, admit_work_result_from},
 };
 use crate::{
     model::*,
     net::{AddressRecord, SignedAddress},
-    scheduling::{AdmissionReceipt, TriggerKind, scheduler_key},
+    scheduling::{AdmissionReceipt, SCHEDULING_VERSION, TriggerKind, scheduler_key},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -103,8 +104,9 @@ impl Store {
         self.local_delete(network, &scheduler_key("outbox", conversation, trigger))
     }
 
-    /// The owner admits a user message another Node accepted. Idempotent by trigger, so a
-    /// second entry delivering the same message gets the original receipt.
+    /// The owner admits a user message or a work result another Node holds. Idempotent by
+    /// trigger, so a second delivery gets the original receipt. `None` means the triggering
+    /// event has not been synced here yet.
     pub fn admit_delivery(
         &mut self,
         local: &str,
@@ -112,9 +114,6 @@ impl Store {
         conversation: &str,
         trigger: &str,
     ) -> Result<Option<AdmissionReceipt>> {
-        let message_id = trigger
-            .strip_prefix("message:")
-            .context("only user messages are delivered")?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -125,21 +124,44 @@ impl Store {
             owner.as_deref() == Some(local),
             "this Node does not schedule the conversation"
         );
-        let Some(message) = message_from(&tx, network, conversation, message_id)? else {
-            return Ok(None);
+        let receipt = match trigger.split_once(':') {
+            Some(("message", message_id)) => {
+                let Some(message) = message_from(&tx, network, conversation, message_id)? else {
+                    return Ok(None);
+                };
+                ensure!(
+                    message.role == Role::User,
+                    "only user messages are delivered"
+                );
+                admit_from(
+                    &tx,
+                    network,
+                    conversation,
+                    trigger,
+                    TriggerKind::Human,
+                    message_id,
+                )?
+            }
+            Some(("work", work_id)) => {
+                let outcome = super::reduce::works_from(&tx, network, conversation)?
+                    .into_iter()
+                    .find(|work| work.work_id == work_id)
+                    .and_then(|work| work.outcome);
+                let Some(outcome) = outcome.filter(|o| *o != WorkOutcome::Unverified) else {
+                    return Ok(None);
+                };
+                // A result the user asked not to report is delivered all the same.
+                admit_work_result_from(&tx, network, local, conversation, work_id, outcome)?
+                    .unwrap_or(AdmissionReceipt {
+                        version: SCHEDULING_VERSION,
+                        network_id: network.into(),
+                        conversation_id: conversation.into(),
+                        trigger: trigger.into(),
+                        state: "not_reported".into(),
+                    })
+            }
+            _ => anyhow::bail!("only user messages and work results are delivered"),
         };
-        ensure!(
-            message.role == Role::User,
-            "only user messages are delivered"
-        );
-        let receipt = admit_from(
-            &tx,
-            network,
-            conversation,
-            trigger,
-            TriggerKind::Human,
-            message_id,
-        )?;
         tx.commit()?;
         Ok(Some(receipt))
     }

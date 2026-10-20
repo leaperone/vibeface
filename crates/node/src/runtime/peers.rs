@@ -274,6 +274,35 @@ impl Runtime {
                 .await
             }
             "progress_read" => self.read_progress(network, origin, input).await,
+            "dispatch_work" => self.accept_remote_dispatch(network, origin, input).await,
+            "interrupt_work" => {
+                let scope = field(input, "conversation_id")?;
+                let work_id = field(input, "work_id")?;
+                let record = self
+                    .store
+                    .lock()
+                    .await
+                    .work_record(network, work_id)?
+                    .context("work not found on this device")?;
+                ensure!(
+                    record.spec.conversation == scope,
+                    "work belongs to another conversation"
+                );
+                self.interrupt_work(network, work_id).await
+            }
+            "approval_forms" => self.approval_forms(network, field(input, "work_id")?).await,
+            "answer_approval" => {
+                self.answer_approval(
+                    network,
+                    field(input, "conversation_id")?,
+                    field(input, "work_id")?,
+                    field(input, "request_id")?,
+                    input.get("response").context("response is required")?,
+                    serde_json::from_value(input["attestation"].clone())
+                        .context("the user's signature is required")?,
+                )
+                .await
+            }
             "cancel_manager" | "reconcile" | "resolve" => {
                 ensure!(
                     input["human"] == true,
@@ -524,7 +553,13 @@ impl Runtime {
     }
 
     async fn ingest(&self, network: &str, events: &[SignedEvent]) -> Result<()> {
-        let statuses = self.store.lock().await.ingest_events(network, events)?;
+        let statuses = {
+            let mut store = self.store.lock().await;
+            let statuses = store.ingest_events(network, events)?;
+            // The user's choice on an unverified result may have arrived from another entry.
+            store.settle_local_works(network)?;
+            statuses
+        };
         let mut scopes = BTreeSet::new();
         for (event, status) in events.iter().zip(&statuses) {
             match status {
@@ -606,6 +641,47 @@ impl Runtime {
                 .lock()
                 .await
                 .forget_address(&view.network_id, &revoked.device_id);
+        }
+        self.abandon_revoked_works(&view.network_id).await;
+    }
+
+    /// Work on removed devices that never reported is recorded as abandoned by the owner, and
+    /// requests still waiting for those devices are dropped.
+    pub(super) async fn abandon_revoked_works(&self, network: &str) {
+        let Ok(view) = self
+            .membership_state()
+            .await
+            .and_then(|state| state.project())
+        else {
+            return;
+        };
+        let removed: Vec<String> = view
+            .revoked
+            .iter()
+            .map(|revoked| revoked.device_id.clone())
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        let result =
+            self.store
+                .lock()
+                .await
+                .abandon_works(&self.identity, network, &removed, now_ms());
+        match result {
+            Ok(abandoned) => {
+                for (scope, work_id) in &abandoned {
+                    self.publish_changed(network, scope, work_id);
+                }
+                if !abandoned.is_empty() {
+                    self.schedule_wakeup.notify_one();
+                    self.outbox_wakeup.notify_one();
+                }
+            }
+            Err(error) => tracing::warn!(%error, "abandoning work on removed devices is pending"),
+        }
+        if let Err(error) = self.store.lock().await.drop_requests_to(network, &removed) {
+            tracing::warn!(%error, "dropping requests to removed devices is pending");
         }
     }
 
@@ -749,19 +825,41 @@ impl Runtime {
             if let Err(error) = self.deliver_outbox().await {
                 tracing::debug!(%error, "scheduler delivery pending");
             }
+            if let Ok(state) = self.membership_state().await
+                && let Err(error) = self.deliver_work_requests(&state.genesis.network_id).await
+            {
+                tracing::debug!(%error, "work requests wait for their devices");
+            }
         }
     }
 
-    /// Hands each waiting message to its scheduling Node. The owner admits by trigger, so a
-    /// retry after an unknown outcome is harmless.
+    /// Hands each waiting message or result to the conversation's current owner. The owner admits
+    /// by trigger, so a retry after an unknown outcome is harmless.
     async fn deliver_outbox(self: &Arc<Self>) -> Result<()> {
         let networks = self.store.lock().await.networks()?;
+        let local = self.identity.device_id()?;
         for network in networks {
             let entries = self.store.lock().await.scheduler_outbox(&network)?;
             for entry in entries {
-                let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
-                    "trigger":entry.trigger});
-                match self.peer_request(&network, &entry.owner, request).await {
+                let owner = self
+                    .store
+                    .lock()
+                    .await
+                    .conversation(&network, &entry.conversation_id)?
+                    .and_then(|conversation| conversation.owner)
+                    .context("conversation has no scheduling Node")?;
+                let delivered = if owner == local {
+                    self.store
+                        .lock()
+                        .await
+                        .admit_delivery(&local, &network, &entry.conversation_id, &entry.trigger)
+                        .map(|receipt| json!({ "receipt": receipt }))
+                } else {
+                    let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
+                        "trigger":entry.trigger});
+                    self.peer_request(&network, &owner, request).await
+                };
+                match delivered {
                     Ok(reply) if reply["receipt"].is_object() => {
                         self.store.lock().await.remove_outbox(
                             &network,
@@ -769,12 +867,13 @@ impl Runtime {
                             &entry.trigger,
                         )?;
                         self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
+                        self.schedule_wakeup.notify_one();
                     }
                     Ok(_) => {
-                        tracing::debug!(owner = %entry.owner, "delivery answer had no receipt")
+                        tracing::debug!(%owner, "delivery answer had no receipt")
                     }
                     Err(error) => {
-                        tracing::debug!(owner = %entry.owner, %error, "scheduler delivery pending")
+                        tracing::debug!(%owner, %error, "scheduler delivery pending")
                     }
                 }
             }
@@ -1015,6 +1114,15 @@ mod tests {
     }
 
     fn user(identity: &LocalIdentity, network: &str, id: &str) -> Result<Attestation> {
+        user_with(identity, network, id, vec![])
+    }
+
+    fn user_with(
+        identity: &LocalIdentity,
+        network: &str,
+        id: &str,
+        attachments: Vec<BlobRef>,
+    ) -> Result<Attestation> {
         identity
             .fixture_admin()
             .attest(
@@ -1024,6 +1132,7 @@ mod tests {
                     message_id: id.into(),
                     role: Role::User,
                     text: id.into(),
+                    attachments,
                     report_results: Some(true),
                     in_reply_to: None,
                     status: None,
@@ -1058,10 +1167,11 @@ mod tests {
             };
             {
                 let mut store = a.store.lock().await;
-                store.create_conversation(&ia, &network, "c", "Sync", now_ms())?;
+                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                store.create_conversation(&ia, &network, "c", "Sync", owner, now_ms())?;
                 store.put_blob(&blob, &content)?;
                 store.accept_message(&ia, &network, "c", "m1", "m1", vec![blob.clone()], true,
-                    user(&ia, &network, "m1")?, now_ms())?;
+                    user_with(&ia, &network, "m1", vec![blob.clone()])?, now_ms())?;
             }
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
@@ -1183,6 +1293,7 @@ mod tests {
                 &network,
                 "c",
                 "Relayed",
+                ids[0].owner_fixture(&network, "c", &ids[1].device_id()?)?,
                 now_ms(),
             )?;
             let addr = tokio::time::timeout(Duration::from_secs(10), async {
