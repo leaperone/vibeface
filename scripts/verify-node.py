@@ -2504,6 +2504,186 @@ def public_entry_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
+def node_status(node):
+    result = subprocess.run([str(node.binary), "status", "--json", "--data-dir", str(node.directory)],
+                            capture_output=True, timeout=20)
+    return json.loads(result.stdout)
+
+
+def phase5_acceptance(options):
+    """Write protection, logs and troubleshooting with real Node processes.
+
+    A and B are member Nodes (B runs the relay). A is restored from a backup, restarted alone, and its
+    data directory is copied and run as A' while A is stopped. One browser identity opens A and B.
+    """
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("phase5-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    nodes, clients = [], []
+    report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
+              "coverage": "two real Node processes over iroh plus a copy of A's data directory; WASM browser client",
+              "not_checked": ["rendered browser UI (see the browser screenshots)", "no App Server runs in this mode"]}
+    created = iter(range(1, 1000))
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS " + name, flush=True)
+
+    def write(client, *, status=200):
+        name = f"p5-{next(created)}"
+        return client.rpc("create_conversation", conversation_id=name, title=name, status=status)
+
+    def state(client):
+        return client.call("write_state")
+
+    def reopen(node):
+        node.start()
+        node.client.connect()
+        node.client.authenticate()
+
+    def at_b():
+        browser.connect(b.device_id)
+        browser.authenticate()
+        return browser
+
+    def until(node, wanted, timeout=90):
+        return wait_for(f"{node.name} writes {wanted}", lambda: state(node.client)["state"] == wanted or None, timeout=timeout)
+
+    try:
+        relay_port = available_port()
+        relay_url = f"http://127.0.0.1:{relay_port}"
+        a = Node(run, "A", binary, workspace, None, helper, module)
+        b = Node(run, "B", binary, workspace, None, helper, module)
+        nodes += [a, b]
+        for node in nodes:
+            node.configure(codex_socket=str(run / "unavailable.sock"))
+        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+        a.configure_network(relays=[relay_url])
+        a.start()
+        network = a.bootstrap()
+        b.pair(a)
+        b.start()
+        browser = Client(b.url, helper, module, identity_file=a.client.identity_file)
+        browser.network_id = network
+        clients.append(browser)
+        wait_for("the browser is known at B", at_b)
+        write(a.client)
+        wait_for("A and B converge", lambda: converged(nodes, network), timeout=60)
+        shown = wait_for("A's status shows B synced", lambda: (lambda s: s if s["peers"] and s["peers"][0]["synced_ms"] else None)(node_status(a)))
+        require(shown["write_state"] == "writable" and shown["peers"][0]["device_id"] == b.device_id
+                and shown["peers"][0]["reachable"] is True, "status reports writes and the reachable peer")
+        text = subprocess.run([str(binary), "status", "--data-dir", str(a.directory)], capture_output=True, timeout=20).stdout.decode()
+        require("Writes: writable" in text and re.search(r"Peer: .* reachable, synced \d+s ago", text), "plain status names the peer and its last sync")
+        passed("status-shows-writes-and-peer-sync", peers=len(shown["peers"]))
+
+        a.stop()
+        backup = run / "A-backup"
+        shutil.copytree(a.directory, backup)
+        reopen(a)
+        until(a, "writable")
+        write(a.client)
+        write(a.client)
+        ahead = wait_for("B holds A's newer events", lambda: converged(nodes, network), timeout=60)[a.device_id]
+        a.stop()
+        b.stop()
+        shutil.rmtree(a.directory)
+        shutil.copytree(backup, a.directory)
+        reopen(a)
+        before = state(a.client)["state"]
+        require(before in ("aligning", "read_only"), "a restored Node does not start writable")
+        refused = write(a.client, status=400)["error"]
+        require(re.search(r"aligning|read-only", refused), "a restored Node refuses writes before it aligns")
+        b.start()
+        until(a, "writable")
+        require(heads(a, network)[a.device_id] >= ahead, "A took back the events it wrote after the backup")
+        write(a.client)
+        wait_for("A and B converge after the restore", lambda: converged(nodes, network), timeout=60)
+        require(not state(a.client)["conflicts"] and not state(at_b())["conflicts"], "no fork after the restore")
+        passed("restored-backup-refuses-writes-until-aligned", before=before, refused=refused[:120], own_seq_from_peer=ahead)
+
+        b.stop()
+        a.stop()
+        reopen(a)
+        until(a, "read_only")
+        refused = write(a.client, status=400)["error"]
+        require("read-only" in refused, "alone, A refuses writes until the user confirms")
+        alone = node_status(a)
+        require(alone["write_state"] == "read_only" and alone["peers"][0]["reachable"] is False, "status shows read-only and the unreachable peer")
+        require(a.client.call("confirm_writable")["state"] == "writable", "the user's confirmation makes A writable")
+        write(a.client)
+        passed("offline-node-stays-read-only-until-confirmed", refused=refused[:120])
+
+        a.stop()
+        copied = run / "A-copy"
+        shutil.copytree(a.directory, copied)
+        b.start()
+        reopen(a)
+        until(a, "writable")
+        write(a.client)
+        wait_for("B holds A's newest event", lambda: converged(nodes, network), timeout=60)
+        a.stop()
+        b.stop()
+        twin = copy.copy(a)
+        twin.name, twin.directory, twin.process, twin.log = "A-copy", copied, None, None
+        nodes.append(twin)
+        reopen(twin)
+        until(twin, "read_only")
+        twin.client.call("confirm_writable")
+        write(twin.client)
+        b.start()
+        until(twin, "forked")
+        refused = write(twin.client, status=400)["error"]
+        require("forked" in refused, "the copy stops writing")
+        kept = state(twin.client)["conflicts"]
+        require(kept, "the copy lists the events kept aside")
+        require(node_status(twin)["write_state"] == "forked", "status shows the fork")
+        require(b"writes stopped" in (copied / "node.log").read_bytes(), "the copy's log says why it stopped")
+        diagnostics = twin.client.call("diagnostics")
+        require(diagnostics["write_state"] == "forked" and diagnostics["conflicts"] >= 1
+                and diagnostics["logs"].get("node.log"), "the diagnostics export carries the fork and the log tail")
+        private_json(run / "diagnostics.json", diagnostics)
+        twin.stop()
+        reopen(a)
+        until(a, "writable")
+        write(a.client)
+        write(at_b())
+        passed("copied-data-directory-forks-and-only-the-copy-stops", conflicts=len(kept), refused=refused[:120])
+
+        secrets = [node.access["capability"] for node in (a, b)] + [a.backup_password]
+        logs = [path for path in run.rglob("*.log*") if path.is_file()]
+        require(all(path.stat().st_mode & 0o077 == 0 for path in logs if path.name.startswith("node.log")), "node.log is private")
+        require(all(b"write state changed" in (node.directory / "node.log").read_bytes() for node in (a, b)),
+                "a foreground Node writes info lines to node.log")
+        exported = json.dumps(diagnostics)
+        leaked = [str(path) for path in logs if any(secret.encode() in path.read_bytes() for secret in secrets)
+                  or b"vibeface1" in path.read_bytes()]
+        require(not leaked, f"no capability, passphrase or invite in logs: {leaked}")
+        require(not any(secret in exported for secret in secrets) and "vibeface1" not in exported,
+                "the diagnostics export holds no capability, passphrase or invite")
+        epoch = json.loads((a.directory / "data-epoch.json").read_text())["data_epoch"]
+        require(epoch == 7, "data epoch 7")
+        passed("logs-and-diagnostics-hold-no-secrets", logs=len(logs), data_epoch=epoch)
+        report["status"] = "passed"
+    except BaseException as error:
+        report["status"] = "failed"
+        report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        for client in reversed(clients):
+            client.close()
+        for node in reversed(nodes):
+            node.client.close()
+            node.stop()
+        private_json(run / "report.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+
+
 def upgrade_status(node, path, origin):
     """The status of a WebSocket upgrade to `path` sent as a page on `origin` would send it."""
     connection = http.client.HTTPConnection("127.0.0.1", node.port, timeout=5)
@@ -2727,9 +2907,12 @@ if __name__ == "__main__":
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
         modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards to a member Node through its relay")
+        modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         arguments = parser.parse_args()
         try:
-            if arguments.public_entry:
+            if arguments.phase5:
+                phase5_acceptance(arguments)
+            elif arguments.public_entry:
                 public_entry_acceptance(arguments)
             elif arguments.phase4:
                 phase4_acceptance(arguments)
