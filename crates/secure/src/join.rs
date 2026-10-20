@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn attestation_payload_binds_network_and_conversation() {
         let network = Identity::generate().unwrap().device_id();
-        let body = r#"{"type":"autonomy_set","version":1,"mode":"off"}"#;
+        let body = r#"{"type":"example","version":1,"mode":"off"}"#;
         let a = attestation_payload(&network, "c1", body).unwrap();
         assert_ne!(a, attestation_payload(&network, "c2", body).unwrap());
         assert_eq!(
@@ -288,7 +288,7 @@ mod tests {
             attestation_payload(
                 &network,
                 "c1",
-                r#"{"mode":"off","type":"autonomy_set","version":1}"#
+                r#"{"mode":"off","type":"example","version":1}"#
             )
             .unwrap()
         );

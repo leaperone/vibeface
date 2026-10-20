@@ -13,7 +13,6 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
 pub struct ManagerAccess {
     pub attempt_id: String,
     pub trigger: String,
-    pub read_only: bool,
 }
 
 pub(super) struct ActiveManager {
@@ -31,7 +30,6 @@ impl Runtime {
         mut access: Access,
         attempt_id: &str,
         trigger: &str,
-        read_only: bool,
     ) -> Result<watch::Receiver<bool>> {
         let mut controls = self.manager_controls.lock().await;
         if let Some(active) = controls.get(attempt_id) {
@@ -48,14 +46,10 @@ impl Runtime {
             .scheduler_job(&access.network_id, scope, trigger)?
             .context("manager job missing")?;
         let attempt = job.state.attempt().context("manager attempt missing")?;
-        ensure!(
-            attempt.id == attempt_id && attempt.read_only == read_only,
-            "manager attempt mismatch"
-        );
+        ensure!(attempt.id == attempt_id, "manager attempt mismatch");
         access.manager = Some(ManagerAccess {
             attempt_id: attempt_id.into(),
             trigger: trigger.into(),
-            read_only,
         });
         let (cancel, receiver) = watch::channel(false);
         let active = Arc::new(ActiveManager {
@@ -116,7 +110,6 @@ impl Runtime {
     pub(super) async fn manager_tool_lease(
         &self,
         access: &Access,
-        write: bool,
     ) -> Result<Option<OwnedRwLockReadGuard<()>>> {
         let Some(manager) = &access.manager else {
             return Ok(None);
@@ -138,18 +131,13 @@ impl Runtime {
                 && active.access.conversation_id == access.conversation_id,
             "management invocation scope mismatch"
         );
-        ensure!(
-            !write || !manager.read_only,
-            "this management invocation is read-only"
-        );
-        Self::check_manager_permission(&*self.store.lock().await, access, write)?;
+        Self::check_manager_permission(&*self.store.lock().await, access)?;
         Ok(Some(guard))
     }
 
     pub(super) fn check_manager_permission(
         store: &crate::store::Store,
         access: &Access,
-        write: bool,
     ) -> Result<()> {
         let Some(manager) = &access.manager else {
             return Ok(());
@@ -164,7 +152,6 @@ impl Runtime {
                 scope,
                 &manager.trigger,
                 &manager.attempt_id,
-                write
             )?,
             "management invocation permission is no longer valid"
         );

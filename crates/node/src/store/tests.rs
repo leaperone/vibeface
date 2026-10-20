@@ -371,19 +371,11 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
             attestation: None,
         })
     };
-    let autonomy = |mode| EventBody::AutonomySet {
-        mode,
-        version: 3,
-        attestation: None,
-    };
-    let outcome = |store: &Store| -> Result<(Option<String>, AutonomyMode)> {
-        Ok((
-            store
-                .conversation(&net.network, "c")?
-                .context("conversation")?
-                .owner,
-            store.autonomy(&net.network, "c")?.mode,
-        ))
+    let outcome = |store: &Store| -> Result<Option<String>> {
+        Ok(store
+            .conversation(&net.network, "c")?
+            .context("conversation")?
+            .owner)
     };
     let mut at = 10;
     let mut write =
@@ -395,21 +387,11 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
                 .hash)
         };
     let mut originals = vec![];
-    for body in [
-        owner(&net.a)?,
-        owner(&net.b)?,
-        autonomy(AutonomyMode::Off),
-        autonomy(AutonomyMode::Continue),
-    ] {
+    for body in [owner(&net.a)?, owner(&net.b)?] {
         originals.push(write(&mut store, &net.a, body)?);
     }
     let settled = outcome(&store)?;
-    assert_eq!(
-        settled.1,
-        AutonomyMode::Off,
-        "the stricter mode wins a same-version conflict"
-    );
-    let losing_owner = if settled.0 == Some(net.a.device_id()?) {
+    let losing_owner = if settled == Some(net.a.device_id()?) {
         &net.b
     } else {
         &net.a
@@ -420,7 +402,6 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
     for _ in 0..64 {
         let retry = write(&mut store, &net.b, owner(losing_owner)?)?;
         undercut |= retry < winning_owner;
-        write(&mut store, &net.b, autonomy(AutonomyMode::Continue))?;
         assert_eq!(
             outcome(&store)?,
             settled,
@@ -974,4 +955,13 @@ fn append_100k_stays_flat() -> Result<()> {
     std::fs::remove_dir_all(&dir)?;
     assert!(last < first * 3, "append cost grew: {first:?} -> {last:?}");
     Ok(())
+}
+
+#[test]
+fn autonomy_is_not_an_event() {
+    let body = serde_json::json!({"type":"autonomy_set","mode":"off","version":1});
+    assert!(
+        serde_json::from_value::<EventBody>(body).is_err(),
+        "the coordination Agent always runs with full permission; there is no autonomy setting"
+    );
 }

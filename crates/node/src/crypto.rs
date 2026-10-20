@@ -112,7 +112,6 @@ impl LocalIdentity {
             | EventBody::BotCreated { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
-            | EventBody::AutonomySet { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. }
             | EventBody::AttentionResolved { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
@@ -275,7 +274,6 @@ fn validate_attestation(event: &Event) -> Result<()> {
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
-        | EventBody::AutonomySet { .. }
         | EventBody::NotificationAcked { .. }
         | EventBody::AttentionResolved { .. } => UserSignature::Required,
         EventBody::WorkFinished {
@@ -442,9 +440,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 "triage cards live in the attention scope"
             );
             id(alert_id)?;
-        }
-        EventBody::AutonomySet { version, .. } => {
-            ensure!(*version > 0, "autonomy version starts at 1")
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {

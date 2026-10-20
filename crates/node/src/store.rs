@@ -492,49 +492,6 @@ impl Store {
     pub fn works(&self, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
         reduce::works_from(&self.connection, network, scope)
     }
-    pub fn autonomy(&self, network: &str, scope: &str) -> Result<Autonomy> {
-        autonomy_from(&self.connection, network, scope)
-    }
-    /// Optimistic: a stale `expected_version` is refused, so two clients never silently override.
-    #[expect(clippy::too_many_arguments, reason = "the decision and its signature")]
-    pub fn set_autonomy(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        scope: &str,
-        mode: AutonomyMode,
-        expected_version: u64,
-        attestation: Attestation,
-        at: i64,
-    ) -> Result<SignedEvent> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(
-            conversation_from(&tx, network, scope)?.is_some(),
-            "conversation not found"
-        );
-        ensure!(
-            autonomy_from(&tx, network, scope)?.version == expected_version,
-            "autonomy changed; refresh before changing it"
-        );
-        let envelope = log::append_from(
-            &tx,
-            &self.blob_dir,
-            identity,
-            network,
-            scope,
-            EventBody::AutonomySet {
-                mode,
-                version: expected_version + 1,
-                attestation: Some(attestation),
-            },
-            vec![],
-            at,
-        )?;
-        tx.commit()?;
-        Ok(envelope)
-    }
     /// Every local append checks this gate; it lives only as long as this connection.
     pub fn set_write_state(&mut self, state: WriteState) -> Result<()> {
         self.connection
@@ -811,30 +768,6 @@ pub(crate) fn message_from(
         )
         .optional()?
         .transpose()
-}
-
-pub(crate) fn autonomy_from(
-    connection: &Connection,
-    network: &str,
-    scope: &str,
-) -> Result<Autonomy> {
-    let row: Option<(String, u64)> = connection
-        .query_row(
-            "SELECT mode,version FROM autonomy WHERE network_id=? AND conversation_id=?",
-            params![network, scope],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(match row {
-        Some((mode, version)) => Autonomy {
-            mode: serde_json::from_value(Value::String(mode))?,
-            version,
-        },
-        None => Autonomy {
-            mode: AutonomyMode::Report,
-            version: 0,
-        },
-    })
 }
 
 pub(crate) fn local_load<T: DeserializeOwned>(

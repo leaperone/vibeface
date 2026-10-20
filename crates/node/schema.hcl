@@ -383,36 +383,6 @@ table "works" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "autonomy" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "conversation_id" {
-    null = false
-    type = text
-  }
-  column "mode" {
-    null = false
-    type = text
-  }
-  column "strictness" {
-    null = false
-    type = integer
-  }
-  column "version" {
-    null = false
-    type = integer
-  }
-  column "request_key" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.conversation_id]
-  }
-}
 table "notifications" {
   schema = schema.main
   column "network_id" {
@@ -459,6 +429,62 @@ table "notification_acks" {
   }
   primary_key {
     columns = [column.network_id, column.notification_id, column.client_id]
+  }
+}
+table "alerts" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "matter" {
+    null = false
+    type = text
+  }
+  column "alert_id" {
+    null = false
+    type = text
+  }
+  column "raise" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "node" {
+    null = false
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.matter]
+  }
+}
+table "alert_resolutions" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "alert_id" {
+    null = false
+    type = text
+  }
+  column "resolution" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.alert_id]
   }
 }
 table "budget_days" {

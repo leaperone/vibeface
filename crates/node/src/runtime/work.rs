@@ -130,10 +130,6 @@ impl Runtime {
                     "only the conversation's scheduling device dispatches its work"
                 );
                 ensure!(
-                    store.autonomy(network, &spec.conversation)?.mode == AutonomyMode::Continue,
-                    "continuing after a result needs the user's permission in this conversation"
-                );
-                ensure!(
                     store
                         .works(network, &spec.conversation)?
                         .iter()

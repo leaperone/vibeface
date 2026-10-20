@@ -37,12 +37,10 @@ impl Runtime {
             !write || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
-        let _lease = tokio::time::timeout(
-            Duration::from_secs(20),
-            self.manager_tool_lease(&access, write),
-        )
-        .await
-        .context("agent tool admission timed out")??;
+        let _lease =
+            tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(&access))
+                .await
+                .context("agent tool admission timed out")??;
         let network = access.network_id.as_str();
         match name {
             "nodes" => {

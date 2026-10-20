@@ -36,14 +36,6 @@ pub enum ReplyStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum AutonomyMode {
-    Continue,
-    Report,
-    Off,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 /// `codex`: a Codex turn this device's coordination Agent sent and the Node watches.
@@ -186,12 +178,6 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    AutonomySet {
-        mode: AutonomyMode,
-        version: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
-    },
     NotificationAcked {
         notification_id: String,
         client_id: String,
@@ -236,7 +222,6 @@ impl EventBody {
             | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
-            | Self::AutonomySet { attestation, .. }
             | Self::NotificationAcked { attestation, .. }
             | Self::AttentionResolved { attestation, .. } => attestation.as_ref(),
             _ => None,
@@ -398,11 +383,6 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Autonomy {
-    pub mode: AutonomyMode,
-    pub version: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetUsage {

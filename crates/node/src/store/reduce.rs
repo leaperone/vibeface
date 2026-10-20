@@ -45,14 +45,6 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
     Ok(crate::crypto::digest(&signed))
 }
 
-pub(crate) fn strictness(mode: AutonomyMode) -> u8 {
-    match mode {
-        AutonomyMode::Continue => 0,
-        AutonomyMode::Report => 1,
-        AutonomyMode::Off => 2,
-    }
-}
-
 pub(crate) fn apply(
     connection: &Connection,
     network: &str,
@@ -184,12 +176,6 @@ pub(crate) fn apply(
                 "work_finished",
                 result_text,
                 rank,
-            )?;
-        }
-        EventBody::AutonomySet { mode, version, .. } => {
-            connection.execute(
-                "INSERT INTO autonomy(network_id,conversation_id,mode,strictness,version,request_key) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET mode=excluded.mode,strictness=excluded.strictness,version=excluded.version,request_key=excluded.request_key WHERE excluded.version>version OR (excluded.version=version AND (excluded.strictness>strictness OR (excluded.strictness=strictness AND excluded.request_key<request_key)))",
-                params![network, scope, text(mode)?, strictness(*mode), version, request_key(network, event)?],
             )?;
         }
         EventBody::NotificationAcked {

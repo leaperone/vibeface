@@ -45,7 +45,6 @@ pub(crate) fn maintenance_idle(store: &Store, network: &str) -> Result<()> {
 fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
     let mut value = serde_json::to_value(job).expect("scheduler job serializes");
     value["network_id"] = json!(network);
-    value["read_only"] = json!(job.state.attempt().is_some_and(|attempt| attempt.read_only));
     value["error"] = match &job.state {
         JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => json!(detail),
         _ => Value::Null,
@@ -170,36 +169,27 @@ pub async fn run(
     let mut registered = false;
     let mut sdk_live = false;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
-        let mut prompt = {
+        let prompt = {
             let store = node.store.lock().await;
             let context = store.context(&network, &conversation, Some(&job.basis))?;
             let works = store.works(&network, &conversation)?;
             let bot = store.bot_for_conversation(&network, &conversation)?.map(|bot| {
                 json!({"name":bot.name,"instructions":bot.instructions,"project":bot.project})
             });
-            let assistant = json!({"configured_bot":bot,"autonomy":store.autonomy(&network, &conversation)?});
+            let assistant = json!({"configured_bot":bot});
             materialize(&context, &job, &works, assistant, &local_settings.roots, claimed.covers.as_ref())?
         };
-        if attempt.read_only {
-            prompt.push_str("\nThis turn is read-only: report the finished work to the user; no write tool is authorized.\n");
-        }
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        let custom_tools = if attempt.read_only {
-            tools().into_iter().filter(|(name, _)| matches!(name.as_str(), "context" | "nodes" | "work_status" | "call_lookup")).collect()
-        } else {
-            tools()
-        };
         let config = ManagerConfig {
             kind,
             workspace: settings.workspace,
             model: settings.model,
-            read_only: attempt.read_only,
             timeout_secs: node.config.timeout_secs,
             cursor_sdk_bin: settings.cursor_sdk_bin,
             node_bin: settings.node_bin,
             codex_bin: node.config.codex_bin.clone(),
             codex_sdk_script: settings.codex_sdk_script,
-            custom_tools,
+            custom_tools: tools(),
             tool_callback_url: Some(local_url.clone()),
             tool_callback_token: Some(token.clone()),
             tool_cli: Some(std::env::current_exe()?),
@@ -226,7 +216,7 @@ pub async fn run(
             )?;
         }
         let cancel = node
-            .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, attempt.read_only)
+            .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger)
             .await?;
         registered = true;
         let (persist_node, persist_network, persist_conversation, persist_trigger, persist_attempt) =

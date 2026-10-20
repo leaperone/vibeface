@@ -238,7 +238,6 @@ impl Runtime {
             }
             messages.push(value);
         }
-        let autonomy = store.autonomy(network, scope)?;
         drop(store);
         let settings = self.settings_snapshot();
         let manager = settings.manager.as_ref();
@@ -247,7 +246,6 @@ impl Runtime {
             "bot":bot,
             "messages":messages,
             "works":works,
-            "autonomy":autonomy,
             "pending_checks":pending_checks,
             "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),

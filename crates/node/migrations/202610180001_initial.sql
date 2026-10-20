@@ -34,8 +34,6 @@ CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL
 CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NULL, `dispatch` text NULL, `dispatch_rank` text NULL, `progress` text NULL, `progress_rank` text NULL, `thread_id` text NULL, `turn_id` text NULL, `finish` text NULL, `finish_rank` text NULL, PRIMARY KEY (`network_id`, `work_id`));
 -- Create index "works_conversation" to table: "works"
 CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
--- Create "autonomy" table
-CREATE TABLE `autonomy` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `mode` text NOT NULL, `strictness` integer NOT NULL, `version` integer NOT NULL, `request_key` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "notifications" table
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table

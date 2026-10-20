@@ -13,7 +13,7 @@ the Codex CLI, and npm dependencies are not included in the archive.
 
 The first frame must be an `init` object. It contains `prompt`, `session_id`,
 `cwd`, optional `model`, and `codex_path`, plus optional `tool_cli` and
-`tool_env`, and `read_only`, which defaults to `false`. Paths are absolute.
+`tool_env`. Paths are absolute.
 All fields have byte and count limits. An omitted or empty model uses the
 account's configured default.
 The sidecar emits one `ready` frame containing the requested `session_id` and
@@ -67,36 +67,29 @@ well as snapshots. Its cancellation also needs matching terminal or managed
 process evidence.
 
 The sidecar uses the official TypeScript SDK, which wraps `codex exec
---experimental-json`. The SDK has no native custom-tool callback. `tool_cli` is
-therefore available through the Codex shell tool with the `vibeface_manager`
-permissions profile. Code mode, its host, and unified exec are enabled so the
-model can call that CLI. Every invocation has a read-only host filesystem and a
-network profile limited to `127.0.0.1` and `localhost`, with no Unix socket
-grants. The manager changes code on this host only through native Codex work
-started with the Node `codex` tool. `read_only=true` additionally exposes only
-the scoped read tools supplied by the Node. There is no shell command
-allow-list. Prompt instructions and scoped CLI credentials do not isolate an
-untrusted model or plugin.
+--experimental-json`. The SDK has no native custom-tool callback, so
+`tool_cli` is reached through the Codex shell tool. Every invocation runs with
+`sandboxMode=danger-full-access` and `approvalPolicy=never`: the coordination
+Agent has a full shell on this host, edits files, runs git and gh, and calls the
+App Server with `vibeface codex`. Prompt instructions and scoped CLI credentials
+do not isolate an untrusted model or plugin.
 
 The Codex child process and its shell use explicit environment-variable lists.
 Calls pass every supplied `tool_env` entry to the child and shell, including
-`VIBEFACE_NODE_TRIGGER` and `VIBEFACE_MANAGER_ATTEMPT`. The Node never supplies
-the native Codex socket. Provider credential variables stay outside the shell
-list. Cursor SDK receives the same tool environment in its actual bridge
-process. Normal Cursor calls use its default host toolset. Read-only Cursor
-calls keep the MCP-only tool selection.
-The Codex profile enforces filesystem restrictions, but on macOS it does not
-block a same-user process from connecting to a Unix socket whose path it finds.
+`VIBEFACE_NODE_TRIGGER`, `VIBEFACE_MANAGER_ATTEMPT` and `VIBEFACE_CODEX_SOCKET`.
+Provider credential variables stay outside the shell list. Cursor SDK receives
+the same tool environment in its actual bridge process and its default host
+toolset.
 The sidecar disables child-agent features, web search, apps, plugins, apply
 patch, and host skill discovery.
 
 `vibeface tool dispatch_work --json '{"prompt":"...","cwd":"..."}' --call-ref REF`
-asks the Node to start one native Codex turn in `cwd`, which must be inside an
-authorized root. The Node sets `approvalPolicy=on-request`,
-`approvalsReviewer=user`, and a workspace-write sandbox in that `cwd` without
-network. The same `call_ref` in the same turn names the same work, so a retry
-never starts a second turn. Only the user answers approvals, through
-`answer_approval`; `interrupt_work` stops a work and the works it delegated.
+registers the work with the Node, then the CLI itself starts one Codex turn in
+`cwd` with `approvalPolicy=never` and full access. The same `call_ref` in the
+same turn names the same work, so a retry never starts a second turn.
+Requests the App Server sends while a turn runs go to the coordination Agent
+(`vibeface codex requests` and `vibeface codex respond`); `interrupt_work` stops
+a work and the works it delegated.
 
 The coordinating turn ends after dispatch. When the work finishes, the Node
 admits its result as a new trigger, so the agent reports it in a later turn.

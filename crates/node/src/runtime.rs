@@ -424,19 +424,7 @@ impl Runtime {
     }
 
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
-        let write = !matches!(
-            input["method"].as_str(),
-            Some(
-                "nodes"
-                    | "conversation"
-                    | "conversations"
-                    | "bots"
-                    | "notifications"
-                    | "codex_state"
-                    | "alerts"
-            )
-        );
-        let _lease = self.manager_tool_lease(&access, write).await?;
+        let _lease = self.manager_tool_lease(&access).await?;
         self.rpc_inner(access, input).await
     }
     async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
@@ -539,12 +527,6 @@ impl Runtime {
             "set_owner" => {
                 let scope = scope.context("conversation_id is required")?;
                 self.set_owner(&access, &scope, &input).await
-            }
-            "set_autonomy" => {
-                let scope = scope.context("conversation_id is required")?;
-                let result = self.set_autonomy(&access, &scope, &input).await?;
-                self.schedule_wakeup.notify_one();
-                Ok(result)
             }
             "read_artifact" => self.read_artifact(&access, &input).await,
             "upload_attachment" => self.upload_attachment(&access, &input).await,

@@ -31,7 +31,6 @@ pub fn task_trigger(work_id: &str) -> String {
 pub struct ManagerAttempt {
     pub id: String,
     pub boot: String,
-    pub read_only: bool,
     pub permission_version: u64,
 }
 
