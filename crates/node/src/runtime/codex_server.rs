@@ -31,16 +31,16 @@ impl CodexServer {
     pub(crate) fn client(&self) -> &CodexClient {
         &self.client
     }
-    /// Threads the client re-subscribes after every reconnect; requests on them are answered
-    /// by the method table.
+    /// Threads the client re-subscribes after every reconnect; requests on them come to the
+    /// Node, which hands them to the coordination Agent.
     pub(crate) fn observe(&self, threads: Vec<String>) -> Result<(), CodexError> {
         self.client.set_observed_threads(threads)
     }
-    pub(crate) async fn snapshot(&self) -> Value {
-        self.client.snapshot().await
+    pub(crate) async fn status(&self) -> Value {
+        self.client.status().await
     }
     pub(crate) async fn capability(&self) -> Value {
-        json!({"connected":self.client.snapshot().await["connection"]["state"] == "connected"})
+        json!({"connected":self.client.status().await["connection"]["state"] == "connected"})
     }
     pub(crate) async fn interrupt(&self, thread: &str, turn: &str) -> Result<(), CodexError> {
         self.client

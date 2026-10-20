@@ -1,5 +1,6 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
-//! scans, rule verdicts, outlet choice, webhook signing and delivery, and hook installation.
+//! scans, matter dedupe, outlet choice, webhook signing and delivery, and hook installation. The
+//! coordination Agent judges; nothing here decides what matters.
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,6 +66,45 @@ pub struct AgentEvent {
     pub detail: String,
     pub ts_ms: i64,
     pub test: bool,
+    /// An App Server request waiting for an answer; set by the Node, never by a hook.
+    pub request_id: Option<String>,
+}
+
+/// One answer a decision card offers: the label the user sees, and the JSON result sent to the
+/// App Server request the card holds (or the label as a message when it holds none).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Choice {
+    pub label: String,
+    #[serde(default)]
+    pub reply: Value,
+}
+
+/// What a raised card needs locally to take a decision: kept on the device that raised it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Card {
+    pub thread_id: Option<String>,
+    pub request_id: Option<String>,
+    pub choices: Vec<Choice>,
+}
+
+/// `label=<json>`, as `vibeface triage raise --choice` takes it; a non-JSON value is a string.
+pub fn parse_choice(text: &str) -> Result<Choice> {
+    let (label, reply) = text
+        .split_once('=')
+        .map_or((text, ""), |(label, reply)| (label, reply));
+    ensure!(
+        !label.trim().is_empty() && label.len() <= 120,
+        "a choice needs a label of at most 120 bytes"
+    );
+    let reply = match reply {
+        "" => Value::Null,
+        reply => serde_json::from_str(reply).unwrap_or_else(|_| Value::String(reply.into())),
+    };
+    Ok(Choice {
+        label: label.trim().into(),
+        reply,
+    })
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -241,23 +281,30 @@ pub use crate::model::Severity;
 
 /// The coordination Agent's turn when new events wait: it decides, then answers through
 /// `vibeface triage raise|dismiss`. Events it leaves alone stay pending.
-pub fn wake_prompt(events: &[AgentEvent], cli: &str) -> Result<String> {
+pub fn wake_prompt(events: &[AgentEvent], cli: &str, answer_within_secs: u64) -> Result<String> {
     let items: Vec<Value> = events
         .iter()
         .map(|e| {
             json!({"event_id":e.event_id,"agent":e.agent,"event":e.event,"status":e.status,
             "session_id":e.session_id,"turn_id":e.turn_id,"cwd":e.cwd,"repo":e.repo,
             "git_branch":e.git_branch,"last_message":clip(&e.last_message, 1500),
-            "detail":clip(&e.detail, 500)})
+            "detail":clip(&e.detail, 500),"request_id":e.request_id})
         })
         .collect();
     Ok(format!(
         "New events from the user's local coding agent sessions are waiting. Decide for each \
-whether the user must look at it now. Stay silent unless it matters.\n\
+whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
+dropped after this turn.\n\
 - Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --summary \"one line in the user's language\" --matter KEY`. \
 Use the same short KEY for events about the same matter (for example `codex:<session_id>`); \
 a repeat only updates the card and is re-sent when the severity rises.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
+- An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \
+shows its full params. Answer it yourself with `{cli} codex respond REQUEST_ID 'RESULT_JSON'` \
+(the thread already runs with full access). Only when the user must decide, raise a decision card: \
+add `--request-id REQUEST_ID --thread THREAD_ID --choice 'LABEL=RESULT_JSON'` (repeat --choice) \
+to the raise; the request then waits for the user's choice. A request neither answered nor \
+carded is declined after {answer_within_secs} seconds or when this turn ends.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
         serde_json::to_string_pretty(&items)?
     ))

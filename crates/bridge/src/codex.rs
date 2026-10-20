@@ -42,7 +42,7 @@ fn rejected(message: impl Into<String>) -> CodexError {
 
 #[derive(Clone)]
 pub struct CodexClient {
-    commands: mpsc::UnboundedSender<Execute>,
+    commands: mpsc::UnboundedSender<Command>,
     cache: Arc<RwLock<Cache>>,
     observed_threads: watch::Sender<BTreeSet<String>>,
 }
@@ -79,7 +79,7 @@ impl CodexClient {
         let uncertain = call.uncertain();
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Execute { call, reply })
+            .send(Command::Call(Execute { call, reply }))
             .map_err(|_| rejected("Codex adapter is stopped"))?;
         response.await.unwrap_or_else(|_| {
             Err(CodexError {
@@ -100,6 +100,45 @@ impl CodexClient {
 
     pub async fn snapshot(&self) -> Value {
         self.cache.read().await.snapshot()
+    }
+
+    /// What the web shows: connection, each thread's status, plan, reasoning summary and token
+    /// usage, and rate limits. Commands, output, diffs and changed files stay out.
+    pub async fn status(&self) -> Value {
+        let cache = self.cache.read().await;
+        let threads: Vec<Value> = cache
+            .threads
+            .iter()
+            .map(|(id, thread)| {
+                json!({"thread_id":id,"name":thread.name,"status":thread.status,"cwd":thread.cwd,
+                    "plan":thread.plan,"reasoning":thread.reasoning,"token_usage":thread.token_usage})
+            })
+            .collect();
+        json!({"connection":cache.connection,"threads":threads,"rate_limits":cache.rate_limits})
+    }
+
+    /// Answers a server request this connection received and still holds. Fails when it was
+    /// answered already or the connection that carried it is gone.
+    pub async fn respond(
+        &self,
+        id: &Value,
+        result: Result<Value, Value>,
+        decision: &str,
+    ) -> Result<(), CodexError> {
+        let id: RpcId = serde_json::from_value(id.clone())
+            .map_err(|_| rejected("invalid server request ID"))?;
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Respond(Respond {
+                id,
+                result,
+                decision: decision.into(),
+                reply,
+            }))
+            .map_err(|_| rejected("Codex adapter is stopped"))?;
+        response
+            .await
+            .unwrap_or_else(|_| Err(rejected("Codex adapter stopped before answering")))
     }
 }
 
@@ -131,6 +170,31 @@ fn validate_request(method: &str, params: &Value) -> Result<(), CodexError> {
 struct Execute {
     call: NativeCall,
     reply: oneshot::Sender<Result<Value, CodexError>>,
+}
+
+struct Respond {
+    id: RpcId,
+    result: Result<Value, Value>,
+    decision: String,
+    reply: oneshot::Sender<Result<(), CodexError>>,
+}
+
+enum Command {
+    Call(Execute),
+    Respond(Respond),
+}
+
+impl Command {
+    fn reject(self, message: &str) {
+        match self {
+            Self::Call(execute) => {
+                let _ = execute.reply.send(Err(rejected(message)));
+            }
+            Self::Respond(respond) => {
+                let _ = respond.reply.send(Err(rejected(message)));
+            }
+        }
+    }
 }
 
 enum Write {
@@ -171,6 +235,7 @@ fn push_ring(ring: &mut VecDeque<Value>, value: Value) {
 struct ThreadState {
     status: Value,
     name: Option<String>,
+    cwd: Option<String>,
     archived: bool,
     settings: Value,
     goal: Value,
@@ -192,6 +257,7 @@ impl Default for ThreadState {
         Self {
             status: json!({"type":"unknown"}),
             name: None,
+            cwd: None,
             archived: false,
             settings: Value::Null,
             goal: Value::Null,
@@ -298,6 +364,9 @@ impl Cache {
             .unwrap_or(json!({"type":"unknown"}));
         if let Some(name) = thread["name"].as_str() {
             state.name = Some(name.into());
+        }
+        if let Some(cwd) = thread["cwd"].as_str() {
+            state.cwd = Some(cwd.into());
         }
         state.updated_at_ms = now_ms();
         if let Some(turns) = thread["turns"].as_array() {
@@ -498,14 +567,11 @@ fn observe_assistant(state: &mut ThreadState, item: &Value) {
     }
 }
 
-/// The JSON-RPC answer to a server request, per the method table.
-fn answer(id: &RpcId, method: &str, params: &Value) -> (Value, &'static str) {
-    let (result, decision) = methods::reply(method, params);
-    let message = match result {
+fn response(id: &RpcId, result: &Result<Value, Value>) -> Value {
+    match result {
         Ok(result) => json!({"id":id,"result":result}),
         Err(error) => json!({"id":id,"error":error}),
-    };
-    (message, decision)
+    }
 }
 
 fn request_id(message: &Value) -> Option<RpcId> {
@@ -640,7 +706,7 @@ impl Session {
 
 async fn connection_loop(
     socket: PathBuf,
-    mut commands: mpsc::UnboundedReceiver<Execute>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
     observed: watch::Receiver<BTreeSet<String>>,
     cache: Arc<RwLock<Cache>>,
     events: mpsc::UnboundedSender<Value>,
@@ -652,8 +718,8 @@ async fn connection_loop(
         let result = loop {
             tokio::select! {
                 result = &mut connect => break result,
-                execute = commands.recv() => match execute {
-                    Some(execute) => { let _ = execute.reply.send(Err(rejected("Codex is disconnected"))); }
+                command = commands.recv() => match command {
+                    Some(command) => command.reject("Codex is disconnected"),
                     None => return,
                 }
             }
@@ -675,8 +741,8 @@ async fn connection_loop(
         loop {
             tokio::select! {
                 _ = &mut delay => break,
-                execute = commands.recv() => match execute {
-                    Some(execute) => { let _ = execute.reply.send(Err(rejected("Codex is disconnected"))); }
+                command = commands.recv() => match command {
+                    Some(command) => command.reject("Codex is disconnected"),
                     None => return,
                 }
             }
@@ -687,7 +753,7 @@ async fn connection_loop(
 
 async fn run_session(
     stream: WebSocketStream<UnixStream>,
-    commands: &mut mpsc::UnboundedReceiver<Execute>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
     observed: &watch::Receiver<BTreeSet<String>>,
     cache: &Arc<RwLock<Cache>>,
     events: &mpsc::UnboundedSender<Value>,
@@ -723,13 +789,29 @@ async fn run_session(
                     Err(error) => error.to_string(),
                 };
             }
-            execute = commands.recv() => {
-                let Some(execute) = execute else { break "Codex adapter stopped".into() };
+            command = commands.recv() => {
+                let Some(command) = command else { break "Codex adapter stopped".into() };
                 if !state.ready {
-                    let _ = execute.reply.send(Err(rejected("Codex is initializing")));
+                    command.reject("Codex is initializing");
                     continue;
                 }
-                if let Err(reason) = state.command(&writer, execute) { break reason; }
+                match command {
+                    Command::Call(execute) => if let Err(reason) = state.command(&writer, execute) { break reason; },
+                    Command::Respond(respond) => {
+                        let mut observed_cache = cache.write().await;
+                        let Some(request) = observed_cache.requests.remove(&respond.id) else {
+                            let _ = respond.reply.send(Err(rejected("the request is no longer waiting for an answer")));
+                            continue;
+                        };
+                        let message = response(&respond.id, &respond.result);
+                        if writer.send(Write::Message(Message::Text(message.to_string().into()))).is_err() {
+                            let _ = respond.reply.send(Err(CodexError { uncertain: true, message: "Codex writer stopped".into() }));
+                            break "Codex writer stopped".into();
+                        }
+                        observed_cache.replied(request["method"].as_str().unwrap_or_default(), request["params"]["threadId"].as_str(), &respond.decision);
+                        let _ = respond.reply.send(Ok(()));
+                    }
+                }
             }
             message = reader.next() => {
                 let text = match message {
@@ -750,15 +832,12 @@ async fn run_session(
                     let mut observed_cache = cache.write().await;
                     observed_cache.observe_event(&message);
                     let thread = message["params"]["threadId"].as_str();
-                    // Only requests on this Node's own threads, or with no thread at all, are answered here.
+                    // Requests on this Node's own threads, or with no thread at all, go to the Node
+                    // to answer; the rest stay with the client that opened the thread.
                     if let Some(id) = request_id(&message)
                         && thread.is_none_or(|thread| observed.borrow().contains(thread))
                     {
-                        let (reply, decision) = answer(&id, method, &message["params"]);
-                        if writer.send(Write::Message(Message::Text(reply.to_string().into()))).is_err() { break "Codex writer stopped".into(); }
-                        observed_cache.requests.remove(&id);
-                        observed_cache.replied(method, thread, decision);
-                        let _ = events.send(json!({"method":"bridge.codex_replied","params":{"method":method,"threadId":thread,"decision":decision}}));
+                        let _ = events.send(json!({"method":"bridge.codex_request","params":{"id":id,"method":method,"threadId":thread,"params":message["params"]}}));
                     }
                     drop(observed_cache);
                     if (message["method"] == "thread/closed" || message["method"] == "thread/unsubscribed")
@@ -855,8 +934,8 @@ fn initialize_params(title: &str) -> Value {
     json!({"clientInfo":{"name":"vibeface","title":title,"version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})
 }
 
-/// A short-lived connection for one caller, such as the Agent's CLI. Server requests that reach
-/// it are answered by the method table, so a turn it started never waits on it.
+/// A short-lived connection for one caller, such as the Agent's CLI. It leaves server requests to
+/// the Node, which holds a lasting connection to every thread it watches.
 pub struct DirectSession {
     stream: WebSocketStream<UnixStream>,
     next_id: u64,
@@ -919,13 +998,7 @@ impl DirectSession {
             };
             let message: Value =
                 serde_json::from_str(&text).map_err(|error| lost(error.to_string()))?;
-            if let Some(request) = request_id(&message) {
-                let method = message["method"].as_str().unwrap_or_default();
-                let (reply, _) = answer(&request, method, &message["params"]);
-                let _ = self
-                    .stream
-                    .send(Message::Text(reply.to_string().into()))
-                    .await;
+            if request_id(&message).is_some() {
                 continue;
             }
             if message
@@ -945,7 +1018,7 @@ impl DirectSession {
         }
     }
 
-    /// The next notification on this connection, answering server requests on the way.
+    /// The next notification or server request on this connection.
     pub async fn notification(&mut self) -> Result<Value, CodexError> {
         loop {
             let text = match self.stream.next().await {
@@ -962,14 +1035,6 @@ impl DirectSession {
             };
             let message: Value =
                 serde_json::from_str(&text).map_err(|error| rejected(error.to_string()))?;
-            if let Some(request) = request_id(&message) {
-                let method = message["method"].as_str().unwrap_or_default();
-                let (reply, _) = answer(&request, method, &message["params"]);
-                let _ = self
-                    .stream
-                    .send(Message::Text(reply.to_string().into()))
-                    .await;
-            }
             if message["method"].is_string() {
                 return Ok(message);
             }
@@ -1207,9 +1272,15 @@ mod tests {
 
             let refresh = json!({"id":28,"method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized"}});
             server.send(Message::Text(refresh.to_string().into())).await.unwrap();
+            let handed = received_events.recv().await.unwrap();
+            assert_eq!(handed["method"], "bridge.codex_request", "a request without a thread goes to the Node");
+            assert_eq!(handed["params"]["id"], 28);
+            assert_eq!(received_events.recv().await.unwrap(), refresh);
+            client.respond(&json!(28), Err(json!({"code":-32601,"message":"no credentials"})), "refuse").await.unwrap();
             let sent: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(sent["id"], 28);
-            assert!(sent["error"]["message"].is_string(), "a request without a thread is refused, never left hanging");
+            assert!(sent["error"]["message"].is_string());
+            assert!(client.respond(&json!(28), Ok(json!({})), "again").await.is_err(), "a request is answered once");
             assert_eq!(client.snapshot().await["pending_requests"].as_array().unwrap().len(), 1, "another client's approval stays for that client");
             server.close(None).await.unwrap();
             assert_eq!(session.await.unwrap(), "Codex connection closed");
@@ -1269,8 +1340,10 @@ mod tests {
                         }
                     }
                     assert_eq!(recovered, vec![approval, completed]);
+                    assert!(timeout(Duration::from_millis(200), server.next()).await.is_err(), "the bridge itself answers nothing");
+                    client.respond(&json!(42), Ok(json!({"decision":"accept"})), "accept").await.unwrap();
                     let reply: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                    assert_eq!(reply, json!({"id":42,"result":{"decision":"accept"}}), "an owned thread's approval is answered by policy");
+                    assert_eq!(reply, json!({"id":42,"result":{"decision":"accept"}}), "the Node's answer reaches the App Server");
                     let snapshot = client.snapshot().await;
                     assert!(snapshot["pending_requests"].as_array().unwrap().is_empty());
                     assert_eq!(snapshot["replies"][0]["decision"], "accept");
@@ -1486,7 +1559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_session_answers_requests_and_returns_its_result() {
+    async fn direct_session_leaves_requests_and_returns_its_result() {
         timeout(Duration::from_secs(5), async {
             let socket = std::env::temp_dir().join(format!("vibeface-direct-{}-{}.sock", std::process::id(), now_ms()));
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1500,7 +1573,6 @@ mod tests {
                 let start = next(&mut server).await;
                 assert_eq!(start["params"]["clientUserMessageId"], "work-1");
                 server.send(Message::Text(json!({"id":5,"method":"item/fileChange/requestApproval","params":{"threadId":"t"}}).to_string().into())).await.unwrap();
-                assert_eq!(next(&mut server).await, json!({"id":5,"result":{"decision":"accept"}}));
                 server.send(Message::Text(json!({"id":start["id"],"result":{"turn":{"id":"r"}}}).to_string().into())).await.unwrap();
             });
             let mut session = DirectSession::connect(&socket).await.unwrap();

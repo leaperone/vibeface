@@ -42,11 +42,12 @@ pub enum Category {
     Output,
 }
 
-/// The deterministic answer to a server request on a thread this Node owns.
+/// The fallback answer to a server request when the coordination Agent does not answer it:
+/// none is configured, or it let the request wait past its deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reply {
-    /// The thread already runs with full access, so accepting widens nothing.
-    Accept,
+    /// Nobody approved it.
+    Decline,
     /// Nobody is present to answer.
     Cancel,
     /// This client offers no dynamic tools.
@@ -170,16 +171,16 @@ pub const CLIENT_REQUESTS: &[(&str, Access)] = &[
 pub const CLIENT_NOTIFICATIONS: &[&str] = &["initialized"];
 
 pub const SERVER_REQUESTS: &[(&str, Reply)] = &[
-    ("item/commandExecution/requestApproval", Reply::Accept),
-    ("item/fileChange/requestApproval", Reply::Accept),
+    ("item/commandExecution/requestApproval", Reply::Decline),
+    ("item/fileChange/requestApproval", Reply::Decline),
     ("item/tool/requestUserInput", Reply::Cancel),
     ("mcpServer/elicitation/request", Reply::Cancel),
-    ("item/permissions/requestApproval", Reply::Accept),
+    ("item/permissions/requestApproval", Reply::Decline),
     ("item/tool/call", Reply::Fail),
     ("account/chatgptAuthTokens/refresh", Reply::Refuse),
     ("attestation/generate", Reply::Refuse),
-    ("applyPatchApproval", Reply::Accept),
-    ("execCommandApproval", Reply::Accept),
+    ("applyPatchApproval", Reply::Decline),
+    ("execCommandApproval", Reply::Decline),
 ];
 
 pub const SERVER_NOTIFICATIONS: &[(&str, Category)] = &[
@@ -286,19 +287,17 @@ pub fn category(method: &str) -> Option<Category> {
     find(SERVER_NOTIFICATIONS, method)
 }
 
-/// The answer to a server request, as a JSON-RPC `result` or `error`. Unknown requests are
-/// refused so they never hang.
-pub fn reply(method: &str, params: &Value) -> (Result<Value, Value>, &'static str) {
+/// The fallback answer to a server request, as a JSON-RPC `result` or `error`. Unknown
+/// requests are refused so they never hang.
+pub fn fallback(method: &str) -> (Result<Value, Value>, &'static str) {
     match find(SERVER_REQUESTS, method).unwrap_or(Reply::Refuse) {
-        Reply::Accept => (
+        Reply::Decline => (
             Ok(match method {
-                "item/permissions/requestApproval" => {
-                    json!({"permissions":params["permissions"],"scope":"turn"})
-                }
-                "applyPatchApproval" | "execCommandApproval" => json!({"decision":"approved"}),
-                _ => json!({"decision":"accept"}),
+                "item/permissions/requestApproval" => json!({"permissions":{},"scope":"turn"}),
+                "applyPatchApproval" | "execCommandApproval" => json!({"decision":"denied"}),
+                _ => json!({"decision":"decline"}),
             }),
-            "accept",
+            "decline",
         ),
         Reply::Cancel => (
             Ok(match method {
@@ -395,29 +394,25 @@ mod tests {
     }
 
     #[test]
-    fn server_requests_get_deterministic_answers() {
-        let (result, decision) = reply(
-            "item/permissions/requestApproval",
-            &json!({"permissions":{"network":{"enabled":true}}}),
-        );
-        assert_eq!(decision, "accept");
-        assert_eq!(result.unwrap()["permissions"]["network"]["enabled"], true);
+    fn unanswered_server_requests_fall_back_to_refusals() {
+        let (result, decision) = fallback("item/permissions/requestApproval");
+        assert_eq!(decision, "decline");
+        assert_eq!(result.unwrap()["permissions"], json!({}), "grants nothing");
         assert_eq!(
-            reply("mcpServer/elicitation/request", &json!({}))
-                .0
-                .unwrap(),
+            fallback("item/commandExecution/requestApproval").0.unwrap(),
+            json!({"decision":"decline"})
+        );
+        assert_eq!(
+            fallback("execCommandApproval").0.unwrap(),
+            json!({"decision":"denied"})
+        );
+        assert_eq!(
+            fallback("mcpServer/elicitation/request").0.unwrap(),
             json!({"action":"cancel"})
         );
-        assert_eq!(
-            reply("item/tool/call", &json!({})).0.unwrap()["success"],
-            false
-        );
-        assert!(
-            reply("account/chatgptAuthTokens/refresh", &json!({}))
-                .0
-                .is_err()
-        );
-        assert!(reply("future/request", &json!({})).0.is_err());
+        assert_eq!(fallback("item/tool/call").0.unwrap()["success"], false);
+        assert!(fallback("account/chatgptAuthTokens/refresh").0.is_err());
+        assert!(fallback("future/request").0.is_err());
         assert_eq!(access("future/method"), Write);
         assert_eq!(access("thread/read"), Read);
     }

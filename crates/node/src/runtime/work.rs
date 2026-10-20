@@ -609,7 +609,6 @@ impl Runtime {
         event: Value,
     ) -> Result<()> {
         let method = event["method"].as_str().unwrap_or_default();
-        let params = &event["params"];
         let records = self.store.lock().await.work_records(network)?;
         match method {
             "bridge.codex_connected" => {
@@ -632,10 +631,6 @@ impl Runtime {
                     self.signal_work(network, &record.spec.work_id, Signal::Disconnected)
                         .await?;
                 }
-                return Ok(());
-            }
-            "bridge.codex_replied" => {
-                tracing::info!(method = %params["method"], decision = %params["decision"], "answered an App Server request by policy");
                 return Ok(());
             }
             _ => {}
@@ -706,6 +701,14 @@ impl Runtime {
         let node = self.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                match event["method"].as_str() {
+                    Some("bridge.codex_request") => {
+                        node.on_codex_request(&event["params"]).await;
+                        continue;
+                    }
+                    Some("bridge.codex_disconnected") => node.drop_codex_requests(),
+                    _ => {}
+                }
                 node.triage_app_server(&event);
                 let networks = node.store.lock().await.networks().unwrap_or_default();
                 for network in networks {

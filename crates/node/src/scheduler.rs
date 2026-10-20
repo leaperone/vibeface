@@ -194,6 +194,10 @@ pub async fn run(
             tool_callback_token: Some(token.clone()),
             tool_cli: Some(std::env::current_exe()?),
             tool_env: BTreeMap::from([
+                (
+                    crate::runtime::TRIAGE_URL_ENV.into(),
+                    format!("http://{}", node.config.local_listen),
+                ),
                 ("VIBEFACE_NODE_URL".into(), local_url),
                 ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),

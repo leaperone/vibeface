@@ -274,8 +274,9 @@ fn validate_attestation(event: &Event) -> Result<()> {
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
-        | EventBody::NotificationAcked { .. }
-        | EventBody::AttentionResolved { .. } => UserSignature::Required,
+        | EventBody::NotificationAcked { .. } => UserSignature::Required,
+        // The user dismisses with a signature; the device that delivered a decision closes it.
+        EventBody::AttentionResolved { .. } => UserSignature::Optional,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -417,6 +418,9 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             summary,
             cwd,
             agent,
+            thread_id,
+            request_id,
+            choices,
             ..
         } => {
             ensure!(
@@ -432,6 +436,16 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                     && cwd.len() <= 4096
                     && agent.len() <= 32,
                 "invalid triage card"
+            );
+            for value in thread_id.iter().chain(request_id.iter()) {
+                id(value)?;
+            }
+            ensure!(
+                choices.len() <= 8
+                    && choices
+                        .iter()
+                        .all(|choice| !choice.label.trim().is_empty() && choice.label.len() <= 120),
+                "invalid card choices"
             );
         }
         EventBody::AttentionResolved { alert_id, .. } => {

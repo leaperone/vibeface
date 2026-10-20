@@ -78,7 +78,7 @@ enum Action {
     Codex {
         /// App Server socket; the coordination Agent gets it in VIBEFACE_CODEX_SOCKET.
         #[arg(long, env = "VIBEFACE_CODEX_SOCKET")]
-        socket: PathBuf,
+        socket: Option<PathBuf>,
         #[command(subcommand)]
         command: CodexCommand,
     },
@@ -108,6 +108,18 @@ enum CodexCommand {
     },
     /// Print the thread's notifications as JSON lines.
     Watch { thread: String },
+    /// List the App Server requests waiting for the coordination Agent.
+    Requests {
+        #[command(flatten)]
+        local: LocalNode,
+    },
+    /// Answer a waiting request once with its result JSON; answering again prints the first answer.
+    Respond {
+        request_id: String,
+        result: String,
+        #[command(flatten)]
+        local: LocalNode,
+    },
 }
 
 #[derive(Args)]
@@ -281,6 +293,15 @@ enum TriageAction {
         /// Same key for events about the same matter.
         #[arg(long)]
         matter: String,
+        /// Codex thread a decision on this card is sent to; defaults to the event's thread.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Hold this App Server request for the user; a choice answers it, dismissing declines.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// `label=<json>`: a button and the reply it sends; repeat for more.
+        #[arg(long = "choice", value_parser = vibeface::triage::parse_choice)]
+        choices: Vec<vibeface::triage::Choice>,
     },
     /// Handled silently.
     Dismiss {
@@ -370,8 +391,15 @@ async fn main() -> Result<()> {
         } => call_tool(name, json, call_ref).await,
         Action::Codex { socket, command } => {
             use vibeface::agent_cli::{Command, run};
-            let command = match command {
-                CodexCommand::Call { method, params } => Command::Call { method, params },
+            let socket = || {
+                socket
+                    .clone()
+                    .context("--socket or VIBEFACE_CODEX_SOCKET is required")
+            };
+            match command {
+                CodexCommand::Call { method, params } => {
+                    run(&socket()?, Command::Call { method, params }).await
+                }
                 CodexCommand::Send {
                     thread,
                     text,
@@ -379,19 +407,39 @@ async fn main() -> Result<()> {
                     model,
                     effort,
                     image,
-                } => Command::Send(vibeface_bridge::codex::Outgoing {
-                    thread_id: thread,
-                    text,
-                    client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    model,
-                    effort,
-                    images: image,
-                    start_only: false,
-                    full_access: true,
-                }),
-                CodexCommand::Watch { thread } => Command::Watch { thread_id: thread },
-            };
-            run(&socket, command).await
+                } => {
+                    run(
+                        &socket()?,
+                        Command::Send(vibeface_bridge::codex::Outgoing {
+                            thread_id: thread,
+                            text,
+                            client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            model,
+                            effort,
+                            images: image,
+                            start_only: false,
+                            full_access: true,
+                        }),
+                    )
+                    .await
+                }
+                CodexCommand::Watch { thread } => {
+                    run(&socket()?, Command::Watch { thread_id: thread }).await
+                }
+                CodexCommand::Requests { local } => {
+                    codex_requests(&local, json!({"action":"requests"})).await
+                }
+                CodexCommand::Respond {
+                    request_id,
+                    result,
+                    local,
+                } => {
+                    let result: serde_json::Value =
+                        serde_json::from_str(&result).context("result must be JSON")?;
+                    let body = json!({"action":"respond","request_id":request_id,"result":result});
+                    codex_requests(&local, body).await
+                }
+            }
         }
         Action::Hook(options) => {
             if let Err(error) = hook(options).await {
@@ -402,6 +450,18 @@ async fn main() -> Result<()> {
         Action::Hooks(options) => hooks(options).await,
         Action::Triage(options) => triage(options).await,
     }
+}
+
+async fn codex_requests(local: &LocalNode, body: serde_json::Value) -> Result<()> {
+    let result = post_local(
+        &local_node_url(local)?,
+        "api/triage",
+        &body,
+        Duration::from_secs(30),
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
 }
 
 /// Logs at info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. A running
@@ -1162,8 +1222,12 @@ async fn triage(options: Triage) -> Result<()> {
             severity,
             summary,
             matter,
+            thread,
+            request_id,
+            choices,
         } => {
-            json!({"action":"raise","event_id":event_id,"severity":severity,"summary":summary,"matter":matter})
+            json!({"action":"raise","event_id":event_id,"severity":severity,"summary":summary,
+                "matter":matter,"thread_id":thread,"request_id":request_id,"choices":choices})
         }
         TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
     };

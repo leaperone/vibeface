@@ -1,9 +1,11 @@
 //! The unified downlink: a decision from a web card or webhook reaches its thread through the
-//! same send path as `vibeface codex send`. A local journal keeps one decision ID to one send.
+//! same send path as `vibeface codex send`, or answers the App Server request its card holds.
+//! A local journal keeps one decision ID to one send.
 use super::Runtime;
+use crate::model::{ATTENTION_SCOPE, AlertResolution, EventBody};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use vibeface_bridge::codex::{Delivery, DirectSession, Outgoing};
 
@@ -13,8 +15,15 @@ pub struct DecisionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     pub thread_id: String,
+    #[serde(default)]
     pub text: String,
     pub decision_id: String,
+    /// The card this decision answers; it is resolved once the decision lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_id: Option<String>,
+    /// Index into the card's choices, instead of free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<usize>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -48,7 +57,6 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
         !req.decision_id.is_empty() && req.decision_id.len() <= 128,
         "decision_id is required"
     );
-    ensure!(!req.text.trim().is_empty(), "text is required");
     let network = rt.membership_state().await?.genesis.network_id;
     if let Some(node) = req.node.take()
         && node != rt.identity.device_id()?
@@ -62,6 +70,24 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
             .await?;
         return serde_json::from_value(reply).context("the device returned no decision outcome");
     }
+    let card = match &req.alert_id {
+        Some(alert_id) => rt.decision_card(&network, alert_id).await?,
+        None => None,
+    };
+    // A choice on a card that holds an App Server request answers that request.
+    let mut answer = None;
+    if let Some(index) = req.choice {
+        let card = card.as_ref().context("this card offers no choices")?;
+        let choice = card.choices.get(index).context("no such choice")?;
+        match &card.request_id {
+            Some(request_id) => {
+                req.text = format!("choice:{index}:{}", choice.label);
+                answer = Some((request_id.clone(), choice.reply.clone()));
+            }
+            None => req.text = choice.label.clone(),
+        }
+    }
+    ensure!(!req.text.trim().is_empty(), "text is required");
     let outcome = |delivery| DecisionOutcome {
         decision_id: req.decision_id.clone(),
         thread_id: req.thread_id.clone(),
@@ -80,14 +106,17 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
                     return Ok(outcome(delivery));
                 }
                 // The first send may have landed: read back, never send again.
-                _ => {
+                _ if answer.is_none() => {
                     drop(store);
                     let delivery = read_back(rt, &req).await;
                     if matches!(delivery, Delivery::Delivered { .. }) {
                         record(rt, &network, &req, &delivery).await?;
+                        resolve(rt, &network, &req).await;
                     }
                     return Ok(outcome(delivery));
                 }
+                // An answer is idempotent per request: asking again returns the first answer.
+                _ => {}
             }
         }
         let journal = Journal {
@@ -97,31 +126,76 @@ pub async fn send_decision(rt: &Arc<Runtime>, mut req: DecisionRequest) -> Resul
         };
         store.local_set(&network, &key(&req.decision_id), &json!(journal))?;
     }
-    let delivery = match DirectSession::connect(&rt.codex.socket).await {
-        Ok(mut session) => {
-            let delivery = session
-                .send(&Outgoing {
-                    thread_id: req.thread_id.clone(),
-                    text: req.text.clone(),
-                    client_id: req.decision_id.clone(),
-                    model: req.model.clone(),
-                    effort: req.effort.clone(),
-                    images: req.images.clone(),
-                    start_only: false,
-                    full_access: false,
-                })
-                .await;
-            session.close().await;
-            delivery
+    let delivery = match answer {
+        Some((request_id, reply)) => {
+            let answered = rt
+                .answer_codex_request(&request_id, Some(Ok(reply)), "user")
+                .await?;
+            if answered["answered"] == true {
+                Delivery::Delivered {
+                    mode: "answer".into(),
+                    turn_id: answered["turn_id"].as_str().unwrap_or_default().into(),
+                }
+            } else {
+                Delivery::Rejected {
+                    reason: answered["error"]
+                        .as_str()
+                        .unwrap_or("the request was answered already")
+                        .into(),
+                }
+            }
         }
-        Err(error) => Delivery::Rejected {
-            reason: error.message,
+        None => match DirectSession::connect(&rt.codex.socket).await {
+            Ok(mut session) => {
+                let delivery = session
+                    .send(&Outgoing {
+                        thread_id: req.thread_id.clone(),
+                        text: req.text.clone(),
+                        client_id: req.decision_id.clone(),
+                        model: req.model.clone(),
+                        effort: req.effort.clone(),
+                        images: req.images.clone(),
+                        start_only: false,
+                        full_access: false,
+                    })
+                    .await;
+                session.close().await;
+                delivery
+            }
+            Err(error) => Delivery::Rejected {
+                reason: error.message,
+            },
         },
     };
     record(rt, &network, &req, &delivery).await?;
+    if matches!(delivery, Delivery::Delivered { .. }) {
+        resolve(rt, &network, &req).await;
+    }
     tracing::info!(decision = %req.decision_id, thread = %req.thread_id,
         status = ?std::mem::discriminant(&delivery), "decision sent");
     Ok(outcome(delivery))
+}
+
+/// The card is done once its decision landed; a resolution that fails to append is only logged,
+/// the user can still dismiss the card.
+async fn resolve(rt: &Arc<Runtime>, network: &str, req: &DecisionRequest) {
+    let Some(alert_id) = &req.alert_id else {
+        return;
+    };
+    let resolved = rt
+        .append(
+            network,
+            ATTENTION_SCOPE,
+            EventBody::AttentionResolved {
+                alert_id: alert_id.clone(),
+                resolution: AlertResolution::Decided,
+                attestation: None,
+            },
+        )
+        .await;
+    if let Err(error) = resolved {
+        tracing::warn!(%error, alert = %alert_id, "decided card was not resolved");
+    }
 }
 
 async fn read_back(rt: &Arc<Runtime>, req: &DecisionRequest) -> Delivery {
@@ -163,52 +237,28 @@ async fn record(
 }
 
 impl Runtime {
-    /// The web's App Server passthrough: `codex`, `codex_state` and `send_decision`, on this
-    /// device or forwarded to the device named by `node`.
+    /// The web's view of Codex: `codex_state` is a status summary and `send_decision` the
+    /// downlink, on this device or forwarded to the device named by `node`. The web never calls
+    /// App Server methods.
     pub(super) async fn codex_rpc(
         self: &Arc<Self>,
         network: &str,
         method: &str,
-        input: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        use vibeface_bridge::methods::{self, Access};
+        input: &Value,
+    ) -> Result<Value> {
         if method == "send_decision" {
-            let req: DecisionRequest = serde_json::from_value(input.clone())?;
+            // A device forwards the request as `request`; the web sends it as the input itself.
+            let req: DecisionRequest =
+                serde_json::from_value(input.get("request").unwrap_or(input).clone())?;
             return Ok(json!(send_decision(self, req).await?));
         }
         if let Some(node) = input["node"].as_str()
             && node != self.identity.device_id()?
         {
-            let mut forward = input.clone();
-            forward["type"] = json!(method);
-            forward["human"] = json!(true);
-            forward.as_object_mut().map(|object| object.remove("node"));
-            return self.peer_request(network, node, forward).await;
+            return self
+                .peer_request(network, node, json!({"type":method,"human":true}))
+                .await;
         }
-        let mut reply = if method == "codex" {
-            let name = input["method"].as_str().context("method is required")?;
-            ensure!(
-                methods::access(name) != Access::Hidden,
-                "{name} is not available from the web"
-            );
-            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
-            match self.codex.client().request(name, params).await {
-                Ok(result) => result,
-                Err(error) if error.uncertain => anyhow::bail!(
-                    "{}; the result is unknown, read the state back before calling again",
-                    error.message
-                ),
-                Err(error) => anyhow::bail!(error.message),
-            }
-        } else {
-            let mut state = self.codex.snapshot().await;
-            if let Some(thread) = input["thread_id"].as_str() {
-                let one = state["threads"][thread].take();
-                state["threads"] = json!({thread: one});
-            }
-            state
-        };
-        methods::sanitize(&mut reply);
-        Ok(reply)
+        Ok(self.codex.status().await)
     }
 }

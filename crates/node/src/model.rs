@@ -85,6 +85,12 @@ pub enum AlertResolution {
     Dismissed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceLabel {
+    pub label: String,
+}
+
 /// Scope of the triage cards every device shows.
 pub const ATTENTION_SCOPE: &str = "attention";
 
@@ -197,6 +203,15 @@ pub enum EventBody {
         severity: Severity,
         summary: String,
         count: u64,
+        /// The Codex thread a decision goes to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        /// The App Server request this card holds until the user chooses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// Labels only; what each choice sends stays on the device that raised the card.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<ChoiceLabel>,
     },
     AttentionResolved {
         alert_id: String,

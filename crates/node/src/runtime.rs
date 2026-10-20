@@ -536,7 +536,7 @@ impl Runtime {
                 self.stop_work(network, &scope, &id(&input, "work_id")?)
                     .await
             }
-            "codex" | "codex_state" | "send_decision" => {
+            "codex_state" | "send_decision" => {
                 ensure!(access.human, "only the user reaches the App Server");
                 self.codex_rpc(network, method, &input).await
             }

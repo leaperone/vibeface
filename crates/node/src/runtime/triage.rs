@@ -1,5 +1,6 @@
-//! Triage workers (design 4): capture into one queue, judge in batches, send to the outlets,
-//! deliver webhooks from a local outbox, and accept decisions for local sessions.
+//! Triage workers (design 4): capture into one queue, hand batches to the coordination Agent,
+//! send what it raises to the outlets, deliver webhooks from a local outbox, hold App Server
+//! requests for the Agent, and accept decisions for local sessions.
 use super::{Access, Runtime, now_ms};
 use crate::{
     config,
@@ -7,7 +8,7 @@ use crate::{
     model::{ATTENTION_SCOPE, AlertResolution, EventBody},
     net,
     store::{local_load, local_prefix, local_save},
-    triage::{self, AgentEvent, Delivery, Matter, OutboxEntry, Severity, TriageConfig},
+    triage::{self, AgentEvent, Card, Delivery, Matter, OutboxEntry, Severity, TriageConfig},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -25,14 +26,20 @@ const BATCH: usize = 20;
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 const SCAN_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const SEEN_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+/// How long an App Server request waits for the coordination Agent before the fallback answer.
+pub(crate) const AGENT_ANSWER_WITHIN: Duration = Duration::from_secs(120);
 const WEBHOOK_KEY: &str = "triage-webhook.key";
 const DECISION_TOKENS: &str = "decision-tokens.json";
 pub const SPOOL_DIR: &str = "hook-spool";
 
 pub(crate) struct TriageState {
     config: std::sync::Mutex<TriageConfig>,
-    /// Events already handed to the Agent in this process; a restart offers them once more.
-    offered: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// App Server requests waiting for an answer, by the Node's own request ID. They live only as
+    /// long as the connection that carried them.
+    requests: std::sync::Mutex<HashMap<String, CodexRequest>>,
+    /// Answers given in this process: answering again returns the first answer.
+    answered: std::sync::Mutex<HashMap<String, Value>>,
+    wake: tokio::sync::Notify,
     outbox: tokio::sync::Notify,
     /// App Server threads' working directory and last answer, for their turn-end events.
     threads: std::sync::Mutex<HashMap<String, (String, String)>>,
@@ -43,7 +50,9 @@ impl TriageState {
     pub(crate) fn new(config: TriageConfig) -> Self {
         Self {
             config: std::sync::Mutex::new(config),
-            offered: Default::default(),
+            requests: Default::default(),
+            answered: Default::default(),
+            wake: Default::default(),
             outbox: Default::default(),
             threads: Default::default(),
             started_ms: now_ms(),
@@ -55,6 +64,41 @@ impl TriageState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+}
+
+#[derive(Clone, Serialize)]
+struct CodexRequest {
+    request_id: String,
+    #[serde(skip)]
+    rpc_id: Value,
+    method: String,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    params: Value,
+    received_ms: i64,
+    /// `None` while a decision card holds it for the user.
+    answer_by_ms: Option<i64>,
+    alert_id: Option<String>,
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What a request asks, for the event the Agent and the outlets see. Commands, patches and
+/// paths are left out; the Agent reads them with `vibeface codex requests`.
+fn describe(method: &str, params: &Value) -> String {
+    let questions: Vec<&str> = params["questions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|question| question["question"].as_str())
+        .collect();
+    json!({"method":method,"reason":params["reason"],"message":params["message"],
+        "questions":questions,"server":params["serverName"]})
+    .to_string()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,8 +132,13 @@ struct DecisionToken {
 struct DecisionInput {
     device_id: String,
     thread_id: String,
+    #[serde(default)]
     text: String,
     decision_id: String,
+    #[serde(default)]
+    alert_id: Option<String>,
+    #[serde(default)]
+    choice: Option<usize>,
 }
 
 fn queue_key(event: &AgentEvent) -> String {
@@ -117,15 +166,27 @@ impl Runtime {
         Ok(self.membership_state().await?.genesis.network_id)
     }
 
-    /// Takes one event from any source. Test events are acknowledged and dropped; an event ID
-    /// seen before is a duplicate, whichever source sent it first.
+    /// Takes one event from a hook, a scan or the App Server. Test events are acknowledged and
+    /// dropped; so is everything while no coordination Agent is configured to judge it. An event
+    /// ID seen before is a duplicate, whichever source sent it first.
     pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
+        self.queue_event(AgentEvent {
+            request_id: None,
+            ..event
+        })
+        .await
+    }
+
+    async fn queue_event(&self, event: AgentEvent) -> Result<Value> {
         let event = event.seal(&self.identity.device_id()?, &config::hostname(), now_ms())?;
         if event.test {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
         }
         let network = self.network_id().await?;
+        if self.settings_snapshot().manager.is_none() {
+            return Ok(json!({"status":"dropped","event_id":event.event_id}));
+        }
         let store = self.store.lock().await;
         let seen = format!("triage.seen.{}", event.event_id);
         if local_load::<Seen>(&store.connection, &network, &seen)?.is_some() {
@@ -142,6 +203,161 @@ impl Runtime {
         )?;
         local_save(&store.connection, &network, &queue_key(&event), &event)?;
         Ok(json!({"status":"accepted","event_id":event.event_id}))
+    }
+
+    /// A server request the bridge handed over: held for the coordination Agent, or answered by
+    /// the fallback at once when there is none.
+    pub(crate) async fn on_codex_request(self: &Arc<Self>, params: &Value) {
+        let request = CodexRequest {
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+            rpc_id: params["id"].clone(),
+            method: params["method"].as_str().unwrap_or_default().into(),
+            thread_id: params["threadId"].as_str().map(str::to_owned),
+            turn_id: params["params"]["turnId"].as_str().map(str::to_owned),
+            params: params["params"].clone(),
+            received_ms: now_ms(),
+            answer_by_ms: Some(now_ms() + AGENT_ANSWER_WITHIN.as_millis() as i64),
+            alert_id: None,
+        };
+        tracing::info!(request = %request.request_id, method = %request.method,
+            thread = ?request.thread_id, "App Server request received");
+        let request_id = request.request_id.clone();
+        lock(&self.triage.requests).insert(request_id.clone(), request.clone());
+        let cwd = request
+            .thread_id
+            .as_ref()
+            .and_then(|thread| lock(&self.triage.threads).get(thread).map(|t| t.0.clone()))
+            .unwrap_or_default();
+        let event = AgentEvent {
+            source: triage::Source::AppServer,
+            agent: triage::Agent::Codex,
+            event: triage::Kind::NeedsInput,
+            session_id: request.thread_id.clone().unwrap_or("app-server".into()),
+            turn_id: format!("request:{request_id}"),
+            cwd,
+            detail: describe(&request.method, &request.params),
+            request_id: Some(request_id.clone()),
+            ..Default::default()
+        };
+        let queued = self.queue_event(event).await;
+        if !matches!(&queued, Ok(result) if result["status"] == "accepted") {
+            if let Err(error) = &queued {
+                tracing::warn!(%error, "App Server request could not reach the Agent");
+            }
+            let _ = self
+                .answer_codex_request(&request_id, None, "fallback")
+                .await;
+            return;
+        }
+        self.triage.wake.notify_one();
+    }
+
+    /// Answers a held request once: `result` from the Agent or the user, or the method's fallback
+    /// when `None`. Answering again returns the first answer.
+    pub(crate) async fn answer_codex_request(
+        &self,
+        request_id: &str,
+        result: Option<Result<Value, Value>>,
+        by: &str,
+    ) -> Result<Value> {
+        if let Some(done) = lock(&self.triage.answered).get(request_id) {
+            return Ok(done.clone());
+        }
+        let request = lock(&self.triage.requests)
+            .remove(request_id)
+            .context("no App Server request is waiting with this ID")?;
+        let (result, decision) = match result {
+            Some(result) => {
+                let decision = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r["decision"].as_str().or(r["action"].as_str()))
+                    .unwrap_or(if result.is_ok() { "answered" } else { "error" })
+                    .to_owned();
+                (result, decision)
+            }
+            None => {
+                let (result, decision) = vibeface_bridge::methods::fallback(&request.method);
+                (result, decision.to_owned())
+            }
+        };
+        let sent = self
+            .codex
+            .client()
+            .respond(&request.rpc_id, result, &decision)
+            .await;
+        let outcome = json!({"request_id":request_id,"method":request.method,"thread_id":request.thread_id,
+            "turn_id":request.turn_id,"decision":decision,"by":by,"answered":sent.is_ok(),
+            "error":sent.as_ref().err().map(|error| error.message.clone())});
+        tracing::info!(request = %request_id, method = %request.method, %decision, %by,
+            answered = sent.is_ok(), "App Server request answered");
+        {
+            let mut answered = lock(&self.triage.answered);
+            // ponytail: forget answers past 1024; a restart forgets them all, as the requests.
+            if answered.len() > 1024 {
+                answered.clear();
+            }
+            answered.insert(request_id.into(), outcome.clone());
+        }
+        if let Ok(network) = self.network_id().await {
+            let store = self.store.lock().await;
+            for event in local_prefix::<AgentEvent>(&store.connection, &network, "triage.queue.")? {
+                if event.request_id.as_deref() == Some(request_id) {
+                    delete(&store.connection, &network, &queue_key(&event))?;
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Requests past their deadline, or whose card the user dismissed, get the fallback answer.
+    async fn expire_codex_requests(&self) -> Result<()> {
+        let now = now_ms();
+        let requests: Vec<CodexRequest> = lock(&self.triage.requests).values().cloned().collect();
+        let network = self.network_id().await.ok();
+        for request in requests {
+            let dismissed = match (&request.alert_id, &network) {
+                (Some(alert_id), Some(network)) => self
+                    .store
+                    .lock()
+                    .await
+                    .connection
+                    .query_row(
+                        "SELECT resolution FROM alert_resolutions WHERE network_id=? AND alert_id=?",
+                        rusqlite::params![network, alert_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .is_ok_and(|resolution| resolution == "dismissed"),
+                _ => false,
+            };
+            if dismissed || request.answer_by_ms.is_some_and(|by| by <= now) {
+                self.answer_codex_request(&request.request_id, None, "fallback")
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The choices and request a card was raised with; they stay on this Node.
+    pub(crate) async fn decision_card(
+        &self,
+        network: &str,
+        alert_id: &str,
+    ) -> Result<Option<Card>> {
+        let store = self.store.lock().await;
+        local_load(
+            &store.connection,
+            network,
+            &format!("triage.card.{alert_id}"),
+        )
+    }
+
+    /// The connection that carried the held requests is gone, and so are they.
+    pub(crate) fn drop_codex_requests(&self) {
+        for (request_id, request) in lock(&self.triage.requests).drain() {
+            tracing::info!(request = %request_id, method = %request.method,
+                "App Server request lost with its connection");
+        }
     }
 
     /// Turn ends of every thread the managed App Server reports, not only the Node's own work.
@@ -204,9 +420,21 @@ impl Runtime {
         let node = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(WAKE_EVERY).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(WAKE_EVERY) => {}
+                    _ = node.triage.wake.notified() => {}
+                }
                 if let Err(error) = node.wake_agent().await {
                     tracing::warn!(%error, "could not hand triage events to the Agent");
+                }
+            }
+        });
+        let node = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if let Err(error) = node.expire_codex_requests().await {
+                    tracing::warn!(%error, "could not answer expired App Server requests");
                 }
             }
         });
@@ -237,34 +465,23 @@ impl Runtime {
         local_prefix(&store.connection, network, "triage.queue.")
     }
 
-    /// Hands events the coordination Agent has not seen to one turn of it, at most once per
-    /// `WAKE_EVERY`. It answers through `vibeface triage`; without an Agent events stay here.
+    /// Hands waiting events to one turn of the coordination Agent. It answers through
+    /// `vibeface triage` and `vibeface codex respond`; what it leaves alone is dropped after the
+    /// turn, and a request it neither answered nor carded gets the fallback answer.
     async fn wake_agent(&self) -> Result<()> {
         let Some(settings) = self.settings_snapshot().manager else {
             return Ok(());
         };
         let network = self.network_id().await?;
-        let pending = self.pending_events(&network).await?;
-        let fresh: Vec<AgentEvent> = {
-            let offered = self
-                .triage
-                .offered
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending
-                .into_iter()
-                .filter(|event| !offered.contains(&event.event_id))
-                .take(BATCH)
-                .collect()
-        };
+        let fresh: Vec<AgentEvent> = self
+            .pending_events(&network)
+            .await?
+            .into_iter()
+            .take(BATCH)
+            .collect();
         if fresh.is_empty() {
             return Ok(());
         }
-        self.triage
-            .offered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(fresh.iter().map(|event| event.event_id.clone()));
         let program = std::env::current_exe()?;
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
@@ -280,23 +497,47 @@ impl Runtime {
             codex_bin: self.config.codex_bin.clone(),
             codex_sdk_script: settings.codex_sdk_script,
             tool_cli: Some(program),
-            tool_env: [(
-                TRIAGE_URL_ENV.to_owned(),
-                format!("http://{}", self.config.local_listen),
-            )]
+            tool_env: [
+                (
+                    TRIAGE_URL_ENV.to_owned(),
+                    format!("http://{}", self.config.local_listen),
+                ),
+                (
+                    "VIBEFACE_CODEX_SOCKET".to_owned(),
+                    self.codex.socket.display().to_string(),
+                ),
+            ]
             .into(),
             ..Default::default()
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
-        manager::run_manager(
+        let turn = manager::run_manager(
             &config,
-            &triage::wake_prompt(&fresh, &cli)?,
+            &triage::wake_prompt(&fresh, &cli, AGENT_ANSWER_WITHIN.as_secs())?,
             None,
             |_| async { Ok(()) },
             cancel,
             |_| async { Ok(()) },
         )
-        .await?;
+        .await;
+        self.settle_offered(&network, &fresh).await?;
+        turn.map(|_| ())
+    }
+
+    async fn settle_offered(&self, network: &str, offered: &[AgentEvent]) -> Result<()> {
+        for event in offered {
+            if let Some(request_id) = &event.request_id {
+                let unattended = lock(&self.triage.requests)
+                    .get(request_id)
+                    .is_some_and(|request| request.answer_by_ms.is_some());
+                if unattended {
+                    self.answer_codex_request(request_id, None, "fallback")
+                        .await?;
+                }
+            }
+            let store = self.store.lock().await;
+            delete(&store.connection, network, &queue_key(event))?;
+        }
         Ok(())
     }
 
@@ -304,6 +545,18 @@ impl Runtime {
     pub(crate) async fn triage_command(&self, input: Value) -> Result<Value> {
         let network = self.network_id().await?;
         let action = super::field(&input, "action")?;
+        if action == "requests" {
+            let requests: Vec<CodexRequest> =
+                lock(&self.triage.requests).values().cloned().collect();
+            return Ok(json!({"requests":requests}));
+        }
+        if action == "respond" {
+            let request_id = super::field(&input, "request_id")?;
+            let result = input.get("result").cloned().context("result is required")?;
+            return self
+                .answer_codex_request(request_id, Some(Ok(result)), "agent")
+                .await;
+        }
         if action == "events" {
             let since = input["since"].as_i64().unwrap_or(0);
             let events: Vec<_> = self
@@ -340,7 +593,31 @@ impl Runtime {
                     summary.len() <= 1024 && matter.len() <= 256,
                     "summary or matter is too long"
                 );
-                self.raise(&network, &event, severity, summary, matter)
+                let choices: Vec<triage::Choice> =
+                    serde_json::from_value(input.get("choices").cloned().unwrap_or(json!([])))
+                        .context("choices must be [{label, reply}]")?;
+                ensure!(choices.len() <= 8, "at most 8 choices");
+                let request_id = input["request_id"].as_str().map(str::to_owned);
+                if let Some(request_id) = &request_id {
+                    ensure!(
+                        !choices.is_empty(),
+                        "a card that holds a request needs choices"
+                    );
+                    ensure!(
+                        lock(&self.triage.requests).contains_key(request_id),
+                        "no App Server request is waiting with this ID"
+                    );
+                }
+                let thread_id = input["thread_id"].as_str().map(str::to_owned).or_else(|| {
+                    (event.agent == triage::Agent::Codex && event.session_id != "app-server")
+                        .then(|| event.session_id.clone())
+                });
+                let card = Card {
+                    thread_id,
+                    request_id,
+                    choices,
+                };
+                self.raise(&network, &event, severity, summary, matter, card)
                     .await?
             }
             _ => bail!("unknown triage action"),
@@ -369,17 +646,43 @@ impl Runtime {
         severity: Severity,
         summary: &str,
         matter: &str,
+        card: Card,
     ) -> Result<Value> {
         let key = triage::matter_key(&event.node, matter);
         let matter_key = format!("triage.matter.{key}");
         let (matter, emit) = {
             let store = self.store.lock().await;
             let previous: Option<Matter> = local_load(&store.connection, network, &matter_key)?;
+            // A card that holds a request always goes out on its own: the user must answer it.
+            let previous = previous.filter(|_| card.request_id.is_none());
             let (matter, emit) =
                 triage::merge(previous.as_ref(), &key, &event.event_id, severity, now_ms());
             local_save(&store.connection, network, &matter_key, &matter)?;
+            if emit {
+                local_save(
+                    &store.connection,
+                    network,
+                    &format!("triage.card.{}", matter.alert_id),
+                    &card,
+                )?;
+            }
             (matter, emit)
         };
+        if emit && let Some(request_id) = &card.request_id {
+            let mut requests = lock(&self.triage.requests);
+            let request = requests
+                .get_mut(request_id)
+                .context("the App Server request was answered meanwhile")?;
+            request.answer_by_ms = None;
+            request.alert_id = Some(matter.alert_id.clone());
+        }
+        let labels: Vec<_> = card
+            .choices
+            .iter()
+            .map(|choice| crate::model::ChoiceLabel {
+                label: choice.label.clone(),
+            })
+            .collect();
         let config = self.triage.config();
         let outlet = config.outlet_for(&event.cwd);
         let mut result = json!({"event_id":event.event_id,"alert_id":matter.alert_id,"matter":key,
@@ -405,6 +708,9 @@ impl Runtime {
                     severity: matter.severity,
                     summary: summary.into(),
                     count: matter.count,
+                    thread_id: card.thread_id.clone(),
+                    request_id: card.request_id.clone(),
+                    choices: labels,
                 },
             )
             .await?;
@@ -415,8 +721,13 @@ impl Runtime {
                 "schema_version":triage::SCHEMA_VERSION, "event_id":event.event_id,
                 "alert_id":matter.alert_id, "matter":key, "severity":matter.severity,
                 "summary":summary, "count":matter.count, "event":event,
-                "decision":(event.agent == triage::Agent::Codex).then(|| json!({
-                    "url":self.decision_url(), "device_id":event.node, "thread_id":event.session_id})),
+                "request_id":card.request_id,
+                "choices":card.choices.iter().enumerate()
+                    .map(|(index, choice)| json!({"index":index,"label":choice.label}))
+                    .collect::<Vec<_>>(),
+                "decision":card.thread_id.as_ref().map(|thread| json!({
+                    "url":self.decision_url(), "device_id":event.node, "thread_id":thread,
+                    "alert_id":matter.alert_id})),
             });
             let store = self.store.lock().await;
             let outbox_key = format!("triage.outbox.{}", event.event_id);
@@ -522,12 +833,6 @@ impl Runtime {
                         &network,
                         &format!("triage.handled.{}", handled.event_id),
                     )?;
-                }
-            }
-            // ponytail: unanswered events expire with their dedupe marks.
-            for event in local_prefix::<AgentEvent>(&store.connection, &network, "triage.queue.")? {
-                if event.ts_ms < cutoff {
-                    delete(&store.connection, &network, &queue_key(&event))?;
                 }
             }
         }
@@ -763,10 +1068,9 @@ impl Runtime {
                 thread_id: input.thread_id,
                 text: input.text,
                 decision_id: input.decision_id,
-                node: None,
-                model: None,
-                effort: None,
-                images: vec![],
+                alert_id: input.alert_id,
+                choice: input.choice,
+                ..Default::default()
             },
         )
         .await
@@ -880,7 +1184,12 @@ mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.roles = vec![NodeRole::Relay, NodeRole::Replica];
-        configuration.codex_socket = Some(dir.join("unavailable.sock"));
+        // A unix socket path must stay short; nothing listens unless a test binds it.
+        let socket = format!(
+            "/tmp/vf-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        configuration.codex_socket = Some(socket.into());
         configuration.save(&dir)?;
         config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
         config::private_write(
@@ -896,6 +1205,202 @@ mod tests {
         )?)?;
         node.install_membership(state).await?;
         Ok((node, admin, dir))
+    }
+
+    fn with_agent(node: &Runtime) {
+        node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
+            provider: "codex_sdk".into(),
+            workspace: "/tmp".into(),
+            model: "fixture".into(),
+            cursor_sdk_bin: "/nonexistent".into(),
+            node_bin: "/nonexistent".into(),
+            codex_sdk_script: "/nonexistent".into(),
+        });
+    }
+
+    type Server = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
+
+    async fn read(server: &mut Server) -> Value {
+        use futures_util::StreamExt as _;
+        let message = server.next().await.unwrap().unwrap();
+        serde_json::from_str(message.to_text().unwrap()).unwrap()
+    }
+
+    /// A fake App Server on the Node's socket that sends one approval request without a thread,
+    /// which the bridge hands to the Node.
+    async fn app_server(node: &Runtime) -> Result<(Server, Value)> {
+        use futures_util::SinkExt as _;
+        let listener = tokio::net::UnixListener::bind(&node.codex.socket)?;
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+        let mut server = tokio_tungstenite::accept_async(stream).await?;
+        let initialize = read(&mut server).await;
+        let ready = json!({"id":initialize["id"],"result":{"userAgent":"codex/fixture"}});
+        server.send(ready.to_string().into()).await?;
+        assert_eq!(read(&mut server).await["method"], "initialized");
+        let params = json!({"command":"rm -rf build","reason":"clean the build"});
+        let request =
+            json!({"id":41,"method":"item/commandExecution/requestApproval","params":params});
+        server.send(request.to_string().into()).await?;
+        while node.codex.client().snapshot().await["pending_requests"] == json!([]) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let handed = json!({"id":41,"method":"item/commandExecution/requestApproval","threadId":null,"params":params});
+        Ok((server, handed))
+    }
+
+    /// The answer the fake App Server got for request 41, and that nothing else follows it.
+    async fn answered_once(server: &mut Server) -> Value {
+        let answer = read(server).await;
+        assert_eq!(answer["id"], 41);
+        let again = tokio::time::timeout(Duration::from_millis(300), read(server)).await;
+        assert!(again.is_err(), "the request is answered once");
+        answer
+    }
+
+    #[tokio::test]
+    async fn a_held_request_is_answered_by_the_agent_once() -> Result<()> {
+        let (node, _, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            let requests = node.triage_command(json!({"action":"requests"})).await?;
+            let request_id = requests["requests"][0]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                requests["requests"][0]["method"],
+                "item/commandExecution/requestApproval"
+            );
+            let events = node.triage_command(json!({"action":"events"})).await?;
+            assert_eq!(events["events"][0]["request_id"], request_id.as_str());
+            assert!(
+                !events["events"][0]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rm -rf"),
+                "commands stay out of events"
+            );
+
+            let respond =
+                json!({"action":"respond","request_id":request_id,"result":{"decision":"accept"}});
+            let answered = node.triage_command(respond.clone()).await?;
+            assert_eq!(
+                (answered["answered"].clone(), answered["by"].clone()),
+                (json!(true), json!("agent"))
+            );
+            assert_eq!(
+                answered_once(&mut server).await["result"],
+                json!({"decision":"accept"})
+            );
+            assert_eq!(
+                node.triage_command(respond).await?,
+                answered,
+                "answering again returns the first answer"
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"requests"})).await?["requests"],
+                json!([])
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"events"})).await?["events"],
+                json!([])
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let _ = std::fs::remove_file(&node.codex.socket);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn without_an_agent_requests_are_declined_and_events_dropped() -> Result<()> {
+        let (node, _, dir) = node().await?;
+        let result = async {
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            assert_eq!(
+                answered_once(&mut server).await["result"],
+                json!({"decision":"decline"})
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"requests"})).await?["requests"],
+                json!([])
+            );
+            let recorded = node
+                .triage
+                .answered
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                (recorded["decision"].clone(), recorded["by"].clone()),
+                (json!("decline"), json!("fallback"))
+            );
+            assert_eq!(
+                node.ingest_agent_event(turn("s1", "t1", "/x")).await?["status"],
+                "dropped"
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"events"})).await?["events"],
+                json!([])
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let _ = std::fs::remove_file(&node.codex.socket);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_choice_answers_the_carded_request_once() -> Result<()> {
+        let (node, _, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            let event = node.triage_command(json!({"action":"events"})).await?["events"][0].clone();
+            let request_id = event["request_id"].as_str().unwrap().to_owned();
+            let raised = node.triage_command(json!({"action":"raise","event_id":event["event_id"],"severity":"urgent",
+                "summary":"要清理 build 吗","matter":"codex:clean","thread_id":"t","request_id":request_id,
+                "choices":[{"label":"批准","reply":{"decision":"accept"}},{"label":"拒绝","reply":{"decision":"decline"}}]})).await?;
+            assert_eq!(raised["sent"], true);
+            let requests = node.triage_command(json!({"action":"requests"})).await?;
+            assert_eq!(requests["requests"][0]["answer_by_ms"], Value::Null, "the card holds it for the user");
+
+            let network = node.network_id().await?;
+            let alert = node.store.lock().await.alerts(&network, 10)?[0].clone();
+            assert_eq!((alert["thread_id"].clone(), alert["request_id"].clone()), (json!("t"), json!(request_id)));
+            assert_eq!(alert["choices"], json!([{"label":"批准"},{"label":"拒绝"}]), "replies stay on the Node");
+            let decision = super::super::decision::DecisionRequest {
+                thread_id: "t".into(),
+                decision_id: "d1".into(),
+                alert_id: alert["alert_id"].as_str().map(str::to_owned),
+                choice: Some(0),
+                ..Default::default()
+            };
+            let sent = super::super::decision::send_decision(&node, decision.clone()).await?;
+            assert!(matches!(&sent.delivery, vibeface_bridge::codex::Delivery::Delivered { mode, .. } if mode == "answer"));
+            assert_eq!(answered_once(&mut server).await["result"], json!({"decision":"accept"}));
+            let retried = super::super::decision::send_decision(&node, decision).await?;
+            assert_eq!(retried, sent, "a retry with the same decision ID sends nothing");
+            assert!(tokio::time::timeout(Duration::from_millis(300), read(&mut server)).await.is_err());
+            assert_eq!(node.store.lock().await.alerts(&network, 10)?[0]["resolution"], "decided");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let _ = std::fs::remove_file(&node.codex.socket);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     fn turn(session: &str, turn: &str, cwd: &str) -> AgentEvent {
@@ -933,6 +1438,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let result = async {
+            with_agent(&node);
             let secret = "fixture-webhook-secret-0123456789";
             let settings = node
                 .configure_triage(json!({"default_outlet":"record","projects":[{"prefix":"/hooked","outlet":"both"}],
@@ -1018,6 +1524,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        let _ = std::fs::remove_file(&node.codex.socket);
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result

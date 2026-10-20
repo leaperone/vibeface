@@ -345,7 +345,7 @@ impl Runtime {
                 );
                 self.interrupt_work(network, work_id).await
             }
-            "codex" | "codex_state" | "send_decision" => {
+            "codex_state" | "send_decision" => {
                 ensure!(
                     input["human"] == true,
                     "the App Server answers the user only"
