@@ -128,7 +128,7 @@ impl Store {
             network,
             conversation,
             &spec.name,
-            spec.owner_attestation.clone(),
+            spec.owner.clone(),
             created_at_ms,
         )?;
         log::append_from(

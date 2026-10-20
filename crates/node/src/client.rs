@@ -658,7 +658,20 @@ async fn dispatch(
         "join_status" => {
             let Some(join_id) = params.get("join_id") else {
                 manager_view(node, session).await?;
-                let pending = node.store.lock().await.pending_joins(&session.device_id)?;
+                let mut pending = serde_json::to_value(
+                    node.store.lock().await.pending_joins(&session.device_id)?,
+                )?;
+                // A join waits on the Node whose invite it used; managers see it from any entry.
+                if let Some(local) = pending.as_array_mut() {
+                    for remote in node.remote_joins(&session.device_id).await {
+                        if !local
+                            .iter()
+                            .any(|known| known["join_id"] == remote["join_id"])
+                        {
+                            local.push(remote);
+                        }
+                    }
+                }
                 return Ok(json!({"requests":pending}));
             };
             let join_id = join_id.as_str().context("join_id must be a string")?;
@@ -687,27 +700,12 @@ async fn dispatch(
         "approve" => {
             manager_view(node, session).await?;
             let join_id = text(&params, "join_id")?;
-            let admin = &session.device_id;
-            let request = if params["reject"] == true {
-                node.store.lock().await.reject_join(join_id, admin)?
-            } else if let Some(nonce) = params.get("admin_nonce") {
-                let nonce = nonce.as_str().context("admin_nonce must be a string")?;
-                node.store
-                    .lock()
-                    .await
-                    .approve_nonce(join_id, admin, nonce)?
+            if node.store.lock().await.holds_join(join_id)? {
+                approve_join(node, &session.device_id, &params).await
             } else {
-                let event: GovernanceEvent = from_field(&params, "event")?;
-                let (request, state) = node
-                    .store
-                    .lock()
+                node.forward_join_approval(&session.device_id, &params)
                     .await
-                    .approve_grant(join_id, admin, event)?;
-                node.install_membership(state.clone()).await?;
-                request
-            };
-            notify_join(node, &request);
-            Ok(serde_json::to_value(request)?)
+            }
         }
         "revoke" => {
             manager_view(node, session).await?;
@@ -798,6 +796,32 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
         node.install_membership(state.clone()).await?;
     }
     Ok(())
+}
+
+/// One approval step for a join this Node holds; `admin` is the authenticated manager, here or
+/// at the entry that forwarded it.
+pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) -> Result<Value> {
+    let join_id = text(params, "join_id")?;
+    let request = if params["reject"] == true {
+        node.store.lock().await.reject_join(join_id, admin)?
+    } else if let Some(nonce) = params.get("admin_nonce") {
+        let nonce = nonce.as_str().context("admin_nonce must be a string")?;
+        node.store
+            .lock()
+            .await
+            .approve_nonce(join_id, admin, nonce)?
+    } else {
+        let event: GovernanceEvent = from_field(params, "event")?;
+        let (request, state) = node
+            .store
+            .lock()
+            .await
+            .approve_grant(join_id, admin, event)?;
+        node.install_membership(state.clone()).await?;
+        request
+    };
+    notify_join(node, &request);
+    Ok(serde_json::to_value(request)?)
 }
 
 fn notify_join(node: &Runtime, request: &JoinRequest) {
@@ -1541,7 +1565,7 @@ mod tests {
             let owner = browser.attest(&network, &conversation, crate::model::EventBody::ConversationOwner {
                 scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None })?;
             let created = local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser",
-                "owner_attestation":owner.attestation()})).await;
+                "scheduler_node":node.identity.device_id()?,"owner_attestation":owner.attestation()})).await;
             assert!(created.is_err(), "a local session's key is not a member's signature");
             let conversations = local.call("rpc", json!({"method":"conversations"})).await?;
             assert!(conversations["conversations"].is_array());

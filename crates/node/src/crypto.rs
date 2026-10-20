@@ -114,17 +114,22 @@ impl LocalIdentity {
     }
     /// The fixture client's signature making `node` the first owner of conversation `scope`.
     #[cfg(test)]
-    pub fn owner_fixture(&self, network: &str, scope: &str, node: &str) -> Result<Attestation> {
+    pub fn owner_fixture(&self, network: &str, scope: &str, node: &str) -> Result<FirstOwner> {
         let body = EventBody::ConversationOwner {
             scheduler_node: node.into(),
             epoch: 1,
             attestation: None,
         };
-        self.fixture_admin()
+        let attestation = self
+            .fixture_admin()
             .attest(network, scope, body)?
             .attestation()
             .cloned()
-            .context("signed owner")
+            .context("signed owner")?;
+        Ok(FirstOwner {
+            scheduler_node: node.into(),
+            attestation,
+        })
     }
     /// A recovered network whose members are a fixture admin client and `nodes`.
     #[cfg(test)]

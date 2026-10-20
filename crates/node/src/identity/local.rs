@@ -396,6 +396,11 @@ impl Store {
         })
     }
 
+    /// Whether this Node holds the invite the join came through.
+    pub fn holds_join(&self, join_id: &str) -> Result<bool> {
+        Ok(load_request(&self.connection, "join_id", join_id)?.is_some())
+    }
+
     pub fn reject_join(&self, join_id: &str, admin: &str) -> Result<JoinRequest> {
         let now = now_ms();
         self.transaction(|tx| {

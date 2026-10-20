@@ -309,7 +309,16 @@ pub struct BotCreateSpec {
     pub instructions: String,
     pub project: Option<BotProject>,
     pub attestation: Attestation,
-    pub owner_attestation: Attestation,
+    pub owner: FirstOwner,
+}
+
+/// The user's signed choice of a new conversation's first scheduling Node. Any entry can write
+/// it, so a retry through another entry keeps the same owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FirstOwner {
+    pub scheduler_node: DeviceId,
+    pub attestation: Attestation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

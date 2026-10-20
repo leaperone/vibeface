@@ -2,6 +2,8 @@ use super::*;
 use crate::work::{DispatchState, WorkState};
 
 const ARTIFACT_PAGE: usize = 65_536;
+/// Raw bytes per upload request, well inside the client channel's message limit.
+const UPLOAD_CHUNK: usize = 1024 * 1024;
 
 fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Value> {
     ensure!(
@@ -41,6 +43,75 @@ impl Runtime {
             input["offset"].as_u64().unwrap_or(0),
             input["limit"].as_u64().unwrap_or(ARTIFACT_PAGE as u64),
         )
+    }
+
+    /// One chunk of an attachment the user is sending. Bytes synced to disk survive a restart;
+    /// the reply's offset says where the client continues.
+    pub(super) async fn upload_attachment(&self, access: &Access, input: &Value) -> Result<Value> {
+        use base64::Engine as _;
+        use std::io::{Seek as _, Write as _};
+        ensure!(access.human, "only the user sends attachments");
+        let scope = field(input, "conversation_id")?;
+        self.require_scope(access, scope).await?;
+        let network = &access.network_id;
+        let blob = BlobRef {
+            hash: field(input, "hash")?.into(),
+            size: input["size"].as_u64().context("size is required")?,
+        };
+        ensure!(
+            blob.size > 0 && blob.size as usize <= MAX_BLOB_BYTES,
+            "attachment must be 1 byte to 64 MiB"
+        );
+        let mut store = self.store.lock().await;
+        if store.has_blob(&blob)? {
+            return Ok(json!({"offset":blob.size,"complete":true}));
+        }
+        let (part, target) = (
+            store.partial_blob_file(&blob.hash)?,
+            store.blob_file(&blob.hash)?,
+        );
+        let committed = store.committed_offset(network, &blob.hash)?;
+        let offset = input["offset"].as_u64().context("offset is required")?;
+        if offset != committed {
+            return Ok(json!({"offset":committed,"complete":false}));
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(field(input, "data")?)
+            .context("attachment data must be base64")?;
+        ensure!(
+            data.len() <= UPLOAD_CHUNK && committed + data.len() as u64 <= blob.size,
+            "attachment chunk does not fit"
+        );
+        let dir = part.parent().context("partial directory")?;
+        std::fs::create_dir_all(dir)?;
+        if !part.exists() {
+            super::peers::staging_room(dir, blob.size)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)?;
+        file.set_len(committed)?;
+        file.seek(std::io::SeekFrom::Start(committed))?;
+        file.write_all(&data)?;
+        file.sync_data()?;
+        let offset = committed + data.len() as u64;
+        store.commit_offset(network, &blob.hash, Some(offset))?;
+        if offset < blob.size {
+            return Ok(json!({"offset":offset,"complete":false}));
+        }
+        drop(file);
+        // ponytail: hashes the whole file under the store lock once per attachment (<= 64 MiB).
+        if crate::crypto::digest(&std::fs::read(&part)?) != blob.hash {
+            let _ = std::fs::remove_file(&part);
+            store.commit_offset(network, &blob.hash, None)?;
+            bail!("attachment failed its hash check; send it again");
+        }
+        std::fs::create_dir_all(target.parent().context("blob directory")?)?;
+        std::fs::rename(&part, &target)?;
+        store.commit_offset(network, &blob.hash, None)?;
+        Ok(json!({"offset":offset,"complete":true}))
     }
 
     pub(super) async fn conversation_snapshot(
@@ -92,9 +163,22 @@ impl Runtime {
             } else if work.target_node != local && !work.open_approvals.is_empty() {
                 remote_forms.push((works.len(), work.target_node.clone(), work.work_id.clone()));
             }
-            if let Some(record) = record {
-                value["state"] = json!(record.state.name());
-            }
+            value["state"] = match record {
+                // An agent task runs as its device's coordination turn, without Codex phases.
+                _ if work.executor == Executor::Agent && work.outcome.is_none() => json!("running"),
+                Some(record) => json!(record.state.name()),
+                // Another device runs it: its progress events say where it is.
+                None => json!(match (work.outcome, work.phase) {
+                    (Some(_), _) => "finished",
+                    (None, Some(WorkPhase::Started)) => "starting",
+                    (None, Some(WorkPhase::WaitingApproval)) if !work.open_approvals.is_empty() => {
+                        "waiting_approval"
+                    }
+                    (None, Some(WorkPhase::Interrupting)) => "interrupting",
+                    (None, Some(_)) => "running",
+                    (None, None) => "accepted",
+                }),
+            };
             if work.outcome == Some(WorkOutcome::Unverified) {
                 value["state"] = json!("unverified");
                 let (detail, probe) = match record.map(|r| &r.state) {
@@ -135,7 +219,15 @@ impl Runtime {
         }
         let conversation = store.conversation(network, scope)?;
         let bot = store.bot_for_conversation(network, scope)?;
-        let messages = store.messages(network, scope)?;
+        let mut messages = Vec::new();
+        for message in store.messages(network, scope)? {
+            let mut value = json!(message);
+            let attachments = store.event_blobs(network, &message.event_hash)?;
+            if !attachments.is_empty() {
+                value["blobs"] = json!(attachments);
+            }
+            messages.push(value);
+        }
         let autonomy = store.autonomy(network, scope)?;
         drop(store);
         for (index, target, work_id) in remote_forms {

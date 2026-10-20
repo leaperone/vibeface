@@ -152,9 +152,12 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
 fn attestation(v: &Value) -> Result<Attestation> {
     signed(v, "attestation")
 }
-/// The signature over the conversation's first `ConversationOwner`, which names this entry Node.
-fn owner_attestation(v: &Value) -> Result<Attestation> {
-    signed(v, "owner_attestation")
+/// The Node the user chose to schedule a new conversation, with their signature over it.
+fn first_owner(v: &Value) -> Result<FirstOwner> {
+    Ok(FirstOwner {
+        scheduler_node: id(v, "scheduler_node")?,
+        attestation: signed(v, "owner_attestation")?,
+    })
 }
 fn signed(v: &Value, key: &str) -> Result<Attestation> {
     serde_json::from_value(v[key].clone())
@@ -469,7 +472,7 @@ impl Runtime {
                     network,
                     &scope,
                     title,
-                    owner_attestation(&input)?,
+                    first_owner(&input)?,
                     now_ms(),
                 )?;
                 self.publish_changed(network, &scope, &scope);
@@ -488,6 +491,7 @@ impl Runtime {
                 Ok(result)
             }
             "read_artifact" => self.read_artifact(&access, &input).await,
+            "upload_attachment" => self.upload_attachment(&access, &input).await,
             "answer_approval" | "interrupt_work" => {
                 ensure!(access.human, "only the user answers or stops work");
                 let scope = scope.context("conversation_id is required")?;

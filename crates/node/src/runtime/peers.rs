@@ -275,6 +275,12 @@ impl Runtime {
             }
             "progress_read" => self.read_progress(network, origin, input).await,
             "dispatch_work" => self.accept_remote_dispatch(network, origin, input).await,
+            "pending_joins" => Ok(
+                json!({"requests":self.store.lock().await.pending_joins(field(input, "admin")?)?}),
+            ),
+            "approve_join" => {
+                crate::client::approve_join(self, field(input, "admin")?, &input["params"]).await
+            }
             "interrupt_work" => {
                 let scope = field(input, "conversation_id")?;
                 let work_id = field(input, "work_id")?;
@@ -628,6 +634,74 @@ impl Runtime {
                 });
             }
         }
+    }
+
+    /// Other member Nodes this one can ask right now.
+    async fn member_peers(&self) -> Result<(String, Vec<String>)> {
+        let view = self.membership_state().await?.project()?;
+        let local = self.identity.device_id()?;
+        let peers = view
+            .members
+            .iter()
+            .filter(|member| {
+                member.kind == IdentityKind::Node
+                    && member.device_id != local
+                    && view.cutoff(&member.device_id).is_none()
+            })
+            .map(|member| member.device_id.clone())
+            .collect();
+        Ok((view.network_id, peers))
+    }
+
+    /// Join requests waiting on other member Nodes; an unreachable Node simply lists none.
+    pub(crate) async fn remote_joins(&self, admin: &str) -> Vec<Value> {
+        let Ok((network, peers)) = self.member_peers().await else {
+            return vec![];
+        };
+        let asks = peers.iter().map(|peer| {
+            let request = self.peer_request(
+                &network,
+                peer,
+                json!({"type":"pending_joins","admin":admin}),
+            );
+            async move { tokio::time::timeout(Duration::from_secs(3), request).await }
+        });
+        futures_util::future::join_all(asks)
+            .await
+            .into_iter()
+            .filter_map(|reply| reply.ok()?.ok())
+            .flat_map(|reply| reply["requests"].as_array().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// An approval step for a join held elsewhere goes to the Node that holds it.
+    pub(crate) async fn forward_join_approval(&self, admin: &str, params: &Value) -> Result<Value> {
+        let (network, peers) = self.member_peers().await?;
+        let join_id = field(params, "join_id")?;
+        for peer in peers {
+            let listed = self
+                .peer_request(
+                    &network,
+                    &peer,
+                    json!({"type":"pending_joins","admin":admin}),
+                )
+                .await;
+            let holds = listed.is_ok_and(|reply| {
+                reply["requests"]
+                    .as_array()
+                    .is_some_and(|requests| requests.iter().any(|r| r["join_id"] == join_id))
+            });
+            if holds {
+                return self
+                    .peer_request(
+                        &network,
+                        &peer,
+                        json!({"type":"approve_join","admin":admin,"params":params}),
+                    )
+                    .await;
+            }
+        }
+        bail!("join request not found")
     }
 
     /// Drops connections and addresses of Nodes the directory has revoked.
@@ -1067,7 +1141,7 @@ impl Runtime {
 }
 
 /// Refuses a new download once 64 objects or 256 MiB are already staged.
-fn staging_room(dir: &Path, size: u64) -> Result<()> {
+pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
     let mut objects = 0;
     let mut bytes = size;
     for entry in std::fs::read_dir(dir)? {

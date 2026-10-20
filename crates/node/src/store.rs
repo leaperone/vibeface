@@ -292,14 +292,14 @@ impl Store {
         Ok(envelope)
     }
 
-    /// Creates a conversation owned by this Node; the user's entry device schedules it.
+    /// Creates a conversation scheduled by the Node the user signed for.
     pub fn create_conversation(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
         scope: &str,
         title: &str,
-        owner: Attestation,
+        owner: FirstOwner,
         created_at_ms: i64,
     ) -> Result<Conversation> {
         let tx = self
@@ -362,6 +362,10 @@ impl Store {
             "invalid blob hash"
         );
         Ok(self.blob_dir.join("sha256").join(&hash[..2]).join(hash))
+    }
+
+    pub fn has_blob(&self, blob: &BlobRef) -> Result<bool> {
+        Ok(log::blob_file_matches(&self.blob_path(&blob.hash)?, blob))
     }
 
     /// Attachments are files named by their SHA-256; writes are atomic and reads re-verify.
@@ -438,6 +442,21 @@ impl Store {
         statement
             .query_map(params![network_id, scope_id], message_row)?
             .map(|row| row?)
+            .collect()
+    }
+    /// Attachments an event carries, in its signed order.
+    pub fn event_blobs(&self, network: &str, event_hash: &str) -> Result<Vec<BlobRef>> {
+        let mut statement = self.connection.prepare(
+            "SELECT blob,size FROM event_blobs WHERE network_id=? AND hash=? ORDER BY blob",
+        )?;
+        statement
+            .query_map(params![network, event_hash], |r| {
+                Ok(BlobRef {
+                    hash: r.get(0)?,
+                    size: r.get(1)?,
+                })
+            })?
+            .map(|row| Ok(row?))
             .collect()
     }
     pub fn message(&self, network: &str, scope: &str, message_id: &str) -> Result<Option<Message>> {
@@ -609,7 +628,10 @@ impl Store {
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "the conversation and its signed first owner")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the conversation and its signed first owner"
+)]
 pub(crate) fn create_conversation_from(
     connection: &Connection,
     blob_dir: &Path,
@@ -617,9 +639,10 @@ pub(crate) fn create_conversation_from(
     network: &str,
     scope: &str,
     title: &str,
-    owner: Attestation,
+    owner: FirstOwner,
     created_at_ms: i64,
 ) -> Result<()> {
+    authorize_node_from(connection, network, &owner.scheduler_node)?;
     log::append_from(
         connection,
         blob_dir,
@@ -639,9 +662,9 @@ pub(crate) fn create_conversation_from(
         network,
         scope,
         EventBody::ConversationOwner {
-            scheduler_node: identity.device_id()?,
+            scheduler_node: owner.scheduler_node,
             epoch: 1,
-            attestation: Some(owner),
+            attestation: Some(owner.attestation),
         },
         vec![],
         created_at_ms,

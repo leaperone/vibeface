@@ -46,7 +46,7 @@ impl Runtime {
                 instructions: instructions.to_owned(),
                 project,
                 attestation: attestation(input)?,
-                owner_attestation: owner_attestation(input)?,
+                owner: first_owner(input)?,
             },
             now_ms(),
         )?;
