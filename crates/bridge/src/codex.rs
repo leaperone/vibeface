@@ -353,7 +353,10 @@ impl Cache {
                 }
             }
             (Some(Category::Warning), _) => {
-                push_ring(&mut self.warnings, json!({"method":method,"params":bounded(params),"at_ms":now_ms()}));
+                push_ring(
+                    &mut self.warnings,
+                    json!({"method":method,"params":bounded(params),"at_ms":now_ms()}),
+                );
             }
             (Some(Category::Output), None) => {
                 self.hidden.insert(method.into(), bounded(params));
@@ -431,7 +434,10 @@ impl Cache {
             }
             method if methods::category(method) == Some(Category::Output) => {
                 if let (Some(id), Some(delta)) = (item_id, params["delta"].as_str()) {
-                    append(state.hidden.entry(format!("output:{id}")).or_default(), delta);
+                    append(
+                        state.hidden.entry(format!("output:{id}")).or_default(),
+                        delta,
+                    );
                 } else {
                     state.hidden.insert(method.into(), bounded(params));
                 }
@@ -700,7 +706,13 @@ async fn run_session(
     });
     let mut writer_task = writer_task;
     let mut state = Session::default();
-    let _ = state.request(&writer, "initialize", initialize_params("Vibeface Rust Bridge"), PendingKind::Initialize, false);
+    let _ = state.request(
+        &writer,
+        "initialize",
+        initialize_params("Vibeface Rust Bridge"),
+        PendingKind::Initialize,
+        false,
+    );
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     let reason = loop {
         tokio::select! {
@@ -860,7 +872,9 @@ impl DirectSession {
             .map_err(|error| rejected(error.message))?;
         session
             .stream
-            .send(Message::Text(json!({"method":"initialized"}).to_string().into()))
+            .send(Message::Text(
+                json!({"method":"initialized"}).to_string().into(),
+            ))
             .await
             .map_err(|error| rejected(error.to_string()))?;
         Ok(session)
@@ -877,30 +891,48 @@ impl DirectSession {
         self.next_id += 1;
         let id = RpcId::String(format!("vibeface-cli-{}", self.next_id));
         self.stream
-            .send(Message::Text(json!({"id":id,"method":method,"params":params}).to_string().into()))
+            .send(Message::Text(
+                json!({"id":id,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
             .await
             .map_err(|error| lost(error.to_string()))?;
         let deadline = Instant::now() + RPC_TIMEOUT;
         loop {
             let text = match tokio::time::timeout_at(deadline, self.stream.next()).await {
-                Err(_) => return Err(lost("Codex request timed out; do not blindly retry mutations".into())),
+                Err(_) => {
+                    return Err(lost(
+                        "Codex request timed out; do not blindly retry mutations".into(),
+                    ));
+                }
                 Ok(Some(Ok(Message::Text(text)))) => text,
                 Ok(Some(Ok(Message::Ping(data)))) => {
                     let _ = self.stream.send(Message::Pong(data)).await;
                     continue;
                 }
-                Ok(Some(Ok(Message::Close(_))) | None) => return Err(lost("Codex connection closed".into())),
+                Ok(Some(Ok(Message::Close(_))) | None) => {
+                    return Err(lost("Codex connection closed".into()));
+                }
                 Ok(Some(Err(error))) => return Err(lost(error.to_string())),
                 Ok(Some(Ok(_))) => continue,
             };
-            let message: Value = serde_json::from_str(&text).map_err(|error| lost(error.to_string()))?;
+            let message: Value =
+                serde_json::from_str(&text).map_err(|error| lost(error.to_string()))?;
             if let Some(request) = request_id(&message) {
                 let method = message["method"].as_str().unwrap_or_default();
                 let (reply, _) = answer(&request, method, &message["params"]);
-                let _ = self.stream.send(Message::Text(reply.to_string().into())).await;
+                let _ = self
+                    .stream
+                    .send(Message::Text(reply.to_string().into()))
+                    .await;
                 continue;
             }
-            if message.get("id").and_then(|got| serde_json::from_value::<RpcId>(got.clone()).ok()) != Some(id.clone()) {
+            if message
+                .get("id")
+                .and_then(|got| serde_json::from_value::<RpcId>(got.clone()).ok())
+                != Some(id.clone())
+            {
                 continue;
             }
             if let Some(error) = message.get("error") {
@@ -922,15 +954,21 @@ impl DirectSession {
                     let _ = self.stream.send(Message::Pong(data)).await;
                     continue;
                 }
-                Some(Ok(Message::Close(_))) | None => return Err(rejected("Codex connection closed")),
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err(rejected("Codex connection closed"));
+                }
                 Some(Err(error)) => return Err(rejected(error.to_string())),
                 Some(Ok(_)) => continue,
             };
-            let message: Value = serde_json::from_str(&text).map_err(|error| rejected(error.to_string()))?;
+            let message: Value =
+                serde_json::from_str(&text).map_err(|error| rejected(error.to_string()))?;
             if let Some(request) = request_id(&message) {
                 let method = message["method"].as_str().unwrap_or_default();
                 let (reply, _) = answer(&request, method, &message["params"]);
-                let _ = self.stream.send(Message::Text(reply.to_string().into())).await;
+                let _ = self
+                    .stream
+                    .send(Message::Text(reply.to_string().into()))
+                    .await;
             }
             if message["method"].is_string() {
                 return Ok(message);
@@ -968,18 +1006,28 @@ pub struct Outgoing {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Delivery {
-    Delivered { mode: String, turn_id: String },
+    Delivered {
+        mode: String,
+        turn_id: String,
+    },
     /// The send may or may not have happened; sending again with the same `client_id` only reads back.
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
     /// Nothing was sent.
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
 }
 
 fn input(outgoing: &Outgoing) -> Value {
     let mut input = vec![json!({"type":"text","text":outgoing.text,"text_elements":[]})];
     for image in &outgoing.images {
         input.push(
-            if ["data:", "http://", "https://"].iter().any(|scheme| image.starts_with(scheme)) {
+            if ["data:", "http://", "https://"]
+                .iter()
+                .any(|scheme| image.starts_with(scheme))
+            {
                 json!({"type":"image","url":image})
             } else {
                 json!({"type":"localImage","path":image})
@@ -1002,9 +1050,16 @@ fn delivered(thread: &Value, client_id: &str) -> Option<String> {
 
 impl DirectSession {
     /// The turn that carries `client_id`, if the thread has it.
-    pub async fn read_back(&mut self, thread: &str, client_id: &str) -> Result<Option<String>, CodexError> {
+    pub async fn read_back(
+        &mut self,
+        thread: &str,
+        client_id: &str,
+    ) -> Result<Option<String>, CodexError> {
         let reply = self
-            .request("thread/read", json!({"threadId":thread,"includeTurns":true}))
+            .request(
+                "thread/read",
+                json!({"threadId":thread,"includeTurns":true}),
+            )
             .await?;
         Ok(delivered(&reply["thread"], client_id))
     }
@@ -1021,7 +1076,10 @@ impl DirectSession {
             Err(error) => return rejected(error.message),
         };
         if let Some(turn_id) = delivered(&resumed["thread"], &outgoing.client_id) {
-            return Delivery::Delivered { mode: "existing".into(), turn_id };
+            return Delivery::Delivered {
+                mode: "existing".into(),
+                turn_id,
+            };
         }
         let active = (!outgoing.start_only && resumed["thread"]["status"]["type"] == "active")
             .then(|| {
@@ -1037,8 +1095,11 @@ impl DirectSession {
         let mut steered = None;
         if let Some(turn) = &active {
             match self
-                .request("turn/steer", json!({"threadId":outgoing.thread_id,"expectedTurnId":turn,
-                    "input":input(outgoing),"clientUserMessageId":outgoing.client_id}))
+                .request(
+                    "turn/steer",
+                    json!({"threadId":outgoing.thread_id,"expectedTurnId":turn,
+                    "input":input(outgoing),"clientUserMessageId":outgoing.client_id}),
+                )
                 .await
             {
                 // Refused (the turn just ended): nothing was sent, so a new turn is safe.
@@ -1065,17 +1126,36 @@ impl DirectSession {
             }
         };
         let sent = match result {
-            Ok(reply) => reply["turn"]["id"].as_str().or(reply["turnId"].as_str()).map(str::to_owned),
+            Ok(reply) => reply["turn"]["id"]
+                .as_str()
+                .or(reply["turnId"].as_str())
+                .map(str::to_owned),
             Err(error) if !error.uncertain => return rejected(error.message),
             Err(_) => None,
         };
-        match self.read_back(&outgoing.thread_id, &outgoing.client_id).await {
-            Ok(Some(turn_id)) => Delivery::Delivered { mode: mode.into(), turn_id },
-            Ok(None) if sent.is_some() => Delivery::Delivered { mode: mode.into(), turn_id: sent.expect("checked") },
-            Ok(None) => Delivery::Unknown { reason: "the message is not in the thread yet".into() },
+        match self
+            .read_back(&outgoing.thread_id, &outgoing.client_id)
+            .await
+        {
+            Ok(Some(turn_id)) => Delivery::Delivered {
+                mode: mode.into(),
+                turn_id,
+            },
+            Ok(None) if sent.is_some() => Delivery::Delivered {
+                mode: mode.into(),
+                turn_id: sent.expect("checked"),
+            },
+            Ok(None) => Delivery::Unknown {
+                reason: "the message is not in the thread yet".into(),
+            },
             Err(error) => match sent {
-                Some(turn_id) => Delivery::Delivered { mode: mode.into(), turn_id },
-                None => Delivery::Unknown { reason: error.message },
+                Some(turn_id) => Delivery::Delivered {
+                    mode: mode.into(),
+                    turn_id,
+                },
+                None => Delivery::Unknown {
+                    reason: error.message,
+                },
             },
         }
     }
@@ -1330,17 +1410,50 @@ mod tests {
     fn notifications_fill_the_observed_state_and_sanitize_hides_execution() {
         let mut cache = Cache::default();
         for (method, params) in [
-            ("turn/started", json!({"threadId":"t","turn":{"id":"r","status":"inProgress","items":[]}})),
-            ("thread/name/updated", json!({"threadId":"t","threadName":"fix login"})),
-            ("thread/tokenUsage/updated", json!({"threadId":"t","turnId":"r","tokenUsage":{"total":{"totalTokens":42}}})),
-            ("turn/plan/updated", json!({"threadId":"t","turnId":"r","explanation":null,"plan":[{"step":"read","status":"completed"}]})),
-            ("item/reasoning/summaryTextDelta", json!({"threadId":"t","turnId":"r","itemId":"z","summaryIndex":0,"delta":"thinking"})),
-            ("item/started", json!({"threadId":"t","turnId":"r","item":{"id":"c","type":"commandExecution","status":"inProgress","command":"cat secret"}})),
-            ("item/commandExecution/outputDelta", json!({"threadId":"t","turnId":"r","itemId":"c","delta":"output"})),
-            ("turn/diff/updated", json!({"threadId":"t","turnId":"r","diff":"+x"})),
-            ("account/rateLimits/updated", json!({"rateLimits":{"primary":{"usedPercent":10}}})),
-            ("account/updated", json!({"authMode":"chatgpt","planType":"pro"})),
-            ("mcpServer/startupStatus/updated", json!({"name":"docs","status":"ready","threadId":null})),
+            (
+                "turn/started",
+                json!({"threadId":"t","turn":{"id":"r","status":"inProgress","items":[]}}),
+            ),
+            (
+                "thread/name/updated",
+                json!({"threadId":"t","threadName":"fix login"}),
+            ),
+            (
+                "thread/tokenUsage/updated",
+                json!({"threadId":"t","turnId":"r","tokenUsage":{"total":{"totalTokens":42}}}),
+            ),
+            (
+                "turn/plan/updated",
+                json!({"threadId":"t","turnId":"r","explanation":null,"plan":[{"step":"read","status":"completed"}]}),
+            ),
+            (
+                "item/reasoning/summaryTextDelta",
+                json!({"threadId":"t","turnId":"r","itemId":"z","summaryIndex":0,"delta":"thinking"}),
+            ),
+            (
+                "item/started",
+                json!({"threadId":"t","turnId":"r","item":{"id":"c","type":"commandExecution","status":"inProgress","command":"cat secret"}}),
+            ),
+            (
+                "item/commandExecution/outputDelta",
+                json!({"threadId":"t","turnId":"r","itemId":"c","delta":"output"}),
+            ),
+            (
+                "turn/diff/updated",
+                json!({"threadId":"t","turnId":"r","diff":"+x"}),
+            ),
+            (
+                "account/rateLimits/updated",
+                json!({"rateLimits":{"primary":{"usedPercent":10}}}),
+            ),
+            (
+                "account/updated",
+                json!({"authMode":"chatgpt","planType":"pro"}),
+            ),
+            (
+                "mcpServer/startupStatus/updated",
+                json!({"name":"docs","status":"ready","threadId":null}),
+            ),
             ("warning", json!({"message":"slow","threadId":null})),
             ("thread/realtime/started", json!({"threadId":"t"})),
         ] {
@@ -1362,7 +1475,10 @@ mod tests {
         methods::sanitize(&mut snapshot);
         let text = snapshot.to_string();
         assert!(!text.contains("cat secret") && !text.contains("output") && !text.contains("+x"));
-        assert_eq!(snapshot["threads"]["t"]["items"]["c"], json!({"id":"c","type":"commandExecution","status":"inProgress"}));
+        assert_eq!(
+            snapshot["threads"]["t"]["items"]["c"],
+            json!({"id":"c","type":"commandExecution","status":"inProgress"})
+        );
     }
 
     async fn next(server: &mut WebSocketStream<UnixStream>) -> Value {

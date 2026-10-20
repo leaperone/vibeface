@@ -371,7 +371,10 @@ mod tests {
             ("client_requests", names(CLIENT_REQUESTS)),
             (
                 "client_notifications",
-                CLIENT_NOTIFICATIONS.iter().map(|m| (*m).to_owned()).collect(),
+                CLIENT_NOTIFICATIONS
+                    .iter()
+                    .map(|m| (*m).to_owned())
+                    .collect(),
             ),
             ("server_requests", names(SERVER_REQUESTS)),
             ("server_notifications", names(SERVER_NOTIFICATIONS)),
@@ -400,14 +403,20 @@ mod tests {
         assert_eq!(decision, "accept");
         assert_eq!(result.unwrap()["permissions"]["network"]["enabled"], true);
         assert_eq!(
-            reply("mcpServer/elicitation/request", &json!({})).0.unwrap(),
+            reply("mcpServer/elicitation/request", &json!({}))
+                .0
+                .unwrap(),
             json!({"action":"cancel"})
         );
         assert_eq!(
             reply("item/tool/call", &json!({})).0.unwrap()["success"],
             false
         );
-        assert!(reply("account/chatgptAuthTokens/refresh", &json!({})).0.is_err());
+        assert!(
+            reply("account/chatgptAuthTokens/refresh", &json!({}))
+                .0
+                .is_err()
+        );
         assert!(reply("future/request", &json!({})).0.is_err());
         assert_eq!(access("future/method"), Write);
         assert_eq!(access("thread/read"), Read);
