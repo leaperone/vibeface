@@ -14,55 +14,48 @@ await crypto.default({ module_or_path: await readFile(join(dirname(modulePath), 
 const hex = value => Buffer.from(value).toString('hex');
 const bytes = value => Uint8Array.from(Buffer.from(value, 'hex'));
 
+/** A signer like the browser's: a non-extractable WebCrypto key, or a fixture secret through WASM. */
+async function webKey() {
+  const pair = await globalThis.crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
+  const deviceId = hex(await globalThis.crypto.subtle.exportKey('raw', pair.publicKey));
+  return { deviceId, raw: async message => hex(await globalThis.crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, message)) };
+}
+function secretKey(secretHex) {
+  const identity = crypto.Identity.fromSecretHex(secretHex);
+  const deviceId = identity.deviceId(), secret = identity.secretHex();
+  identity.free();
+  const key = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(secret, 'hex')]), format: 'der', type: 'pkcs8' });
+  return { deviceId, raw: async message => sign(null, Buffer.from(message), key).toString('hex') };
+}
+async function fixtureSecret(file) {
+  try {
+    const metadata = await lstat(file);
+    assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
+    return JSON.parse(await readFile(file, 'utf8')).secret_key_hex;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    const created = crypto.Identity.generate();
+    const secret = created.secretHex();
+    created.free();
+    await writeFile(file, JSON.stringify({ secret_key_hex: secret }) + '\n', { mode: 0o600, flag: 'wx' });
+    return secret;
+  }
+}
+
 function endpoint() {
-  let identity = crypto.Identity.generate();
+  let key;
   let handshake;
   let channel;
+  const signer = async () => key ??= await webKey();
   return async input => {
     try {
       let result = null;
       switch (input.op) {
         case 'fixture_identity': {
-          let fixture;
-          try {
-            const metadata = await lstat(input.identity_file);
-            assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
-            fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
-          } catch (error) {
-            if (error.code !== 'ENOENT') throw error;
-            fixture = crypto.Identity.generate();
-            try {
-              await writeFile(input.identity_file, JSON.stringify({secret_key_hex:fixture.secretHex()})+'\n', {mode:0o600,flag:'wx'});
-            } catch (error) { fixture.free(); throw error; }
-          }
-          if (input.expected_peer_id) {
-            try { assert(fixture.peerId() === input.expected_peer_id, 'fixture identity must retain the pinned target'); }
-            catch (error) { fixture.free(); throw error; }
-          }
-          identity.free(); identity = fixture;
-          result = {public_key:identity.publicKeyHex(),peer_id:identity.peerId()};
-          break;
-        }
-        case 'fixture_reachability': {
-          const metadata = await lstat(input.identity_file);
-          assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
-          const fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
-          try {
-            assert(fixture.peerId() === input.expected_peer_id, 'fixture signer must match the original target');
-            assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
-            assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
-            const direct = input.direct_urls || [];
-            assert(Array.isArray(direct) && direct.length <= 8, 'fixture direct list must be bounded');
-            for (const value of [...direct,...input.relay_urls]) {
-              const url = new URL(value);
-              assert(value.length <= 2048 && ['ws:','wss:'].includes(url.protocol) && url.hostname && !url.username && !url.password && !url.search && !url.hash, 'fixture URL must be a bounded network endpoint');
-            }
-            const issued = Math.floor(Date.now() / 1000);
-            const record = {peer_id:fixture.peerId(),public_key:fixture.publicKeyHex(),direct_urls:direct,relay_urls:input.relay_urls,
-              issued_at:issued,expires_at:issued+input.ttl_secs,signature:''};
-            record.signature = fixture.sign('reachability',new TextEncoder().encode(JSON.stringify(record)));
-            result = record;
-          } finally { fixture.free(); }
+          const fixture = secretKey(await fixtureSecret(input.identity_file));
+          assert(!input.expected_device_id || fixture.deviceId === input.expected_device_id, 'fixture identity must retain the pinned target');
+          key = fixture;
+          result = { device_id: key.deviceId };
           break;
         }
         case 'fixture_event':
@@ -98,13 +91,24 @@ function endpoint() {
           break;
         }
         case 'identity':
-          if (input.secret_hex) { identity.free(); identity = crypto.Identity.fromSecretHex(input.secret_hex); }
-          result = { public_key: identity.publicKeyHex(), peer_id: identity.peerId() }; break;
+          if (input.secret_hex) key = secretKey(input.secret_hex);
+          result = { device_id: (await signer()).deviceId }; break;
         case 'recovery_seal': result = hex(crypto.recoverySeal(bytes(input.data), input.password)); break;
         case 'recovery_open': result = hex(crypto.recoveryOpen(bytes(input.data), input.password)); break;
-        case 'sign': result = identity.sign(input.domain, bytes(input.data)); break;
-        case 'handshake':
-          handshake = new crypto.Handshake(input.initiator, identity.secretHex(), input.expected_peer_id, new TextEncoder().encode(input.context)); break;
+        case 'sign': result = await (await signer()).raw(crypto.signingMessage(input.domain, bytes(input.data))); break;
+        case 'attest': {
+          const own = await signer();
+          const payload = crypto.attestationPayload(input.network_id, input.scope_id, JSON.stringify(input.body));
+          result = { device_id: own.deviceId, signature: await own.raw(crypto.signingMessage('attestation', payload)) };
+          break;
+        }
+        case 'handshake': {
+          const own = await signer();
+          handshake?.free();
+          handshake = new crypto.Handshake(input.initiator, input.expected_device_id ?? undefined, new TextEncoder().encode(input.context));
+          handshake.setProof(own.deviceId, await own.raw(handshake.signingBytes()));
+          break;
+        }
         case 'write': result = hex(handshake.write(bytes(input.data))); break;
         case 'read': result = hex(handshake.read(bytes(input.data))); break;
         case 'remote': result = handshake.remoteId() ?? null; break;
@@ -139,19 +143,23 @@ async function selfTest() {
   async function pair(wrongIdentity = false) {
     const a = endpoint(); const b = native();
     const ai = await call(a, { op: 'identity' }); const bi = await call(b, { op: 'identity' });
-    await call(a, { op: 'handshake', initiator: true, expected_peer_id: wrongIdentity ? 'ab'.repeat(32) : bi.peer_id, context: 'vibeface:client:v1' });
-    await call(b, { op: 'handshake', initiator: false, expected_peer_id: ai.peer_id, context: 'vibeface:client:v1' });
+    await call(a, { op: 'handshake', initiator: true, expected_device_id: wrongIdentity ? crypto.Identity.generate().deviceId() : bi.device_id, context: 'vibeface:client:v1' });
+    await call(b, { op: 'handshake', initiator: false, expected_device_id: ai.device_id, context: 'vibeface:client:v1' });
     assert.equal(await call(a, { op: 'remote' }), null);
     assert.equal(await call(b, { op: 'read', data: await call(a, { op: 'write', data: '' }) }), '');
     const message2 = await call(b, { op: 'write', data: '' });
     if (wrongIdentity) { assert.equal((await a({ op: 'read', data: message2 })).ok, false); assert.equal((await a({ op: 'finish' })).ok, false); return; }
     assert.equal(await call(a, { op: 'read', data: message2 }), '');
     assert.equal(await call(b, { op: 'read', data: await call(a, { op: 'write', data: hex(Buffer.from('browser private hello')) }) }), hex(Buffer.from('browser private hello')));
-    assert.equal(await call(a, { op: 'remote' }), bi.peer_id);
-    assert.equal(await call(b, { op: 'remote' }), ai.peer_id);
+    assert.equal(await call(a, { op: 'remote' }), bi.device_id);
+    assert.equal(await call(b, { op: 'remote' }), ai.device_id);
     await call(a, { op: 'finish' }); await call(b, { op: 'finish' });
     const signature = await call(b, { op: 'sign', domain: 'client-challenge', data: '010203' });
-    crypto.verify(bi.public_key, 'client-challenge', bytes('010203'), signature);
+    crypto.verify(bi.device_id, 'client-challenge', bytes('010203'), signature);
+    const body = { type: 'message_posted', message_id: 'm1', role: 'user', text: 'hi', report_results: true };
+    const attestation = await call(a, { op: 'attest', network_id: bi.device_id, scope_id: 'c1', body });
+    assert.equal(attestation.device_id, ai.device_id);
+    crypto.verify(ai.device_id, 'attestation', crypto.attestationPayload(bi.device_id, 'c1', JSON.stringify(body)), attestation.signature);
     return { a, b };
   }
   try {
@@ -178,7 +186,7 @@ async function selfTest() {
     const cipher = bytes(await call(tamper.a, { op: 'seal', data: '010203' })); cipher[0] ^= 1;
     assert.equal((await tamper.b({ op: 'open', data: hex(cipher) })).ok, false);
     assert.equal((await tamper.b({ op: 'open', data: await call(tamper.a, { op: 'seal', data: '04' }) })).ok, false);
-    process.stdout.write(`${JSON.stringify({ ok: true, peer: nativePath ? 'native-rust' : 'wasm', checks: ['identity-binding', 'private-handshake', 'fragmented-message', 'domain-signature', 'wrong-identity', 'tamper', 'replay', 'fail-closed', 'recovery-native-wasm', 'recovery-wrong-password'] })}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: true, peer: nativePath ? 'native-rust' : 'wasm', checks: ['identity-binding', 'private-handshake', 'fragmented-message', 'domain-signature', 'attestation', 'wrong-identity', 'tamper', 'replay', 'fail-closed', 'recovery-native-wasm', 'recovery-wrong-password'] })}\n`);
   } finally { clearTimeout(timeout); for (const child of children) child.stdin.end(); }
 }
 

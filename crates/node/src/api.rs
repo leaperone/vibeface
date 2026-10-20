@@ -1,6 +1,5 @@
 use crate::{
     identity::local::BootstrapCapability,
-    pairing::{Invitation, JoinState, NodePairing},
     runtime::{Access, Runtime},
 };
 use anyhow::{Context, Result, ensure};
@@ -23,12 +22,23 @@ use tokio::net::TcpListener;
 
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
+const MAX_CLIENT_SOCKETS: usize = 256;
 
 #[derive(Clone)]
 struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
-    pairing: Arc<NodePairing>,
+    clients: Arc<tokio::sync::Semaphore>,
+}
+
+impl App {
+    fn new(node: Arc<Runtime>, sites: Vec<Site>) -> Self {
+        Self {
+            node,
+            sites,
+            clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -112,17 +122,26 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
     let listener = TcpListener::bind(node.config.listen).await?;
-    let local_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let local_url = format!("http://{}", local_listener.local_addr()?);
+    if node.config.public_entry {
+        return axum::serve(
+            listener,
+            browser_router(node.clone(), sites, false)
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(Into::into);
+    }
+    let local_listen = node.config.local_listen;
+    let local_listener = TcpListener::bind(local_listen).await.with_context(|| {
+        format!(
+            "端口 {} 被占用，可用 --local-listen 更换",
+            local_listen.port()
+        )
+    })?;
+    let local_url = format!("http://{local_listen}");
     node.local_access
-        .publish_listener(local_url.clone(), node.identity.peer_id()?)?;
-    let pairing = Arc::new(NodePairing::new(node.clone()));
-    let local = browser_router(
-        node.clone(),
-        vec![Site::parse(&local_url)?],
-        true,
-        pairing.clone(),
-    );
+        .publish_listener(local_url.clone(), node.identity.device_id()?)?;
+    let local = browser_router(node.clone(), vec![Site::parse(&local_url)?], true);
     let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let tool_url = format!("http://{}", tools.local_addr()?);
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
@@ -133,7 +152,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         async {
             axum::serve(
                 listener,
-                browser_router(node.clone(), sites, false, pairing)
+                browser_router(node.clone(), sites, false)
                     .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -157,11 +176,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 }
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
-    let app = App {
-        pairing: Arc::new(NodePairing::new(node.clone())),
-        node,
-        sites: vec![site],
-    };
+    let app = App::new(node, vec![site]);
     Router::new()
         .route("/api/tools", post(tool))
         .route(
@@ -190,32 +205,18 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    let pairing = Arc::new(NodePairing::new(node.clone()));
-    browser_router(node, sites, false, pairing)
+    browser_router(node, sites, false)
 }
 
-fn browser_router(
-    node: Arc<Runtime>,
-    sites: Vec<Site>,
-    local: bool,
-    pairing: Arc<NodePairing>,
-) -> Router {
-    let app = App {
-        sites,
-        node,
-        pairing,
-    };
+fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
+    let app = App::new(node, sites);
     let mut routes = Router::new()
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
         .route("/api/info", get(info))
         .route("/api/local/setup", post(local_setup))
-        .route("/api/local/join/request", post(local_join_request))
-        .route("/api/local/join/accept", post(local_join_accept))
-        .route("/api/local/join/status", post(local_join_status))
-        .route("/peer", get(peer))
-        .route("/api/network/ws", get(network))
+        .route("/api/client", get(client_gateway))
         .fallback(frontend);
     if local {
         routes = routes
@@ -292,19 +293,31 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    let site = if path == "/api/network/ws" && *method == Method::GET {
-        let host = one_header(headers, header::HOST.as_str()).ok_or_else(ApiError::forbidden)?;
-        app.sites
-            .iter()
-            .find(|site| host.eq_ignore_ascii_case(&site.authority))
-            .ok_or_else(ApiError::forbidden)?
+    let site = if path == "/api/client" && *method == Method::GET {
+        // Cross-origin by design: this Node's browser origins and those of the personal
+        // network's other Gateways, as their signed address records state them.
+        let site = host_site(&app.sites, headers)?;
+        if let Some(origin) = headers.get(header::ORIGIN) {
+            let origin = one_header(headers, header::ORIGIN.as_str())
+                .filter(|_| origin.to_str().is_ok())
+                .ok_or_else(ApiError::forbidden)?;
+            if !app
+                .sites
+                .iter()
+                .any(|site| site.origin.eq_ignore_ascii_case(origin))
+                && !app.node.member_gateway_origin(origin).await
+            {
+                return Err(ApiError::forbidden());
+            }
+        }
+        site
     } else {
         check_site(&app.sites, headers)?
     };
     if !http_site_allowed(site, app.node.config.allow_insecure_lan, ip) {
         return Err(ApiError::forbidden());
     }
-    if path == "/api/local/setup" || path.starts_with("/api/local/join/") {
+    if path == "/api/local/setup" {
         check_local_setup(site, headers, ip)?;
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
@@ -330,12 +343,16 @@ async fn check_boundary(
     Ok(())
 }
 
-fn check_site<'a>(sites: &'a [Site], headers: &HeaderMap) -> ApiResult<&'a Site> {
+fn host_site<'a>(sites: &'a [Site], headers: &HeaderMap) -> ApiResult<&'a Site> {
     let host = one_header(headers, header::HOST.as_str()).ok_or_else(ApiError::forbidden)?;
-    let site = sites
+    sites
         .iter()
         .find(|site| host.eq_ignore_ascii_case(&site.authority))
-        .ok_or_else(ApiError::forbidden)?;
+        .ok_or_else(ApiError::forbidden)
+}
+
+fn check_site<'a>(sites: &'a [Site], headers: &HeaderMap) -> ApiResult<&'a Site> {
+    let site = host_site(sites, headers)?;
     if headers.contains_key(header::ORIGIN)
         && !one_header(headers, header::ORIGIN.as_str())
             .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
@@ -386,7 +403,7 @@ async fn info(State(app): State<App>) -> Json<Value> {
 }
 
 async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     let network_id = if app.node.has_membership().await.map_err(ApiError::bad)? {
         Some(
             app.node
@@ -400,29 +417,29 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         None
     };
     let local_session = network_id.as_ref().and_then(|network_id| {
-        local_cookie(&headers, &peer_id).and_then(|cookie| {
+        local_cookie(&headers, &device_id).and_then(|cookie| {
             app.node
                 .local_access
-                .session(cookie, &peer_id, network_id)
+                .session(cookie, &device_id, network_id)
                 .ok()
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"subject_id":local_session.map(|session| session.subject_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"device_id":local_session.map(|session| session.device_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"local":true}}),
     ))
 }
 
 async fn local_launch(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let capability = bearer(&headers).ok_or_else(ApiError::auth)?;
     let state = app.node.membership_state().await.map_err(ApiError::bad)?;
-    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     let token = app
         .node
         .local_access
-        .issue(capability, &peer_id, &state.genesis.network_id)
+        .issue(capability, &device_id, &state.genesis.network_id)
         .map_err(|_| ApiError::auth())?;
     Ok(Json(
-        json!({"url":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"token":token}),
+        json!({"url":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"token":token}),
     ))
 }
 
@@ -430,17 +447,16 @@ async fn local_launch(State(app): State<App>, headers: HeaderMap) -> ApiResult<J
 #[serde(deny_unknown_fields)]
 struct LocalExchange {
     token: String,
-    peer_id: String,
-    subject_id: String,
-    public_key: String,
+    node_id: String,
+    device_id: String,
 }
 
 async fn local_exchange(
     State(app): State<App>,
     Json(input): Json<LocalExchange>,
 ) -> ApiResult<Response> {
-    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
-    if input.peer_id != peer_id {
+    let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
+    if input.node_id != device_id {
         return Err(ApiError::auth());
     }
     let state = app.node.membership_state().await.map_err(ApiError::bad)?;
@@ -449,18 +465,17 @@ async fn local_exchange(
         .local_access
         .exchange(
             &input.token,
-            &peer_id,
+            &device_id,
             &state.genesis.network_id,
-            &input.subject_id,
-            &input.public_key,
+            &input.device_id,
         )
         .map_err(|_| ApiError::auth())?;
-    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"peer_id":peer_id,"local":true},"network_id":state.genesis.network_id})).into_response();
+    let mut response = Json(json!({"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"local":true},"network_id":state.genesis.network_id})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
             "{}={cookie}; HttpOnly; SameSite=Strict; Path=/api/local; Max-Age={}",
-            crate::local_access::cookie_name(&peer_id),
+            crate::local_access::cookie_name(&device_id),
             crate::local_access::SESSION_SECONDS
         ))
         .map_err(ApiError::bad)?,
@@ -468,8 +483,8 @@ async fn local_exchange(
     Ok(response)
 }
 
-fn local_cookie<'a>(headers: &'a HeaderMap, peer_id: &str) -> Option<&'a str> {
-    let name = crate::local_access::cookie_name(peer_id);
+fn local_cookie<'a>(headers: &'a HeaderMap, device_id: &str) -> Option<&'a str> {
+    let name = crate::local_access::cookie_name(device_id);
     let mut cookies = one_header(headers, header::COOKIE.as_str())?
         .split(';')
         .filter_map(|cookie| cookie.trim().split_once('='))
@@ -483,14 +498,14 @@ async fn local_websocket(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
-    let cookie = local_cookie(&headers, &peer_id)
+    let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
+    let cookie = local_cookie(&headers, &device_id)
         .ok_or_else(ApiError::auth)?
         .to_owned();
     let state = app.node.membership_state().await.map_err(ApiError::bad)?;
     app.node
         .local_access
-        .session(&cookie, &peer_id, &state.genesis.network_id)
+        .session(&cookie, &device_id, &state.genesis.network_id)
         .map_err(|_| ApiError::auth())?;
     Ok(websocket
         .max_message_size(65535)
@@ -498,7 +513,7 @@ async fn local_websocket(
         .on_upgrade(move |socket| async move {
             if let Err(error) = crate::client::serve_local(
                 app.node,
-                crate::network::NetworkSocket::server(socket),
+                crate::client::ClientSocket::server(socket),
                 cookie,
             )
             .await
@@ -528,20 +543,20 @@ enum LocalSetup {
 #[derive(Serialize)]
 struct LocalLaunch {
     url: String,
-    peer_id: String,
+    device_id: String,
     token: String,
 }
 
 #[derive(Serialize)]
 struct LocalEntry {
     address: String,
-    peer_id: String,
+    device_id: String,
 }
 
 #[derive(Serialize)]
 struct BootstrapInvitation {
     url: String,
-    peer_id: String,
+    device_id: String,
     capability: String,
 }
 
@@ -550,8 +565,14 @@ async fn local_setup(
     headers: HeaderMap,
     Json(_): Json<LocalSetupRequest>,
 ) -> ApiResult<Json<LocalSetup>> {
+    if app.node.config.public_entry {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "a public entry has no local setup".into(),
+        ));
+    }
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
-    let peer_id = app.node.identity.peer_id().map_err(ApiError::bad)?;
+    let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     if app.node.has_membership().await.map_err(ApiError::bad)? {
         let local_launch = if app.node.local_access.enabled() {
             match app.node.local_access.origin() {
@@ -566,11 +587,11 @@ async fn local_setup(
                     let token = app
                         .node
                         .local_access
-                        .issue_from_local_setup(&peer_id, &network_id)
+                        .issue_from_local_setup(&device_id, &network_id)
                         .map_err(ApiError::bad)?;
                     Some(LocalLaunch {
                         url,
-                        peer_id: peer_id.clone(),
+                        device_id: device_id.clone(),
                         token,
                     })
                 }
@@ -582,7 +603,7 @@ async fn local_setup(
         return Ok(Json(LocalSetup::Initialized {
             entry: LocalEntry {
                 address: origin.into(),
-                peer_id,
+                device_id,
             },
             local_launch,
         }));
@@ -615,7 +636,7 @@ async fn local_setup(
     Ok(Json(LocalSetup::Uninitialized {
         invitation: BootstrapInvitation {
             url: origin.into(),
-            peer_id,
+            device_id,
             capability: capability.capability,
         },
     }))
@@ -623,54 +644,9 @@ async fn local_setup(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalJoinRequest {
-    invitation: String,
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LocalJoinAccept {
-    request_id: String,
-    review_hash: String,
-}
-
-async fn local_join_request(
-    State(app): State<App>,
-    Json(input): Json<LocalJoinRequest>,
-) -> ApiResult<Json<JoinState>> {
-    let invitation = Invitation::parse(&input.invitation).map_err(ApiError::bad)?;
-    app.pairing
-        .request(invitation, &input.name)
-        .await
-        .map(Json)
-        .map_err(ApiError::bad)
-}
-
-async fn local_join_accept(
-    State(app): State<App>,
-    Json(input): Json<LocalJoinAccept>,
-) -> ApiResult<Json<JoinState>> {
-    app.pairing
-        .accept(&input.request_id, &input.review_hash)
-        .await
-        .map(Json)
-        .map_err(ApiError::bad)
-}
-
-async fn local_join_status(
-    State(app): State<App>,
-    Json(_): Json<LocalSetupRequest>,
-) -> ApiResult<Json<JoinState>> {
-    app.pairing.status().await.map(Json).map_err(ApiError::bad)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ToolRequest {
     name: String,
     arguments: Value,
-    call_id: String,
 }
 
 async fn tool(
@@ -679,10 +655,10 @@ async fn tool(
     Json(input): Json<ToolRequest>,
 ) -> ApiResult<Json<Value>> {
     let access = bearer_access(&app, &headers).await?;
-    validate_tool_call(&input.name, &input.call_id)?;
+    validate_tool_call(&input.name)?;
     Ok(Json(
         app.node
-            .tool(access, &input.name, input.arguments, &input.call_id)
+            .tool(access, &input.name, input.arguments)
             .await
             .map_err(ApiError::bad)?,
     ))
@@ -693,7 +669,6 @@ async fn tool(
 struct ToolCallback {
     tool_name: String,
     args: Value,
-    tool_call_id: Option<String>,
     agent_id: String,
 }
 
@@ -708,71 +683,39 @@ async fn tool_callback(
             "args must be an object and agentId must be nonempty and bounded",
         ));
     }
-    let write = !matches!(
-        input.tool_name.as_str(),
-        "nodes" | "context" | "task_status" | "call_lookup"
-    );
-    let call_id = match input.tool_call_id {
-        Some(id) => id,
-        None if !write => uuid::Uuid::new_v4().to_string(),
-        None => {
-            return Err(ApiError::bad(
-                "write tool callbacks require a stable toolCallId",
-            ));
-        }
-    };
-    validate_tool_call(&input.tool_name, &call_id)?;
+    validate_tool_call(&input.tool_name)?;
     let result = app
         .node
-        .tool(access, &input.tool_name, input.args, &call_id)
+        .tool(access, &input.tool_name, input.args)
         .await
         .map_err(ApiError::bad)?;
     Ok(Json(json!({"result": result})))
 }
 
-fn validate_tool_call(name: &str, call_id: &str) -> ApiResult<()> {
-    if name.is_empty() || name.len() > 128 || call_id.is_empty() || call_id.len() > 256 {
-        return Err(ApiError::bad(
-            "tool name and call ID must be nonempty and bounded",
-        ));
+fn validate_tool_call(name: &str) -> ApiResult<()> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(ApiError::bad("tool name must be nonempty and bounded"));
     }
     Ok(())
 }
 
-async fn network(
-    State(app): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    websocket: WebSocketUpgrade,
-) -> Response {
-    let admission = match app.node.network.admit(peer.ip()) {
-        Ok(admission) => admission,
-        Err(error) => {
-            let status = if error.rate() {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            return (status, error.code()).into_response();
-        }
+async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
+    let Ok(permit) = app.clients.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many client connections",
+        )
+            .into_response();
     };
     websocket
         .max_message_size(65535)
         .max_frame_size(65535)
         .on_upgrade(move |socket| async move {
-            if let Err(error) = app.node.network.clone().accept(socket, admission).await {
-                tracing::debug!(%error, "network connection closed");
+            let socket = crate::client::ClientSocket::server(socket);
+            if let Err(error) = crate::client::serve_gateway(app.node, socket).await {
+                tracing::debug!(%error, "client connection closed");
             }
-        })
-}
-
-async fn peer(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
-    websocket
-        .max_message_size(MAX_BODY_BYTES)
-        .max_frame_size(MAX_BODY_BYTES)
-        .on_upgrade(move |socket| async move {
-            if let Err(error) = app.node.hub.clone().accept(socket).await {
-                tracing::warn!(%error, "peer connection closed");
-            }
+            drop(permit);
         })
 }
 
@@ -782,12 +725,7 @@ mod web_assets {
 
 async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     let path = uri.path();
-    if path == "/api"
-        || path.starts_with("/api/")
-        || path == "/peer"
-        || path.starts_with("/peer/")
-        || path.starts_with("/sdk.v1.")
-    {
+    if path == "/api" || path.starts_with("/api/") || path.starts_with("/sdk.v1.") {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     }
     if method != Method::GET && method != Method::HEAD {
@@ -795,12 +733,14 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     }
     if let Some(file) = web_assets::get(path) {
         let mut response = ([(header::CONTENT_TYPE, file.content_type)], file.body).into_response();
-        if path.starts_with("/assets/") {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
-        }
+        let cache = if path.starts_with("/assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
         return response;
     }
     if path == "/assets"
@@ -974,7 +914,8 @@ mod tests {
         use crate::{
             config::{self, Config},
             crypto::LocalIdentity,
-            identity::{Genesis, Member, NetworkState, NodeRole},
+            identity::{Genesis, Member, NetworkState},
+            model::NodeRole,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -987,7 +928,7 @@ mod tests {
         let mut config = Config::local(address, vec![], false);
         config.roles = vec![NodeRole::Relay];
         config.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -1019,7 +960,7 @@ mod tests {
             let first: Value = response.json().await?;
             assert_eq!(first["kind"], "uninitialized");
             assert_eq!(first["invitation"]["url"], origin);
-            assert_eq!(first["invitation"]["peer_id"], node.identity.peer_id()?);
+            assert_eq!(first["invitation"]["device_id"], node.identity.device_id()?);
             assert_eq!(first["invitation"]["capability"], capability.capability);
             assert_eq!(request().send().await?.json::<Value>().await?, first);
             assert_eq!(client.get(&endpoint).header(header::ORIGIN, &origin).send().await?.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -1027,54 +968,39 @@ mod tests {
             assert_eq!(client.post(&endpoint).json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(request().header("x-forwarded-for", "127.0.0.1").send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
-            for (path, input) in [
-                ("status", json!({})),
-                ("request", json!({"invitation":"invalid","name":"Mac mini"})),
-                ("accept", json!({"request_id":"request","review_hash":"00"})),
-            ] {
-                let endpoint = format!("{origin}/api/local/join/{path}");
-                assert_eq!(client.post(&endpoint).json(&input).send().await?.status(), StatusCode::FORBIDDEN);
-                assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header("x-forwarded-for", "127.0.0.1").json(&input).send().await?.status(), StatusCode::FORBIDDEN);
-                assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&input).send().await?.status(), StatusCode::FORBIDDEN);
-                assert_eq!(client.post(&endpoint).header(header::ORIGIN, &origin).header(header::CONTENT_TYPE, "text/plain").body("{}").send().await?.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-                let response = client.post(&endpoint).header(header::ORIGIN, &origin).json(&input).send().await?;
-                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-                if path == "status" { assert_eq!(response.json::<Value>().await?, json!({"kind":"idle"})); }
-                else { assert_eq!(response.status(), StatusCode::BAD_REQUEST); }
-            }
+            let removed = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?;
+            assert_eq!(removed.status(), StatusCode::NOT_FOUND);
             let public_info: Value = client.get(format!("{origin}/api/info")).send().await?.json().await?;
             assert!(!public_info.to_string().contains(&capability.capability));
             assert!(public_info.get("invitation").is_none());
             let root = LocalIdentity::generate();
             let admin = LocalIdentity::generate();
-            let state = NetworkState::new(Genesis::create(&root, vec![
+            let state = NetworkState::new(Genesis::create(
+                &root,
                 Member::client(&admin, "browser", true)?,
-                Member::node(&node.identity, "node", node.config.roles.clone())?,
-            ])?)?;
-            node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.peer_id()?)?;
+                Member::node(&node.identity, "node")?,
+            )?)?;
+            node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.device_id()?)?;
             let initialized: Value = request().send().await?.json().await?;
-            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"peer_id":node.identity.peer_id()?}}));
+            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?}}));
             assert!(!initialized.to_string().contains(&capability.capability));
             assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
             let local_origin = "http://127.0.0.1:4791";
-            node.local_access.publish_listener(local_origin.into(), node.identity.peer_id()?)?;
+            node.local_access.publish_listener(local_origin.into(), node.identity.device_id()?)?;
             let launched: Value = request().send().await?.json().await?;
             assert_eq!(launched["entry"], initialized["entry"]);
             assert_eq!(launched["local_launch"]["url"], local_origin);
-            assert_eq!(launched["local_launch"]["peer_id"], node.identity.peer_id()?);
+            assert_eq!(launched["local_launch"]["device_id"], node.identity.device_id()?);
             let token = launched["local_launch"]["token"].as_str().context("local token missing")?;
             assert!(token.len() == 64 && hex::decode(token).is_ok());
             let browser = LocalIdentity::generate();
             let network_id = node.membership_state().await?.genesis.network_id;
-            let cookie = node.local_access.exchange(token, &node.identity.peer_id()?, &network_id, &browser.peer_id()?, &browser.public_key_hex()?)?;
-            assert_eq!(node.local_access.session(&cookie, &node.identity.peer_id()?, &network_id)?.subject_id, browser.peer_id()?);
-            assert!(node.local_access.exchange(token, &node.identity.peer_id()?, &network_id, &browser.peer_id()?, &browser.public_key_hex()?).is_err());
+            let cookie = node.local_access.exchange(token, &node.identity.device_id()?, &network_id, &browser.device_id()?)?;
+            assert_eq!(node.local_access.session(&cookie, &node.identity.device_id()?, &network_id)?.device_id, browser.device_id()?);
+            assert!(node.local_access.exchange(token, &node.identity.device_id()?, &network_id, &browser.device_id()?).is_err());
             node.local_access.set_enabled(false)?;
             assert_eq!(request().send().await?.json::<Value>().await?, initialized);
-            assert!(node.local_access.session(&cookie, &node.identity.peer_id()?, &network_id).is_err());
-            let joined: Value = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?.json().await?;
-            assert_eq!(joined["kind"], "joined");
-            assert_eq!(joined["peer_id"], node.identity.peer_id()?);
+            assert!(node.local_access.session(&cookie, &node.identity.device_id()?, &network_id).is_err());
             Ok::<(), anyhow::Error>(())
         }.await;
         server.abort();
@@ -1092,7 +1018,7 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
-        assert!(validate_tool_call("send_task", "stable-call-id").is_ok());
-        assert!(validate_tool_call("send_task", "").is_err());
+        assert!(validate_tool_call("dispatch_work").is_ok());
+        assert!(validate_tool_call("").is_err());
     }
 }

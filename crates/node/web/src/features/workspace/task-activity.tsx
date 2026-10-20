@@ -13,37 +13,39 @@ import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
 import { approvalKind, approvalRisk, nodeName } from "./labels"
 import { ActionButton, SubmitButton } from "./present"
-import type { HumanRequest, NativeSessionRecord, PendingCheck } from "./types"
+import type { PendingCheck, WorkApproval, WorkRecord } from "./types"
 
 const decisionOf = (response: unknown) => response && typeof response === "object" ? (response as { decision?: unknown }).decision : undefined
 
 /** Shared by the chat stream, the task panel and /inbox; `stoppable` is off where the view has its own stop button. */
-export function ApprovalCard({ session, request, meta, stoppable = true }: { session: NativeSessionRecord; request: HumanRequest; meta?: ReactNode; stoppable?: boolean }) {
+export function ApprovalCard({ work, request, meta, stoppable = true }: { work: WorkRecord; request: WorkApproval; meta?: ReactNode; stoppable?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
-  const busy = busyGeneration === workspace.generation
-  const node = workspace.nodes.find((item) => item.peer_id === session.target_node)
-  const active = session.state === "running" || session.state === "waiting"
-  const disabled = !workspace.writable || !node?.online || Boolean(node.revoked) || !active || session.freshness !== "observed" || !session.can_control
+  const busy = busyGeneration === workspace.generation || request.answering === true
+  const node = workspace.nodes.find((item) => item.device_id === work.target_node)
+  const form = request.form
+  // Answer forms exist only where the work runs; the answer is signed by this browser's device key.
+  const active = work.state === "running" || work.state === "waiting_approval"
+  const disabled = !workspace.writable || !form || !active || busy
   const respond = (response: unknown) => async () => {
     if (disabled) return
-    await workspace.respondNative(session.work_id, session.target_node, request.request_id, response)
+    await workspace.answerApproval(work.work_id, request.request_id, response)
   }
-  const choice = (decision: string) => request.choices?.find((item) => decisionOf(item.response) === decision)
+  const choice = (decision: string) => form?.choices?.find((item) => decisionOf(item.response) === decision)
   const accept = choice("accept"), decline = choice("decline"), cancel = choice("cancel")
   const reject = decline ?? cancel
-  const questions = request.questions ?? []
+  const questions = form?.questions ?? []
   const secret = questions.some((question) => question.is_secret)
   const single = questions.length === 1 && questions[0].options?.length ? questions[0] : null
-  const risk = approvalRisk(request, node?.capabilities?.roots ?? [])
+  const risk = approvalRisk(form ?? {}, node?.capabilities?.roots ?? [])
   const elsewhere = secret ? "到执行设备上填写" : !questions.length && !accept && !reject ? "到执行设备上处理" : ""
 
   return <ActionCard
     icon={Hand}
     title={`需要你同意 · ${approvalKind(request)}`}
-    meta={meta ?? nodeName(session.target_node, { nodes: workspace.nodes, directory })}
+    meta={meta ?? nodeName(work.target_node, { nodes: workspace.nodes, directory })}
     menu={stoppable && decline && cancel ? <Popover.Root>
       <Popover.Trigger asChild><Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="更多" title="更多"><Ellipsis aria-hidden="true" /></Button></Popover.Trigger>
       <Popover.Portal><Popover.Content align="end" sideOffset={4} className="z-50 rounded-xl border bg-popover p-1 shadow-lg">
@@ -55,12 +57,13 @@ export function ApprovalCard({ session, request, meta, stoppable = true }: { ses
       {accept ? <ActionButton variant="default" disabled={disabled} action={respond(accept.response)}>同意一次</ActionButton> : null}
     </>}
   >
-    {request.command ? <code className="block whitespace-pre-wrap break-all rounded-lg bg-background/70 px-3 py-2 font-mono text-meta">{request.command}</code> : null}
-    {request.cwd ? <p className="break-all text-meta text-muted-foreground">在 {request.cwd}</p> : null}
+    {form?.command ? <code className="block whitespace-pre-wrap break-all rounded-lg bg-background/70 px-3 py-2 font-mono text-meta">{form.command}</code> : null}
+    {form?.cwd ? <p className="break-all text-meta text-muted-foreground">在 {form.cwd}</p> : null}
+    {!form ? <p className="whitespace-pre-line break-words text-meta">{request.summary}</p> : null}
     {risk ? <p className="flex items-center gap-1.5 text-meta font-medium text-warning"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{risk}</p> : null}
-    {request.files?.length ? <Details label={`会修改 ${request.files.length} 个文件`}>{request.files.map((file) => <span key={file} className="font-mono">{file}</span>)}</Details> : null}
-    {request.reason ? <p className="text-meta"><span className="text-muted-foreground">原因：</span>{request.reason}</p> : null}
-    {session.freshness !== "observed" ? <p role="status" className="text-meta text-muted-foreground">正在确认最新状态</p> : null}
+    {form?.files?.length ? <Details label={`会修改 ${form.files.length} 个文件`}>{form.files.map((file) => <span key={file} className="font-mono">{file}</span>)}</Details> : null}
+    {form?.reason ? <p className="text-meta"><span className="text-muted-foreground">原因：</span>{form.reason}</p> : null}
+    {request.answering ? <p role="status" className="text-meta text-muted-foreground">正在送达</p> : null}
     {elsewhere ? <p className="text-meta text-muted-foreground">{elsewhere}</p> : single ? <div className="grid gap-2">
       <p>{single.question}</p>
       <div className="flex flex-wrap gap-2">{single.options!.map((option) => <ActionButton key={option.label} disabled={disabled} action={respond({ answers: { [single.id]: { answers: [option.label] } } })}>{option.label}</ActionButton>)}</div>
@@ -117,19 +120,16 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   const [note, setNote] = useState("")
   const [summary, setSummary] = useState("")
   const disabled = !workspace.writable || !workspace.selectedBot
-  const native = check.kind === "native_turn"
-  const answer = (choice: string, outcome: string) => async () => {
-    const evidence = `用户在网页上选择：${choice}${note.trim() ? `。${note.trim()}` : ""}`
-    await workspace.resolveCheck(check, evidence, native ? outcome : undefined)
-  }
+  const native = check.kind === "work"
+  const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note) }
   return <ActionCard
     icon={CircleQuestionMark}
     title={`需要确认 · ${native ? "任务被打断" : "上次回复被打断"}`}
-    meta={nodeName(check.target_node, { nodes: workspace.nodes, directory })}
+    meta={nodeName(check.target_node ?? workspace.data?.local_node, { nodes: workspace.nodes, directory })}
     actions={<>
       <ActionButton variant="ghost" disabled={disabled} action={async () => { setSummary(""); setSummary(recheckSummary(await workspace.reconcileCheck(check))) }}>不确定，再查一次</ActionButton>
-      <ActionButton disabled={disabled} action={answer("没做完", "interrupted")}>没做完</ActionButton>
-      <ActionButton variant="default" disabled={disabled} action={answer("做完了", "completed")}>做完了</ActionButton>
+      <ActionButton disabled={disabled} action={answer("interrupted")}>没做完</ActionButton>
+      <ActionButton variant="default" disabled={disabled} action={answer("completed")}>做完了</ActionButton>
     </>}
   >
     <p>{checkReason(check)}{native ? "那个任务实际做完了吗？" : "那次要做的事实际做完了吗？"}</p>

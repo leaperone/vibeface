@@ -75,7 +75,8 @@ impl CodexClient {
     }
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<(), CodexError> {
-        let id = serde_json::from_value(id).map_err(|_| rejected("invalid native request id"))?;
+        let id: RpcId =
+            serde_json::from_value(id).map_err(|_| rejected("invalid native request id"))?;
         if serde_json::to_vec(&result)
             .map_err(|error| rejected(error.to_string()))?
             .len()
@@ -83,9 +84,14 @@ impl CodexClient {
         {
             return Err(rejected("native response is too large"));
         }
-        self.send(NativeCall::Respond { id, result })
-            .await
-            .map(|_| ())
+        self.send(NativeCall::Respond {
+            id: id.clone(),
+            result,
+        })
+        .await?;
+        // Only a sent answer settles the request; a failed send leaves it answerable.
+        self.cache.write().await.requests.remove(&id);
+        Ok(())
     }
 
     async fn send(&self, call: NativeCall) -> Result<Value, CodexError> {
@@ -576,8 +582,7 @@ async fn run_session(
                     continue;
                 }
                 if let NativeCall::Respond { id: request_id, result: response } = &execute.call {
-                    let pending = cache.write().await.requests.remove(request_id);
-                    if pending.is_none() {
+                    if !cache.read().await.requests.contains_key(request_id) {
                         let _ = execute.reply.send(Err(rejected("request is unknown or already resolved")));
                     } else {
                         let message = Message::Text(json!({"id":request_id,"result":response}).to_string().into());

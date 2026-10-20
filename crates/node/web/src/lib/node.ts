@@ -1,11 +1,12 @@
 import { validEndpoint, validTarget } from '../../transport.js'
 import type { ChangedEvent } from './progress'
+import { humanError } from './errors'
 
-export type ConnectionEntry = { address: string; peer_id: string; local?: boolean }
-export type PublicIdentity = { peerId: string; publicKey: string }
-export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
+export type ConnectionEntry = { address: string; device_id: string; local?: boolean }
+export type PublicIdentity = { deviceId: string }
+export type ClientPrincipal = { network_id: string; device_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler'
-export type EntryInfo = { peer_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean; connection_entry?: ConnectionEntry }
+export type EntryInfo = { device_id: string; name: string; version: string; roles: NodeRole[]; initialized: boolean; network_id: string | null; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
   readonly generation: number
   entry: ConnectionEntry
@@ -15,16 +16,19 @@ export type ReadyConnection = {
   rpc(method: string, params?: Record<string, unknown>): Promise<unknown>
   subscribe(listener: (event: ChangedEvent) => void): () => void
   isCurrent(): boolean
+  /** The entry has not yet seen everything this page showed; keep what is on screen meanwhile. */
+  catchingUp?(): boolean
 }
-export type Member = { subject_id: string; public_key: string; kind: 'node' | 'client'; name: string; node_roles: NodeRole[]; manage: boolean }
-export type MembershipView = { network_id: string; epoch: number; heads: string[]; members: Member[]; revoked: string[] }
-export type PairReview = { version: number; invite_id: string; network_id: string; inviter_subject_id: string; new_member: Member; proposal_hash: string; parents: string[]; epoch: number; expires_at_ms: number }
-export type PairReceipt = { request_id: string; review: PairReview; new_subject_signature: string }
-export type Signing = { domain: string; payload: string }
-export type WaitingPair = { request_id: string; network_id: string; entry: ConnectionEntry; review: PairReview; signing: Signing; accepted: boolean }
-export type Invitation = { kind: 'bootstrap'; entry: ConnectionEntry; capability: string } | { kind: 'pair' | 'node'; entry: ConnectionEntry; invite: Record<string, unknown>; capability: string; payload: Record<string, unknown> }
-export type LocalSetup = { kind: 'uninitialized'; invitation: Extract<Invitation, { kind: 'bootstrap' }> } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; peer_id: string; token: string } }
-export type LocalJoin = { kind: 'idle' } | { kind: 'review' | 'pending'; request_id: string; review: PairReview; review_hash: string } | { kind: 'joined'; network_id: string; peer_id: string } | { kind: 'uncertain'; request_id: string; message: string }
+export type Member = { device_id: string; kind: 'node' | 'client'; name: string; manage: boolean }
+export type Revocation = { device_id: string; cutoff_seq: number }
+export type MembershipView = { network_id: string; epoch: number; heads: string[]; members: Member[]; revoked: Revocation[] }
+export type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'expired'
+/** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
+export type JoinRequest = {
+  join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
+  admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
+}
+export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; device_id: string; token: string } }
 export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string; node_bin: string; codex_sdk_script: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type NodeSettingsResponse = {
@@ -51,83 +55,77 @@ export function roles(value: unknown): NodeRole[] {
 }
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')
-  const entry = { address: validEndpoint(text(v.address)), peer_id: validTarget(v.peer_id) }
+  const entry = { address: validEndpoint(text(v.address)), device_id: validTarget(v.device_id) }
   if (v.local === true) {
     if (entry.address !== location.origin) throw new Error('本机打开时只能连这台电脑。')
     return { ...entry, local: true }
   }
   return entry
 }
-export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.peer_id}:${entry.local === true}`
+export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.device_id}:${entry.local === true}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
-  return { peer_id: validTarget(v.peer_id), public_key: validTarget(v.public_key), version: text(v.version), roles: roles(v.roles), initialized: boolean(v.initialized), ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }) }
+  const initialized = boolean(v.initialized)
+  return {
+    device_id: validTarget(v.device_id), name: text(v.name), version: text(v.version), roles: roles(v.roles), initialized,
+    network_id: initialized ? validTarget(v.network_id) : null,
+    ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }),
+  }
 }
 export function parseMember(value: unknown): Member {
   const v = record(value)
   if (v.kind !== 'node' && v.kind !== 'client') throw new Error('设备类型无效。')
-  const member: Member = { subject_id: validTarget(v.subject_id), public_key: validTarget(v.public_key), kind: v.kind, name: text(v.name), node_roles: roles(v.node_roles), manage: boolean(v.manage) }
-  if ((member.kind === 'node' && member.manage) || (member.kind === 'client' && member.node_roles.length)) throw new Error('设备权限无效。')
+  const member: Member = { device_id: validTarget(v.device_id), kind: v.kind, name: text(v.name), manage: boolean(v.manage) }
+  if (member.kind === 'node' && member.manage) throw new Error('设备权限无效。')
   return member
 }
+function cutoff(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('撤销记录无效。'); return value }
 export function parseView(value: unknown): MembershipView {
   const v = record(value)
-  return { network_id: validTarget(v.network_id), epoch: integer(v.epoch), heads: strings(v.heads), members: array(v.members).map(parseMember), revoked: strings(v.revoked) }
+  return {
+    network_id: validTarget(v.network_id), epoch: integer(v.epoch), heads: strings(v.heads), members: array(v.members).map(parseMember),
+    revoked: array(v.revoked).map(item => { const r = record(item); return { device_id: validTarget(r.device_id), cutoff_seq: cutoff(r.cutoff_seq) } }),
+  }
 }
 export function parsePrincipal(value: unknown): ClientPrincipal {
   const v = record(value)
-  const principal = { network_id: validTarget(v.network_id), subject_id: validTarget(v.subject_id), epoch: integer(v.epoch) }
+  const principal = { network_id: validTarget(v.network_id), device_id: validTarget(v.device_id), epoch: integer(v.epoch) }
   if (v.source === 'local_session') {
     if (v.can_manage !== false) throw new Error('本机会话不能取得设备管理权限。')
     return { ...principal, source: 'local_session', can_manage: false }
   }
-  if (v.source !== undefined && v.source !== 'membership') throw new Error('设备返回了未知授权来源。')
+  if (v.source !== 'membership') throw new Error('设备返回了未知授权来源。')
   return { ...principal, source: 'membership', can_manage: boolean(v.can_manage) }
 }
-export function parseReview(value: unknown): PairReview {
-  const v = record(value)
-  const review = { version: integer(v.version), invite_id: text(v.invite_id), network_id: validTarget(v.network_id), inviter_subject_id: validTarget(v.inviter_subject_id), new_member: parseMember(v.new_member), proposal_hash: validTarget(v.proposal_hash), parents: strings(v.parents), epoch: integer(v.epoch), expires_at_ms: integer(v.expires_at_ms) }
-  if (review.version !== 1 || review.new_member.manage) throw new Error('普通配对不能授予管理权限。')
-  return review
-}
-export function parseSigning(value: unknown): Signing { const v = record(value); return { domain: text(v.domain), payload: text(v.payload) } }
-export function parsePairReceipt(value: unknown): PairReceipt {
-  const v = record(value)
-  if (typeof v.new_subject_signature !== 'string') throw new Error('加入确认没通过校验。')
-  return { request_id: text(v.request_id), review: parseReview(v.review), new_subject_signature: v.new_subject_signature }
-}
-export function parseInvitation(value: unknown): Invitation {
-  const v = record(value, '邀请')
-  const entry = parseEntry({ address: v.url, peer_id: v.peer_id })
-  if (typeof v.capability === 'string' && !v.invite && !v.payload) return { kind: 'bootstrap', entry, capability: text(v.capability) }
-  const envelope = record(v.invite, '配对邀请')
-  const invite = record(envelope.invite, '配对授权')
-  const payload = record(invite.payload, '邀请权限')
-  if (payload.new_kind !== 'client' && payload.new_kind !== 'node') throw new Error('邀请设备类型无效。')
-  const nodeRoles = roles(payload.node_roles)
-  if (payload.manage !== false || payload.new_kind === 'client' && nodeRoles.length || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请已过期或权限无效。请创建新邀请。')
-  validTarget(payload.network_id)
-  return { kind: payload.new_kind === 'node' ? 'node' : 'pair', entry, invite, capability: text(envelope.capability), payload }
+const hex32 = (value: unknown) => value === null || value === undefined ? null : validTarget(value)
+export function parseJoinRequest(value: unknown): JoinRequest {
+  const v = record(value, '加入请求')
+  if (!['pending', 'confirming', 'joined', 'rejected', 'expired'].includes(v.status as string)) throw new Error('加入状态无效。')
+  if (v.kind !== 'node' && v.kind !== 'client') throw new Error('设备类型无效。')
+  if (typeof v.invite_id !== 'string' || !/^[a-f0-9]{32}$/.test(v.invite_id)) throw new Error('邀请编号无效。')
+  return {
+    join_id: text(v.join_id), status: v.status as JoinStatus, network_id: validTarget(v.network_id), invite_id: v.invite_id, device_id: validTarget(v.device_id),
+    kind: v.kind, name: text(v.name), commit: validTarget(v.commit), admin_id: hex32(v.admin_id), admin_nonce: hex32(v.admin_nonce), joiner_nonce: hex32(v.joiner_nonce),
+    reason: typeof v.reason === 'string' ? v.reason : null, expires_at_ms: integer(v.expires_at_ms),
+  }
 }
 export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
   const v = record(value, '本机设置')
   let setup: LocalSetup
   if (v.kind === 'uninitialized') {
-    const invitation = parseInvitation(v.invitation)
-    if (invitation.kind !== 'bootstrap') throw new Error('本机设置返回了不同用途的邀请。')
-    setup = { kind: 'uninitialized', invitation }
+    const invitation = record(v.invitation, '本机初始化')
+    setup = { kind: 'uninitialized', entry: parseEntry({ address: invitation.url, device_id: invitation.device_id }), capability: validTarget(invitation.capability) }
   } else if (v.kind === 'initialized') {
     const entry = parseEntry(v.entry)
     setup = { kind: 'initialized', entry }
     if (v.local_launch !== undefined) {
-      const launch = record(v.local_launch), url = new URL(text(launch.url)), peer_id = validTarget(launch.peer_id), token = text(launch.token)
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || peer_id !== entry.peer_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这台电脑对不上。')
-      setup.local_launch = { url: url.origin, peer_id, token }
+      const launch = record(v.local_launch), url = new URL(text(launch.url)), device_id = validTarget(launch.device_id), token = text(launch.token)
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || device_id !== entry.device_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这台电脑对不上。')
+      setup.local_launch = { url: url.origin, device_id, token }
     }
   }
   else throw new Error('本机设置状态无效。')
-  const entry = setup.kind === 'uninitialized' ? setup.invitation.entry : setup.entry
-  if (entry.address !== origin || entry.local) throw new Error('本机设置和当前页面对不上。')
+  if (setup.entry.address !== origin || setup.entry.local) throw new Error('本机设置和当前页面对不上。')
   return setup
 }
 export function parseNodeSettings(value: unknown): NodeSettingsResponse {
@@ -145,22 +143,6 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)), scheduler_available: boolean(readiness.scheduler_available) },
   }
 }
-export function parseLocalJoin(value: unknown, entry: ConnectionEntry): LocalJoin {
-  const v = record(value, '加入状态')
-  if (v.kind === 'idle') return { kind: 'idle' }
-  if (v.kind === 'joined') {
-    const peer_id = validTarget(v.peer_id)
-    if (peer_id !== entry.peer_id) throw new Error('加入结果和这台电脑对不上。')
-    return { kind: 'joined', peer_id, network_id: validTarget(v.network_id) }
-  }
-  if (v.kind === 'uncertain') return { kind: 'uncertain', request_id: text(v.request_id), message: text(v.message) }
-  if (v.kind === 'review' || v.kind === 'pending') {
-    const review = parseReview(v.review)
-    if (review.new_member.kind !== 'node' || review.new_member.subject_id !== entry.peer_id) throw new Error('加入确认和这台电脑对不上。')
-    return { kind: v.kind, request_id: text(v.request_id), review, review_hash: validTarget(v.review_hash) }
-  }
-  throw new Error('加入状态格式不对。')
-}
 export function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value)
@@ -169,16 +151,7 @@ export function canonical(value: unknown): string {
   throw new Error('待确认的内容格式不对。')
 }
 export function same(left: unknown, right: unknown): boolean { return canonical(left) === canonical(right) }
-export function signingPayload(value: unknown, domain: string, expected: unknown): string {
-  const signing = parseSigning(value)
-  if (signing.domain !== domain || signing.payload.length > 262144 || signing.payload !== canonical(expected)) throw new Error('待确认的内容和这台设备对不上，已停止。')
-  return signing.payload
-}
-export async function digest(value: unknown): Promise<string> {
-  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(value)))
-  return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('')
-}
-export const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error)
+export const messageOf = (error: unknown) => error instanceof Error ? humanError(error.message, (error as { code?: unknown }).code) : humanError(String(error))
 export function deviceName(value: string): string {
   const name = value.trim()
   if (!name || new TextEncoder().encode(name).length > 128 || /[\u0000-\u001f\u007f]/.test(name)) throw new Error('设备名称需要 1 至 128 字节，不能包含控制字符。')

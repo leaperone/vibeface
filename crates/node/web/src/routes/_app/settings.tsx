@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { ArchiveRestore, Bell, Globe, LogOut, Palette } from 'lucide-react'
+import { ArchiveRestore, Bell, Download, Globe, LifeBuoy, LogOut, Palette } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
 import { ConnectionSettings } from '@/features/identity/device-controls'
@@ -36,6 +36,11 @@ function SettingsPage() {
       <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5" />恢复</h2>
       <RecoveryControls />
     </section> : null}
+    {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
+      <h2 className="flex items-center gap-2 text-heading font-semibold"><LifeBuoy aria-hidden="true" className="size-5" />排障</h2>
+      <p className="text-muted-foreground">诊断包里没有密钥和邀请，可以发给帮你排查的人。</p>
+      <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics())) }}><Download aria-hidden="true" />导出诊断包</Button>
+    </section> : null}
     <section className="grid gap-3 border-t pt-6">
       {leaving ? <>
         <p>断开后，要重新打开本机页面或用加入链接才能回来。</p>
@@ -46,4 +51,13 @@ function SettingsPage() {
       </> : <Button type="button" variant="ghost" className="w-fit text-muted-foreground" onClick={() => setLeaving(true)}><LogOut aria-hidden="true" />断开这个浏览器</Button>}
     </section>
   </div>
+}
+
+function saveDiagnostics(bundle: unknown) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `vibeface-diagnostics-${new Date().toLocaleDateString('sv')}.json`
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
 import { useWorkspace } from '@/features/workspace/context'
+import { humanError } from '@/lib/errors'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ApprovalCard, ConfirmCard } from '@/features/workspace/task-activity'
 import { approvalKind, decisionLabel, nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
-import type { AnsweredRequest, AutonomyMode, ManagerJob, NativeSessionRecord } from '@/features/workspace/types'
+import type { AutonomyMode, ManagerJob, WorkAnswer, WorkRecord } from '@/features/workspace/types'
 import { Chat, type ChatEntry } from './elements/chat'
 import { Message, type ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
@@ -26,11 +27,11 @@ export function ConversationScreen() {
   const { directory } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
   const [sendError, setSendError] = useState<unknown>(null)
+  const [files, setFiles] = useState<File[]>([])
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
-  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.peer_id
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const pendingChecks = data?.pending_checks ?? []
@@ -46,15 +47,14 @@ export function ConversationScreen() {
   const interruptedRow = (reply: (typeof workspace.interrupted)[number]): ChatMessage => ({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: 0, state: 'interrupted' })
 
   // Tasks and the approvals answered inside them sit right after the message that started them.
-  const sessions = data?.native_sessions ?? []
-  const tasks: TaskRow[] = (data?.agent_tasks ?? []).map((task) => ({ id: task.task_ref, state: task.state as string, device: task.target_node, summary: task.text, trigger: task.origin_trigger, sessions: sessions.filter((session) => session.task_ref === task.task_ref) }))
-    .concat(sessions.filter((session) => !session.task_ref || !data?.agent_tasks.some((task) => task.task_ref === session.task_ref)).map((session) => ({ id: session.work_id, state: shownState(session), device: session.target_node, summary: session.detail, trigger: session.origin_trigger ?? '', sessions: [session] })))
-  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'pending_check' || task.state === 'unknown')
+  const works = data?.works ?? []
+  const tasks: TaskRow[] = works.map((work) => ({ id: work.work_id, state: shownState(work), device: work.target_node, summary: work.summary, trigger: work.trigger, work }))
+  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'unverified')
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
     const rows = bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} open={openTasks.includes(task)} /> }] : []
-    for (const session of task.sessions) for (const answer of session.answered_requests ?? []) rows.push({ key: `answered:${session.work_id}:${answer.request_id}`, node: <AnsweredLine answer={answer} /> })
+    for (const answer of task.work.answered_approvals) rows.push({ key: `answered:${task.id}:${answer.request_id}`, node: <AnsweredLine answer={answer} /> })
     return rows
   }
 
@@ -73,7 +73,10 @@ export function ConversationScreen() {
   if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
   for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
 
-  const approvals = sessions.flatMap((session) => session.pending_requests.map((request) => ({ session, request, key: `${session.target_node}:${session.work_id}:${request.request_id}` })))
+  const owner = data?.conversation?.owner
+  const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
+  const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
+  const approvals = works.flatMap((work) => work.open_approvals.map((request) => ({ work, request, key: `${work.work_id}:${request.request_id}` })))
   const needsConfirm = pendingChecks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p> })
@@ -83,19 +86,23 @@ export function ConversationScreen() {
     messagePending && !messageBusy ? <ActionCard key="undelivered" icon={MessageSquareWarning} title="消息可能没送达" actions={<>
       <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
       <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
-      <ActionButton variant="default" disabled={!workspace.writable || !originalEntry || workspace.incomplete} action={async () => {
+      <ActionButton variant="default" disabled={!workspace.writable || workspace.incomplete} action={async () => {
         if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
       }}>重新发送</ActionButton>
     </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
-    ...pendingChecks.map((check) => <ConfirmCard key={`${check.target_node}:${check.check_id}`} check={check} />),
-    ...approvals.map(({ session, request, key }) => <ApprovalCard key={key} session={session} request={request} />),
+    ownerAway && owner ? <ActionCard key="owner" icon={ArrowRightLeft} title={`${nodeName(owner, lookup)} 离线了，这个对话在等它`} actions={
+      <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
+    }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
+    ...pendingChecks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
+    ...approvals.map(({ work, request, key }) => <ApprovalCard key={key} work={work} request={request} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
   const managerOffline = workspace.nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager)
   const hint = !workspace.connectionOnline ? '离线，恢复后可发送'
+    : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
-    : messagePending ? (!originalEntry ? '这条消息要回到原来的设备上处理' : '上一条消息还没确认送达')
+    : messagePending ? '上一条消息还没确认送达'
     : needsConfirm ? '先处理上面这件事'
     : bot && !agentReady ? (managerOffline ? '能运行助手的设备离线了' : '暂时没有能运行助手的设备')
     : bot ? composerHint(gate) : ''
@@ -147,10 +154,12 @@ export function ConversationScreen() {
         busy={messageBusy}
         onStop={stopJob && workspace.writable && bot ? () => { setSendError(null); workspace.cancelManager(stopJob.trigger).catch(setSendError) } : undefined}
         onChange={setText}
+        files={files}
+        onFiles={setFiles}
         onSubmit={() => {
           if (sendDisabled || !text.trim()) return
           setSendError(null)
-          workspace.sendMessage(text).then((sent) => { if (sent && workspace.isCurrent()) clearSentDraft(conversationId, text) }).catch(setSendError)
+          workspace.sendMessage(text, files).then((sent) => { if (sent && workspace.isCurrent()) { clearSentDraft(conversationId, text); setFiles([]) } }).catch(setSendError)
         }}
       >
         <InlineError error={sendError} />
@@ -172,29 +181,31 @@ export function ConversationScreen() {
   )
 }
 
-type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; sessions: NativeSessionRecord[] }
+type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; work: WorkRecord }
 
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string; device: string; open: boolean }) {
-  const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'cancelled'
-  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
-    {failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0 truncate">任务 · {device} · {taskLabel(task.state)}</span>
+  const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'rejected'
+  const result = (task.work.result_text || task.work.failure_reason || '').split('\n')[0]
+  const title = task.work.title || '任务'
+  // The reason wraps on its own line, so a phone shows why a task stopped.
+  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+    {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
+    <span className="min-w-0"><span className="block truncate">{title} · {device} · {taskLabel(task.state)}</span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
     <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-    <span className="min-w-0 flex-1 truncate"><span className="font-medium">任务</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
+    <span className="min-w-0 flex-1 truncate"><span className="font-medium">{title}</span><span className="text-muted-foreground"> · {device} · {taskLabel(task.state)}</span>{task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
   </Link>
 }
 
-function AnsweredLine({ answer }: { answer: AnsweredRequest }) {
-  const agreed = answer.decision === 'accept' || answer.decision === 'answer'
+function AnsweredLine({ answer }: { answer: WorkAnswer }) {
+  const agreed = answer.decision === 'accept' || answer.decision === 'answered'
   return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
     {agreed ? <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /> : <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />}
-    <span className="min-w-0 flex-1 truncate">{decisionLabel(answer.decision)} · {approvalKind(answer)}{answer.command ? <span className="font-mono"> {answer.command}</span> : null}</span>
-    <time className="shrink-0 tabular-nums" dateTime={new Date(answer.at_ms).toISOString()}>{new Date(answer.at_ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
+    <span className="min-w-0 flex-1 truncate">{decisionLabel(answer.decision)} · {approvalKind(answer)}</span>
   </p>
 }
 
@@ -202,6 +213,6 @@ function JobLine({ job }: { job: ManagerJob }) {
   return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-danger">
     <CircleX aria-hidden="true" className="size-4 shrink-0" />
     <span className="shrink-0">{replyStates[job.state] ?? '回复失败'}</span>
-    {job.error ? <span className="min-w-0 truncate" title={job.error}>{job.error.split('\n')[0]}</span> : null}
+    {job.error ? <span className="min-w-0 truncate" title={job.error}>{humanError(job.error.split('\n')[0])}</span> : null}
   </p>
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::Url;
 use serde_json::{Value, json};
 use std::{
@@ -14,12 +14,12 @@ use std::{
 use vibeface::{
     api,
     config::{self, Config, ManagerSettings},
-    crypto::LocalIdentity,
+    crypto::{LocalIdentity, random_hex},
     identity::local::BootstrapCapability,
     local_access::Launcher,
     maintenance,
-    network::NetworkConfig,
-    pairing::{Invitation, JoinState, NodePairing, network_url},
+    model::NodeRole,
+    net::{self, NetworkConfig, PublicEntry},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -39,9 +39,6 @@ struct Cli {
     /// Data directory for direct startup. Subcommands accept their own --data-dir.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Discovery or relay endpoints for direct startup. May be repeated.
-    #[arg(long = "bootstrap-url", value_name = "URL")]
-    bootstrap_urls: Vec<String>,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -56,12 +53,12 @@ enum Action {
     Status(Access),
     /// Manage this user's installed node service and update timer.
     Service(service::Service),
-    /// Display this node's trusted bootstrap or local browser entry.
+    /// Display this node's local browser entry.
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
-    /// Join a personal network using its invite and pinned Peer ID.
-    Pair(Pair),
+    /// Join a personal network with an invite link from a management device.
+    Join(Join),
     /// Call a node tool from a locally managed SDK process.
     Tool {
         name: String,
@@ -83,9 +80,6 @@ struct DataDir {
 struct Serve {
     #[command(flatten)]
     data: DataDir,
-    /// Override discovery or relay endpoints for this run. May be repeated.
-    #[arg(long = "bootstrap-url", value_name = "URL")]
-    bootstrap_urls: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -111,6 +105,9 @@ struct Init {
     data: DataDir,
     #[arg(long, default_value_t = DEFAULT_LISTEN)]
     listen: SocketAddr,
+    /// Loopback address of this device's own browser session.
+    #[arg(long, default_value_t = config::DEFAULT_LOCAL_LISTEN)]
+    local_listen: SocketAddr,
     #[arg(long)]
     public_url: Option<String>,
     /// Additional browser origins allowed to reach this node. May be repeated.
@@ -119,9 +116,6 @@ struct Init {
     /// Existing project directories available to this device's Agent. May be repeated.
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
-    /// Serve Web and public discovery/relay without joining a personal network or starting an Agent.
-    #[arg(long, conflicts_with_all = ["manager", "roots", "codex_socket"])]
-    relay_only: bool,
     /// Require ordinary device pairing for local browser access.
     #[arg(long)]
     no_local_auto_access: bool,
@@ -143,17 +137,31 @@ struct Init {
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
-    /// Discovery or relay endpoints to save in the configuration. May be repeated.
-    #[arg(long = "bootstrap-url", value_name = "URL")]
-    bootstrap_urls: Vec<String>,
-    /// Reachable WebSocket addresses published for this Node. May be repeated.
-    #[arg(long = "advertise-url")]
-    advertise_urls: Vec<String>,
+    /// iroh relay of another Node in the personal network, e.g. `https://relay.example`. May be repeated.
+    #[arg(long = "relay", value_name = "URL")]
+    relays: Vec<String>,
+    /// Run an iroh relay for the personal network on this address.
+    #[arg(long, value_name = "ADDR")]
+    relay_listen: Option<SocketAddr>,
+    /// The relay's URL as other Nodes reach it; defaults to `http://<relay-listen>`.
+    #[arg(long, value_name = "URL", requires = "relay_listen")]
+    relay_url: Option<String>,
+    /// Reach other Nodes only through relays, as behind a strict NAT.
     #[arg(long)]
-    mdns: bool,
-    /// Offer bounded encrypted forwarding to other personal networks.
-    #[arg(long)]
-    public_relay: bool,
+    relay_paths_only: bool,
+    /// Serve only the web app, a relay and ciphertext forwarding for other people's Nodes;
+    /// this Node never joins a personal network.
+    #[arg(long, requires = "relay_listen", conflicts_with_all = ["manager", "roots", "entry"])]
+    public_entry: bool,
+    /// Public entry that browsers use to reach this Node, e.g. `https://vb.example`.
+    #[arg(long, value_name = "URL", requires = "relay_token_file")]
+    entry: Option<String>,
+    /// The public entry's relay when it is not on the entry's own origin.
+    #[arg(long, value_name = "URL", requires = "entry")]
+    entry_relay: Option<String>,
+    /// File holding the public entry's operator token (`entry-token` in its data directory).
+    #[arg(long, value_name = "PATH", requires = "entry")]
+    relay_token_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -165,80 +173,71 @@ struct Access {
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("invitation").required(true).args(["invite_file", "invite"])))]
-struct Pair {
+struct Join {
+    /// Invite link, `https://<gateway>/join#vibeface1…`.
+    link: String,
     #[command(flatten)]
     data: DataDir,
+    /// Device name shown to the network; defaults to this machine's host name.
     #[arg(long)]
-    invite_file: Option<PathBuf>,
-    /// Base64url encoded invitation copied from a trusted management client.
-    #[arg(long)]
-    invite: Option<String>,
-    #[arg(long, default_value = "Node")]
-    name: String,
-}
-
-impl Cli {
-    fn normalize_bootstrap_urls(&mut self) -> Result<()> {
-        let urls = match &mut self.command {
-            None => &mut self.bootstrap_urls,
-            Some(Action::Serve(options)) => &mut options.bootstrap_urls,
-            Some(Action::Init(options)) => &mut options.bootstrap_urls,
-            _ => return Ok(()),
-        };
-        for url in urls {
-            *url = network_url(url)?;
-        }
-        Ok(())
-    }
+    name: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
-    let mut cli = Cli::parse();
-    cli.normalize_bootstrap_urls()?;
+    let cli = Cli::parse();
     let command = match cli.command {
         Some(command) => command,
         None => {
             let data_dir = cli.data_dir.unwrap_or_else(config::default_dir);
-            prepare_start(&data_dir, &cli.bootstrap_urls)?;
+            if !data_dir.join("config.json").exists() {
+                check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
+            }
+            prepare_start(&data_dir)?;
             Action::Serve(Serve {
                 data: DataDir { data_dir },
-                bootstrap_urls: cli.bootstrap_urls,
             })
         }
     };
+    logging(match &command {
+        Action::Serve(options) => Some(&options.data.data_dir),
+        _ => None,
+    });
     match command {
-        Action::Init(options) => init(*options),
+        Action::Init(options) => {
+            check_ports(options.listen, options.local_listen)?;
+            init(*options)
+        }
         Action::Serve(options) => {
-            let runtime = Arc::new(
-                Runtime::open_with_bootstrap_urls(&options.data.data_dir, &options.bootstrap_urls)
-                    .await?,
-            );
+            let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
             runtime.start().await?;
             eprintln!("Web: {}", runtime.config.public_url);
-            if runtime.config.listen.ip().is_loopback()
-                || runtime.config.listen.ip().is_unspecified()
+            if !runtime.config.public_entry
+                && (runtime.config.listen.ip().is_loopback()
+                    || runtime.config.listen.ip().is_unspecified())
             {
                 eprintln!(
                     "Local setup: http://localhost:{}",
                     runtime.config.listen.port()
                 );
             }
-            tokio::select! {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let result = tokio::select! {
                 result = api::serve(runtime.clone()) => result,
-                result = maintenance::serve(runtime, options.data.data_dir) => result,
-            }
+                result = maintenance::serve(runtime.clone(), options.data.data_dir) => result,
+                _ = terminate.recv() => Ok(()),
+                _ = tokio::signal::ctrl_c() => Ok(()),
+            };
+            // The App Server group must not outlive the Node that manages it.
+            runtime.shutdown().await;
+            result
         }
         Action::Access(options) => access(options).await,
         Action::Status(options) => status(options).await,
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
-        Action::Pair(options) => pair(options).await,
+        Action::Join(options) => join(options).await,
         Action::Tool {
             name,
             json,
@@ -247,7 +246,51 @@ async fn main() -> Result<()> {
     }
 }
 
-fn prepare_start(dir: &Path, bootstrap_urls: &[String]) -> Result<()> {
+/// Logs at info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. A running
+/// Node also appends to `node.log` in its data directory and copies to stderr only on a terminal,
+/// so a service's own stderr file keeps just crashes.
+fn logging(data_dir: Option<&PathBuf>) {
+    use std::io::IsTerminal as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+    let file = data_dir.and_then(|dir| {
+        let path = dir.join("node.log");
+        // ponytail: one rollover at start; a long-running Node grows past it until the next start.
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 16 << 20) {
+            let _ = fs::rename(&path, dir.join("node.log.1"));
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
+    });
+    let terminal = file.is_none() || std::io::stderr().is_terminal();
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("warn,vibeface=info,vibeface_bridge=info")),
+        )
+        .with(file.map(|file| {
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+        }))
+        .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
+        .init();
+}
+
+/// Fails before any file is written, so a busy port never leaves a half-made data directory.
+fn check_ports(listen: SocketAddr, local_listen: SocketAddr) -> Result<()> {
+    for (address, flag) in [(listen, "--listen"), (local_listen, "--local-listen")] {
+        std::net::TcpListener::bind(address)
+            .with_context(|| format!("端口 {} 被占用，可用 {flag} 更换", address.port()))?;
+    }
+    Ok(())
+}
+
+fn prepare_start(dir: &Path) -> Result<()> {
     let empty = match dir.symlink_metadata() {
         Ok(metadata) => {
             ensure!(
@@ -260,9 +303,7 @@ fn prepare_start(dir: &Path, bootstrap_urls: &[String]) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if empty {
-        let mut configuration = Config::local(DEFAULT_LISTEN, vec![], false);
-        configuration.network.bootstrap_urls = bootstrap_urls.to_vec();
-        initialize(dir, configuration)?;
+        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false), None)?;
     }
     Ok(())
 }
@@ -271,10 +312,10 @@ async fn status(options: Access) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
-    let peer_id = config::identity(&data)?.peer_id()?;
+    let device_id = config::identity(&data)?.device_id()?;
     let health = maintenance::probe(&data).await.and_then(|health| {
         ensure!(
-            health.peer_id == peer_id,
+            health.device_id == device_id,
             "running node identity does not match this data directory"
         );
         Ok(health)
@@ -298,20 +339,39 @@ async fn status(options: Access) -> Result<()> {
         println!(
             "{}",
             json!({
-                "status":state, "peer_id":peer_id, "data_dir":data,
+                "status":state, "device_id":device_id, "data_dir":data,
                 "listen":configuration.listen, "roles":configuration.roles,
                 "version":health.as_ref().ok().map(|health| &health.version),
+                "write_state":health.as_ref().ok().and_then(|health| health.write_state),
+                "peers":health.as_ref().ok().map(|health| &health.peers),
                 "cli_version":env!("CARGO_PKG_VERSION"), "error":error,
             })
         );
     } else {
         println!(
-            "Peer ID: {peer_id}\nStatus: {state}\nListen: {}\nData: {}",
+            "Peer ID: {device_id}\nStatus: {state}\nListen: {}\nData: {}",
             configuration.listen,
             data.display()
         );
         if let Ok(health) = &health {
             println!("Version: {}", health.version);
+            if let Some(state) = health.write_state {
+                println!("Writes: {}", state.as_str());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |now| now.as_millis() as i64);
+            for peer in &health.peers {
+                let link = match peer.reachable {
+                    Some(true) => "reachable",
+                    Some(false) => "unreachable",
+                    None => "not tried yet",
+                };
+                let synced = peer.synced_ms.map_or("never synced".into(), |at| {
+                    format!("synced {}s ago", now.saturating_sub(at) / 1000)
+                });
+                println!("Peer: {} ({}) {link}, {synced}", peer.name, peer.device_id);
+            }
         }
         if let Some(error) = error {
             println!("Detail: {error}");
@@ -330,25 +390,39 @@ fn init(options: Init) -> Result<()> {
         .map(|root| root.canonicalize().context("resolve project root"))
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
-    configuration.local_auto_access = !options.no_local_auto_access && !options.relay_only;
+    configuration.local_listen = options.local_listen;
+    configuration.local_auto_access = !options.no_local_auto_access;
     configuration.codex_socket = options.codex_socket;
     configuration.codex_bin = options.codex_bin;
-    if options.relay_only {
-        configuration.roles = vec![vibeface::model::NodeRole::Relay];
-    }
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     }
     configuration.allowed_origins = options.allowed_origins;
+    let entry = match options.entry {
+        Some(url) => {
+            let url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
+            Some(PublicEntry {
+                relay: options.entry_relay.unwrap_or_else(|| url.clone()),
+                url,
+            })
+        }
+        None => None,
+    };
     configuration.network = NetworkConfig {
-        bootstrap_urls: options.bootstrap_urls,
-        advertise_urls: options
-            .advertise_urls
-            .iter()
-            .map(|value| network_url(value))
-            .collect::<Result<_>>()?,
-        mdns: options.mdns,
-        relay_enabled: options.public_relay || options.relay_only,
+        relays: options.relays,
+        relay_listen: options.relay_listen,
+        relay_url: options.relay_url,
+        relay_paths_only: options.relay_paths_only,
+        entry,
+        ..NetworkConfig::default()
+    };
+    configuration.public_entry = options.public_entry;
+    if options.public_entry {
+        configuration.roles = vec![NodeRole::Relay];
+    }
+    let entry_token = match &options.relay_token_file {
+        Some(path) => Some(net::read_token_file(path)?),
+        None => options.public_entry.then(|| random_hex(32)),
     };
     if let Some(manager) = options.manager {
         let workspace = options
@@ -377,10 +451,10 @@ fn init(options: Init) -> Result<()> {
             },
         });
     }
-    initialize(dir, configuration)
+    initialize(dir, configuration, entry_token)
 }
 
-fn initialize(dir: &Path, configuration: Config) -> Result<()> {
+fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
         "node already initialized; existing identity and configuration were preserved"
@@ -405,14 +479,25 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
     create_private(&dir.join("identity.json"), &encoded_identity)?;
     create_private(&dir.join("config.json"), &encoded_configuration)?;
     let store = Store::open(dir.join("node.sqlite3"))?;
-    let capability = store.bootstrap_capability()?;
-    create_private(
-        &dir.join("bootstrap.json"),
-        &serde_json::to_vec(&capability)?,
-    )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":5}"#)?;
-    println!("Initialized device with Peer ID {}", identity.peer_id()?);
+    if !configuration.public_entry {
+        let capability = store.bootstrap_capability()?;
+        create_private(
+            &dir.join("bootstrap.json"),
+            &serde_json::to_vec(&capability)?,
+        )?;
+    }
+    if let Some(token) = &entry_token {
+        create_private(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
+    }
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+    println!("Initialized device with Peer ID {}", identity.device_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
+    if configuration.public_entry {
+        println!(
+            "Relay token: {} (copy it to your Node and pass --relay-token-file)",
+            dir.join(net::ENTRY_TOKEN_FILE).display()
+        );
+    }
     Ok(())
 }
 
@@ -451,11 +536,22 @@ async fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":5}),
+        epoch == json!({"data_epoch":7}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
     let identity = config::identity(dir)?;
+    if configuration.public_entry {
+        if options.json {
+            println!(
+                "{}",
+                json!({"url":configuration.public_url,"device_id":identity.device_id()?,"public_entry":true})
+            );
+        } else {
+            println!("{}", configuration.public_url);
+        }
+        return Ok(());
+    }
     let store = Store::open_readonly(dir.join("node.sqlite3"))?;
     let initialized = store.has_network()?;
     let capability = if initialized {
@@ -491,7 +587,7 @@ async fn access(options: Access) -> Result<()> {
         ensure!(
             url.scheme() == "http"
                 && url.host_str() == Some("127.0.0.1")
-                && launcher.peer_id == identity.peer_id()?
+                && launcher.node_id == identity.device_id()?
                 && launcher.capability.len() == 64
                 && hex::decode(&launcher.capability).is_ok(),
             "local launcher does not match this node"
@@ -514,14 +610,14 @@ async fn access(options: Access) -> Result<()> {
             .filter(|token| token.len() == 64 && hex::decode(token).is_ok())
             .context("invalid local browser entry")?;
         ensure!(
-            entry["peer_id"] == launcher.peer_id && entry["url"] == launcher.origin,
+            entry["device_id"] == launcher.node_id && entry["url"] == launcher.origin,
             "local browser entry does not match this node"
         );
-        url.set_fragment(Some(&format!("local={token}&node={}", launcher.peer_id)));
+        url.set_fragment(Some(&format!("local={token}&node={}", launcher.node_id)));
         if options.json {
             println!(
                 "{}",
-                json!({"url":url.to_string(),"peer_id":launcher.peer_id,"local":true})
+                json!({"url":url.to_string(),"device_id":launcher.node_id,"local":true})
             );
         } else {
             println!("{url}");
@@ -541,7 +637,7 @@ async fn access(options: Access) -> Result<()> {
         };
         url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
-    let entry = json!({"url":url.origin().ascii_serialization(),"peer_id":identity.peer_id()?,"capability":capability});
+    let entry = json!({"url":url.origin().ascii_serialization(),"device_id":identity.device_id()?,"capability":capability});
     if options.json {
         println!("{}", serde_json::to_string(&entry)?);
     } else {
@@ -565,66 +661,26 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn invitation(options: &Pair) -> Result<Invitation> {
-    if let Some(path) = &options.invite_file {
-        Invitation::from_bytes(&read_bounded(path, 128 * 1024)?)
-    } else {
-        Invitation::parse(options.invite.as_deref().context("invitation required")?)
-    }
-}
-
-async fn pair(options: Pair) -> Result<()> {
-    let invitation = invitation(&options)?;
-    let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
-    let pairing = NodePairing::new(runtime);
-    let mut status = pairing.request(invitation, &options.name).await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
-    loop {
-        match status {
-            JoinState::Joined {
-                peer_id,
-                network_id,
-            } => {
-                println!("Paired node {peer_id} with network {network_id}");
-                println!("Start the Node to connect to its personal network.");
-                return Ok(());
-            }
-            JoinState::Review {
-                request_id,
-                review_hash,
-                ..
-            } => {
-                status = pairing.accept(&request_id, &review_hash).await?;
-                println!(
-                    "Pairing request submitted. Confirm this device in the management client."
-                );
-            }
-            JoinState::Pending { .. } => {
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "pairing is still pending; run the same command again to resume"
-                );
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                status = pairing.status().await?;
-            }
-            JoinState::Uncertain { message, .. } => bail!("{message}"),
-            JoinState::Idle => bail!("pairing request is missing; pending receipt was preserved"),
-        }
-    }
+async fn join(options: Join) -> Result<()> {
+    let name = options.name.unwrap_or_else(config::hostname);
+    let state =
+        vibeface::client::join_network(&options.data.data_dir, &options.link, &name).await?;
+    println!(
+        "已加入个人网络 {}。启动 Node 后即可连接。",
+        state.genesis.network_id
+    );
+    Ok(())
 }
 
 async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 128, "invalid tool name");
-    let arguments: Value =
+    let mut arguments: Value =
         serde_json::from_str(&arguments).context("invalid tool arguments JSON")?;
     ensure!(
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let write = !matches!(
-        name.as_str(),
-        "nodes" | "context" | "task_status" | "call_lookup"
-    );
+    let write = name == "dispatch_work";
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
@@ -636,13 +692,12 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
     ensure!(
         !write || call_ref.is_some(),
-        "write tools require --call-ref; keep it and query call_lookup after any uncertain result"
+        "dispatch_work requires --call-ref; keep it and query call_lookup after any uncertain result"
     );
-    let call_id = call_ref.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    ensure!(
-        !call_id.is_empty() && call_id.len() <= 256 && !call_id.chars().any(char::is_control),
-        "invalid call reference"
-    );
+    if let Some(call_ref) = &call_ref {
+        arguments["call_ref"] = json!(call_ref);
+    }
+    let call_id = call_ref.unwrap_or_default();
     let url =
         origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
     ensure!(
@@ -657,7 +712,7 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         .build()?
         .post(url.join("api/tools")?)
         .bearer_auth(token)
-        .json(&json!({"name": name, "arguments": arguments, "call_id": call_id}))
+        .json(&json!({"name": name, "arguments": arguments}))
         .send()
         .await
         .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
@@ -692,7 +747,6 @@ mod tests {
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
         assert!(default.command.is_none() && default.data_dir.is_none());
-        assert!(default.bootstrap_urls.is_empty());
         let direct = Cli::try_parse_from(["vibeface", "--data-dir", "/private/node data"]).unwrap();
         assert!(direct.command.is_none());
         assert_eq!(direct.data_dir.unwrap(), Path::new("/private/node data"));
@@ -703,7 +757,6 @@ mod tests {
         };
         assert!(explicit.data_dir.is_none());
         assert_eq!(options.data.data_dir, Path::new("/private/node data"));
-        assert!(options.bootstrap_urls.is_empty());
         for arguments in [
             vec!["vibeface", "--data-dir", "/one", "serve"],
             vec![
@@ -722,168 +775,54 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_urls_normalize_for_direct_start_serve_and_init() {
-        for command in [None, Some("serve"), Some("init")] {
-            let mut arguments = vec!["vibeface"];
-            arguments.extend(command);
-            arguments.extend([
-                "--bootstrap-url",
-                "https://node.test",
-                "--bootstrap-url",
-                "ws://127.0.0.1:4790/api/network/ws",
-            ]);
-            let mut cli = Cli::try_parse_from(arguments).unwrap();
-            cli.normalize_bootstrap_urls().unwrap();
-            let urls = match cli.command {
-                None => cli.bootstrap_urls,
-                Some(Action::Serve(options)) => options.bootstrap_urls,
-                Some(Action::Init(options)) => options.bootstrap_urls,
-                _ => panic!("expected startup or initialization"),
-            };
-            assert_eq!(
-                urls,
-                [
-                    "wss://node.test/api/network/ws",
-                    "ws://127.0.0.1:4790/api/network/ws"
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_bootstrap_urls_do_not_initialize_data_directories() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "vibeface-invalid-bootstrap-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir(&root)?;
-        for command in [None, Some("serve"), Some("init")] {
-            let dir = root.join(command.unwrap_or("direct"));
-            for url in [
-                "file:///tmp/node",
-                "https://fixture-user:fixture-password@node.test",
-                "https://node.test/?token=fixture-query",
-                "https://node.test/other",
-                "https://node.test/#fragment",
-            ] {
-                let mut arguments = vec!["vibeface"];
-                arguments.extend(command);
-                arguments.extend(["--data-dir", dir.to_str().unwrap(), "--bootstrap-url", url]);
-                let mut cli = Cli::try_parse_from(arguments)?;
-                let error = cli.normalize_bootstrap_urls().unwrap_err().to_string();
-                for secret in ["fixture-user", "fixture-password", "fixture-query"] {
-                    assert!(!error.contains(secret));
-                }
-                assert!(!dir.exists());
-            }
-        }
-        let urls = vec![String::from("wss://node.test/api/network/ws"); 9];
-        assert!(prepare_start(&root.join("direct"), &urls).is_err());
-        let dir = root.join("init");
-        let mut arguments = vec!["vibeface", "init", "--data-dir", dir.to_str().unwrap()];
-        for _ in 0..9 {
-            arguments.extend(["--bootstrap-url", "https://node.test"]);
-        }
-        let mut cli = Cli::try_parse_from(arguments)?;
-        cli.normalize_bootstrap_urls()?;
+    fn relay_flags_are_saved_and_invalid_relays_leave_no_directory() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vibeface-relays-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("node");
+        let cli = Cli::try_parse_from([
+            "vibeface",
+            "init",
+            "--data-dir",
+            dir.to_str().context("temporary path is invalid")?,
+            "--relay",
+            "https://relay.test",
+            "--relay-listen",
+            "127.0.0.1:0",
+            "--relay-paths-only",
+        ])?;
         let Some(Action::Init(options)) = cli.command else {
-            panic!("expected init")
+            bail!("expected init command")
         };
-        assert!(init(*options).is_err());
-        assert!(fs::read_dir(&root)?.next().is_none());
-        fs::remove_dir(root)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn startup_bootstrap_urls_persist_and_overrides_preserve_saved_config() -> Result<()> {
-        let root =
-            std::env::temp_dir().join(format!("vibeface-bootstrap-{}", uuid::Uuid::new_v4()));
-        for command in [None, Some("init")] {
-            let dir = root.join(command.unwrap_or("direct"));
-            let mut arguments = vec!["vibeface"];
-            arguments.extend(command);
-            arguments.extend([
-                "--data-dir",
-                dir.to_str().unwrap(),
-                "--bootstrap-url",
-                "https://first.test",
-                "--bootstrap-url",
-                "http://second.test",
-            ]);
-            let mut cli = Cli::try_parse_from(arguments)?;
-            cli.normalize_bootstrap_urls()?;
-            match cli.command {
-                None => prepare_start(&dir, &cli.bootstrap_urls)?,
-                Some(Action::Init(options)) => init(*options)?,
-                _ => panic!("expected direct startup or init"),
-            }
-            let mut configuration = Config::load(&dir)?;
-            assert_eq!(
-                configuration.network.bootstrap_urls,
-                [
-                    "wss://first.test/api/network/ws",
-                    "ws://second.test/api/network/ws"
-                ]
-            );
-            configuration.roles = vec![vibeface::model::NodeRole::Replica];
-            configuration.codex_socket = Some(dir.join("codex.sock"));
-            configuration.save(&dir)?;
-            let saved = fs::read(dir.join("config.json"))?;
-            let identity = fs::read(dir.join("identity.json"))?;
-            let mut cli = Cli::try_parse_from([
+        init(*options)?;
+        let network = Config::load(&dir)?.network;
+        assert_eq!(network.relays, ["https://relay.test"]);
+        assert_eq!(network.relay_listen, Some("127.0.0.1:0".parse()?));
+        assert!(network.relay_paths_only);
+        for url in [
+            "file:///tmp/node",
+            "https://fixture-user:fixture-password@relay.test",
+            "https://relay.test/?token=fixture-query",
+        ] {
+            let bad = root.join("bad");
+            let cli = Cli::try_parse_from([
                 "vibeface",
-                "serve",
+                "init",
                 "--data-dir",
-                dir.to_str().unwrap(),
-                "--bootstrap-url",
-                "https://override.test",
+                bad.to_str().context("temporary path is invalid")?,
+                "--relay",
+                url,
             ])?;
-            cli.normalize_bootstrap_urls()?;
-            let Some(Action::Serve(options)) = cli.command else {
-                panic!("expected serve")
+            let Some(Action::Init(options)) = cli.command else {
+                bail!("expected init command")
             };
-            prepare_start(&dir, &options.bootstrap_urls)?;
-            let runtime =
-                Runtime::open_with_bootstrap_urls(&options.data.data_dir, &options.bootstrap_urls)
-                    .await?;
-            assert_eq!(
-                runtime.config.network.bootstrap_urls,
-                ["wss://override.test/api/network/ws"]
-            );
-            assert!(Runtime::open(&dir).await.is_err());
-            assert_eq!(fs::read(dir.join("config.json"))?, saved);
-            assert_eq!(fs::read(dir.join("identity.json"))?, identity);
-            drop(runtime);
-            let runtime = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match Runtime::open(&dir).await {
-                        Ok(runtime) => break Ok(runtime),
-                        Err(error)
-                            if matches!(
-                                error.downcast_ref::<std::fs::TryLockError>(),
-                                Some(std::fs::TryLockError::WouldBlock)
-                            ) =>
-                        {
-                            tokio::task::yield_now().await;
-                        }
-                        Err(error) => break Err(error),
-                    }
-                }
-            })
-            .await
-            .context("data directory lock was not released after dropping Runtime")??;
-            assert_eq!(
-                runtime.config.network.bootstrap_urls,
-                [
-                    "wss://first.test/api/network/ws",
-                    "ws://second.test/api/network/ws"
-                ]
-            );
-            assert_eq!(fs::read(dir.join("config.json"))?, saved);
-            assert_eq!(fs::read(dir.join("identity.json"))?, identity);
-            drop(runtime);
+            let error = format!("{:#}", init(*options).unwrap_err());
+            for secret in ["fixture-user", "fixture-password", "fixture-query"] {
+                assert!(!error.contains(secret));
+            }
+            assert!(!bad.exists());
         }
+        assert!(
+            Cli::try_parse_from(["vibeface", "init", "--relay-url", "https://relay.test"]).is_err()
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -897,29 +836,30 @@ mod tests {
             if name == "empty" {
                 fs::create_dir(&dir).unwrap();
             }
-            prepare_start(&dir, &[]).unwrap();
+            prepare_start(&dir).unwrap();
             let mut configuration = Config::load(&dir).unwrap();
             assert_eq!(configuration.listen, "127.0.0.1:4790".parse().unwrap());
             assert_eq!(configuration.public_url, "http://127.0.0.1:4790");
             assert!(configuration.roots.is_empty() && configuration.manager.is_none());
-            assert!(!configuration.allow_insecure_lan && !configuration.network.mdns);
-            assert!(configuration.network.bootstrap_urls.is_empty());
-            assert!(configuration.network.advertise_urls.is_empty());
-            assert!(!configuration.network.relay_enabled);
+            assert!(!configuration.allow_insecure_lan);
+            assert!(configuration.network.relays.is_empty());
+            assert!(
+                configuration.network.relay_listen.is_none() && !configuration.network.n0_relays
+            );
             configuration.timeout_secs = 1234;
             configuration.save(&dir).unwrap();
             let identity = fs::read(dir.join("identity.json")).unwrap();
             let config = fs::read(dir.join("config.json")).unwrap();
-            let peer_id = config::identity(&dir).unwrap().peer_id().unwrap();
-            prepare_start(&dir, &[]).unwrap();
+            let device_id = config::identity(&dir).unwrap().device_id().unwrap();
+            prepare_start(&dir).unwrap();
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
             let runtime = Runtime::open(&dir).await.unwrap();
-            assert_eq!(runtime.identity.peer_id().unwrap(), peer_id);
+            assert_eq!(runtime.identity.device_id().unwrap(), device_id);
             assert_eq!(runtime.config.timeout_secs, 1234);
             drop(runtime);
             fs::write(dir.join("config.json"), b"invalid configuration").unwrap();
-            prepare_start(&dir, &[]).unwrap();
+            prepare_start(&dir).unwrap();
             assert!(Runtime::open(&dir).await.is_err());
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(
@@ -930,7 +870,7 @@ mod tests {
         let uninitialized = root.join("uninitialized");
         fs::create_dir(&uninitialized).unwrap();
         fs::write(uninitialized.join("existing-data"), b"preserve me").unwrap();
-        prepare_start(&uninitialized, &[]).unwrap();
+        prepare_start(&uninitialized).unwrap();
         assert!(Runtime::open(&uninitialized).await.is_err());
         assert_eq!(
             fs::read(uninitialized.join("existing-data")).unwrap(),
@@ -939,37 +879,26 @@ mod tests {
         assert!(!uninitialized.join("identity.json").exists());
         let file = root.join("file");
         fs::write(&file, b"preserve file").unwrap();
-        assert!(prepare_start(&file, &[]).is_err());
+        assert!(prepare_start(&file).is_err());
         #[cfg(unix)]
         for target in [root.join("empty"), root.join("absent")] {
             let link = root.join("link");
             std::os::unix::fs::symlink(target, &link).unwrap();
-            assert!(prepare_start(&link, &[]).is_err());
+            assert!(prepare_start(&link).is_err());
             fs::remove_file(link).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn cli_requires_one_invitation_and_supports_accountless_flags() {
-        assert!(Cli::try_parse_from(["vibeface", "pair"]).is_err());
+    fn cli_requires_one_invite_link_and_supports_accountless_flags() {
+        assert!(Cli::try_parse_from(["vibeface", "join"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "pair", "--invite", "abc"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "vibeface",
-                "pair",
-                "--invite",
-                "abc",
-                "--invite-file",
-                "invite.json"
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "vibeface",
-                "pair",
-                "--invite",
-                "abc",
+                "join",
+                "https://node.example/join#vibeface1abc",
                 "--name",
                 "Build Node"
             ])
@@ -1003,12 +932,12 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "init",
-                "--bootstrap-url",
-                "wss://relay.test/api/network/ws",
-                "--advertise-url",
-                "wss://node.test/api/network/ws",
-                "--mdns",
-                "--public-relay"
+                "--relay",
+                "https://relay.test",
+                "--relay-listen",
+                "0.0.0.0:3340",
+                "--relay-url",
+                "https://relay.test"
             ])
             .is_ok()
         );
@@ -1023,7 +952,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface", "tool", "send_task", "--json", "{}"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch_work", "--json", "{}"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "vibeface",
@@ -1041,45 +970,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_only_initialization_does_not_join_a_personal_network() -> Result<()> {
-        let dir =
-            std::env::temp_dir().join(format!("vibeface-relay-only-{}", uuid::Uuid::new_v4()));
-        let cli = Cli::try_parse_from([
-            "vibeface",
-            "init",
-            "--relay-only",
-            "--data-dir",
-            dir.to_str().context("temporary path is invalid")?,
-        ])?;
-        let Some(Action::Init(options)) = cli.command else {
-            bail!("expected init command")
-        };
-        init(*options)?;
-        let configuration = Config::load(&dir)?;
-        assert_eq!(configuration.roles, vec![vibeface::model::NodeRole::Relay]);
-        assert!(configuration.network.relay_enabled);
-        assert!(configuration.manager.is_none() && configuration.roots.is_empty());
-        assert!(!configuration.local_auto_access);
-        let store = Store::open_readonly(dir.join("node.sqlite3"))?;
-        assert!(!store.has_network()?);
-        drop(store);
-        assert!(
-            Cli::try_parse_from([
-                "vibeface",
-                "init",
-                "--relay-only",
-                "--manager",
-                "codex_sdk",
-                "--workspace",
-                "."
-            ])
-            .is_err()
-        );
-        fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
     fn node_url_rejects_paths_and_embedded_credentials() {
         for value in [
             "http://user:password@localhost:4790",
@@ -1092,34 +982,6 @@ mod tests {
         assert!(is_loopback(&origin("http://127.0.0.1:4790").unwrap()));
         assert!(is_loopback(&origin("http://[::1]:4790").unwrap()));
         assert!(!is_loopback(&origin("http://192.168.1.5:4790").unwrap()));
-    }
-
-    #[test]
-    fn network_urls_normalize_without_accepting_credentials() {
-        assert_eq!(
-            network_url("ws://node.test").unwrap(),
-            "ws://node.test/api/network/ws"
-        );
-        assert_eq!(
-            network_url("wss://node.test/custom/network").unwrap(),
-            "wss://node.test/custom/network"
-        );
-        assert_eq!(
-            network_url("https://node.test").unwrap(),
-            "wss://node.test/api/network/ws"
-        );
-        assert_eq!(
-            network_url("ws://127.0.0.1:4790/api/network/ws").unwrap(),
-            "ws://127.0.0.1:4790/api/network/ws"
-        );
-        for value in [
-            "file:///tmp/node",
-            "https://user:secret@node.test",
-            "https://node.test/?token=secret",
-            "https://node.test/other",
-        ] {
-            assert!(network_url(value).is_err());
-        }
     }
 
     #[test]

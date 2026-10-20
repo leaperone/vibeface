@@ -1,5 +1,5 @@
 import type { MembershipView } from "@/lib/node"
-import type { HumanRequest, NativeSessionRecord, NodeInfo } from "./types"
+import type { NodeInfo, WorkRecord } from "./types"
 
 export const roleNames: Record<string, string> = {
   gateway: "对外访问",
@@ -18,6 +18,9 @@ export const stateNames: Record<string, string> = {
   cancelling: "正在确认是否已取消",
   interrupting: "正在确认是否已停止",
   interrupted: "已中断",
+  starting: "正在启动",
+  unverified: "需要确认",
+  stopped: "已停止",
   unknown: "结果未知",
   pending_check: "需要确认",
   succeeded: "操作完成",
@@ -49,37 +52,18 @@ export function nodeName(
   fallback?: string,
 ) {
   if (!id) return "未知设备"
-  const node = lookup?.nodes?.find((item) => item.peer_id === id)
+  const node = lookup?.nodes?.find((item) => item.device_id === id)
   if (node?.name) return node.name
-  const member = lookup?.directory?.members.find((item) => item.subject_id === id)
+  const member = lookup?.directory?.members.find((item) => item.device_id === id)
   if (member?.name) return member.name
   if (node?.local) return "本机"
-  if (fallback) return fallback
-  return `${id.slice(0, 10)}${id.length > 10 ? "…" : ""}`
+  return fallback ?? "另一台设备"
 }
 
 export function stateLabel(value: string | undefined, override?: string) {
   if (override) return override
   if (!value) return "未知"
   return stateNames[value] || value
-}
-
-export function isIncomplete(missing: { events?: unknown; blobs?: unknown; conflicts?: unknown } | undefined) {
-  return !missing || (["events", "blobs", "conflicts"] as const).some((key) => {
-    const value = missing[key]
-    return !Array.isArray(value) || value.length > 0
-  })
-}
-
-export function mergeBasis(current: readonly string[], basisText: string | null) {
-  if (!basisText || basisText.length >= 6000) return current
-  try {
-    const heads: unknown = JSON.parse(basisText)
-    if (!Array.isArray(heads) || !heads.every((head) => typeof head === "string")) return current
-    return [...new Set([...current, ...heads])]
-  } catch {
-    return current
-  }
 }
 
 export function isLoopback(address: string) {
@@ -95,7 +79,8 @@ export function addressName(address: string) {
 const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
-  pending_check: "需要确认", unknown: "需要确认",
+  pending_check: "需要确认", unknown: "需要确认", starting: "准备中", waiting_approval: "需要你同意", finished: "已完成", unverified: "需要确认",
+  abandoned: "已放弃、未执行", waiting_for_device: "等设备接收", rejected: "未接收", stop_waiting: "已请求、等待设备确认", stop_unconfirmed: "设备没有确认停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 
@@ -106,18 +91,20 @@ const progressStates: Record<string, string> = {
 }
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
-const decisions: Record<string, string> = { accept: "已同意", decline: "已拒绝", cancel: "已拒绝并停止", answer: "已回答" }
+const decisions: Record<string, string> = { accept: "已同意", decline: "已拒绝", cancel: "已拒绝并停止", answered: "已回答" }
 export const decisionLabel = (decision: string) => decisions[decision] ?? "已处理"
-/** A turn stays `waiting` until its next event; once nothing is left to answer it reads as running. */
-export const shownState = (session: Pick<NativeSessionRecord, "state" | "pending_requests">) => session.state === "waiting" && !session.pending_requests.length ? "running" : session.state
-export const taskActive = (state: string) => ["pending_delivery", "queued", "claimed", "accepted", "running", "waiting", "cancelling", "interrupting"].includes(state)
+/** A finished work reads as its outcome; a stop sent to an unreachable device reads as that request; one left waiting with nothing to answer reads as running. */
+export const shownState = (work: Pick<WorkRecord, "state" | "outcome" | "open_approvals" | "stop">) =>
+  work.outcome ?? (work.stop ? work.stop.timed_out ? "stop_unconfirmed" : "stop_waiting"
+    : work.state === "waiting_approval" && !work.open_approvals.length ? "running" : work.state ?? "accepted")
+export const taskActive = (state: string) => ["accepted", "starting", "running", "waiting_approval", "interrupting", "waiting_for_device", "stop_waiting", "stop_unconfirmed"].includes(state)
 
 const kinds: Record<string, string> = {
   "item/commandExecution/requestApproval": "运行命令",
   "item/fileChange/requestApproval": "修改文件",
   "item/tool/requestUserInput": "补充信息",
 }
-export const approvalKind = (request: Pick<HumanRequest, "kind">) => kinds[request.kind] ?? "处理请求"
+export const approvalKind = (request: { kind: string }) => kinds[request.kind] ?? "处理请求"
 
 // ponytail: keyword heuristics; a command parser if these miss real cases.
 const risks: [RegExp, string][] = [
@@ -128,7 +115,7 @@ const risks: [RegExp, string][] = [
 ]
 
 /** One line describing the consequence of a risky request, or "" when nothing stands out. */
-export function approvalRisk(request: HumanRequest, roots: string[]): string {
+export function approvalRisk(request: { command?: string; cwd?: string }, roots: string[]): string {
   const hit = risks.find(([pattern]) => pattern.test(request.command ?? ""))
   if (hit) return hit[1]
   const cwd = request.cwd

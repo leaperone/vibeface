@@ -1,14 +1,17 @@
-import init, { Identity, Handshake, verify } from "/generated/vibeface_secure.js";
+import init, { Handshake, signingMessage, ticketDecode } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const peerPattern = /^[a-f0-9]{64}$/;
-const lostKeyMessage = "此浏览器的设备密钥已被清除。请使用另一台管理设备重新配对，或导入恢复包。原任务不会因此重新执行。";
-let identity;
+const devicePattern = /^[a-f0-9]{64}$/;
+const prologue = encoder.encode("vibeface:client:v1");
+const lostKeyMessage = "此浏览器的设备密钥已被清除。请在管理设备上重新邀请这台浏览器，或导入恢复包。原任务不会因此重新执行。";
+let device;
 let initializing;
 
+const hex = (bytes) => [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");
+
 export function validTarget(value) {
-  if (typeof value !== "string" || !peerPattern.test(value)) throw new Error("填写完整的 64 位设备编号。请从节点本机页面或可信邀请中取得，不要使用中继提供的替代编号。");
+  if (typeof value !== "string" || !devicePattern.test(value)) throw new Error("设备编号无效。请使用邀请链接或本机页面提供的入口。");
   return value;
 }
 
@@ -16,28 +19,31 @@ export function validEndpoint(value) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || !["", "/"].includes(url.pathname)) throw new Error("填写 HTTP 或 HTTPS 入口地址，不包含路径、账号或密钥。");
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (location.protocol === "https:" && url.protocol === "http:" && !local) throw new Error("HTTPS 客户端需要 HTTPS 入口。请为目标或中继启用 HTTPS，再保留相同设备编号连接。");
+  if (location.protocol === "https:" && url.protocol === "http:" && !local) throw new Error("HTTPS 页面只能连接 HTTPS 入口。");
   return url.origin;
 }
 
-export function readInvitation(value) {
+/** The ticket in a join QR code or link: `vibeface1…` alone or `https://<entry>/join#vibeface1…`. */
+export function joinTicket(value) {
   const input = value.trim();
-  if (input.length > 65536) throw new Error("邀请内容超过大小限制。请重新复制管理设备生成的邀请。");
-  let content = input;
-  if (/^https?:\/\//.test(input)) {
+  if (input.startsWith("vibeface1")) return { ticket: input, origin: null };
+  try {
     const url = new URL(input);
-    const fragment = new URLSearchParams(url.hash.slice(1));
-    content = fragment.get("invite") || fragment.get("bootstrap") || "";
-  }
-  if (!content) throw new Error("邀请链接缺少配对信息。请从管理设备重新复制完整链接。");
-  let invitation;
-  try { invitation = JSON.parse(content); }
-  catch {
-    try { invitation = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(content.replace(/-/g, "+").replace(/_/g, "/")), (character) => character.charCodeAt(0)))); }
-    catch { throw new Error("无法读取邀请。请粘贴完整邀请链接或管理客户端复制的邀请内容。"); }
-  }
-  if (!invitation || typeof invitation !== "object" || Array.isArray(invitation)) throw new Error("邀请内容格式无效。");
-  return invitation;
+    if (url.pathname === "/join" && url.hash.startsWith("#vibeface1")) return { ticket: url.hash.slice(1), origin: url.origin };
+  } catch {}
+  return null;
+}
+
+/** Trust comes from the ticket's device key; the address in a link is only a hint. */
+export async function parseJoinLink(value) {
+  await init();
+  if (value.trim().length > 8192) throw new Error("邀请链接过长。请重新复制管理设备上的链接。");
+  const found = joinTicket(value);
+  if (!found) throw new Error("这不是 Vibeface 邀请链接。");
+  const ticket = JSON.parse(ticketDecode(found.ticket));
+  let origin = null;
+  try { origin = found.origin && validEndpoint(found.origin); } catch {}
+  return { origin, entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret };
 }
 
 function database() {
@@ -49,14 +55,18 @@ function database() {
   });
 }
 
-async function keyRecord(write) {
+/** Runs one transaction on the key store; `operation` returns the request whose result is wanted. */
+async function keys(mode, operation) {
   const db = await database();
   try {
     return await new Promise((resolve, reject) => {
-      const transaction = db.transaction("keys", write ? "readwrite" : "readonly");
-      const request = write ? transaction.objectStore("keys").put(write, "identity") : transaction.objectStore("keys").get("identity");
+      const transaction = db.transaction("keys", mode);
+      const request = operation(transaction.objectStore("keys"));
       let result;
       request.onsuccess = () => { result = request.result; };
+      request.onerror = (event) => {
+        if (request.error?.name === "ConstraintError") { result = false; event.preventDefault(); event.stopPropagation(); }
+      };
       transaction.oncomplete = () => resolve(result);
       transaction.onerror = () => reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
       transaction.onabort = transaction.onerror;
@@ -64,69 +74,52 @@ async function keyRecord(write) {
   } finally { db.close(); }
 }
 
-async function claimKey(record) {
-  const db = await database();
-  try {
-    return await new Promise((resolve, reject) => {
-      const transaction = db.transaction("keys", "readwrite");
-      const request = transaction.objectStore("keys").add(record, "identity");
-      let alreadyStored = false;
-      request.onerror = (event) => {
-        if (request.error?.name === "ConstraintError") { alreadyStored = true; event.preventDefault(); event.stopPropagation(); return; }
-        reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
-      };
-      transaction.oncomplete = () => resolve(!alreadyStored);
-      transaction.onerror = () => reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
-      transaction.onabort = transaction.onerror;
-    });
-  } finally { db.close(); }
-}
-
 export async function initClient({ replaceLostKey = false } = {}) {
-  if (!globalThis.isSecureContext || !globalThis.crypto?.getRandomValues || !globalThis.indexedDB) throw new Error("此地址不能安全保存设备密钥。请在本机使用 http://localhost:4790，或使用你信任的 HTTPS 客户端连接设备。局域网 HTTP 页面仅能展示此指引，不会降级认证。");
-  if (!initializing) initializing = initializeIdentity(replaceLostKey).catch((error) => { initializing = null; throw error; });
+  if (!globalThis.isSecureContext || !globalThis.crypto?.subtle || !globalThis.indexedDB) throw new Error("此地址不能安全保存设备密钥。请在本机使用 localhost，或使用 HTTPS 入口。");
+  if (!initializing) initializing = loadDevice(replaceLostKey).catch((error) => { initializing = null; throw error; });
   return initializing;
 }
 
-async function initializeIdentity(replaceLostKey) {
+/** The device key is a non-extractable Ed25519 CryptoKey; page scripts can only ask it to sign. */
+async function loadDevice(replaceLostKey) {
   await init();
-  if (!identity) {
-    const record = await keyRecord();
-    if (record?.secret) identity = Identity.fromSecretHex(record.secret);
-    else {
-      let previouslyPaired = false;
-      try { previouslyPaired = localStorage.getItem("vibeface.device-created") === "true"; } catch {}
-      if (previouslyPaired && !replaceLostKey) { const error = new Error(lostKeyMessage); error.code = "key_lost"; throw error; }
-      const generated = Identity.generate();
-      let claimed;
-      try { claimed = await claimKey({ secret: generated.secretHex(), created_at: Date.now() }); }
-      catch (error) { generated.free(); throw error; }
-      if (claimed) identity = generated;
-      else { generated.free(); const existing = await keyRecord(); if (!existing?.secret) throw new Error("浏览器设备密钥初始化发生竞争，请刷新后重试。"); identity = Identity.fromSecretHex(existing.secret); }
-      try { localStorage.setItem("vibeface.device-created", "true"); } catch {}
-    }
+  if (device) return { deviceId: device.deviceId };
+  let record = await keys("readonly", (store) => store.get("device"));
+  if (!record) {
+    let created = false;
+    try { created = localStorage.getItem("vibeface.device-created") === "true"; } catch {}
+    if (created && !replaceLostKey) { const error = new Error(lostKeyMessage); error.code = "key_lost"; throw error; }
+    let pair;
+    try { pair = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]); }
+    catch { throw new Error("此浏览器不支持 Ed25519 设备密钥。请更新浏览器后重试。"); }
+    const candidate = { privateKey: pair.privateKey, deviceId: hex(await crypto.subtle.exportKey("raw", pair.publicKey)), created_at: Date.now() };
+    await keys("readwrite", (store) => store.add(candidate, "device"));
+    record = await keys("readonly", (store) => store.get("device"));
+    try { localStorage.setItem("vibeface.device-created", "true"); } catch {}
   }
-  return { peerId: identity.peerId(), publicKey: identity.publicKeyHex() };
+  if (!(record?.privateKey instanceof CryptoKey) || record.privateKey.extractable || !devicePattern.test(record.deviceId)) throw new Error("浏览器设备密钥损坏。请重新加入个人网络。");
+  device = record;
+  return { deviceId: device.deviceId };
 }
 
-export function signClient(domain, payload) {
-  if (!identity) throw new Error("浏览器设备密钥尚未初始化。");
-  return identity.sign(domain, encoder.encode(payload));
+async function sign(bytes) {
+  if (!device) await initClient();
+  return hex(await crypto.subtle.sign({ name: "Ed25519" }, device.privateKey, bytes));
 }
 
-function networkUrl(value) {
-  const url = new URL(value);
-  if (value.length > 2048 || !["ws:", "wss:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) throw new Error("设备提供的连接地址无效或不安全。");
-  return url.href;
+/** Signs `vibeface:message:v1:{domain}:{sha256(payload)}`, the format every Node verifies. */
+export async function signClient(domain, payload) {
+  await init();
+  return sign(signingMessage(domain, typeof payload === "string" ? encoder.encode(payload) : payload));
 }
 
-function openSocket(url, signal, onClose) {
+function openSocket(url, signal, onClose, timeoutMs) {
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
   const incoming = [], waiting = [];
   let failure;
-  const timer = setTimeout(() => close(new Error("此路径连接超时。")), 10000);
-  function close(error = new Error("此路径无法接通指定设备。")) {
+  const timer = setTimeout(() => close(new Error("连接超时。")), timeoutMs);
+  function close(error = new Error("无法接通指定设备。")) {
     if (failure) return;
     failure = error;
     clearTimeout(timer);
@@ -138,194 +131,86 @@ function openSocket(url, signal, onClose) {
   function abort() { close(new Error("设备连接已取消。")); }
   signal?.addEventListener("abort", abort, { once: true });
   socket.addEventListener("message", (event) => {
-    if ((typeof event.data === "string" && encoder.encode(event.data).byteLength > 16384) || (event.data instanceof ArrayBuffer && event.data.byteLength > 65535)) { close(new Error("设备消息超过通道大小限制。")); return; }
+    if (typeof event.data === "string") {
+      // The Gateway refuses in English for logs; `code` is what the page translates.
+      const refusal = new Error("访问地址拒绝了这次连接。");
+      try { const value = JSON.parse(event.data); refusal.message = String(value.error || refusal.message); refusal.code = value.code; } catch {}
+      close(refusal);
+      return;
+    }
+    if (event.data.byteLength > 65535) { close(new Error("设备消息超过通道大小限制。")); return; }
     const item = waiting.shift();
     if (item) item.resolve(event.data);
     else if (incoming.length < 512) incoming.push(event.data);
     else close(new Error("入口发送的数据过多，已关闭连接。"));
   });
   socket.addEventListener("close", () => close());
-  socket.addEventListener("error", () => close(new Error("无法连接此路径，请检查地址和设备在线状态。")));
+  socket.addEventListener("error", () => close(new Error("连不上这台设备。请确认它开着，并且和这里网络互通。")));
   if (signal?.aborted) abort();
-  function receive() {
-    if (incoming.length) return Promise.resolve(incoming.shift());
-    if (failure) return Promise.reject(failure);
-    return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
-  }
-  async function control(expected) {
-    const frame = await receive();
-    if (typeof frame !== "string") throw new Error("入口连接响应格式无效。");
-    const message = JSON.parse(frame);
-    if (!message || typeof message !== "object" || Array.isArray(message) || message.type !== expected) throw new Error("入口未能建立指定设备的通道。");
-    return message;
-  }
   return {
-    socket, receive, control, close, ready() { clearTimeout(timer); },
+    socket, close, ready() { clearTimeout(timer); },
+    receive() {
+      if (incoming.length) return Promise.resolve(incoming.shift());
+      if (failure) return Promise.reject(failure);
+      return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+    },
     opened() {
       if (failure) return Promise.reject(failure);
       if (socket.readyState === WebSocket.OPEN) return Promise.resolve();
       return new Promise((resolve, reject) => {
         socket.addEventListener("open", resolve, { once: true });
-        socket.addEventListener("close", () => reject(failure || new Error("本机连接已断开。")), { once: true });
-        socket.addEventListener("error", () => reject(failure || new Error("无法连接本机入口。")), { once: true });
+        socket.addEventListener("close", () => reject(failure || new Error("连接已断开。")), { once: true });
       });
     },
   };
 }
 
-async function lookupPaths(url, target, signal) {
-  const wire = openSocket(url, signal);
-  try {
-    await wire.control("welcome");
-    wire.socket.send(JSON.stringify({ type: "lookup", target }));
-    const { record } = await wire.control("record");
-    if (record === null) return [];
-    const fields = ["peer_id", "public_key", "direct_urls", "relay_urls", "issued_at", "expires_at", "signature"];
-    const now = Math.floor(Date.now() / 1000);
-    if (!record || typeof record !== "object" || Array.isArray(record) || Object.keys(record).length !== fields.length || fields.some(key => !Object.hasOwn(record, key)) || record.peer_id !== target || !peerPattern.test(record.public_key) || !/^[a-f0-9]{128}$/.test(record.signature) || !Number.isSafeInteger(record.issued_at) || !Number.isSafeInteger(record.expires_at) || record.issued_at > now + 30 || record.expires_at <= now || record.expires_at <= record.issued_at || record.expires_at > record.issued_at + 180) throw new Error("入口提供的设备地址记录无效或已过期。");
-    for (const urls of [record.direct_urls, record.relay_urls]) {
-      if (!Array.isArray(urls) || urls.length > 8 || urls.some(value => typeof value !== "string")) throw new Error("设备地址记录超出限制。");
-      for (const value of urls) networkUrl(value);
-    }
-    const publicBytes = Uint8Array.from(record.public_key.match(/../g), value => parseInt(value, 16));
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", publicBytes));
-    if ([...digest].map(value => value.toString(16).padStart(2, "0")).join("") !== target) throw new Error("设备地址记录与目标 Peer ID 不符。");
-    const unsigned = Object.fromEntries(fields.map(key => [key, key === "signature" ? "" : record[key]]));
-    verify(record.public_key, "reachability", encoder.encode(JSON.stringify(unsigned)), record.signature);
-    return [
-      ...record.direct_urls.map(value => ({ url: networkUrl(value), relay: false, expires: record.expires_at })),
-      ...record.relay_urls.map(value => ({ url: networkUrl(value), relay: true, expires: record.expires_at })),
-    ].filter(candidate => {
-      const url = new URL(candidate.url);
-      return location.protocol !== "https:" || url.protocol === "wss:" || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    });
-  } finally { wire.close(); }
-}
-
-export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
+/**
+ * Opens a Noise channel to `entry.device_id` through the Gateway at `entry.address`.
+ * The Node must prove that device key; any other key closes the connection.
+ */
+export async function connectDevice(entry, { onEvent, onClose, signal, timeoutMs = 10000 } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
-  if (!identity) await initClient();
-  const target = validTarget(entry.peer_id);
+  await initClient();
+  const target = validTarget(entry.device_id);
   const endpoint = validEndpoint(entry.address);
-  if (entry.local === true) {
-    if (endpoint !== location.origin) throw new Error("本机会话只能连接当前本机入口。");
-    const local = new URL("/api/local/ws", endpoint);
-    local.protocol = local.protocol === "https:" ? "wss:" : "ws:";
-    return connectPath(local.href, target, null, { onEvent, onClose, signal });
-  }
-  const initial = new URL("/api/network/ws", endpoint);
-  initial.protocol = initial.protocol === "https:" ? "wss:" : "ws:";
-  const entryUrl = initial.href;
-  return new Promise((resolve, reject) => {
-    const queue = [], active = new Map(), seen = new Set();
-    const lookup = new AbortController();
-    let winner, finished = false, looking = true, lastError, direct = 0, relay = 0;
-    const timer = setTimeout(() => stop(new Error("无法连接指定设备，请检查设备是否在线及入口地址。")), 15000);
-    function cleanup() { clearTimeout(timer); signal?.removeEventListener("abort", abort); lookup.abort(); }
-    function stop(error) {
-      cleanup();
-      if (winner) { winner.controller.abort(); return; }
-      if (finished) return;
-      finished = true;
-      for (const attempt of active.values()) attempt.controller.abort();
-      reject(error);
-    }
-    function abort() { stop(new Error("设备连接已取消。")); }
-    signal?.addEventListener("abort", abort, { once: true });
-    function add(candidate) {
-      const key = `${candidate.relay}:${candidate.url}`;
-      if (seen.has(key)) return;
-      if (candidate.relay ? relay >= 8 : direct >= 16) return;
-      seen.add(key);
-      if (candidate.relay) relay++; else direct++;
-      queue.push(candidate);
-    }
-    function pump() {
-      if (finished) return;
-      while (active.size < 2 && queue.length) {
-        const needRelay = active.size && ![...active.values()].some(item => item.relay);
-        const preferred = queue.findIndex(item => item.relay === Boolean(needRelay));
-        const candidate = queue.splice(preferred < 0 ? 0 : preferred, 1)[0];
-        if (candidate.expires && candidate.expires <= Math.floor(Date.now() / 1000)) continue;
-        const attempt = { ...candidate, controller: new AbortController() };
-        active.set(attempt, attempt);
-        connectPath(candidate.url, target, candidate.relay, {
-          signal: attempt.controller.signal,
-          onEvent: event => { if (winner === attempt) onEvent?.(event); },
-          onClose: error => { if (winner === attempt) { cleanup(); onClose?.(error); } },
-        }).then(channel => {
-          active.delete(attempt);
-          if (finished) { channel.close(); return; }
-          winner = attempt; finished = true; clearTimeout(timer); lookup.abort();
-          for (const other of active.values()) other.controller.abort();
-          resolve(channel);
-        }, error => {
-          active.delete(attempt);
-          if (finished) return;
-          lastError = error;
-          pump();
-        });
-      }
-      if (!active.size && !queue.length && !looking) stop(lastError || new Error("没有找到此设备的可达路径。"));
-    }
-    add({ url: entryUrl, relay: true });
-    pump();
-    lookupPaths(entryUrl, target, lookup.signal).then(candidates => {
-      looking = false;
-      if (finished) return;
-      for (const candidate of candidates) {
-        if (candidate.url !== entryUrl || candidate.relay) add(candidate);
-      }
-      pump();
-    }, error => {
-      looking = false;
-      lastError ??= error;
-      pump();
-    });
-    if (signal?.aborted) abort();
-  });
-}
-
-async function connectPath(url, target, relay, { onEvent, onClose, signal }) {
+  if (entry.local === true && endpoint !== location.origin) throw new Error("本机会话只能连接当前本机入口。");
+  const url = new URL(entry.local === true ? "/api/local/ws" : "/api/client", endpoint);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   const pending = new Map();
-  let channel, closed = false, nextId = 0, publicKey;
-  const disconnected = () => new Error("加密连接已断开，操作结果尚未确认。重新连接后先核对原操作，不要重复派发。");
-  const wire = openSocket(url, signal, error => {
+  let channel, closed = false, nextId = 0;
+  const disconnected = () => new Error("加密连接已断开，操作结果尚未确认。重新连接后先核对原操作，不要重复提交。");
+  const wire = openSocket(url.href, signal, (error) => {
     closed = true;
     const reason = channel ? disconnected() : error;
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(reason); }
     pending.clear();
     onClose?.(reason);
-  });
+  }, timeoutMs);
   const { socket, receive } = wire;
-  const fail = error => wire.close(error);
+  const fail = (error) => wire.close(error);
   let handshake;
   try {
-    if (relay === null) await wire.opened();
-    else {
-      await wire.control("welcome");
-      socket.send(JSON.stringify(relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
-      await wire.control("ready");
-    }
-    handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
+    await wire.opened();
+    if (entry.local !== true) socket.send(JSON.stringify({ type: "connect", target }));
+    handshake = new Handshake(true, target, prologue);
+    handshake.setProof(device.deviceId, await sign(handshake.signingBytes()));
     socket.send(handshake.write(new Uint8Array()));
     const response = await receive();
-    if (!(response instanceof ArrayBuffer)) throw new Error("设备未返回加密握手。");
     if (handshake.read(new Uint8Array(response)).length) throw new Error("设备握手包含未预期的数据。");
     socket.send(handshake.write(new Uint8Array()));
-    if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与目标 Peer ID 不符，已拒绝连接。");
-    publicKey = handshake.remotePublicKey();
-    if (typeof publicKey !== "string" || !peerPattern.test(publicKey)) throw new Error("设备未提供有效的认证公钥。");
+    if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与目标编号不符，已拒绝连接。");
     channel = handshake.finish();
     wire.ready();
-  } catch (error) { fail(error); throw error; }
-  finally { handshake?.free(); }
+  } catch (error) {
+    const reason = !error?.code && /device|identity|Proof|signature/i.test(String(error?.message ?? error)) ? new Error("设备身份与目标编号不符，已拒绝连接。") : error;
+    fail(reason);
+    throw reason;
+  } finally { handshake?.free(); }
   (async () => {
     try {
       while (!closed) {
-        const frame = await receive();
-        if (!(frame instanceof ArrayBuffer)) throw new Error("加密通道收到未加密的数据，已关闭连接。");
-        const plaintext = channel.openRecord(new Uint8Array(frame));
+        const plaintext = channel.openRecord(new Uint8Array(await receive()));
         if (plaintext == null) continue;
         const message = JSON.parse(decoder.decode(plaintext));
         if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("设备返回的加密消息格式无效。");
@@ -343,13 +228,12 @@ async function connectPath(url, target, relay, { onEvent, onClose, signal }) {
     finally { channel.free(); }
   })();
   return {
-    peerId: target,
-    publicKey,
+    deviceId: target,
     request(method, params = {}) {
       if (closed) return Promise.reject(disconnected());
       const id = String(++nextId);
       return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { pending.delete(id); reject(new Error("设备尚未确认请求结果。请核对原操作，不要重复派发。")); }, 60000);
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error("设备尚未确认请求结果。请核对原操作，不要重复提交。")); }, 60000);
         pending.set(id, { resolve, reject, timer });
         try { for (const record of channel.sealMessage(encoder.encode(JSON.stringify({ id, method, params })))) socket.send(record); }
         catch (error) { fail(error); }

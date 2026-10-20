@@ -75,18 +75,17 @@ test('text snapshots replace their item while deltas append once in sequence', (
   assert.equal(fourth[0].needsRefresh, false)
 })
 
-test('each invocation and native turn keeps its own sequence and task association', () => {
+test('each invocation and work keeps its own sequence', () => {
   let state = mergeProgress([], manager(1, { type: 'text_delta', text: '第一轮' }))
   state = mergeProgress(state, manager(1, { type: 'text_delta', text: '第二轮' }, 'turn-b'))
-  for (const turn_id of ['turn-a', 'turn-b']) {
-    state = mergeProgress(state, parseChanged({ type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', thread_id: 'thread-a', turn_id, task_ref: 'task-a', target_node: 'node-a', sequence: 1, progress: { type: 'text_snapshot', text: turn_id } }))
+  for (const work_id of ['work-a', 'work-b']) {
+    state = mergeProgress(state, parseChanged({ type: 'native_progress', conversation_id: 'chat-a', work_id, target_node: 'node-a', sequence: 1, progress: { type: 'text_snapshot', text: work_id } }))
   }
   assert.equal(state.length, 4)
-  assert.deepEqual(state.map(item => item.text), ['第一轮', '第二轮', 'turn-a', 'turn-b'])
+  assert.deepEqual(state.map(item => item.text), ['第一轮', '第二轮', 'work-a', 'work-b'])
   assert.deepEqual(state.map(item => item.kind), ['manager', 'manager', 'native', 'native'])
-  assert.equal(state[2].kind === 'native' && state[2].task_ref, 'task-a')
   assert.equal(state[2].kind === 'native' && state[2].work_id, 'work-a')
-  const next = mergeProgress(state, parseChanged({ type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', thread_id: 'thread-a', turn_id: 'turn-a', task_ref: null, target_node: 'node-b', sequence: 1, progress: { type: 'text_snapshot', text: 'other device' } }))
+  const next = mergeProgress(state, parseChanged({ type: 'native_progress', conversation_id: 'chat-a', work_id: 'work-a', target_node: 'node-b', sequence: 1, progress: { type: 'text_snapshot', text: 'other device' } }))
   assert.equal(next.length, 5)
   assert.equal(next[4].text, 'other device')
 })

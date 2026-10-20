@@ -1,26 +1,18 @@
 # Node 协议参考
 
-协议版本为 `1`。产品入口为 `vibeface`，共享协议以 `crates/node/src/model.rs` 为准。本文描述 Node HTTP、对等传输、事件、Agent 任务和原生工作观察。
+协议版本为 `1`，数据格式 `data_epoch=7`，数据库 `user_version=6`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
-`network_id` 是个人网络根公钥原始字节的 SHA256，`peer_id` 是设备公钥原始字节的 SHA256，均编码为 64 个小写十六进制字符。地址不参与身份计算。
+`network_id` 是个人网络根 Ed25519 公钥，`device_id` 是设备 Ed25519 公钥本身，均编码为 64 个小写十六进制字符。Node 的 `device_id` 同时是它的 iroh `EndpointId`。地址不参与身份计算。
 
 个人网络使用 `NetworkState { genesis, checkpoint, events }`。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
 
-`Member` 包含 `subject_id`、`public_key`、`kind`、`name`、`node_roles` 和 `manage`。`kind` 为 `node` 或 `client`。Node 成员只能具有本机启用角色，不能持有管理权限。客户端没有 Node 角色，只有明确授权的管理客户端能签署成员变更。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 能做什么由本机 `config.json` 的 `roles` 声明，不写入成员目录。
 
-角色为 `gateway`、`relay`、`replica` 和 `scheduler`。`config.json` 控制本机能力，个人网络成员授权限制设备在该网络中的权限。公共中继能力独立于私人网络授权。
+管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq`，接收方只接受被撤销设备 `seq <= cutoff_seq` 的事件。并发的授予与撤销冲突时撤销优先。根恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
 
-管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`。签名目录验证因果授权，不能通过并发事件自行扩大权限，已知撤销优先。管理恢复由根签名的更高 epoch checkpoint 建立新授权，旧 epoch 不能覆盖新授权。
-
-所有共享会话、事件、附件、任务及通知按 `network_id` 分区。公网发现目录不发布私人网络成员关系、项目或会话。一个物理 Node 可运行自己的调度执行，同时为其他网络转发密文。
-
-## Peer ID 术语
-
-内部类型使用 `PeerId`，身份方法使用 `peer_id()`，浏览器 SDK 使用 `peerId()`。JSON、RPC、邀请、连接记录、Peer 握手、发现记录、中转签名、维护响应和更新日志统一使用 `peer_id`。mDNS 只广告和读取 `peer_id`。
-
-Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制字符。恢复挑战使用 `target_peer_id`，blob 下载清单使用 `source_peer_id`。`network_id` 是网络编号，`subject_id` 是签名成员编号。
+一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。地址、成员关系、项目和会话都不发布到公共目录。
 
 ## 本机配置
 
@@ -28,21 +20,35 @@ Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制�
 
 | 字段 | 含义 |
 |---|---|
-| `listen` | 实际 HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡 |
-| `public_url` | 配对和展示使用的主入口 origin，公网为 HTTPS |
+| `listen` | HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡；iroh 默认在同一端口号上监听 UDP |
+| `local_listen` | 本机会话的固定回环地址，默认 `127.0.0.1:4791`，让本机 origin 和浏览器存储跨重启不变 |
+| `public_url` | 本 Node 的网页 origin，公网为 HTTPS；启用 `gateway` 时作为地址记录的 `gateway_url` |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
-| `roles` | 本机启用的 Node 角色 |
-| `roots` | 本机 Agent 可选择的绝对项目目录列表 |
-| `network` | 公共发现、候选直连地址、mDNS 与公共中继配置 |
+| `roles` | 本机启用的角色：`gateway`、`relay`、`replica`、`scheduler`；`gateway` 和 `scheduler` 依赖 `replica` |
+| `public_entry` | `true` 表示本进程是公共入口，只提供网页、relay 和密文转发，不加入个人网络 |
+| `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
+| `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | 管理 SDK 配置，未启用时为 `null` |
-| `codex_socket` | 已有 Codex App Server Socket，启用 Agent 且为 `null` 时可启动私有实例 |
-| `codex_bin` | Codex CLI 程序路径 |
+| `codex_socket` | 外部自管的 Codex App Server Unix socket；为 `null` 时 Node 自行托管 App Server |
+| `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日自主管理调用次数，默认 20；本人主动聊天不受此额度限制 |
 
-`gateway`、`scheduler` 依赖 `replica`，配置和配对邀请都会校验此条件。无需 Agent 的入口可启用 `gateway`、`replica` 和可选 `relay`；纯 `relay` 可以只转发消息而不保存业务副本。当前不提供无本地历史的 Gateway 代理模式。
+`network` 的字段：
+
+| 字段 | `init` 参数 | 含义 |
+|---|---|---|
+| `bind` | 无 | iroh 的 UDP 地址；省略时在 `listen` 端口上绑定 IPv4 与 IPv6 通配地址，IPv6 失败不阻止启动 |
+| `relays` | `--relay URL` | 个人网络中其他 Node 的 relay，最多 16 个 |
+| `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
+| `relay_paths_only` | `--relay-paths-only` | 不绑定直连 socket，只经 relay 连接 |
+| `relay_listen` | `--relay-listen ADDR` | 本 Node 运行 iroh relay 的地址，明文 HTTP，公网经反向代理提供 HTTPS |
+| `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，默认 `http://<relay_listen>`；监听全部网卡时必填 |
+| `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
+
+配置了 `network.bind` 或 `relay_paths_only` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。
 
 启用管理 Agent 时，`manager` 对象包含以下全部字段。程序路径在后台运行时使用绝对路径。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
@@ -57,152 +63,142 @@ Peer ID 是设备公钥原始字节的 SHA256，使用 64 个小写十六进制�
 }
 ```
 
-该对象作为 `manager` 的值，保留 `config.json` 的其他字段。`provider` 也可为 `codex_sdk`，Cursor 模式不启动 Node.js sidecar。模型名和程序路径需替换为本机可用配置。
+`provider` 也可为 `codex_sdk`，Cursor 模式不启动 Node.js sidecar。`manager_capabilities` 声明本机 SDK 能力：两种 Manager 均支持流式进度、取消请求和本机原生会话延续，均不支持原生 steer 或 Provider run 对账。`cancel_confirmation=true` 表示取消可被确认，Codex 以停止时受管进程树全部退出为证据，Cursor 以 Provider 终态或受管进程退出为证据。配置存在、进程可达和真实模型可用是不同状态。
 
-`manager_capabilities` 声明本机 SDK 能力。两种 Manager 均支持流式进度、取消请求和本机原生会话延续，均不支持原生 steer 或 Provider run 对账。Cursor 文本支持增量和快照，Codex 文本是按 item 替换的快照。`cancel=true` 表示可请求取消；`cancel_confirmation=true` 表示取消可被确认：Codex 以停止时受管进程树（含另建进程组的子进程）全部退出为证据，Cursor 以 Provider 终态或受管进程退出为证据。`verified=false` 不表示已通过当前环境的真实模型验收。配置存在、进程可达和已验证是不同状态。
+## 数据目录
+
+| 文件 | 内容 |
+|---|---|
+| `identity.json` | 设备私钥，0600 |
+| `config.json` | 本机配置，0600 |
+| `data-epoch.json` | `{"data_epoch":7}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=6` |
+| `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
+| `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
+| `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
+| `local-sessions.json` | 本机会话的 cookie 摘要 |
+| `join.json` | `vibeface join` 进行中的请求，重试时沿用同一请求 |
+| `codex-app-server.pid` | 托管 App Server 的进程组号 |
+| `node.log`、`node.log.1` | Node 日志，0600，启动时超过 16 MiB 轮转一次 |
+| `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
+
+运行中的 Node 用目录锁独占数据目录，并在私有维护 socket 上回答 `vibeface status`。
 
 ## HTTP 与客户端通道
 
-允许的浏览器入口由 `public_url`、`allowed_origins` 和本机 HTTP 别名组成。本机别名为 `127.0.0.1`、`localhost`、`0.0.0.0`，端口使用 `listen` 的端口。允许入口不会改变监听网卡或开放防火墙。
+允许的浏览器入口由 `public_url`、`allowed_origins`、本机 HTTP 别名，以及地址簿中未撤销成员 Node 的 `gateway_url` 组成。本机别名为 `127.0.0.1`、`localhost`、`0.0.0.0`，端口使用 `listen` 的端口。允许入口不会改变监听网卡或开放防火墙。
 
-显式入口是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`。同一主机和端口不能同时配置两个 scheme。HTTP 检查 Host，带 Origin 时必须匹配该 Host 对应的同一入口。普通 HTTP 正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
+显式入口是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`。同一主机和端口不能同时配置两个 scheme。HTTP 检查 Host，带 Origin 时必须匹配该 Host 对应的同一入口；只有 `/api/client` 接受跨源连接。普通 HTTP 正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
-| `/`、`/app.js`、`/transport.js`、`/style.css` | GET | 内置可信网页客户端 |
+| `/`、`/assets/*`、`/transport.js` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
+| `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
-| `/api/info` | GET | Node 公开身份与能力信息 |
-| `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口 |
-| `/api/local/join/request` | POST | 本机运行中的 Node 提交节点邀请和名称，保存申请收据 |
-| `/api/local/join/accept` | POST | 本人以申请编号及完整 review hash 确认节点身份和权限 |
-| `/api/local/join/status` | POST | 核对原申请并安装已授予的 Node 成员授权，不重发申请 |
-| `/api/network/ws` | GET，WebSocket upgrade | 直连、发现、中继及端到端客户端通道 |
-| `/api/tools` | POST | 本地管理 Agent 的受限工具调用 |
-| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | Cursor SDK 原生工具回调 |
+| `/api/info` | GET | `device_id`、`version`、`roles`、`manager_available` 和 `public_entry` |
+| `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
+| `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
+| `/api/tools`、`/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，供本机管理 SDK 调用协调工具 |
 
-网站不提供用户名密码注册或明文业务 RPC。公网通道始终验证签名成员身份。独立回环入口另用本机启动凭据兑换绑定浏览器 Noise 公钥的 HttpOnly 会话 Cookie，不授予永久成员资格。网页的密钥存储需要安全上下文，普通 LAN HTTP 页面不能降级为无密钥认证。
+网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，已有网络时返回 `{ kind: "initialized", entry, local_launch? }`。该响应不授予成员资格。
 
-`/api/local/setup` 要求正文为 JSON 空对象 `{}`。全部本机设置及加入路径要求实际 TCP 来源为 loopback、Host 为允许的字面 localhost 或 loopback 地址，且 Origin 与该入口完整一致。不接受 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP` 请求头，`0.0.0.0`、`::` 和公网入口不能使用。响应禁止缓存，初始化材料不进入公开的 `/api/info`。
+独立回环 listener（`local_listen`）提供 `/api/local/info`、`/api/local/launch`、`/api/local/exchange` 和 `/api/local/ws`。`launch` 只接受本机私有启动凭据，`exchange` 消费 URL fragment 中的单次 token 后签发绑定浏览器公钥的 HttpOnly Cookie，`ws` 仍执行 Noise 握手。公开 router 不挂这些入口。关闭 `local_auto_access` 会撤销本机会话、待兑换 token 和连接。
 
-未初始化时返回 `{ kind: "uninitialized", invitation: { url, peer_id, capability } }`，其中一次性能力仍由原有签名建网或恢复协议消耗。已有网络时返回 `{ kind: "initialized", entry: { address, peer_id }, local_launch?: { url, peer_id, token } }`。先尝试原入口的签名身份；可选启动凭据仅用于本人明确选择本机自动访问时导航到独立回环入口，不自动切换浏览器来源。该响应不授予永久成员资格，也不重建个人网络。
+### 浏览器通道
 
-节点加入的响应状态为 `idle`、`review`、`pending`、`joined` 或 `uncertain`。`review` 与 `pending` 带 `request_id`、现有 `PairReview` 及其 canonical JSON 的 SHA256 `review_hash`。接受需要明确提交同一编号与 hash，原网络的管理客户端仍须批准。`joined` 只表示 Node 入网，不授予浏览器客户端权限。未知结果先查 `status`，不重新创建请求身份。
+浏览器连接 `/api/client` 后先发送文本帧 `{"type":"connect","target":"DEVICE_ID"}`：
 
-WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"PEER_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v1`。客户端钉住目标 Peer ID，服务端在加密通道内验证客户端个人网络授权。
+- `target` 是本 Node 且本 Node 不是公共入口时，Noise 在这里终止。
+- `target` 是其他成员 Node 时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。目标不是成员时回 `{"type":"error","code":"target_not_member"}`，连不上时回 `target_unreachable`，随后关闭。
+- 公共入口没有地址簿，它把目标当作挂在自己 relay 上的设备去连接。只有持有入口令牌的 Node 能连上这台 relay，其他目标得到 `target_unreachable`。
+- 每台网关同时最多转发 256 个会话，超出时回 `gateway_busy` 并关闭。`connect` 首帧须在 10 秒内到达。
 
-握手后的应用消息均为二进制加密记录。文本应用消息、身份错配、篡改及重放关闭通道。大消息通过 `sealMessage` 和 `openRecord` 分片重组，不能直接把一个超长 JSON 塞入单个 Noise record。
+随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。转发会话的网关、它前面的 TLS 终止方和 relay 只能看到 Noise 密文。提供网页的 origin 不在此列：它分发浏览器运行的代码，必须是本人自己的 Gateway 或本人自己服务器上的公共入口。
 
-解密后的请求为 `Request { id: string, method, params }`，响应为 `Response { id, result, error? }`。`error` 是错误说明字符串，不包含成功结果。请求 ID 仅用于响应匹配，业务写入仍依靠稳定的消息 ID、任务引用及原目标去重。
+握手后的应用消息均为二进制加密记录，大消息分片重组。解密后的请求为 `{ id, method, params }`，响应为 `{ id, result, error? }`。请求 ID 只用于匹配响应，写入去重依靠业务 ID。Noise 握手须在 10 秒内完成。连接每 20 秒心跳，90 秒无数据关闭，单次调用 120 秒超时，超时的写操作结果未知，需要按业务 ID 对账。每台 Node 同时最多保留 32 个未加入设备的会话，超出时回 `too many devices are joining this Node; try again later`；未加入设备的会话最长 15 分钟，加入后不再计入。
 
 | method | params | 用途 |
 | --- | --- | --- |
-| `info` | `{}` | 当前 Node 的公开身份、角色、版本和初始化状态 |
-| `prepare_genesis` | `owner_public_key`、`client_name` | 构造首个成员目录及待签名内容 |
-| `bootstrap` | `capability`、`state` | 一次性本机授权安装根签名目录 |
-| `authenticate` | `network_id` | 验证握手客户端的成员授权，或独立入口已验证的本机会话 |
-| `local_access` | 可选 `enabled` | 查询本机自动访问；管理客户端可开关，本机会话可关闭 |
-| `directory` | `{}` | 返回当前签名目录及投影 |
-| `node_settings` | `{}` | 管理客户端或有效本机会话读取当前节点 manager、roots、默认程序路径及角色和依赖准备状态 |
-| `configure_node` | `manager`、`roots` | 管理客户端或有效本机会话验证并保存当前节点设置，更新后续操作读取的本机快照 |
-| `rpc` | 下节 RPC 对象 | 执行业务读写 |
-| `subscribe` | `{}` | 订阅本网络的 `changed` 消息及其语义 payload |
-| `prepare_invite` | `kind`、`node_roles`、`request_id` | 生成邀请正文与管理客户端待签名内容 |
-| `commit_invite` | `invite`、`capability` | 验证管理客户端签名并登记一次性邀请 |
-| `prepare_pair_request` | `invite`、`capability`、`name`、可选 `request_id` | 构造新设备的持钥证明 |
-| `pair_request` | `request` | 提交新设备签名的配对申请 |
-| `pair_accept` | `request_id`、`signature` | 新设备签名确认本次 review |
-| `pair_requests` | `{}` | 管理客户端查看待确认申请 |
-| `prepare_pair` | `request_id` | 返回 review、治理事件及两份待签名内容 |
-| `pair_confirm` | `request_id`、`inviter_signature`、`event` | 管理客户端签名后授予设备权限 |
-| `pair_status` | `request_id` | 查询当前持钥设备的 pending 或 granted 状态 |
-| `prepare_revoke` | `subject_id` | 生成客户端待签名撤销事件 |
-| `revoke` | `event` | 验证并同步签名撤销 |
-| `recovery_challenge` | `network_id`、`owner_public_key`、可选 `genesis` | 生成根身份持钥挑战 |
-| `recovery_context` | `challenge_id`、`signature`、新节点的 `state` 与 `capability` | 验证根签名后读取恢复上下文 |
-| `prepare_recovery` | `challenge_id`、`members` | 生成更高 epoch checkpoint 及根待签名内容 |
-| `recover` | `challenge_id`、`checkpoint`、新节点的 `state` 与 `capability` | 安装根签 checkpoint 并授权新管理客户端 |
+| `info` | `{}` | 公开身份、主机名、角色、版本、初始化状态和 `connection_entry` |
+| `authenticate` | 可选 `network_id` | 验证成员授权或本机会话 |
+| `directory` | `{}` | 当前签名目录及投影 |
+| `entrances` | `{}` | 地址簿中的签名地址记录，浏览器自行验签 |
+| `subscribe` | 可选 `vector` | 订阅 `changed` 推送；浏览器带已见的版本向量，入口落后时回 `behind: true` 并立即同步 |
+| `rpc` | 下节业务对象 | 业务读写 |
+| `write_state` | `{}` | 写入状态和本机记下的冲突，见 [写入保护](#写入保护) |
+| `confirm_writable` | `{}` | 本人确认数据目录不是从备份恢复的，只读或对齐中的 Node 进入可写 |
+| `diagnostics` | `{}` | 脱敏诊断包，见 [排障](troubleshooting.md) |
+| `node_settings` | `{}` | 读取本机 manager、roots 和依赖准备状态 |
+| `configure_node` | `manager`、`roots` | 保存本机设置 |
+| `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
+| `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
+| `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
+| `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
+| `approve` | `join_id` 加 `admin_nonce`、`event` 或 `reject: true` | 管理设备推进或拒绝加入，请求在其他入口时转发过去 |
+| `revoke` | `event` | 管理设备签名撤销成员 |
+| `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的两分钟签名读取当前目录 |
+| `recover` | `genesis`、`checkpoint`、`capability` | 空 Node 安装根签目录，已建网 Node 安装更高 epoch checkpoint |
 
-`prepare_genesis` 返回 `state` 和 `signing { domain, payload }`。客户端使用本地根身份签名并写入 `state.genesis.signature`。`bootstrap` 和 `authenticate` 返回 `principal`、`state` 和 `view`。`principal` 包含 `network_id`、`subject_id`、`epoch`、`can_manage` 和 `source`，不能由客户端自行声明。`source=membership` 使用签名成员目录；`source=local_session` 绑定本机 Node、当前网络和浏览器 Noise 公钥，`can_manage=false`，不参加成员治理。本机设置写入在取得配置锁后重新核对 Cookie 的有效性、Node、网络及浏览器身份；关闭本机访问后，旧 Cookie 不能保存设置。已有签名管理身份优先保留其成员权限。
+未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证 `RootCheckpoint` 的根签名并要求 epoch 更高，验证前没有副作用。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
 
-邀请含管理客户端签名的 `InviteEnvelope`，新设备还要签署持钥证明和最终 review。管理客户端分别签署 review 与治理事件。只有一次性邀请，或只取得未确认的申请，都不能成为成员。在线新增成员不授予管理权限，管理客户端由根签初始化或恢复 checkpoint 明确建立。
+加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
-恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`。加密正文包含 `version`、`network_id`、`root_secret_key`、`genesis`、`recovery_epoch` 和 `decryption_keys`。恢复加密复用 Rust/WASM 的 Argon2id 与 XChaCha20-Poly1305，实现同时验证格式、KDF 参数、身份及完整性。口令和明文根私钥不发给 Node。
+浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、`ApprovalAnswered`、本人结清的 `WorkFinished`、`AutonomySet` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。Node 和协调 Agent 不能代写这些事件。
 
-恢复流程先验证根签 challenge，再返回可核对的设备目录。客户端明确选择保留成员，生成新的独立管理客户端，并使用本地解锁的根身份签署 checkpoint。已初始化 Node 只能恢复该个人网络。新 Node 另需本机 capability，持有其他网络的根私钥不能抢占公共主机。业务正文和项目文件不在根恢复包中。
+恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`，加密正文包含根私钥、`genesis`、`recovery_epoch` 和解密材料，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文根私钥不发给 Node。根恢复默认保留现有管理设备。业务正文和项目文件不在恢复包中。
 
-未初始化时，本机 `access --json` 输出含 Peer ID 与一次性 bootstrap capability。个人网络建立且本机自动访问开启时，它输出独立回环入口，URL fragment 包含短期单次 token。凭据不放入服务日志、公共目录或 DAG。知道 Node 地址或公开身份不能抢占初始化，也不能取得私人网络权限。
-
-独立回环 listener 提供 `/api/local/info`、`/api/local/launch`、`/api/local/exchange` 和 `/api/local/ws`。`launch` 仅接受本机私有启动凭据，`exchange` 消费单次 token 后签发绑定浏览器公钥的 Cookie，`ws` 仍执行 Noise 握手。公开 router 不挂这些入口。仅检查来源 IP、Host 或代理头不足以建立本机授权。关闭 `local_auto_access` 会撤销本机会话、待兑换 token 和连接，普通成员会话保留。
-
-`/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不是供外部 Bot 保存的长期身份，不能添加或撤销设备、回答审批或修改后续授权。管理 SDK 使用独立随机端口的回环 listener，不依赖公网或 LAN 地址。
-
-HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目标入队以版本化调度回执为准，工作是否完成仍查询持久任务、准确原生 turn 及结果。
+`/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话，不能添加或撤销设备、回答审批或修改后续授权。
 
 ## RPC 方法
 
-`rpc` 通道方法的 `params` 使用 JSON 对象，`method` 选择业务方法，其余字段与 `method` 同级。已验证客户端确定 `network_id`，操作请求中的网络必须一致。
+`rpc` 的 `params` 是 JSON 对象，`method` 选择业务方法，其余字段与 `method` 同级。已验证的客户端确定 `network_id`。
 
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
-| `nodes` | 无 | 已授权 Node、可达性和当前可查能力 |
-| `bots` | 无 | 当前个人网络的持久机器人定义 |
-| `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project` | 本人显式创建机器人并绑定独立聊天历史；完整请求精确去重 |
-| `conversations` | 无 | 本地已知业务会话 |
-| `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
-| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、`autonomy`、`agent_tasks`、`native_sessions`、`pending_checks`、观察目标、heads、missing、调度队列及事实新鲜度 |
-| `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node`、`report_results` | 原子保存用户消息、汇报意图和本机 inbox 或 outbox，返回调度回执 |
-| `set_autonomy` | `conversation_id`、`mode`、`expected_version`、可选 `scheduler_node` | 本人设置该机器人聊天的后续权限，模式为 `off`、`report` 或 `continue` |
-| `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示后台任务已停止 |
-| `reconcile` | `conversation_id`、`target_node`、`check_id` | 向原目标复查一条待核对记录，只读，不重发 |
-| `resolve` | `conversation_id`、`target_node`、`check_id`、`evidence`，原生项另需 `outcome` | 本人附证据结清待核对记录，不重做原触发 |
-| `cancel_agent_task` | `conversation_id`、`task_ref` | 沿原任务向目标 Agent 请求取消，核对实际停止后回传终态 |
-| `native_interrupt` | `conversation_id`、`work_id`、`target_node` | 请求中断已登记的准确原生 turn |
-| `native_respond` | `conversation_id`、`work_id`、`target_node`、`request_id`、`response` | 本人回答该原生 turn 当前仍有效的请求 |
-| `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit` | 分页读取本网络、该会话实际引用的 UTF-8 文本附件 |
+| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq` 和能力；同步正在失败的 Node 直接记为离线，不等待探测 |
+| `bots` | 无 | 当前网络的机器人定义 |
+| `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
+| `conversations` | 无 | 本地已知会话 |
+| `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |
+| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`、`autonomy`、`pending_checks`、`local_node` 和调度队列 |
+| `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执 |
+| `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
+| `set_autonomy` | `conversation_id`、`mode`、`expected_version`、`attestation` | 设置该聊天的后续权限：`off`、`report` 或 `continue` |
+| `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作 |
+| `interrupt_work` | `conversation_id`、`work_id` | 中断工作及它委派出的工作；目标在其他 Node 时由入口转发和重试 |
+| `answer_approval` | `conversation_id`、`work_id`、`request_id`、`response`、`attestation` | 回答仍有效的审批，转发到执行它的 Node |
+| `reconcile` | `conversation_id`、`check_id` | 只读复查一条待核对 |
+| `resolve` | `conversation_id`、`check_id`、选择与可选备注 | 本人结清待核对，工作项写一条带本人签名的 `WorkFinished`，不重做原触发 |
+| `upload_attachment` | `conversation_id`、`hash`、`size`、`offset`、`data` | 按 1 MiB 分块上传附件，返回已落盘的偏移 |
+| `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit`、`binary` | 分页读取该会话实际引用的附件 |
 | `notifications` | `client_id` | 该客户端尚未确认的通知 |
-| `ack` | `notification_id`、`client_id` | 记录该客户端已读 |
-| `export` | `conversation_id` | 导出包含签名事件的快照 |
+| `ack` | `notification_id`、`client_id`、`attestation` | 写入 `NotificationAcked` |
 
-`bot_id`、`message_id`、`conversation_id`、`task_ref` 和 `call_ref` 标识业务写入及原调用。重试保留原身份、内容和目标；同 ID 换内容会被拒绝。协调工具为 `nodes`、`context`、`send_task`、`task_status`、`call_lookup`、`cancel_task`、`observe_session` 和 `codex`。只读结果回调只得到查询工具。宿主 SDK 工具只读取本机，本机修改通过 `codex` 工具启动的原生工作完成。
+`bot_id`、`message_id`、`conversation_id` 和 `call_ref` 标识业务写入。重试保留原身份和内容，同 ID 换内容会被拒绝。协调 Agent 的 token 只能调用 `nodes`。
 
-Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入或重建同版本定义不启动模型。
+`read_artifact` 默认按 UTF-8 文本分页，返回 `{ blob_hash, text, offset, next_offset, size }`，`limit` 为 4 至 65536 字节，偏移必须位于字符边界。`binary: true` 时每页 512 KiB，只读取请求的区间，返回 `{ blob_hash, offset, size, next_offset, data }`，`data` 为 base64。`next_offset` 为 `null` 时结束。浏览器拼好全部字节后用 SHA-256 与 `blob_hash` 比对，一致才保存文件。附件随引用它的消息由同步按哈希拉到其他成员 Node，还没拉到的入口读取失败，稍后再试。
 
-Node 的 manager 配置保存本机 SDK adapter、模型和目录，不保存模型凭证。Provider 凭证由本机运行环境或 Provider 自身保存。Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存仍按网络、scope 和本机节点保存。缓存不是共享聊天的事实来源。
-
-`send_task` 在同一事务保存带稳定调用引用的签名任务及调度记录，固定原目标。恢复先用 `call_lookup` 或 `task_status` 查询原任务，不能根据同一文本猜测是否重复，也不能换目标重派。宿主 SDK 的 Shell 和原生写请求没有旧 Operation 账本，结果不明时必须核对真实副作用。
-
-`conversation.scheduler` 包含 `jobs`、`provider`、`model` 和 `capabilities`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state`、`pending_check` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human`、`autonomous`、`agent_task` 或 `agent_result`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
-
-`autonomy` 包含 `mode`、`version` 和 `scheduler_node`；授权链无法验证时 `mode` 为 `off`、`version` 为 `null` 并附带 `error`。`agent_tasks` 包含 `task_ref`、来源与目标 Node、`origin_trigger`、`state`、任务文本和结果说明。`native_sessions` 包含 `work_id`、可选 `task_ref`、目标 Node、准确 thread 与 turn、状态、说明和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
-
-原生控制按已登记的 `work_id` 找到原 thread 和 turn，再核对目标、会话及当前有效请求。审批仅本人可回答，过期请求被拒绝。中断请求发出或 SDK 进程退出都不直接证明后台工作已经停止。
-
-`read_artifact` 返回 `{ blob_hash, text, offset, next_offset, size }`。偏移与长度按 UTF-8 字节计算，`limit` 范围为 4 至 65536，默认 65536。偏移必须位于字符边界；下一页使用返回的 `next_offset`，为 `null` 时结束。Node 核对签名附件引用、长度和哈希，正文未同步、非 UTF-8 或仅凭其他会话的哈希猜读都会拒绝。
+`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`executor`、`cwd`、`title`、`prompt`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`open_approvals` 和本机状态 `state`。网页以 `title` 为任务名，`prompt` 放在详细信息里。
 
 ## 可靠调度回执
 
-可靠调度版本为 `1`。入口在同一事务保存消息、不可改写的汇报意图以及 inbox 或 outbox。个人网络中的节点使用同一版本，远端投递不探测目标协议版本。
-
-`message` 返回 `accepted`、`queued`、`state`、`trigger`、`message_id`、`scheduler_node` 和 `receipt`。目标调度节点持久入队后，回执结构为：
+可靠调度版本为 `2`。调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>` 或 `work:<work_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
 
 ```json
 {
-	"version": 1,
-	"network_id": "NETWORK_FINGERPRINT",
+	"version": 2,
+	"network_id": "NETWORK_ID",
 	"conversation_id": "conversation-id",
-	"trigger": "SIGNED_EVENT_HASH",
-	"target_node": "SCHEDULER_PEER_ID",
+	"trigger": "message:message-id",
 	"state": "queued"
 }
 ```
 
-入口仅写入 outbox 时，`accepted=true`、`queued=false`、`state=pending_delivery`。只有目标提交 inbox 后的匹配回执才能确认已入队，HTTP 成功或本机已保存不替代这个确认。`queued=true` 表示已经可靠接收，查询时 `state` 可能已推进至运行或终态。
+会话负责人由 `ConversationOwner` 决定。入口不是负责人时，消息写入入口自己的日志并留在本机 outbox，回执 `state=pending_delivery`，入口每 3 秒经 `vibeface/rpc/1` 的 `deliver` 投递一次，负责人按触发事件幂等接纳。投递时才解析负责人，所以换负责人后旧负责人尚未开始的 job 交给新负责人。浏览器收到入口回执即删除自己的 outbox 项。
 
-投递以网络、会话、trigger、原目标和版本核对回执。未确认的 outbox 先向原目标查询同一 trigger 的 `manager_status`，只有经过完整身份、版本、历史和状态校验的新鲜 `not_found` 才允许投递原 trigger。已有匹配持久 job 和回执时直接确认接单，job 为 `interrupted` 也不能重派。查询失败、过期或矛盾结果不能作为不存在。发送前再次读取持久 outbox，已经确认的条目不再投递。已投递项继续向原目标查询进展和结果，不因离线或超时改派另一台。
+每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果。每轮按领取时固定的版本向量 `basis` 准备上下文。
 
-每个会话的本机管理队列有界，最多保留 256 个待处理触发；本机每个网络的未投递 outbox 也上限为 256。单消费者按持久状态领取，本人待处理消息优先于自主后续。提示通知只负责唤醒，周期扫描补上丢失的唤醒。每轮按持久固定的依据准备上下文，后发消息不会隐式算作已处理。
-
-job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `interrupted`，后四种是终态。`queued` 和确认尚未跨启动边界的 `claimed` 可恢复首次执行。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。最终回答和 job 终态一次提交。导入 DAG 或重建视图不创建 job，也不重放模型、工具或执行操作。
+job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `interrupted`，后四种是终态。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。助手回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。
 
 ```text
 queued → claimed → running ─→ completed | failed
@@ -211,47 +207,25 @@ queued → claimed → running ─→ completed | failed
              └ 重启时 running / cancelling ─→ interrupted（登记待核对）
 ```
 
-停止回复只停止管理轮。Node 封存旧 attempt 的工具权限并排空已接纳工具，SDK 确认受管进程已退出后 job 进入 `cancelled`；已发起的原生 turn 和 Agent 任务继续独立观察和汇报，停止原生 turn 用 `native_interrupt`。`cancelling` 不是停止成功。SDK 进程退出无法确认时 job 进入 `interrupted`，并在原目标登记一条 `manager:<attempt>` 待核对记录。`interrupted` 是终态，不冻结会话，后续消息照常处理。
+待核对统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `work`。同一工作只显示一条：`executor=agent` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
 
-待核对记录统一列在 `conversation.pending_checks`，`kind` 为 `manager_process` 或 `native_turn`，`freshness` 表示本机观察或缓存。管理进程记录关联该 attempt 的 SDK 进程组、它登记的原生 turn 和它发起的 Agent 任务 job；它签发的工具 token 已封存，不需再核对。`reconcile` 在原目标只读复查：管理进程项探测记录的进程组是否已退出，并列出关联原生 turn 和 Agent 任务的当前状态；原生项只读补查原 turn。管理 SDK 的文件系统只读、网络仅限本机回环；进程存活期间经回环产生的副作用无法查询，只能由本人附证据 `resolve`。管理进程项要求记录的进程组均已退出、关联原生 turn 均有终态；原生项由本人给出 `completed`、`failed` 或 `interrupted`。模型不能结清待核对，结论不重跑旧 trigger。
+负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。
 
-`interrupted` 的 Agent 任务在待核对结清、关联工作结束前不回传结果，来源端 `agent_tasks` 显示 `pending_check`，不显示运行中。结清后目标端汇报实际结果或中断结果，不重发原任务。
+本机调度 job、outbox、工作状态日志和原生 SDK 会话不进入事件日志。
 
-本机版本化队列、outbox、原生 SDK 会话及观察记录不通过 DAG 迁移。维护空闲检查包含待投递、排队、活动和待核对项，新进程通过更新健康门后才消费。存在新调度记录时不承诺任意降级旧程序。
+## 工作
 
-## Agent 任务与原生会话
+协调 Agent 用宿主 SDK 的工具只读访问本机，修改通过协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, executor?, parent?, continues? }` 完成。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。其他协调工具为 `nodes`、`context`、`work_status` 和 `interrupt_work`，只读的结果汇报轮只得到查询工具。
 
-跨设备任务是签名 `agent_message` 事件，目标设备的协调 Agent 使用自己的宿主工具执行。没有通用远程 Shell RPC，也没有独立 Engine、Binding 或 Operation 协议。
+目标 Node 接纳 `dispatch_work` 时核对派发方是成员 Node、触发消息带本人签名或会话 `AutonomySet` 为 `continue`，并核对 `cwd` 位于目标自己的 `roots` 内。接纳后写 `WorkDispatched`，在本机日志记下 thread 再启动 turn。`executor=codex` 在目标的 Codex App Server 上开 turn，`executor=agent` 把任务作为目标管理 Agent 的一轮执行，这一轮只能在目标本机启动 Codex 工作。`continues` 在原工作的 thread 上开新 turn，原目标不可达时报错，不改派。
 
-```json
-{
-	"type": "agent_message",
-	"message": {
-		"message_id": "stable-agent-message-id",
-		"target_node": "TARGET_PEER_ID",
-		"origin_trigger": "ORIGINAL_TRIGGER_HASH",
-		"in_reply_to": null,
-		"kind": "task",
-		"text": "要在目标设备完成的工作"
-	}
-}
-```
+`thread/start` 使用 `approvalPolicy=on-request`、`approvalsReviewer=user`，`turn/start` 另加 `sandboxPolicy={type:workspaceWrite, writableRoots:[cwd], networkAccess:false}`。Agent 不能回答审批，Node 不自动批准、不自动重试写请求。工作改动了 `cwd` 之外的文件时，Node 只在 `node.log` 记一行 `work changed a file outside its directory`，不拦截、不告警。
 
-来源取事件签名作者，不能由消息正文冒充。`task_ref` 是原任务事件 hash。回信使用 `in_reply_to=task_ref` 和同一 `origin_trigger`，回到原来源设备。`kind` 为 `task`、`progress`、`completed`、`failed` 或 `interrupted`。普通进度不启动模型，终态必须来自原目标并通过原任务关联校验。
+工作状态为 `accepted`、`starting`、`running`、`waiting_approval`、`interrupting`、`finished` 和 `unverified`。每次转换在同一事务更新本机日志并追加对应事件。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`；只有 `unverified` 可以被本人签名的 `WorkFinished` 取代。工作结束时若原消息的 `report_results` 不为 `false`，负责人把 `work:<work_id>` 入队，下一轮向本人汇报。
 
-`send_task` 在同一管理 attempt 内固定 `call_ref`、目标和内容。相同引用返回原任务，同引用改目标或内容拒绝。接纳、inbox、outbox 和回执复用可靠调度事务。导入签名历史只重建视图，不能产生新的执行；丢回执、重连或重启先查原 trigger，不重复启动 SDK。
+审批的 `request_id` 为 `hash(work_id, executor_epoch, rpc_id)`。回答先标记为发送中，送达 App Server 后才写 `ApprovalAnswered`。App Server 每次重连 executor epoch 加一，旧请求不能再回答。
 
-任务内继续委派时，若目标在同一聊天中已有未结束的 Agent 任务，目标在接纳事务中回传未启动的 `interrupted` 结果，避免两个 Agent 互相等待。本人发起的任务仍可正常排队。
-
-协调 Agent 用宿主 SDK 的 Shell 和文件工具只读访问本机，不持有 App Server Socket。原生请求经 `codex` 工具 `{"method":...,"params":{...}}` 由 Node 转发，参数不翻译成 Operation。方法白名单为 `thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`、`thread/read`、`thread/turns/list`、`thread/loaded/list`，各方法只接受固定字段，其余方法和字段拒绝。审批、审阅者、沙箱及 `config` 字段只能由 Node 设置。启动类方法要求 `cwd` 位于授权 `roots` 内，Node 写入 `approvalPolicy=on-request`、`approvalsReviewer=user`，`thread/start` 与 `thread/resume` 使用 `sandbox=workspace-write`，`turn/start` 使用 `sandboxPolicy={type:workspaceWrite, writableRoots:[cwd], networkAccess:false}`。工具不能回复原生请求，审批只经本人的 `native_respond`。不自动批准、不自动重试写请求。
-
-原生工作启动后，用 `observe_session` 登记准确的 `thread_id` 和 `turn_id`。Node 保存所属会话、来源 trigger、管理 attempt 和可选任务引用，观察进度、审批和终态。它只订阅当前 Socket 已加载的线程；历史补查不能把其他 stdio 进程的线程视为已接管。无有效控制端点的会话保持不可确认。
-
-原生状态为 `running`、`waiting`、`interrupting`、`completed`、`failed`、`interrupted` 或 `unknown`。只有对应 thread 和 turn 的精确事件或只读补查可确认终态。协调 SDK 一轮返回、原生 turn 结束和用户任务完成分别表达，不能互相替代。SDK 已返回而子任务或原生工作仍运行时，调度任务继续等待；工作结束后恢复同一 SDK 会话做只读收尾。
-
-取消沿原任务和原目标发送。排队任务可在启动前原子取消；运行中的任务封存旧工具权限并请求中断真实工作。`cancelling` 或 `interrupting` 仅表示请求中，不能直接回报已停止。无法证明原生 turn 停止时保留 `unknown` 并列入待核对；无法证明管理进程停止时登记管理进程待核对。都不换 ID 或设备重跑。一个原生 turn 结束不能结清管理进程待核对。
-
-本地自动访问与授权记录都使用当前数据格式。单一 `node.sqlite3` 使用 `user_version=5`，制品声明 `data_epoch=5`。Atlas HCL 为 `crates/node/schema.hcl`，`migrations/` 只保留 `202610180001_initial.sql` 和 `atlas.sum`。此版本不迁移或清理旧数据目录。
+Node 未配置 `codex_socket` 时托管 App Server：执行 `codex app-server --listen unix://<socket>`，socket 位于 0700 的 `/tmp/vibeface-<identity>/` 目录，App Server 放入独立进程组，进程组号写入 `codex-app-server.pid`。启动时先结束上次遗留且命令相符的进程组，退出时 SIGTERM，3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启。重连后对未结束的工作调用 `thread/read` 只读复查，读不到原 turn 时进入 `unverified`。同一用户的本机进程可以连接这个 socket。
 
 ## 事件 DAG
 
@@ -261,125 +235,119 @@ queued → claimed → running ─→ completed | failed
 - `canonical_body` 为原始规范 JSON 字符串，校验时保留并核对这些字节。
 - `signature` 为作者 Ed25519 签名，签名输入是 `vibeface:event:v1:` 加十六进制 hash 的 ASCII 字节。
 
-正文结构为：
-
 ```text
 Event {
-  version, network_id, scope_id, author,
-  sequence, previous, parents, created_at_ms,
-  body, blobs
+  version, network_id, author, seq, prev, deps,
+  scope_id, created_at_ms, body, blobs
 }
 ```
 
-`previous` 和 `sequence` 校验同一作者的来源链，`parents` 引用当前事件依据的因果前项。父引用和附件列表按序去重。`created_at_ms` 不决定唯一全局顺序，也不能覆盖并发分支。
+每台 Node 在网络中只有一条日志：`seq` 从 1 连续递增，`prev` 为同一作者 `seq - 1` 的 hash。`deps` 引用写入时依据的其他作者事件。`created_at_ms` 用于展示，排序时只在 `lamport` 相同时作为第二键。浏览器不写日志，它发起的写入由所连 Node 作为作者写入并附 `attestation`。
 
-正文类型包括 `conversation_created`、`bot_created`、`message_posted`、`agent_message`、`decision_recorded`、`notification_raised`、`notification_acknowledged` 和 `context_checkpoint`。
+| 类型 | 主要字段 | 作者 |
+|---|---|---|
+| `conversation_created` | `title` | 入口 Node |
+| `conversation_owner` | `scheduler_node`、`epoch`、`attestation` | 入口 Node |
+| `bot_created` | `bot_id`、`name`、`instructions`、`project?`、`attestation` | 入口 Node |
+| `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`attestation?` | 本人消息由入口写，回答由负责人写 |
+| `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`executor`、`cwd`、`title`、`prompt`、`continues?`、`parent?` | 目标 Node |
+| `work_progress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node |
+| `approval_requested` | `work_id`、`request_id`、`kind`、`summary` | 目标 Node |
+| `approval_answered` | `work_id`、`request_id`、`decision`、`attestation` | 入口 Node |
+| `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`attestation?` | 目标 Node，本人结清时由入口写 |
+| `autonomy_set` | `mode`、`version`、`attestation` | 入口 Node |
+| `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
+| `context_checkpoint` | `covers`、`summary`、`standing_instructions`、`open_work`、`decisions` | 负责人 |
 
-投影前检查网络、作者证书、签名、hash、来源链、因果依赖及附件。缺口和来源分叉分别保留在 `missing.events`、`missing.blobs` 与 `missing.conflicts`。必要历史未齐或冲突未处理时，禁止继续调度和执行。
+通知由 `approval_requested` 和 `work_finished` 派生，通知 ID 即该事件 hash。执行层内部的命令、diff、推理和工具输出不进入 DAG。
 
-事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限为 64 MiB，传输分块并校验总长度及 SHA256。附件内容按个人网络保存，不能跨网络凭 hash 读取。
+入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者成员资格与 `cutoff_seq`，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会写入 `log_conflicts`，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；同作者同序号不同内容写入 `log_conflicts`，不锁住会话；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。`log_heads` 保存每个作者的 `max_seq` 和 `head_hash`，即本机版本向量。
 
-节点交换 scope 的 heads，按需拉取事件、前驱和附件，再重建 SQLite 视图。并发历史保留为不同 heads。快照和摘要不替代原始依据，历史导入和视图重建不触发 Agent 或外部写操作。
+入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者；`AutonomySet` 取 `version` 最大者，同版本取更严格的模式；同一审批的回答取更严格的决定；工作状态只前进。这三类同级再相同时取请求身份较小者，请求身份为 `SHA256(attestation 签名输入 ‖ 签名设备)`。同一份已签名请求经不同入口重试时请求身份相同，外层事件 hash 不参与仲裁，重试不会改变结果。
 
-同步先保存已验签的事件，缺少父事件或附件时保留为 `pending`。后台按个人网络和 scope 保存未完成项，分批继续拉取，也可向其他已授权副本请求同一 hash。单个 scope 失败不阻止其他 scope 推进。内部同步结果区分 `complete`、`partial` 和 `unreachable`，并保留缺口及错误；取得事件不代表其依赖已经完整。
+事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限 64 MiB，正文是 `blobs/sha256/<前两位>/<hash>` 文件，按网络和会话引用授权读取。
 
-相同 envelope 的重复导入不重建投影。新事件每批最多 1024 项、正文合计最多 8 MiB，同批只重建一次。快照导入使用相同批处理。附件补齐、成员状态改变和实际新增历史仍触发必要重建。完整前沿绑定投影代次，新增历史或恢复后重新核验，已有事件不能代替完整性证明。
+## 写入保护
 
-历史事件只通过批读拉取，不做能力探测。每批最多 128 项、2096128 字节：
+Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只有 `writable` 时 Node 追加自己的事件，其他状态下所有本地写入在追加时被拒绝，调度和执行在进入 `writable` 前不启动。读取、同步和入库其他设备的事件不受影响。
 
-```json
-{
-	"type": "history_batch",
-	"hash": "REQUESTED_EVENT_HASH",
-	"limit": 128,
-	"max_bytes": 2096128
-}
-```
+| 状态 | 进入条件 | 离开条件 |
+|---|---|---|
+| `aligning` | 启动时成员目录中还有其他 Node | 某个对端的 Hello 表明它记录的本机 `max_seq` 不大于本机，且同序号 hash 一致；对端更多时先拉回本机自己的日志 |
+| `read_only` | 对齐中且所有其他 Node 都同步失败 | 对端恢复后照常对齐，或本人调用 `confirm_writable` |
+| `writable` | 没有其他 Node、对齐完成或本人确认 | 发现分叉 |
+| `forked` | 某个对端持有本机作者同序号的不同事件 | 不离开；撤销这台设备后用新数据目录重新加入 |
 
-批读返回 `{ hash, events }`，包含请求事件及其部分祖先。事件数和实际 JSON 字节量同时受请求与服务端上限约束。接收方核对请求 hash、逐项验签，并验证每项都能从请求事件沿该批的 `parents` 或 `previous` 到达。它不接受不相关事件、重复事件或越界响应。
+拒绝写入时的错误为 `this Node is aligning with other Nodes; try again shortly`、`this Node is read-only until you confirm it was not restored from a backup` 和 `this Node's log has forked and it no longer writes`，网页翻译成中文。`confirm_writable` 只记录在本机，不进入 DAG，对 `forked` 无效。
 
-请求事件本身装不进批预算时，来源返回错误，接收方改向其他已授权副本请求或保留缺口，不报告完整。没有单事件读取请求。单批仍受 2 MiB Packet 上限约束，部分极端转义的最大正文可能超限，此时同样保留缺口。
+对端发现某个作者的分叉时，保留先到的一条，后到的写入 `log_conflicts`，其他会话照常写入。分叉的 Node 自己在 Hello 中看到同序号不同 hash 时拉取对方那条，记下冲突后进入 `forked` 并停止写入。`write_state` 返回 `{ state, conflicts }`，每条冲突含作者、序号、保留的和放在一边的版本。状态变化时向已订阅的浏览器推送 `{"type":"changed","payload":{"type":"write_state","state":...}}`。
 
-附件请求仍使用 `{ type: "blob", hash, offset, limit }`，响应为 `{ data, size }`，`data` 为 hex。`offset` 按正文的字节计，`limit` 为 1 至 65536。来源核对当前个人网络、本机及请求方的 Replica 授权，再读取指定范围。来源使用独立只读 SQLite 连接保留读取位置，分页不重复物化或 hash 全文。新建读取者并从非零偏移开始时，SQLite 仍可能扫描一次前缀。现有 `get_blob` 的全文校验保留，接收端仍必须验证最终大小和 hash。
+## Node 之间的传输
 
-来源最多保留 4 个范围读取者，每个请求方身份最多 2 个，所引用对象合计不超过 128 MiB。该额度不表示进程内存或 WAL 大小。读取者空闲 30 秒或存活 300 秒后退出，额度不足返回 busy。同对象正文修复及成员变更使相关读取者失效，缓存不能代替逐页授权。底层磁盘 I/O 不受这些期限强制中断，超时读取者在真正退出前仍占额度。
+### iroh Endpoint
 
-接收端按 `(network_id, hash, expected_size)` 保存连续前缀，正文位于数据目录的私有 `.part` 文件，进度使用 `local_values` 的 `net1:v1:blob:` 保留前缀。每块先同步文件，再提交偏移。断线或重启后重新核验授权，截去未提交尾部，从已提交位置继续。文件短于进度时重置已有进度，不能通过补零伪造前缀。单对象上限仍为 64 MiB，全网暂存合计最多 256 MiB、64 个对象，未清理和异常占用也计入额度。
+每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。Node 不向 n0 DNS、pkarr 或局域网发布地址，对端地址只来自 ticket 和个人网络内部交换的签名地址记录。连接优先打洞直连，失败时经 relay 转发 QUIC 密文。
 
-收齐只代表传输完成。接收端核对最终大小和 hash，并在同一事务发布完整 blob、重建必要投影和记录 `Cleanup`，之后删除所属暂存文件。启动及周期维护重试清理，完整对象缺失或损坏时保留暂存并报告异常。纯本机清理不要求旧来源仍获授权，继续下载和发布则必须通过当前授权。未完成内容始终不进入正常附件读取或执行上下文。
+`Router` 按 ALPN 分发连接。每个请求占一条 QUIC 双向流，帧为 4 字节大端长度前缀加 JSON，单帧最多 16 MiB。
 
-Agent 附件分页先核对当前会话的签名引用，再完整校验正文并保存私有不可变快照。后续页继续检查当前授权和引用，只从已验证快照取片。快照最多 4 个、正文合计 128 MiB，终页或所属管理调用排空后回收。该路径保留完整性校验，人工 `read_artifact` 仍使用原 UTF-8 和字符边界规则。
+| ALPN | 用途 | 接受的对端 |
+|---|---|---|
+| `vibeface/sync/1` | `hello`、`membership`、`pull`、`have` | 未撤销的成员 Node |
+| `vibeface/blob/1` | 按哈希和偏移读取附件 | 未撤销的成员 Node |
+| `vibeface/rpc/1` | 投递、派发、中断、审批转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
+| `vibeface/client/1` | 网关转发的浏览器 Noise 会话，每条流一个会话 | 任意设备，会话本身由 Noise 认证 |
+| `vibeface/join/1` | 只开放 `join` 和 `join_status` | 任意设备 |
 
-DAG 能验证已知历史位置及依赖完整，不能证明全网最新。原始副本全部失联或丢失时，不承诺恢复缺失内容，也不迁移其他设备 SDK 的隐藏状态。
+`sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。连接接受时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝；成员目录变化时已接受的连接重新核对，对端不再是成员就关闭。撤销还会关闭到被撤销 Node 的出站连接并删除它的地址。公共入口不接受任何入站 iroh 连接。
 
-## 发现、对等连接与公共中继
+### 同步
 
-`network` 配置包含 `bootstrap_urls`、`advertise_urls`、`mdns` 和 `relay_enabled`。地址使用 `/api/network/ws` 的完整 WS 或 WSS URL。`bootstrap_urls` 提供可替换的会合入口，`advertise_urls` 是本 Node 声明的候选直连地址。Node 可通过 mDNS 获取局域网候选地址，随后仍要核验身份。
+1. 双方交换 `{"type":"hello", network_id, vector: {author: [max_seq, head_hash]}, boot, membership_epoch, membership}`。成员目录摘要不同时交换 `membership`，epoch 不低于本机的目录被合并。
+2. 对每个对方领先的作者发 `{"type":"pull", author, from_seq, limit}`，对方按 `seq` 升序返回，每批最多 1024 条、合计 8 MiB。
+3. 本机追加事件后向已连接的成员发 `{"type":"have", author, seq, hash}`，对方落后时立即同步。空闲连接每 60 秒重新 Hello。
+4. `boot` 是对端本次启动的编号。编号变化说明对端重启，本机立即关闭到它的旧连接并重新同步，不等 QUIC 空闲超时。
 
-mDNS 按完整服务实例名保存来源，最多 256 个实例，每个实例最多 8 个候选地址。同一设备的多个实例可以提供相同地址，移除一个实例不会撤销其他来源。来源有效期沿用发现库的缓存和撤销通知，Node 轮换复核原实例名，不用最后一次解析时间推定固定租期。接口变化会清除旧代来源，旧发现服务确认退出后才重建。关闭无法确认时停止重建并告警，不能保证强制终止库内线程。
+同步只写入历史和投影，不重新执行历史中的操作。同步失败按退避重试，最长间隔 30 秒。
 
-固定 IP 监听只宣告该 IP，回环监听只发现其他设备而不宣告自身。wildcard 监听的宣告与发现都限制在对应地址族，不使用没有接口范围的 IPv6 link-local 候选。接口变化不会自动重绑固定监听地址，也不提供 NAT 打洞。实例冲突后的撤销依赖实际缓存复核，不保证即时生效。
+### 地址簿
 
-`Reachability` 包含 `peer_id`、`public_key`、`direct_urls`、`relay_urls`、`issued_at`、`expires_at` 和 `signature`。设备使用 Ed25519 的 `reachability` domain 签名。记录有效期受限，只按已知 Peer ID 查询，不提供全网枚举。签名证明设备声明该路径，不证明设备属于本人或路径此刻可达。
+每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在配置了 `network.entry` 时取入口 URL，否则在启用 `gateway` 时取 `public_url`。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。浏览器为每台 Node 保存已接受记录的 `seq` 高水位，撤回地址的记录也保存，刷新后不接受更旧的记录。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
 
-普通客户端只保存入口地址和目标 `peer_id`，不选择直连或中继。浏览器将 HTTP 或 HTTPS 入口转换为 `/api/network/ws`，Rust Client 也接受保留完整路径的 WS 或 WSS 端点。客户端首先发送 `dial`，携带 `target` 和 `service: "client"`。目标等于入口本机时，入口接入本地 Client 服务，无需启用公共 `relay_enabled`；其他目标仍须启用公共中继并持有其活动预约。`direct` 控制用于已验明的直连候选。WS 或 WSS 根地址沿用默认 `/api/network/ws`，显式非根路径保持原值。
+### 附件
 
-本机启动器授予的 `local_session` 保留独立的同源 `/api/local/ws` 通道，由 Cookie 和原目标 Noise 身份约束。该通道直接开始 Noise 握手，不发送网络控制消息，也不查询目录或回退到网络入口。内部 `local` 标记不是用户路由偏好。
+接收方在 `vibeface/blob/1` 上发送 `{ network_id, hash, size, offset }`。来源核对请求方是成员 Node、该哈希被本机某个事件引用且大小一致，然后从 `offset` 起按 64 KiB 发送。接收方写入 `blobs/partial/<hash>.part`，每 1 MiB `fsync` 并在 SQLite 中提交偏移，断线或重启后从已提交位置继续。收齐后核对大小和 SHA256 再原子改名。一次只下载一个附件，暂存最多 256 MiB、64 个对象。
 
-客户端同时向入口发送 `lookup`，核验记录的目标、公钥指纹、签名和时间范围，再尝试记录中的直连或其他中继。签名字节使用上述字段顺序的紧凑 JSON，`signature` 为 `""`，与 Rust `Reachability::signing_bytes` 一致。有效期最多 180 秒，签发时间最多领先本机 30 秒，每份记录最多包含 8 个直连和 8 个中继 URL。浏览器先验证整份记录，再过滤 HTTPS 页面不能使用的非回环 `ws://` 候选，保留其中可用的 `wss://` 路径。
+### 节点间 RPC
 
-每次连接最多尝试 16 个直连和 8 个中继候选，输入入口占用一个中继候选；最多同时拨号两条数据路径，整次拨号最多 15 秒。候选失效或失败时继续其他已知路径，首个完成固定目标 Noise 握手的路径胜出，其余尝试和目录查询关闭。页面不跳转到候选地址，浏览器密钥仍属于原客户端站点。入口没有预约或有效可达记录时，连接明确失败，不承诺仅凭 Peer ID 搜索全网。公共中继不替客户端主动拨号目录 URL。
+`vibeface/rpc/1` 的请求为 `{ type, network_id, ... }`：
 
-断线后以相同目标重新选路、认证并订阅。身份不符或成员授权被撤销时拒绝访问，不能通过换路绕过。未确认写操作保留原编号并先对账，重连本身只恢复读取与订阅。
+| type | 用途 |
+|---|---|
+| `capabilities` | 角色、版本和管理 Agent 是否可用 |
+| `addresses` | 交换签名地址记录 |
+| `deliver` | 入口 outbox 向负责人投递消息或 job |
+| `manager_status` | 查询某个触发在负责人上的状态 |
+| `progress_read` | 读取管理轮和原生工作的临时进度 |
+| `dispatch_work` | 派发方请求目标接纳工作 |
+| `interrupt_work` | 停止目标上的工作 |
+| `approval_forms`、`answer_approval` | 读取审批表单，转发带本人签名的回答 |
+| `cancel_manager`、`reconcile`、`resolve` | 转发本人的管理控制，要求 `human: true` |
+| `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 
-目录结果逐项验签并核对目标身份，过期或非法记录只影响对应来源。候选交付及拨号前再次检查有效期，健康来源不必等待其他目录全部返回。公共发布目录最多保存 2048 个身份，本机解析缓存另有 256 个名额；缓存满时仍可使用本次有效候选，公共查询不读取该私有缓存。
+### Relay 与公共入口
 
-每个去重后的会合入口分别维护目录发布和 relay 预约。入口拒绝中继仍可提供目录服务，预约重试不会反复触发发布。慢发布只影响对应入口，活跃 relay 地址变化在下一次发布中合并，已有预约继续处理心跳和连接请求。
+启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。个人网络里的 relay 只接纳当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
-NAT 后的 Node 主动连接会合入口，在随机 challenge 上签名后预约 relay。中继使用单独的出站 attach 通道连接目标，建立通道后只搬运二进制记录。中继限制为 128 个连接、64 份预约和 32 条电路。每条电路最多传输 64 MiB、持续 30 分钟，并限制每秒流量。中继不解释工单或执行命令。
-
-同一身份在新连接上完成 challenge 后，可以用新的 `Reservation.id` 接管预约。旧连接实际释放前仍占连接额度。新来源自身满额时，拒绝本次接管并保留旧预约。同一身份每个固定 60 秒窗口最多安装 6 代，相邻安装至少间隔 1 秒，断开后仍保留限频历史。接管撤回旧代未完成的 attach，旧任务清理只影响自己的代次，已经 Ready 的数据电路继续工作。新代安装后的连接失败会清理本代，不恢复旧预约。协议不增加代次字段。
-
-连接额度在升级前按真实 TCP 来源 IP 计算，不读取 `X-Forwarded-For` 或 `Forwarded`。初始握手及短控制合计最多 16 个，每来源最多 4 个；已建立连接最多 112 个，每来源最多 16 个。全部连接共用 128 上限，实际连接释放后才归还额度。入站请求每分钟全局最多 600 次、每来源最多 120 次；来源限制触发后不继续消耗全局请求额度。反向代理后的连接共用代理的来源 IP，本规则不推断代理背后的不同用户。
-
-等待 attach 和已建立转发共用电路额度，每来源及每目标各最多 4 条。来源、目标及全局限制分别拒绝当前请求，短控制连接仍受自己的额度限制。HTTP 升级前的速率拒绝返回 429，容量拒绝返回 503；升级后的失败关闭当前连接，不新增 `Control` 消息。64 份预约与 32 条双端电路不能保证同时达到各自上限，实体连接总量及控制余量仍生效。
-
-转发的两个方向独立读写，每向队列最多 4 帧，单帧最多 65535 字节。计入两个方向的队列、读取者和写入者持有的正文后，应用层帧正文最多 786420 字节；该数值不含对象结构、WebSocket 和 TCP 缓冲。两个方向共用 64 MiB 总字节、每秒 2 MiB 和每分钟 30720 帧的额度。每端独立检查 90 秒接收活性，另一端持续发送不能代替该端活性。等待队列空位或单次写入超过 10 秒会关闭本条电路，慢方向不阻止反向读写、独立心跳检查或其他电路继续处理。
-
-私网 Node 在该流上执行独立 Noise 握手并验证成员授权，业务报文还保留网络、来源、目标、请求 ID、签名和去重约束。公共 relay 不需要也不得获得私人网络成员身份。TLS 保护逐跳传输，Noise 保护真实通信两端之间的业务内容。
-
-Node 的一次自动目标拨号总期限为 15 秒，同时最多尝试两条路径，整次最多尝试 16 个直连地址和 8 个中继地址。不同来源共用这些上限。仍有效且最近完成认证的直连路径可在首次尝试时领先最多 250 毫秒，随后允许其他候选竞争。只有完成固定目标的 Noise、Hello 和当前成员授权检查后才能胜出，之后取消其余本地尝试。本机当前成员授权检查拒绝时终止整次拨号，不能换路绕过；路径失败只惩罚对应路径，取消不记为路径失败。
-
-后台维护与按需请求共用按个人网络和目标隔离的连接任务，登记表最多 128 项，包含正在拨号和仍有效的已就绪连接。链路失效后可建立新代连接，尚未退出的旧连接继续占用对等连接和 socket 准入额度。取消单个等待者不会取消其他等待者的连接任务。连接任务不保存业务请求，等待者只在恢复路径后首次发送自己的请求，发送前重新核对当前授权。
-
-Presence 的每个来源绑定邻居和 `Link.id`，有效期由原签名时间限制为最多 90 秒，重复观察不续租。同一已签名 Presence 从另一合法邻居抵达时仍可保留备用来源。检测到邻居断线、连接代次变化或邻居失去中继授权后，在线判断和发送选路会排除对应间接路径，其他无关连接不能维持该目标的在线状态。
-
-定向 request 与 response 优先使用目标直连，再使用有效下一跳，最后最多向两个合法邻居探索。广播和 Presence 保留独立的转发规则。响应必须来自原请求的预期 Node，仍校验签名、跳数和请求去重。只有本机所有队列都未接纳时，才能明确报告无路径或繁忙；队列接纳后的超时或取消保留为未知结果。
-
-路径变化不能改变已投递任务的目标，也不触发业务写入重放。未知结果须使用原目标和原业务 ID 对账。连接目录和在线状态是有时效的软状态。
+公共入口（`init --public-entry`）不加入个人网络。它的 relay 只接纳持有 `entry-token` 的设备，它不运行调度、执行和同步，不保存业务数据，本机设置路径回 404。成员 Node 用 `--entry URL --relay-token-file PATH` 指向它：把入口的 relay 加为自己的 relay 并带上令牌，地址记录的 `gateway_url` 写入口 URL，于是邀请链接和二维码打开的是入口的 origin。浏览器经入口的 `/api/client` 连到成员 Node，入口只搬运 Noise 密文。部署步骤见 [配置公共入口](node.md#配置公共入口)。
 
 ## 通知和自动后续
 
-加密通道保留外层 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress` 与失效提醒。客户端读取 `notifications`，使用稳定 `client_id` 确认 `notification_id`，同一客户端换路由后仍可去重。不同浏览器具有不同 client ID，各自确认。
+加密通道推送 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress`、`write_state` 与失效提醒。客户端读取 `notifications`，用稳定 `client_id` 确认 `notification_id`，不同浏览器各自确认。
 
-管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`。`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。文字按 `item_id` 关联，delta 追加，snapshot 替换全文。原生进度包含 `conversation_id`、`work_id`、`target_node`、`thread_id`、`turn_id`、可选 `task_ref`、`sequence` 和 `progress`，不能串入其他任务。临时进度不逐 token 写 DAG，持久回答和任务结果仍来自 Store 及签名事件。
+管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`，`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。原生进度包含 `conversation_id`、`work_id`、`target_node`、`sequence` 和 `progress`。临时进度不写入事件日志。客户端读取 `conversation` 时，入口为该会话建立有界的只读观察，经 `progress_read` 从负责人和执行节点读取进度。
 
-客户端读取 `conversation` 时，入口为该已授权会话建立有界的只读观察，从原管理节点和执行节点读取进度。节点间 `progress_read` 校验网络、来源和会话，响应包含 `version`、`cursor`、`reset` 和 `events`。游标缺口或源进程重启要求重新读取持久 snapshot，不生成重放写操作。连接关闭、权限撤销或观察租约过期后停止观察，代理进度不再次转发形成循环。
+`message.report_results` 默认 `true`，保存在签名的用户消息中。为 `false` 时，该消息引出的工作结束后不再入队汇报。
 
-普通进度、审批提醒和结果通知不调用管理模型。无人在线时保留通知，重新连接后读取。浏览器系统提醒是可选客户端功能，不等于网页关闭后的手机推送。
+`set_autonomy` 仅本人可用，写入 `AutonomySet { mode, version }`。`off` 停止自主后续，`report` 让结果汇报轮只读，`continue` 允许汇报轮继续派发工作。未设置时等同版本 `0` 的 `report`。`expected_version` 必须等于当前 `autonomy.version`。
 
-后续权限使用 `DecisionRecorded.tool_configuration` 中带类型的签名记录，类型为 `followup_intent_v1` 和 `conversation_autonomy_v1`。自然语言或模型传入的参数不构成授权。
-
-`message.report_results` 默认 `true`。汇报意图固定原消息 hash、网络、会话和目标 Scheduler，Agent 任务通过签名消息中的 `origin_trigger` 关联原消息，终态只触发只读总结，不创建隐藏 Task。`false` 保存明确的 `off` 意图，重试不能改变。原始结果与通知始终保留，模型不能借回调获得新的写权限。
-
-`set_autonomy` 仅本人可用，Agent token 不能调用，授权按机器人聊天生效。`off` 停止该聊天的自主后续，`report` 只允许读取结果并保存最终 assistant 回答，`continue` 允许固定的 Scheduler 收到结果后继续业务工作。未设置时等同版本 `0` 的 `report`。每条记录携带递增 `version` 和上一版本的 `previous_head`，`expected_version` 必须使用会话快照返回的当前 `autonomy.version`。并发或旧版本修改被拒绝；同一版本出现两条记录或版本链断开时，后续失效直到本人核对。省略 `scheduler_node` 时沿用当前目标，首次授权按新消息的规则选择 Scheduler。其他 Scheduler 收到的结果只做只读汇报。
-
-领取后续、签发工具权限及每次工具调用前都复核本机已验证的最新会话授权和版本，写入还要求 `continue`。撤销封存旧权限；离线节点尚未获知撤销时，不保证全网立即停止。审批、验收与未知确认始终由本人处理。
-
-目标 Agent 的终态、关联结果事件及回投 outbox 在同一事务保存。来源验证原任务和汇报政策后调度一次只读收尾。原生 turn 结束与协调 SDK 结束分别记录，只有所有已登记工作均有真实终态才完成任务。结果未知时保留状态并查询原调用，不因超时再派给另一台。未授权模型后续不影响原始结果与通知保存。
-
-`daily_decision_limit` 只限制每个 Node 上、每个个人网络的 UTC 每日自主管理 SDK 调用。本人主动聊天不受这个额度限制。预算先预留，失败调用不保证退回；它不限制宿主 SDK 工具启动的其他模型调用，也不是 token 或账单上限。额度耗尽不把执行结果标为未知。
-
-每条用户消息在签名 `MessagePosted.scheduler_node` 中固定本次调度目标。客户端重试必须保留原 `message_id` 和 `scheduler_node`，网页将两者一同持久化。同一目标通过本地调用账本去重。已取得该消息的入口拒绝改写其目标；未同步节点之间没有全局消息唯一性共识，调用方不能用同一编号改换目标。切换入口后继续工作时提交一条新消息，可选择任意已授权调度节点。这个目标只属于该消息，不是会话或工单的负责人。
-
-消息请求中的 `entry_node` 固定为首次接收的 Gateway。未确认的同一消息只能回原入口核对或重试；换入口可只读查看历史，不能重签原请求。Node 在落盘前核对该字段。
+`daily_decision_limit` 只限制每个 Node、每个个人网络的 UTC 每日结果汇报轮，预算先预留，失败调用不保证退回，不是 token 或账单上限。

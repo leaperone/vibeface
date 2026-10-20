@@ -45,6 +45,8 @@ impl Runtime {
                 name: name.to_owned(),
                 instructions: instructions.to_owned(),
                 project,
+                attestation: attestation(input)?,
+                owner: first_owner(input)?,
             },
             now_ms(),
         )?;
@@ -63,7 +65,7 @@ impl Runtime {
             "wrong personal network"
         );
         let store = self.store.lock().await;
-        store.authorize_node(&access.network_id, &self.identity.peer_id()?, None)?;
+        store.authorize_node(&access.network_id, &self.identity.device_id()?)?;
         let bots = store
             .bots(&access.network_id)?
             .into_iter()
@@ -78,11 +80,10 @@ impl Runtime {
     }
 
     async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {
-        self.store.lock().await.authorize_node(
-            network,
-            &project.target_node,
-            Some(NodeRole::Scheduler),
-        )?;
+        self.store
+            .lock()
+            .await
+            .authorize_node(network, &project.target_node)?;
         let cwd = Path::new(&project.cwd);
         ensure!(
             cwd.is_absolute()
@@ -94,7 +95,7 @@ impl Runtime {
                 }),
             "Bot project must use an absolute directory without parent components"
         );
-        if project.target_node == self.identity.peer_id()? {
+        if project.target_node == self.identity.device_id()? {
             ensure!(
                 self.config.roles.contains(&NodeRole::Scheduler)
                     && self.settings_snapshot().manager.is_some(),

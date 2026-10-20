@@ -1,7 +1,8 @@
-import type { PendingMessage, TranscriptMessage } from "../chat/types"
+import type { TranscriptMessage } from "../chat/types"
+import type { ReplyStatus } from "../chat/types"
 import type {
-  AgentTaskRecord, AnsweredRequest, AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
-  HumanRequest, SchedulerSnapshot, HumanQuestion, NativeSessionRecord, AgentTaskState, NativeSessionState, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
+  AutonomyMode, ConversationAutonomy, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
+  SchedulerSnapshot, HumanQuestion, ConflictVersion, WriteStatus, WorkAnswer, WorkApproval, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck,
 } from "./types"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -34,14 +35,14 @@ function list(value: unknown): unknown[] {
 function texts(value: unknown): string[] { return list(value).map(text) }
 function conversation(value: unknown): ConversationSummary {
   const data = record(value)
-  return { conversation_id: text(data.conversation_id), title: text(data.title) }
+  return { conversation_id: text(data.conversation_id), title: text(data.title), owner: data.owner == null ? null : text(data.owner), owner_epoch: number(data.owner_epoch) }
 }
 export function parseNodes(value: unknown): NodeInfo[] {
   return list(record(value).nodes).map((item) => {
     const data = record(item)
     const capabilities = data.capabilities == null ? null : record(data.capabilities)
     return {
-      peer_id: text(data.peer_id),
+      device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked), roles: texts(data.roles),
       capabilities: capabilities ? { manager: capabilities.manager === null ? null : text(capabilities.manager), roots: texts(capabilities.roots) } : undefined,
@@ -56,71 +57,68 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
 }
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), blobs: blobReferences(data.blobs) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs) }
+}
+function replyStatus(value: unknown): ReplyStatus {
+  switch (value) {
+    case "completed": case "stopped": case "interrupted": case "failed": return value
+    default: throw new Error("未知的回复状态。")
+  }
 }
 function blobReferences(value: unknown) { return value == null ? undefined : list(value).map((item) => { const blob = record(item); return { hash: text(blob.hash), size: number(blob.size) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
-function humanRequest(value: unknown): HumanRequest {
-  const data = record(value)
-  const questions: HumanQuestion[] | undefined = data.questions == null ? undefined : list(data.questions).map((item) => {
+function questions(value: unknown): HumanQuestion[] | undefined {
+  if (value == null) return undefined
+  const parsed = list(value).map((item) => {
     const question = record(item)
-    return { id: text(question.id), header: text(question.header), question: text(question.question), is_secret: question.is_secret == null ? undefined : flag(question.is_secret), options: question.options == null ? undefined : list(question.options).map((item) => { const option = record(item); return { label: text(option.label), description: optionalText(option.description) } }) }
+    return { id: text(question.id), header: question.header == null ? "" : text(question.header), question: text(question.question), is_secret: question.is_secret == null ? undefined : flag(question.is_secret), options: question.options == null ? undefined : list(question.options).map((item) => { const option = record(item); return { label: text(option.label), description: optionalText(option.description) } }) }
   })
-  if (questions?.some((question) => !question.id) || questions && new Set(questions.map((question) => question.id)).size !== questions.length) throw new Error("人工问题编号无效或重复。")
-  return { request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind), title: optionalText(data.title), text: text(data.text), command: optionalText(data.command), cwd: optionalText(data.cwd), reason: optionalText(data.reason), files: data.files == null ? undefined : list(data.files).map(text), choices: data.choices == null ? undefined : list(data.choices).map((item) => { const choice = record(item); if (!("response" in choice)) throw new Error("人工决定缺少回复内容。"); return { label: text(choice.label), response: choice.response } }), questions }
+  if (parsed.some((question) => !question.id) || new Set(parsed.map((question) => question.id)).size !== parsed.length) throw new Error("人工问题编号无效或重复。")
+  return parsed
+}
+function approval(value: unknown): WorkApproval {
+  const data = record(value), form = data.form == null ? null : record(data.form)
+  return {
+    request_id: text(data.request_id), kind: text(data.kind), summary: text(data.summary), answering: data.answering == null ? undefined : flag(data.answering),
+    form: form ? { command: optionalText(form.command), cwd: optionalText(form.cwd), reason: optionalText(form.reason), files: form.files == null ? undefined : list(form.files).map(text), choices: form.choices == null ? undefined : list(form.choices).map((item) => { const choice = record(item); if (!("response" in choice)) throw new Error("人工决定缺少回复内容。"); return { label: text(choice.label), response: choice.response } }), questions: questions(form.questions) } : undefined,
+  }
+}
+function answer(value: unknown): WorkAnswer {
+  const data = record(value)
+  return { request_id: text(data.request_id), kind: text(data.kind), summary: text(data.summary), decision: text(data.decision) }
 }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), target_node: optionalText(job.target_node), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), delivery_error: optionalText(job.delivery_error), pending_check: job.pending_check === true } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
+  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), pending_check: job.pending_check === true } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
 }
-export function hasQueuedMessage(scheduler: SchedulerSnapshot | null, pending: PendingMessage): boolean {
-  return scheduler?.jobs.some((job) => job.message_id === pending.message_id && typeof job.target_node === "string" && job.target_node.length > 0 && (pending.scheduler_node === null || job.target_node === pending.scheduler_node) && ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "interrupted"].includes(job.state)) ?? false
-}
-function agentTaskState(value: unknown): AgentTaskState {
+function workState(value: unknown): WorkState | null {
   switch (value) {
-    case "pending_delivery": case "queued": case "claimed": case "accepted": case "running": case "cancelling":
-    case "completed": case "failed": case "cancelled": case "interrupted": case "pending_check": return value
-    default: throw new Error("未知的任务状态。")
-  }
-}
-function nativeSessionState(value: unknown): NativeSessionState {
-  switch (value) {
-    case "running": case "waiting": case "interrupting": case "completed": case "failed": case "interrupted": case "unknown": return value
+    case undefined: case null: return null
+    case "accepted": case "starting": case "running": case "waiting_approval": case "interrupting": case "finished": case "unverified": case "waiting_for_device": case "rejected": return value
     default: throw new Error("任务状态无法识别。")
   }
 }
-function agentTask(value: unknown): AgentTaskRecord {
-  const data = record(value)
-  return {
-    task_ref: text(data.task_ref), source_node: text(data.source_node), target_node: text(data.target_node),
-    origin_trigger: text(data.origin_trigger), state: agentTaskState(data.state), text: text(data.text), detail: text(data.detail),
+function workOutcome(value: unknown): WorkOutcome | null {
+  switch (value) {
+    case undefined: case null: return null
+    case "completed": case "failed": case "interrupted": case "rejected": case "unverified": case "abandoned": return value
+    default: throw new Error("任务结果无法识别。")
   }
 }
-function nativeSession(value: unknown): NativeSessionRecord {
+function work(value: unknown): WorkRecord {
   const data = record(value)
-  const freshness = data.freshness
-  if (freshness !== "observed" && freshness !== "cached") throw new Error("未知的原生进度读取来源。")
   return {
-    work_id: text(data.work_id), task_ref: data.task_ref === null ? null : text(data.task_ref),
-    target_node: text(data.target_node), thread_id: text(data.thread_id), turn_id: data.turn_id === null ? null : text(data.turn_id),
-    state: nativeSessionState(data.state), freshness, can_control: flag(data.can_control),
-    detail: text(data.detail), pending_requests: list(data.pending_requests).map(humanRequest),
-    origin_trigger: optionalText(data.origin_trigger), answered_requests: list(data.answered_requests ?? []).map(answeredRequest),
-  }
-}
-function answeredRequest(value: unknown): AnsweredRequest {
-  const data = record(value), decision = data.decision
-  return {
-    request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind),
-    decision: decision === "accept" || decision === "decline" || decision === "cancel" ? decision : "answer", command: optionalText(data.command), at_ms: number(data.at_ms),
+    work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: text(data.title), prompt: text(data.prompt),
+    state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
+    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), open_approvals: list(data.open_approvals).map(approval), answered_approvals: list(data.answered_approvals).map(answer),
+    ...(data.stop == null ? {} : { stop: { waiting_for_device: flag(record(data.stop).waiting_for_device), timed_out: flag(record(data.stop).timed_out) } }),
   }
 }
 function pendingCheck(value: unknown): PendingCheck {
-  const data = record(value), kind = data.kind, freshness = data.freshness
-  if (kind !== "manager_process" && kind !== "native_turn") throw new Error("需要确认的事项无法识别。")
-  if (freshness !== "observed" && freshness !== "cached") throw new Error("需要确认的事项来源无法识别。")
-  return { check_id: text(data.check_id), kind, target_node: text(data.target_node), trigger: text(data.trigger), detail: text(data.detail), freshness, process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number) }
+  const data = record(value), kind = data.kind
+  if (kind !== "manager_process" && kind !== "work") throw new Error("需要确认的事项无法识别。")
+  return { check_id: text(data.check_id), kind, detail: text(data.detail), process_groups: data.process_groups == null ? [] : list(data.process_groups).map(number), ...(kind === "work" ? { work_id: text(data.work_id), target_node: text(data.target_node) } : {}) }
 }
 function autonomyMode(value: unknown): AutonomyMode {
   switch (value) {
@@ -130,36 +128,37 @@ function autonomyMode(value: unknown): AutonomyMode {
 }
 function autonomy(value: unknown): ConversationAutonomy {
   const data = record(value)
-  return {
-    mode: autonomyMode(data.mode), version: data.version === null ? null : number(data.version),
-    scheduler_node: data.scheduler_node == null ? "" : text(data.scheduler_node), error: optionalText(data.error),
-  }
+  return { mode: autonomyMode(data.mode), version: number(data.version) }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
-  const data = record(value), missing = record(data.missing)
+  const data = record(value)
   const owner = data.conversation === null ? null : conversation(data.conversation)
   if (expectedId && owner?.conversation_id !== expectedId) throw new Error("设备返回了别的对话，已暂停。")
   return {
-    conversation: owner, messages: list(data.messages).map(message), autonomy: autonomy(data.autonomy), heads: texts(data.heads),
-    missing: { events: texts(missing.events), blobs: list(missing.blobs), conflicts: texts(missing.conflicts) },
-    agent_tasks: list(data.agent_tasks).map(agentTask),
-    native_sessions: list(data.native_sessions).map(nativeSession),
-    observation_targets: texts(data.observation_targets),
+    conversation: owner, messages: list(data.messages).map(message), autonomy: autonomy(data.autonomy),
+    works: list(data.works).map(work),
     scheduler: schedulerSnapshot(data.scheduler),
     pending_checks: list(data.pending_checks).map(pendingCheck),
+    local_node: text(data.local_node),
   }
 }
-export function parsePendingMessages(value: unknown): PendingMessage[] {
-  return list(value).map((item) => {
-    const data = record(item)
-    return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), scheduler_node: data.scheduler_node == null ? null : text(data.scheduler_node), entry_node: text(data.entry_node), basis_heads: texts(data.basis_heads), report_results: data.report_results == null ? undefined : flag(data.report_results), rejected: data.rejected == null ? undefined : { entry_node: text(record(data.rejected).entry_node) } }
-  })
+export function parseBinaryPage(value: unknown, hash: string, offset: number) {
+  const data = record(value)
+  const size = number(data.size)
+  const bytes = Uint8Array.from(atob(text(data.data)), (char) => char.charCodeAt(0))
+  const next_offset = data.next_offset === null ? null : number(data.next_offset)
+  if (data.blob_hash !== hash || data.offset !== offset || bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
+  return { bytes, next_offset, size }
 }
-export function frontierMap(value: unknown) {
-  const next: Record<string, string[]> = {}
-  for (const [key, heads] of Object.entries(record(value))) next[key] = texts(heads)
-  return next
+
+/** 1536 → "1.5 KB"; decimal units, as file managers show them. */
+export function formatSize(bytes: number) {
+  const units = ["字节", "KB", "MB", "GB"]
+  let value = bytes, unit = 0
+  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1 }
+  return unit === 0 ? `${bytes} 字节` : `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
 }
+
 export function parseArtifactPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
   const size = number(data.size), content = text(data.text)
@@ -185,4 +184,21 @@ export function parsePendingBot(value: unknown): PendingBot {
   const data = record(value), submission = record(data.submission)
   if (submission.state !== "unconfirmed" && submission.state !== "rejected") throw new Error("机器人创建记录的提交状态无效。")
   return { ...parseCreateBot(value), submission: { state: submission.state, entry_node: text(submission.entry_node) } }
+}
+
+function conflictVersion(value: unknown): ConflictVersion {
+  const data = record(value)
+  return { hash: text(data.hash), scope_id: text(data.scope_id), created_at_ms: number(data.created_at_ms), body: record(data.body) }
+}
+export function parseWriteStatus(value: unknown): WriteStatus {
+  const data = record(value)
+  const state = data.state
+  if (state !== "aligning" && state !== "read_only" && state !== "writable" && state !== "forked") throw new Error("设备返回的写入状态不对。")
+  return {
+    state,
+    conflicts: list(data.conflicts).map((item) => {
+      const conflict = record(item)
+      return { author: text(conflict.author), seq: number(conflict.seq), kept: conflict.kept == null ? null : conflictVersion(conflict.kept), other: conflictVersion(conflict.other) }
+    }),
+  }
 }

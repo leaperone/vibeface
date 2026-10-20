@@ -90,29 +90,18 @@ block a same-user process from connecting to a Unix socket whose path it finds.
 The sidecar disables child-agent features, web search, apps, plugins, apply
 patch, and host skill discovery.
 
-`vibeface tool codex --json '{"method":"turn/start","params":{...}}' --call-ref REF`
-asks the Node to send one native request. The Node allows only `thread/start`,
-`thread/resume`, `turn/start`, `turn/interrupt`, `thread/read`,
-`thread/turns/list`, and `thread/loaded/list`, each with a fixed field list. It
-rejects `approvalPolicy`, `approvalsReviewer`, `sandbox`, `sandboxPolicy`, and
-`config`, requires `cwd` inside an authorized root for the three start methods,
-and sets `approvalPolicy=on-request`, `approvalsReviewer=user`, and a
-workspace-write sandbox in that `cwd` without network. The tool cannot answer
-native requests; only the user answers approvals through `native_respond`. The
-Node does not retry a method after disconnect or an uncertain result.
+`vibeface tool dispatch_work --json '{"prompt":"...","cwd":"..."}' --call-ref REF`
+asks the Node to start one native Codex turn in `cwd`, which must be inside an
+authorized root. The Node sets `approvalPolicy=on-request`,
+`approvalsReviewer=user`, and a workspace-write sandbox in that `cwd` without
+network. The same `call_ref` in the same turn names the same work, so a retry
+never starts a second turn. Only the user answers approvals, through
+`answer_approval`; `interrupt_work` stops a work and the works it delegated.
 
-After starting native work, call the Node `observe_session` tool with its exact
-thread and turn IDs. The coordinating SDK's final response does not mark that
-background work complete. The observer reads current metadata, subscribes only
-to threads already loaded on the configured Socket, and attempts read-only
-history queries to recover missed progress. The installed Codex `0.163.0`
-backend can reject resume and turn pagination with `list_turns is not supported
-yet`; live broadcasts and the exact turn cache remain usable on that connection.
-An observer connection can answer a broadcast approval and interrupt the
-original turn after the caller's short CLI connection has closed. The Node
-still requires a human response and the original task, thread, and turn match.
-A `notLoaded` thread remains unconfirmed; historical turns do not prove another
-stdio process is controllable or stopped.
+The coordinating turn ends after dispatch. When the work finishes, the Node
+admits its result as a new trigger, so the agent reports it in a later turn.
+After an App Server restart the Node reads the journaled thread and turn; a
+turn it cannot read stays unverified until the user confirms its outcome.
 
 Select a model through `manager.model` that the configured account supports.
 An empty model uses the Codex account default. `auto` or a fast model name does

@@ -1,10 +1,7 @@
-use super::native_observation::NativeState;
-use super::{Access, Runtime};
-use crate::{
-    model::*,
-    scheduling::{JobState, PendingCheck},
-};
-use anyhow::{Context, Result, ensure};
+use super::{Access, Runtime, now_ms};
+use crate::model::WorkOutcome;
+use crate::scheduling::{JobState, PendingCheck};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -16,9 +13,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
 pub struct ManagerAccess {
     pub attempt_id: String,
     pub trigger: String,
-    pub target_node: String,
     pub read_only: bool,
-    pub followup_version: Option<u64>,
 }
 
 pub(super) struct ActiveManager {
@@ -42,7 +37,6 @@ impl Runtime {
         if let Some(active) = controls.get(attempt_id) {
             return Ok(active.cancel.subscribe());
         }
-        let target = self.identity.peer_id()?;
         let scope = access
             .conversation_id
             .as_deref()
@@ -51,7 +45,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .scheduler_job(&access.network_id, scope, trigger, &target)?
+            .scheduler_job(&access.network_id, scope, trigger)?
             .context("manager job missing")?;
         let attempt = job.state.attempt().context("manager attempt missing")?;
         ensure!(
@@ -61,9 +55,7 @@ impl Runtime {
         access.manager = Some(ManagerAccess {
             attempt_id: attempt_id.into(),
             trigger: trigger.into(),
-            target_node: target,
             read_only,
-            followup_version: attempt.followup_version,
         });
         let (cancel, receiver) = watch::channel(false);
         let active = Arc::new(ActiveManager {
@@ -102,13 +94,11 @@ impl Runtime {
                     .conversation_id
                     .as_deref()
                     .context("manager scope missing")?,
-                &manager.target_node,
                 &manager.trigger,
                 &manager.attempt_id,
             )?;
             // Wait for admitted tools before declaring this attempt unable to write.
             let _drained = active.admission.clone().write_owned().await;
-            self.clear_agent_blob_attempt(attempt_id).await;
         }
         Ok(())
     }
@@ -119,7 +109,6 @@ impl Runtime {
             active.fenced.store(true, Ordering::Release);
             self.agent_tokens.lock().await.remove(&active.token);
             let _drained = active.admission.clone().write_owned().await;
-            self.clear_agent_blob_attempt(attempt_id).await;
             self.manager_controls.lock().await.remove(attempt_id);
         }
     }
@@ -173,53 +162,13 @@ impl Runtime {
             store.manager_attempt_allowed(
                 &access.network_id,
                 scope,
-                &manager.target_node,
                 &manager.trigger,
                 &manager.attempt_id,
                 write
             )?,
             "management invocation permission is no longer valid"
         );
-        if let Some(version) = manager.followup_version {
-            store.validate_latest_manager_policy(
-                &access.network_id,
-                scope,
-                &manager.trigger,
-                &manager.target_node,
-                version,
-                write,
-            )?;
-        }
         Ok(())
-    }
-
-    async fn manager_target(&self, network: &str, scope: &str, trigger: &str) -> Result<String> {
-        let local = self.identity.peer_id()?;
-        let store = self.store.lock().await;
-        if store
-            .scheduler_job(network, scope, trigger, &local)?
-            .is_some()
-        {
-            return Ok(local);
-        }
-        let context = store.context(network, scope, &[])?;
-        let event = context
-            .events
-            .iter()
-            .find(|event| {
-                crate::crypto::digest(&serde_json::to_vec(event).unwrap_or_default()) == trigger
-            })
-            .context("management trigger not found")?;
-        ensure!(event.scope_id == scope, "management trigger scope mismatch");
-        match &event.body {
-            EventBody::MessagePosted {
-                role,
-                scheduler_node: Some(target),
-                ..
-            } if role == "user" => Ok(target.clone()),
-            EventBody::AgentMessage { message } => Ok(message.target_node.clone()),
-            _ => anyhow::bail!("event is not a management trigger"),
-        }
     }
 
     pub(super) async fn cancel_manager(&self, access: &Access, input: &Value) -> Result<Value> {
@@ -228,21 +177,12 @@ impl Runtime {
         let trigger = super::field(input, "trigger")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
-        let target = self.manager_target(network, scope, trigger).await?;
-        if target != self.identity.peer_id()? {
-            self.require_role(network, NodeRole::Gateway).await?;
-            return self.peer_request(network, &target, json!({"type":"cancel_manager","conversation_id":scope,"trigger":trigger,"human":true})).await;
-        }
-        let job = {
-            let mut store = self.store.lock().await;
-            let job = store
-                .request_manager_cancel(network, scope, &target, trigger)?
-                .context("management job missing")?;
-            if store.scheduler_publication_pending(network, scope, &target, trigger)? {
-                return Ok(json!({"job":job,"cancel_requested":false,"publication_pending":true}));
-            }
-            job
-        };
+        let job = self
+            .store
+            .lock()
+            .await
+            .request_manager_cancel(&self.identity, network, scope, trigger)?
+            .context("this reply is scheduled on another device; stop it there")?;
         if let JobState::Cancelling { attempt } = &job.state {
             self.fence_manager_attempt(&attempt.id).await?;
         }
@@ -254,7 +194,8 @@ impl Runtime {
         Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
-    /// Routes a pending check to the Node that owns it; only that Node can observe the original work.
+    /// Pending checks belong to this Node: an unconfirmed coordination process (`manager:`)
+    /// or a work whose real result cannot be proven (`work:`).
     pub(super) async fn pending_check_control(
         self: &Arc<Self>,
         access: &Access,
@@ -263,73 +204,24 @@ impl Runtime {
     ) -> Result<Value> {
         ensure!(access.human, "only the user reconciles pending checks");
         let scope = super::field(input, "conversation_id")?;
-        let target = super::field(input, "target_node")?;
-        super::field(input, "check_id")?;
-        self.require_scope(access, scope).await?;
-        if target != self.identity.peer_id()? {
-            self.require_role(&access.network_id, NodeRole::Gateway)
-                .await?;
-            let mut request = input.clone();
-            request["type"] = json!(kind);
-            request["human"] = json!(true);
-            return self.peer_request(&access.network_id, target, request).await;
-        }
-        if kind == "reconcile" {
-            self.reconcile_local(&access.network_id, input).await
-        } else {
-            self.resolve_local(&access.network_id, input).await
-        }
-    }
-
-    pub(super) async fn reconcile_local(&self, network: &str, input: &Value) -> Result<Value> {
-        let scope = super::field(input, "conversation_id")?;
         let check_id = super::field(input, "check_id")?;
-        if let Some(work_id) = check_id.strip_prefix("native:") {
-            let work = self.reconcile_native_work(network, scope, work_id).await?;
-            self.publish_changed(network, scope, &work.origin_trigger);
-            return Ok(
-                json!({"check_id":check_id,"pending":work.state == NativeState::Unknown,"native_session":work}),
-            );
+        self.require_scope(access, scope).await?;
+        let network = &access.network_id;
+        if let Some(work_id) = check_id.strip_prefix("work:") {
+            return self
+                .work_check_control(network, scope, work_id, input, kind)
+                .await;
         }
         let check = self.local_pending_check(network, scope, check_id).await?;
         let processes = process_groups(&check.process_groups).await;
-        let native = self
-            .native_work_for_attempt(network, scope, &check.trigger, &check.attempt_id)
-            .await?;
-        let tasks = self
-            .child_agent_tasks(network, scope, &check.trigger)
-            .await?;
-        Ok(
-            json!({"check_id":check_id,"pending":true,"check":check,"process_groups":processes,
-            "native_sessions":native,"agent_tasks":tasks,
-            "note":"Exited process groups do not prove that detached tools or external side effects stopped."}),
-        )
-    }
-
-    pub(super) async fn resolve_local(&self, network: &str, input: &Value) -> Result<Value> {
-        let scope = super::field(input, "conversation_id")?;
-        let check_id = super::field(input, "check_id")?;
-        let evidence = super::field(input, "evidence")?;
-        ensure!(
-            (12..=4096).contains(&evidence.trim().len()),
-            "evidence must be 12 to 4096 bytes"
-        );
-        if let Some(work_id) = check_id.strip_prefix("native:") {
-            let state = match super::field(input, "outcome")? {
-                "completed" => NativeState::Completed,
-                "failed" => NativeState::Failed,
-                "interrupted" => NativeState::Interrupted,
-                _ => anyhow::bail!("outcome must be completed, failed or interrupted"),
-            };
-            let work = self
-                .resolve_native_work(network, scope, work_id, state, evidence)
-                .await?;
-            self.publish_changed(network, scope, &work.origin_trigger);
-            return Ok(json!({"check_id":check_id,"resolved":true}));
+        if kind == "reconcile" {
+            return Ok(
+                json!({"check_id":check_id,"pending":true,"check":check,"process_groups":processes,
+                "note":"Exited process groups do not prove that detached tools or external side effects stopped."}),
+            );
         }
-        let check = self.local_pending_check(network, scope, check_id).await?;
-        let running = process_groups(&check.process_groups)
-            .await
+        let evidence = evidence(input)?;
+        let running = processes
             .into_iter()
             .filter(|group| group["exited"] != true)
             .filter_map(|group| group["process_group"].as_u64())
@@ -338,21 +230,102 @@ impl Runtime {
             running.is_empty(),
             "process groups {running:?} are still running or cannot be checked; stop them before confirming"
         );
-        let native = self
-            .native_work_for_attempt(network, scope, &check.trigger, &check.attempt_id)
-            .await?;
-        ensure!(
-            native.iter().all(|work| work.state.terminal()),
-            "confirm the native turns this invocation started before confirming the invocation"
-        );
         self.fence_manager_attempt(&check.attempt_id).await?;
-        self.store.lock().await.resolve_pending_check(
-            network,
-            check_id,
-            evidence,
-            super::now_ms(),
-        )?;
+        self.store
+            .lock()
+            .await
+            .resolve_pending_check(network, check_id, evidence)?;
         self.publish_changed(network, scope, &check.trigger);
+        Ok(json!({"check_id":check_id,"resolved":true}))
+    }
+
+    /// An unverified work result is checked again on the device that ran it; the user's choice
+    /// is signed and written by whichever entry they use.
+    async fn work_check_control(
+        self: &Arc<Self>,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+        input: &Value,
+        kind: &str,
+    ) -> Result<Value> {
+        let check_id = format!("work:{work_id}");
+        let work = self
+            .store
+            .lock()
+            .await
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == work_id)
+            .context("work not found in this conversation")?;
+        if kind == "reconcile" {
+            if work.target_node != self.identity.device_id()? {
+                return self
+                    .peer_request(
+                        network,
+                        &work.target_node,
+                        json!({"type":"reconcile","conversation_id":scope,"check_id":check_id,"human":true}),
+                    )
+                    .await;
+            }
+            self.probe_work(network, work_id).await?;
+            let record = self.store.lock().await.work_record(network, work_id)?;
+            return Ok(
+                json!({"check_id":check_id,"pending":record.as_ref().is_none_or(|r| !r.state.finished()),"work":record}),
+            );
+        }
+        let outcome = match super::field(input, "outcome")? {
+            "completed" => WorkOutcome::Completed,
+            "interrupted" => WorkOutcome::Interrupted,
+            _ => bail!("choose completed or interrupted"),
+        };
+        let note = input["note"].as_str().unwrap_or("").trim();
+        ensure!(note.len() <= 4096, "note must be at most 4096 bytes");
+        // An agent task's coordination process has its own check here; the work card answers both.
+        let manager = self
+            .store
+            .lock()
+            .await
+            .pending_checks(network)?
+            .into_iter()
+            .find(|check| check.trigger == crate::scheduling::task_trigger(work_id));
+        if let Some(check) = manager {
+            let running = process_groups(&check.process_groups)
+                .await
+                .into_iter()
+                .filter(|group| group["exited"] != true)
+                .filter_map(|group| group["process_group"].as_u64())
+                .collect::<Vec<_>>();
+            ensure!(
+                running.is_empty(),
+                "process groups {running:?} are still running or cannot be checked; stop them before confirming"
+            );
+            self.fence_manager_attempt(&check.attempt_id).await?;
+            let evidence = format!("{outcome:?}: {note}");
+            self.store.lock().await.resolve_pending_check(
+                network,
+                &check.check_id,
+                if note.is_empty() {
+                    "settled with the work's own check"
+                } else {
+                    &evidence
+                },
+            )?;
+        }
+        let receipt = self.store.lock().await.settle_work(
+            &self.identity,
+            network,
+            scope,
+            work_id,
+            outcome,
+            note,
+            super::attestation(input)?,
+            now_ms(),
+        )?;
+        self.publish_changed(network, scope, work_id);
+        if receipt.is_some() {
+            self.spawn_scheduler(network, scope)?;
+        }
         Ok(json!({"check_id":check_id,"resolved":true}))
     }
 
@@ -369,11 +342,20 @@ impl Runtime {
             .pending_check(network, check_id)?
             .context("pending check not found")?;
         ensure!(
-            check.conversation_id == scope && check.target_node == self.identity.peer_id()?,
-            "pending check belongs to another conversation or device"
+            check.conversation_id == scope,
+            "pending check belongs to another conversation"
         );
         Ok(check)
     }
+}
+
+fn evidence(input: &Value) -> Result<&str> {
+    let evidence = super::field(input, "evidence")?;
+    ensure!(
+        (12..=4096).contains(&evidence.trim().len()),
+        "evidence must be 12 to 4096 bytes"
+    );
+    Ok(evidence)
 }
 
 /// Signal 0 only checks the recorded group; it never stops a group whose ID may have been reused.
@@ -381,7 +363,7 @@ async fn process_groups(groups: &[u32]) -> Vec<Value> {
     let mut result = Vec::new();
     for group in groups {
         let probe = tokio::process::Command::new("/bin/kill")
-            .args(["-0", &format!("-{group}")])
+            .args(["-0", "--", &format!("-{group}")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

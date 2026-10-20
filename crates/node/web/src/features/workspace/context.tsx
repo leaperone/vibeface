@@ -2,31 +2,57 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import type { ReadyConnection } from "@/lib/node"
+import { attestationPayload } from "../../../generated/vibeface_secure.js"
+import { signClient } from "../../../transport.js"
 import { messageOf } from "@/lib/node"
+import { enqueue, indexedOutbox, settle, type OutboxItem, type OutboxStore } from "@/lib/outbox"
+import type { Tabs } from "@/features/identity/context"
 import { mergeProgress, type LiveProgress } from "@/lib/progress"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol"
-import { isIncomplete, mergeBasis } from "./labels"
 import {
-  frontierMap, inputText, parseConversation, parseNodes, parseNotifications,
-  parsePendingMessages, parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, hasQueuedMessage,
+  inputText, parseConversation, parseNodes, parseNotifications,
+  parseBot, parseBots, parseCreateBot, parsePendingBot, record,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AutonomyMode, ConversationPayload, NodeInfo, NotificationRecord,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus,
 } from "./types"
+
+/** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
+const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
+  aligning: "这台设备正在和你的其他设备对齐，对齐后就能写。",
+  read_only: "这台设备现在只读，在待处理里确认后就能写。",
+  forked: "这台设备的数据和另一份副本不一致，已停止写入。",
+}
 
 export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
 
-function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}) {
+/** Signed writes this origin has not seen confirmed, shared by every tab (docs/design/unified-network.md 4.5). */
+const browserOutbox = indexedOutbox()
+const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
+const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
+
+function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab) {
   const networkId = connection.principal.network_id
-  const clientId = connection.principal.subject_id
+  const clientId = connection.principal.device_id
+  const prefix = `${networkId}.${clientId}:`
+  const outbox: OutboxStore = {
+    all: async () => (await browserOutbox.all()).filter((item) => item.key.startsWith(prefix)),
+    put: (item) => browserOutbox.put(item),
+    delete: (key) => browserOutbox.delete(key),
+  }
+  const outboxKey = (kind: string, id: string) => `${prefix}${kind}:${id}`
+  /** This device's signature over the exact event body the Node will write for it. */
+  const attest = async (scope: string, body: Record<string, unknown>) =>
+    ({ device_id: clientId, signature: await signClient("attestation", attestationPayload(networkId, scope, JSON.stringify(body))) })
   const [booted, setBooted] = useState(false)
   const [error, setError] = useState("")
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
@@ -59,7 +85,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const requireContext = (id = activeId.current) => {
     requireCurrent()
     const context = dataRef.current
-    if (readConnection.current !== connection || !id || id !== activeId.current || context?.conversation?.conversation_id !== id || isIncomplete(context.missing)) throw new Error("先选择并读取上下文完整的对话。")
+    if (readConnection.current !== connection || !id || id !== activeId.current || context?.conversation?.conversation_id !== id) throw new Error("先选择并读取对话。")
     return context
   }
   const requireBotContext = (id = activeId.current) => {
@@ -71,14 +97,30 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     requireCurrent()
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
+    if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
-  const readFrontiers = () => frontierMap(readStorage<unknown>(networkKey("frontiers", networkId), {}, true))
-  const replaceMessages = (next: PendingMessage[]) => {
-    requireWritable()
-    writeStorage(scoped("pending-messages"), next, true)
+  /** Unconfirmed messages as the page shows them, read back from the outbox. */
+  const syncPending = async () => {
+    const next: PendingMessage[] = (await outbox.all()).filter((item) => item.method === "message").map((item) => ({
+      message_id: String(item.params.message_id), conversation_id: String(item.params.conversation_id), text: String(item.params.text),
+      report_results: item.params.report_results !== false, ...(item.rejected === undefined ? {} : { rejected: item.rejected }),
+    }))
     messagesRef.current = next
-    if (current()) setPendingMessages(next)
+    if (alive.current) setPendingMessages(next)
+  }
+  const outboxChanged = async () => { await syncPending(); tabs.post({ type: "outbox", networkId }) }
+  /** Keeps the signed request until the entry answers; an unknown outcome stays for the next check. */
+  const signedWrite = async (kind: string, id: string, method: string, params: Record<string, unknown>) => {
+    const item = await enqueue(outbox, { key: outboxKey(kind, id), method, params, created_at_ms: Date.now() })
+    try {
+      const result = await connection.rpc(item.method, item.params)
+      await outbox.delete(item.key)
+      return result
+    } catch (caught) {
+      if (responded(caught)) await outbox.delete(item.key)
+      throw caught
+    }
   }
   const selectConversation = (id: string) => {
     requireCurrent()
@@ -92,19 +134,22 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   }
   const readConversation = async (id: string) => {
     const sequence = ++readSequence.current
-    const basis = readFrontiers()[id] ?? []
-    const next = parseConversation(await connection.rpc("conversation", { conversation_id: id, basis_heads: basis }), id)
+    const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
     if (activeId.current !== id || sequence !== readSequence.current) throw new Error("对话有更新，请再查一次。")
-    if (!isIncomplete(next.missing)) {
-      const latest = readFrontiers()
-      const concurrent = (latest[id] ?? []).filter((head) => !basis.includes(head))
-      writeStorage(networkKey("frontiers", networkId), { ...latest, [id]: [...new Set([...next.heads, ...concurrent])] }, true)
+    // While the entry catches up, what the page already showed stays on screen.
+    const shown = dataRef.current
+    if (connection.catchingUp?.() && shown?.conversation?.conversation_id === id) {
+      const missing = shown.messages.filter((message) => !next.messages.some((item) => item.message_id === message.message_id))
+      if (missing.length) next.messages = [...next.messages, ...missing].sort((a, b) => a.created_at_ms - b.created_at_ms)
     }
     dataRef.current = next
     setData(next)
-    if (current() && readConnection.current === connection && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
-      replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
+    // A message settles once the Node's own history holds it.
+    const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
+    if (current() && messagesRef.current.some(admitted)) {
+      for (const item of messagesRef.current.filter(admitted)) await outbox.delete(outboxKey("message", item.message_id))
+      await outboxChanged()
     }
     // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
     const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && ["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
@@ -117,15 +162,15 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     writeStorage(scoped("interrupted"), kept.slice(-50))
     setInterrupted(kept.filter((item) => item.conversation_id === id))
     setLiveProgress((previous) => previous.filter((progress) => {
-      if (progress.kind === "native") return next.native_sessions.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.thread_id === progress.thread_id && item.turn_id === (progress.turn_id ?? null))
+      if (progress.kind === "native") return next.works.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.state !== "finished")
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
-    if (current() && readConnection.current === connection && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
+    if (current() && readConnection.current === connection && view === "chat" && !document.hidden) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
-          await connection.rpc("ack", { notification_id: notification.notification_id })
+          await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
           requireCurrent()
           notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
           setNotifications(notificationsRef.current)
@@ -173,13 +218,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawNotifications, rawBots] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"),
+      const [rawNodes, rawNotifications, rawBots, rawWrite] = await Promise.all([
+        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"),
       ])
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
       const nextBots = parseBots(rawBots)
-      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setWriteState(parseWriteStatus(rawWrite))
+      if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
       const bot = nextBots.find((item) => item.conversation_id === activeId.current) ?? nextBots.find((item) => item.bot_id === selected) ?? nextBots[0]
@@ -202,12 +248,35 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   }
   refreshRef.current = refresh
 
-  const loadPending = () => {
-    const storedMessages = parsePendingMessages(readStorage<unknown>(scoped("pending-messages"), [], true))
+  const loadPending = async () => {
     const rawBot = readStorage<unknown>(scoped("pending-bot"), null, true)
     const storedBot = rawBot == null ? null : parsePendingBot(rawBot)
-    messagesRef.current = storedMessages; setPendingMessages(storedMessages)
     botCreationRef.current = storedBot; setPendingBot(storedBot)
+    await syncPending()
+  }
+  /** Is this write already in the entry's history (or moot)? Asked by business ID before any resubmission. */
+  const recorded = async (item: OutboxItem) => {
+    if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
+    if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
+    const id = String(item.params.conversation_id)
+    const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
+    if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
+    if (item.method === "answer_approval") return !context.works.some((work) => work.work_id === item.params.work_id && work.open_approvals.some((request) => request.request_id === item.params.request_id))
+    if (item.method === "set_autonomy") return context.autonomy.version !== item.params.expected_version
+    if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
+    if (item.method === "resolve") return !context.pending_checks.some((check) => check.check_id === item.params.check_id)
+    return true
+  }
+  /** After a (re)connection: confirm what the entry has, resubmit the rest byte for byte, stop at an unknown. */
+  const settleOutbox = async () => {
+    if (!tabs.leader() || !current()) return
+    const result = await settle(outbox, {
+      recorded: async (item) => { requireCurrent(); return recorded(item) },
+      submit: async (item) => { requireCurrent(); await connection.rpc(item.method, item.params) },
+    })
+    if (!alive.current) return
+    await outboxChanged()
+    if (result.confirmed.length || result.resubmitted.length || result.rejected.length) scheduleRefresh()
   }
 
   useEffect(() => {
@@ -215,23 +284,20 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(""); setNoticeText("")
     try {
-      const url = new URL(window.location.href), params = url.searchParams
+      const url = new URL(window.location.href)
       const routeBot = /^\/b\/([^/]+)/.exec(url.pathname)?.[1]
       if (routeBot) writeStorage(scoped("selected-bot"), decodeURIComponent(routeBot))
       activeId.current = ""
-      loadPending()
       setConversationId(activeId.current)
-      const frontiers = readFrontiers(), heads = frontiers[activeId.current] ?? []
-      const basis = mergeBasis(heads, params.get("basis"))
-      if (activeId.current && basis !== heads) writeStorage(networkKey("frontiers", networkId), { ...frontiers, [activeId.current]: basis }, true)
-      setBooted(true)
+      void loadPending().then(() => { if (alive.current) setBooted(true) }, showError)
     } catch (caught) { showError(caught) }
-    return () => { alive.current = false }
+    const stop = tabs.listen((message) => { if (message.type === "outbox" && message.networkId === networkId) void syncPending().catch(() => {}) })
+    return () => { alive.current = false; stop() }
   }, [connection])
 
   useEffect(() => {
     if (!booted) return
-    void refreshRef.current().catch(showError)
+    void refreshRef.current().then(() => settleOutbox()).catch(showError)
     const unsubscribe = connection.subscribe((event) => {
       if (!current()) return
       if (event.type === "invalidate") { scheduleRefresh(); return }
@@ -272,32 +338,63 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     setNoticeText("还没确认结果，正在重新查。")
     scheduleRefresh()
   }
-  const submitMessage = async (text: string) => {
-    const context = requireContext(), id = activeId.current
-    const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, schedulerPeerId: null, entryNode: connection.entry.peer_id, pending: prior, heads: context.heads, reportResults: true })
-    if (!prepared.ok) throw new Error(prepared.error)
-    replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
-    try {
-      const receipt = await connection.rpc("message", prepared.body)
+  /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
+  /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
+  const uploadAttachment = async (id: string, file: File): Promise<BlobRef> => {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    if (!bytes.length || bytes.length > 64 * 1024 * 1024) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+    let offset = 0
+    for (;;) {
       requireCurrent()
-      const response = record(receipt)
-      if (response.accepted === true && response.message_id === prepared.pending.message_id && typeof response.scheduler_node === "string" && response.scheduler_node && (prepared.pending.scheduler_node === null || prepared.pending.scheduler_node === response.scheduler_node)) {
-        const schedulerNode = response.scheduler_node
-        replaceMessages(messagesRef.current.map((item) => item.message_id === prepared.pending.message_id ? { ...item, scheduler_node: schedulerNode } : item))
-      }
+      const chunk = bytes.subarray(offset, offset + 1024 * 1024)
+      let binary = ""
+      for (let index = 0; index < chunk.length; index += 0x8000) binary += String.fromCharCode(...chunk.subarray(index, index + 0x8000))
+      const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash, size: bytes.length, offset, data: btoa(binary) }))
+      if (reply.complete === true) return { hash, size: bytes.length }
+      offset = Number(reply.offset)
+    }
+  }
+  const submitMessage = async (text: string, files: File[] = []) => {
+    requireContext()
+    const id = activeId.current
+    const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
+    const prepared = prepareSend({ conversationId: id, text, pending: prior, reportResults: true })
+    if (!prepared.ok) throw new Error(prepared.error)
+    const key = outboxKey("message", prepared.pending.message_id)
+    let item = prior ? (await outbox.all()).find((entry) => entry.key === key) : undefined
+    if (!item) {
+      const { body } = prepared
+      const uploaded: BlobRef[] = []
+      for (const file of files) uploaded.push(await uploadAttachment(id, file))
+      // Signed in the Node's order: by hash then size, without duplicates.
+      const attachments = uploaded.sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : a.size - b.size)
+        .filter((blob, index, all) => index === 0 || blob.hash !== all[index - 1].hash || blob.size !== all[index - 1].size)
+      const extra = attachments.length ? { attachments } : {}
+      const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, ...extra, report_results: body.report_results })
+      item = await enqueue(outbox, { key, method: "message", params: { ...body, ...extra, attestation }, created_at_ms: Date.now() })
+    } else if (item.rejected !== undefined) {
+      item = { ...item, rejected: undefined }
+      await outbox.put(item)
+    }
+    requireWritable()
+    await outboxChanged()
+    try {
+      const receipt = await connection.rpc("message", item.params)
+      requireCurrent()
       if (!isQueuedReceipt(receipt, prepared.pending)) {
         if (activeId.current === id) await refreshRef.current().catch(showError)
         return false
       }
-      replaceMessages(messagesRef.current.filter((item) => item.message_id !== prepared.pending.message_id))
+      await outbox.delete(key)
+      await outboxChanged()
       setNoticeText("")
       if (activeId.current === id) await refreshRef.current().catch(showError)
       return true
     } catch (caught) {
-      if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
-        const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
-        if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.entry.peer_id } } : item))
+      if (current() && responded(caught)) {
+        await outbox.put({ ...item, rejected: caught instanceof Error ? caught.message : String(caught) })
+        await outboxChanged()
       }
       throw caught
     }
@@ -308,7 +405,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     botCreationRef.current = null; setPendingBot(null)
   }
   const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
-    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.peer_id) throw new Error("请回到原来的设备确认助手是否建好，内容已保留。")
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.device_id) throw new Error("请回到原来的设备确认助手是否建好，内容已保留。")
     const known = parseBots(await connection.rpc("bots"))
     requireCurrent()
     const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
@@ -324,25 +421,26 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     selectConversation(bot.conversation_id)
     await refreshRef.current()
   }
-  const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
+  const sendMessage = (input: string, files: File[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个助手。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
-    try { return await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
+    try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
   })
-  const incomplete = !data || isIncomplete(data.missing)
+  const incomplete = !data
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
-  const chatSlot = { conversationId: conversationId || null, missing: incomplete }
+  const chatSlot = { conversationId: conversationId || null }
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
-    writable: booted && current() && readConnection.current === connection,
+    writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
-    syncText: !data ? "发一条消息开始对话。" : incomplete
-      ? "对话还在同步。"
-      : "已加载能拿到的记录，离线设备上可能还有没同步的内容。",
+    writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
+    diagnostics: () => { requireCurrent(); return connection.request("diagnostics") },
+    confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
+    syncText: !data ? "发一条消息开始对话。" : "已加载这台设备上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
@@ -356,15 +454,19 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
         if (known) { await selectBot(known); return known }
         throw new Error("确认没建成，可以修改后再试。")
       }
-      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.peer_id } }
+      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.device_id } }
       const request: CreateBotRequest = parseCreateBot(pending)
       writeStorage(scoped("pending-bot"), pending, true)
       botCreationRef.current = pending; setPendingBot(pending)
       let response: unknown
-      try { response = await connection.rpc("create_bot", request) }
+      const attestation = await attest(request.conversation_id, { type: "bot_created", bot_id: request.bot_id, name: request.name, instructions: request.instructions, ...(request.project ? { project: request.project } : {}) })
+      // The entry first asked schedules the conversation, so a retry through any entry writes the same owner.
+      const scheduler = pending.submission?.entry_node ?? connection.entry.device_id
+      const owner_attestation = await attest(request.conversation_id, { type: "conversation_owner", scheduler_node: scheduler, epoch: 1 })
+      try { response = await signedWrite("bot", request.bot_id, "create_bot", { ...request, scheduler_node: scheduler, owner_attestation, attestation }) }
       catch (caught) {
         if (!prior && current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
-          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.peer_id } }
+          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.device_id } }
           writeStorage(scoped("pending-bot"), rejected, true)
           botCreationRef.current = rejected; setPendingBot(rejected)
           const known = await checkRejectedBot(rejected)
@@ -397,9 +499,10 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const id = activeId.current, context = requireBotContext(id)
       const version = context.autonomy.version
       if (version === null) throw new Error("后面的记录读不到，请再查一次。")
-      try { await connection.rpc("set_autonomy", { conversation_id: id, mode, expected_version: version }) }
+      const attestation = await attest(id, { type: "autonomy_set", mode, version: version + 1 })
+      try { await signedWrite("autonomy", `${id}:${version}`, "set_autonomy", { conversation_id: id, mode, expected_version: version, attestation }) }
       catch (caught) {
-        if (messageOf(caught).includes("refresh")) {
+        if (caught instanceof Error && caught.message.includes("refresh")) {
           if (activeId.current === id) await refreshRef.current()
           throw new Error("后续授权已在别处更改，已刷新。请确认当前设置后再改。")
         }
@@ -410,54 +513,73 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       setNoticeText(mode === "off" ? "已停止这个对话的后续。" : mode === "report" ? "后续只汇报结果，不再继续动手。" : "已允许 Agent 收到结果后继续工作。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    cancelAgentTask: (taskRef: string) => withMutation(`cancel-task:${taskRef}`, async () => {
+    takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      if (!context.agent_tasks.some((task) => task.task_ref === taskRef)) throw new Error("找不到这个任务，请再查一次。")
-      try { await connection.rpc("cancel_agent_task", { conversation_id: id, task_ref: taskRef }) }
+      if (!context.conversation) throw new Error("这台设备上还没有这个对话，可能还在同步。")
+      const scheduler = context.local_node, epoch = context.conversation.owner_epoch + 1
+      const attestation = await attest(id, { type: "conversation_owner", scheduler_node: scheduler, epoch })
+      try { await signedWrite("owner", `${id}:${epoch}`, "set_owner", { conversation_id: id, scheduler_node: scheduler, epoch, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      setNoticeText("已提交取消任务请求，最终结果以目标设备回报为准。")
+      setNoticeText("已交给这台设备处理，排队的消息会在这里继续。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    interruptNative: (workId: string, targetNode: string) => withMutation(`native-control:${targetNode}:${workId}`, async () => {
+    interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      const session = context.native_sessions.find((item) => item.work_id === workId && item.target_node === targetNode)
-      if (!session?.turn_id || !["running", "waiting"].includes(session.state)) throw new Error("这个任务现在停不了，请再查一次。")
-      try { await connection.rpc("native_interrupt", { conversation_id: id, work_id: workId, target_node: targetNode }) }
+      const work = context.works.find((item) => item.work_id === workId)
+      if (!work || work.outcome || !["accepted", "starting", "running", "waiting_approval"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
+      let receipt: Record<string, unknown>
+      try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      setNoticeText("已请求停止任务。")
+      setNoticeText(receipt.waiting_for_device === true ? "已请求、等待设备确认。" : "已请求停止任务。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    respondNative: (workId: string, targetNode: string, requestId: string | number, response: unknown) => withMutation(`native-control:${targetNode}:${workId}`, async () => {
+    answerApproval: (workId: string, requestId: string, response: unknown) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      const session = context.native_sessions.find((item) => item.work_id === workId && item.target_node === targetNode)
-      const request = session?.pending_requests.find((item) => item.request_id === requestId)
-      if (!session || !["running", "waiting"].includes(session.state) || !request) throw new Error("找不到这个请求，请再查一次。")
-      if (request.questions?.some((question) => question.is_secret)) throw new Error("这项内容请到执行设备上填写。")
-      try { await connection.rpc("native_respond", { conversation_id: id, work_id: workId, target_node: targetNode, request_id: requestId, response }) }
+      const work = context.works.find((item) => item.work_id === workId)
+      const request = work?.open_approvals.find((item) => item.request_id === requestId)
+      if (!work || work.state !== "waiting_approval" || !request?.form) throw new Error("找不到这个请求，请再查一次。")
+      if (request.form.questions?.some((question) => question.is_secret)) throw new Error("这项内容请到执行设备上填写。")
+      const chosen = (response as { decision?: unknown } | null)?.decision
+      const attestation = await attest(id, { type: "approval_answered", work_id: workId, request_id: requestId, decision: typeof chosen === "string" ? chosen : "answered" })
+      try { await signedWrite("approval", `${workId}:${requestId}`, "answer_approval", { conversation_id: id, work_id: workId, request_id: requestId, response, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       setNoticeText("已提交。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.target_node}:${check.check_id}`, async () => {
+    reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
-      const result = record(await connection.rpc("reconcile", { conversation_id: id, target_node: check.target_node, check_id: check.check_id }))
+      const result = record(await connection.rpc("reconcile", { conversation_id: id, check_id: check.check_id }))
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
       return result
     }),
-    resolveCheck: (check: PendingCheck, evidence: string, outcome?: string) => withMutation(`pending-check:${check.target_node}:${check.check_id}`, async () => {
+    /** A task check records the user's signed choice; a reply check keeps the written evidence. */
+    resolveCheck: (check: PendingCheck, choice: "completed" | "interrupted", note: string) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current
       requireBotContext(id)
-      if (new TextEncoder().encode(evidence.trim()).length < 12) throw new Error("说明太短了。")
-      if (check.kind === "native_turn" && !outcome) throw new Error("请选择实际结果。")
-      await connection.rpc("resolve", { conversation_id: id, target_node: check.target_node, check_id: check.check_id, evidence: evidence.trim(), ...(outcome ? { outcome } : {}) })
+      const text = note.trim()
+      if (check.work_id) {
+        if (new TextEncoder().encode(text).length > 4096) throw new Error("备注太长了。")
+        const attestation = await attest(id, { type: "work_finished", work_id: check.work_id, outcome: choice, result_text: text })
+        try { await signedWrite("resolve", check.check_id, "resolve", { conversation_id: id, check_id: check.check_id, outcome: choice, note: text, attestation }) }
+        catch (caught) { requireControlRefresh(); throw caught }
+      } else {
+        const evidence = `${choice === "completed" ? "用户确认已完成" : "用户确认没做完"}${text ? `：${text}` : "。"}`
+        await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id, evidence })
+      }
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
+    readArtifactBytes: async (hash: string, offset = 0) => {
+      requireCurrent()
+      const result = parseBinaryPage(await connection.rpc("read_artifact", { conversation_id: activeId.current, blob_hash: hash, offset, binary: true }), hash, offset)
+      requireCurrent()
+      return result
+    },
     readArtifact: async (hash: string, offset = 0) => {
       const id = activeId.current
       requireCurrent()
@@ -470,11 +592,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
       if (!original) throw new Error("原消息还在发送，请稍等。")
-      if (original.entry_node !== connection.entry.peer_id || original.rejected?.entry_node !== connection.entry.peer_id) throw new Error("只有原来的设备明确返回失败后才能放弃。断线或超时请重新发送或再查一次。")
+      if (original.rejected === undefined) throw new Error("只有设备明确返回失败后才能放弃。断线或超时请重新发送或再查一次。")
       const complete = await readConversation(id)
       requireContext(id)
-      if (messagesRef.current.find((item) => item.conversation_id === id) !== original || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("原消息状态有变化，请再查一次。")
-      replaceMessages(messagesRef.current.filter((item) => item !== original))
+      const still = messagesRef.current.find((item) => item.conversation_id === id)
+      if (still?.message_id !== original.message_id || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("原消息状态有变化，请再查一次。")
+      requireWritable()
+      await outbox.delete(outboxKey("message", original.message_id))
+      await outboxChanged()
       setNoticeText("已放弃这条消息，没有重发。")
     }),
     enableBrowserNotifications: async () => {
@@ -495,7 +620,7 @@ export function useWorkspace() {
   if (!value) throw new Error("工作区组件缺少上下文。")
   return value
 }
-export function WorkspaceProvider({ connection, openConversation, children }: { connection: ReadyConnection; openConversation: (conversationId: string) => void; children: ReactNode }) {
-  const value = useWorkspaceState(connection, openConversation)
+export function WorkspaceProvider({ connection, openConversation, tabs, children }: { connection: ReadyConnection; openConversation: (conversationId: string) => void; tabs: Tabs; children: ReactNode }) {
+  const value = useWorkspaceState(connection, openConversation, tabs)
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

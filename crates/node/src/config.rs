@@ -9,17 +9,39 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
+
+/// This machine's name, the default device name shown when creating or joining a network.
+pub fn hostname() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is writable for its full length and gethostname NUL-terminates within it.
+    let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    let name = String::from_utf8_lossy(&buffer[..end]);
+    let name = name.trim().trim_end_matches(".local");
+    if ok && !name.is_empty() {
+        name.chars().take(128).collect()
+    } else {
+        "Node".into()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+    /// Loopback-only local session listener; fixed so its origin and browser storage persist.
+    pub local_listen: SocketAddr,
     pub public_url: String,
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
     pub local_auto_access: bool,
     pub roles: Vec<NodeRole>,
+    /// Serves only the web app, the relay and ciphertext forwarding; never joins a network.
+    pub public_entry: bool,
     pub roots: Vec<PathBuf>,
-    pub network: crate::network::NetworkConfig,
+    pub network: crate::net::NetworkConfig,
     pub manager: Option<ManagerSettings>,
     pub codex_socket: Option<PathBuf>,
     pub codex_bin: PathBuf,
@@ -40,6 +62,7 @@ impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
         Self {
             listen,
+            local_listen: DEFAULT_LOCAL_LISTEN,
             public_url: format!("http://{listen}"),
             allowed_origins: vec![],
             allow_insecure_lan,
@@ -50,8 +73,9 @@ impl Config {
                 NodeRole::Replica,
                 NodeRole::Scheduler,
             ],
+            public_entry: false,
             roots,
-            network: crate::network::NetworkConfig::default(),
+            network: crate::net::NetworkConfig::default(),
             manager: None,
             codex_socket: None,
             codex_bin: "codex".into(),
@@ -66,6 +90,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         validate_role_dependencies(&self.roles)?;
+        self.network.validate()?;
         let url = http_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
             h == "localhost"
@@ -82,6 +107,10 @@ impl Config {
         );
         self.browser_origins()?;
         ensure!(
+            self.local_listen.ip().is_loopback() && self.local_listen != self.listen,
+            "local_listen must be a loopback address different from listen"
+        );
+        ensure!(
             self.timeout_secs > 0 && self.timeout_secs <= 86400,
             "invalid SDK timeout"
         );
@@ -89,6 +118,15 @@ impl Config {
             ensure!(
                 root.is_absolute() && root.is_dir(),
                 "project root must be an existing absolute directory"
+            );
+        }
+        if self.public_entry {
+            ensure!(
+                self.network.relay_listen.is_some()
+                    && self.network.entry.is_none()
+                    && self.manager.is_none()
+                    && self.roots.is_empty(),
+                "a public entry runs a relay and nothing else"
             );
         }
         if let Some(m) = &self.manager {

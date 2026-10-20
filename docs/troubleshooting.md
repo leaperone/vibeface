@@ -1,0 +1,104 @@
+# 排障
+
+出问题时按顺序看三样东西：`vibeface status`、数据目录里的 `node.log`，以及网页设置里导出的诊断包。三者都不含设备私钥、模型密钥、邀请链接或入口令牌，可以发给帮你排查的人。
+
+## 看状态
+
+```sh
+vibeface status --data-dir "$HOME/.vibeface"
+```
+
+Node 在运行时输出类似：
+
+```text
+Peer ID: 3f2a…
+Status: running
+Listen: 127.0.0.1:4790
+Data: /Users/me/.vibeface
+Version: 0.0.1
+Writes: writable
+Peer: mac-mini (9c41…) reachable, synced 4s ago
+Peer: pve (51be…) unreachable, synced 1830s ago
+```
+
+`Writes` 是这台 Node 能否写入，取值见下文“写入状态”。每台其他成员 Node 一行 `Peer`：`reachable` 表示最近一次同步连上了，`unreachable` 表示最近一次失败，`not tried yet` 表示启动后还没试过；`synced Ns ago` 是最近一次同步完成的时间，`never synced` 表示本次启动后没有成功过。`--json` 输出同样的内容，`write_state` 和 `peers` 是对应字段。
+
+Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原因。`status` 经数据目录里的私有维护 socket 查询，不需要网络，也不需要安装服务。
+
+## 看日志
+
+运行中的 Node 把日志追加到数据目录的 `node.log`（权限 600）。默认级别是 vibeface 的 info 和依赖库的 warn，可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`。前台在终端运行时日志同时打印到终端。启动时 `node.log` 超过 16 MiB 会改名为 `node.log.1`，只保留一份旧日志。
+
+作为后台服务运行时，标准错误不是终端，日志只写 `node.log`。macOS 的 `service.stderr.log` 和 Linux 用户 journal 里只剩崩溃输出。更新器的日志在 `update.stdout.log` 和 `update.stderr.log`。
+
+日志里值得找的几行：
+
+| 日志 | 含义 |
+|---|---|
+| `write state changed` | 写入状态变化，`state` 是新状态 |
+| `another copy of this device wrote different events; writes stopped` | 发现这台设备的数据被复制过，已停止写入 |
+| `write confirmed without a backup check` | 有人在网页上确认了“不是从备份恢复的” |
+| `refused a connection from a non-member` | 非成员设备试图连接，debug 级别 |
+| `work changed a file outside its directory` | 工作改动了它目录之外的文件，只记录，不拦截 |
+| `relay started` | 本机 relay 已启动，`listen` 字段是它的地址 |
+
+日志不记录邀请链接、加入 secret、入口令牌、本机启动 token 或模型密钥。
+
+## 导出诊断包
+
+在网页**设置**的**排障**里点**导出诊断包**，浏览器保存一个 `vibeface-diagnostics-<日期>.json`。管理设备和本机会话可以导出。诊断包来自当前连接的那台 Node，包含：
+
+- 版本、操作系统、CPU 架构和设备编号；
+- `config.json` 的内容，其中没有密钥；
+- 写入状态、冲突数量和每台对端的连通情况；
+- `node.log` 最后 400 行和 `service.stderr.log` 最后 50 行。
+
+导出前日志中的邀请链接片段替换为 `[invite]`，入口令牌替换为 `[redacted]`。
+
+## 写入状态
+
+| `Writes` | 网页显示 | 意思 | 怎么办 |
+|---|---|---|---|
+| `writable` | 无提示 | 正常 | 无 |
+| `aligning` | “这台设备正在和你的其他设备对齐” | 刚启动，正在确认自己没有落后于其他设备记下的内容 | 等它连上任一台其他 Node，通常几秒；`Peer` 行一直 `unreachable` 时检查网络和 relay |
+| `read_only` | 待处理里出现“这个设备的数据是从备份恢复的吗？” | 其他 Node 都连不上，无法确认这份数据是不是旧备份 | 见下文 |
+| `forked` | “这台设备的数据有两份副本” | 另一份同样身份的数据写了不同内容 | 见下文 |
+
+对齐和只读期间可以照常阅读，发消息会提示稍后再试，已排队的消息在可写后继续处理。
+
+### 只读：是否从备份恢复
+
+数据目录是从备份、快照或旧磁盘恢复的，点**是，先同步**，然后打开你的其他设备，连上后它会先拉回自己写过的内容再变成可写，不会产生分叉。
+
+确定这份数据没有被恢复过，例如只是其他设备暂时都关机，点**不是，继续使用**。这个确认只记在这台设备上。确认错了的后果是分叉：这台设备之后写的内容会与它以前写过、但不在这份数据里的内容冲突。
+
+### 分叉：数据有两份副本
+
+同一个数据目录被复制到两处，或者从备份恢复后被确认为可写，两份都写了内容，就会分叉。分叉不影响对话：其他设备保留先收到的那份，另一份放在一边，其他设备和其他对话照常写入。
+
+分叉的设备会停止写入。处理方法：
+
+1. 在待处理卡片的**两份内容**里看两边各写了什么，记下需要保留的。
+2. 点**去设备页**，在管理设备上移除这台设备。
+3. 停掉这台设备上的 Node，用 `vibeface init --data-dir <新目录>` 初始化一个新的数据目录，再用新的加入链接执行 `vibeface join --data-dir <新目录> <链接>`。旧数据目录不要再启动。
+4. 把需要保留的内容重新发一次。
+
+其他设备上出现“某某 的数据有两份副本”时，说明是那台设备分叉了，按同样步骤处理那台设备。
+
+## 常见问题
+
+**对端一直 `unreachable`。** 两台 Node 没有直连路径时要经 relay 转发。确认至少一台 Node 用 `--relay-listen` 运行 relay，其他 Node 的 `config.json` 里 `network.relays` 指向它，反向代理允许 WebSocket 升级。改了 `network` 字段要重启。见 [Node 之间的连接](node.md#node-之间的连接)。
+
+**手机打开公共入口后连不上家里的设备。** 公共入口只经自己的 relay 找到成员 Node。检查家里的 Node 是否用 `--entry` 和 `--relay-token-file` 初始化，令牌文件是否与入口数据目录里的 `entry-token` 相同，nginx 是否把 `/relay`、`/ping` 和 `/generate_204` 转给入口的 relay 端口。见 [配置公共入口](node.md#配置公共入口)。
+
+**任务停在“待核对”。** Node 无法确认一项工作是否执行过时不会自己重做，见 [待核对](node.md#待核对)。
+
+**设置页提示 Codex 后台服务没启动。** Node 托管的 `codex app-server` 退出后会按 1 到 30 秒退避重启。持续失败时检查 `codex_bin` 是否可执行、Codex 是否已登录，然后重启 Node。它的 socket 在私有的 `/tmp/vibeface-<编号>/` 目录，进程组号在数据目录的 `codex-app-server.pid`。
+
+**连接页提示网关忙或加入的设备太多。** 一台 Gateway 同时最多转发 256 个会话，超出时回 `gateway_busy`；一台 Node 同时最多接待 32 个还没加入的设备，每个最多 15 分钟。正常使用碰不到这两个上限，碰到时多半有大量陌生连接，查看 `node.log` 和反向代理的访问日志，稍后再试。
+
+**所有管理浏览器都丢了。** 在任意浏览器打开自己设备的网页，连接页选“用恢复文件找回”，选恢复文件、输入恢复密码，勾选丢失的设备后确认。这个浏览器不需要先加入，完成后成为新的管理设备。
+
+**端口被占用。** `init` 和首次启动会先检查 `listen` 和 `local_listen`，提示“端口 X 被占用”，用 `--listen` 或 `--local-listen` 换一个。
+
+不要为了排障删除 `node.sqlite3`、复制运行中的数据目录，或用另一台机器启动同一个数据目录的副本，这些都会造成分叉或丢失历史。

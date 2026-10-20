@@ -23,14 +23,14 @@ export function useDeviceRows(): DeviceRow[] {
   const { directory, ready, identity } = useDevice()
   const { nodes } = useWorkspace()
   const members = directory?.members ?? []
-  const ids = [...new Set([...members.map((member) => member.subject_id), ...nodes.filter((node) => !node.revoked).map((node) => node.peer_id)])]
+  const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])]
   const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : 3
   return ids.map((id): DeviceRow => {
-    const member = members.find((item) => item.subject_id === id), node = nodes.find((item) => item.peer_id === id)
+    const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
     const kind = member?.kind ?? "node"
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
-      entry: id === ready?.entry.peer_id, browser: id === identity?.peerId,
+      entry: id === ready?.entry.device_id, browser: id === identity?.deviceId,
       online: kind === "node" ? node?.online ?? false : undefined, assistant: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
@@ -84,7 +84,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
-    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>{device.directory.revoked.map((id) => <span key={id} className="font-mono">{id}</span>)}</Details> : null}
+    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>{device.directory.revoked.map((item) => <span key={item.device_id} className="font-mono">{item.device_id}</span>)}</Details> : null}
   </div>
 }
 
@@ -132,9 +132,9 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     {row.entry ? <Section icon={Globe} title="访问地址">
       <p className="break-all font-mono text-meta">{address}</p>
-      {isLoopback(address) ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
-        <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />手机和其他电脑连不上</span>
-        <a className="font-medium underline underline-offset-4" href={`${docs}node.md#%E5%BC%80%E6%94%BE%E5%B1%80%E5%9F%9F%E7%BD%91%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
+      {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
+        <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>
+        <a className="font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
       </p> : null}
       {canManage || localSession ? <label className="flex min-h-11 items-center justify-between gap-3 border-t pt-3">
         <span className="grid"><span>本机免确认打开</span><span className="text-meta text-muted-foreground">在这台电脑上打开时直接进入</span></span>
@@ -147,8 +147,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     <Details>
       <DetailRow label="设备编号" value={row.id} mono />
-      {row.member ? <DetailRow label="公钥" value={row.member.public_key} mono /> : null}
-      {row.member?.node_roles.length ? <DetailRow label="设备能力" value={row.member.node_roles.map((role) => roleNames[role] ?? role).join("、")} /> : null}
+      {row.node?.roles?.length ? <DetailRow label="设备能力" value={row.node.roles.map((role) => roleNames[role] ?? role).join("、")} /> : null}
     </Details>
 
     {canManage && row.member && !row.admin && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">

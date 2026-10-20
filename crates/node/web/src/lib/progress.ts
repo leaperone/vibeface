@@ -4,7 +4,7 @@ export type ProgressUpdate =
 
 type ProgressFields = { conversation_id: string; sequence: number; progress: ProgressUpdate }
 export type ManagerProgressEvent = ProgressFields & { type: 'manager_progress'; trigger: string; source_node: string; invocation_id?: string }
-export type NativeProgressEvent = ProgressFields & { type: 'native_progress'; work_id: string; thread_id: string; turn_id?: string; task_ref?: string; target_node: string }
+export type NativeProgressEvent = ProgressFields & { type: 'native_progress'; work_id: string; target_node: string }
 export type ChangedEvent = { type: 'invalidate' } | ManagerProgressEvent | NativeProgressEvent
 type LiveProgressFields = {
   key: string; conversation_id: string
@@ -12,7 +12,7 @@ type LiveProgressFields = {
 }
 export type LiveProgress = LiveProgressFields & (
   | { kind: 'manager'; trigger: string; source_node: string; invocation_id?: string }
-  | { kind: 'native'; work_id: string; thread_id: string; turn_id?: string; task_ref?: string; target_node: string }
+  | { kind: 'native'; work_id: string; target_node: string }
 )
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -47,7 +47,7 @@ export function parseChanged(value: unknown): ChangedEvent {
     const sequence = value.sequence
     if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 1) return { type: 'invalidate' }
     if (value.type === 'manager_progress') return { type: value.type, conversation_id, progress, sequence, trigger: requiredText(value.trigger), source_node: requiredText(value.source_node), invocation_id: optionalText(value.invocation_id) }
-    return { type: value.type, conversation_id, progress, sequence, work_id: requiredText(value.work_id), thread_id: requiredText(value.thread_id), turn_id: optionalText(value.turn_id), task_ref: optionalText(value.task_ref), target_node: requiredText(value.target_node) }
+    return { type: value.type, conversation_id, progress, sequence, work_id: requiredText(value.work_id), target_node: requiredText(value.target_node) }
   } catch { return { type: 'invalidate' } }
 }
 
@@ -55,7 +55,7 @@ export function mergeProgress(previous: LiveProgress[], event: ChangedEvent): Li
   if (event.type === 'invalidate') return previous
   const key = event.type === 'manager_progress'
     ? JSON.stringify(['manager', event.conversation_id, event.source_node, event.trigger])
-    : JSON.stringify(['native', event.conversation_id, event.target_node, event.work_id, event.thread_id, event.turn_id ?? ''])
+    : JSON.stringify(['native', event.conversation_id, event.target_node, event.work_id])
   const current = previous.find(item => item.key === key)
   const existing = event.type === 'manager_progress' && current?.kind === 'manager' && current.invocation_id !== event.invocation_id ? undefined : current
   if (existing && event.sequence <= existing.sequence) return previous
@@ -67,7 +67,7 @@ export function mergeProgress(previous: LiveProgress[], event: ChangedEvent): Li
   }
   const next: LiveProgress = event.type === 'manager_progress'
     ? { ...fields, kind: 'manager', trigger: event.trigger, source_node: event.source_node, invocation_id: event.invocation_id }
-    : { ...fields, kind: 'native', work_id: event.work_id, thread_id: event.thread_id, turn_id: event.turn_id, task_ref: event.task_ref, target_node: event.target_node }
+    : { ...fields, kind: 'native', work_id: event.work_id, target_node: event.target_node }
   const progress = event.progress
   if (progress.type === 'text_snapshot' || progress.type === 'text_delta') {
     const item_id = progress.item_id ?? 'message'

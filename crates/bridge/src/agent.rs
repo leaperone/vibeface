@@ -109,6 +109,8 @@ pub async fn terminate_process_group(child: &mut Child, group: u32) -> bool {
     async fn signal(group: u32, signal: &str) -> Option<bool> {
         Command::new("/bin/kill")
             .arg(signal)
+            // procps kill parses a bare negative PID as an option; `--` makes it a group.
+            .arg("--")
             .arg(format!("-{group}"))
             .output()
             .await
@@ -534,7 +536,7 @@ impl Drop for SdkProcess {
         self.stderr.abort();
         if let Some(group) = self.group.take() {
             let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", &format!("-{group}")])
+                .args(["-KILL", "--", &format!("-{group}")])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();

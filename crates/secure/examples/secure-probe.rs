@@ -27,7 +27,7 @@ fn main() -> Result<()> {
                     if let Some(secret) = input.get("secret_hex").and_then(Value::as_str) {
                         identity = Identity::from_secret_hex(secret)?;
                     }
-                    json!({"public_key":identity.public_key_hex(),"peer_id":identity.peer_id()})
+                    json!({"device_id":identity.device_id()})
                 }
                 "recovery_seal" => json!(hex::encode(vibeface_secure::recovery_seal(
                     &bytes(&input)?,
@@ -39,14 +39,14 @@ fn main() -> Result<()> {
                 )?)),
                 "sign" => json!(identity.sign(text(&input, "domain")?, &bytes(&input)?)?),
                 "handshake" => {
-                    handshake = Some(Handshake::new(
+                    handshake = Some(Handshake::signed(
                         input
                             .get("initiator")
                             .and_then(Value::as_bool)
                             .ok_or("missing initiator")?,
-                        &identity.secret_hex(),
+                        &identity,
                         input
-                            .get("expected_peer_id")
+                            .get("expected_device_id")
                             .and_then(Value::as_str)
                             .map(str::to_owned),
                         text(&input, "context")?.as_bytes(),

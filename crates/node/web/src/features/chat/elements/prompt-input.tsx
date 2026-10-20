@@ -1,5 +1,5 @@
 import { useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from 'react'
-import { ArrowUpIcon, SquareIcon } from 'lucide-react'
+import { ArrowUpIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { isSubmitKey } from '../protocol'
 
@@ -18,6 +18,8 @@ export function PromptInput({
   onChange,
   onSubmit,
   onStop,
+  files = [],
+  onFiles,
   children,
 }: {
   value: string
@@ -27,9 +29,12 @@ export function PromptInput({
   onChange: (value: string) => void
   onSubmit: () => void
   onStop?: () => void
+  files?: File[]
+  onFiles?: (files: File[]) => void
   children?: ReactNode
 }) {
   const formRef = useRef<HTMLFormElement>(null)
+  const pickerRef = useRef<HTMLInputElement>(null)
   return (
     <form
       ref={formRef}
@@ -61,7 +66,17 @@ export function PromptInput({
             }
           }}
         />
-        <InputGroupAddon align="block-end" className="pt-1">
+        <InputGroupAddon align="block-end" className="flex-wrap pt-1">
+          {onFiles ? <>
+            <input ref={pickerRef} type="file" multiple hidden onChange={(event) => { onFiles([...files, ...event.target.files ?? []]); event.target.value = '' }} />
+            <InputGroupButton type="button" variant="ghost" size="icon-sm" className="size-11 rounded-full" aria-label="添加附件" title="添加附件" disabled={disabled || busy} onClick={() => pickerRef.current?.click()}>
+              <PaperclipIcon aria-hidden="true" />
+            </InputGroupButton>
+            {files.map((file, index) => <span key={`${file.name}:${index}`} className="flex max-w-48 min-w-0 items-center gap-1 rounded-full bg-muted ps-3 text-meta">
+              <span className="truncate">{file.name}</span>
+              <button type="button" className="grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} disabled={busy} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
+            </span>)}
+          </> : null}
           <InputGroupButton
             type={onStop ? 'button' : 'submit'}
             variant={onStop ? 'outline' : 'default'}

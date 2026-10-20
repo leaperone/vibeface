@@ -90,11 +90,11 @@ vibeface --help
 vibeface
 ```
 
-直接运行默认使用 `~/.vibeface`。首次仅在不存在或为空的真实目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，默认不配置发现入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
+直接运行默认使用 `~/.vibeface`。首次仅在不存在或为空的真实目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
 
 保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或恢复包。使用恢复包时，本机入口和初始化授权自动选取。
 
-另一台节点加入已有个人网络时，在它的 localhost 页面选择**使用节点邀请加入**，粘贴原管理客户端生成的 Node 邀请。双方分别核对节点身份和权限后确认。刷新页面只核对原申请，不重新提交。不能新建网络代替配对。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 和 `vibeface pair` 保留为备用方式。
+另一台节点加入已有个人网络时，先在它上面执行 `vibeface init`，不要在它的本机网页上建网。然后在管理设备的**添加设备**里生成加入链接，在新节点上执行 `vibeface join <链接>`，终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
 
 使用签名管理身份或可信本机会话进入工作区后，在**设置**中选择管理 Agent、模型和允许 Agent 访问的项目目录。默认 Agent 工作目录在首次保存时自动创建，无需编辑配置文件或重启 Node。编码执行和管理 Agent 仍需事先安装并登录对应 Provider，角色授权也必须满足要求。见 [配置管理 Agent](node.md#配置管理-agent)。
 
@@ -109,15 +109,25 @@ vibeface
 
 `init` 拒绝覆盖非空数据目录。显式 `vibeface serve` 只启动已初始化节点。已有节点先停止进程，再修改原 `config.json`，不要重新初始化身份。
 
-要使用自己的发现或中继入口，在初始化或启动时传入 URL：
+Node 之间经 iroh 连接。不能直连的 Node 经个人网络中另一台 Node 运行的 relay 转发，在初始化时指定：
 
 ```sh
-vibeface --bootstrap-url https://relay.example
-vibeface serve --bootstrap-url wss://relay.example/api/network/ws
-vibeface init --data-dir /absolute/path/to/new-node --bootstrap-url https://relay.example
+vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example   # 运行 relay 的公网 Node
+vibeface init --relay https://relay.example                                      # 其他 Node，可重复
 ```
 
-这三种命令分别使用，可重复 `--bootstrap-url` 指定多个入口，最多 8 个。HTTP(S) 地址自动转换成 WS(S) 的 `/api/network/ws` 端点，URL 不接受凭证、查询参数或片段。HTTP(S) 仅接受根路径或 `/api/network/ws`，WS(S) 保留显式的非根路径。程序不内置公共入口。首次直接启动和显式 `init` 将传入的 URL 保存到配置；已有节点启动时，传入的列表仅覆盖本次运行的 `network.bootstrap_urls`，不改写配置或身份。省略该参数时使用原配置。更多说明见[发现与公共中继](node.md#发现与公共中继)。
+设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。程序不内置公共 relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
+
+要让手机从外网打开网页而公网机器不保存你的数据，在公网机器上运行公共入口，家里的 Node 指向它：
+
+```sh
+vibeface init --public-entry --public-url https://vb.example.com --relay-listen 127.0.0.1:3340   # 公网机器
+vibeface init --entry https://vb.example.com --relay-token-file /path/to/entry-token             # 家里的 Node
+```
+
+反向代理和令牌的处理见 [配置公共入口](node.md#配置公共入口)。
+
+前台运行时日志同时写到数据目录的 `node.log`。`vibeface status` 显示写入状态和每台对端最近一次同步，出问题时先看 [排障](troubleshooting.md)。
 
 ## 用 CLI 管理后台服务
 

@@ -1,18 +1,19 @@
-//! Private, local state for identity handshakes and network membership.
+//! This Node's membership record, its one-time bootstrap capability, and join requests.
 //!
-//! One-time capability secrets stay on the client; this database stores their
-//! hashes and signed pairing receipts, never a recovery root or client private key.
+//! A ticket's secret never reaches this database; invites are stored by `SHA256(secret)`.
+//! A join request moves `pending → confirming → joined`, or ends `rejected` or `expired`.
 
-use super::{AuthorizationView, IdentityKind, Member, NetworkState};
+use super::{AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, NetworkState};
 use crate::crypto;
-use crate::model::NodeRole;
 use crate::store::Store;
 use crate::{crypto::random_hex, runtime::now_ms};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use vibeface_secure::join::{InviteRecord, TICKET_LIFETIME_MS, invite_id, join_commit};
 
-const INVITE_TTL_MS: i64 = 10 * 60_000;
+const MAX_PENDING_INVITES: i64 = 32;
+const CLOCK_SKEW_MS: i64 = 60_000;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -27,160 +28,43 @@ impl std::fmt::Debug for BootstrapCapability {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinStatus {
+    Pending,
+    Confirming,
+    Joined,
+    Rejected,
+    Expired,
+}
+
+/// What the joining device and management devices may see of one request.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct InvitePayload {
-    pub version: u32,
-    pub invite_id: String,
-    pub request_id: String,
+pub struct JoinRequest {
+    pub join_id: String,
+    pub status: JoinStatus,
     pub network_id: String,
-    pub inviter_subject_id: String,
-    pub capability_hash: String,
-    pub new_kind: IdentityKind,
-    pub node_roles: Vec<NodeRole>,
-    pub manage: bool,
-    pub epoch: u64,
-    pub expires_at_ms: i64,
-    pub nonce: String,
-}
-impl InvitePayload {
-    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        super::canonical_json(self)
-    }
-    pub fn hash(&self) -> Result<String> {
-        Ok(crypto::digest(&self.signing_bytes()?))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct InviteEnvelope {
-    pub payload: InvitePayload,
-    pub inviter_signature: String,
-}
-impl InviteEnvelope {
-    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        self.payload.signing_bytes()
-    }
-    pub fn hash(&self) -> Result<String> {
-        self.payload.hash()
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct InviteRequest {
-    pub request_id: String,
-    pub network_id: String,
-    pub inviter_subject_id: String,
-    pub epoch: u64,
-    pub capability: String,
-    pub new_kind: IdentityKind,
-    pub node_roles: Vec<NodeRole>,
-    pub manage: bool,
-    pub expires_at_ms: Option<i64>,
-}
-impl std::fmt::Debug for InviteRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InviteRequest")
-            .field("request_id", &self.request_id)
-            .field("network_id", &self.network_id)
-            .field("inviter_subject_id", &self.inviter_subject_id)
-            .field("capability", &"[redacted]")
-            .field("new_kind", &self.new_kind)
-            .field("node_roles", &self.node_roles)
-            .field("manage", &self.manage)
-            .field("expires_at_ms", &self.expires_at_ms)
-            .finish()
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PairRequest {
-    pub request_id: String,
     pub invite_id: String,
-    pub capability: String,
-    pub member: Member,
-    pub nonce: String,
-    pub proof: String,
-}
-impl std::fmt::Debug for PairRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PairRequest")
-            .field("request_id", &self.request_id)
-            .field("invite_id", &self.invite_id)
-            .field("capability", &"[redacted]")
-            .field("member", &self.member)
-            .field("nonce", &self.nonce)
-            .field("proof", &"[redacted]")
-            .finish()
-    }
-}
-impl PairRequest {
-    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        super::canonical_json(&(
-            self.request_id.clone(),
-            self.invite_id.clone(),
-            self.capability.clone(),
-            &self.member,
-            self.nonce.clone(),
-        ))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PairReview {
-    pub version: u32,
-    pub invite_id: String,
-    pub network_id: String,
-    pub inviter_subject_id: String,
-    pub new_member: Member,
-    pub proposal_hash: String,
-    pub parents: Vec<String>,
-    pub epoch: u64,
+    pub device_id: String,
+    pub kind: IdentityKind,
+    pub name: String,
+    pub commit: String,
+    pub admin_id: Option<String>,
+    pub admin_nonce: Option<String>,
+    pub joiner_nonce: Option<String>,
+    pub reason: Option<String>,
     pub expires_at_ms: i64,
 }
-impl PairReview {
-    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        super::canonical_json(self)
-    }
-    pub fn hash(&self) -> Result<String> {
-        Ok(crypto::digest(&self.signing_bytes()?))
-    }
-}
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The joining device's request; `commit` is `SHA256(device_id ‖ joiner_nonce)`.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PairConfirm {
-    pub review: PairReview,
-    pub inviter_signature: String,
-    pub new_subject_signature: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct GrantProposal {
-    pub review: PairReview,
-    pub inviter_signature: String,
-    pub new_subject_signature: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Receipt {
-    pub request_id: String,
-    pub subject_id: String,
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PendingPair {
-    pub request_id: String,
-    pub review: PairReview,
-    pub new_subject_signature: String,
+pub struct Join {
+    pub secret: String,
+    pub public_key: String,
+    pub kind: IdentityKind,
+    pub name: String,
+    pub commit: String,
 }
 
 impl Store {
@@ -214,53 +98,30 @@ impl Store {
         Ok(BootstrapCapability { capability })
     }
 
+    pub fn verify_bootstrap_capability(&self, capability: &str) -> Result<()> {
+        verify_bootstrap_in(&self.connection, capability)
+    }
+
+    /// Installs a genesis, or a recovered network, on a Node that has none yet.
     pub fn bootstrap_network(
         &self,
         state: NetworkState,
         capability: &str,
-        remote_client_id: &str,
+        client: &str,
     ) -> Result<AuthorizationView> {
         ensure!(
-            state.checkpoint.is_none() && state.events.is_empty(),
-            "bootstrap accepts genesis only"
+            state.events.is_empty(),
+            "bootstrap accepts genesis or a checkpoint"
         );
-        self.bootstrap_network_inner(state, capability, remote_client_id)
-    }
-
-    pub fn bootstrap_recovered_network(
-        &self,
-        state: NetworkState,
-        capability: &str,
-        remote_client_id: &str,
-    ) -> Result<AuthorizationView> {
-        ensure!(
-            state.checkpoint.is_some() && state.events.is_empty(),
-            "recovery bootstrap requires a signed checkpoint"
-        );
-        self.bootstrap_network_inner(state, capability, remote_client_id)
-    }
-
-    pub fn verify_bootstrap_capability(&self, capability: &str) -> Result<()> {
-        let conn = &self.connection;
-        verify_bootstrap_in(conn, capability)
-    }
-
-    fn bootstrap_network_inner(
-        &self,
-        state: NetworkState,
-        capability: &str,
-        remote_client_id: &str,
-    ) -> Result<AuthorizationView> {
         let view = state.project()?;
-        ensure!(
-            view.authorize_client(remote_client_id)?.manage,
-            "remote bootstrap identity must manage"
-        );
-        self.transaction(|tx|{
-            ensure!(!has_network_in(tx)?,"network already installed");
-            verify_bootstrap_in(tx,capability)?;
-            save_state(tx,&state)?;
-            tx.execute("UPDATE identity_meta SET value='consumed:' || value WHERE key='bootstrap_capability_hash'",[])?;
+        view.manager(client)?;
+        self.transaction(|tx| {
+            verify_bootstrap_in(tx, capability)?;
+            save_state(tx, &state)?;
+            tx.execute(
+                "UPDATE identity_meta SET value='consumed:' || value WHERE key='bootstrap_capability_hash'",
+                [],
+            )?;
             Ok(())
         })?;
         Ok(view)
@@ -276,29 +137,24 @@ impl Store {
     }
 
     pub fn public_state(&self) -> Result<NetworkState> {
-        let conn = &self.connection;
-        let state = load_state(conn)?;
+        let state = load_state(&self.connection)?;
         state.project()?;
         Ok(state)
     }
 
     pub fn has_network(&self) -> Result<bool> {
-        let conn = &self.connection;
-        has_network_in(conn)
+        has_network_in(&self.connection)
     }
 
+    /// Merges `incoming`; a higher recovery epoch voids every invite and join request.
     pub fn install_state(&mut self, incoming: NetworkState) -> Result<AuthorizationView> {
         incoming.project()?;
-        self.retire_identity_readers(&incoming.genesis.network_id);
         self.transaction(|tx| {
             let next = if has_network_in(tx)? {
                 let current = load_state(tx)?;
                 let merged = current.merge(&incoming)?;
                 if merged.epoch() > current.epoch() {
-                    tx.execute_batch(
-                        "DELETE FROM identity_pair_reviews; DELETE FROM identity_pair_requests;
-                         DELETE FROM identity_invites; DELETE FROM identity_requests;",
-                    )?;
+                    tx.execute("DELETE FROM invites", [])?;
                 }
                 merged
             } else {
@@ -310,268 +166,338 @@ impl Store {
         })
     }
 
-    pub fn create_invite(&self, request: InviteRequest) -> Result<InvitePayload> {
-        super::validate_id(&request.capability)?;
-        let mut roles = request.node_roles;
-        roles.sort_by_key(super::role_key);
-        roles.dedup();
-        let payload = InvitePayload {
-            version: super::IDENTITY_VERSION,
-            invite_id: random_id(),
-            request_id: request.request_id,
-            network_id: request.network_id,
-            inviter_subject_id: request.inviter_subject_id,
-            capability_hash: crypto::digest(request.capability.as_bytes()),
-            new_kind: request.new_kind,
-            node_roles: roles,
-            manage: request.manage,
-            epoch: request.epoch,
-            expires_at_ms: request.expires_at_ms.unwrap_or(now_ms() + INVITE_TTL_MS),
-            nonce: random_hex(32),
-        };
-        let view = self.public_state()?.project()?;
-        validate_invite(&payload, &view)?;
-        Ok(payload)
-    }
-
-    pub fn commit_invite(&self, envelope: InviteEnvelope) -> Result<Receipt> {
-        self.transaction(|tx|{
-            let payload=&envelope.payload;
-            let view=load_state(tx)?.project()?;
-            let inviter=validate_invite(payload,&view)?;
-            crypto::verify_payload(&inviter.public_key,"identity-invite",&payload.signing_bytes()?,&envelope.inviter_signature)?;
-            if let Some((old,signature))=tx.query_row("SELECT payload_hash,inviter_signature FROM identity_invites WHERE invite_id=?",[&payload.invite_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
-                ensure!(old==payload.hash()?&&signature==envelope.inviter_signature,"invite id reused with another payload");
-                return Ok(invite_receipt(payload));
-            }
-            let pending:i64=tx.query_row("SELECT COUNT(*) FROM identity_invites WHERE used=0 AND expires_at_ms>?",[now_ms()],|r|r.get(0))?;
-            ensure!(pending<32,"too many pending invitations");
-            tx.execute("INSERT INTO identity_invites(invite_id,request_id,network_id,inviter_subject_id,payload,payload_hash,capability_hash,inviter_signature,epoch,expires_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",params![payload.invite_id,payload.request_id,payload.network_id,payload.inviter_subject_id,serde_json::to_string(payload)?,payload.hash()?,payload.capability_hash,envelope.inviter_signature,payload.epoch,payload.expires_at_ms])?;
-            Ok(invite_receipt(payload))
-        })
-    }
-
-    pub fn pair_request(&self, request: PairRequest) -> Result<PairReview> {
-        validate_text(&request.request_id, 128)?;
-        super::validate_id(&request.capability)?;
-        super::validate_id(&request.nonce)?;
-        request.member.validate()?;
+    /// Registers a manager-signed invite; registering the same record again is a no-op.
+    pub fn register_invite(&self, record: &InviteRecord, issuer: &str) -> Result<String> {
+        record.verify()?;
         ensure!(
-            !request.member.manage,
-            "management clients require a root checkpoint"
+            record.issuer == issuer,
+            "invite signer differs from this session"
         );
-        crypto::verify_payload(
-            &request.member.public_key,
-            "identity-pair",
-            &request.signing_bytes()?,
-            &request.proof,
-        )?;
-        let proposal_hash = crypto::digest(&request.signing_bytes()?);
-        self.transaction(|tx|{
-            let view=load_state(tx)?.project()?;
-            let (encoded,hash,used):(String,String,i64)=tx.query_row("SELECT payload,capability_hash,used FROM identity_invites WHERE invite_id=?",[&request.invite_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            ensure!(crypto::digest(request.capability.as_bytes())==hash,"invalid invite capability");
-            let payload:InvitePayload=serde_json::from_str(&encoded)?;
-            ensure!(payload.capability_hash==hash,"invitation capability mismatch");
-            if let Some((id,encoded))=tx.query_row("SELECT request_id,review FROM identity_pair_requests WHERE invite_id=?",[&request.invite_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
-                let review:PairReview=serde_json::from_str(&encoded)?;
-                ensure!(id==request.request_id&&review.new_member==request.member&&review.proposal_hash==proposal_hash,"invitation is already bound to another pairing request");
-                ensure!(view.epoch==review.epoch,"pair review epoch is stale");
-                return Ok(review);
-            }
-            validate_invite(&payload,&view)?;
-            ensure!(used==0,"invitation has already been used");
-            ensure!(request.member.kind==payload.new_kind&&request.member.node_roles==payload.node_roles&&request.member.manage==payload.manage,"member does not match invitation");
-            ensure!(!view.members.iter().any(|m|m.subject_id==request.member.subject_id)&&!view.revoked.contains(&request.member.subject_id),"identity is already enrolled or revoked in this epoch");
-            let pending:i64=tx.query_row("SELECT COUNT(*) FROM identity_pair_requests",[],|r|r.get(0))?;
-            ensure!(pending<super::MAX_MEMBERS as i64,"too many pairing records");
-            let mut stmt=tx.prepare("SELECT review FROM identity_pair_requests WHERE subject_id=?")?;
-            let records=stmt.query_map([&request.member.subject_id],|r|r.get::<_,String>(0))?;
-            for record in records {
-                let previous:PairReview=serde_json::from_str(&record?)?;
-                ensure!(previous.epoch!=view.epoch||previous.expires_at_ms<=now_ms(),"identity already has a pending pairing request");
-            }
-            let review=PairReview{version:super::IDENTITY_VERSION,invite_id:request.invite_id.clone(),network_id:payload.network_id,inviter_subject_id:payload.inviter_subject_id,new_member:request.member.clone(),proposal_hash,parents:view.heads,epoch:payload.epoch,expires_at_ms:payload.expires_at_ms};
-            tx.execute("INSERT INTO identity_pair_requests(request_id,invite_id,subject_id,review,review_hash,new_subject_signature) VALUES(?,?,?,?,?,'')",params![request.request_id,review.invite_id,review.new_member.subject_id,serde_json::to_string(&review)?,review.hash()?])?;
-            Ok(review)
-        })
-    }
-
-    pub fn accept_pair(
-        &self,
-        review: PairReview,
-        new_subject_signature: String,
-    ) -> Result<Receipt> {
-        self.transaction(|tx|{
-            let view=load_state(tx)?.project()?;
-            validate_review(&review,&view)?;
-            let (request_id,encoded,hash,old):(String,String,String,String)=tx.query_row("SELECT request_id,review,review_hash,new_subject_signature FROM identity_pair_requests WHERE invite_id=?",[&review.invite_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-            ensure!(encoded==serde_json::to_string(&review)?&&hash==review.hash()?,"pair review differs from pending request");
-            crypto::verify_payload(&review.new_member.public_key,"identity-pair-review",&review.signing_bytes()?,&new_subject_signature)?;
-            ensure!(old.is_empty()||old==new_subject_signature,"pairing already accepted with a different signature");
-            tx.execute("UPDATE identity_pair_requests SET new_subject_signature=? WHERE invite_id=?",params![new_subject_signature,review.invite_id])?;
-            Ok(Receipt{request_id,subject_id:review.new_member.subject_id.clone(),kind:"pair-accepted".into()})
-        })
-    }
-
-    pub fn lookup_pair(&self, request_id: &str) -> Result<PairReview> {
-        let conn = &self.connection;
-        let encoded: String = conn.query_row(
-            "SELECT review FROM identity_pair_requests WHERE request_id=?",
-            [request_id],
-            |r| r.get(0),
-        )?;
-        Ok(serde_json::from_str(&encoded)?)
-    }
-
-    pub fn pair_accepted(&self, request_id: &str) -> Result<bool> {
-        Ok(self.connection.query_row(
-            "SELECT new_subject_signature<>'' FROM identity_pair_requests WHERE request_id=?",
-            [request_id],
-            |row| row.get(0),
-        )?)
-    }
-
-    pub fn pending_pairs(&self, inviter_id: &str) -> Result<Vec<PendingPair>> {
-        let conn = &self.connection;
-        let view = load_state(conn)?.project()?;
+        let now = now_ms();
         ensure!(
-            view.authorize_client(inviter_id)?.manage,
-            "management permission required"
+            record.expires_at_ms > now
+                && record.expires_at_ms <= now + TICKET_LIFETIME_MS + CLOCK_SKEW_MS,
+            "invalid invite expiry"
         );
-        let mut stmt=conn.prepare("SELECT p.request_id,p.review,p.new_subject_signature FROM identity_pair_requests p WHERE p.new_subject_signature<>'' AND NOT EXISTS(SELECT 1 FROM identity_requests r WHERE r.request_id='pair:' || p.invite_id)")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut result = vec![];
-        for row in rows {
-            let (request_id, encoded, new_subject_signature) = row?;
-            let review: PairReview = serde_json::from_str(&encoded)?;
-            if review.inviter_subject_id == inviter_id
-                && review.epoch == view.epoch
-                && review.expires_at_ms > now_ms()
+        let join_id = invite_id(&record.invite_hash)?;
+        self.transaction(|tx| {
+            let view = load_state(tx)?.project()?;
+            ensure!(record.network_id == view.network_id, "invite belongs to another network");
+            view.manager(issuer)?;
+            let encoded = serde_json::to_string(record)?;
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT record FROM invites WHERE invite_hash=?",
+                    [&record.invite_hash],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
             {
-                result.push(PendingPair {
-                    request_id,
-                    review,
-                    new_subject_signature,
-                });
+                ensure!(existing == encoded, "invite was registered with another record");
+                return Ok(());
             }
-        }
-        Ok(result)
-    }
-
-    pub fn confirm_pair(&self, confirm: PairConfirm) -> Result<GrantProposal> {
-        self.transaction(|tx|{
-            let review=&confirm.review;
-            let view=load_state(tx)?.project()?;
-            let inviter=validate_review(review,&view)?;
-            let (encoded,hash,accepted):(String,String,String)=tx.query_row("SELECT review,review_hash,new_subject_signature FROM identity_pair_requests WHERE invite_id=?",[&review.invite_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            ensure!(encoded==serde_json::to_string(review)?&&hash==review.hash()?,"pair review differs from pending request");
-            ensure!(!accepted.is_empty()&&accepted==confirm.new_subject_signature,"joining identity has not confirmed this review");
-            crypto::verify_payload(&inviter.public_key,"identity-pair-review",&review.signing_bytes()?,&confirm.inviter_signature)?;
-            crypto::verify_payload(&review.new_member.public_key,"identity-pair-review",&review.signing_bytes()?,&confirm.new_subject_signature)?;
-            if let Some((old,issuer_sig,new_sig))=tx.query_row("SELECT review_hash,inviter_signature,new_subject_signature FROM identity_pair_reviews WHERE invite_id=?",[&review.invite_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
-                ensure!(old==hash&&issuer_sig==confirm.inviter_signature&&new_sig==confirm.new_subject_signature,"pairing is already confirmed with another review");
-            } else {
-                tx.execute("INSERT INTO identity_pair_reviews(invite_id,review,review_hash,inviter_signature,new_subject_signature,created_at_ms) VALUES(?,?,?,?,?,?)",params![review.invite_id,encoded,hash,confirm.inviter_signature,confirm.new_subject_signature,now_ms()])?;
-                tx.execute("UPDATE identity_invites SET used=1 WHERE invite_id=?",[&review.invite_id])?;
-            }
-            Ok(GrantProposal{review:review.clone(),inviter_signature:confirm.inviter_signature,new_subject_signature:confirm.new_subject_signature})
-        })
-    }
-
-    pub fn store_signed_grant(&mut self, event: super::GovernanceEvent) -> Result<NetworkState> {
-        self.retire_identity_readers(&event.network_id);
-        let super::GovernanceAction::Grant { member } = &event.action else {
-            bail!("pairing requires a grant")
-        };
-        let member = member.clone();
-        self.transaction(|tx|{
-            let mut stmt=tx.prepare("SELECT review,inviter_signature,new_subject_signature FROM identity_pair_reviews")?;
-            let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?;
-            let mut matching=None;
-            for row in rows {
-                let (encoded,inviter_signature,new_subject_signature)=row?;
-                let review:PairReview=serde_json::from_str(&encoded)?;
-                if event.network_id==review.network_id&&event.epoch==review.epoch&&event.issuer==review.inviter_subject_id&&event.parents==review.parents&&member==review.new_member {
-                    ensure!(matching.is_none(),"ambiguous confirmed pairing");
-                    matching=Some((review,inviter_signature,new_subject_signature));
-                }
-            }
-            let (review,issuer_sig,new_sig)=matching.context("grant does not match a confirmed pairing")?;
-            let mut state=load_state(tx)?;
-            let view=state.project()?;
-            let inviter=validate_review(&review,&view)?;
-            crypto::verify_payload(&inviter.public_key,"identity-pair-review",&review.signing_bytes()?,&issuer_sig)?;
-            crypto::verify_payload(&review.new_member.public_key,"identity-pair-review",&review.signing_bytes()?,&new_sig)?;
-            let receipt_id=format!("pair:{}",review.invite_id);
-            let event_hash=event.hash()?;
-            if let Some(previous)=tx.query_row("SELECT response FROM identity_requests WHERE request_id=?",[&receipt_id],|r|r.get::<_,String>(0)).optional()? {
-                ensure!(previous==event_hash,"pairing already completed with another grant");
-                return Ok(state);
-            }
-            state.append(event)?;
-            ensure!(state.project()?.authorize_member(&member.subject_id)?==member,"approved pairing permissions no longer apply");
-            save_state(tx,&state)?;
-            tx.execute("INSERT INTO identity_requests(request_id,subject_id,kind,response,created_at_ms) VALUES(?,?,'pair-granted',?,?)",params![receipt_id,member.subject_id,event_hash,now_ms()])?;
-            Ok(state)
-        })
-    }
-
-    pub fn pair_status(
-        &self,
-        invite_id: &str,
-        capability: &str,
-        subject_id: &str,
-    ) -> Result<Option<NetworkState>> {
-        super::validate_id(capability)?;
-        let conn = &self.connection;
-        let hash: String = conn.query_row(
-            "SELECT capability_hash FROM identity_invites WHERE invite_id=?",
-            [invite_id],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            crypto::digest(capability.as_bytes()) == hash,
-            "invalid invite capability"
-        );
-        let review: Option<String> = conn
-            .query_row(
-                "SELECT review FROM identity_pair_requests WHERE invite_id=?",
-                [invite_id],
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM invites WHERE status IS NULL AND expires_at_ms>?",
+                [now],
                 |r| r.get(0),
-            )
-            .optional()?;
-        let Some(encoded) = review else {
-            return Ok(None);
-        };
-        let review: PairReview = serde_json::from_str(&encoded)?;
-        ensure!(
-            review.new_member.subject_id == subject_id,
-            "pair status belongs to another identity"
-        );
-        let done: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM identity_requests WHERE request_id=?",
-            [format!("pair:{invite_id}")],
-            |r| r.get(0),
-        )?;
-        if done == 0 {
-            return Ok(None);
-        };
-        let state = load_state(conn)?;
-        let view = state.project()?;
-        ensure!(
-            view.network_id == review.network_id && view.epoch == review.epoch,
-            "pairing epoch is stale"
-        );
-        view.authorize_member(subject_id)?;
-        Ok(Some(state))
+            )?;
+            ensure!(pending < MAX_PENDING_INVITES, "too many pending invites");
+            tx.execute(
+                "INSERT INTO invites(join_id,invite_hash,issuer,epoch,expires_at_ms,record) VALUES(?,?,?,?,?,?)",
+                params![join_id, record.invite_hash, issuer, view.epoch, record.expires_at_ms, encoded],
+            )?;
+            Ok(())
+        })?;
+        Ok(join_id)
     }
+
+    /// Consumes the ticket for one device; the same request retried returns the same `join_id`.
+    pub fn join(&self, join: &Join, device: &str) -> Result<JoinRequest> {
+        ensure!(
+            join.public_key == device,
+            "join key differs from this session"
+        );
+        super::validate_name(&join.name)?;
+        super::validate_hash(&join.commit)?;
+        let secret: [u8; 32] = hex::decode(&join.secret)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .context("invalid ticket secret")?;
+        let invite_hash = vibeface_secure::join::invite_hash(&secret);
+        let kind = serde_json::to_value(join.kind)?;
+        let kind = kind.as_str().context("invalid device kind")?;
+        let now = now_ms();
+        self.transaction(|tx| {
+            let view = load_state(tx)?.project()?;
+            let row = load_request(tx, "invite_hash", &invite_hash)?
+                .context("ticket is unknown or already expired")?;
+            if row.status.is_some() {
+                ensure!(
+                    row.device_id.as_deref() == Some(device)
+                        && row.kind.as_deref() == Some(kind)
+                        && row.name.as_deref() == Some(join.name.as_str())
+                        && row.commit.as_deref() == Some(join.commit.as_str()),
+                    "ticket has already been used"
+                );
+                return row.view(&view, now);
+            }
+            ensure!(row.expires_at_ms > now && row.epoch == view.epoch, "ticket has expired");
+            ensure!(
+                view.cutoff(device).is_none() && view.member(device).is_err(),
+                "device is already a member or was revoked"
+            );
+            tx.execute(
+                "UPDATE invites SET device_id=?,kind=?,name=?,commit_hash=?,status='pending',expires_at_ms=? WHERE join_id=?",
+                params![device, kind, join.name, join.commit, now + TICKET_LIFETIME_MS, row.join_id],
+            )?;
+            load_request(tx, "join_id", &row.join_id)?
+                .context("join request vanished")?
+                .view(&view, now)
+        })
+    }
+
+    /// The joining device's view; `reveal` opens its commitment once the admin nonce is known.
+    pub fn join_status(
+        &self,
+        join_id: &str,
+        device: &str,
+        reveal: Option<&str>,
+    ) -> Result<JoinRequest> {
+        let now = now_ms();
+        self.transaction(|tx| {
+            let view = load_state(tx)?.project()?;
+            let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
+            ensure!(row.device_id.as_deref() == Some(device), "join request belongs to another device");
+            let current = row.view(&view, now)?;
+            if let Some(nonce) = reveal {
+                match (&row.joiner_nonce, current.status) {
+                    (Some(old), _) => ensure!(old == nonce, "a different nonce was already revealed"),
+                    (None, JoinStatus::Confirming) => {
+                        let matches = super::validate_hash(nonce).is_ok()
+                            && join_commit(device, nonce).ok().as_deref() == row.commit.as_deref();
+                        if matches {
+                            tx.execute("UPDATE invites SET joiner_nonce=? WHERE join_id=?", params![nonce, join_id])?;
+                        } else {
+                            tx.execute(
+                                "UPDATE invites SET status='rejected',reason='commitment_mismatch' WHERE join_id=?",
+                                [join_id],
+                            )?;
+                        }
+                    }
+                    (None, _) => bail!("nothing to reveal in this state"),
+                }
+                return load_request(tx, "join_id", join_id)?
+                    .context("join request vanished")?
+                    .view(&view, now);
+            }
+            Ok(current)
+        })
+    }
+
+    /// Requests a management device may approve; any manager may answer any request.
+    pub fn pending_joins(&self, admin: &str) -> Result<Vec<JoinRequest>> {
+        let view = load_state(&self.connection)?.project()?;
+        view.manager(admin)?;
+        let now = now_ms();
+        let mut statement = self.connection.prepare(
+            "SELECT join_id FROM invites WHERE status IN ('pending','confirming') AND expires_at_ms>? ORDER BY expires_at_ms",
+        )?;
+        let ids = statement
+            .query_map([now], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.iter()
+            .filter_map(|id| load_request(&self.connection, "join_id", id).transpose())
+            .map(|row| row?.view(&view, now))
+            .collect()
+    }
+
+    /// First approval step: this manager's fresh nonce, sent only after the commitment exists.
+    pub fn approve_nonce(&self, join_id: &str, admin: &str, nonce: &str) -> Result<JoinRequest> {
+        super::validate_hash(nonce)?;
+        let now = now_ms();
+        self.transaction(|tx| {
+            let view = load_state(tx)?.project()?;
+            view.manager(admin)?;
+            let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
+            let current = row.view(&view, now)?;
+            match current.status {
+                JoinStatus::Pending => {
+                    tx.execute(
+                        "UPDATE invites SET status='confirming',admin_id=?,admin_nonce=? WHERE join_id=?",
+                        params![admin, nonce, join_id],
+                    )?;
+                    load_request(tx, "join_id", join_id)?
+                        .context("join request vanished")?
+                        .view(&view, now)
+                }
+                JoinStatus::Confirming
+                    if row.admin_id.as_deref() == Some(admin)
+                        && row.admin_nonce.as_deref() == Some(nonce) =>
+                {
+                    Ok(current)
+                }
+                _ => bail!("join request is not waiting for this approval"),
+            }
+        })
+    }
+
+    /// Second approval step: the manager's signed grant for exactly the requested device.
+    pub fn approve_grant(
+        &self,
+        join_id: &str,
+        admin: &str,
+        event: GovernanceEvent,
+    ) -> Result<(JoinRequest, NetworkState)> {
+        let now = now_ms();
+        let hash = event.hash()?;
+        self.transaction(|tx| {
+            let mut state = load_state(tx)?;
+            let view = state.project()?;
+            let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
+            let current = row.view(&view, now)?;
+            if current.status == JoinStatus::Joined {
+                ensure!(
+                    row.grant_hash.as_deref() == Some(hash.as_str()),
+                    "join completed with another grant"
+                );
+                return Ok((current, state));
+            }
+            ensure!(
+                current.status == JoinStatus::Confirming && row.joiner_nonce.is_some(),
+                "the new device has not confirmed its short code yet"
+            );
+            ensure!(
+                event.issuer == admin && row.admin_id.as_deref() == Some(admin),
+                "only the manager that started the confirmation can approve it"
+            );
+            let GovernanceAction::Grant { member } = &event.action else {
+                bail!("approval requires a grant")
+            };
+            ensure!(
+                member.device_id == current.device_id
+                    && member.kind == current.kind
+                    && member.name == current.name,
+                "grant differs from the join request"
+            );
+            state.append(event)?;
+            ensure!(
+                state.project()?.member(&current.device_id).is_ok(),
+                "grant did not admit the device"
+            );
+            save_state(tx, &state)?;
+            tx.execute(
+                "UPDATE invites SET status='joined',grant_hash=? WHERE join_id=?",
+                params![hash, join_id],
+            )?;
+            let joined = load_request(tx, "join_id", join_id)?
+                .context("join request vanished")?
+                .view(&state.project()?, now)?;
+            Ok((joined, state))
+        })
+    }
+
+    /// Whether this Node holds the invite the join came through.
+    pub fn holds_join(&self, join_id: &str) -> Result<bool> {
+        Ok(load_request(&self.connection, "join_id", join_id)?.is_some())
+    }
+
+    pub fn reject_join(&self, join_id: &str, admin: &str) -> Result<JoinRequest> {
+        let now = now_ms();
+        self.transaction(|tx| {
+            let view = load_state(tx)?.project()?;
+            view.manager(admin)?;
+            let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
+            match row.view(&view, now)?.status {
+                JoinStatus::Pending | JoinStatus::Confirming => {
+                    tx.execute(
+                        "UPDATE invites SET status='rejected',reason='rejected' WHERE join_id=?",
+                        [join_id],
+                    )?;
+                }
+                JoinStatus::Rejected => {}
+                _ => bail!("join request can no longer be rejected"),
+            }
+            load_request(tx, "join_id", join_id)?
+                .context("join request vanished")?
+                .view(&view, now)
+        })
+    }
+}
+
+struct Row {
+    join_id: String,
+    epoch: u64,
+    expires_at_ms: i64,
+    device_id: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    commit: Option<String>,
+    status: Option<String>,
+    admin_id: Option<String>,
+    admin_nonce: Option<String>,
+    joiner_nonce: Option<String>,
+    reason: Option<String>,
+    grant_hash: Option<String>,
+}
+
+impl Row {
+    fn view(&self, view: &AuthorizationView, now: i64) -> Result<JoinRequest> {
+        let stored = self.status.as_deref().context("ticket has not been used")?;
+        let mut status: JoinStatus = serde_json::from_value(serde_json::json!(stored))?;
+        if matches!(status, JoinStatus::Pending | JoinStatus::Confirming)
+            && (self.expires_at_ms <= now || self.epoch != view.epoch)
+        {
+            status = JoinStatus::Expired;
+        }
+        Ok(JoinRequest {
+            join_id: self.join_id.clone(),
+            status,
+            network_id: view.network_id.clone(),
+            invite_id: self.join_id.clone(),
+            device_id: self.device_id.clone().context("join device missing")?,
+            kind: serde_json::from_value(serde_json::json!(self.kind))?,
+            name: self.name.clone().unwrap_or_default(),
+            commit: self.commit.clone().context("join commit missing")?,
+            admin_id: self.admin_id.clone(),
+            admin_nonce: self.admin_nonce.clone(),
+            joiner_nonce: self.joiner_nonce.clone(),
+            reason: self.reason.clone(),
+            expires_at_ms: self.expires_at_ms,
+        })
+    }
+}
+
+fn load_request(conn: &Connection, column: &str, value: &str) -> Result<Option<Row>> {
+    let column = match column {
+        "join_id" => "join_id",
+        "invite_hash" => "invite_hash",
+        _ => bail!("invalid join lookup"),
+    };
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT join_id,epoch,expires_at_ms,device_id,kind,name,commit_hash,status,admin_id,admin_nonce,joiner_nonce,reason,grant_hash FROM invites WHERE {column}=?"
+            ),
+            [value],
+            |r| {
+                Ok(Row {
+                    join_id: r.get(0)?,
+                    epoch: r.get(1)?,
+                    expires_at_ms: r.get(2)?,
+                    device_id: r.get(3)?,
+                    kind: r.get(4)?,
+                    name: r.get(5)?,
+                    commit: r.get(6)?,
+                    status: r.get(7)?,
+                    admin_id: r.get(8)?,
+                    admin_nonce: r.get(9)?,
+                    joiner_nonce: r.get(10)?,
+                    reason: r.get(11)?,
+                    grant_hash: r.get(12)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 fn load_state(conn: &Connection) -> Result<NetworkState> {
@@ -589,7 +515,7 @@ fn has_network_in(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row("SELECT COUNT(*) FROM networks", [], |r| r.get::<_, i64>(0))? > 0)
 }
 fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
-    super::validate_id(capability)?;
+    super::validate_hash(capability)?;
     ensure!(!has_network_in(conn)?, "network already installed");
     let expected: String = conn
         .query_row(
@@ -603,72 +529,6 @@ fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
         "invalid bootstrap capability"
     );
     Ok(())
-}
-fn validate_invite(payload: &InvitePayload, view: &AuthorizationView) -> Result<Member> {
-    ensure!(
-        payload.version == super::IDENTITY_VERSION
-            && payload.network_id == view.network_id
-            && payload.epoch == view.epoch,
-        "invitation network or epoch mismatch"
-    );
-    validate_text(&payload.invite_id, 64)?;
-    validate_text(&payload.request_id, 128)?;
-    super::validate_id(&payload.capability_hash)?;
-    super::validate_id(&payload.nonce)?;
-    ensure!(
-        payload.expires_at_ms > now_ms() && payload.expires_at_ms <= now_ms() + INVITE_TTL_MS,
-        "invalid invitation expiry"
-    );
-    let inviter = view.authorize_client(&payload.inviter_subject_id)?;
-    ensure!(inviter.manage, "management permission required");
-    ensure!(
-        !payload.manage,
-        "management-client changes require a root checkpoint"
-    );
-    Member {
-        subject_id: inviter.subject_id.clone(),
-        public_key: inviter.public_key.clone(),
-        kind: payload.new_kind,
-        name: "new device".into(),
-        node_roles: payload.node_roles.clone(),
-        manage: false,
-    }
-    .validate()?;
-    Ok(inviter)
-}
-fn validate_review(review: &PairReview, view: &AuthorizationView) -> Result<Member> {
-    ensure!(
-        review.version == super::IDENTITY_VERSION
-            && review.network_id == view.network_id
-            && review.epoch == view.epoch,
-        "pair review network or epoch mismatch"
-    );
-    ensure!(review.expires_at_ms > now_ms(), "pair review expired");
-    review.new_member.validate()?;
-    ensure!(
-        !review.new_member.manage && !view.revoked.contains(&review.new_member.subject_id),
-        "pairing cannot grant management or revoked identity"
-    );
-    let inviter = view.authorize_client(&review.inviter_subject_id)?;
-    ensure!(inviter.manage, "management permission required");
-    Ok(inviter)
-}
-fn invite_receipt(payload: &InvitePayload) -> Receipt {
-    Receipt {
-        request_id: payload.request_id.clone(),
-        subject_id: payload.inviter_subject_id.clone(),
-        kind: "invite".into(),
-    }
-}
-fn validate_text(value: &str, max: usize) -> Result<()> {
-    ensure!(
-        !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control),
-        "invalid text"
-    );
-    Ok(())
-}
-fn random_id() -> String {
-    random_hex(16)
 }
 
 #[cfg(test)]

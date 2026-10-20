@@ -26,22 +26,24 @@ impl LocalIdentity {
     fn key(&self) -> Result<SigningKey> {
         Ok(SigningKey::from_bytes(&decode32(&self.secret_key_hex)?))
     }
-    pub fn public_key_hex(&self) -> Result<String> {
+    /// The device's Ed25519 public key, which is also its `DeviceId`.
+    pub fn device_id(&self) -> Result<DeviceId> {
         Ok(hex::encode(self.key()?.verifying_key().as_bytes()))
     }
-    pub fn peer_id(&self) -> Result<PeerId> {
-        fingerprint(&self.public_key_hex()?)
-    }
-    pub fn network_id(&self) -> Result<NetworkId> {
-        self.peer_id()
-    }
-    pub fn certificate(&self, roles: Vec<NodeRole>) -> Result<NodeCertificate> {
-        Ok(NodeCertificate {
-            peer_id: self.peer_id()?,
-            public_key: self.public_key_hex()?,
-            roles,
-            revoked: false,
-        })
+    /// A Noise handshake whose per-session static key this device signs.
+    pub fn handshake(
+        &self,
+        initiator: bool,
+        expected_device_id: Option<String>,
+        context: &[u8],
+    ) -> Result<vibeface_secure::Handshake> {
+        let identity = vibeface_secure::Identity::from_secret_hex(&self.secret_key_hex)?;
+        Ok(vibeface_secure::Handshake::signed(
+            initiator,
+            &identity,
+            expected_device_id,
+            context,
+        )?)
     }
     pub fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
         Ok(
@@ -51,11 +53,11 @@ impl LocalIdentity {
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
-            event.author == self.peer_id()?,
+            event.author == self.device_id()?,
             "event author does not match local identity"
         );
-        event.parents.sort();
-        event.parents.dedup();
+        event.deps.sort();
+        event.deps.dedup();
         event.blobs.sort();
         event.blobs.dedup();
         validate_event_shape(&event)?;
@@ -83,71 +85,92 @@ impl LocalIdentity {
     }
     #[cfg(test)]
     pub fn fixture_network_id(&self) -> Result<String> {
-        self.fixture_root().network_id()
+        self.fixture_root().device_id()
     }
+    /// The client device in `sign_network_fixture`'s network.
+    #[cfg(test)]
+    pub fn fixture_admin(&self) -> Self {
+        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
+        admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
+        Self {
+            secret_key_hex: hex::encode(Sha256::digest(admin_seed)),
+        }
+    }
+    /// `body` with this client's signature, as a browser would send it.
+    #[cfg(test)]
+    pub fn attest(&self, network: &str, scope: &str, mut body: EventBody) -> Result<EventBody> {
+        let signature = self.sign_payload(
+            vibeface_secure::join::ATTESTATION_DOMAIN,
+            &attestation_payload(network, scope, &body)?,
+        )?;
+        let value = Some(Attestation {
+            device_id: self.device_id()?,
+            signature,
+        });
+        match &mut body {
+            EventBody::ConversationOwner { attestation, .. }
+            | EventBody::BotCreated { attestation, .. }
+            | EventBody::MessagePosted { attestation, .. }
+            | EventBody::WorkFinished { attestation, .. }
+            | EventBody::ApprovalAnswered { attestation, .. }
+            | EventBody::AutonomySet { attestation, .. }
+            | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
+            _ => anyhow::bail!("this event carries no device signature"),
+        }
+        Ok(body)
+    }
+    /// The fixture client's signature making `node` the first owner of conversation `scope`.
+    #[cfg(test)]
+    pub fn owner_fixture(&self, network: &str, scope: &str, node: &str) -> Result<FirstOwner> {
+        let body = EventBody::ConversationOwner {
+            scheduler_node: node.into(),
+            epoch: 1,
+            attestation: None,
+        };
+        let attestation = self
+            .fixture_admin()
+            .attest(network, scope, body)?
+            .attestation()
+            .cloned()
+            .context("signed owner")?;
+        Ok(FirstOwner {
+            scheduler_node: node.into(),
+            attestation,
+        })
+    }
+    /// A recovered network whose members are a fixture admin client and `nodes`.
     #[cfg(test)]
     pub fn sign_network_fixture(
         &self,
         revision: u64,
-        nodes: Vec<NodeCertificate>,
+        nodes: Vec<DeviceId>,
     ) -> Result<crate::identity::NetworkState> {
-        use crate::identity::{
-            Genesis, HistoricalNode, IdentityKind, Member, NetworkState, RootCheckpoint,
-        };
+        use crate::identity::{Genesis, IdentityKind, Member, NetworkState, RootCheckpoint};
 
-        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
-        admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
-        let admin_secret = Sha256::digest(admin_seed);
-        let admin = LocalIdentity {
-            secret_key_hex: hex::encode(admin_secret),
-        };
+        let admin = self.fixture_admin();
         let admin_member = Member::client(&admin, "fixture-admin", true)?;
         let root = self.fixture_root();
-        let genesis = Genesis::create(&root, vec![admin_member.clone()])?;
-        let history = nodes
-            .iter()
-            .map(|node| HistoricalNode {
-                subject_id: node.peer_id.clone(),
-                public_key: node.public_key.clone(),
-            })
-            .collect();
+        let genesis = Genesis::create(
+            &root,
+            admin_member.clone(),
+            Member::node(self, "fixture-node")?,
+        )?;
         let mut members = vec![admin_member];
-        for certificate in nodes.into_iter().filter(|certificate| !certificate.revoked) {
-            let peer_id = certificate.peer_id;
-            let public_key = certificate.public_key;
-            let mut roles = certificate.roles;
-            if roles
-                .iter()
-                .any(|role| matches!(role, NodeRole::Gateway | NodeRole::Scheduler))
-                && !roles.contains(&NodeRole::Replica)
-            {
-                roles.push(NodeRole::Replica);
-            }
-            roles.sort_by_key(node_role_key);
-            let member = Member {
-                subject_id: peer_id.clone(),
-                public_key,
-                kind: IdentityKind::Node,
-                name: format!("node-{peer_id}"),
-                node_roles: roles,
-                manage: false,
-            };
-            member.validate()?;
-            members.push(member);
+        for node in nodes {
+            let name = format!("node-{}", &node[..8]);
+            members.push(Member::new(&node, IdentityKind::Node, &name, false)?);
         }
         let mut state = NetworkState::new(genesis)?;
         let epoch = revision
             .checked_add(1)
             .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create_with_history(
-            &root, epoch, members, history,
-        )?)?;
+        state.recover(RootCheckpoint::create(&root, epoch, members)?)?;
         Ok(state)
     }
 }
 impl vibeface_secure::membership::MembershipSigner for LocalIdentity {
-    fn public_key_hex(&self) -> Result<String> {
-        LocalIdentity::public_key_hex(self)
+    fn device_id(&self) -> Result<String> {
+        LocalIdentity::device_id(self)
     }
 
     fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
@@ -164,9 +187,6 @@ pub fn random_hex(bytes: usize) -> String {
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-pub fn fingerprint(public_key: &str) -> Result<String> {
-    Ok(digest(&decode32(public_key)?))
-}
 fn decode32(value: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value).context("invalid hexadecimal key/hash")?;
     bytes
@@ -182,20 +202,14 @@ fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
     key.verify_strict(message, &signature)
         .context("invalid signature")
 }
-#[cfg(test)]
-fn node_role_key(role: &NodeRole) -> &'static str {
-    match role {
-        NodeRole::Gateway => "gateway",
-        NodeRole::Relay => "relay",
-        NodeRole::Replica => "replica",
-        NodeRole::Scheduler => "scheduler",
-    }
+/// Checks the event and its author's signature; the author's `DeviceId` is its public key.
+pub fn verify_signed_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
+    let body = check_event(network_id, event)?;
+    verify_event_signature(event, &body.author)?;
+    Ok(body)
 }
-pub fn verify_signed_event(
-    network_id: &str,
-    event: &SignedEvent,
-    public_key: &str,
-) -> Result<Event> {
+/// Every check except the signature: size, hash, canonical encoding, network and shape.
+pub fn check_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
     ensure!(
         event.canonical_body.len() <= MAX_EVENT_BYTES,
         "event too large"
@@ -213,17 +227,15 @@ pub fn verify_signed_event(
         body.network_id == network_id,
         "event belongs to another network"
     );
-    ensure!(
-        body.author == fingerprint(public_key)?,
-        "author Peer ID mismatch"
-    );
     validate_event_shape(&body)?;
+    Ok(body)
+}
+pub fn verify_event_signature(event: &SignedEvent, public_key: &str) -> Result<()> {
     verify(
         public_key,
         &event.signature,
         &domain_message(EVENT_DOMAIN, &event.hash),
-    )?;
-    Ok(body)
+    )
 }
 pub fn verify_payload(
     public_key: &str,
@@ -235,6 +247,66 @@ pub fn verify_payload(
         public_key, domain, payload, signature,
     )?)
 }
+/// What a client signs for `body` (its `attestation` left out) in one conversation.
+pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(body)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("attestation");
+    }
+    Ok(vibeface_secure::join::attestation_payload(
+        network_id,
+        scope_id,
+        &value.to_string(),
+    )?)
+}
+
+/// The user's own writes must carry their device signature; nothing else may carry one.
+enum UserSignature {
+    Required,
+    /// The user's settlement of an unverified work result.
+    Optional,
+    Forbidden,
+}
+
+fn validate_attestation(event: &Event) -> Result<()> {
+    let rule = match &event.body {
+        EventBody::MessagePosted {
+            role: Role::User, ..
+        }
+        | EventBody::ConversationOwner { .. }
+        | EventBody::BotCreated { .. }
+        | EventBody::ApprovalAnswered { .. }
+        | EventBody::AutonomySet { .. }
+        | EventBody::NotificationAcked { .. } => UserSignature::Required,
+        EventBody::WorkFinished {
+            outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
+            ..
+        } => UserSignature::Optional,
+        _ => UserSignature::Forbidden,
+    };
+    match (rule, event.body.attestation()) {
+        (UserSignature::Required, None) => {
+            anyhow::bail!("this write needs the user's device signature")
+        }
+        (UserSignature::Forbidden, Some(_)) => {
+            anyhow::bail!("only the user's own writes carry a device signature")
+        }
+        (_, None) => Ok(()),
+        _ => verify_attestation(&event.network_id, &event.scope_id, &event.body),
+    }
+}
+
+pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) -> Result<()> {
+    let attestation = body.attestation().context("missing device signature")?;
+    verify_payload(
+        &attestation.device_id,
+        vibeface_secure::join::ATTESTATION_DOMAIN,
+        &attestation_payload(network_id, scope_id, body)?,
+        &attestation.signature,
+    )
+    .context("the device signature does not match this write")
+}
+
 pub fn validate_event_shape(event: &Event) -> Result<()> {
     ensure!(event.version == WIRE_VERSION, "unsupported event version");
     ensure!(
@@ -244,66 +316,114 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
     decode32(&event.network_id)?;
     decode32(&event.author)?;
     ensure!(
-        event.sequence > 0 && event.sequence <= i64::MAX as u64,
+        event.seq > 0 && event.seq <= i64::MAX as u64,
         "invalid sequence"
     );
     ensure!(
-        (event.sequence == 1) == event.previous.is_none(),
+        (event.seq == 1) == event.prev.is_none(),
         "invalid predecessor"
     );
+    ensure!(event.created_at_ms >= 0, "invalid creation time");
     ensure!(
-        event.parents.len() <= 1024 && event.blobs.len() <= 128,
+        event.deps.len() <= 1024 && event.blobs.len() <= 128,
         "too many dependencies"
     );
     ensure!(
-        event.parents.windows(2).all(|w| w[0] < w[1]),
-        "parents must be sorted and unique"
+        event.deps.windows(2).all(|w| w[0] < w[1]),
+        "deps must be sorted and unique"
     );
     ensure!(
         event.blobs.windows(2).all(|w| w[0] < w[1]),
         "blobs must be sorted and unique"
     );
-    for hash in event.parents.iter().chain(event.previous.iter()) {
+    for hash in event.deps.iter().chain(event.prev.iter()) {
         decode32(hash)?;
     }
+    ensure!(
+        event
+            .prev
+            .as_ref()
+            .is_none_or(|prev| !event.deps.contains(prev)),
+        "prev is not a dependency on another author"
+    );
     for blob in &event.blobs {
         decode32(&blob.hash)?;
         ensure!(blob.size <= MAX_BLOB_BYTES as u64, "blob too large");
     }
-    if let EventBody::ContextCheckpoint { covered_heads, .. } = &event.body {
-        for hash in covered_heads {
-            ensure!(
-                event.parents.contains(hash),
-                "checkpoint head must be a parent"
-            );
+    let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
+    match &event.body {
+        EventBody::MessagePosted {
+            message_id,
+            role,
+            attachments,
+            report_results,
+            in_reply_to,
+            status,
+            ..
+        } => {
+            id(message_id)?;
+            match role {
+                Role::User => ensure!(
+                    report_results.is_some()
+                        && in_reply_to.is_none()
+                        && status.is_none()
+                        && *attachments == event.blobs,
+                    "a user message carries only its reporting choice and its signed attachments"
+                ),
+                Role::Assistant => {
+                    ensure!(
+                        report_results.is_none() && status.is_some() && attachments.is_empty(),
+                        "an assistant reply carries its turn status"
+                    );
+                    in_reply_to.as_deref().map(id).transpose()?;
+                }
+            }
         }
-    }
-    if let EventBody::AgentMessage { message } = &event.body {
-        vibeface_protocol::validate_id(&message.message_id).map_err(anyhow::Error::msg)?;
-        decode32(&message.target_node)?;
-        decode32(&message.origin_trigger)?;
-        ensure!(
-            event.parents.contains(&message.origin_trigger),
-            "agent origin must be a parent"
-        );
-        if message.kind == AgentMessageKind::Task {
-            ensure!(
-                message.in_reply_to.is_none() && !message.text.trim().is_empty(),
-                "agent task requires text and cannot reply to another task"
-            );
-        } else {
-            let reference = message
-                .in_reply_to
-                .as_ref()
-                .context("agent reply has no task reference")?;
-            decode32(reference)?;
-            ensure!(
-                event.parents.contains(reference),
-                "agent task reference must be a parent"
-            );
+        EventBody::ConversationOwner {
+            scheduler_node,
+            epoch,
+            ..
+        } => {
+            decode32(scheduler_node)?;
+            ensure!(*epoch > 0, "owner epoch starts at 1");
         }
+        EventBody::WorkDispatched {
+            work_id,
+            trigger,
+            dispatcher,
+            call_ref,
+            continues,
+            parent,
+            ..
+        } => {
+            id(work_id)?;
+            let (kind, trigger_id) = trigger.split_once(':').unwrap_or_default();
+            ensure!(
+                matches!(kind, "message" | "work" | "task"),
+                "invalid work trigger"
+            );
+            id(trigger_id)?;
+            id(call_ref)?;
+            decode32(dispatcher)?;
+            for work in continues.iter().chain(parent.iter()) {
+                id(work)?;
+            }
+        }
+        EventBody::WorkProgress { work_id, .. }
+        | EventBody::WorkFinished { work_id, .. }
+        | EventBody::ApprovalRequested { work_id, .. }
+        | EventBody::ApprovalAnswered { work_id, .. } => id(work_id)?,
+        EventBody::AutonomySet { version, .. } => {
+            ensure!(*version > 0, "autonomy version starts at 1")
+        }
+        EventBody::ContextCheckpoint { covers, .. } => {
+            for author in covers.keys() {
+                decode32(author)?;
+            }
+        }
+        _ => {}
     }
-    Ok(())
+    validate_attestation(event)
 }
 
 #[cfg(test)]
@@ -313,63 +433,28 @@ mod tests {
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let revoked = LocalIdentity::generate();
-        let mut revoked_certificate = revoked.certificate(vec![NodeRole::Relay])?;
-        revoked_certificate.revoked = true;
-        let state = owner.sign_network_fixture(
-            1,
-            vec![
-                owner.certificate(vec![NodeRole::Gateway])?,
-                revoked_certificate,
-            ],
-        )?;
+        let other_node = LocalIdentity::generate();
+        let state = owner.sign_network_fixture(1, vec![other_node.device_id()?])?;
         let view = state.project()?;
         assert_eq!(view.network_id, owner.fixture_network_id()?);
-        assert!(
-            view.authorize_node(&owner.peer_id()?, Some(NodeRole::Replica))
-                .is_ok()
-        );
-        assert!(view.authorize_node(&revoked.peer_id()?, None).is_err());
-        let all = owner.sign_network_fixture(
-            1,
-            vec![owner.certificate(vec![
-                NodeRole::Scheduler,
-                NodeRole::Relay,
-                NodeRole::Gateway,
-            ])?],
-        )?;
-        assert!(
-            all.project()?
-                .authorize_node(&owner.peer_id()?, Some(NodeRole::Scheduler))
-                .is_ok()
-        );
+        assert!(view.node(&other_node.device_id()?).is_ok());
+        assert!(view.node(&owner.device_id()?).is_err());
         let later = owner.sign_network_fixture(2, vec![])?;
         assert_eq!(state.genesis, later.genesis);
         let signed = owner.sign_payload("peer-request", b"challenge")?;
-        verify_payload(
-            &owner.public_key_hex()?,
-            "peer-request",
-            b"challenge",
-            &signed,
-        )?;
+        verify_payload(&owner.device_id()?, "peer-request", b"challenge", &signed)?;
         assert!(
-            verify_payload(
-                &owner.public_key_hex()?,
-                "peer-response",
-                b"challenge",
-                &signed
-            )
-            .is_err()
+            verify_payload(&owner.device_id()?, "peer-response", b"challenge", &signed).is_err()
         );
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
         let body = Event {
             version: 1,
             network_id: owner.fixture_network_id()?,
             scope_id: "c".into(),
-            author: owner.peer_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![],
+            author: owner.device_id()?,
+            seq: 1,
+            prev: None,
+            deps: vec![],
             created_at_ms: 0,
             body: EventBody::ConversationCreated {
                 title: "test".into(),
@@ -377,61 +462,95 @@ mod tests {
             blobs: vec![],
         };
         let event = owner.sign_event(body)?;
-        verify_signed_event(&view.network_id, &event, &owner.public_key_hex()?)?;
+        verify_signed_event(&view.network_id, &event)?;
         let mut bad = event.clone();
         bad.canonical_body.push(' ');
-        assert!(verify_signed_event(&view.network_id, &bad, &owner.public_key_hex()?).is_err());
-        assert!(verify_signed_event(&"0".repeat(64), &event, &owner.public_key_hex()?).is_err());
-        let other = LocalIdentity::generate();
-        assert!(verify_signed_event(&view.network_id, &event, &other.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&view.network_id, &bad).is_err());
+        assert!(verify_signed_event(&"0".repeat(64), &event).is_err());
+        let mut forged = event.clone();
+        forged.signature = LocalIdentity::generate().sign_payload("x", b"y")?;
+        assert!(verify_signed_event(&view.network_id, &forged).is_err());
         Ok(())
     }
 
     #[test]
-    fn agent_messages_bind_valid_ids_and_causal_references() -> Result<()> {
+    fn message_roles_and_log_links_are_part_of_the_signed_shape() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let origin = digest(b"origin");
-        let task = digest(b"task");
+        let message = |role, report_results, status| EventBody::MessagePosted {
+            message_id: "m-1".into(),
+            role,
+            text: "hi".into(),
+            attachments: vec![],
+            report_results,
+            in_reply_to: None,
+            status,
+            attestation: None,
+        };
+        let network = identity.fixture_network_id()?;
+        let client = identity.fixture_admin();
+        let signed_user = client.attest(
+            &network,
+            "conversation",
+            message(Role::User, Some(true), None),
+        )?;
         let mut event = Event {
             version: WIRE_VERSION,
-            network_id: identity.fixture_network_id()?,
+            network_id: network.clone(),
+            author: identity.device_id()?,
+            seq: 1,
+            prev: None,
+            deps: vec![digest(b"b"), digest(b"a"), digest(b"b")],
             scope_id: "conversation".into(),
-            author: identity.peer_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![origin.clone()],
             created_at_ms: 0,
-            body: EventBody::AgentMessage {
-                message: AgentMessage {
-                    message_id: "work-1".into(),
-                    target_node: identity.peer_id()?,
-                    origin_trigger: origin,
-                    in_reply_to: None,
-                    kind: AgentMessageKind::Task,
-                    text: "inspect the project".into(),
-                },
-            },
+            body: signed_user.clone(),
             blobs: vec![],
         };
         let signed = identity.sign_event(event.clone())?;
-        verify_signed_event(&event.network_id, &signed, &identity.public_key_hex()?)?;
-        let EventBody::AgentMessage { message } = &mut event.body else {
-            unreachable!()
-        };
-        message.kind = AgentMessageKind::Completed;
+        let verified = verify_signed_event(&event.network_id, &signed)?;
+        assert_eq!(verified.deps.len(), 2);
+        assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
+        // The Node cannot write the user's message alone, change it, or move it to another conversation.
+        event.body = message(Role::User, Some(true), None);
         assert!(identity.sign_event(event.clone()).is_err());
-        let EventBody::AgentMessage { message } = &mut event.body else {
-            unreachable!()
-        };
-        message.in_reply_to = Some(task.clone());
+        event.body = signed_user.clone();
+        if let EventBody::MessagePosted { text, .. } = &mut event.body {
+            *text = "rm -rf".into();
+        }
         assert!(identity.sign_event(event.clone()).is_err());
-        event.parents.push(task);
+        event.body = signed_user;
+        event.scope_id = "other".into();
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.scope_id = "conversation".into();
+        assert!(
+            client
+                .attest(
+                    &network,
+                    "conversation",
+                    message(Role::Assistant, None, Some(ReplyStatus::Stopped))
+                )
+                .is_ok_and(|body| identity
+                    .sign_event(Event {
+                        body,
+                        ..event.clone()
+                    })
+                    .is_err()),
+            "assistant replies carry no device signature"
+        );
+        event.body = message(Role::User, None, None);
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = message(Role::Assistant, None, None);
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = message(Role::Assistant, None, Some(ReplyStatus::Stopped));
         assert!(identity.sign_event(event.clone()).is_ok());
-        let EventBody::AgentMessage { message } = &mut event.body else {
-            unreachable!()
-        };
-        message.target_node = "not-a-device-key".into();
-        assert!(identity.sign_event(event).is_err());
+        event.seq = 2;
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.prev = Some(digest(b"a"));
+        assert!(
+            identity.sign_event(event.clone()).is_err(),
+            "prev must not repeat a dep"
+        );
+        event.prev = Some(digest(b"c"));
+        assert!(identity.sign_event(event).is_ok());
         Ok(())
     }
 }

@@ -38,11 +38,9 @@ impl Runtime {
     pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
         let view = self.membership_state().await?.project()?;
-        let peer = self.identity.peer_id()?;
-        let scheduler_available = self.config.roles.contains(&NodeRole::Scheduler)
-            && view
-                .authorize_node(&peer, Some(NodeRole::Scheduler))
-                .is_ok();
+        let peer = self.identity.device_id()?;
+        let scheduler_available =
+            self.config.roles.contains(&NodeRole::Scheduler) && view.node(&peer).is_ok();
         let defaults = json!({
             "workspace":self.data_dir.canonicalize()?.join("manager-workspace"),
             "cursor_sdk_bin":"cursor-sdk-bridge",
@@ -70,9 +68,6 @@ impl Runtime {
                 }) {
                     missing.push("Codex SDK dependencies");
                 }
-                if scheduler_available && self.native_socket().is_none() {
-                    missing.push("Codex App Server");
-                }
             }
         }
         let readiness = if settings.manager.is_none() {
@@ -99,24 +94,17 @@ impl Runtime {
         let _work = self.maintenance.enter()?;
         let view = self.membership_state().await?.project()?;
         if let Some(cookie) = local_cookie {
-            let peer_id = self.identity.peer_id()?;
-            let member = view.authorize_node(&peer_id, None)?;
-            ensure!(
-                member.public_key == self.identity.public_key_hex()?,
-                "local node membership key changed"
-            );
+            let device_id = self.identity.device_id()?;
+            view.node(&device_id)?;
             let session = self
                 .local_access
-                .session(cookie, &peer_id, &view.network_id)?;
+                .session(cookie, &device_id, &view.network_id)?;
             ensure!(
-                session.subject_id == subject,
+                session.device_id == subject,
                 "local session identity changed"
             );
         } else {
-            ensure!(
-                view.principal(subject)?.can_manage,
-                "management permission required"
-            );
+            view.manager(subject)?;
         }
         let directory = &self.data_dir;
         let default_workspace = directory.canonicalize()?.join("manager-workspace");
@@ -186,12 +174,6 @@ impl Runtime {
             .settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
-        if self.settings_snapshot().manager.is_some_and(|manager| {
-            manager.provider == "codex_sdk" || self.config.codex_socket.is_some()
-        }) && let Err(error) = self.ensure_native_client().await
-        {
-            tracing::warn!(%error, "native Codex is unavailable after settings change");
-        }
         self.schedule_wakeup.notify_one();
         self.node_settings().await
     }

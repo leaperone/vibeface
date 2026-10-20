@@ -1,100 +1,12 @@
 use super::*;
+use crate::work::{DispatchState, WorkState};
 
 const ARTIFACT_PAGE: usize = 65_536;
+/// Raw bytes per upload request, well inside the client channel's message limit.
+const UPLOAD_CHUNK: usize = 1024 * 1024;
 
-pub(super) fn pending_requests(
-    snapshot: &Value,
-    native: Option<&str>,
-    turn: Option<&str>,
-) -> Vec<Value> {
-    let (Some(native), Some(turn)) = (native, turn) else {
-        return Vec::new();
-    };
-    snapshot["pending_requests"].as_array().into_iter().flatten()
-        .filter(|request| request["params"]["threadId"].as_str() == Some(native))
-        .filter(|request| request["params"]["turnId"].as_str() == Some(turn))
-        .filter(|request| serde_json::from_value::<vibeface_protocol::RpcId>(request["id"].clone()).is_ok())
-        .map(|request| {
-            let method = request["method"].as_str().unwrap_or("request");
-            let params = &request["params"];
-            let mut projected = json!({"request_id":request["id"],"kind":method,"text":request_text(method,params)});
-            // Structured copies of the text lines so the web can lay them out.
-            if let Some(reason) = params["reason"].as_str().filter(|reason| !reason.trim().is_empty()) {
-                projected["reason"] = json!(reason);
-            }
-            if let Some(command) = request_command(params) {
-                projected["command"] = json!(command);
-            }
-            if let Some(cwd) = params["cwd"].as_str().or(params["grantRoot"].as_str()) {
-                projected["cwd"] = json!(cwd);
-            }
-            if let Some(changes) = params["changes"].as_object() {
-                projected["files"] = json!(changes.keys().collect::<Vec<_>>());
-            }
-            if matches!(method, "item/commandExecution/requestApproval" | "item/fileChange/requestApproval") {
-                let decisions = request["params"]["availableDecisions"].as_array();
-                let choices = [("批准一次", "accept"), ("拒绝", "decline"), ("取消本轮", "cancel")]
-                    .into_iter()
-                    .filter(|(_, decision)| decisions.is_none_or(|allowed| allowed.iter().any(|value| value.as_str() == Some(*decision))))
-                    .map(|(label, decision)| json!({"label":label,"response":{"decision":decision}}))
-                    .collect::<Vec<_>>();
-                projected["choices"] = json!(choices);
-            }
-            if method == "item/tool/requestUserInput"
-                && let Some(questions) = request["params"]["questions"].as_array()
-            {
-                projected["questions"] = json!(questions.iter().filter(|question|question["id"].is_string() && question["question"].is_string() && question["header"].is_string()).map(|question|json!({"id":question["id"],"header":question["header"],"question":question["question"],"is_secret":question["isSecret"].as_bool().unwrap_or(false),"options":question["options"].as_array().into_iter().flatten().filter(|option|option["label"].is_string()).map(|option|json!({"label":option["label"],"description":option["description"].as_str()})).collect::<Vec<_>>()})).collect::<Vec<_>>());
-            }
-            projected
-        }).collect()
-}
-
-pub(super) fn request_command(params: &Value) -> Option<String> {
-    params["command"].as_str().map(str::to_owned).or_else(|| {
-        params["command"].as_array().map(|command| {
-            command
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-    })
-}
-
-fn request_text(method: &str, params: &Value) -> String {
-    let mut lines = vec![match method {
-        "item/commandExecution/requestApproval" => "原生 Agent请求运行命令。".to_owned(),
-        "item/fileChange/requestApproval" => "原生 Agent请求修改文件。".to_owned(),
-        "item/tool/requestUserInput" => "原生 Agent需要你补充信息。".to_owned(),
-        _ => return "原生 Agent发来暂不支持的请求，请到执行设备处理。".into(),
-    }];
-    if let Some(reason) = params["reason"]
-        .as_str()
-        .filter(|reason| !reason.trim().is_empty())
-    {
-        lines.push(reason.into());
-    }
-    if method == "item/commandExecution/requestApproval" {
-        if let Some(command) = request_command(params) {
-            lines.push(format!("命令：{command}"));
-        }
-        if let Some(cwd) = params["cwd"].as_str() {
-            lines.push(format!("目录：{cwd}"));
-        }
-    }
-    if method == "item/fileChange/requestApproval" {
-        if let Some(root) = params["grantRoot"].as_str() {
-            lines.push(format!("允许修改的目录：{root}"));
-        }
-        if let Some(changes) = params["changes"].as_object() {
-            lines.push(format!(
-                "文件：{}",
-                changes.keys().cloned().collect::<Vec<_>>().join("、")
-            ));
-        }
-    }
-    lines.join("\n")
-}
+/// Raw pages for downloads; base64 of 512 KiB stays under one forwarded frame.
+const BINARY_PAGE: usize = 512 * 1024;
 
 fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Value> {
     ensure!(
@@ -117,123 +29,33 @@ fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Va
     )
 }
 
-fn native_cache_key(scope: &str, target: &str) -> String {
-    format!(
-        "native-snapshot:v1:{}",
-        crypto::digest(&serde_json::to_vec(&(scope, target)).expect("string tuple serializes"))
-    )
-}
-
-fn remote_native_sessions(reply: &Value, scope: &str, target: &str) -> Result<Vec<Value>> {
-    let sessions = reply["native_sessions"]
-        .as_array()
-        .context("native observation response is invalid")?;
-    for work in sessions {
-        ensure!(
-            work["conversation_id"] == scope
-                && work["target_node"] == target
-                && work["work_id"].as_str().is_some_and(|id| !id.is_empty())
-                && work["thread_id"].as_str().is_some_and(|id| !id.is_empty()),
-            "native observation identity mismatch"
-        );
-    }
-    Ok(sessions.clone())
-}
-
-fn mark_native_freshness(work: &mut Value, cached: bool) {
-    work["freshness"] = json!(if cached { "cached" } else { "observed" });
-    work["can_control"] = json!(
-        !cached
-            && work["can_control"].as_bool() == Some(true)
-            && matches!(work["state"].as_str(), Some("running" | "waiting"))
-    );
-    if cached
-        && !matches!(
-            work["state"].as_str(),
-            Some("completed" | "failed" | "interrupted")
-        )
-    {
-        work["state"] = json!("unknown");
-    }
-}
-
-fn native_pending_check(work: &Value) -> Value {
-    json!({"check_id":format!("native:{}",work["work_id"].as_str().unwrap_or_default()),"kind":"native_turn",
-        "conversation_id":work["conversation_id"],"target_node":work["target_node"],"trigger":work["origin_trigger"],
-        "attempt_id":work["attempt_id"],"work_id":work["work_id"],"thread_id":work["thread_id"],"turn_id":work["turn_id"],
-        "detail":work["detail"],"freshness":work["freshness"]})
-}
-
-fn remote_native_projection(
-    store: &mut Store,
-    network: &str,
-    scope: &str,
-    target: &str,
-    reply: Result<Value>,
-) -> Result<Vec<Value>> {
-    let key = native_cache_key(scope, target);
-    let (mut sessions, cached) = match reply.and_then(|reply| {
-        let sessions = remote_native_sessions(&reply, scope, target)?;
-        ensure!(
-            sessions
-                .iter()
-                .all(|work| work["freshness"] == "observed" && work["can_control"].is_boolean()),
-            "native observation control metadata is invalid"
-        );
-        Ok(sessions)
-    }) {
-        Ok(sessions) => {
-            let snapshot =
-                json!({"conversation_id":scope,"target_node":target,"native_sessions":sessions});
-            if store.local_value(network, &key)?.as_ref() != Some(&snapshot) {
-                store.local_set(network, &key, &snapshot)?;
-            }
-            (sessions, false)
-        }
-        Err(error) => {
-            tracing::debug!(network,scope,target,%error,"native observation unavailable; preserving its last authenticated snapshot");
-            let Some(snapshot) = store.local_value(network, &key)? else {
-                return Ok(Vec::new());
-            };
-            ensure!(
-                snapshot["conversation_id"] == scope && snapshot["target_node"] == target,
-                "cached native observation identity mismatch"
-            );
-            (remote_native_sessions(&snapshot, scope, target)?, true)
-        }
-    };
-    for work in &mut sessions {
-        mark_native_freshness(work, cached);
-    }
-    Ok(sessions)
-}
-
 impl Runtime {
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "artifact access requires the user");
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         let hash = field(input, "blob_hash")?;
-        ensure!(
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "invalid artifact hash"
-        );
-        let store = self.store.lock().await;
-        let context = store.context(&access.network_id, scope, &[])?;
-        let reference = context
-            .events
-            .iter()
-            .filter(|event| event.scope_id == scope)
-            .flat_map(|event| &event.blobs)
-            .find(|blob| blob.hash == hash)
-            .context("artifact is not referenced by this conversation")?;
-        let bytes = store
-            .get_blob(&access.network_id, hash)?
-            .context("artifact content is pending synchronization")?;
-        ensure!(
-            reference.size == bytes.len() as u64 && crypto::digest(&bytes) == hash,
-            "artifact content does not match its signed reference"
-        );
+        if input["binary"] == true {
+            use base64::Engine as _;
+            let offset = input["offset"].as_u64().unwrap_or(0);
+            let (size, bytes) = self.store.lock().await.read_blob_range(
+                &access.network_id,
+                scope,
+                hash,
+                offset,
+                BINARY_PAGE,
+            )?;
+            let start = offset.min(size);
+            let end = start + bytes.len() as u64;
+            return Ok(json!({"blob_hash":hash,"offset":start,"size":size,
+                "next_offset":(end < size).then_some(end),
+                "data":base64::engine::general_purpose::STANDARD.encode(&bytes)}));
+        }
+        let (_, bytes) = self
+            .store
+            .lock()
+            .await
+            .read_blob(&access.network_id, scope, hash)?;
         artifact_page(
             hash,
             &bytes,
@@ -241,95 +63,75 @@ impl Runtime {
             input["limit"].as_u64().unwrap_or(ARTIFACT_PAGE as u64),
         )
     }
-}
 
-impl Runtime {
-    pub(super) async fn agent_task_projections(
-        &self,
-        network: &str,
-        scope: &str,
-    ) -> Result<Vec<Value>> {
-        let store = self.store.lock().await;
-        let context = store.context(network, scope, &[])?;
-        let mut tasks = Vec::new();
-        for event in context
-            .events
-            .iter()
-            .filter(|event| event.scope_id == scope)
-        {
-            let EventBody::AgentMessage { message } = &event.body else {
-                continue;
-            };
-            if message.kind != AgentMessageKind::Task {
-                continue;
-            }
-            let task_ref = crypto::digest(&serde_json::to_vec(event)?);
-            let status = store.agent_task_status(network, scope, &task_ref)?;
-            tasks.push(json!({"task_ref":task_ref,"source_node":event.author,"target_node":message.target_node,
-                "origin_trigger":message.origin_trigger,"state":status["state"],"text":message.text,
-                "detail":status["result"]["text"].as_str().unwrap_or("")}));
-        }
-        Ok(tasks)
-    }
-
-    pub(super) async fn native_session_projections(
-        &self,
-        network: &str,
-        scope: &str,
-    ) -> Result<Vec<Value>> {
-        let local = self.identity.peer_id()?;
-        let mut sessions = self.native_status(network, scope).await?["native_sessions"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        for work in &mut sessions {
-            mark_native_freshness(work, false);
-        }
-        let targets = {
-            let store = self.store.lock().await;
-            store
-                .context(network, scope, &[])?
-                .events
-                .into_iter()
-                .filter_map(|event| match event.body {
-                    EventBody::AgentMessage { message }
-                        if message.kind == AgentMessageKind::Task =>
-                    {
-                        Some(message.target_node)
-                    }
-                    EventBody::MessagePosted { scheduler_node, .. } => scheduler_node,
-                    _ => None,
-                })
-                .filter(|target| {
-                    target != &local
-                        && store
-                            .authorize_node(network, target, Some(NodeRole::Scheduler))
-                            .is_ok()
-                })
-                .collect::<BTreeSet<_>>()
+    /// One chunk of an attachment the user is sending. Bytes synced to disk survive a restart;
+    /// the reply's offset says where the client continues.
+    pub(super) async fn upload_attachment(&self, access: &Access, input: &Value) -> Result<Value> {
+        use base64::Engine as _;
+        use std::io::{Seek as _, Write as _};
+        ensure!(access.human, "only the user sends attachments");
+        let scope = field(input, "conversation_id")?;
+        self.require_scope(access, scope).await?;
+        let network = &access.network_id;
+        let blob = BlobRef {
+            hash: field(input, "hash")?.into(),
+            size: input["size"].as_u64().context("size is required")?,
         };
-        for target in targets {
-            let result = tokio::time::timeout(
-                Duration::from_secs(3),
-                self.read_peer(
-                    network,
-                    &target,
-                    json!({"type":"native_status","conversation_id":scope}),
-                ),
-            )
-            .await;
-            let reply = result
-                .context("native observation timed out")
-                .and_then(|result| result);
-            sessions.extend(remote_native_projection(
-                &mut *self.store.lock().await,
-                network,
-                scope,
-                &target,
-                reply,
-            )?);
+        ensure!(
+            blob.size > 0 && blob.size as usize <= MAX_BLOB_BYTES,
+            "attachment must be 1 byte to 64 MiB"
+        );
+        let mut store = self.store.lock().await;
+        if store.has_blob(&blob)? {
+            return Ok(json!({"offset":blob.size,"complete":true}));
         }
-        Ok(sessions)
+        let (part, target) = (
+            store.partial_blob_file(&blob.hash)?,
+            store.blob_file(&blob.hash)?,
+        );
+        let committed = store.committed_offset(network, &blob.hash)?;
+        let offset = input["offset"].as_u64().context("offset is required")?;
+        if offset != committed {
+            return Ok(json!({"offset":committed,"complete":false}));
+        }
+        // A 1 MiB chunk is longer than `field` allows for ordinary text.
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(input["data"].as_str().context("data is required")?)
+            .context("attachment data must be base64")?;
+        ensure!(
+            data.len() <= UPLOAD_CHUNK && committed + data.len() as u64 <= blob.size,
+            "attachment chunk does not fit"
+        );
+        let dir = part.parent().context("partial directory")?;
+        std::fs::create_dir_all(dir)?;
+        if !part.exists() {
+            super::peers::staging_room(dir, blob.size)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)?;
+        file.set_len(committed)?;
+        file.seek(std::io::SeekFrom::Start(committed))?;
+        file.write_all(&data)?;
+        file.sync_data()?;
+        let offset = committed + data.len() as u64;
+        store.commit_offset(network, &blob.hash, Some(offset))?;
+        if offset < blob.size {
+            return Ok(json!({"offset":offset,"complete":false}));
+        }
+        drop(file);
+        // ponytail: hashes the whole file under the store lock once per attachment (<= 64 MiB).
+        if crate::crypto::digest(&std::fs::read(&part)?) != blob.hash {
+            let _ = std::fs::remove_file(&part);
+            store.commit_offset(network, &blob.hash, None)?;
+            bail!("attachment failed its hash check; send it again");
+        }
+        std::fs::create_dir_all(target.parent().context("blob directory")?)?;
+        std::fs::rename(&part, &target)?;
+        store.commit_offset(network, &blob.hash, None)?;
+        Ok(json!({"offset":offset,"complete":true}))
     }
 
     pub(super) async fn conversation_snapshot(
@@ -340,236 +142,161 @@ impl Runtime {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
-        let (jobs, mut pending_checks) = self.scheduler_snapshot_jobs(network, scope).await?;
-        let agent_tasks = self.agent_task_projections(network, scope).await?;
-        let native_sessions = self.native_session_projections(network, scope).await?;
-        pending_checks.extend(
-            native_sessions
-                .iter()
-                .filter(|work| work["state"] == "unknown")
-                .map(native_pending_check),
-        );
+        let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
         let store = self.store.lock().await;
-        let context = store.context(network, scope, &heads(input)?)?;
-        let mut targets = jobs
+        let mut pending_checks = checks
             .iter()
-            .filter_map(|job| job["target_node"].as_str().map(String::from))
-            .collect::<BTreeSet<_>>();
-        for task in &agent_tasks {
-            if let Some(target) = task["target_node"].as_str() {
-                targets.insert(target.into());
+            .map(|check| {
+                let mut value = json!(check);
+                value["kind"] = json!("manager_process");
+                value
+            })
+            .collect::<Vec<_>>();
+        let records = store
+            .work_records(network)?
+            .into_iter()
+            .filter(|record| record.spec.conversation == scope)
+            .map(|record| (record.spec.work_id.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let local = self.identity.device_id()?;
+        let stops = store
+            .stop_requests(network)?
+            .into_iter()
+            .map(|stop| (stop.work_id.clone(), stop))
+            .collect::<BTreeMap<_, _>>();
+        let mut works = Vec::new();
+        let mut remote_forms = Vec::new();
+        let unverified: BTreeSet<_> = store
+            .works(network, scope)?
+            .into_iter()
+            .filter(|work| work.outcome == Some(WorkOutcome::Unverified))
+            .map(|work| crate::scheduling::task_trigger(&work.work_id))
+            .collect();
+        // One card per work: an agent task's coordination check is answered by its work card.
+        pending_checks
+            .retain(|check| !unverified.contains(check["trigger"].as_str().unwrap_or_default()));
+        for work in store.works(network, scope)? {
+            let mut value = json!(work);
+            let record = records.get(&work.work_id);
+            // Answer forms come from the target's journal; another target is asked below.
+            if let Some(WorkState::WaitingApproval { approvals, .. }) = record.map(|r| &r.state) {
+                for approval in value["open_approvals"].as_array_mut().into_iter().flatten() {
+                    if let Some(pending) = approvals
+                        .iter()
+                        .find(|p| approval["request_id"] == p.request_id)
+                    {
+                        approval["form"] = executor::request_form(&pending.method, &pending.params);
+                        approval["answering"] = json!(pending.answering);
+                    }
+                }
+            } else if work.target_node != local && !work.open_approvals.is_empty() {
+                remote_forms.push((works.len(), work.target_node.clone(), work.work_id.clone()));
             }
-            if let Some(source) = task["source_node"].as_str() {
-                targets.insert(source.into());
+            value["state"] = match record {
+                // An agent task runs as its device's coordination turn, without Codex phases.
+                _ if work.executor == Executor::Agent && work.outcome.is_none() => json!("running"),
+                Some(record) => json!(record.state.name()),
+                // Another device runs it: its progress events say where it is.
+                // `Started` is written when the native turn starts, so it already means running.
+                None => json!(match (work.outcome, work.phase) {
+                    (Some(_), _) => "finished",
+                    (None, _) if !work.open_approvals.is_empty() => "waiting_approval",
+                    (None, Some(WorkPhase::Interrupting)) => "interrupting",
+                    (None, Some(_)) => "running",
+                    (None, None) => "accepted",
+                }),
+            };
+            if work.outcome == Some(WorkOutcome::Unverified) {
+                value["state"] = json!("unverified");
+                let (detail, probe) = match record.map(|r| &r.state) {
+                    Some(WorkState::Unverified {
+                        evidence, probe, ..
+                    }) => (evidence.clone(), *probe),
+                    _ => (work.failure_reason.clone().unwrap_or_default(), false),
+                };
+                pending_checks.push(
+                    json!({"check_id":format!("work:{}",work.work_id),"kind":"work",
+                    "conversation_id":scope,"work_id":work.work_id,"target_node":work.target_node,
+                    "detail":detail,"probe":probe}),
+                );
             }
+            if let Some(stop) = stops.get(&work.work_id) {
+                value["stop"] =
+                    json!({"waiting_for_device":!stop.timed_out,"timed_out":stop.timed_out});
+            }
+            works.push(value);
         }
+        // Dispatches another device has not taken yet show as work waiting for it.
+        for dispatch in store.dispatches(network)? {
+            let spec = &dispatch.spec;
+            if spec.conversation != scope
+                || works.iter().any(|w| w["work_id"] == spec.work_id.as_str())
+            {
+                continue;
+            }
+            let (state, reason) = match &dispatch.state {
+                DispatchState::Pending => ("waiting_for_device", None),
+                DispatchState::Accepted => ("accepted", None),
+                DispatchState::Rejected { reason } => ("rejected", Some(reason.clone())),
+            };
+            works.push(json!({"work_id":spec.work_id,"conversation_id":scope,"target_node":spec.target,
+                "trigger":spec.trigger,"dispatcher":spec.dispatcher,"executor":spec.executor,"cwd":spec.cwd,
+                "prompt":spec.prompt,"phase":null,"summary":"","thread_id":null,"turn_id":null,"outcome":null,
+                "result_text":"","failure_reason":reason,"open_approvals":[],"answered_approvals":[],"state":state}));
+        }
+        let conversation = store.conversation(network, scope)?;
+        let bot = store.bot_for_conversation(network, scope)?;
         let mut messages = Vec::new();
         for message in store.messages(network, scope)? {
-            let mut projected = json!(message);
-            let envelope = store
-                .event(network, &message.event_hash)?
-                .context("message event is missing")?;
-            let event = store.verify_event(network, &envelope)?;
-            projected["blobs"] = json!(event.blobs);
-            messages.push(projected);
-        }
-        let autonomy = match store.conversation_autonomy(network, scope) {
-            Ok(policy) => {
-                json!({"mode":policy.mode,"version":policy.version,"scheduler_node":policy.target_node})
+            let mut value = json!(message);
+            let attachments = store.event_blobs(network, &message.event_hash)?;
+            if !attachments.is_empty() {
+                value["blobs"] = json!(attachments);
             }
-            Err(error) => json!({"mode":"off","version":null,"error":error.to_string()}),
-        };
-        targets.retain(|target| store.authorize_node(network, target, None).is_ok());
+            messages.push(value);
+        }
+        let autonomy = store.autonomy(network, scope)?;
+        drop(store);
+        for (index, target, work_id) in remote_forms {
+            let request = self.peer_request(
+                network,
+                &target,
+                json!({"type":"approval_forms","work_id":work_id}),
+            );
+            let Ok(Ok(reply)) = tokio::time::timeout(Duration::from_secs(3), request).await else {
+                continue;
+            };
+            for approval in works[index]["open_approvals"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                if let Some(remote) = reply["approvals"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|remote| remote["request_id"] == approval["request_id"])
+                {
+                    approval["form"] = remote["form"].clone();
+                    approval["answering"] = remote["answering"].clone();
+                }
+            }
+        }
         let settings = self.settings_snapshot();
         let manager = settings.manager.as_ref();
-        let remote_manager = jobs
-            .iter()
-            .rev()
-            .find(|job| job["manager"].is_object())
-            .map(|job| job["manager"].clone());
-        let metadata = remote_manager.unwrap_or_else(||json!({"provider":manager.map(|manager|&manager.provider),
-            "model":manager.map(|manager|&manager.model),"capabilities":manager.and_then(|manager| match manager.provider.as_str() {
-                "codex_sdk"=>Some(crate::manager::ManagerKind::CodexSdk.capabilities()),
-                "cursor_sdk"=>Some(crate::manager::ManagerKind::CursorSdk.capabilities()),_=>None})}));
-        let current_heads = store.heads(network, scope)?;
-        let needs_sync = !store
-            .missing_dependencies(network, &current_heads)?
-            .is_complete();
-        let snapshot = json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),
-            "messages":messages,"autonomy":autonomy,"agent_tasks":agent_tasks,"native_sessions":native_sessions,"heads":context.heads,"missing":context.missing,
+        Ok(json!({
+            "conversation":conversation,
+            "bot":bot,
+            "messages":messages,
+            "works":works,
+            "autonomy":autonomy,
             "pending_checks":pending_checks,
-            "facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"]},"observation_targets":targets});
-        drop(store);
-        if needs_sync {
-            let _ = self.request_scope_sync(network, scope, current_heads).await;
-        }
-        Ok(snapshot)
-    }
-
-    pub(super) async fn cancel_task_rpc(
-        self: &Arc<Self>,
-        access: &Access,
-        input: &Value,
-    ) -> Result<Value> {
-        ensure!(
-            access.human,
-            "only the user cancels a task through this endpoint"
-        );
-        let scope = field(input, "conversation_id")?;
-        let task_ref = field(input, "task_ref")?;
-        self.require_scope(access, scope).await?;
-        let status =
-            self.store
-                .lock()
-                .await
-                .agent_task_status(&access.network_id, scope, task_ref)?;
-        self.cancel_known_task(&access.network_id, scope, task_ref, &status)
-            .await
-    }
-
-    pub(super) async fn cancel_known_task(
-        self: &Arc<Self>,
-        network: &str,
-        scope: &str,
-        task_ref: &str,
-        status: &Value,
-    ) -> Result<Value> {
-        let target = field(&status["task"], "target_node")?;
-        let source = field(status, "source_node")?;
-        let local = self.identity.peer_id()?;
-        if target == local {
-            self.cancel_agent_task(network, scope, task_ref, source)
-                .await
-        } else {
-            ensure!(
-                source == local,
-                "cancel this task through its source or target device"
-            );
-            self.peer_request(
-                network,
-                target,
-                json!({"type":"cancel_agent_task","conversation_id":scope,"task_ref":task_ref}),
-            )
-            .await
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn approval_requests_carry_structured_fields() {
-        let snapshot = json!({"pending_requests":[
-            {"id":1,"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"u",
-                "command":["npm","test"],"cwd":"/p","reason":"run tests","availableDecisions":["accept","decline"]}},
-            {"id":2,"method":"item/fileChange/requestApproval","params":{"threadId":"t","turnId":"u",
-                "grantRoot":"/p","changes":{"a.ts":{}}}}]});
-        let requests = pending_requests(&snapshot, Some("t"), Some("u"));
-        assert_eq!(requests[0]["command"], "npm test");
-        assert_eq!(requests[0]["cwd"], "/p");
-        assert_eq!(requests[0]["reason"], "run tests");
-        assert_eq!(requests[0]["choices"].as_array().map(Vec::len), Some(2));
-        assert_eq!(requests[1]["files"], json!(["a.ts"]));
-        assert_eq!(requests[1]["cwd"], "/p");
-    }
-
-    #[test]
-    fn remote_native_snapshot_survives_reopen_and_unavailable_reads_without_controls() -> Result<()>
-    {
-        let dir = crate::runtime::tests::fixture()?;
-        let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
-        let mut store = Store::open(dir.join("node.sqlite3"))?;
-        store.install_trust_bundle(
-            &network,
-            &identity.sign_network_fixture(
-                1,
-                vec![identity.certificate(vec![NodeRole::Replica, NodeRole::Scheduler])?],
-            )?,
-        )?;
-        let session = json!({"conversation_id":"chat","target_node":"remote","work_id":"work",
-            "task_ref":"task","thread_id":"thread","turn_id":"turn","state":"waiting","detail":"original work",
-            "freshness":"observed","can_control":true,
-            "pending_requests":[{"request_id":7,"kind":"item/commandExecution/requestApproval","text":"confirm the original command",
-                "choices":[{"label":"拒绝","response":{"decision":"decline"}}]}]});
-        let live = remote_native_projection(
-            &mut store,
-            &network,
-            "chat",
-            "remote",
-            Ok(json!({"native_sessions":[session]})),
-        )?;
-        assert_eq!(live[0]["freshness"], "observed");
-        assert_eq!(live[0]["can_control"], true);
-        assert_eq!(live[0]["pending_requests"][0]["request_id"], 7);
-        drop(store);
-        let mut store = Store::open(dir.join("node.sqlite3"))?;
-        let cached = remote_native_projection(
-            &mut store,
-            &network,
-            "chat",
-            "remote",
-            Err(anyhow::anyhow!("peer unavailable")),
-        )?;
-        assert_eq!(cached.len(), 1);
-        assert_eq!(cached[0]["work_id"], "work");
-        assert_eq!(cached[0]["thread_id"], "thread");
-        assert_eq!(cached[0]["turn_id"], "turn");
-        assert_eq!(cached[0]["freshness"], "cached");
-        assert_eq!(cached[0]["can_control"], false);
-        assert_eq!(cached[0]["state"], "unknown");
-        assert_eq!(cached[0]["pending_requests"], session["pending_requests"]);
-        let wrong_scope = json!({"native_sessions":[{"conversation_id":"other","target_node":"remote","work_id":"foreign","thread_id":"foreign"}]});
-        assert_eq!(
-            remote_native_projection(&mut store, &network, "chat", "remote", Ok(wrong_scope))?[0]["work_id"],
-            "work"
-        );
-        assert!(
-            remote_native_projection(
-                &mut store,
-                &network,
-                "other",
-                "remote",
-                Err(anyhow::anyhow!("peer unavailable"))
-            )?
-            .is_empty()
-        );
-        let mut invalid_control = session.clone();
-        invalid_control["can_control"] = json!("true");
-        let invalid = remote_native_projection(
-            &mut store,
-            &network,
-            "chat",
-            "remote",
-            Ok(json!({"native_sessions":[invalid_control]})),
-        )?;
-        assert_eq!(invalid[0]["freshness"], "cached");
-        assert_eq!(invalid[0]["can_control"], false);
-        let mut completed = session;
-        completed["state"] = json!("completed");
-        completed["can_control"] = json!(false);
-        completed["pending_requests"] = json!([]);
-        remote_native_projection(
-            &mut store,
-            &network,
-            "chat",
-            "remote",
-            Ok(json!({"native_sessions":[completed]})),
-        )?;
-        let terminal = remote_native_projection(
-            &mut store,
-            &network,
-            "chat",
-            "remote",
-            Err(anyhow::anyhow!("peer unavailable")),
-        )?;
-        assert_eq!(terminal[0]["state"], "completed");
-        assert_eq!(terminal[0]["freshness"], "cached");
-        assert_eq!(terminal[0]["can_control"], false);
-        drop(store);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
+            "local_node":self.identity.device_id()?,
+            "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
+                "capabilities":manager.and_then(|m| match m.provider.as_str() {
+                    "codex_sdk"=>Some(crate::manager::ManagerKind::CodexSdk.capabilities()),
+                    "cursor_sdk"=>Some(crate::manager::ManagerKind::CursorSdk.capabilities()),
+                    _=>None})},
+        }))
     }
 }

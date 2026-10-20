@@ -1,56 +1,46 @@
 import { useEffect, useRef, useState } from "react"
 import { Link } from "@tanstack/react-router"
-import { Copy, Download, Laptop, Plus, Smartphone, TriangleAlert } from "lucide-react"
+import { Copy, Plus, TriangleAlert } from "lucide-react"
 import qrcode from "qrcode-generator"
-import { cn } from "cn"
 import { BusyIcon, Details, InlineError } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@/features/identity/context"
+import type { Invitation } from "@/features/identity/context"
 import { isLoopback } from "@/features/workspace/labels"
-import { JoinRequests } from "./join"
-import { useIgnoredPairs } from "./ignored"
-import { downloadConnectionFile } from "@/lib/connection-file"
-import { invitationLink } from "@/lib/enrollment-reference"
-import { messageOf, record, text } from "@/lib/node"
+import { messageOf } from "@/lib/node"
+import { JoinRequests, useOpenJoins } from "./join"
 
-type Kind = "client" | "node"
-type Share = { kind: Kind; content: string; link: string; qr: string | null; local: boolean }
+type Share = Invitation & { qr: string | null }
 
-function share(kind: Kind, content: string, fallback: string): Share {
-  const info = record(JSON.parse(content) as unknown, "连接信息")
-  const page = typeof info.url === "string" ? text(info.url, "连接地址") : fallback
-  let link = ""
-  try { link = invitationLink(content, page) } catch {}
-  const local = isLoopback(page)
+function share(invitation: Invitation): Share {
   let qr: string | null = null
-  if (kind === "client" && link && !local) { try { const code = qrcode(0, "M"); code.addData(link); code.make(); qr = code.createDataURL(4, 16) } catch {} }
-  return { kind, content, link, qr, local }
+  // A phone's camera opens a public HTTPS link; any other address would scan into a dead page,
+  // so the code then carries only the ticket, read by the scanner on the public entry's page.
+  try { const code = qrcode(0, "M"); code.addData(invitation.publicEntry ? invitation.link : invitation.ticket); code.make(); qr = code.createDataURL(4, 16) } catch {}
+  return { ...invitation, qr }
 }
 
-/** "添加设备": one link (and QR for phones) the new device opens, then both sides compare the check code. */
+/** "添加设备": one link (QR for phones) the new device opens, then both sides compare the safety code. */
 export function AddDevice() {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
   const [open, setOpen] = useState(false)
-  const [kind, setKind] = useState<Kind>("client")
   const [result, setResult] = useState<Share | null>(null)
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
   const pending = useRef<number | null>(null)
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
-  const ignored = useIgnoredPairs()
   // A join request is the next thing to act on, so it takes the only solid button.
-  const requests = device.pairs.some((pair) => !ignored.includes(pair.request_id))
+  const requests = useOpenJoins().length > 0
   useEffect(() => { setResult(null); setError(""); setStatus("") }, [ready])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
     if (!result) return
-    const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 5000)
+    const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 3000)
     return () => clearInterval(timer)
   }, [result, ready])
   if (!ready?.principal.can_manage) return null
@@ -67,43 +57,31 @@ export function AddDevice() {
   }
   const generate = () => { setResult(null); void run(async () => {
     const connection = ready
-    // Computers get the roles a personal device needs; no role picker (docs/design/web-ux.md section 8).
-    const content = await device.createInvitation(kind, kind === "node" ? ["relay", "replica", "scheduler"] : [])
-    if (connection?.isCurrent()) setResult(share(kind, content, connection.entry.address))
+    const invitation = await device.createInvitation()
+    if (connection?.isCurrent()) setResult(share(invitation))
   }, "") }
   const copy = (value: string) => void run(() => navigator.clipboard.writeText(value), "已复制")
-  const choose = (next: Kind) => { setKind(next); setResult(null); setStatus("") }
+  const local = result ? isLoopback(result.link) : false
 
   return <>
     <Button type="button" variant={requests ? "outline" : "default"} onClick={() => setOpen(true)}><Plus aria-hidden="true" />添加设备</Button>
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
-        <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription>在新设备上打开链接，核对码一致后允许</SheetDescription></SheetHeader>
+        <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription>在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
-          <JoinRequests />
-          <div role="radiogroup" aria-label="设备类型" className="grid grid-cols-2 gap-2">
-            {([["client", Smartphone, "手机或浏览器"], ["node", Laptop, "另一台电脑"]] as const).map(([value, Icon, label]) => <button key={value} type="button" role="radio" aria-checked={kind === value} disabled={busy}
-              className={cn("grid min-h-20 place-items-center gap-1 rounded-xl border p-3 text-meta", kind === value ? "border-foreground bg-muted" : "hover:bg-muted/50")} onClick={() => choose(value)}>
-              <Icon aria-hidden="true" className="size-6" />{label}
-            </button>)}
-          </div>
-          {kind === "node" ? <p className="text-meta text-muted-foreground">在那台电脑的 vibeface 本机网页里粘贴</p> : null}
+          <JoinRequests issuing={result !== null} />
           {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} />生成链接</Button> : null}
           {result ? <div className="grid gap-3">
-            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用新设备扫码打开" /> : null}
-            {result.kind === "client" && result.local ? <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
-              <p className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />手机连不上本机地址</p>
-              <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.peer_id }} onClick={() => setOpen(false)}>设置访问地址</Link></Button>
-            </div> : null}
-            {result.link ? <Input readOnly aria-label="加入链接" className="font-mono text-meta" value={result.link} onFocus={(event) => event.target.select()} /> : null}
-            <div className="flex flex-wrap gap-2">
-              {result.link ? <Button type="button" variant={requests ? "outline" : "default"} disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button> : null}
-              <Button type="button" variant="outline" disabled={busy} onClick={() => void run(async () => downloadConnectionFile(result.content), "已下载")}><Download aria-hidden="true" />下载文件</Button>
-            </div>
-            <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</p>
-            <Details label="原始内容">
-              <Textarea readOnly className="min-h-24 font-mono text-meta" value={result.content} onFocus={(event) => event.target.select()} />
-              <Button type="button" variant="ghost" className="w-fit" disabled={busy} onClick={() => copy(result.content)}>复制原始内容</Button>
+            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在你的公网网页里扫码"} /> : null}
+            {result.publicEntry ? <p className="text-meta text-muted-foreground">用手机相机扫码，或在你的公网网页里扫码</p> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
+              <p>用手机打开你的公网网页，点“扫码”扫这个二维码</p>
+              <p className="flex items-center gap-1.5 text-muted-foreground"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{local ? "手机相机打不开本机地址" : "还没设置公网地址，手机相机打不开"}</p>
+              <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置公网地址</Link></Button>
+            </div>}
+            <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button>
+            <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p>
+            <Details label="链接原文">
+              <Textarea readOnly className="min-h-24 font-mono text-meta" value={result.link} onFocus={(event) => event.target.select()} />
             </Details>
           </div> : null}
           {status ? <p role="status" className="text-meta text-success">{status}</p> : null}

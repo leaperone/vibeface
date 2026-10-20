@@ -135,7 +135,7 @@ jobs:
           version: 11.9.0
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: pnpm
           cache-dependency-path: crates/node/web/pnpm-lock.yaml
       - name: Build and typecheck the static web client
@@ -283,7 +283,7 @@ jobs:
           import json, os, pathlib, subprocess, sys
           info = json.load(open(sys.argv[1]))
           assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
-          assert info["update_protocol"] == 2 and info["data_epoch"] == 5
+          assert info["update_protocol"] == 2 and info["data_epoch"] == 7
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
           binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
@@ -298,16 +298,36 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
-      - name: Verify unpacked Node processes without model calls
+      - name: Verify unpacked Node scheduling and signed log without model calls
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
+      - name: Verify multi-Node sync, entrances and delivery over iroh
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-multi-node
       - name: Verify bot tools and startup event recovery
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
+      - name: Verify cross-device coordination, owner moves and attachments
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
+      - name: Verify the public entry and its relay token
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
+      - name: Verify write protection, status and diagnostics
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase5 --phase5
       - name: Verify packaged SDK lockfile without model calls
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: ${{ steps.unpack.outputs.package }}/sidecars
@@ -332,19 +352,19 @@ jobs:
           path: |
             .artifacts/ci-web/web-process-*/report.json
             .artifacts/ci-web/web-process-*/WEB/process.log
-            .artifacts/ci-node/node-acceptance-*/report.json
-            .artifacts/ci-node/node-acceptance-*/A/process.log
-            .artifacts/ci-node/node-acceptance-*/B/process.log
-            .artifacts/ci-node/node-acceptance-*/C/process.log
-            .artifacts/ci-node/node-acceptance-*/R/process.log
+            .artifacts/ci-node/phase1-process-*/report.json
+            .artifacts/ci-node/phase1-process-*/A/process.log
+            .artifacts/ci-node/phase1-process-*/fixture-manager-*.stderr.log
             .artifacts/ci-chat-agent/chat-agent-process-*/report.json
             .artifacts/ci-chat-agent/chat-agent-process-*/A/process.log
-            .artifacts/ci-chat-agent/chat-agent-process-*/B/process.log
-            .artifacts/ci-chat-agent/chat-agent-process-*/C/process.log
             .artifacts/ci-chat-agent/chat-agent-process-*/fixture-manager-*.stderr.log
-            .artifacts/ci-chat-agent/chat-agent-process-*/command-target-readiness.json
-            .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-starts.jsonl
             .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
+            .artifacts/ci-phase4/phase4-*/report.json
+            .artifacts/ci-phase4/phase4-*/*/node.log
+            .artifacts/ci-public-entry/public-entry-*/report.json
+            .artifacts/ci-public-entry/public-entry-*/*/node.log
+            .artifacts/ci-phase5/phase5-*/report.json
+            .artifacts/ci-phase5/phase5-*/*/node.log
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
