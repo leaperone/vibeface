@@ -1398,9 +1398,10 @@ def verify_recovery(node, other, network):
 
 def scheduler_records(node, network):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT trigger, state, attempt_id, detail FROM scheduler_jobs").fetchall()
-    return [{"trigger": trigger, "state": state, "attempt": {"id": attempt} if attempt else None, "detail": detail or ""}
-            for trigger, state, attempt, detail in rows]
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT * FROM scheduler_jobs").fetchall()
+    return [{**dict(row), "attempt": {"id": row["attempt_id"]} if row["attempt_id"] else None, "detail": row["detail"] or ""}
+            for row in rows]
 
 
 def scheduler_record(node, network, trigger):
@@ -3214,7 +3215,7 @@ def phase5_acceptance(options):
         require(not any(secret in exported for secret in secrets) and "vibeface1" not in exported,
                 "the diagnostics export holds no capability, passphrase or invite")
         epoch = json.loads((a.directory / "data-epoch.json").read_text())["data_epoch"]
-        require(epoch == 7, "data epoch 7")
+        require(epoch == DATA_EPOCH, "data epoch matches the build")
         passed("logs-and-diagnostics-hold-no-secrets", logs=len(logs), data_epoch=epoch)
         report["status"] = "passed"
     except BaseException as error:
