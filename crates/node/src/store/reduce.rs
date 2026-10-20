@@ -202,6 +202,24 @@ pub(crate) fn apply(
                 params![network, notification_id, client_id],
             )?;
         }
+        EventBody::AttentionRaised {
+            matter, alert_id, ..
+        } => {
+            connection.execute(
+                "INSERT INTO alerts(network_id,matter,alert_id,raise,rank,node,created_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,matter) DO UPDATE SET alert_id=excluded.alert_id,raise=excluded.raise,rank=excluded.rank,node=excluded.node,created_at_ms=excluded.created_at_ms WHERE excluded.rank>rank",
+                params![network, matter, alert_id, serde_json::to_string(&event.body)?, rank, event.author, event.created_at_ms],
+            )?;
+        }
+        EventBody::AttentionResolved {
+            alert_id,
+            resolution,
+            ..
+        } => {
+            connection.execute(
+                "INSERT INTO alert_resolutions(network_id,alert_id,resolution,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,alert_id) DO UPDATE SET resolution=excluded.resolution,rank=excluded.rank WHERE excluded.rank<rank",
+                params![network, alert_id, text(resolution)?, rank],
+            )?;
+        }
         EventBody::ContextCheckpoint { .. } => {}
     }
     Ok(())

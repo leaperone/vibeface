@@ -40,6 +40,10 @@ CREATE TABLE `autonomy` (`network_id` text NOT NULL, `conversation_id` text NOT 
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table
 CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
+-- Create "alerts" table
+CREATE TABLE `alerts` (`network_id` text NOT NULL, `matter` text NOT NULL, `alert_id` text NOT NULL, `raise` text NOT NULL, `rank` text NOT NULL, `node` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `matter`));
+-- Create "alert_resolutions" table
+CREATE TABLE `alert_resolutions` (`network_id` text NOT NULL, `alert_id` text NOT NULL, `resolution` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `alert_id`));
 -- Create "budget_days" table
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 -- Create "local_values" table

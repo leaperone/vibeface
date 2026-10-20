@@ -76,6 +76,26 @@ pub enum WorkOutcome {
     Abandoned,
 }
 
+/// How soon the user should look at a triaged session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Info,
+    Attention,
+    Urgent,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertResolution {
+    /// A decision went back to the session.
+    Decided,
+    Dismissed,
+}
+
+/// Scope of the triage cards every device shows.
+pub const ATTENTION_SCOPE: &str = "attention";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct OpenWork {
@@ -178,6 +198,26 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    /// A triaged session that needs the user, in scope `attention`; a later raise of the same
+    /// `matter` (an escalation) replaces the card.
+    AttentionRaised {
+        alert_id: String,
+        matter: String,
+        agent: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        cwd: String,
+        severity: Severity,
+        summary: String,
+        count: u64,
+    },
+    AttentionResolved {
+        alert_id: String,
+        resolution: AlertResolution,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
     /// Written only by the owner in a read-only closing turn; covered events stay stored.
     ContextCheckpoint {
         covers: VersionVector,
@@ -197,7 +237,8 @@ impl EventBody {
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
             | Self::AutonomySet { attestation, .. }
-            | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
+            | Self::NotificationAcked { attestation, .. }
+            | Self::AttentionResolved { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
