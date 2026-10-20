@@ -114,7 +114,8 @@ impl LocalIdentity {
             | EventBody::WorkFinished { attestation, .. }
             | EventBody::ApprovalAnswered { attestation, .. }
             | EventBody::AutonomySet { attestation, .. }
-            | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
+            | EventBody::NotificationAcked { attestation, .. }
+            | EventBody::AttentionResolved { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -277,7 +278,8 @@ fn validate_attestation(event: &Event) -> Result<()> {
         | EventBody::BotCreated { .. }
         | EventBody::ApprovalAnswered { .. }
         | EventBody::AutonomySet { .. }
-        | EventBody::NotificationAcked { .. } => UserSignature::Required,
+        | EventBody::NotificationAcked { .. }
+        | EventBody::AttentionResolved { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -413,6 +415,37 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         | EventBody::WorkFinished { work_id, .. }
         | EventBody::ApprovalRequested { work_id, .. }
         | EventBody::ApprovalAnswered { work_id, .. } => id(work_id)?,
+        EventBody::AttentionRaised {
+            alert_id,
+            matter,
+            session_id,
+            summary,
+            cwd,
+            agent,
+            ..
+        } => {
+            ensure!(
+                event.scope_id == ATTENTION_SCOPE,
+                "triage cards live in the attention scope"
+            );
+            id(alert_id)?;
+            id(matter)?;
+            ensure!(
+                !session_id.is_empty()
+                    && session_id.len() <= 256
+                    && summary.len() <= 1024
+                    && cwd.len() <= 4096
+                    && agent.len() <= 32,
+                "invalid triage card"
+            );
+        }
+        EventBody::AttentionResolved { alert_id, .. } => {
+            ensure!(
+                event.scope_id == ATTENTION_SCOPE,
+                "triage cards live in the attention scope"
+            );
+            id(alert_id)?;
+        }
         EventBody::AutonomySet { version, .. } => {
             ensure!(*version > 0, "autonomy version starts at 1")
         }

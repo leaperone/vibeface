@@ -25,7 +25,7 @@ mod tests;
 pub(crate) mod work;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Whether this Node may append to its own log (design 5.7 and 5.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -540,6 +540,32 @@ impl Store {
         self.connection
             .execute("UPDATE temp.write_gate SET state=?", [state.as_str()])?;
         Ok(())
+    }
+    /// Triage cards: open ones first, newest first, at most `limit`.
+    pub fn alerts(&self, network_id: &str, limit: usize) -> Result<Vec<Value>> {
+        let mut statement = self.connection.prepare(
+            "SELECT a.raise,a.node,a.created_at_ms,r.resolution FROM alerts a LEFT JOIN alert_resolutions r ON r.network_id=a.network_id AND r.alert_id=a.alert_id WHERE a.network_id=? ORDER BY r.resolution IS NOT NULL, a.rank DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map(params![network_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (raise, node, created_at_ms, resolution) = row?;
+            let mut alert: Value = serde_json::from_str(&raise)?;
+            alert["node"] = node.into();
+            alert["created_at_ms"] = created_at_ms.into();
+            alert["resolution"] = resolution.map_or(Value::Null, Value::String);
+            if let Some(object) = alert.as_object_mut() {
+                object.remove("type");
+            }
+            Ok(alert)
+        })
+        .collect()
     }
     pub fn local_value(&self, network_id: &str, key: &str) -> Result<Option<Value>> {
         local_load(&self.connection, network_id, key)
