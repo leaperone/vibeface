@@ -1,4 +1,4 @@
-use super::*;
+use super::{assistant::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
     scheduling::{JobOutcome, JobState, TriggerKind, message_trigger, work_trigger},
@@ -975,6 +975,290 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
         outbox.iter().map(|e| e.trigger.clone()).collect::<Vec<_>>(),
         vec![trigger]
     );
+    Ok(())
+}
+
+fn bot(net: &Net, name: &str) -> Result<EventBody> {
+    net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::BotCreated {
+            bot_id: "bot".into(),
+            name: name.into(),
+            instructions: "be brief".into(),
+            project: None,
+            attestation: None,
+        },
+    )
+}
+
+fn assistant_reply(id: &str, to: &str) -> EventBody {
+    EventBody::MessagePosted {
+        message_id: id.into(),
+        role: Role::Assistant,
+        text: "ok".into(),
+        attachments: vec![],
+        report_results: None,
+        in_reply_to: Some(to.into()),
+        status: Some(ReplyStatus::Completed),
+        attestation: None,
+    }
+}
+
+fn skill(name: &str, body: &str) -> Skill {
+    Skill {
+        name: name.into(),
+        description: format!("{name} in short"),
+        body: body.into(),
+    }
+}
+
+fn save_routine(routine_id: Option<&str>, name: &str, every_minutes: u32) -> ChangeRequest {
+    ChangeRequest::SaveRoutine {
+        routine_id: routine_id.map(Into::into),
+        name: name.into(),
+        prompt: "Summarize yesterday's commits; say so if there are none.".into(),
+        first_run_at_ms: 1_000,
+        every_minutes,
+        enabled: None,
+    }
+}
+
+fn rename(name: &str) -> ChangeRequest {
+    ChangeRequest::Profile {
+        name: Some(name.into()),
+        instructions: None,
+    }
+}
+
+fn assistant_projection(store: &Store, net: &Net) -> Result<Value> {
+    let changes: Vec<_> = store
+        .assistant_changes(&net.network, "c")?
+        .into_iter()
+        .map(|change| (change.change_id, change.event_hash, change.change))
+        .collect();
+    Ok(serde_json::json!({
+        "bots": store.bots(&net.network)?,
+        "skills": store.skills(&net.network)?,
+        "routines": store.routines(&net.network, "c")?,
+        "changes": changes,
+    }))
+}
+
+/// Only the user's own signed message in the same conversation can be the cause a change follows.
+#[test]
+fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
+    let net = net()?;
+    let mut origin = store(&net)?;
+    conversation(&mut origin, &net)?;
+    origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
+    let m1 = origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
+    let a1 = origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        assistant_reply("a1", "m1"),
+        vec![],
+        4,
+    )?;
+    let mut target = store(&net)?;
+    let a_events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
+    assert!(
+        target
+            .ingest_events(&net.network, &a_events)?
+            .iter()
+            .all(|status| *status == IngestStatus::Accepted)
+    );
+    let change = |cause: &str, deps: Vec<String>| {
+        net.b.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: net.network.clone(),
+            author: net.b.device_id()?,
+            seq: 1,
+            prev: None,
+            deps,
+            scope_id: "c".into(),
+            created_at_ms: 5,
+            body: EventBody::AssistantChanged {
+                change_id: "change-1".into(),
+                cause: cause.into(),
+                change: AssistantChange::Profile {
+                    name: Some(Edit {
+                        before: "Helper".into(),
+                        after: "Nova".into(),
+                    }),
+                    instructions: None,
+                },
+            },
+            blobs: vec![],
+        })
+    };
+    for (cause, deps) in [
+        ("m1", vec![]),
+        ("a1", vec![a1.hash.clone()]),
+        ("m2", vec![m1.hash.clone()]),
+    ] {
+        assert!(
+            matches!(&target.ingest_events(&net.network, &[change(cause, deps)?])?[0],
+                IngestStatus::Rejected(error) if error.contains("user's own signed message")),
+            "{cause}"
+        );
+    }
+    assert_eq!(target.bots(&net.network)?[0].name, "Helper");
+    assert_eq!(
+        target.ingest_events(&net.network, &[change("m1", vec![m1.hash.clone()])?])?,
+        vec![IngestStatus::Accepted]
+    );
+    assert_eq!(target.bots(&net.network)?[0].name, "Nova");
+    assert_eq!(target.assistant_changes(&net.network, "c")?.len(), 1);
+
+    // The local writer takes the cause from the trigger and refuses anything but a user message.
+    for trigger in ["work:w1", "message:a1"] {
+        let error = origin
+            .change_assistant(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(assistant::NOT_FROM_USER),
+            "{trigger}: {error}"
+        );
+    }
+    Ok(())
+}
+
+/// Chat changes from two devices converge to the same assistant in any arrival order, and a
+/// retried tool call writes nothing new.
+#[test]
+fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
+    let net = net()?;
+    let mut origin = store(&net)?;
+    conversation(&mut origin, &net)?;
+    origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
+    origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
+    let change = |store: &mut Store, identity, trigger, call_ref, request, at| {
+        store.change_assistant(identity, &net.network, "c", trigger, call_ref, request, at)
+    };
+    let (renamed, written) = change(&mut origin, &net.a, "message:m1", "r1", rename("Nova"), 4)?;
+    assert!(written);
+    assert_eq!(
+        renamed.change,
+        AssistantChange::Profile {
+            name: Some(Edit {
+                before: "Helper".into(),
+                after: "Nova".into()
+            }),
+            instructions: None
+        }
+    );
+    assert_eq!(
+        change(&mut origin, &net.a, "message:m1", "r1", rename("Nova"), 5)?,
+        (renamed.clone(), false)
+    );
+    for (call_ref, request, error) in [
+        ("r1", rename("Orion"), "different change"),
+        ("r2", rename("Nova"), "nothing to change"),
+    ] {
+        let failed = change(&mut origin, &net.a, "message:m1", call_ref, request, 5).unwrap_err();
+        assert!(failed.to_string().contains(error), "{failed}");
+    }
+    let (saved, _) = change(
+        &mut origin,
+        &net.a,
+        "message:m1",
+        "r3",
+        ChangeRequest::SaveSkill {
+            skill_id: None,
+            skill: skill("Digest", "List the commits."),
+        },
+        6,
+    )?;
+    let AssistantChange::Skill { skill_id, .. } = saved.change else {
+        panic!("skill change")
+    };
+    let duplicate = change(
+        &mut origin,
+        &net.a,
+        "message:m1",
+        "r4",
+        ChangeRequest::SaveSkill {
+            skill_id: None,
+            skill: skill("digest", "Other."),
+        },
+        6,
+    )
+    .unwrap_err();
+    assert!(duplicate.to_string().contains(&skill_id), "{duplicate}");
+    let (routine, _) = change(
+        &mut origin,
+        &net.a,
+        "message:m1",
+        "r5",
+        save_routine(None, "Morning", 1440),
+        7,
+    )?;
+    let AssistantChange::Routine { routine_id, .. } = routine.change else {
+        panic!("routine change")
+    };
+
+    // Device b answers a later message concurrently with a's next edits.
+    origin.append_event(&net.b, &net.network, "c", user(&net, "m2", "y"), vec![], 8)?;
+    change(&mut origin, &net.b, "message:m2", "r1", rename("Orion"), 9)?;
+    change(
+        &mut origin,
+        &net.b,
+        "message:m2",
+        "r2",
+        ChangeRequest::SaveSkill {
+            skill_id: Some(skill_id.clone()),
+            skill: skill("Digest", "List the commits by author."),
+        },
+        10,
+    )?;
+    change(
+        &mut origin,
+        &net.a,
+        "message:m1",
+        "r6",
+        ChangeRequest::RemoveSkill {
+            skill_id: skill_id.clone(),
+        },
+        11,
+    )?;
+    change(
+        &mut origin,
+        &net.a,
+        "message:m1",
+        "r7",
+        save_routine(Some(&routine_id), "Morning", 60),
+        12,
+    )?;
+    change(
+        &mut origin,
+        &net.b,
+        "message:m2",
+        "r3",
+        ChangeRequest::RemoveRoutine {
+            routine_id: routine_id.clone(),
+        },
+        13,
+    )?;
+    let expected = assistant_projection(&origin, &net)?;
+    assert_eq!(expected["bots"][0]["name"], "Orion");
+    assert_eq!(expected["skills"], serde_json::json!([]));
+    assert_eq!(expected["routines"], serde_json::json!([]));
+    assert_eq!(expected["changes"].as_array().map(Vec::len), Some(8));
+
+    let a_events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
+    let b_events = origin.events_from(&net.network, &net.b.device_id()?, 1, 100)?;
+    let mut a_first = store(&net)?;
+    a_first.ingest_events(&net.network, &a_events)?;
+    a_first.ingest_events(&net.network, &b_events)?;
+    let mut b_first = store(&net)?;
+    b_first.ingest_events(&net.network, &b_events)?;
+    b_first.ingest_events(&net.network, &a_events)?;
+    // Events rejected for a gap are fetched again by sync.
+    b_first.ingest_events(&net.network, &b_events)?;
+    assert_eq!(assistant_projection(&a_first, &net)?, expected);
+    assert_eq!(assistant_projection(&b_first, &net)?, expected);
     Ok(())
 }
 

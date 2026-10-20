@@ -21,14 +21,8 @@ fn validate_definition(
 ) -> Result<()> {
     ensure!(valid_id(bot_id), "invalid bot_id");
     ensure!(valid_id(conversation_id), "invalid conversation_id");
-    ensure!(
-        !name.trim().is_empty() && name.len() <= 512 && !name.chars().any(char::is_control),
-        "invalid Bot name"
-    );
-    ensure!(
-        instructions.len() <= 8192,
-        "Bot instructions must be at most 8192 bytes"
-    );
+    validate_bot_name(name)?;
+    validate_instructions(instructions)?;
     ensure!(
         serde_json::to_vec(&(name, instructions, project))?.len() <= 12000,
         "Bot definition is too large for the assistant context"
@@ -66,7 +60,13 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Bot, Option<String>)> {
     ))
 }
 
-const BOT_COLUMNS: &str = "bot_id,conversation_id,name,instructions,project,event_hash";
+/// `BotCreated` gives the first name and instructions; a chat change with a later rank replaces each.
+const MERGED_COLUMNS: &str = "b.bot_id,b.conversation_id,
+    CASE WHEN n.rank>b.rank THEN n.value ELSE b.name END,
+    CASE WHEN i.rank>b.rank THEN i.value ELSE b.instructions END,
+    b.project,b.event_hash";
+const CREATED_COLUMNS: &str =
+    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash";
 
 fn bots_where(
     connection: &Connection,
@@ -74,8 +74,21 @@ fn bots_where(
     filter: &str,
     value: &str,
 ) -> Result<Vec<Bot>> {
+    select_bots(connection, network, MERGED_COLUMNS, filter, value)
+}
+
+fn select_bots(
+    connection: &Connection,
+    network: &str,
+    columns: &str,
+    filter: &str,
+    value: &str,
+) -> Result<Vec<Bot>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {BOT_COLUMNS} FROM bots WHERE network_id=?1 {filter} ORDER BY bot_id"
+        "SELECT {columns} FROM bots b
+         LEFT JOIN assistant_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
+         LEFT JOIN assistant_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
+         WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
     let rows = statement.query_map(params![network, value], bot_row)?;
     rows.map(|row| {
@@ -84,6 +97,14 @@ fn bots_where(
         Ok(bot)
     })
     .collect()
+}
+
+pub(crate) fn bot_for_conversation_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+) -> Result<Option<Bot>> {
+    Ok(bots_where(connection, network, "AND b.conversation_id=?2", scope)?.pop())
 }
 
 impl Store {
@@ -107,7 +128,16 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         authorize_node_from(&tx, network, &identity.device_id()?)?;
-        if let Some(existing) = bots_where(&tx, network, "AND bot_id=?2", &spec.bot_id)?.pop() {
+        // A retry compares the signed definition, not what the chat changed since.
+        if let Some(existing) = select_bots(
+            &tx,
+            network,
+            CREATED_COLUMNS,
+            "AND b.bot_id=?2",
+            &spec.bot_id,
+        )?
+        .pop()
+        {
             ensure!(
                 existing.conversation_id == conversation
                     && existing.name == spec.name
@@ -147,18 +177,19 @@ impl Store {
             vec![],
             created_at_ms,
         )?;
-        let bot = bots_where(&tx, network, "AND conversation_id=?2", conversation)?
+        let bot = bots_where(&tx, network, "AND b.conversation_id=?2", conversation)?
             .pop()
             .context("created Bot could not be projected")?;
         tx.commit()?;
         Ok(bot)
     }
 
+    /// Bots with the name and instructions the chat last set.
     pub fn bots(&self, network: &str) -> Result<Vec<Bot>> {
         bots_where(&self.connection, network, "AND ?2=''", "")
     }
 
     pub fn bot_for_conversation(&self, network: &str, scope: &str) -> Result<Option<Bot>> {
-        Ok(bots_where(&self.connection, network, "AND conversation_id=?2", scope)?.pop())
+        bot_for_conversation_from(&self.connection, network, scope)
     }
 }
