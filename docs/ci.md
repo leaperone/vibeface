@@ -34,11 +34,14 @@ Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 ep
 | 单 Node 调度与事件日志验收 | Linux x64 一次，使用 `--phase1` |
 | 多 Node 同步、入口与投递验收 | Linux x64 一次，不带模式参数，四台 Node 经 iroh 和成员 relay 互连 |
 | 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
+| 跨设备协作、换负责人与附件验收 | Linux x64 一次，使用 `--phase4` |
+| 公共入口与 relay 令牌验收 | Linux x64 一次，使用 `--public-entry` |
+| 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
 | Nightly npm 包 | 组装三个原生包，三个平台分别安装、检查版本并执行 `--web-only` 冒烟 |
 
 慢组使用 `opt-level=1`，保留调试断言和整数溢出检查，使用独立缓存。快、慢组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。
 
-CI 不使用真实 AI Provider 或模型密钥。默认模式、`--phase1`、`--auto-route` 和 `--chat-agent` 都使用受控 SDK 和 App Server 夹具。模拟协议通过不能证明真实模型理解需求或正确选择工具。
+CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
 只有版本 tag 可以发布。tag 必须与 Cargo 版本一致且提交已进入 `main`；扩展 gate、三平台制品及适用的 npm 检查必须通过。发布前继续校验资产清单并下载逐字节比对，详见 [构建与发布](releasing.md)。
 
@@ -73,6 +76,8 @@ python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --ar
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-queue --phase1
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-phase4 --phase4
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-public-entry --public-entry
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-phase5 --phase5
 ```
 
 身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、经另一台 Node 的 Gateway 跨入口访问、根恢复保留管理设备及未知写入不重放。
@@ -81,7 +86,11 @@ Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默
 
 队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、审批、中断、App Server 托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。
 
-跨设备派发与停止、负责人切换、撤销后放弃、待核对结清、跨入口加入和附件上传改动跑 `--phase4`。它启动四台 Node：A、B 带夹具 Agent 和 App Server，P 是运行 relay 的公网角色，C 只有夹具 App Server；目前不在扩展 CI 中，须本地运行。
+跨设备派发与停止、负责人切换、撤销后放弃、待核对结清、跨入口加入和附件上传改动跑 `--phase4`。它启动四台 Node：A、B 带夹具 Agent 和 App Server，P 是运行 relay 的公网角色，C 只有夹具 App Server。
+
+公共入口、relay 准入和成员 Node 指向入口的改动跑 `--public-entry`。P 是不入网的公共入口，M 只经 P 的 relay 可达，X 持错误令牌；覆盖浏览器经 P 加入 M 并对话、P 重启后重连、错误令牌被拒，以及 P 不存事件和附件。
+
+写入闸门、对齐、分叉、日志、`status` 与诊断导出改动跑 `--phase5`。A、B 两台 Node：A 从备份恢复后对齐前拒绝写入、对齐后无分叉；B 离线时 A 只读，用户确认后才写；复制的数据目录在 B 处分叉后只有副本停写并列出冲突，原 A 与 B 继续写；同时检查 `status` 的对端连通与上次同步、`node.log` 权限与内容、诊断包和日志里没有能力、口令或邀请。
 
 真正模型调用、浏览器渲染、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
