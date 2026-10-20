@@ -27,11 +27,11 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
   assert.throws(() => parseConversation({ ...context, autonomy: { mode: "always", version: 1 } }, "chat"))
   assert.throws(() => parseConversation({ ...context, autonomy: { mode: "off", version: null } }, "chat"))
 })
-test("nodeName prefers rpc and directory names over truncated peer ids", () => {
+test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
   assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
   assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [] } }), "工作机")
-  assert.equal(nodeName(id), `${id.slice(0, 10)}…`)
+  assert.equal(nodeName(id), "另一台设备")
 })
 
 test("capabilities parse the actual provider name and reject malformed node lists", () => {

@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
 import { useWorkspace } from '@/features/workspace/context'
+import { humanError } from '@/lib/errors'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ApprovalCard, ConfirmCard } from '@/features/workspace/task-activity'
@@ -212,6 +213,6 @@ function JobLine({ job }: { job: ManagerJob }) {
   return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-danger">
     <CircleX aria-hidden="true" className="size-4 shrink-0" />
     <span className="shrink-0">{replyStates[job.state] ?? '回复失败'}</span>
-    {job.error ? <span className="min-w-0 truncate" title={job.error}>{job.error.split('\n')[0]}</span> : null}
+    {job.error ? <span className="min-w-0 truncate" title={job.error}>{humanError(job.error.split('\n')[0])}</span> : null}
   </p>
 }

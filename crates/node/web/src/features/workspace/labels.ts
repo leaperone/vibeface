@@ -57,8 +57,7 @@ export function nodeName(
   const member = lookup?.directory?.members.find((item) => item.device_id === id)
   if (member?.name) return member.name
   if (node?.local) return "本机"
-  if (fallback) return fallback
-  return `${id.slice(0, 10)}${id.length > 10 ? "…" : ""}`
+  return fallback ?? "另一台设备"
 }
 
 export function stateLabel(value: string | undefined, override?: string) {
