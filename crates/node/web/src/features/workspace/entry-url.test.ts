@@ -7,13 +7,13 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
-import { approvalKind, approvalRisk, nodeName } from "./labels.ts"
-import { inputText, parseArtifactPage, parseConversation, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
+import { nodeName } from "./labels.ts"
+import { inputText, parseAlerts, parseArtifactPage, parseConversation, parseDecision, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
-  conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [], autonomy: { mode: "report", version: 0 },
+  conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
   works: [], pending_checks: [], local_node: "gateway",
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
@@ -23,9 +23,6 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
   assert.throws(() => parseConversation(context, "other"))
   assert.throws(() => parseConversation({ ...context, works: undefined }, "chat"))
   assert.throws(() => parseConversation({ ...context, local_node: undefined }, "chat"))
-  assert.throws(() => parseConversation({ ...context, autonomy: undefined }, "chat"))
-  assert.throws(() => parseConversation({ ...context, autonomy: { mode: "always", version: 1 } }, "chat"))
-  assert.throws(() => parseConversation({ ...context, autonomy: { mode: "off", version: null } }, "chat"))
 })
 test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
@@ -40,34 +37,24 @@ test("capabilities parse the actual provider name and reject malformed node list
   assert.equal(nodes[0]?.capabilities?.manager, "cursor_agent")
   assert.throws(() => parseNodes({ nodes: [{ device_id: "n" }] }))
 })
-test("works, approvals with decline, reply status and pending checks keep their exact shape", () => {
-  const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "waiting_approval", summary: "等待决定", outcome: null, result_text: "", failure_reason: null,
-    open_approvals: [{ request_id: "req", kind: "commandExecution", summary: "运行命令", form: { command: "npm test", cwd: "/project", files: ["a.ts"], choices: [{ label: "拒绝", response: { decision: "decline" } }] } }],
-    answered_approvals: [{ request_id: "old", kind: "commandExecution", summary: "运行命令", decision: "accept" }] }
-  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false } }
+test("works, reply status and pending checks keep their exact shape", () => {
+  const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "running", summary: "进行中", outcome: null, result_text: "", failure_reason: null }
+  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], capabilities: { streaming: true, cancel: false, steer: false } }
   const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped", blobs: [{ hash: "result", size: 20 }] }
   const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message] })
-  assert.deepEqual(parsed.works[0].open_approvals[0].form?.choices?.[0].response, { decision: "decline" })
-  assert.equal(parsed.works[0].state, "waiting_approval")
-  assert.deepEqual([parsed.works[0].open_approvals[0].form?.command, parsed.works[0].open_approvals[0].form?.files], ["npm test", ["a.ts"]])
-  assert.equal(parsed.works[0].answered_approvals[0].decision, "accept")
-  assert.throws(() => parseConversation({ ...context, works: [{ ...work, answered_approvals: undefined }] }))
-  assert.equal(parsed.scheduler?.jobs[0].read_only, true)
+  assert.equal(parsed.works[0].state, "running")
+  assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_approval" }] }), "approval states are gone")
+  assert.equal(parseConversation({ ...context, works: [{ ...work, title: undefined }] }).works[0].title, "", "a dispatch row without a title still parses")
   assert.equal(parsed.messages[0].status, "stopped")
   assert.equal(parsed.messages[0].in_reply_to, "one")
   assert.deepEqual(parsed.messages[0].blobs, [{ hash: "result", size: 20 }])
   assert.equal(parseConversation(context).scheduler, null)
   for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
-    assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome, open_approvals: [] }] }).works[0].outcome, outcome)
+    assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome }] }).works[0].outcome, outcome)
   }
   assert.equal(parseConversation({ ...context, works: [{ ...work, state: undefined }] }).works[0].state, null)
-  assert.equal(parseConversation({ ...context, works: [{ ...work, open_approvals: [{ request_id: "req", kind: "k", summary: "s" }] }] }).works[0].open_approvals[0].form, undefined)
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting" }] }))
-  assert.throws(() => parseConversation({ ...context, works: [{ ...work, open_approvals: undefined }] }))
   assert.throws(() => parseConversation({ ...context, messages: [{ ...message, status: "cancelled" }] }))
-  const input = { request_id: "input", kind: "input", summary: "请补充需求", form: { questions: [{ id: "scope", header: "范围", question: "选择本次操作范围", options: [{ label: "当前目录", description: "仅处理当前目录" }] }] } }
-  assert.equal(parseConversation({ ...context, works: [{ ...work, open_approvals: [input] }] }).works[0].open_approvals[0].form?.questions?.[0].options?.[0].label, "当前目录")
-  assert.throws(() => parseConversation({ ...context, works: [{ ...work, open_approvals: [{ ...input, form: { questions: [...input.form.questions, ...input.form.questions] } }] }] }))
   const check = { check_id: "manager:attempt", kind: "manager_process", detail: "进程退出未确认", process_groups: [42] }
   assert.deepEqual(parseConversation({ ...context, pending_checks: [check] }).pending_checks, [check])
   assert.deepEqual(parseConversation({ ...context, pending_checks: [{ check_id: "work:w", kind: "work", detail: "无法证明结果", work_id: "w", target_node: "worker" }] }).pending_checks[0], { check_id: "work:w", kind: "work", detail: "无法证明结果", process_groups: [], work_id: "w", target_node: "worker" })
@@ -75,6 +62,15 @@ test("works, approvals with decline, reply status and pending checks keep their 
   assert.throws(() => parseConversation({ ...context, pending_checks: [{ ...check, kind: "native_turn" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
   assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }] } }).scheduler?.jobs[0].state, "pending_delivery")
+})
+test("alerts and decision results fail closed on shapes the web cannot show", () => {
+  const alert = { alert_id: "a", matter: "m", agent: "codex", session_id: "s", cwd: "/p", severity: "urgent", summary: "失败了", count: 1, node: "n", created_at_ms: 1, resolution: null }
+  assert.deepEqual(parseAlerts({ alerts: [alert] })[0].choices, [], "an alert without choices takes a reply")
+  assert.equal(parseAlerts({ alerts: [{ ...alert, choices: [{ label: "批准" }] }] })[0].choices[0].label, "批准")
+  assert.throws(() => parseAlerts({ alerts: [{ ...alert, severity: "loud" }] }))
+  assert.throws(() => parseAlerts({ alerts: [{ ...alert, resolution: "maybe" }] }))
+  assert.equal(parseDecision({ decision_id: "d", thread_id: "t", status: "unknown" }).status, "unknown")
+  assert.throws(() => parseDecision({ decision_id: "d", status: "sent" }))
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
@@ -163,8 +159,7 @@ test("workspace preserves bot and message requests while routing native decision
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event" }
-  const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "waiting_approval", summary: "", outcome: null, result_text: "", failure_reason: null,
-    open_approvals: [{ request_id: "req", kind: "fileChange", summary: "允许修改吗？", form: { choices: [{ label: "拒绝", response: { decision: "decline" } }] } }], answered_approvals: [] }
+  const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
   const posted = (message_id: unknown) => ({ message_id, role: "user", text: "work", event_hash: `event-${message_id}`, created_at_ms: 1 })
@@ -178,6 +173,10 @@ test("workspace preserves bot and message requests while routing native decision
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
   let failControl = false, failBotCheck = false, failMessage = false
+  const alertRow = { alert_id: "alert", matter: "m", agent: "codex", session_id: "thread", choices: [{ label: "批准" }, { label: "拒绝" }], cwd: "/project", severity: "attention", summary: "要不要继续", count: 1, node: "worker", created_at_ms: 1, resolution: null }
+  let alertRows: Record<string, unknown>[] = [alertRow]
+  const decisions: Record<string, unknown>[] = []
+  let decisionOutcome: "delivered" | "unknown" | "lost" = "unknown"
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
@@ -189,6 +188,9 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "nodes") return { nodes: [] }
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }
       if (method === "notifications") return { notifications: unreadNotifications }
+      if (method === "alerts") return { alerts: alertRows }
+      if (method === "send_decision") { decisions.push(JSON.parse(JSON.stringify(body))); if (decisionOutcome === "lost") throw new Error("connection lost"); return { decision_id: body.decision_id, thread_id: body.thread_id, status: decisionOutcome } }
+      if (method === "resolve_alert") { controls.push(JSON.parse(JSON.stringify({ method, ...body }))); alertRows = alertRows.map((row) => row.alert_id === body.alert_id ? { ...row, resolution: body.resolution } : row); return { event_hash: "resolved" } }
       if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
       if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: transcript, works: [work] }
       if (method === "create_bot") {
@@ -200,7 +202,7 @@ test("workspace preserves bot and message requests while routing native decision
         knownBots = [...knownBots.filter((item) => item.bot_id !== created.bot_id), created]
         return { bot: created }
       }
-      if (["interrupt_work", "answer_approval", "resolve"].includes(method)) {
+      if (["interrupt_work", "resolve"].includes(method)) {
         controls.push(JSON.parse(JSON.stringify({ method, ...body })))
         if (failControl) throw new Error("connection lost")
         return { accepted: true }
@@ -253,22 +255,34 @@ test("workspace preserves bot and message requests while routing native decision
     connection.entry.device_id = "gateway"
     assert.equal(render().messagePending, null)
     await render().interruptWork("work")
-    await render().answerApproval("work", "req", { decision: "decline" })
-    assert.deepEqual(controls, [
-      { method: "interrupt_work", conversation_id: "chat", work_id: "work" },
-      { method: "answer_approval", conversation_id: "chat", work_id: "work", request_id: "req", response: { decision: "decline" }, attestation },
-    ])
-    assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"approval_answered","work_id":"work","request_id":"req","decision":"decline"}')
+    assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
+    const [alert] = render().alerts
+    assert.equal(alert.summary, "要不要继续")
+    decisionOutcome = "lost"
+    await assert.rejects(render().sendDecision(alert, "d1", { choice: 0 }), /connection lost/)
+    decisionOutcome = "unknown"
+    assert.equal((await render().sendDecision(alert, "d1", { choice: 0 })).status, "unknown")
+    decisionOutcome = "delivered"
+    assert.equal((await render().sendDecision(alert, "d1", { choice: 0 })).status, "delivered")
+    assert.deepEqual(decisions.map((item) => item.decision_id), ["d1", "d1", "d1"], "a retry sends the same decision_id")
+    assert.deepEqual(decisions[0], { node: "worker", thread_id: "thread", decision_id: "d1", alert_id: "alert", choice: 0 })
+    await assert.rejects(render().sendDecision(alert, "d2", { text: "  " }), /不能为空/)
+    await render().resolveAlert(alert, "decided")
+    assert.deepEqual(controls.pop(), { method: "resolve_alert", alert_id: "alert", resolution: "decided", attestation })
+    assert.equal(signed.at(-1), 'attestation|network|attention|{"type":"attention_resolved","alert_id":"alert","resolution":"decided"}', "the dismissal is signed for the shared attention scope")
+    assert.equal(render().alerts[0].resolution, "decided")
+    const resolved = controls.length
+    await render().resolveAlert(alert, "dismissed")
+    assert.equal(controls.length, resolved, "a resolved alert is not resolved twice")
     await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", process_groups: [], work_id: "work" }, "completed", " 设备上已看到结果 ")
     assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
     assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
     await assert.rejects(render().interruptWork("other-work"), /停不了/)
-    await assert.rejects(render().answerApproval("work", "other", { decision: "accept" }), /找不到这个请求/)
     const beforeUnknown = controls.length
     failControl = true
-    await assert.rejects(render().answerApproval("work", "req", { decision: "decline" }), /connection lost/)
+    await assert.rejects(render().interruptWork("work"), /connection lost/)
     assert.equal(render().writable, false)
-    await assert.rejects(render().answerApproval("work", "req", { decision: "decline" }), /补读/)
+    await assert.rejects(render().interruptWork("work"), /补读/)
     failControl = false
     await render().refresh()
     assert.equal(controls.length, beforeUnknown + 1)
@@ -276,14 +290,7 @@ test("workspace preserves bot and message requests while routing native decision
     work.state = "finished"; work.outcome = "completed"
     await render().refresh()
     await assert.rejects(render().interruptWork("work"), /停不了/)
-    await assert.rejects(render().answerApproval("work", "req", { decision: "decline" }), /找不到这个请求/)
-    work.state = "waiting_approval"; work.outcome = null
-    const choices = work.open_approvals[0].form
-    work.open_approvals[0].form = { questions: [{ id: "secret", header: "密码", question: "请输入", is_secret: true }] }
-    await render().refresh()
-    await assert.rejects(render().answerApproval("work", "req", { decision: "accept" }), /执行设备上填写/)
-    assert.equal(controls.length, beforeUnknown + 1)
-    work.open_approvals[0].form = choices
+    work.state = "running"; work.outcome = null
     await render().refresh()
     await assert.rejects(render().createBot({ name: "large", instructions: "中".repeat(2731) }), /8192/)
     assert.equal(render().pendingBot, null)
@@ -451,52 +458,34 @@ const pendingResult = () => {
 }
 const settleComponent = () => new Promise(setImmediate)
 
-test("approvals submit only the person's selected response and keep sensitive input on the device", async () => {
-  const responses: unknown[][] = []
-  const request = { request_id: "approval", kind: "item/commandExecution/requestApproval", summary: "运行命令", form: { command: "npm test", choices: [{ label: "批准一次", response: { decision: "accept" } }, { label: "拒绝", response: { decision: "decline" } }] } }
-  const work = { work_id: "work", target_node: "worker", state: "waiting_approval" }
-  const workspace = { generation: 1, writable: true, nodes: [{ device_id: 'worker', online: true, revoked: false }], run: (action: () => Promise<void>) => action(), answerApproval: async (...args: unknown[]) => { responses.push(args) } }
-  class Answers { get(name: string) { return name === 'answer-0' ? '当前目录' : name === 'answer-1' ? '是' : null } }
-  const app = componentHarness('./task-activity.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', approvalRisk, approvalKind } }, { FormData: Answers })
+test("alert cards answer with a fixed choice or a short reply and keep the decision id until the session confirms", async () => {
+  const sent: unknown[][] = [], resolved: unknown[][] = []
+  let status = "unknown"
+  const workspace = { generation: 1, writable: true, nodes: [], run: (action: () => Promise<void>) => action(), announce() {},
+    sendDecision: async (...args: unknown[]) => { sent.push(args); return { decision_id: args[1], status } }, resolveAlert: async (...args: unknown[]) => { resolved.push(args) } }
+  const app = componentHarness('./alert-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备' }, './storage': { newId: () => `id-${sent.length}` } })
+  const alert = { alert_id: 'alert', matter: 'm', agent: 'codex', session_id: 'thread', choices: [{ label: '批准' }, { label: '拒绝' }], cwd: '/p', severity: 'attention', summary: '要不要继续', count: 2, node: 'worker', created_at_ms: 1, resolution: null }
+  const button = (elements: { props: Record<string, unknown> }[], label: string) => elements.find(({ props }) => props.children === label)
   try {
-    let elements = app.render('ApprovalCard', { work, request })
-    assert.deepEqual(responses, [])
-    await elements.find(({ props }) => props.children === '拒绝')?.props.action?.()
-    assert.deepEqual(responses, [['work', 'approval', { decision: 'decline' }]])
-    elements = app.render('ApprovalCard', { work: { ...work, state: 'finished' }, request })
-    assert.equal(elements.find(({ props }) => props.children === '同意一次')?.props.disabled, true)
-    elements = app.render('ApprovalCard', { work, request: { ...request, form: { choices: [{ label: "取消本轮", response: { decision: "cancel" } }] } } })
-    assert.equal(elements.some(({ props }) => props.children === '拒绝并停止'), true)
-    assert.equal(elements.some(({ props }) => props.children === '同意一次'), false)
-    const scope = { id: 'scope', header: '范围', question: '选择范围', options: [{ label: '当前目录' }] }
-    elements = app.render('ApprovalCard', { work, request: { ...request, form: { questions: [scope] } } })
-    await elements.find(({ props }) => props.children === '当前目录')?.props.action?.()
-    assert.deepEqual(JSON.parse(JSON.stringify(responses[1])), ['work', 'approval', { answers: { scope: { answers: ['当前目录'] } } }])
-    elements = app.render('ApprovalCard', { work, request: { ...request, form: { questions: [scope, { id: 'go', header: '继续', question: '继续吗' }] } } })
-    elements.find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {}, currentTarget: { reportValidity: () => true } })
-    await settleComponent()
-    assert.deepEqual(JSON.parse(JSON.stringify(responses[2])), ['work', 'approval', { answers: { scope: { answers: ['当前目录'] }, go: { answers: ['是'] } } }])
-    elements = app.render('ApprovalCard', { work, request: { ...request, form: { questions: [{ id: 'secret', header: '密码', question: '请输入', is_secret: true }] } } })
-    assert.equal(elements.some(({ props }) => props.action), false)
-    assert.equal(elements.some(({ props }) => props.children === '到执行设备上填写'), true)
-    // Other devices see only the summary; the answer form exists where the work runs.
-    elements = app.render('ApprovalCard', { work, request: { ...request, form: undefined } })
-    assert.equal(elements.some(({ props }) => props.action), false)
-    assert.equal(elements.some(({ props }) => props.children === '到执行设备上处理'), true)
+    let elements = app.render('AlertCard', { alert })
+    assert.equal(elements.some(({ type }) => type === 'form'), false, 'a decision with choices has no free text')
+    await (button(elements, '拒绝')?.props.action as () => Promise<void>)()
+    const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
+    assert.deepEqual(plain(sent[0]), [alert, 'id-0', { choice: 1 }])
+    elements = app.render('AlertCard', { alert })
+    assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'an unconfirmed send says so')
+    status = 'delivered'
+    await (button(app.render('AlertCard', { alert }), '拒绝')?.props.action as () => Promise<void>)()
+    assert.deepEqual(plain(sent[1]), [alert, 'id-0', { choice: 1 }], 'the same answer reuses the decision id')
+    assert.deepEqual(plain(resolved), [[alert, 'decided']])
+    elements = app.render('AlertCard', { alert: { ...alert, choices: [] } })
+    assert.equal(elements.some(({ type }) => type === 'form'), true, 'a Codex session without choices takes a reply')
+    elements = app.render('AlertCard', { alert: { ...alert, choices: [], agent: 'claude' } })
+    assert.equal(elements.some(({ type }) => type === 'form'), false, 'a Claude Code session has no channel back')
+    elements = app.render('AlertCard', { alert: { ...alert, resolution: 'dismissed' } })
+    assert.equal(button(elements, '批准'), undefined, 'a handled alert offers no answers')
   } finally { app.close() }
 })
-
-test("approval risk names deletion, force push, permissions, downloads and folders outside the allowed roots", () => {
-  const risk = (command: string, cwd = "/p") => approvalRisk({ command, cwd }, ["/p"])
-  assert.equal(risk("npm test"), "")
-  assert.equal(risk("rm -rf dist"), "会删除文件")
-  assert.equal(risk("git push -f origin main"), "会覆盖远端的提交记录")
-  assert.equal(risk("sudo make install"), "会改动权限")
-  assert.equal(risk("pnpm add lodash"), "会从网络下载")
-  assert.equal(risk("ls", "/etc"), "在可用文件夹之外")
-  assert.equal(risk("ls", "/p/sub"), "")
-})
-
 
 test("any entrance stops an unfinished task once, even on another device", async () => {
   const stopped: string[] = []

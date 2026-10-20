@@ -21,7 +21,6 @@ const patterns: [RegExp, string][] = [
   [/conversation moved meanwhile/i, '这个对话刚换过负责的设备，已刷新。请确认后再试。'],
   [/management reply changed/i, '回复状态已变化，请刷新后再停止。'],
   [/scheduled on another device/i, '这条回复由另一台设备负责，请到那台设备上停止。'],
-  [/answered on the executing device/i, '这个请求要在执行任务的设备上回答。'],
   [/already answered or expired|executor restarted; this request expired/i, '这个请求已经回答过或已过期。'],
   [/not waiting for an answer/i, '这个任务现在不需要回答。'],
   [/answer every question|answers? (is|are) (missing|required)|answers must be text/i, '请回答每个问题后再提交。'],

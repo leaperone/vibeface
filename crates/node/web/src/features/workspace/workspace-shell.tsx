@@ -77,8 +77,6 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     setCreatingBot(true); setOpenMobile(false)
   }
 
-  const waitingHere = Boolean(workspace.data?.works.some((work) => work.open_approvals.length))
-
   return (
     <CreateBot.Provider value={openCreator}>
       <a className="skip-link" href="#main">跳到主要内容</a>
@@ -101,7 +99,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
               <SidebarMenu>
                 {workspace.bots.map((bot) => {
                   const active = chatRoute && bot.bot_id === workspace.selectedBot?.bot_id
-                  const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id) || bot.bot_id === workspace.selectedBot?.bot_id && waitingHere)
+                  const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id))
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
