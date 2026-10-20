@@ -513,7 +513,7 @@ class Node:
                 capture_output=True, timeout=45)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
-        require(result.returncode == 0, f"{name}: CLI initialization succeeds")
+        require(result.returncode == 0, f"{name}: CLI initialization succeeds: {result.stderr.decode(errors='replace')[-300:]}")
         require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": 7},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
@@ -2176,10 +2176,13 @@ def phase4_acceptance(options):
                 "a message through entrance B continues the owner's native Agent session")
         require(any("p4-m2" in text for text in t2["messages"]), "the turn reads the message sent through B")
         wait_for("all entrances converge", lambda: converged(members, network), timeout=60)
-        views = {name: [(row["message_id"], row["text"]) for row in client.rpc("conversation", conversation_id=conversation)["messages"]]
-                 for name, client in (("A", a.client), ("B", at_b), ("P", at_p))}
-        require(views["A"] == views["B"] == views["P"], "every entrance shows the same conversation")
-        passed("cross-entrance-context", messages=len(views["A"]), native_session=t1["native_session_id"][:24],
+
+        def same_views():
+            seen = [[(row["message_id"], row["text"]) for row in client.rpc("conversation", conversation_id=conversation)["messages"]]
+                    for client in (a.client, at_b, at_p)]
+            return seen[0] if seen[0] == seen[1] == seen[2] else None
+        shown = wait_for("every entrance shows the same conversation", same_views, timeout=30)
+        passed("cross-entrance-context", messages=len(shown), native_session=t1["native_session_id"][:24],
                thread=done["thread_id"][:24], resumed=t2["resumed"])
 
         task_dir = folder("p4-task")
@@ -2300,6 +2303,8 @@ def phase4_acceptance(options):
             send(a.client, f"p4-pad-{index}", f"p4-pad-{index} " + "背景资料" * 1200, report_results=False)
         for index in range(6):
             turn(a, f"message:p4-pad-{index}")
+        for work_id in (done_id, not_id):
+            turn(a, "work:" + work_id)
         wait_for("A condenses the long history into a checkpoint", lambda: any(
             event["body"]["type"] == "context_checkpoint" for event in scope_events(a, network, conversation)), timeout=90)
         wait_for("the checkpoint reaches B", lambda: any(
