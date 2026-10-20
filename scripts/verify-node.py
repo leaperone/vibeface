@@ -961,14 +961,14 @@ def fixture_manager(arguments):
         require(completed.returncode == 0, "fixture host command exits successfully")
     if autonomous:
         require(read_only, "work results in report mode have server-enforced read-only authority")
-        tool("dispatch_work", {"prompt": "forbidden", "cwd": initial["cwd"], "call_ref": "forbidden-followup"},
+        tool("dispatch_work", {"title": "forbidden", "prompt": "forbidden", "cwd": initial["cwd"], "call_ref": "forbidden-followup"},
              expected=False)
         status = tool("work_status", {"work_id": body["work_id"]})
         fixture_record(run, "manager-results.jsonl", {"trigger": trigger, "work_id": body["work_id"],
                        "outcome": body.get("outcome"), "status_outcome": status["outcome"]})
     dispatch = directive.get("dispatch")
     if dispatch:
-        arguments = {"prompt": json.dumps(dispatch["native"]), "cwd": dispatch["cwd"], "call_ref": "work-" + dispatch["label"],
+        arguments = {"title": dispatch.get("title", dispatch["label"]), "prompt": json.dumps(dispatch["native"]), "cwd": dispatch["cwd"], "call_ref": "work-" + dispatch["label"],
                      **{key: dispatch[key] for key in ("parent", "target_node", "executor", "continues") if key in dispatch}}
         for index in range(dispatch.get("repeat", 1)):
             work = tool("dispatch_work", arguments, discard=dispatch.get("discard_first", False) and index == 0)
@@ -2188,7 +2188,7 @@ def phase4_acceptance(options):
                                        "native": {"gate": str(task_dir / "release"), "approval": True}},
                           "tools": [{"name": "answer_approval", "arguments": {"work_id": "any", "request_id": "any"},
                                      "accepted": False, "rejection": "unknown or unavailable"},
-                                    {"name": "dispatch_work", "arguments": {"prompt": "bounce", "cwd": str(task_dir), "call_ref": "bounce",
+                                    {"name": "dispatch_work", "arguments": {"title": "bounce", "prompt": "bounce", "cwd": str(task_dir), "call_ref": "bounce",
                                                                             "executor": "agent", "target_node": a.device_id},
                                      "accepted": False, "rejection": "only starts Codex work on its own device"}]}
         r3 = send(a.client, "p4-m3", {"label": "p4-m3", "dispatch": {"label": "p4-task", "cwd": str(task_dir), "executor": "agent",
@@ -2226,9 +2226,9 @@ def phase4_acceptance(options):
         passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b))
 
         r4 = send(a.client, "p4-m4", {"label": "p4-m4", "tools": [
-            {"name": "dispatch_work", "arguments": {"prompt": "outside", "cwd": str(run), "call_ref": "outside-codex"},
+            {"name": "dispatch_work", "arguments": {"title": "outside", "prompt": "outside", "cwd": str(run), "call_ref": "outside-codex"},
              "accepted": False, "rejection": "outside configured roots"},
-            {"name": "dispatch_work", "arguments": {"prompt": "outside", "cwd": str(run), "call_ref": "outside-agent",
+            {"name": "dispatch_work", "arguments": {"title": "outside", "prompt": "outside", "cwd": str(run), "call_ref": "outside-agent",
                                                     "executor": "agent", "target_node": b.device_id}}]})
         turn(a, r4["trigger"])
         remote = next(row for row in records(a, "manager-tools.jsonl") if row["call_ref"] == "outside-agent")["result"]

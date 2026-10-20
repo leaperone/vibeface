@@ -110,6 +110,7 @@ impl Runtime {
                     call_ref: call_ref.into(),
                     executor,
                     cwd: field(&args, "cwd")?.into(),
+                    title: field(&args, "title")?.chars().take(120).collect(),
                     prompt: field(&args, "prompt")?.into(),
                     continues: optional("continues"),
                     parent: task.map(String::from).or_else(|| optional("parent")),

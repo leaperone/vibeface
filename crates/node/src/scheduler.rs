@@ -657,9 +657,10 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
         (
             "dispatch_work",
             "Start work in cwd on target_node (default: this device). executor=codex (default) runs one native Codex turn, its approvals pinned to the user and its sandbox to cwd; executor=agent hands the task to another device's assistant. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up.",
-            json!({"prompt":string(),"cwd":string(),"call_ref":string(),"target_node":string(),
+            json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
+                "prompt":string(),"cwd":string(),"call_ref":string(),"target_node":string(),
                 "executor":{"type":"string","enum":["codex","agent"]},"parent":string(),"continues":string()}),
-            vec!["prompt", "cwd", "call_ref"],
+            vec!["title", "prompt", "cwd", "call_ref"],
         ),
         (
             "work_status",

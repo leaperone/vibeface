@@ -146,6 +146,8 @@ pub enum EventBody {
         call_ref: String,
         executor: Executor,
         cwd: String,
+        /// A short line for the user; `prompt` is what the executor gets.
+        title: String,
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continues: Option<String>,
@@ -370,6 +372,7 @@ pub struct WorkProjection {
     pub dispatcher: DeviceId,
     pub executor: Executor,
     pub cwd: String,
+    pub title: String,
     pub prompt: String,
     pub phase: Option<WorkPhase>,
     pub summary: String,

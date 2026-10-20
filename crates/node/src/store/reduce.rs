@@ -265,6 +265,7 @@ pub(crate) fn works_from(
             dispatcher,
             executor,
             cwd,
+            title,
             prompt,
             ..
         } = serde_json::from_str(&dispatch)?
@@ -321,6 +322,7 @@ pub(crate) fn works_from(
             dispatcher,
             executor,
             cwd,
+            title,
             prompt,
             phase,
             summary,
