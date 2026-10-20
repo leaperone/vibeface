@@ -12,11 +12,11 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseAlerts, parseDecision,
 } from "./model"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
-  AutonomyMode, ConversationPayload, NodeInfo, NotificationRecord,
+  Alert, ConversationPayload, NodeInfo, NotificationRecord,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus,
 } from "./types"
 
@@ -56,6 +56,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
+  const [alerts, setAlerts] = useState<Alert[]>([])
+  const alertsRef = useRef<Alert[]>([])
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([])
   const [bots, setBots] = useState<BotRecord[]>([])
   const [pendingBot, setPendingBot] = useState<PendingBot | null>(null)
@@ -218,13 +220,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawNotifications, rawBots, rawWrite] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"),
+      const [rawNodes, rawNotifications, rawBots, rawWrite, rawAlerts] = await Promise.all([
+        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("alerts"),
       ])
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
-      const nextBots = parseBots(rawBots)
+      const nextBots = parseBots(rawBots), nextAlerts = parseAlerts(rawAlerts)
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setWriteState(parseWriteStatus(rawWrite))
+      alertsRef.current = nextAlerts; setAlerts(nextAlerts)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
@@ -258,11 +261,10 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const recorded = async (item: OutboxItem) => {
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
     if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
+    if (item.method === "resolve_alert") return parseAlerts(await connection.rpc("alerts")).some((alert) => alert.alert_id === item.params.alert_id && alert.resolution !== null)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
-    if (item.method === "answer_approval") return !context.works.some((work) => work.work_id === item.params.work_id && work.open_approvals.some((request) => request.request_id === item.params.request_id))
-    if (item.method === "set_autonomy") return context.autonomy.version !== item.params.expected_version
     if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
     if (item.method === "resolve") return !context.pending_checks.some((check) => check.check_id === item.params.check_id)
     return true
@@ -433,7 +435,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, bots, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, alerts, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
@@ -495,24 +497,6 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    setAutonomy: (mode: AutonomyMode) => withMutation(`autonomy:${activeId.current}`, async () => {
-      const id = activeId.current, context = requireBotContext(id)
-      const version = context.autonomy.version
-      if (version === null) throw new Error("后面的记录读不到，请再查一次。")
-      const attestation = await attest(id, { type: "autonomy_set", mode, version: version + 1 })
-      try { await signedWrite("autonomy", `${id}:${version}`, "set_autonomy", { conversation_id: id, mode, expected_version: version, attestation }) }
-      catch (caught) {
-        if (caught instanceof Error && caught.message.includes("refresh")) {
-          if (activeId.current === id) await refreshRef.current()
-          throw new Error("后续授权已在别处更改，已刷新。请确认当前设置后再改。")
-        }
-        requireControlRefresh()
-        throw caught
-      }
-      requireCurrent()
-      setNoticeText(mode === "off" ? "已停止这个对话的后续。" : mode === "report" ? "后续只汇报结果，不再继续动手。" : "已允许 Agent 收到结果后继续工作。")
-      if (activeId.current === id) await refreshRef.current()
-    }),
     takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
       if (!context.conversation) throw new Error("这台设备上还没有这个对话，可能还在同步。")
@@ -527,7 +511,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
       const work = context.works.find((item) => item.work_id === workId)
-      if (!work || work.outcome || !["accepted", "starting", "running", "waiting_approval"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
+      if (!work || work.outcome || !["accepted", "starting", "running"].includes(work.state ?? "")) throw new Error("这个任务现在停不了，请再查一次。")
       let receipt: Record<string, unknown>
       try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
       catch (caught) { requireControlRefresh(); throw caught }
@@ -535,19 +519,25 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       setNoticeText(receipt.waiting_for_device === true ? "已请求、等待设备确认。" : "已请求停止任务。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    answerApproval: (workId: string, requestId: string, response: unknown) => withMutation(`work-control:${workId}`, async () => {
-      const id = activeId.current, context = requireBotContext(id)
-      const work = context.works.find((item) => item.work_id === workId)
-      const request = work?.open_approvals.find((item) => item.request_id === requestId)
-      if (!work || work.state !== "waiting_approval" || !request?.form) throw new Error("找不到这个请求，请再查一次。")
-      if (request.form.questions?.some((question) => question.is_secret)) throw new Error("这项内容请到执行设备上填写。")
-      const chosen = (response as { decision?: unknown } | null)?.decision
-      const attestation = await attest(id, { type: "approval_answered", work_id: workId, request_id: requestId, decision: typeof chosen === "string" ? chosen : "answered" })
-      try { await signedWrite("approval", `${workId}:${requestId}`, "answer_approval", { conversation_id: id, work_id: workId, request_id: requestId, response, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+    /**
+     * The person's answer to a triaged session, through the same downlink Grok Bot uses.
+     * Retrying with the same decision_id only reads back what the session already has.
+     */
+    sendDecision: (alert: Alert, decisionId: string, answer: { text: string } | { choice: number }) => withMutation(`decision:${alert.alert_id}`, async () => {
+      const thread = alert.thread_id ?? alert.session_id
+      const params = "text" in answer ? { text: inputText(answer.text, "回复", 65536) } : { choice: answer.choice }
+      const result = parseDecision(await connection.rpc("send_decision", { node: alert.node, thread_id: thread, decision_id: decisionId, alert_id: alert.alert_id, ...params }))
       requireCurrent()
-      setNoticeText("已提交。")
-      if (activeId.current === id) await refreshRef.current()
+      if (result.decision_id !== decisionId) throw new Error("送达结果和这次回复对不上，请再查一次。")
+      scheduleRefresh()
+      return result
+    }),
+    resolveAlert: (alert: Alert, resolution: "decided" | "dismissed") => withMutation(`alert:${alert.alert_id}`, async () => {
+      if (alertsRef.current.find((item) => item.alert_id === alert.alert_id)?.resolution) return
+      const attestation = await attest("attention", { type: "attention_resolved", alert_id: alert.alert_id, resolution })
+      await signedWrite("alert", alert.alert_id, "resolve_alert", { alert_id: alert.alert_id, resolution, attestation })
+      requireCurrent()
+      await refreshRef.current()
     }),
     reconcileCheck: (check: PendingCheck) => withMutation(`pending-check:${check.check_id}`, async () => {
       const id = activeId.current

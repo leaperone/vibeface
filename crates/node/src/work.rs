@@ -3,7 +3,6 @@
 //! the pending-check list and the Web state all derive from it.
 use crate::{crypto::digest, model::*};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkSpec {
@@ -16,7 +15,7 @@ pub struct WorkSpec {
     pub target: DeviceId,
     pub dispatcher: DeviceId,
     pub call_ref: String,
-    pub executor: Executor,
+    pub kind: WorkKind,
     pub cwd: String,
     pub title: String,
     pub prompt: String,
@@ -67,40 +66,28 @@ pub struct StopRequest {
 pub struct Handle {
     pub thread_id: String,
     pub turn_id: String,
-    /// The executor host epoch; requests from an older epoch can no longer be answered.
+    /// The App Server epoch; requests from an older epoch can no longer be answered.
     pub epoch: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PendingApproval {
-    pub request_id: String,
-    pub rpc_id: Value,
-    pub method: String,
-    pub params: Value,
-    pub kind: String,
-    pub summary: String,
-    /// Set before the answer is sent; a resolution while set is this Node's own answer.
-    pub answering: bool,
-}
-
-pub fn request_id(work_id: &str, epoch: u64, rpc_id: &Value) -> String {
-    digest(&serde_json::to_vec(&(work_id, epoch, rpc_id)).expect("json"))
-}
+/// How long the Agent that registered a work may send its `turn/start`; afterwards it must not.
+pub const SEND_WINDOW_MS: i64 = 60_000;
+/// After the send window plus this grace, the Node settles a work that never showed up.
+pub const RECONCILE_GRACE_MS: i64 = 30_000;
+/// Two persisted progress updates of one work are at least this far apart.
+pub const PROGRESS_INTERVAL_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum WorkState {
     Accepted,
-    /// The thread ID is journaled before `turn/start`, so a crash can be reconciled.
+    /// The thread is journaled before the Agent sends `turn/start`, so the Node can look for
+    /// the turn by its `clientUserMessageId` (the work ID).
     Starting {
         thread: Option<String>,
     },
     Running {
         handle: Handle,
-    },
-    WaitingApproval {
-        handle: Handle,
-        approvals: Vec<PendingApproval>,
     },
     Interrupting {
         handle: Handle,
@@ -108,7 +95,7 @@ pub enum WorkState {
     Finished {
         outcome: WorkOutcome,
     },
-    /// The real result cannot be proven. `probe` says a later executor probe may settle it;
+    /// The real result cannot be proven. `probe` says a later App Server probe may settle it;
     /// otherwise only the user does.
     Unverified {
         handle: Option<Handle>,
@@ -120,9 +107,7 @@ pub enum WorkState {
 impl WorkState {
     pub fn handle(&self) -> Option<&Handle> {
         match self {
-            Self::Running { handle }
-            | Self::WaitingApproval { handle, .. }
-            | Self::Interrupting { handle } => Some(handle),
+            Self::Running { handle } | Self::Interrupting { handle } => Some(handle),
             Self::Unverified { handle, .. } => handle.as_ref(),
             _ => None,
         }
@@ -135,7 +120,6 @@ impl WorkState {
             Self::Accepted => "accepted",
             Self::Starting { .. } => "starting",
             Self::Running { .. } => "running",
-            Self::WaitingApproval { .. } => "waiting_approval",
             Self::Interrupting { .. } => "interrupting",
             Self::Finished { .. } => "finished",
             Self::Unverified { .. } => "unverified",
@@ -149,12 +133,17 @@ pub struct WorkRecord {
     pub state: WorkState,
     /// Latest final-answer text of the turn; reported once in `WorkFinished`.
     pub text: String,
+    /// The Agent may send `turn/start` only before this time.
+    pub send_by_ms: i64,
+    /// The last persisted progress summary and when it was written.
+    pub progress: String,
+    pub progress_at_ms: i64,
 }
 
-/// What a probe of the executor found for the journaled thread.
+/// What a probe of the App Server found for the journaled thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Probe {
-    /// The turn exists and is still running under the current executor epoch.
+    /// The turn exists and is still running under the current App Server epoch.
     Running { turn_id: String, epoch: u64 },
     Terminal {
         turn_id: String,
@@ -168,6 +157,13 @@ pub enum Probe {
     Missing,
 }
 
+impl WorkRecord {
+    /// A work that never reached `Running` is settled by the Node only after the Agent's window.
+    pub fn send_window_over(&self, at: i64) -> bool {
+        at >= self.send_by_ms + RECONCILE_GRACE_MS
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Signal {
     ThreadCreated(String),
@@ -175,28 +171,14 @@ pub enum Signal {
         turn_id: String,
         epoch: u64,
     },
-    /// The executor proved nothing started.
+    /// Nothing started: the Agent reported a refusal, or the window passed without a turn.
     StartRejected(String),
-    /// The start may or may not have happened.
-    StartUnknown(String),
     Text(String),
-    ApprovalRequested {
-        rpc_id: Value,
-        method: String,
-        params: Value,
-        kind: String,
+    /// A plan or commentary update; persisted at most every `PROGRESS_INTERVAL_MS`.
+    Progress {
         summary: String,
-        epoch: u64,
+        at_ms: i64,
     },
-    ApprovalAnswering(String),
-    ApprovalAnswerFailed(String),
-    ApprovalAnswered {
-        request_id: String,
-        decision: ApprovalDecision,
-        attestation: Attestation,
-    },
-    /// The executor reports a request resolved; unless this Node was answering it, someone bypassed it.
-    ApprovalResolved(Value),
     InterruptRequested,
     TurnCompleted {
         turn_id: String,
@@ -204,7 +186,7 @@ pub enum Signal {
         text: String,
         error: Option<String>,
     },
-    /// The executor host restarted; live requests from the old epoch are gone.
+    /// The App Server restarted; live requests from the old epoch are gone.
     Disconnected,
     Probed(Probe),
     InterruptTimedOut,
@@ -218,13 +200,13 @@ pub enum Signal {
     },
 }
 
-pub fn accept(spec: WorkSpec) -> (WorkRecord, EventBody) {
+pub fn accept(spec: WorkSpec, at: i64) -> (WorkRecord, EventBody) {
     let event = EventBody::WorkDispatched {
         work_id: spec.work_id.clone(),
         trigger: spec.trigger.clone(),
         dispatcher: spec.dispatcher.clone(),
         call_ref: spec.call_ref.clone(),
-        executor: spec.executor,
+        kind: spec.kind,
         cwd: spec.cwd.clone(),
         title: spec.title.clone(),
         prompt: spec.prompt.clone(),
@@ -236,6 +218,9 @@ pub fn accept(spec: WorkSpec) -> (WorkRecord, EventBody) {
             spec,
             state: WorkState::Accepted,
             text: String::new(),
+            send_by_ms: at + SEND_WINDOW_MS,
+            progress: String::new(),
+            progress_at_ms: 0,
         },
         event,
     )
@@ -331,119 +316,28 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         (Accepted | Starting { .. }, Signal::StartRejected(reason)) => {
             finish(record, WorkOutcome::Rejected, Some(reason))
         }
-        (Accepted | Starting { .. }, Signal::StartUnknown(reason)) => {
-            unverified(record, None, &reason, true)
-        }
-        (Running { .. } | WaitingApproval { .. } | Interrupting { .. }, Signal::Text(text)) => {
+        (Running { .. } | Interrupting { .. }, Signal::Text(text)) => {
             record.text = bounded(&text);
             None
         }
-        (
-            Running { handle } | WaitingApproval { handle, .. },
-            Signal::ApprovalRequested {
-                rpc_id,
-                method,
-                params,
-                kind,
-                summary,
-                epoch,
-            },
-        ) if epoch == handle.epoch => {
-            let request_id = request_id(&record.spec.work_id, epoch, &rpc_id);
-            let mut approvals = match &record.state {
-                WaitingApproval { approvals, .. } => approvals.clone(),
-                _ => Vec::new(),
-            };
-            if approvals.iter().any(|known| known.request_id == request_id) {
+        (Running { .. }, Signal::Progress { summary, at_ms }) => {
+            let summary: String = summary.chars().take(500).collect();
+            if summary.trim().is_empty()
+                || summary == record.progress
+                || at_ms < record.progress_at_ms + PROGRESS_INTERVAL_MS
+            {
                 return None;
             }
-            approvals.push(PendingApproval {
-                request_id: request_id.clone(),
-                rpc_id,
-                method,
-                params,
-                kind: kind.clone(),
-                summary: summary.clone(),
-                answering: false,
-            });
-            record.state = WaitingApproval { handle, approvals };
-            Some(EventBody::ApprovalRequested {
-                work_id: record.spec.work_id.clone(),
-                request_id,
-                kind,
-                summary: bounded(&summary),
-            })
+            record.progress = summary;
+            record.progress_at_ms = at_ms;
+            progress(record, WorkPhase::Running, &record.progress.clone())
         }
-        (
-            WaitingApproval {
-                handle,
-                mut approvals,
-            },
-            Signal::ApprovalAnswering(request),
-        ) => {
-            let approval = approvals.iter_mut().find(|a| a.request_id == request)?;
-            approval.answering = true;
-            record.state = WaitingApproval { handle, approvals };
-            None
-        }
-        (
-            WaitingApproval {
-                handle,
-                mut approvals,
-            },
-            Signal::ApprovalAnswerFailed(request),
-        ) => {
-            let approval = approvals.iter_mut().find(|a| a.request_id == request)?;
-            approval.answering = false;
-            record.state = WaitingApproval { handle, approvals };
-            None
-        }
-        (
-            WaitingApproval {
-                handle,
-                mut approvals,
-            },
-            Signal::ApprovalAnswered {
-                request_id,
-                decision,
-                attestation,
-            },
-        ) => {
-            let before = approvals.len();
-            approvals.retain(|approval| approval.request_id != request_id);
-            if approvals.len() == before {
-                return None;
-            }
-            record.state = if approvals.is_empty() {
-                Running { handle }
-            } else {
-                WaitingApproval { handle, approvals }
-            };
-            Some(EventBody::ApprovalAnswered {
-                work_id: record.spec.work_id.clone(),
-                request_id,
-                decision,
-                attestation: Some(attestation),
-            })
-        }
-        (WaitingApproval { handle, approvals }, Signal::ApprovalResolved(rpc_id)) => {
-            let approval = approvals.iter().find(|a| a.rpc_id == rpc_id)?;
-            if approval.answering {
-                return None;
-            }
-            unverified(
-                record,
-                Some(handle),
-                "审批请求在本设备之外被处理；无法确认执行结果",
-                false,
-            )
-        }
-        (Running { handle } | WaitingApproval { handle, .. }, Signal::InterruptRequested) => {
+        (Running { handle }, Signal::InterruptRequested) => {
             record.state = Interrupting { handle };
             progress(record, WorkPhase::Interrupting, "正在停止")
         }
         (
-            Running { handle } | WaitingApproval { handle, .. } | Interrupting { handle },
+            Running { handle } | Interrupting { handle },
             Signal::TurnCompleted {
                 turn_id,
                 status,
@@ -470,10 +364,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             "停止请求未得到执行器确认；无法确认是否仍在运行",
             true,
         ),
-        (
-            Running { handle } | WaitingApproval { handle, .. } | Interrupting { handle },
-            Signal::Disconnected,
-        ) => {
+        (Running { handle } | Interrupting { handle }, Signal::Disconnected) => {
             record.state = Unverified {
                 handle: Some(handle),
                 evidence: DISCONNECTED.into(),
@@ -481,20 +372,17 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             };
             None
         }
-        (Accepted | Starting { thread: None }, Signal::Disconnected) => finish(
-            record,
-            WorkOutcome::Rejected,
-            Some("执行器在启动前退出".into()),
-        ),
         (
             Starting {
                 thread: Some(thread),
             },
             Signal::Probed(probe),
         ) => match probe {
-            Probe::NotStarted | Probe::Missing => {
-                finish(record, WorkOutcome::Rejected, Some("执行未开始".into()))
-            }
+            Probe::NotStarted | Probe::Missing => finish(
+                record,
+                WorkOutcome::Rejected,
+                Some("协调 Agent 没有在时限内开始这项工作".into()),
+            ),
             Probe::Running { turn_id, epoch } => {
                 record.state = Running {
                     handle: Handle {
@@ -531,7 +419,6 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         },
         (
             Running { handle }
-            | WaitingApproval { handle, .. }
             | Interrupting { handle }
             | Unverified {
                 handle: Some(handle),
@@ -608,24 +495,26 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn record() -> WorkRecord {
-        accept(WorkSpec {
-            work_id: "w".into(),
-            conversation: "c".into(),
-            trigger: "message:m".into(),
-            attempt: "a".into(),
-            target: "t".into(),
-            dispatcher: "t".into(),
-            call_ref: "r".into(),
-            executor: Executor::Codex,
-            cwd: "/tmp".into(),
-            title: "do".into(),
-            prompt: "do".into(),
-            continues: None,
-            parent: None,
-        })
+        accept(
+            WorkSpec {
+                work_id: "w".into(),
+                conversation: "c".into(),
+                trigger: "message:m".into(),
+                attempt: "a".into(),
+                target: "t".into(),
+                dispatcher: "t".into(),
+                call_ref: "r".into(),
+                kind: WorkKind::Codex,
+                cwd: "/tmp".into(),
+                title: "do".into(),
+                prompt: "do".into(),
+                continues: None,
+                parent: None,
+            },
+            0,
+        )
         .0
     }
 
@@ -649,54 +538,33 @@ mod tests {
         work
     }
 
-    fn approval(rpc: i64, epoch: u64) -> Signal {
-        Signal::ApprovalRequested {
-            rpc_id: json!(rpc),
-            method: "item/commandExecution/requestApproval".into(),
-            params: json!({}),
-            kind: "command".into(),
-            summary: "ls".into(),
-            epoch,
-        }
+    #[test]
+    fn progress_is_persisted_only_when_new_and_spaced() {
+        let mut work = running();
+        let update = |summary: &str, at_ms| Signal::Progress {
+            summary: summary.into(),
+            at_ms,
+        };
+        assert!(transition(&mut work, update("读代码", 10_000)).is_some());
+        assert!(transition(&mut work, update("读代码", 20_000)).is_none());
+        assert!(transition(&mut work, update("改代码", 12_000)).is_none());
+        assert!(matches!(
+            transition(&mut work, update("改代码", 15_000)),
+            Some(EventBody::WorkProgress { ref summary, .. }) if summary == "改代码"
+        ));
     }
 
     #[test]
-    fn approvals_answer_once_and_stale_epochs_are_ignored() {
+    fn missing_turn_and_unconfirmed_interrupt_become_unverified() {
         let mut work = running();
-        assert!(transition(&mut work, approval(7, 0)).is_none());
-        let Some(EventBody::ApprovalRequested { request_id, .. }) =
-            transition(&mut work, approval(7, 1))
-        else {
-            panic!("approval must be recorded");
-        };
-        assert_eq!(request_id, super::request_id("w", 1, &json!(7)));
-        assert!(transition(&mut work, approval(7, 1)).is_none());
-        transition(&mut work, Signal::ApprovalAnswering(request_id.clone()));
-        assert!(transition(&mut work, Signal::ApprovalResolved(json!(7))).is_none());
-        let answered = Signal::ApprovalAnswered {
-            request_id: request_id.clone(),
-            decision: ApprovalDecision::Decline,
-            attestation: Attestation {
-                device_id: "c".repeat(64),
-                signature: "s".into(),
-            },
-        };
-        assert!(transition(&mut work, answered.clone()).is_some());
-        assert!(transition(&mut work, answered).is_none());
-        assert_eq!(work.state.name(), "running");
-    }
-
-    #[test]
-    fn bypassed_approval_and_unconfirmed_interrupt_become_unverified() {
-        let mut work = running();
-        transition(&mut work, approval(1, 1));
-        let Some(EventBody::WorkFinished { outcome, .. }) =
-            transition(&mut work, Signal::ApprovalResolved(json!(1)))
-        else {
-            panic!("bypass must be recorded");
-        };
-        assert_eq!(outcome, WorkOutcome::Unverified);
-        assert!(transition(&mut work, Signal::Probed(Probe::Missing)).is_none());
+        transition(&mut work, Signal::Disconnected);
+        assert!(matches!(
+            transition(&mut work, Signal::Probed(Probe::Missing)),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Unverified,
+                ..
+            })
+        ));
         assert!(transition(&mut work, Signal::Settled(WorkOutcome::Completed)).is_none());
         assert_eq!(
             work.state,
@@ -734,6 +602,8 @@ mod tests {
     #[test]
     fn restart_probes_settle_journaled_work_without_starting_it_again() {
         let mut work = record();
+        assert!(!work.send_window_over(SEND_WINDOW_MS));
+        assert!(work.send_window_over(SEND_WINDOW_MS + RECONCILE_GRACE_MS));
         transition(&mut work, Signal::ThreadCreated("th".into()));
         assert!(matches!(
             transition(&mut work.clone(), Signal::Probed(Probe::NotStarted)),

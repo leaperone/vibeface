@@ -373,31 +373,11 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
             attestation: None,
         })
     };
-    let answer = |decision| EventBody::ApprovalAnswered {
-        work_id: "w".into(),
-        request_id: "r".into(),
-        decision,
-        attestation: None,
-    };
-    let autonomy = |mode| EventBody::AutonomySet {
-        mode,
-        version: 3,
-        attestation: None,
-    };
-    let outcome = |store: &Store| -> Result<(Option<String>, AutonomyMode, String)> {
-        let decision = store.connection.query_row(
-            "SELECT decision FROM approvals WHERE network_id=? AND request_id='r'",
-            params![net.network],
-            |r| r.get(0),
-        )?;
-        Ok((
-            store
-                .conversation(&net.network, "c")?
-                .context("conversation")?
-                .owner,
-            store.autonomy(&net.network, "c")?.mode,
-            decision,
-        ))
+    let outcome = |store: &Store| -> Result<Option<String>> {
+        Ok(store
+            .conversation(&net.network, "c")?
+            .context("conversation")?
+            .owner)
     };
     let mut at = 10;
     let mut write =
@@ -409,24 +389,11 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
                 .hash)
         };
     let mut originals = vec![];
-    for body in [
-        owner(&net.a)?,
-        owner(&net.b)?,
-        autonomy(AutonomyMode::Off),
-        autonomy(AutonomyMode::Continue),
-        answer(ApprovalDecision::Decline),
-        answer(ApprovalDecision::Accept),
-    ] {
+    for body in [owner(&net.a)?, owner(&net.b)?] {
         originals.push(write(&mut store, &net.a, body)?);
     }
     let settled = outcome(&store)?;
-    assert_eq!(
-        settled.1,
-        AutonomyMode::Off,
-        "the stricter mode wins a same-version conflict"
-    );
-    assert_eq!(settled.2, "decline", "a refusal outranks consent");
-    let losing_owner = if settled.0 == Some(net.a.device_id()?) {
+    let losing_owner = if settled == Some(net.a.device_id()?) {
         &net.b
     } else {
         &net.a
@@ -437,12 +404,6 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
     for _ in 0..64 {
         let retry = write(&mut store, &net.b, owner(losing_owner)?)?;
         undercut |= retry < winning_owner;
-        for body in [
-            autonomy(AutonomyMode::Continue),
-            answer(ApprovalDecision::Accept),
-        ] {
-            write(&mut store, &net.b, body)?;
-        }
         assert_eq!(
             outcome(&store)?,
             settled,
@@ -609,7 +570,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         target: net.a.device_id()?,
         dispatcher: net.a.device_id()?,
         call_ref: "call-1".into(),
-        executor: Executor::Codex,
+        kind: WorkKind::Codex,
         cwd: "/tmp".into(),
         title: "t".into(),
         prompt: "p".into(),
@@ -636,56 +597,6 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         },
         6,
     )?;
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::ApprovalRequested {
-            rpc_id: serde_json::json!(7),
-            method: "item/commandExecution/requestApproval".into(),
-            params: serde_json::json!({}),
-            kind: "command".into(),
-            summary: "npm test".into(),
-            epoch: 1,
-        },
-        7,
-    )?;
-    let request_id = store.works(&net.network, "c")?[0].open_approvals[0]
-        .request_id
-        .clone();
-    let EventBody::ApprovalAnswered { attestation, .. } = net.a.fixture_admin().attest(
-        &net.network,
-        "c",
-        EventBody::ApprovalAnswered {
-            work_id: id.clone(),
-            request_id: request_id.clone(),
-            decision: ApprovalDecision::Accept,
-            attestation: None,
-        },
-    )?
-    else {
-        unreachable!()
-    };
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::ApprovalAnswered {
-            request_id: request_id.clone(),
-            decision: ApprovalDecision::Accept,
-            attestation: attestation.context("signed answer")?,
-        },
-        8,
-    )?;
-    let works = store.works(&net.network, "c")?;
-    assert!(works[0].open_approvals.is_empty());
-    assert_eq!(
-        (
-            works[0].answered_approvals[0].summary.as_str(),
-            works[0].answered_approvals[0].decision
-        ),
-        ("npm test", ApprovalDecision::Accept)
-    );
     let (_, receipt) = store.apply_work_signal(
         &net.a,
         &net.network,
@@ -742,7 +653,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             target: target.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: call.into(),
-            executor: Executor::Codex,
+            kind: WorkKind::Codex,
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -1424,4 +1335,13 @@ fn append_100k_stays_flat() -> Result<()> {
     std::fs::remove_dir_all(&dir)?;
     assert!(last < first * 3, "append cost grew: {first:?} -> {last:?}");
     Ok(())
+}
+
+#[test]
+fn autonomy_is_not_an_event() {
+    let body = serde_json::json!({"type":"autonomy_set","mode":"off","version":1});
+    assert!(
+        serde_json::from_value::<EventBody>(body).is_err(),
+        "the coordination Agent always runs with full permission; there is no autonomy setting"
+    );
 }

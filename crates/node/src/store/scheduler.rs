@@ -1,8 +1,8 @@
 //! The owner's local scheduling state. A job is keyed by its trigger, and its reply is written
 //! in the same transaction that ends it, so nothing is published twice or lost.
 use super::{
-    Store, authorize_node_from, autonomy_from, conversation_from, local_load, local_prefix,
-    local_save, log, message_from,
+    Store, authorize_node_from, conversation_from, local_load, local_prefix, local_save, log,
+    message_from,
 };
 use crate::{crypto::LocalIdentity, model::*, scheduling::*};
 use anyhow::{Context as _, Result, bail, ensure};
@@ -648,8 +648,7 @@ impl Store {
         Ok(())
     }
 
-    /// Human messages go first. A work result runs read-only under `report` and is cancelled
-    /// under `off`; the stricter setting always wins.
+    /// Human messages go first.
     pub fn claim_next(
         &mut self,
         identity: &LocalIdentity,
@@ -695,11 +694,9 @@ impl Store {
             queued.push(job);
         }
         queued.sort_by_key(|job| (job.kind != TriggerKind::Human, job.sequence));
-        let mode = autonomy_from(&tx, network, conversation)?.mode;
         let mut selected = None;
         for mut job in queued {
             let evidence = match job.kind {
-                TriggerKind::WorkResult if mode == AutonomyMode::Off => Some("自动跟进已关闭"),
                 TriggerKind::Routine if live_routine(&tx, network, &job)?.is_none() => {
                     Some("例行任务已暂停或删除")
                 }
@@ -728,10 +725,8 @@ impl Store {
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
         }
-        let read_only = job.kind == TriggerKind::WorkResult && mode == AutonomyMode::Report;
         // Reused only under the same ownership and when this basis contains what it saw.
-        let resumable = !read_only
-            && job.kind != TriggerKind::AgentTask
+        let resumable = job.kind != TriggerKind::AgentTask
             && session.native_id.is_some()
             && session
                 .covers
@@ -743,7 +738,6 @@ impl Store {
             attempt: ManagerAttempt {
                 id: uuid::Uuid::new_v4().to_string(),
                 boot: boot.into(),
-                read_only,
                 permission_version: session.permission_version,
             },
         };
@@ -825,13 +819,8 @@ impl Store {
                     ),
                     "scheduler attempt is no longer active"
                 );
-                if !job
-                    .state
-                    .attempt()
-                    .context("scheduler attempt missing")?
-                    .read_only
-                    && job.kind != TriggerKind::AgentTask
-                {
+                job.state.attempt().context("scheduler attempt missing")?;
+                if job.kind != TriggerKind::AgentTask {
                     session.native_id = Some(native_id.into());
                     session.covers = job.basis.clone();
                 }
@@ -922,7 +911,6 @@ impl Store {
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
-        write: bool,
     ) -> Result<bool> {
         let session = load_session(&self.connection, network, conversation)?;
         let Some(job) = self.scheduler_job(network, conversation, trigger)? else {
@@ -937,8 +925,7 @@ impl Store {
             && matches!(
                 job.state,
                 JobState::Claimed { .. } | JobState::Running { .. }
-            )
-            && (!write || !attempt.read_only))
+            ))
     }
 
     /// Idempotent: a job that already ended returns as is.

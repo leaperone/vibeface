@@ -1,4 +1,5 @@
 //! Personal Node coordination, authenticated replication and local SDK tools.
+pub mod agent_cli;
 pub mod api;
 pub mod client;
 pub mod config;
@@ -13,5 +14,6 @@ pub mod runtime;
 pub mod scheduler;
 pub mod scheduling;
 pub mod store;
+pub mod triage;
 pub mod update;
 pub mod work;

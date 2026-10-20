@@ -210,6 +210,9 @@ impl Runtime {
         if alpn == net::CLIENT {
             return crate::client::serve_forwarded(self, connection).await;
         }
+        if alpn == net::DECISION {
+            return self.serve_decisions(connection).await;
+        }
         let network = match self.member_node(&remote).await {
             Ok(network) => network,
             Err(error) => {
@@ -342,18 +345,12 @@ impl Runtime {
                 );
                 self.interrupt_work(network, work_id).await
             }
-            "approval_forms" => self.approval_forms(network, field(input, "work_id")?).await,
-            "answer_approval" => {
-                self.answer_approval(
-                    network,
-                    field(input, "conversation_id")?,
-                    field(input, "work_id")?,
-                    field(input, "request_id")?,
-                    input.get("response").context("response is required")?,
-                    serde_json::from_value(input["attestation"].clone())
-                        .context("the user's signature is required")?,
-                )
-                .await
+            "codex_state" | "send_decision" => {
+                ensure!(
+                    input["human"] == true,
+                    "the App Server answers the user only"
+                );
+                self.codex_rpc(network, kind, input).await
             }
             "cancel_manager" | "reconcile" | "resolve" => {
                 ensure!(
@@ -1195,6 +1192,11 @@ impl Runtime {
                 && let Err(error) = self.deliver_work_requests(&state.genesis.network_id).await
             {
                 tracing::debug!(%error, "work requests wait for their devices");
+            }
+            if let Ok(state) = self.membership_state().await
+                && let Err(error) = self.reconcile_works(&state.genesis.network_id).await
+            {
+                tracing::debug!(%error, "work reconciliation pending");
             }
         }
     }

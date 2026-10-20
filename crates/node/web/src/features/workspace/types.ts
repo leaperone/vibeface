@@ -10,13 +10,8 @@ export type NodeInfo = {
   capabilities?: { manager: string | null; roots: string[] }
 }
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
-export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
-/** An open executor request. `form` exists only on the device that runs the work. */
-export type WorkApproval = { request_id: string; kind: string; summary: string; answering?: boolean; form?: { command?: string; cwd?: string; reason?: string; files?: string[]; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] } }
-/** An answered request stays as one line in the chat; the decision comes from the shared `ApprovalAnswered` event. */
-export type WorkAnswer = { request_id: string; kind: string; summary: string; decision: string }
 /** `waiting_for_device` and `rejected` are dispatches another device has not taken. */
-export type WorkState = "accepted" | "starting" | "running" | "waiting_approval" | "interrupting" | "finished" | "unverified" | "waiting_for_device" | "rejected"
+export type WorkState = "accepted" | "starting" | "running" | "interrupting" | "finished" | "unverified" | "waiting_for_device" | "rejected"
 /** `abandoned`: the device was removed before it reported; the work did not run. */
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified" | "abandoned"
 export type WorkRecord = {
@@ -24,7 +19,7 @@ export type WorkRecord = {
   trigger: string
   target_node: string
   cwd: string
-  /** A few words for the user; `prompt` is the executor's instructions. */
+  /** A few words for the user; `prompt` is what the agent was asked to do. */
   title: string
   prompt: string
   state: WorkState | null
@@ -32,8 +27,6 @@ export type WorkRecord = {
   outcome: WorkOutcome | null
   result_text: string
   failure_reason: string | null
-  open_approvals: WorkApproval[]
-  answered_approvals: WorkAnswer[]
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: { waiting_for_device: boolean; timed_out: boolean }
 }
@@ -42,7 +35,6 @@ export type ManagerJob = {
   state: string
   message_id?: string
   reply_message_id?: string
-  read_only?: boolean
   error?: string
   pending_check?: boolean
 }
@@ -65,8 +57,6 @@ export type PendingCheck = {
   target_node?: string
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
-export type AutonomyMode = "off" | "report" | "continue"
-export type ConversationAutonomy = { mode: AutonomyMode; version: number }
 export type FieldEdit = { before: string; after: string }
 export type AssistantSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms` and every `every_minutes` after it. */
@@ -85,7 +75,6 @@ export type AssistantView = { skills: SkillSummary[]; routines: RoutineView[] }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
-  autonomy: ConversationAutonomy
   works: WorkRecord[]
   scheduler: SchedulerSnapshot | null
   pending_checks: PendingCheck[]
@@ -109,4 +98,38 @@ export type BotRecord = CreateBotRequest & { event_hash: string }
 
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }
+}
+
+export type Severity = "info" | "attention" | "urgent"
+/** A triaged session that needs the person; `choices` turns it into a decision with fixed answers. */
+export type Alert = {
+  alert_id: string
+  matter: string
+  agent: string
+  session_id: string
+  thread_id?: string
+  request_id?: string
+  choices: { label: string }[]
+  turn_id?: string
+  cwd: string
+  severity: Severity
+  summary: string
+  count: number
+  node: string
+  created_at_ms: number
+  resolution: "decided" | "dismissed" | null
+}
+/** `unknown`: the session may have it; sending again with the same decision_id only reads back. */
+export type DecisionResult = { decision_id: string; status: "delivered" | "unknown" | "rejected"; reason?: string }
+export type Outlet = "record" | "webhook" | "both" | "off"
+export type TriageSettings = {
+  default_outlet: Outlet
+  projects: { prefix: string; outlet: Outlet }[]
+  webhook_url: string
+  scan_codex_sessions: boolean
+  webhook_secret_set: boolean
+  decision_url: string
+  device_id: string
+  decision_tokens: { token_id: string; label: string; created_ms: number }[]
+  outbox: { pending: number; delivered: number; dead: number }
 }

@@ -5,7 +5,7 @@ export const roleNames: Record<string, string> = {
   gateway: "对外访问",
   relay: "转发",
   replica: "保存副本",
-  scheduler: "安排任务",
+  scheduler: "运行助手",
 }
 
 export const stateNames: Record<string, string> = {
@@ -79,7 +79,7 @@ export function addressName(address: string) {
 const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
-  pending_check: "需要确认", unknown: "需要确认", starting: "准备中", waiting_approval: "需要你同意", finished: "已完成", unverified: "需要确认",
+  pending_check: "需要确认", unknown: "需要确认", starting: "准备中", finished: "已完成", unverified: "需要确认",
   abandoned: "已放弃、未执行", waiting_for_device: "等设备接收", rejected: "未接收", stop_waiting: "已请求、等待设备确认", stop_unconfirmed: "设备没有确认停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
@@ -91,34 +91,7 @@ const progressStates: Record<string, string> = {
 }
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
-const decisions: Record<string, string> = { accept: "已同意", decline: "已拒绝", cancel: "已拒绝并停止", answered: "已回答" }
-export const decisionLabel = (decision: string) => decisions[decision] ?? "已处理"
-/** A finished work reads as its outcome; a stop sent to an unreachable device reads as that request; one left waiting with nothing to answer reads as running. */
-export const shownState = (work: Pick<WorkRecord, "state" | "outcome" | "open_approvals" | "stop">) =>
-  work.outcome ?? (work.stop ? work.stop.timed_out ? "stop_unconfirmed" : "stop_waiting"
-    : work.state === "waiting_approval" && !work.open_approvals.length ? "running" : work.state ?? "accepted")
-export const taskActive = (state: string) => ["accepted", "starting", "running", "waiting_approval", "interrupting", "waiting_for_device", "stop_waiting", "stop_unconfirmed"].includes(state)
-
-const kinds: Record<string, string> = {
-  "item/commandExecution/requestApproval": "运行命令",
-  "item/fileChange/requestApproval": "修改文件",
-  "item/tool/requestUserInput": "补充信息",
-}
-export const approvalKind = (request: { kind: string }) => kinds[request.kind] ?? "处理请求"
-
-// ponytail: keyword heuristics; a command parser if these miss real cases.
-const risks: [RegExp, string][] = [
-  [/git\s+push\b.*(--force|\s-f\b)/, "会覆盖远端的提交记录"],
-  [/(^|[\s;&|])(rm|rmdir)\s|git\s+clean\b|git\s+reset\s+--hard/, "会删除文件"],
-  [/(^|[\s;&|])(sudo|chmod|chown)\s/, "会改动权限"],
-  [/(^|[\s;&|])(curl|wget)\s|\b(npm|pnpm|yarn|bun)\s+(i|install|add)\b|\bpip3?\s+install\b|\b(brew|cargo)\s+install\b/, "会从网络下载"],
-]
-
-/** One line describing the consequence of a risky request, or "" when nothing stands out. */
-export function approvalRisk(request: { command?: string; cwd?: string }, roots: string[]): string {
-  const hit = risks.find(([pattern]) => pattern.test(request.command ?? ""))
-  if (hit) return hit[1]
-  const cwd = request.cwd
-  if (cwd && roots.length && !roots.some((root) => cwd === root || cwd.startsWith(root.endsWith("/") ? root : `${root}/`))) return "在可用文件夹之外"
-  return ""
-}
+/** A finished work reads as its outcome; a stop sent to an unreachable device reads as that request. */
+export const shownState = (work: Pick<WorkRecord, "state" | "outcome" | "stop">) =>
+  work.outcome ?? (work.stop ? work.stop.timed_out ? "stop_unconfirmed" : "stop_waiting" : work.state ?? "accepted")
+export const taskActive = (state: string) => ["accepted", "starting", "running", "interrupting", "waiting_for_device", "stop_waiting", "stop_unconfirmed"].includes(state)

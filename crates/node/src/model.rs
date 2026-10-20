@@ -36,19 +36,13 @@ pub enum ReplyStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum AutonomyMode {
-    Continue,
-    Report,
-    Off,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Executor {
+/// `codex`: a Codex turn this device's coordination Agent sent and the Node watches.
+/// `task`: work handed to a device's coordination Agent as a task turn.
+pub enum WorkKind {
     Codex,
-    Agent,
+    Task,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,7 +50,6 @@ pub enum Executor {
 pub enum WorkPhase {
     Started,
     Running,
-    WaitingApproval,
     Interrupting,
     Finishing,
 }
@@ -69,20 +62,37 @@ pub enum WorkOutcome {
     Interrupted,
     /// Never started; retrying with the same `work_id` is safe.
     Rejected,
-    /// The executor's real result cannot be proven; only the user or a later probe settles it.
+    /// The real result cannot be proven; only the user or a later probe settles it.
     Unverified,
     /// Its target was removed before reporting a result; written by the conversation's owner.
     Abandoned,
 }
 
+/// How soon the user should look at a triaged session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Info,
+    Attention,
+    Urgent,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
-    Accept,
-    Decline,
-    Cancel,
-    Answered,
+pub enum AlertResolution {
+    /// A decision went back to the session.
+    Decided,
+    Dismissed,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceLabel {
+    pub label: String,
+}
+
+/// Scope of the triage cards every device shows.
+pub const ATTENTION_SCOPE: &str = "attention";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
@@ -316,9 +326,9 @@ pub enum EventBody {
         trigger: String,
         dispatcher: DeviceId,
         call_ref: String,
-        executor: Executor,
+        kind: WorkKind,
         cwd: String,
-        /// A short line for the user; `prompt` is what the executor gets.
+        /// A short line for the user; `prompt` is what the work gets.
         title: String,
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,19 +345,6 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    ApprovalRequested {
-        work_id: String,
-        request_id: String,
-        kind: String,
-        summary: String,
-    },
-    ApprovalAnswered {
-        work_id: String,
-        request_id: String,
-        decision: ApprovalDecision,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
-    },
     /// Written by the target. The user settles an `unverified` result through any entry Node,
     /// signed; the owner records `abandoned` after the target is removed.
     WorkFinished {
@@ -359,15 +356,38 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    AutonomySet {
-        mode: AutonomyMode,
-        version: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
-    },
     NotificationAcked {
         notification_id: String,
         client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
+    /// A triaged session that needs the user, in scope `attention`; a later raise of the same
+    /// `matter` (an escalation) replaces the card.
+    AttentionRaised {
+        alert_id: String,
+        matter: String,
+        agent: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        cwd: String,
+        severity: Severity,
+        summary: String,
+        count: u64,
+        /// The Codex thread a decision goes to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        /// The App Server request this card holds until the user chooses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// Labels only; what each choice sends stays on the device that raised the card.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<ChoiceLabel>,
+    },
+    AttentionResolved {
+        alert_id: String,
+        resolution: AlertResolution,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
@@ -396,9 +416,8 @@ impl EventBody {
             | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
-            | Self::ApprovalAnswered { attestation, .. }
-            | Self::AutonomySet { attestation, .. }
-            | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
+            | Self::NotificationAcked { attestation, .. }
+            | Self::AttentionResolved { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
@@ -406,8 +425,6 @@ impl EventBody {
         match self {
             Self::WorkDispatched { work_id, .. }
             | Self::WorkProgress { work_id, .. }
-            | Self::ApprovalRequested { work_id, .. }
-            | Self::ApprovalAnswered { work_id, .. }
             | Self::WorkFinished { work_id, .. } => Some(work_id),
             _ => None,
         }
@@ -577,7 +594,7 @@ pub struct WorkProjection {
     pub target_node: DeviceId,
     pub trigger: String,
     pub dispatcher: DeviceId,
-    pub executor: Executor,
+    pub kind: WorkKind,
     pub cwd: String,
     pub title: String,
     pub prompt: String,
@@ -588,27 +605,6 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
-    pub open_approvals: Vec<ApprovalProjection>,
-    /// Requests already answered, kept so the conversation shows who decided what.
-    pub answered_approvals: Vec<AnsweredApproval>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ApprovalProjection {
-    pub request_id: String,
-    pub kind: String,
-    pub summary: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AnsweredApproval {
-    pub request_id: String,
-    pub kind: String,
-    pub summary: String,
-    pub decision: ApprovalDecision,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Autonomy {
-    pub mode: AutonomyMode,
-    pub version: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetUsage {

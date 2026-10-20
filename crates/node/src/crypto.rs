@@ -112,9 +112,8 @@ impl LocalIdentity {
             | EventBody::BotCreated { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
-            | EventBody::ApprovalAnswered { attestation, .. }
-            | EventBody::AutonomySet { attestation, .. }
-            | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
+            | EventBody::NotificationAcked { attestation, .. }
+            | EventBody::AttentionResolved { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -275,9 +274,9 @@ fn validate_attestation(event: &Event) -> Result<()> {
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
-        | EventBody::ApprovalAnswered { .. }
-        | EventBody::AutonomySet { .. }
         | EventBody::NotificationAcked { .. } => UserSignature::Required,
+        // The user dismisses with a signature; the device that delivered a decision closes it.
+        EventBody::AttentionResolved { .. } => UserSignature::Optional,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -417,12 +416,52 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 id(work)?;
             }
         }
-        EventBody::WorkProgress { work_id, .. }
-        | EventBody::WorkFinished { work_id, .. }
-        | EventBody::ApprovalRequested { work_id, .. }
-        | EventBody::ApprovalAnswered { work_id, .. } => id(work_id)?,
-        EventBody::AutonomySet { version, .. } => {
-            ensure!(*version > 0, "autonomy version starts at 1")
+        EventBody::WorkProgress { work_id, .. } | EventBody::WorkFinished { work_id, .. } => {
+            id(work_id)?
+        }
+        EventBody::AttentionRaised {
+            alert_id,
+            matter,
+            session_id,
+            summary,
+            cwd,
+            agent,
+            thread_id,
+            request_id,
+            choices,
+            ..
+        } => {
+            ensure!(
+                event.scope_id == ATTENTION_SCOPE,
+                "triage cards live in the attention scope"
+            );
+            id(alert_id)?;
+            id(matter)?;
+            ensure!(
+                !session_id.is_empty()
+                    && session_id.len() <= 256
+                    && summary.len() <= 1024
+                    && cwd.len() <= 4096
+                    && agent.len() <= 32,
+                "invalid triage card"
+            );
+            for value in thread_id.iter().chain(request_id.iter()) {
+                id(value)?;
+            }
+            ensure!(
+                choices.len() <= 8
+                    && choices
+                        .iter()
+                        .all(|choice| !choice.label.trim().is_empty() && choice.label.len() <= 120),
+                "invalid card choices"
+            );
+        }
+        EventBody::AttentionResolved { alert_id, .. } => {
+            ensure!(
+                event.scope_id == ATTENTION_SCOPE,
+                "triage cards live in the attention scope"
+            );
+            id(alert_id)?;
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {

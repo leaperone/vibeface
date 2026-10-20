@@ -36,7 +36,6 @@ pub struct SdkAgentConfig {
     pub workspace: PathBuf,
     pub timeout_secs: u64,
     pub model: String,
-    pub read_only: bool,
     pub tool_env: BTreeMap<String, String>,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_callback: Option<ToolCallbackConfig>,
@@ -471,11 +470,8 @@ fn sdk_options(config: &SdkAgentConfig, api_key: &str) -> Result<Value> {
         .workspace
         .to_str()
         .context("Cursor SDK workspace path must be UTF-8")?;
-    let mut options = json!({"apiKey":api_key,"model":{"id":config.model},
+    let options = json!({"apiKey":api_key,"model":{"id":config.model},
         "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":{}});
-    if config.read_only {
-        options["tools"] = json!({"names":["mcp"]});
-    }
     Ok(options)
 }
 
@@ -1383,7 +1379,6 @@ mod tests {
             workspace: "/manager".into(),
             timeout_secs: 5,
             model: "fixture-model".into(),
-            read_only: false,
             tool_env: BTreeMap::new(),
             process_started: None,
             custom_tools: BTreeMap::from([(
@@ -1407,11 +1402,6 @@ mod tests {
             json!({"type":"object"})
         );
         assert!(options.to_string().find(&"x".repeat(32)).is_none());
-        config.read_only = true;
-        assert_eq!(
-            sdk_options(&config, "fixture-key").unwrap()["tools"],
-            json!({"names":["mcp"]})
-        );
         config
             .tool_env
             .insert("CURSOR_API_KEY".into(), "override".into());

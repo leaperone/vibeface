@@ -6,7 +6,6 @@ use futures_util::FutureExt;
 
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
-    value["read_only"] = json!(job.state.attempt().is_some_and(|attempt| attempt.read_only));
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(checks.iter().any(|check| check.trigger == job.trigger));

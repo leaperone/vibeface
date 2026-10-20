@@ -47,23 +47,6 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
     Ok(crate::crypto::digest(&signed))
 }
 
-/// A refusal outranks consent, so concurrent conflicting answers settle the same way everywhere.
-fn answer_strictness(decision: ApprovalDecision) -> u8 {
-    match decision {
-        ApprovalDecision::Cancel => 0,
-        ApprovalDecision::Decline => 1,
-        ApprovalDecision::Accept | ApprovalDecision::Answered => 2,
-    }
-}
-
-pub(crate) fn strictness(mode: AutonomyMode) -> u8 {
-    match mode {
-        AutonomyMode::Continue => 0,
-        AutonomyMode::Report => 1,
-        AutonomyMode::Off => 2,
-    }
-}
-
 pub(crate) fn apply(
     connection: &Connection,
     network: &str,
@@ -154,37 +137,6 @@ pub(crate) fn apply(
                 params![network, work_id, scope, serde_json::to_string(&event.body)?, rank, thread_id, turn_id],
             )?;
         }
-        EventBody::ApprovalRequested {
-            work_id,
-            request_id,
-            kind,
-            summary,
-        } => {
-            connection.execute(
-                "INSERT INTO approvals(network_id,request_id,work_id,kind,summary,request_rank) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET kind=excluded.kind,summary=excluded.summary,request_rank=excluded.request_rank WHERE request_rank IS NULL OR excluded.request_rank<request_rank",
-                params![network, request_id, work_id, kind, summary, rank],
-            )?;
-            notify(
-                connection,
-                network,
-                hash,
-                scope,
-                "needs_input",
-                summary,
-                rank,
-            )?;
-        }
-        EventBody::ApprovalAnswered {
-            work_id,
-            request_id,
-            decision,
-            ..
-        } => {
-            connection.execute(
-                "INSERT INTO approvals(network_id,request_id,work_id,decision,answer_key) VALUES(?,?,?,?,?) ON CONFLICT(network_id,request_id) DO UPDATE SET decision=excluded.decision,answer_key=excluded.answer_key WHERE answer_key IS NULL OR excluded.answer_key<answer_key",
-                params![network, request_id, work_id, text(decision)?, format!("{}:{}", answer_strictness(*decision), request_key(network, event)?)],
-            )?;
-        }
         EventBody::WorkFinished {
             work_id,
             outcome,
@@ -228,12 +180,6 @@ pub(crate) fn apply(
                 rank,
             )?;
         }
-        EventBody::AutonomySet { mode, version, .. } => {
-            connection.execute(
-                "INSERT INTO autonomy(network_id,conversation_id,mode,strictness,version,request_key) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET mode=excluded.mode,strictness=excluded.strictness,version=excluded.version,request_key=excluded.request_key WHERE excluded.version>version OR (excluded.version=version AND (excluded.strictness>strictness OR (excluded.strictness=strictness AND excluded.request_key<request_key)))",
-                params![network, scope, text(mode)?, strictness(*mode), version, request_key(network, event)?],
-            )?;
-        }
         EventBody::NotificationAcked {
             notification_id,
             client_id,
@@ -242,6 +188,24 @@ pub(crate) fn apply(
             connection.execute(
                 "INSERT OR IGNORE INTO notification_acks(network_id,notification_id,client_id) VALUES(?,?,?)",
                 params![network, notification_id, client_id],
+            )?;
+        }
+        EventBody::AttentionRaised {
+            matter, alert_id, ..
+        } => {
+            connection.execute(
+                "INSERT INTO alerts(network_id,matter,alert_id,raise,rank,node,created_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,matter) DO UPDATE SET alert_id=excluded.alert_id,raise=excluded.raise,rank=excluded.rank,node=excluded.node,created_at_ms=excluded.created_at_ms WHERE excluded.rank>rank",
+                params![network, matter, alert_id, serde_json::to_string(&event.body)?, rank, event.author, event.created_at_ms],
+            )?;
+        }
+        EventBody::AttentionResolved {
+            alert_id,
+            resolution,
+            ..
+        } => {
+            connection.execute(
+                "INSERT INTO alert_resolutions(network_id,alert_id,resolution,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,alert_id) DO UPDATE SET resolution=excluded.resolution,rank=excluded.rank WHERE excluded.rank<rank",
+                params![network, alert_id, text(resolution)?, rank],
             )?;
         }
         EventBody::AssistantChanged {
@@ -317,15 +281,12 @@ pub(crate) fn works_from(
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let mut approvals = connection.prepare(
-        "SELECT request_id,kind,summary,decision FROM approvals WHERE network_id=? AND work_id=? AND request_rank IS NOT NULL ORDER BY request_rank",
-    )?;
     let mut works = Vec::with_capacity(rows.len());
     for (work_id, target_node, dispatch, progress, thread_id, turn_id, finish) in rows {
         let EventBody::WorkDispatched {
             trigger,
             dispatcher,
-            executor,
+            kind,
             cwd,
             title,
             prompt,
@@ -348,41 +309,13 @@ pub(crate) fn works_from(
                 }) => (Some(outcome), result_text, failure_reason),
                 _ => (None, String::new(), None),
             };
-        let mut open_approvals = Vec::new();
-        let mut answered_approvals = Vec::new();
-        let rows = approvals.query_map(params![network, work_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (request_id, kind, summary, decision) = row?;
-            match decision {
-                Some(decision) => answered_approvals.push(AnsweredApproval {
-                    request_id,
-                    kind,
-                    summary,
-                    decision: serde_json::from_value(serde_json::Value::String(decision))?,
-                }),
-                // A finished work has nothing left to answer.
-                None if outcome.is_none() => open_approvals.push(ApprovalProjection {
-                    request_id,
-                    kind,
-                    summary,
-                }),
-                None => {}
-            }
-        }
         works.push(WorkProjection {
             work_id,
             conversation_id: scope.into(),
             target_node,
             trigger,
             dispatcher,
-            executor,
+            kind,
             cwd,
             title,
             prompt,
@@ -393,8 +326,6 @@ pub(crate) fn works_from(
             outcome,
             result_text,
             failure_reason,
-            open_approvals,
-            answered_approvals,
         });
     }
     Ok(works)

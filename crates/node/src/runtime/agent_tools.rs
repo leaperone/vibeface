@@ -9,7 +9,7 @@ use crate::{
 fn dispatch_value(dispatch: &Dispatch) -> Value {
     let spec = &dispatch.spec;
     let mut value = json!({"work_id":spec.work_id,"call_ref":spec.call_ref,
-        "target_node":spec.target,"executor":spec.executor});
+        "target_node":spec.target,"kind":spec.kind});
     match &dispatch.state {
         DispatchState::Pending => value["state"] = json!("waiting_for_device"),
         DispatchState::Accepted => value["state"] = json!("accepted"),
@@ -34,7 +34,7 @@ impl Runtime {
             .context("missing tool scope")?;
         let write = match name {
             "nodes" | "context" | "work_status" | "call_lookup" | "read_skill" => false,
-            "dispatch_work" | "interrupt_work" => true,
+            "track_work" | "bind_work" | "dispatch_work" | "interrupt_work" => true,
             name if SETTINGS_TOOLS.contains(&name) => true,
             _ => bail!("unknown or unavailable coordination tool"),
         };
@@ -42,12 +42,10 @@ impl Runtime {
             !write || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
-        let _lease = tokio::time::timeout(
-            Duration::from_secs(20),
-            self.manager_tool_lease(&access, write),
-        )
-        .await
-        .context("agent tool admission timed out")??;
+        let _lease =
+            tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(&access))
+                .await
+                .context("agent tool admission timed out")??;
         let network = access.network_id.as_str();
         match name {
             "nodes" => {
@@ -115,9 +113,7 @@ impl Runtime {
                 fields.remove("call_ref");
                 fields.insert("tool".into(), json!(name));
                 let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
-                    anyhow::anyhow!(
-                        "{error}. Model, provider, folders and autonomy change only in Settings"
-                    )
+                    anyhow::anyhow!("{error}. Model, provider and folders change only in Settings")
                 })?;
                 let (record, written) = self.store.lock().await.change_assistant(
                     &self.identity,
@@ -133,49 +129,19 @@ impl Runtime {
                 }
                 Ok(json!(record))
             }
+            "track_work" => self.track_work(&access, &scope, &args).await,
+            "bind_work" => self.bind_work(network, &scope, &args).await,
+            // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
             "dispatch_work" => {
-                let manager = access
-                    .manager
-                    .as_ref()
-                    .context("dispatch requires an agent invocation")?;
-                let call_ref = field(&args, "call_ref")?;
-                vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
-                let local = self.identity.device_id()?;
-                let optional = |key: &str| args[key].as_str().map(String::from);
-                // An agent task's turn only runs Codex here, as children of its task.
-                let task = manager.trigger.strip_prefix("task:");
-                let target = match task {
-                    Some(_) => local.clone(),
-                    None => optional("target_node").unwrap_or_else(|| local.clone()),
-                };
-                let executor = match (task, args["executor"].as_str()) {
-                    (_, None | Some("codex")) => Executor::Codex,
-                    (None, Some("agent")) => Executor::Agent,
-                    _ => bail!("an agent task only starts Codex work on its own device"),
-                };
-                let spec = WorkSpec {
-                    work_id: WorkSpec::id(&scope, &manager.trigger, call_ref),
-                    conversation: scope.clone(),
-                    trigger: manager.trigger.clone(),
-                    attempt: manager.attempt_id.clone(),
-                    target: target.clone(),
-                    dispatcher: local.clone(),
-                    call_ref: call_ref.into(),
-                    executor,
-                    cwd: field(&args, "cwd")?.into(),
-                    title: field(&args, "title")?.chars().take(120).collect(),
-                    prompt: field(&args, "prompt")?.into(),
-                    continues: optional("continues"),
-                    parent: task.map(String::from).or_else(|| optional("parent")),
-                };
-                if target == local {
-                    let record = self.accept_dispatch(network, spec).await?;
-                    return Ok(
-                        json!({"work_id":record.spec.work_id,"call_ref":call_ref,"state":record.state}),
-                    );
-                }
-                let dispatch = self.send_dispatch(network, spec).await?;
-                Ok(dispatch_value(&dispatch))
+                let socket = self.codex.socket.clone();
+                let (access, scope) = (&access, scope.as_str());
+                crate::agent_cli::dispatch(
+                    &args,
+                    |args| async move { self.track_work(access, scope, &args).await },
+                    |args| async move { self.bind_work(network, scope, &args).await },
+                    &socket,
+                )
+                .await
             }
             "interrupt_work" => {
                 let id = field(&args, "work_id")?;
@@ -208,5 +174,69 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         Ok(json!({"events":page,"next_offset":(end<events.len()).then_some(end)}))
+    }
+
+    /// Registers a dispatch before anything is sent. On this device it returns `may_send` only to
+    /// the call that created the work; another device's assistant gets the task instead.
+    async fn track_work(
+        self: &Arc<Self>,
+        access: &Access,
+        scope: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let network = access.network_id.as_str();
+        let manager = access
+            .manager
+            .as_ref()
+            .context("dispatch requires an agent invocation")?;
+        let call_ref = field(args, "call_ref")?;
+        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+        let local = self.identity.device_id()?;
+        let optional = |key: &str| args[key].as_str().map(String::from);
+        // An agent task's turn only starts work here, as children of its task.
+        let task = manager.trigger.strip_prefix("task:");
+        let target = match task {
+            Some(_) => local.clone(),
+            None => optional("target_node").unwrap_or_else(|| local.clone()),
+        };
+        let spec = WorkSpec {
+            work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
+            conversation: scope.into(),
+            trigger: manager.trigger.clone(),
+            attempt: manager.attempt_id.clone(),
+            target: target.clone(),
+            dispatcher: local.clone(),
+            call_ref: call_ref.into(),
+            kind: if target == local {
+                WorkKind::Codex
+            } else {
+                WorkKind::Task
+            },
+            cwd: field(args, "cwd")?.into(),
+            title: field(args, "title")?.chars().take(120).collect(),
+            prompt: field(args, "prompt")?.into(),
+            continues: optional("continues"),
+            parent: task.map(String::from).or_else(|| optional("parent")),
+        };
+        if target != local {
+            let dispatch = self.send_dispatch(network, spec).await?;
+            return Ok(dispatch_value(&dispatch));
+        }
+        let (record, created) = self.accept_dispatch(network, spec).await?;
+        let thread = match &record.spec.continues {
+            Some(original) => self
+                .store
+                .lock()
+                .await
+                .works(network, scope)?
+                .into_iter()
+                .find(|work| &work.work_id == original)
+                .and_then(|work| work.thread_id),
+            None => None,
+        };
+        Ok(
+            json!({"work_id":record.spec.work_id,"call_ref":call_ref,"state":record.state,
+            "may_send":created,"send_by_ms":record.send_by_ms,"cwd":record.spec.cwd,"thread_id":thread}),
+        )
     }
 }

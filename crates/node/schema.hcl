@@ -505,77 +505,6 @@ table "works" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "approvals" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "request_id" {
-    null = false
-    type = text
-  }
-  column "work_id" {
-    null = false
-    type = text
-  }
-  column "kind" {
-    null = true
-    type = text
-  }
-  column "summary" {
-    null = true
-    type = text
-  }
-  column "request_rank" {
-    null = true
-    type = text
-  }
-  column "decision" {
-    null = true
-    type = text
-  }
-  column "answer_key" {
-    null = true
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.request_id]
-  }
-  index "approvals_work" {
-    columns = [column.network_id, column.work_id]
-  }
-}
-table "autonomy" {
-  schema = schema.main
-  column "network_id" {
-    null = false
-    type = text
-  }
-  column "conversation_id" {
-    null = false
-    type = text
-  }
-  column "mode" {
-    null = false
-    type = text
-  }
-  column "strictness" {
-    null = false
-    type = integer
-  }
-  column "version" {
-    null = false
-    type = integer
-  }
-  column "request_key" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.network_id, column.conversation_id]
-  }
-}
 table "notifications" {
   schema = schema.main
   column "network_id" {
@@ -622,6 +551,62 @@ table "notification_acks" {
   }
   primary_key {
     columns = [column.network_id, column.notification_id, column.client_id]
+  }
+}
+table "alerts" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "matter" {
+    null = false
+    type = text
+  }
+  column "alert_id" {
+    null = false
+    type = text
+  }
+  column "raise" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "node" {
+    null = false
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.matter]
+  }
+}
+table "alert_resolutions" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "alert_id" {
+    null = false
+    type = text
+  }
+  column "resolution" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.alert_id]
   }
 }
 table "budget_days" {

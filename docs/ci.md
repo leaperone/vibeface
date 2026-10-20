@@ -84,11 +84,11 @@ python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --ar
 
 Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默认模式（不带模式参数）。它启动四台真实 Node 和一台其他网络的 Node：P 运行成员 relay，B 只经 relay 连接（模拟严格 NAT），A 负责调度。覆盖经 iroh 加入与同步、签名入口记录（浏览器 WASM 验签，伪造记录被拒）、四条跨入口转发路径与非成员拒绝、成员 Gateway 的 Origin 放行、调度 Node 离线时入口保留并投递且只执行一次、经另一入口重发得到原结果、崩溃与重启后不重放、relay 中断时直连继续而只经 relay 的 Node 在 relay 恢复后追平、入口切换后每条消息只出现一次，以及撤销后不再列出和转发。
 
-队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、审批、中断、App Server 托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。
+队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、App Server 直连、请求处理、分诊、决定回传、中断、托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。`--chat-agent` 的夹具 App Server 启动时核对 `crates/bridge/schema/app-server-methods.json`，缺一个客户端请求即失败；夹具 Agent 用真实 CLI（`vibeface tool dispatch_work`、`vibeface codex call|send|watch|requests|respond`、`vibeface triage events|raise|dismiss`）工作。覆盖直接派发与重试只开一轮、steer、未知结果按 clientId 对账不重发、服务端请求由 Agent 应答一次、置之不理时回退拒绝、无 Agent 时立即回退、hook 经分诊升卡并发出 HMAC 签名 webhook（重试同一 event_id、4xx 进死信）、带选项的决定卡经 `send_decision` 应答一次且同一 decision_id 不重发，以及 decision token 的 HTTP 回传。
 
-跨设备派发与停止、负责人切换、撤销后放弃、待核对结清、跨入口加入和附件上传改动跑 `--phase4`。它启动四台 Node：A、B 带夹具 Agent 和 App Server，P 是运行 relay 的公网角色，C 只有夹具 App Server。
+跨设备派发与停止、负责人切换、撤销后放弃、待核对结清、跨入口加入和附件上传改动跑 `--phase4`。它启动四台 Node：A、B、C 都带夹具协调 Agent 和 App Server，P 是运行 relay 的公网角色。跨设备工作是 Agent 交给 Agent：目标设备的 Agent 自己开 Codex 线程；目标上的服务端请求升为决定卡，在 A 选择后经设备转发应答一次。C 接任务后离线并被撤销。
 
-公共入口、relay 准入和成员 Node 指向入口的改动跑 `--public-entry`。P 是不入网的公共入口，M 只经 P 的 relay 可达，X 持错误令牌；覆盖浏览器经 P 加入 M 并对话、P 重启后重连、错误令牌被拒，以及 P 不存事件和附件。
+公共入口、relay 准入和成员 Node 指向入口的改动跑 `--public-entry`。P 是不入网的公共入口，M 只经 P 的 relay 可达，X 持错误令牌；覆盖浏览器经 P 加入 M 并对话、P 重启后重连、错误令牌被拒、decision token 经 P 的 `POST /api/decision` 以 `vibeface/decision/1` 送达 M 一次且错误 token 得 401，以及 P 不存事件和附件。
 
 写入闸门、对齐、分叉、日志、`status` 与诊断导出改动跑 `--phase5`。A、B 两台 Node：A 从备份恢复后对齐前拒绝写入、对齐后无分叉；B 离线时 A 只读，用户确认后才写；复制的数据目录在 B 处分叉后只有副本停写并列出冲突，原 A 与 B 继续写；同时检查 `status` 的对端连通与上次同步、`node.log` 权限与内容、诊断包和日志里没有能力、口令或邀请。
 

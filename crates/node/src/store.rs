@@ -493,54 +493,37 @@ impl Store {
     pub fn works(&self, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
         reduce::works_from(&self.connection, network, scope)
     }
-    pub fn autonomy(&self, network: &str, scope: &str) -> Result<Autonomy> {
-        autonomy_from(&self.connection, network, scope)
-    }
-    /// Optimistic: a stale `expected_version` is refused, so two clients never silently override.
-    #[expect(clippy::too_many_arguments, reason = "the decision and its signature")]
-    pub fn set_autonomy(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        scope: &str,
-        mode: AutonomyMode,
-        expected_version: u64,
-        attestation: Attestation,
-        at: i64,
-    ) -> Result<SignedEvent> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(
-            conversation_from(&tx, network, scope)?.is_some(),
-            "conversation not found"
-        );
-        ensure!(
-            autonomy_from(&tx, network, scope)?.version == expected_version,
-            "autonomy changed; refresh before changing it"
-        );
-        let envelope = log::append_from(
-            &tx,
-            &self.blob_dir,
-            identity,
-            network,
-            scope,
-            EventBody::AutonomySet {
-                mode,
-                version: expected_version + 1,
-                attestation: Some(attestation),
-            },
-            vec![],
-            at,
-        )?;
-        tx.commit()?;
-        Ok(envelope)
-    }
     /// Every local append checks this gate; it lives only as long as this connection.
     pub fn set_write_state(&mut self, state: WriteState) -> Result<()> {
         self.connection
             .execute("UPDATE temp.write_gate SET state=?", [state.as_str()])?;
         Ok(())
+    }
+    /// Triage cards: open ones first, newest first, at most `limit`.
+    pub fn alerts(&self, network_id: &str, limit: usize) -> Result<Vec<Value>> {
+        let mut statement = self.connection.prepare(
+            "SELECT a.raise,a.node,a.created_at_ms,r.resolution FROM alerts a LEFT JOIN alert_resolutions r ON r.network_id=a.network_id AND r.alert_id=a.alert_id WHERE a.network_id=? ORDER BY r.resolution IS NOT NULL, a.rank DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map(params![network_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (raise, node, created_at_ms, resolution) = row?;
+            let mut alert: Value = serde_json::from_str(&raise)?;
+            alert["node"] = node.into();
+            alert["created_at_ms"] = created_at_ms.into();
+            alert["resolution"] = resolution.map_or(Value::Null, Value::String);
+            if let Some(object) = alert.as_object_mut() {
+                object.remove("type");
+            }
+            Ok(alert)
+        })
+        .collect()
     }
     pub fn local_value(&self, network_id: &str, key: &str) -> Result<Option<Value>> {
         local_load(&self.connection, network_id, key)
@@ -639,14 +622,14 @@ impl Store {
             .query_map([network_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
-    /// A host-wide counter, so request IDs of a restarted executor never repeat.
-    pub fn next_executor_epoch(&mut self) -> Result<u64> {
+    /// A host-wide counter, so request IDs of a restarted App Server never repeat.
+    pub fn next_codex_epoch(&mut self) -> Result<u64> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: u64 = tx
             .query_row(
-                "SELECT CAST(value AS INTEGER) FROM identity_meta WHERE key='executor_epoch'",
+                "SELECT CAST(value AS INTEGER) FROM identity_meta WHERE key='codex_epoch'",
                 [],
                 |r| r.get(0),
             )
@@ -654,7 +637,7 @@ impl Store {
             .unwrap_or(0);
         let next = current + 1;
         tx.execute(
-            "INSERT INTO identity_meta(key,value) VALUES('executor_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            "INSERT INTO identity_meta(key,value) VALUES('codex_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [next.to_string()],
         )?;
         tx.commit()?;
@@ -786,30 +769,6 @@ pub(crate) fn message_from(
         )
         .optional()?
         .transpose()
-}
-
-pub(crate) fn autonomy_from(
-    connection: &Connection,
-    network: &str,
-    scope: &str,
-) -> Result<Autonomy> {
-    let row: Option<(String, u64)> = connection
-        .query_row(
-            "SELECT mode,version FROM autonomy WHERE network_id=? AND conversation_id=?",
-            params![network, scope],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(match row {
-        Some((mode, version)) => Autonomy {
-            mode: serde_json::from_value(Value::String(mode))?,
-            version,
-        },
-        None => Autonomy {
-            mode: AutonomyMode::Report,
-            version: 0,
-        },
-    })
 }
 
 pub(crate) fn local_load<T: DeserializeOwned>(

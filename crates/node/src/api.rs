@@ -23,6 +23,8 @@ use tokio::net::TcpListener;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 const MAX_CLIENT_SOCKETS: usize = 256;
+const HOOKS: &str = "/api/hooks";
+const TRIAGE: &str = "/api/triage";
 
 #[derive(Clone)]
 struct App {
@@ -217,13 +219,16 @@ fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
         .route("/api/info", get(info))
         .route("/api/local/setup", post(local_setup))
         .route("/api/client", get(client_gateway))
+        .route("/api/decision", post(decision))
         .fallback(frontend);
     if local {
         routes = routes
             .route("/api/local/info", get(local_info))
             .route("/api/local/launch", post(local_launch))
             .route("/api/local/exchange", post(local_exchange))
-            .route("/api/local/ws", get(local_websocket));
+            .route("/api/local/ws", get(local_websocket))
+            .route("/api/hooks", post(hooks))
+            .route(TRIAGE, post(triage));
     }
     routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -320,6 +325,9 @@ async fn check_boundary(
     if path == "/api/local/setup" {
         check_local_setup(site, headers, ip)?;
     }
+    if path == HOOKS || path == TRIAGE {
+        check_hook(headers, ip)?;
+    }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     if unsafe_method {
         let content_type = one_header(headers, header::CONTENT_TYPE.as_str())
@@ -331,8 +339,11 @@ async fn check_boundary(
                 "application/json required".into(),
             ));
         }
-        let is_tool = path == "/api/tools" || path == CALLBACK || path == "/api/local/launch";
-        let bearer_call = is_tool && bearer(headers).is_some();
+        let is_tool = path == "/api/tools"
+            || path == CALLBACK
+            || path == "/api/local/launch"
+            || path == "/api/decision";
+        let bearer_call = (is_tool && bearer(headers).is_some()) || path == HOOKS || path == TRIAGE;
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
@@ -370,6 +381,19 @@ fn check_local_setup(site: &Site, headers: &HeaderMap, peer: IpAddr) -> ApiResul
     if !peer.is_loopback()
         || !site.loopback
         || one_header(headers, header::ORIGIN.as_str()) != Some(site.origin.as_str())
+        || headers.keys().any(|name| {
+            name == "forwarded" || name == "x-real-ip" || name.as_str().starts_with("x-forwarded-")
+        })
+    {
+        return Err(ApiError::forbidden());
+    }
+    Ok(())
+}
+
+/// Hooks and `vibeface triage` run as local processes: a loopback peer, and no `Origin`, so no web page can post.
+fn check_hook(headers: &HeaderMap, peer: IpAddr) -> ApiResult<()> {
+    if !peer.is_loopback()
+        || headers.contains_key(header::ORIGIN)
         || headers.keys().any(|name| {
             name == "forwarded" || name == "x-real-ip" || name.as_str().starts_with("x-forwarded-")
         })
@@ -699,6 +723,48 @@ fn validate_tool_call(name: &str) -> ApiResult<()> {
     Ok(())
 }
 
+async fn hooks(
+    State(app): State<App>,
+    Json(event): Json<crate::triage::AgentEvent>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        app.node
+            .ingest_agent_event(event)
+            .await
+            .map_err(ApiError::bad)?,
+    ))
+}
+
+/// The coordination Agent's triage answers, from `vibeface triage` on this device.
+async fn triage(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        app.node
+            .triage_command(input)
+            .await
+            .map_err(ApiError::bad)?,
+    ))
+}
+
+async fn decision(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    let token = bearer(&headers).ok_or_else(ApiError::auth)?;
+    app.node
+        .decision_http(token, body)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let text = format!("{error:#}");
+            if text.contains("invalid decision token") {
+                ApiError::auth()
+            } else {
+                ApiError::bad(text)
+            }
+        })
+}
+
 async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
     let Ok(permit) = app.clients.clone().try_acquire_owned() else {
         return (
@@ -1005,6 +1071,101 @@ mod tests {
         }.await;
         server.abort();
         let _ = server.await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn hook_routes_take_only_local_processes_on_the_local_listener() -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("hook-boundary-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":7}"#)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let mut origins = vec![];
+        let mut servers = vec![];
+        for local in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let origin = format!("http://{}", listener.local_addr()?);
+            let app = browser_router(node.clone(), vec![Site::parse(&origin)?], local);
+            origins.push(origin);
+            servers.push(tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let result = async {
+            for path in ["/api/hooks", "/api/triage"] {
+                let url = format!("{}{path}", origins[0]);
+                let event = json!({"session_id":"s","turn_id":"t","action":"events"});
+                let status = |request: reqwest::RequestBuilder| async {
+                    Ok::<_, anyhow::Error>(request.send().await?.status())
+                };
+                let body = if path == "/api/hooks" {
+                    json!({"session_id":"s","turn_id":"t"})
+                } else {
+                    event
+                };
+                // Passes the boundary; this Node has no network yet.
+                assert_eq!(
+                    status(client.post(&url).json(&body)).await?,
+                    StatusCode::BAD_REQUEST
+                );
+                assert_eq!(
+                    status(
+                        client
+                            .post(&url)
+                            .header(header::ORIGIN, &origins[0])
+                            .json(&body)
+                    )
+                    .await?,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(
+                    status(
+                        client
+                            .post(&url)
+                            .header("x-forwarded-for", "203.0.113.1")
+                            .json(&body)
+                    )
+                    .await?,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(
+                    status(
+                        client
+                            .post(&url)
+                            .header(header::CONTENT_TYPE, "text/plain")
+                            .body(body.to_string())
+                    )
+                    .await?,
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                );
+                assert_eq!(
+                    status(client.post(format!("{}{path}", origins[1])).json(&body)).await?,
+                    StatusCode::NOT_FOUND
+                );
+            }
+            assert!(check_hook(&HeaderMap::new(), "192.168.1.2".parse()?).is_err());
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for server in servers {
+            server.abort();
+        }
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result

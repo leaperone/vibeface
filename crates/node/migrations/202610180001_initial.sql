@@ -46,16 +46,14 @@ CREATE INDEX `assistant_changes_order` ON `assistant_changes` (`network_id`, `co
 CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NULL, `dispatch` text NULL, `dispatch_rank` text NULL, `progress` text NULL, `progress_rank` text NULL, `thread_id` text NULL, `turn_id` text NULL, `finish` text NULL, `finish_rank` text NULL, PRIMARY KEY (`network_id`, `work_id`));
 -- Create index "works_conversation" to table: "works"
 CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
--- Create "approvals" table
-CREATE TABLE `approvals` (`network_id` text NOT NULL, `request_id` text NOT NULL, `work_id` text NOT NULL, `kind` text NULL, `summary` text NULL, `request_rank` text NULL, `decision` text NULL, `answer_key` text NULL, PRIMARY KEY (`network_id`, `request_id`));
--- Create index "approvals_work" to table: "approvals"
-CREATE INDEX `approvals_work` ON `approvals` (`network_id`, `work_id`);
--- Create "autonomy" table
-CREATE TABLE `autonomy` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `mode` text NOT NULL, `strictness` integer NOT NULL, `version` integer NOT NULL, `request_key` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "notifications" table
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table
 CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
+-- Create "alerts" table
+CREATE TABLE `alerts` (`network_id` text NOT NULL, `matter` text NOT NULL, `alert_id` text NOT NULL, `raise` text NOT NULL, `rank` text NOT NULL, `node` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `matter`));
+-- Create "alert_resolutions" table
+CREATE TABLE `alert_resolutions` (`network_id` text NOT NULL, `alert_id` text NOT NULL, `resolution` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `alert_id`));
 -- Create "budget_days" table
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 -- Create "local_values" table

@@ -60,7 +60,7 @@ test("changes sit after the reply to their message, else after the message", () 
 
 test("conversation snapshots parse assistant changes strictly", () => {
   const base = {
-    conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [], autonomy: { mode: "report", version: 0 },
+    conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
     works: [], pending_checks: [], local_node: "n",
     assistant: { skills: [{ skill_id: "s", name: "发布", description: "发版步骤" }], routines: [{ routine_id: "r", name: "看依赖", prompt: "p", first_run_at_ms: 1, every_minutes: 1440, enabled: false, next_run_at_ms: null }] },
     changes: [

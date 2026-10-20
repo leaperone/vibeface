@@ -14,7 +14,7 @@ pub const MAX_PENDING_JOBS: usize = 256;
 pub enum TriggerKind {
     Human,
     WorkResult,
-    /// An `executor=agent` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
+    /// A `task` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
     AgentTask,
     /// A scheduled run of a routine the user set up in this conversation.
     Routine,
@@ -76,7 +76,6 @@ pub fn next_run(routine: &Routine, now: i64) -> Option<i64> {
 pub struct ManagerAttempt {
     pub id: String,
     pub boot: String,
-    pub read_only: bool,
     pub permission_version: u64,
 }
 

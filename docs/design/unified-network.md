@@ -1,6 +1,8 @@
 # 统一网络、同步与身份设计
 
-状态为已实施。五期都在 PR #63 中完成，各期与本文的差异见第 8 节各期的实施记录，最终协议见 `docs/node-protocol.md`。2026-10-20 的设计审查（基线 `d685b9a`）提出的修订已并入正文和第五期实施记录，留到之后的项目列在第 10 节。本文以 `origin/main` 的 `1bdf6fd` 为现状，该提交已包含 #55（删除 Task，新增会话级 `set_autonomy`）和 #56（Node 的 `codex` 工具取代 `vibeface codex` 命令，并强制原生审批策略）。本文另外假定两项改动会先合入，即 #54 删除向后兼容，以及统一待核对（调度 job 不再有 `unknown` 和写冻结，只保留本机待核对记录）。文中的行数用 `wc -l` 在 `1bdf6fd` 上统计，标为“约”的数字是按函数范围估算的生产代码行数。第 9 节记录已经决定的事项。
+状态为已实施。五期都在 PR #63 中完成，各期与本文的差异见第 8 节各期的实施记录，最终协议见 `docs/node-protocol.md`。2026-10-20 的设计审查（基线 `d685b9a`）提出的修订已并入正文和第五期实施记录，留到之后的项目列在第 10 节。本文以 `origin/main` 的 `1bdf6fd` 为现状，该提交已包含 #55（删除 Task，新增会话级 `set_autonomy`）和 #56（Node 的 `codex` 工具取代 `vibeface codex` 命令，并强制原生审批策略）。本文另外假定两项改动会先合入，即 #54 删除向后兼容，以及统一待核对（调度 job 不再有 `unknown` 和写冻结，只保留本机待核对记录）。文中的行数用 `wc -l` 在 `1bdf6fd` 上统计，标为“约”的数字是按函数范围估算的生产代码行数。
+
+之后的直连 PR（`docs/design/agent-direct-app-server.md`）删除了会话自主度：`AutonomySet`、`off/report/continue` 和只读汇报轮都已不存在，协调 Agent 总是完全权限；Codex 的服务端请求交给协调 Agent 处理，需要本人时生成拍板卡片。下文提到自主度的地方是当时的设计。第 9 节记录已经决定的事项。
 
 ## 1. 目标与非目标
 
@@ -383,21 +385,19 @@ Attestation {
 | `BotCreated` | `bot_id`、`name`、`instructions`、`project?: { target_node, cwd }` | 入口 Node | 带 `Attestation`，删除 `membership_role_proof` |
 | `MessagePosted`（user） | `message_id`、`role: user`、`text`、`report_results`、`attestation` | 入口 Node | 本人发的内容 |
 | `MessagePosted`（assistant） | `message_id`、`role: assistant`、`text`、`in_reply_to: message_id`、`status` | 调度 Node | 协调层每一轮的回复。`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字 |
-| `WorkDispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`executor: codex \| agent`、`cwd`、`prompt`、`continues?: work_id`、`parent?: work_id` | 目标 Node | 目标接纳时写入，此后才有进度。作者即目标，不另写 `target_node` |
-| `WorkProgress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写。`codex` 的 thread 和 turn 在 `running` 时随进度写入。`agent` 路径的摘要由目标协调层给出 |
-| `ApprovalRequested` | `work_id`、`request_id`、`kind`、`summary` | 目标 Node | `summary` 由目标 Node 从执行器的请求生成，含原因、命令、目录、允许修改的目录和文件列表 |
-| `ApprovalAnswered` | `work_id`、`request_id`、`decision`、`attestation` | 入口 Node | 必须带本人设备签名 |
+| `WorkDispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind: codex \| task`、`cwd`、`prompt`、`continues?: work_id`、`parent?: work_id` | 目标 Node | 目标接纳时写入，此后才有进度。作者即目标，不另写 `target_node` |
+| `WorkProgress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node | 只在阶段变化时写一条，附一句摘要，不逐 token 写。`codex` 的 thread 和 turn 在 `running` 时随进度写入。`task` 路径的摘要由目标协调层给出 |
 | `WorkFinished` | `work_id`、`outcome`、`result_text`、`failure_reason?`，结果正文过长时放入 `blobs` | 目标 Node，`unverified` 的复核由入口 Node 写 | `outcome` 为 `completed`、`failed`、`interrupted` 或 `unverified` |
-| `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码 |
+| `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码；直连 PR 已删除 |
 | `NotificationAcked` | `notification_id`、`client_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
 | `AssistantChanged` | `change_id`、`cause`、`change` | 调度 Node | 本人在聊天里要求修改助手名称、说明、共用 skill 或例行任务，见 [在聊天中修改助手](assistant-config.md) |
 | `ContextCheckpoint` | `summary`、`covers: VersionVector` | 调度 Node | 保留现有类型，用于长会话的上下文压缩，`covered_heads` 改为版本向量 |
 
-`executor=codex` 表示委派目标 Node 上的 Codex App Server，`executor=agent` 表示把任务交给目标 Node 的协调 Agent，由它用本机工具执行，第 6 节说明两者的边界。目标协调 Agent 在执行 `agent` 任务时自己启动的 Codex 工作，记为一条 `parent_work` 指向原任务的新 `WorkDispatched`。
+`kind=codex` 表示本机协调 Agent 直连本机 App Server 发出、Node 观察的 Codex 回合，`kind=task` 表示把任务交给目标 Node 的协调 Agent。没有单独的执行层，见 `docs/design/agent-direct-app-server.md`。目标协调 Agent 在执行 `task` 时自己启动的 Codex 工作，记为一条 `parent_work` 指向原任务的新 `WorkDispatched`。
 
 `WorkDispatched` 由目标在接纳时写入，接纳前的派发只存在派发方本机 outbox 中。这样 DAG 中不会出现目标从未收到的派发。目标先写 `WorkDispatched` 并在本机日志记下 thread，再启动 turn，崩溃后能按日志核对，不重启工作。这是设计决定，记录在第 9 节。
 
-审批详情只有这份摘要。网页的审批表单另经 `approval_forms` 从目标 Node 读取选项和结构化的命令、目录与文件，读不到时只显示摘要。diff 等完整内容不进 DAG，网页也不提供，需要时到执行设备上查看。审批将在后续的直连 PR 中删除（第 10 节），这里不再细化。
+审批事件、`approval_forms` 和审批表单已随直连 PR 删除：工作线程以 `approvalPolicy=never`、完全访问运行。
 
 `WorkProgress.phase` 取值为 `started`、`running`、`waiting_approval`、`interrupting` 和 `finishing`。`WorkFinished` 的 `unverified` 表示目标 Node 无法证明执行层的真实结果，证据保存在目标 Node 的本机待核对记录中。本人核对后，入口 Node 可以为同一 `work_id` 再写一条带 `Attestation` 的 `WorkFinished`。只有 `unverified` 可以被后续的 `WorkFinished` 取代。
 
@@ -555,32 +555,30 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 目标 Node 上的工作由本机状态机驱动，状态为 `accepted`、`starting`、`running`、`waiting_approval`、`interrupting`、`finished` 和 `unverified`。状态转换函数是 Work 事件的唯一来源，同一事务内更新本机日志、追加事件并为结果入队。审批的 `request_id` 为 `hash(work_id, executor_epoch, rpc_id)`；App Server 重启后 epoch 加一，旧请求不能再回答。回答先标记为发送中，确认送达后才清除。
 
-### 6.1 两条跨设备工作路径
+### 6.1 工作路径
 
-跨设备工作保留两条路径，并且并存。`executor=codex` 委派目标 Node 上的 Codex App Server。`executor=agent` 把任务发给目标 Node 的协调 Agent，由它用本机工具执行，也就是现在 `send_task` 提供的远端 shell 能力。这是已决定事项，记录在第 9 节。
+原设计的跨设备工作有两条路径：`executor=codex` 委派目标 Node 上的 Codex App Server，`executor=agent` 把任务发给目标 Node 的协调 Agent。直连 PR 删除了前者，只保留协调 Agent 之间的任务（`kind=task`），本机工作为 `kind=codex`。
 
-两条路径共用以下授权规则：
+两类工作共用以下授权规则：
 
-- 派发方必须处于一次正在运行、非只读的调度 attempt 中。该 attempt 由带 `Attestation` 的本人消息触发，或由当前会话 `AutonomySet` 为 `continue` 的自主后续触发。
-- 目标 Node 核对派发方是未撤销的成员 Node，核对触发链上的本人签名或自主授权，核对 `cwd` 位于目标 Node 自己 `config.json` 的 `roots` 中。
+- 派发方必须处于一次正在运行的调度 attempt 中。直连 PR 之后没有自主度，本人消息、工作结果和例行任务触发的轮次都能派发。
+- 目标 Node 核对派发方是未撤销的成员 Node，核对 `cwd` 位于目标 Node 自己 `config.json` 的 `roots` 中。
 - 重试保留原 `work_id` 和 `call_ref`。结果不明时向原目标查询，不改派到其他 Node。
-- 两边的协调 Agent 都不能回答审批、加入或撤销设备，也不能修改 `AutonomySet`。
+- 两边的协调 Agent 都不能加入或撤销设备。
 
-两条路径的差别在审批边界：
+直连 PR 之后每台设备只有一个协调角色（协调 Agent 加 Node 运行时），协调 Agent 的 Shell 完全访问本机，不再逐条审批。跨设备只有 `kind=task` 一种：把任务交给目标设备的协调 Agent，由它在本机直连 App Server。下表为现状：
 
-| | `executor=codex` | `executor=agent` |
+| | 本机工作（`kind=codex`） | 跨设备任务（`kind=task`） |
 |---|---|---|
-| 在目标 Node 上执行的是 | 一个 Codex App Server turn | 目标 Node 的协调 SDK，作为一个 `AgentTask` 调度 job |
-| 目标 Node 需要 | Codex CLI 和允许的 `roots` | 已启用 `manager` 配置，并有剩余的 `daily_decision_limit` 额度 |
-| 每个操作是否审批 | 是。目标 Node 固定 `approvalPolicy=on-request`、`approvalsReviewer=user`、限于 `cwd` 的 workspace-write 沙箱且无网络，拒绝协调层覆盖这些字段（#56 的规则） | 授权在任务一级给出。目标协调 Agent 按目标 Node 的 Provider 使用本机工具，不逐条审批 |
-| 本机工具能力 | 只有 Codex turn 内的工具，受沙箱限制 | Codex SDK 协调层的 shell 对本机只读，改文件必须经本机 `codex` 执行器，因此仍逐条审批。Cursor SDK 协调层使用 Cursor 默认的本机工具集，可以直接执行 shell |
-| 审批由谁回答 | 只有本人，经带 `Attestation` 的 `ApprovalAnswered` | 目标协调层启动的 Codex 工作同左。Cursor 的本机工具没有审批，本人通过选择目标 Node 的 Provider 决定是否允许 |
-| DAG 中记录 | `WorkDispatched` 带 `thread_id` 和 `turn_id`，以及进度、审批和结果 | `WorkDispatched` 不带 thread，目标协调层给出阶段摘要和结果。它启动的 Codex 工作另记一条 `parent_work` 指向原任务的 `WorkDispatched` |
+| 谁发起 Codex 回合 | 本机协调 Agent 经 `dispatch_work` 直连 App Server，Node 先登记后观察 | 目标设备的协调 Agent，作为一个 `AgentTask` 调度 job |
+| 目标设备需要 | Codex CLI 和允许的 `roots` | 已启用 `manager` 配置，并有剩余的 `daily_decision_limit` 额度 |
+| 权限 | `approvalPolicy=never`、`danger-full-access` | 同左；Cursor SDK 协调层使用 Cursor 默认的本机工具集 |
+| DAG 中记录 | `WorkDispatched`、进度（thread、turn）和结果 | `WorkDispatched` 不带 thread，目标协调层给出阶段摘要和结果；它启动的 Codex 工作另记一条 `parent_work` 指向原任务的 `WorkDispatched` |
 | 不进入 DAG | Codex 的命令、diff 和工具输出 | 目标协调层的推理、shell 命令和输出 |
 
-`executor=agent` 沿用现在 `post_agent_task` 的接纳规则（`crates/node/src/store/agent_messages.rs:444` 起）。只有任务可以由 Agent 派发，环形委派被拒绝，目标在同一会话中已有未结束任务时回传 `interrupted`。目标协调层收到的上下文同样只来自 DAG，外加该任务的 `WorkDispatched` 正文。
+`kind=task` 沿用现在 `post_agent_task` 的接纳规则（`crates/node/src/store/agent_messages.rs:444` 起）。只有任务可以由 Agent 派发，环形委派被拒绝，目标在同一会话中已有未结束任务时回传 `interrupted`。目标协调层收到的上下文同样只来自 DAG，外加该任务的 `WorkDispatched` 正文。
 
-“继续上次的任务”由 `dispatch_work` 的 `continues=work_id` 表达。目标从原工作取得 `executor` 和 thread。`codex` 在同一 thread 上启动新 turn，`agent` 向同一目标协调层发送新任务，两者都写入一条 `continues=work_id` 的新 `WorkDispatched`。原目标不可达时返回错误，不改派到其他 Node。
+“继续上次的任务”由 `dispatch_work` 的 `continues=work_id` 表达。目标从原工作取得 `kind` 和 thread。`codex` 在同一 thread 上启动新 turn，`task` 向同一目标协调层发送新任务，两者都写入一条 `continues=work_id` 的新 `WorkDispatched`。原目标不可达时返回错误，不改派到其他 Node。
 
 只在本机保存的内容：
 
@@ -589,7 +587,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 | 调度 job 队列和投递 outbox | 调度 Node 与入口 Node 的 SQLite 本机表 |
 | 待核对记录及其证据 | 产生不确定结果的 Node |
 | SDK 原生会话 ID 和已覆盖向量 | 调度 Node |
-| 工作状态机日志（thread、turn、待回答请求的 RPC ID、executor epoch） | 目标 Node 的 `local_values` |
+| 工作状态机日志（thread、turn、App Server epoch、发送窗口） | 目标 Node 的 `local_values` |
 | 流式文字、工具调用进度 | 内存，经 `vibeface/rpc/1` 推送 |
 | 附件暂存进度、每日预算 | 本机 |
 | 设备私钥、模型凭证 | 本机，不进入任何同步数据 |

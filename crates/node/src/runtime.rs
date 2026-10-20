@@ -19,17 +19,20 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 mod agent_tools;
 mod bots;
 mod chat_controls;
-mod executor;
+mod codex_server;
+pub mod decision;
 mod followup;
 mod manager_control;
 mod observation;
 mod peers;
 mod schedule_delivery;
 mod settings;
+mod triage;
 mod work;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::ObservationGuard;
 pub use settings::NodeSettings;
+pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
@@ -132,8 +135,8 @@ pub struct Runtime {
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
-    pub(crate) executor: Arc<executor::ExecutorHost>,
-    executor_epoch: std::sync::atomic::AtomicU64,
+    pub(crate) codex: Arc<codex_server::CodexServer>,
+    codex_epoch: std::sync::atomic::AtomicU64,
     progress_sequence: std::sync::atomic::AtomicU64,
     pub local_access: Arc<crate::local_access::LocalAccess>,
     /// Operator token of the public entry's relay: this entry's own, or the one it serves.
@@ -142,7 +145,8 @@ pub struct Runtime {
     /// Bumped on every membership change, so open sessions and connections recheck their peer.
     pub(crate) membership: tokio::sync::watch::Sender<u64>,
     _process_lock: Arc<std::fs::File>,
-    executor_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    codex_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    pub(crate) triage: triage::TriageState,
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -201,11 +205,14 @@ impl Runtime {
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
-        let executor = Arc::new(executor::ExecutorHost::open(&config, &identity, dir, tx)?);
+        let codex = Arc::new(codex_server::CodexServer::open(
+            &config, &identity, dir, tx,
+        )?);
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,
             config.local_auto_access,
         )?);
+        let triage = triage::TriageState::new(config.triage.clone());
         let node = Self {
             data_dir: dir.to_owned(),
             settings: std::sync::Mutex::new(NodeSettings {
@@ -233,15 +240,16 @@ impl Runtime {
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
-            executor,
-            executor_epoch: std::sync::atomic::AtomicU64::new(0),
+            codex,
+            codex_epoch: std::sync::atomic::AtomicU64::new(0),
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             local_access,
             entry_token,
             write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
             membership: tokio::sync::watch::Sender::new(0),
             _process_lock: process_lock,
-            executor_rx: Mutex::new(Some(rx)),
+            codex_rx: Mutex::new(Some(rx)),
+            triage,
         };
         Ok(node)
     }
@@ -275,7 +283,7 @@ impl Runtime {
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self
-            .executor_rx
+            .codex_rx
             .lock()
             .await
             .take()
@@ -307,9 +315,10 @@ impl Runtime {
     /// ponytail: a Node that forks later keeps these running and its appends fail; stop them
     /// if a forked device turns out to keep running work.
     fn start_writers(self: &Arc<Self>, events: mpsc::UnboundedReceiver<Value>) {
-        self.start_executor(events);
+        self.start_codex(events);
         self.start_schedule_delivery();
         self.start_observation_worker();
+        self.start_triage();
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         let store = self.store.lock().await;
@@ -324,7 +333,7 @@ impl Runtime {
     /// Stops the managed App Server; the Node calls this on SIGTERM before exiting.
     pub async fn shutdown(&self) {
         self.stop_network().await;
-        self.executor.stop().await;
+        self.codex.stop().await;
     }
     pub async fn append(&self, network: &str, scope: &str, body: EventBody) -> Result<SignedEvent> {
         self.append_blobs(network, scope, body, vec![]).await
@@ -398,7 +407,6 @@ impl Runtime {
         Ok(())
     }
     async fn capabilities(&self) -> Value {
-        use executor::Executor as _;
         let settings = self.settings_snapshot();
         let manager =
             settings
@@ -412,15 +420,11 @@ impl Runtime {
         json!({"roots":settings.roots,"roles":self.config.roles,
             "manager":settings.manager.as_ref().map(|m|m.provider.clone()),
             "manager_capabilities":manager.map(|kind|kind.capabilities()),
-            "executor":self.executor.executor.capability().await})
+            "codex":self.codex.capability().await})
     }
 
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
-        let write = !matches!(
-            input["method"].as_str(),
-            Some("nodes" | "conversation" | "conversations" | "bots" | "notifications")
-        );
-        let _lease = self.manager_tool_lease(&access, write).await?;
+        let _lease = self.manager_tool_lease(&access).await?;
         self.rpc_inner(access, input).await
     }
     async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
@@ -524,33 +528,21 @@ impl Runtime {
                 let scope = scope.context("conversation_id is required")?;
                 self.set_owner(&access, &scope, &input).await
             }
-            "set_autonomy" => {
-                let scope = scope.context("conversation_id is required")?;
-                let result = self.set_autonomy(&access, &scope, &input).await?;
-                self.schedule_wakeup.notify_one();
-                Ok(result)
-            }
             "read_artifact" => self.read_artifact(&access, &input).await,
             "upload_attachment" => self.upload_attachment(&access, &input).await,
-            "answer_approval" | "interrupt_work" => {
-                ensure!(access.human, "only the user answers or stops work");
+            "interrupt_work" => {
+                ensure!(access.human, "only the user stops work");
                 let scope = scope.context("conversation_id is required")?;
-                let work_id = id(&input, "work_id")?;
-                if method == "interrupt_work" {
-                    self.stop_work(network, &scope, &work_id).await
-                } else {
-                    self.answer_approval(
-                        network,
-                        &scope,
-                        &work_id,
-                        &id(&input, "request_id")?,
-                        input.get("response").context("response is required")?,
-                        attestation(&input)?,
-                    )
+                self.stop_work(network, &scope, &id(&input, "work_id")?)
                     .await
-                }
+            }
+            "codex_state" | "send_decision" => {
+                ensure!(access.human, "only the user reaches the App Server");
+                self.codex_rpc(network, method, &input).await
             }
             "bots" => self.bots(&access).await,
+            "alerts" => self.alerts(&access).await,
+            "resolve_alert" => self.resolve_alert(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reconcile" | "resolve" => self.pending_check_control(&access, &input, method).await,
