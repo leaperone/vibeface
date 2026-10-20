@@ -270,11 +270,14 @@ pub(crate) fn append_from(
     blobs: Vec<BlobRef>,
     created_at_ms: i64,
 ) -> Result<SignedEvent> {
-    let gate: String = connection.query_row("SELECT state FROM temp.write_gate", [], |r| r.get(0))?;
+    let gate: String =
+        connection.query_row("SELECT state FROM temp.write_gate", [], |r| r.get(0))?;
     match gate.as_str() {
         "writable" => {}
         "forked" => bail!("this Node's log has forked and it no longer writes"),
-        "read_only" => bail!("this Node is read-only until you confirm it was not restored from a backup"),
+        "read_only" => {
+            bail!("this Node is read-only until you confirm it was not restored from a backup")
+        }
         _ => bail!("this Node is aligning with other Nodes; try again shortly"),
     }
     let author = identity.device_id()?;

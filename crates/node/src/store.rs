@@ -901,7 +901,13 @@ pub(crate) fn context_from(
     scope_id: &str,
     basis: Option<&VersionVector>,
 ) -> Result<Context> {
-    context_after(connection, network_id, scope_id, basis, &VersionVector::new())
+    context_after(
+        connection,
+        network_id,
+        scope_id,
+        basis,
+        &VersionVector::new(),
+    )
 }
 
 /// The newest checkpoint and the events it does not cover, in shared order. The next checkpoint
@@ -943,14 +949,17 @@ fn context_after(
          AND seq>COALESCE((SELECT value FROM json_each(?) WHERE key=events.author),0)
          ORDER BY lamport,created_at_ms,hash",
     )?;
-    let rows = statement.query_map(params![network_id, scope_id, serde_json::to_string(covers)?], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, u64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        params![network_id, scope_id, serde_json::to_string(covers)?],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        },
+    )?;
     let mut events = Vec::new();
     for row in rows {
         let (author, seq, hash, envelope) = row?;

@@ -259,7 +259,12 @@ fn logging(data_dir: Option<&PathBuf>) {
         if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 16 << 20) {
             let _ = fs::rename(&path, dir.join("node.log.1"));
         }
-        fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).ok()
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
     });
     let terminal = file.is_none() || std::io::stderr().is_terminal();
     tracing_subscriber::registry()

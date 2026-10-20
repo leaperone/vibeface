@@ -69,8 +69,10 @@ impl Store {
         let version = |envelope: &str| -> Result<serde_json::Value> {
             let envelope: SignedEvent = serde_json::from_str(envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-            Ok(serde_json::json!({"hash":envelope.hash,"scope_id":event.scope_id,
-                "created_at_ms":event.created_at_ms,"body":event.body}))
+            Ok(
+                serde_json::json!({"hash":envelope.hash,"scope_id":event.scope_id,
+                "created_at_ms":event.created_at_ms,"body":event.body}),
+            )
         };
         let mut conflicts = Vec::new();
         for row in rows {

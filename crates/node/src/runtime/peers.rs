@@ -504,8 +504,12 @@ impl Runtime {
                 tokio::spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
                     if result.is_err() && node.unreachable(&members, &peer) {
-                        node.set_write_state(&network, &[WriteState::Aligning], WriteState::ReadOnly)
-                            .await;
+                        node.set_write_state(
+                            &network,
+                            &[WriteState::Aligning],
+                            WriteState::ReadOnly,
+                        )
+                        .await;
                     }
                     let mut states = node.sync_peers.lock().expect("sync peers");
                     let entry = states.entry(peer.clone()).or_default();
@@ -633,7 +637,8 @@ impl Runtime {
             (false, true) => WriteState::Writable,
             (false, false) => WriteState::Aligning,
         };
-        self.set_write_state(&network, &[WriteState::Writable], state).await;
+        self.set_write_state(&network, &[WriteState::Writable], state)
+            .await;
         Ok(state == WriteState::Writable)
     }
 
@@ -650,7 +655,9 @@ impl Runtime {
         let theirs = vector.get(&own);
         let local = self.local_seq(network, &own).await?;
         let ours = match theirs {
-            Some((seq, _)) if *seq <= local => self.store.lock().await.hash_at(network, &own, *seq)?,
+            Some((seq, _)) if *seq <= local => {
+                self.store.lock().await.hash_at(network, &own, *seq)?
+            }
             _ => None,
         };
         if let Some((seq, hash)) = theirs
@@ -670,13 +677,21 @@ impl Runtime {
             self.ingest(network, &events).await?;
         }
         if self.store.lock().await.has_conflicts_by(network, &own)? {
-            let from = [WriteState::Aligning, WriteState::ReadOnly, WriteState::Writable];
-            if self.set_write_state(network, &from, WriteState::Forked).await {
+            let from = [
+                WriteState::Aligning,
+                WriteState::ReadOnly,
+                WriteState::Writable,
+            ];
+            if self
+                .set_write_state(network, &from, WriteState::Forked)
+                .await
+            {
                 tracing::warn!(%peer, "another copy of this device wrote different events; writes stopped");
             }
         } else if theirs.is_none_or(|(seq, _)| *seq <= local) {
             let from = [WriteState::Aligning, WriteState::ReadOnly];
-            self.set_write_state(network, &from, WriteState::Writable).await;
+            self.set_write_state(network, &from, WriteState::Writable)
+                .await;
         }
         Ok(())
     }
@@ -710,7 +725,11 @@ impl Runtime {
     /// The write state, and the conflicts kept aside here, for the web.
     /// Each other member Node with whether the last sync reached it and when one last finished.
     pub(crate) async fn peer_health(&self) -> Vec<crate::maintenance::PeerHealth> {
-        let Ok(view) = self.membership_state().await.and_then(|state| state.project()) else {
+        let Ok(view) = self
+            .membership_state()
+            .await
+            .and_then(|state| state.project())
+        else {
             return Vec::new();
         };
         let local = self.identity.device_id().unwrap_or_default();
@@ -775,7 +794,10 @@ impl Runtime {
             "this Node's log has forked and it no longer writes"
         );
         let from = [WriteState::Aligning, WriteState::ReadOnly];
-        if self.set_write_state(network, &from, WriteState::Writable).await {
+        if self
+            .set_write_state(network, &from, WriteState::Writable)
+            .await
+        {
             self.store.lock().await.local_set(
                 network,
                 "write-confirmed",

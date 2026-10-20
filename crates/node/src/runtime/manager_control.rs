@@ -305,7 +305,11 @@ impl Runtime {
             self.store.lock().await.resolve_pending_check(
                 network,
                 &check.check_id,
-                if note.is_empty() { "settled with the work's own check" } else { &evidence },
+                if note.is_empty() {
+                    "settled with the work's own check"
+                } else {
+                    &evidence
+                },
             )?;
         }
         let receipt = self.store.lock().await.settle_work(

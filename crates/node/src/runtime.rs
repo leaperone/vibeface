@@ -294,7 +294,11 @@ impl Runtime {
             let node = self.clone();
             tokio::spawn(async move {
                 let mut state = node.write_state.subscribe();
-                if state.wait_for(|state| *state == WriteState::Writable).await.is_ok() {
+                if state
+                    .wait_for(|state| *state == WriteState::Writable)
+                    .await
+                    .is_ok()
+                {
                     node.start_writers(events);
                     if let Ok(state) = node.membership_state().await {
                         node.abandon_revoked_works(&state.genesis.network_id).await;

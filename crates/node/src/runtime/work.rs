@@ -38,7 +38,12 @@ fn escaped(changes: &Value, cwd: &str) -> Option<String> {
     changes
         .as_array()?
         .iter()
-        .flat_map(|change| [change["path"].as_str(), change["kind"]["move_path"].as_str()])
+        .flat_map(|change| {
+            [
+                change["path"].as_str(),
+                change["kind"]["move_path"].as_str(),
+            ]
+        })
         .flatten()
         .find(|path| !inside(path))
         .map(str::to_owned)
@@ -851,8 +856,14 @@ mod tests {
         let changes = |path: &str| json!([{"path":"src/a.rs","kind":{"type":"add"}},{"path":path,"kind":{"type":"add"}}]);
         assert_eq!(super::escaped(&changes("/p/b.rs"), "/p"), None);
         assert_eq!(super::escaped(&changes("sub/../c.rs"), "/p"), None);
-        assert_eq!(super::escaped(&changes("../q/x"), "/p").as_deref(), Some("../q/x"));
-        assert_eq!(super::escaped(&changes("/pq/x"), "/p").as_deref(), Some("/pq/x"));
+        assert_eq!(
+            super::escaped(&changes("../q/x"), "/p").as_deref(),
+            Some("../q/x")
+        );
+        assert_eq!(
+            super::escaped(&changes("/pq/x"), "/p").as_deref(),
+            Some("/pq/x")
+        );
         let moved = json!([{"path":"a","kind":{"type":"update","move_path":"/etc/x"}}]);
         assert_eq!(super::escaped(&moved, "/p").as_deref(), Some("/etc/x"));
     }

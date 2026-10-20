@@ -822,7 +822,10 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
     }
     let full = store.context(&net.network, "c", None)?;
     let recent = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
-    assert!(recent.events.len() < full.events.len(), "covered events are not read");
+    assert!(
+        recent.events.len() < full.events.len(),
+        "covered events are not read"
+    );
     assert_eq!(
         crate::scheduler::checkpoint(&recent, &works),
         crate::scheduler::checkpoint(&full, &works),

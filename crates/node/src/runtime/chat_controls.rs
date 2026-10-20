@@ -165,7 +165,8 @@ impl Runtime {
             .map(|work| crate::scheduling::task_trigger(&work.work_id))
             .collect();
         // One card per work: an agent task's coordination check is answered by its work card.
-        pending_checks.retain(|check| !unverified.contains(check["trigger"].as_str().unwrap_or_default()));
+        pending_checks
+            .retain(|check| !unverified.contains(check["trigger"].as_str().unwrap_or_default()));
         for work in store.works(network, scope)? {
             let mut value = json!(work);
             let record = records.get(&work.work_id);
