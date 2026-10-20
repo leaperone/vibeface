@@ -11,7 +11,9 @@ import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ApprovalCard, ConfirmCard } from '@/features/workspace/task-activity'
 import { approvalKind, decisionLabel, nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
-import type { AutonomyMode, ManagerJob, WorkAnswer, WorkRecord } from '@/features/workspace/types'
+import type { AssistantChangeRecord, AutonomyMode, ManagerJob, WorkAnswer, WorkRecord } from '@/features/workspace/types'
+import { placeChanges, routineName, routineTrigger } from '@/features/workspace/assistant'
+import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import { Message, type ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
@@ -58,18 +60,31 @@ export function ConversationScreen() {
     return rows
   }
 
+  // What a turn changed in the assistant shows after its reply, or after the message while no reply exists.
+  const changes = data?.changes ?? []
+  const placedChanges = placeChanges(data?.messages ?? [], changes)
+  const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={data?.assistant?.routines ?? []} /> })
+
   const entries: ChatEntry[] = []
   for (const message of data?.messages ?? []) {
-    entries.push(pendingRow(message))
+    const routine = message.role === 'user' ? null : routineTrigger(message.in_reply_to)
+    if (routine) {
+      // A routine run has no message of the person; its reply stands alone and the tasks it started follow it.
+      entries.push({ key: message.message_id, node: <Message message={message} routine={routineName(routine, data?.assistant, changes)} /> })
+      for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
+    } else entries.push(pendingRow(message))
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
       if ((job.state === 'failed' || job.state === 'rejected')) entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
+    const turn = placedChanges.after.get(message.message_id)
+    if (turn) entries.push(changeRow(turn))
   }
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
   for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
+  for (const turn of placedChanges.rest) entries.push(changeRow(turn))
   if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
   for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
 

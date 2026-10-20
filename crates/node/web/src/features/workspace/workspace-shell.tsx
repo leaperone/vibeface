@@ -16,6 +16,7 @@ import {
   SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar,
 } from "@/components/ui/sidebar"
 import { useWorkspace } from "./context"
+import { AssistantPanelButton } from "./assistant-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { addressName } from "./labels"
@@ -130,7 +131,10 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
         <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(0.75rem,env(safe-area-inset-left))] pe-[max(0.75rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
           <SidebarTrigger aria-label="菜单" title="菜单" />
-          <h1 className="min-w-0 flex-1 truncate text-heading font-semibold" title={title}>{title}</h1>
+          <div className="flex min-w-0 flex-1 items-center gap-1">
+            <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
+            {chatRoute ? <AssistantPanelButton /> : null}
+          </div>
           <Button asChild variant="ghost" size="icon" className="relative md:hidden">
             <Link to="/inbox" aria-label={inbox.length ? `待处理 ${inbox.length}` : "待处理"}>
               <Inbox aria-hidden="true" />
