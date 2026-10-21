@@ -502,7 +502,13 @@ async fn serve_session(
                 let principal = principal(&node, &session).await?;
                 match event {
                     Ok(event) if event.network_id == principal.network_id => {
-                        let payload = pushed(&node, &principal.network_id, &session.device_id, event.payload).await;
+                        // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
+                        let payload = if events.len() > PUSH_BURST {
+                            while events.try_recv().is_ok() {}
+                            json!({"type":"changed"})
+                        } else {
+                            pushed(&node, &principal.network_id, &session.device_id, event.payload).await
+                        };
                         send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
@@ -977,6 +983,9 @@ pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) ->
     notify_join(node, &request);
     Ok(serde_json::to_value(request)?)
 }
+
+/// Queued changes past which a session asks its client to re-read instead.
+const PUSH_BURST: usize = 32;
 
 /// A conversation change goes out as the records it touched; one this session cannot build
 /// asks the client to re-read that conversation.
