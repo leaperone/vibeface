@@ -256,7 +256,7 @@ function question(value: unknown): Question {
     question_id: text(data.question_id), conversation_id: data.conversation_id == null ? null : text(data.conversation_id),
     assistant: assistant && { bot_id: text(assistant.bot_id), name: text(assistant.name) },
     severity: severity(data.severity), text: text(data.text),
-    choices: list(data.choices).map((item) => {
+    choices: list(data.choices ?? []).map((item) => {
       const choice = record(item)
       return { label: text(choice.label), ...(choice.conversation_id == null ? {} : { conversation_id: text(choice.conversation_id) }) }
     }),

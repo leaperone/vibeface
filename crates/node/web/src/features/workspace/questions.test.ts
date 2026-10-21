@@ -18,6 +18,8 @@ test("questions parse from the list and the chat snapshot, and fail closed on sh
   const [question, parsedSession] = parseQuestions({ questions: [row("q1", 1), session] })
   assert.equal(question.choices[1].conversation_id, "other")
   assert.equal(parsedSession.conversation_id, null, "a session nobody's assistant started has no chat")
+  const { choices: _, ...open } = row("q2", 3)
+  assert.deepEqual(parseQuestions({ questions: [open] })[0].choices, [], "a question the node sent without choices is free text only")
   assert.equal(parsedSession.assistant, null)
   assert.equal(parsedSession.about.request_id, "r")
   const answered = row("q2", 3, { answer: { message_id: "a-q2", text: "继续", author: "client", created_at_ms: 4 } })
