@@ -21,7 +21,7 @@ export type ReadyConnection = {
 export type Member = { device_id: string; kind: 'node' | 'client'; name: string; manage: boolean }
 export type Revocation = { device_id: string; cutoff_seq: number; cutoff_hash: string | null }
 export type MembershipView = { network_id: string; epoch: number; heads: string[]; members: Member[]; revoked: Revocation[]; attesters: string[] }
-export type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'expired'
+export type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'withdrawn' | 'expired'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
   join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
@@ -97,7 +97,7 @@ export function parsePrincipal(value: unknown): ClientPrincipal {
 const hex32 = (value: unknown) => value === null || value === undefined ? null : validTarget(value)
 export function parseJoinRequest(value: unknown): JoinRequest {
   const v = record(value, '加入请求')
-  if (!['pending', 'confirming', 'joined', 'rejected', 'expired'].includes(v.status as string)) throw new Error('加入状态无效。')
+  if (!['pending', 'confirming', 'joined', 'rejected', 'withdrawn', 'expired'].includes(v.status as string)) throw new Error('加入状态无效。')
   if (v.kind !== 'node' && v.kind !== 'client') throw new Error('设备类型无效。')
   if (typeof v.invite_id !== 'string' || !/^[a-f0-9]{32}$/.test(v.invite_id)) throw new Error('邀请编号无效。')
   return {

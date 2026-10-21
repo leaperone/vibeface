@@ -69,8 +69,8 @@ export function AddDevice() {
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription>在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
-          <JoinRequests issuing={result !== null} />
           {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
+          <JoinRequests issuing={result !== null} />
           {result ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在你的公网网页里扫码"} /> : null}
             {result.publicEntry ? <p className="text-meta text-muted-foreground">用手机相机扫码，或在你的公网网页里扫码</p> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
