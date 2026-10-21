@@ -13,6 +13,7 @@ import { useDevice } from "@/features/identity/context"
 import { messageOf } from "@/lib/node"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
+import { projectName } from "./questions"
 import type { BotProject } from "./types"
 
 type BotFormProps = {
@@ -42,7 +43,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
     const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
     return (node.capabilities?.roots ?? []).map((cwd) => {
       const project = { target_node: node.device_id, cwd }
-      return { key: projectKey(project), project, label: `${deviceName} · ${cwd}` }
+      return { key: projectKey(project), project, label: `${deviceName} · ${projectName(cwd)}` }
     })
   })
   const savedProject = pending?.project

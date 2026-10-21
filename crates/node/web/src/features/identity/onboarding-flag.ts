@@ -1,13 +1,15 @@
 import { useSyncExternalStore } from "react"
 
-// Set when a new network is created here; cleared once the assistant step is done or skipped.
+// The onboarding step (3 or 4) after a new network is created here; cleared once the assistant step is done or skipped.
 const key = "vibeface.onboarding"
 const listeners = new Set<() => void>()
-const read = () => { try { return localStorage.getItem(key) === "1" } catch { return false } }
-function write(on: boolean) {
-  try { if (on) localStorage.setItem(key, "1"); else localStorage.removeItem(key) } catch {}
+type Step = 3 | 4
+const read = (): Step | null => { try { const value = localStorage.getItem(key); return value === "3" || value === "4" ? Number(value) as Step : null } catch { return null } }
+function write(step: Step | null) {
+  try { if (step) localStorage.setItem(key, String(step)); else localStorage.removeItem(key) } catch {}
   listeners.forEach((listener) => listener())
 }
-export const startOnboarding = () => write(true)
-export const finishOnboarding = () => write(false)
-export const useOnboarding = () => useSyncExternalStore((listener) => { listeners.add(listener); return () => listeners.delete(listener) }, read, () => false)
+export const startOnboarding = () => write(3)
+export const setOnboardingStep = (step: Step) => write(step)
+export const finishOnboarding = () => write(null)
+export const useOnboarding = () => useSyncExternalStore((listener) => { listeners.add(listener); return () => listeners.delete(listener) }, read, () => null)

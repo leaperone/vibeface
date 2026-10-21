@@ -1977,6 +1977,14 @@ mod tests {
                 {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
         );
         assert_eq!(read["providers"][1]["env"][0]["set"], true);
+        assert_eq!(
+            (
+                read["providers"][1]["state"].clone(),
+                read["providers"][1]["issues"].clone()
+            ),
+            (json!("unused"), json!([])),
+            "Cursor runs nothing until the assistant uses it"
+        );
         assert_eq!(codex["app_server"]["mode"], "system");
         assert_eq!(read["providers"][1]["app_server"], Value::Null);
         let spawn = json!({"provider":"codex","app_server":{"mode":"spawn","socket":null}});

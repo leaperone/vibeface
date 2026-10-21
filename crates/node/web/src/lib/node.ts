@@ -44,7 +44,7 @@ export type AppServer = { mode: AppServerMode; socket: string | null; link: AppS
 export type ProviderStatus = {
   provider: ProviderId; enabled: boolean; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; assistant: boolean; app_server: AppServer | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
-  state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
+  state: 'ready' | 'needs_setup' | 'starting' | 'unused' | 'off'; issues: ProviderIssue[]
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
@@ -160,7 +160,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   }
 }
 const providerIds: ProviderId[] = ['codex', 'cursor'], providerRoles: ProviderRole[] = ['agent', 'execution']
-const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
+const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'unused', 'off']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 服务状态格式不对。')
   return value as T

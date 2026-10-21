@@ -13,7 +13,7 @@ import { agentName, projectName, settledAnswer } from "./questions"
 import type { Question, Severity } from "./types"
 
 const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> = {
-  urgent: { icon: TriangleAlert, tone: "danger", label: "紧急" },
+  urgent: { icon: TriangleAlert, tone: "warning", label: "紧急" },
   attention: { icon: MessageCircleQuestionMark, tone: "warning" },
   info: { icon: Info, tone: "info" },
 }
@@ -41,6 +41,10 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const { icon, tone, label } = looks[question.severity]
   const disabled = !workspace.writable || action.busy !== null
   const session = question.conversation_id === null
+  // 交给 the primary assistant repeats 处理.
+  const shown = question.choices.filter((choice) => !session || !choice.conversation_id || choice.conversation_id !== workspace.primary)
+  // 处理 lets the primary assistant decide, the step most sessions want; otherwise the asker lists the expected answer first.
+  const primary = shown.find((choice) => choice.label === "处理") ?? shown[0]
   const send = (key: string, value: string) => action.run(key, async () => {
     const result = await workspace.answer(question, value)
     if (result.status === "already_answered" && result.text !== value.trim()) workspace.announce("这个问题已经回答过了")
@@ -76,12 +80,10 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
     </p> : <>
       {question.choices.length ? <div className="flex flex-wrap gap-2">
-        {/* 交给 the primary assistant repeats 处理. */}
-        {question.choices.filter((choice) => !session || !choice.conversation_id || choice.conversation_id !== workspace.primary).map((choice) => {
+        {shown.map((choice) => {
           const key = `choice:${choice.label}`
-          // 处理 lets the primary assistant decide, the step most sessions want.
-          const main = session && choice.label === "处理"
-          return <Button key={choice.label} type="button" variant={main ? "default" : "outline"} title={main ? "让主助手来分派" : undefined} disabled={disabled} aria-busy={action.busy === key || undefined} onClick={() => void send(key, choice.label)}><BusyIcon busy={action.busy === key} />{choice.label}</Button>
+          const main = choice === primary
+          return <Button key={choice.label} type="button" variant={main ? "default" : "outline"} title={session && choice.label === "处理" ? "让主助手来分派" : undefined} disabled={disabled} aria-busy={action.busy === key || undefined} onClick={() => void send(key, choice.label)}><BusyIcon busy={action.busy === key} />{choice.label}</Button>
         })}
       </div> : null}
       {session ? null : <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>

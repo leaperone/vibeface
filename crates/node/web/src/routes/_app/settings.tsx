@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { ArchiveRestore, Bell, BellRing, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
+import { ArchiveRestore, Bell, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
@@ -26,6 +26,7 @@ function SettingsPage() {
     <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><Bell aria-hidden="true" className="size-5" />提醒</h2>
       <Button type="button" variant="secondary" className="w-fit" disabled={workspace.notificationButton.disabled} onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>
+      {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <TriageSettings /> : null}
     </section>
     <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><Palette aria-hidden="true" className="size-5" />外观</h2>
@@ -40,10 +41,6 @@ function SettingsPage() {
     {device.ready?.principal.can_manage ? <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5" />恢复</h2>
       <RecoveryControls />
-    </section> : null}
-    {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><BellRing aria-hidden="true" className="size-5" />会话提醒</h2>
-      <TriageSettings />
     </section> : null}
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><LifeBuoy aria-hidden="true" className="size-5" />排障</h2>

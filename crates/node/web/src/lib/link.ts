@@ -19,7 +19,7 @@ export type LinkEvent =
   | { type: 'revoked' }
   | { type: 'left' }
 
-export const backoff = (attempt: number) => Math.min(30_000, 1000 * 2 ** Math.max(0, attempt - 1))
+export const backoff = (attempt: number) => Math.min(10_000, 500 * 2 ** Math.max(0, attempt - 1))
 
 /** Events that make no sense in the current state leave it unchanged. */
 export function nextLink(link: Link, event: LinkEvent): Link {
