@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, Forward, Laptop, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
-import { ActionCard, InlineError } from '@/components/app/kit'
+import { ActionCard, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
 import { useWorkspace } from '@/features/workspace/context'
@@ -73,6 +73,7 @@ export function ConversationScreen() {
     ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id) ?? { name: '另一个助手' }} /> })),
   ])
 
+  const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   const entries: ChatEntry[] = []
   for (const message of data?.messages ?? []) {
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
@@ -82,10 +83,12 @@ export function ConversationScreen() {
       entries.push({ key: message.message_id, message, routine: routineName(routine, data?.assistant, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
+    const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.error
+    if (cause) entries.push({ key: `cause:${message.message_id}`, node: <ReplyCause raw={cause} /> })
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
-      if ((job.state === 'failed' || job.state === 'rejected')) entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+      if ((job.state === 'failed' || job.state === 'rejected') && !replied.has(job.reply_message_id ?? '')) entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
     const turn = placedChanges.after.get(message.message_id)
@@ -103,7 +106,10 @@ export function ConversationScreen() {
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const needsConfirm = checks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
-  if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p> })
+  if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <div className="flex items-start gap-2">
+    <span aria-hidden="true" className="flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground"><Bot className="size-4" /></span>
+    <p role="status" className="flex min-h-7 items-center gap-2 px-1 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p>
+  </div> })
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
@@ -236,6 +242,11 @@ function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name
     <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
     {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
   </p>
+}
+
+/** The provider's own words behind a failed reply, folded under it. */
+function ReplyCause({ raw }: { raw: string }) {
+  return <Details className="-mt-1 pl-9">{raw}</Details>
 }
 
 function JobLine({ job }: { job: ManagerJob }) {

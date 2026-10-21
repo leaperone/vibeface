@@ -38,7 +38,7 @@ export function useInbox(): InboxItem[] {
   for (const note of workspace.notifications) {
     if (note.kind !== "manager_attention") continue
     const owner = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
-    if (owner) items.push({ key: `attention:${note.notification_id}`, icon: MessageSquareWarning, title: "助手需要你看看", meta: owner.name, to: `/b/${owner.bot_id}`, kind: "attention" })
+    if (owner) items.push({ key: `attention:${note.notification_id}`, icon: MessageSquareWarning, title: note.text.trim() || "助手需要你看看", meta: owner.name, to: `/b/${owner.bot_id}`, kind: "attention" })
   }
   if (workspace.nodes.length && !workspace.nodes.some((node) => !node.revoked && node.capabilities?.manager)) items.push({ key: "setup", icon: Sparkles, title: "还没设置 AI 服务", to: device.ready ? `/devices/${device.ready.entry.device_id}` : "/devices", kind: "setup" })
   return items

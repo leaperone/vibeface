@@ -228,6 +228,14 @@ pub fn add_secret(secret: &str) {
     }
 }
 
+/// `text` with the secrets known to this process blanked, for a raw cause shown outside node.log.
+pub fn scrub(text: &str) -> String {
+    match SINK.get() {
+        Some(sink) => redact(text, &sink.secrets.lock().expect("log secrets")),
+        None => redact(text, &environment_secrets()),
+    }
+}
+
 /// Sends this test process's log records to `dir` without a `tracing` subscriber.
 #[cfg(test)]
 pub(crate) fn capture(dir: &Path) -> Result<()> {

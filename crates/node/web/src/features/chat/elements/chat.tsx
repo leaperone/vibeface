@@ -30,7 +30,8 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
   const anchor = entries.map((entry) => entry.anchor === true).lastIndexOf(true)
 
   return (
-    <MessageScrollerProvider autoScroll>
+    // The button shows only once the last line has scrolled out of view, so it never covers it.
+    <MessageScrollerProvider autoScroll scrollEdgeThreshold={96}>
       <MessageScroller className="h-auto min-h-24 flex-1">
         <MessageScrollerViewport aria-label="聊天记录">
           <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-0 px-4 py-6 sm:px-6 lg:px-8">
