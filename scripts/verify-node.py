@@ -1943,7 +1943,7 @@ def foreign_session_checks(run, workspace, a, network, passed):
         asked(sessions[label]))) for label in ("ignore", "hand", "route", "keep")}
     expected = [{"label": "忽略"}, {"label": "处理"}, {"label": "交给 Alpha", "conversation_id": "bot-history-alpha"},
                 {"label": "交给 Beta", "conversation_id": "bot-history-beta"}]
-    require(all(row["conversation_id"] is None and row["text"] == "这个 Codex 会话不是助手发起的：处理还是忽略？"
+    require(all(row["conversation_id"] is None and row["text"] == "谁来接这个 Codex 会话？"
                 and row["choices"] == expected and row["about"]["summary"] == summaries.get(label, "tests fail")
                 for label, row in questions.items()),
             "the question offers 忽略, 处理 and each assistant, and shows only on the pending list")

@@ -106,7 +106,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
-                        {workspace.primary === bot.conversation_id ? <Star aria-label="主助手" className="size-3.5 shrink-0 fill-current text-muted-foreground" /> : null}
+                        {workspace.primary === bot.conversation_id ? <span title="主助手" className="inline-flex shrink-0"><Star aria-label="主助手" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
                         {marked ? <span aria-label="有新进展" className="size-2 shrink-0 rounded-full bg-warning" /> : null}
                       </Link>
                     </SidebarMenuButton>

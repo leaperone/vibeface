@@ -348,7 +348,7 @@ impl Runtime {
             EventBody::QuestionAsked {
                 question_id,
                 severity: Severity::Info,
-                text: format!("这个 {agent} 会话不是助手发起的：处理还是忽略？"),
+                text: format!("谁来接这个 {agent} 会话？"),
                 choices,
                 about: subject(event, None)?,
             },
@@ -1895,7 +1895,7 @@ mod tests {
             let s1 = triage::session_question_id(&local, "s1");
             let first = asked.iter().find(|q| q["question_id"] == s1.as_str()).unwrap();
             assert_eq!(first["conversation_id"], Value::Null);
-            assert_eq!(first["text"], "这个 Codex 会话不是助手发起的：处理还是忽略？");
+            assert_eq!(first["text"], "谁来接这个 Codex 会话？");
             assert_eq!(first["about"]["summary"], "tests fail");
             assert_eq!(
                 first["choices"],
