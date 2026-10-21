@@ -10,6 +10,8 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(checks.iter().any(|check| check.trigger == job.trigger));
     if let JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } = &job.state {
+        let detail = crate::logging::scrub(detail);
+        value["detail"] = json!(detail);
         value["error"] = json!(detail);
     }
     Ok(value)

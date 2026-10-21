@@ -2066,3 +2066,58 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let raw = "CURSOR_API_KEY is required for the Cursor SDK manager";
+    for (id, outcome) in [
+        ("m1", JobOutcome::Failed(raw.into())),
+        (
+            "m2",
+            JobOutcome::Interrupted {
+                detail: raw.into(),
+                process_unconfirmed: true,
+            },
+        ),
+    ] {
+        store.accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            id,
+            "hi",
+            vec![],
+            true,
+            signature(&net, id, "hi")?,
+            2,
+        )?;
+        let claimed = store
+            .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+            .context("job")?;
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started("c", &claimed.job.trigger, &attempt)?;
+        let job = store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &claimed.job.trigger,
+            &attempt,
+            outcome,
+            "",
+            3,
+        )?;
+        let reply = store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .context("reply")?;
+        assert!(!reply.text.contains("CURSOR_API_KEY"), "{}", reply.text);
+        assert!(reply.text.contains("设备 → AI 服务"), "{}", reply.text);
+        assert!(
+            matches!(&job.state, JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } if detail == raw),
+            "the raw cause stays on the local job"
+        );
+    }
+    Ok(())
+}

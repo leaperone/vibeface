@@ -553,14 +553,79 @@ pub(crate) fn admit_work_result_from(
     .map(Some)
 }
 
+/// Provider errors as the person reads them in the chat, each with where to go next. The raw
+/// English cause stays on the local job and in node.log; the reply is synced to every device.
+const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
+    (
+        &[
+            "api_key is required",
+            "api_key is missing",
+            "missing environment variable",
+        ],
+        "AI 服务缺少密钥或密钥无效。去「设备 → AI 服务」填好后再发一次。",
+    ),
+    (
+        &["provider is turned off", "execution is turned off"],
+        "助手用的 AI 服务已关闭。去「设备 → AI 服务」打开后再发一次。",
+    ),
+    (
+        &[
+            "executable was not found",
+            "command not found",
+            "no cursor sdk bridge",
+            "sidecar is missing",
+            "enoent",
+        ],
+        "这台设备上找不到 AI 服务的程序。去「设备 → AI 服务」检查后再发一次。",
+    ),
+    (
+        &["usage limit", "rate limit", "quota", "too many requests"],
+        "AI 服务的用量到上限了。等额度恢复后再发一次。",
+    ),
+    (
+        &[
+            "unauthorized",
+            "authentication failed",
+            "not logged in",
+            "invalid api key",
+        ],
+        "AI 服务登录没通过。去「设备 → AI 服务」检查密钥后再发一次。",
+    ),
+];
+
+fn plain_failure(detail: &str) -> Option<&'static str> {
+    let detail = detail.to_lowercase();
+    PROVIDER_FAILURES
+        .iter()
+        .find(|(needles, _)| needles.iter().any(|needle| detail.contains(needle)))
+        .map(|(_, text)| *text)
+}
+
 fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, String) {
+    let chinese = |detail: &str| {
+        detail
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    };
     match outcome {
         JobOutcome::Completed => (ReplyStatus::Completed, "（没有回复内容）".into()),
-        JobOutcome::Failed(detail) => (ReplyStatus::Failed, format!("回复失败：{detail}")),
+        JobOutcome::Failed(detail) => (
+            ReplyStatus::Failed,
+            match plain_failure(detail) {
+                Some(text) => text.into(),
+                None if chinese(detail) => format!("这次没能回复：{detail}"),
+                None => "这次没能回复。再发一次试试；一直不行就去「设备 → AI 服务」看看。".into(),
+            },
+        ),
         JobOutcome::Cancelled(_) => (ReplyStatus::Stopped, "已停止回复。".into()),
-        JobOutcome::Interrupted { detail, .. } => {
-            (ReplyStatus::Interrupted, format!("回复被中断：{detail}"))
-        }
+        JobOutcome::Interrupted { detail, .. } => (
+            ReplyStatus::Interrupted,
+            match plain_failure(detail) {
+                Some(text) => text.into(),
+                None if chinese(detail) => format!("回复被中断：{detail}"),
+                None => "回复中途断开，结果未知。先看看有没有改动，再决定要不要重发。".into(),
+            },
+        ),
     }
 }
 
