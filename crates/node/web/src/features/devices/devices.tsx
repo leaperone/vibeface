@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Bot, ChevronRight, Copy, Crown, Globe, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Globe, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Details, DetailRow, EmptyState, InlineError, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -113,6 +113,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   if (!row) return device.directory ? <EmptyState icon={MonitorSmartphone} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-3xl gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry ? ready?.entry.address ?? "" : ""
+  const saved = device.entries.find((item) => item.device_id === row.id)
 
   return <div className="mx-auto grid w-full max-w-3xl gap-6">
     <header className="flex items-center gap-4">
@@ -133,10 +134,11 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。请用管理设备移除它，再重新加入。"}</span>
     </p> : null}
 
-    {row.kind === "node" ? <Section icon={Bot} title="助手">
+    {row.kind === "node" && !copied ? <Section icon={Bot} title="助手">
       {row.entry && (canManage || localSession) ? <AssistantSettings /> : <div className="grid gap-1">
         <p>{row.assistant ? "能运行助手" : "还没配置助手"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
+        {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>}
     </Section> : null}
 
