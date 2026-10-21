@@ -767,6 +767,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             WorkOutcome::Completed,
             "checked",
             signed.clone(),
+            false,
             10,
         )?
         .context("the settled result reports back")?;
@@ -791,9 +792,72 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
                 WorkOutcome::Completed,
                 "checked",
                 signed,
+                false,
                 11
             )
             .is_err()
+    );
+
+    let running = spec("running", &net.a)?;
+    store.accept_work(&net.a, &net.network, running.clone(), 12)?;
+    for signal in [
+        Signal::ThreadCreated("th".into()),
+        Signal::TurnStarted {
+            turn_id: "tu".into(),
+            epoch: 1,
+        },
+    ] {
+        store.apply_work_signal(&net.a, &net.network, &running.work_id, signal, 13)?;
+    }
+    let EventBody::WorkFinished {
+        attestation: Some(signed),
+        ..
+    } = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::WorkFinished {
+            work_id: running.work_id.clone(),
+            outcome: WorkOutcome::Interrupted,
+            result_text: String::new(),
+            failure_reason: None,
+            attestation: None,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    let mut settle = |unvouched| {
+        store.settle_work(
+            &net.b,
+            &net.network,
+            "c",
+            &running.work_id,
+            WorkOutcome::Interrupted,
+            "",
+            signed.clone(),
+            unvouched,
+            14,
+        )
+    };
+    assert!(settle(false).is_err(), "a device that can report is waited for");
+    settle(true)?.context("the settled result reports back")?;
+    let (_, receipt) = store.apply_work_signal(
+        &net.a,
+        &net.network,
+        &running.work_id,
+        Signal::TurnCompleted {
+            turn_id: "tu".into(),
+            status: "completed".into(),
+            text: "late".into(),
+            error: None,
+        },
+        15,
+    )?;
+    assert!(receipt.is_none(), "a late result does not report twice");
+    assert_eq!(
+        outcome(&store, &running.work_id)?,
+        Some(WorkOutcome::Interrupted),
+        "the user's settlement stands"
     );
     Ok(())
 }

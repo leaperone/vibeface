@@ -13,13 +13,14 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, pendingChecks,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords,
 } from "./model"
+import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records"
 import { answerBody, answerId, answerScope } from "./questions"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus, OpenWork,
 } from "./types"
 
 /** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
@@ -63,6 +64,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
   const [questions, setQuestions] = useState<Question[]>([])
+  const [openWorks, setOpenWorks] = useState<OpenWork[]>([])
+  const openWorksRef = useRef<OpenWork[]>([])
   /** Answers this browser saw land, by question, until the network's own reads show them. */
   const [answered, setAnswered] = useState<Readonly<Record<string, string>>>({})
   const [pendingAnswers, setPendingAnswers] = useState<PendingAnswer[]>([])
@@ -156,6 +159,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
     if (activeId.current !== id || sequence !== readSequence.current) throw new Error("对话有更新，请再查一次。")
+    return showConversation(id, next)
+  }
+  const showConversation = async (id: string, next: ConversationPayload) => {
     // While the entry catches up, what the page already showed stays on screen.
     const shown = dataRef.current
     if (connection.catchingUp?.() && shown?.conversation?.conversation_id === id) {
@@ -239,13 +245,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("questions"),
+      const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions, rawWorks] = await Promise.all([
+        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("questions"), connection.rpc("open_works"),
       ])
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
-      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions)
+      openWorksRef.current = parseOpenWorks(rawWorks)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
@@ -268,6 +275,28 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     }
   }
   refreshRef.current = refresh
+  /** One pushed change merged in place; a full read only when a read races it or it does not parse. */
+  const applyRecords = async (value: Record<string, unknown>) => {
+    const records = parseRecords(value), id = records.conversation_id
+    if (refreshingRef.current) scheduleRefresh()
+    setQuestions((previous) => mergeQuestions(previous, records))
+    setBots((previous) => mergeBots(previous, records))
+    openWorksRef.current = mergeOpenWorks(openWorksRef.current, records)
+    setOpenWorks(openWorksRef.current)
+    const fresh = records.notifications.filter((item) => !notificationsRef.current.some((known) => known.notification_id === item.notification_id))
+    notificationsRef.current = mergeNotifications(notificationsRef.current, records)
+    setNotifications(notificationsRef.current)
+    notifyBrowser(fresh)
+    const shown = dataRef.current
+    if (id === activeId.current && readConnection.current === connection && shown?.conversation?.conversation_id === id) await showConversation(id, mergeConversation(shown, records))
+  }
+  /** A change the Node pushed without its records: the bot list, and the conversation if it is open. */
+  const reloadScope = async (id: string) => {
+    const rawBots = await connection.rpc("bots")
+    requireCurrent()
+    setBots(parseBots(rawBots)); setPrimary(parsePrimary(rawBots))
+    if (id === activeId.current && readConnection.current === connection) await readConversation(id)
+  }
 
   const loadPending = async () => {
     const rawBot = readStorage<unknown>(scoped("pending-bot"), null, true)
@@ -286,7 +315,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
     if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
-    if (item.method === "resolve") return !pendingChecks(context).some((check) => check.check_id === item.params.check_id)
+    if (item.method === "resolve") {
+      const check = String(item.params.check_id), workId = check.startsWith("work:") ? check.slice(5) : null
+      if (!workId) return !context.checks.some((entry) => entry.check_id === check)
+      return context.works.some((entry) => entry.work_id === workId && entry.outcome !== null && entry.outcome !== "unverified")
+    }
     return true
   }
   /** After a (re)connection: confirm what the entry has, resubmit the rest byte for byte, stop at an unknown. */
@@ -322,7 +355,12 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     void refreshRef.current().then(() => settleOutbox()).catch(showRefreshError)
     const unsubscribe = connection.subscribe((event) => {
       if (!current()) return
-      if (event.type === "invalidate") { scheduleRefresh(); return }
+      if (event.type === "records") { applyRecords(event.value).catch(() => scheduleRefresh()); return }
+      if (event.type === "invalidate") {
+        if (event.conversation_id === undefined) scheduleRefresh()
+        else reloadScope(event.conversation_id).catch(() => scheduleRefresh())
+        return
+      }
       if (event.conversation_id !== activeId.current) return
       setLiveProgress((previous) => {
         const next = mergeProgress(previous, event)
@@ -330,7 +368,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
         return next
       })
     })
-    const timer = window.setInterval(scheduleRefresh, 15000)
+    // Pushes carry every change; this catches a device going offline, which nothing pushes, and anything missed.
+    let ticks = 0
+    const timer = window.setInterval(() => {
+      ticks += 1
+      if (ticks % 5 === 0) scheduleRefresh()
+      else if (openWorksRef.current.length) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
+    }, 60000)
     const visible = () => { if (!document.hidden) scheduleRefresh() }
     document.addEventListener("visibilitychange", visible)
     return () => {
@@ -459,7 +503,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { viewRef.current = next; setView(next); clearMessages(); if (next === "chat") scheduleRefresh() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => { viewRef.current = next; setView(next); clearMessages(); if (next === "chat") scheduleRefresh() }, nodes, conversationId, data, notifications, questions, openWorks, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
@@ -579,17 +623,16 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       scheduleRefresh()
       return result
     }),
-    /** An unverified work: the person's signed choice settles it. */
+    /** A work waiting for the person, from any conversation: their signed choice settles it. */
     resolveCheck: (check: Extract<PendingCheck, { kind: "work" }>, choice: "completed" | "interrupted", note: string) => withMutation(`pending-check:${check.check_id}`, async () => {
-      const id = activeId.current
-      requireBotContext(id)
+      const id = check.conversation_id
       const text = note.trim()
       if (new TextEncoder().encode(text).length > 4096) throw new Error("备注太长了。")
       const attestation = await attest(id, { type: "work_finished", work_id: check.work_id, outcome: choice, result_text: text })
       try { await signedWrite("resolve", check.check_id, "resolve", { conversation_id: id, check_id: check.check_id, outcome: choice, note: text, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      if (activeId.current === id) await refreshRef.current()
+      await refreshRef.current()
     }),
     /** A coordination process still alive: the person confirms it has stopped. */
     confirmStopped: (check: Extract<PendingCheck, { kind: "process" }>) => withMutation(`pending-check:${check.check_id}`, async () => {

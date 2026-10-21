@@ -2342,6 +2342,12 @@ def phase1_acceptance(options):
         require(all(row["source_node"] == a.device_id and row["invocation_id"] and row["sequence"] > 0
                     and row["progress"]["type"] == "text_snapshot" for row in progress),
                 "progress carries the invocation identity and normalized text snapshots")
+        pushed = wait_for("the client receives the posted message as records, not a reload", lambda:
+            [event["payload"] for event in a.client.command("events") if event.get("payload", {}).get("type") == "records"
+             and event["payload"]["conversation_id"] == name
+             and any(row["message_id"] == "queue-first" and row["rank"] for row in event["payload"]["messages"])])
+        require(all(isinstance(row["jobs"], list) and isinstance(row["works"], list) for row in pushed),
+                "pushed records carry the conversation's jobs and changed works")
         active_before = state(first, "running")
         require(active_before, "original reply remains running before queued cancellation")
         cancelled_reply = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled_queued["trigger"])

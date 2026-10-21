@@ -111,6 +111,10 @@ fn load_run(connection: &Connection, work_id: &str) -> Result<Option<WorkRecord>
     Ok(query_runs(connection, "work_id=?", [work_id])?.pop())
 }
 
+pub(super) fn run_finished(connection: &Connection, work_id: &str) -> Result<bool> {
+    Ok(load_run(connection, work_id)?.is_some_and(|run| run.state.finished()))
+}
+
 fn save_run(connection: &Connection, record: &WorkRecord) -> Result<()> {
     let handle = record.state.handle();
     let thread = match &record.state {
@@ -178,7 +182,10 @@ fn apply_signal_from(
             vec![],
             at,
         )?;
-        if let Some(outcome) = finished {
+        // The user's settlement already reported this work; a late result stays on record only.
+        if let Some(outcome) = finished
+            && !reduce::settled_by_user(connection, network, work_id)?
+        {
             receipt = scheduler::admit_work_result_from(
                 connection,
                 network,
@@ -338,8 +345,9 @@ impl Store {
         Ok(result)
     }
 
-    /// The user's signed choice for an unverified result, written by whichever entry Node they
-    /// use. Only `unverified` can be superseded; the result then reports like any other.
+    /// The user's signed choice for a result its device cannot vouch for, written by whichever
+    /// entry Node they use: an `unverified` one, or an open one when the entry saw that its
+    /// device cannot report (`unvouched`). The result then reports like any other.
     #[expect(clippy::too_many_arguments, reason = "the user's signed settlement")]
     pub fn settle_work(
         &mut self,
@@ -350,6 +358,7 @@ impl Store {
         outcome: WorkOutcome,
         note: &str,
         attestation: Attestation,
+        unvouched: bool,
         at: i64,
     ) -> Result<Option<AdmissionReceipt>> {
         let tx = self
@@ -360,7 +369,7 @@ impl Store {
             .find(|work| work.work_id == work_id)
             .context("work not found in this conversation")?;
         ensure!(
-            work.outcome == Some(WorkOutcome::Unverified),
+            work.outcome == Some(WorkOutcome::Unverified) || unvouched && work.outcome.is_none(),
             "this result no longer needs your confirmation"
         );
         log::append_from(
@@ -459,8 +468,14 @@ impl Store {
     }
 }
 
+/// A run that has not started stays unstarted once the user settled it; a running one keeps
+/// going and its late result stays on record without reporting again.
 fn settle_local_from(connection: &Connection, network: &str) -> Result<()> {
-    for mut record in query_runs(connection, "state='unverified'", [])? {
+    for mut record in query_runs(
+        connection,
+        "state IN ('unverified','accepted','starting')",
+        [],
+    )? {
         let outcome =
             reduce::work_from(connection, network, &record.work_id)?.and_then(|work| work.outcome);
         if let Some(outcome) = outcome.filter(|outcome| *outcome != WorkOutcome::Unverified) {

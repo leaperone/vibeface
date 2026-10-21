@@ -1,7 +1,7 @@
 "use client"
 
 import { useId, useState } from "react"
-import { CircleQuestionMark } from "lucide-react"
+import { CircleQuestionMark, Unplug, WifiOff } from "lucide-react"
 import { ActionCard, Details } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "../identity/context"
@@ -17,13 +17,15 @@ export function checkReason(check: PendingCheck): string {
   return "这次的结果没法自动确认，系统不会自动重做。"
 }
 
-/** "需要确认": the person says whether interrupted work finished, or that a leftover process stopped. Nothing is re-run. */
+const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
+
+/** "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run. */
 export function ConfirmCard({ check }: { check: PendingCheck }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
   const [note, setNote] = useState("")
-  const disabled = !workspace.writable || !workspace.selectedBot
+  const disabled = !workspace.writable || check.kind === "process" && !workspace.selectedBot
   const lookup = { nodes: workspace.nodes, directory }
   if (check.kind === "process") return <ActionCard
     icon={CircleQuestionMark}
@@ -35,16 +37,20 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
   const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note) }
+  const device = nodeName(check.target_node, lookup)
+  const reason = check.reason === "offline" ? `${device} 离线了，报不回这个任务的结果。`
+    : check.reason === "disconnected" ? `${device} 上的 Codex 断开了，报不回这个任务的结果。`
+    : checkReason(check)
   return <ActionCard
-    icon={CircleQuestionMark}
-    title="需要确认 · 任务被打断"
-    meta={nodeName(check.target_node, lookup)}
+    icon={confirmIcons[check.reason]}
+    title="待确认 · 任务结果"
+    meta={device}
     actions={<>
       <ActionButton disabled={disabled} action={answer("interrupted")}>没做完</ActionButton>
       <ActionButton variant="default" disabled={disabled} action={answer("completed")}>做完了</ActionButton>
     </>}
   >
-    <p>{checkReason(check)}那个任务实际做完了吗？</p>
+    <p>{reason}那个任务实际做完了吗？</p>
     <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>

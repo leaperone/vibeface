@@ -8,7 +8,7 @@ use crate::{
         Context, Event, EventBody, HashedEvent, OpenWork, Role, RoutineEntry, VersionVector,
         WorkProjection,
     },
-    runtime::{Access, Runtime, Update},
+    runtime::{Access, Changed, Runtime},
     scheduling::{JobOutcome, JobState, SchedulerJob, TriggerKind},
     store::Store,
     tools::{Effect, Tool},
@@ -248,6 +248,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         let progress_text = partial.clone();
         let progress_sequence = std::sync::atomic::AtomicU64::new(0);
         node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
+        node.publish_changed(&network, &conversation, Changed::Job(&trigger));
         started = true;
         sdk_live = true;
         let result = manager::run_manager(
@@ -368,9 +369,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             "agent turn finished"
         ),
     }
-    if final_result.is_ok() {
-        publish_job(&node, &network, &conversation, &job);
-    }
+    node.publish_changed(&network, &conversation, Changed::Job(&job.trigger));
     final_result.map(Some)
 }
 
@@ -389,12 +388,6 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
     })
 }
 
-fn publish_job(node: &Runtime, network: &str, conversation: &str, job: &SchedulerJob) {
-    let _ = node.events.send(Update {
-        network_id: network.into(),
-        payload: json!({"type":"changed","conversation_id":conversation,"trigger":job.trigger,"state":job.state.name()}),
-    });
-}
 
 /// Bytes each index of the assistant's skills and routines takes in the prompt.
 const INDEX_BUDGET: usize = 3_000;

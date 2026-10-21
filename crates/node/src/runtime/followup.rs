@@ -36,7 +36,7 @@ impl Runtime {
                 },
             )
             .await?;
-        self.publish_changed(network, scope, &event.hash);
+        self.publish_changed(network, scope, Changed::Event(&event.hash));
         self.abandon_revoked_works(network).await;
         self.schedule_wakeup.notify_one();
         self.outbox_wakeup.notify_one();

@@ -6,7 +6,7 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  capabilities?: { manager: string | null; relay: boolean; roots: string[] }
+  capabilities?: { manager: string | null; relay: boolean; roots: string[]; codex_connected?: boolean }
 }
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
@@ -31,8 +31,11 @@ export type WorkRecord = {
   outcome: WorkOutcome | null
   result_text: string
   failure_reason: string | null
-  /** The Codex thread running it. */
+  /** `codex`: a Codex turn its device watches; `task`: a task run by its device's coordination Agent. */
+  kind?: "codex" | "task"
+  /** The Codex thread and turn running it; works steered into one turn share both. */
   thread_id?: string
+  turn_id?: string
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
 }
@@ -62,12 +65,29 @@ export type CoordinationCheck = {
   process_groups: number[]
   created_at_ms: number
 }
+/** Why a work waits for the person: its device is offline, its App Server disconnected, or its result could not be checked. */
+export type ConfirmReason = "offline" | "disconnected" | "unverified"
+/** A work no result has settled yet, from any conversation. */
+export type OpenWork = WorkRecord & { conversation_id: string }
+/** What one change touched, pushed by the Node so the page merges it without a reload. */
+export type ConversationRecords = {
+  conversation_id: string
+  messages: TranscriptMessage[]
+  works: WorkRecord[]
+  last_message: LastMessage | null
+  questions: Question[]
+  notifications: NotificationRecord[]
+  /** This device's dispatch and stop requests, as `conversation` returns them. */
+  deliveries: unknown[]
+  checks: CoordinationCheck[]
+  jobs: ManagerJob[]
+}
 /**
  * What only the person can settle; nothing is resent.
- * `work`: an unverified work, answered completed or interrupted. `process`: a coordination process the person confirms stopped.
+ * `work`: a work waiting for the person's confirmation, answered completed or interrupted. `process`: a coordination process the person confirms stopped.
  */
 export type PendingCheck =
-  | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string }
+  | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string; conversation_id: string; reason: ConfirmReason }
   | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type FieldEdit = { before: string; after: string }
