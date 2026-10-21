@@ -1936,7 +1936,10 @@ fn unanswered(store: &Store, net: &Net) -> Result<Vec<String>> {
 #[test]
 fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> {
     let net = net()?;
-    let dir = std::env::temp_dir().join(format!("vibeface-answer-{}", uuid::Uuid::new_v4()));
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("store-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
     let path = dir.join("node.sqlite3");
     let result = (|| -> Result<()> {
         let mut store = Store::open(&path)?;
