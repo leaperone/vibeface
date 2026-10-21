@@ -56,7 +56,7 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
   }, [])
   return <div className="grid gap-3">
     {error ? <p role="alert" className="text-meta text-danger">{error}</p> : <video ref={video} className="aspect-square w-full rounded-lg bg-black object-cover" playsInline muted aria-label="对准二维码" />}
-    <Button type="button" variant="ghost" className="w-fit" onClick={onCancel}>不扫了，粘贴链接</Button>
+    <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={onCancel}>不扫了，粘贴链接</Button>
   </div>
 }
 
@@ -112,7 +112,7 @@ function NodeJoin() {
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
       <p className="text-muted-foreground">在管理设备上比对安全码，相同再批准</p>
       {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
-      <Button type="button" variant="ghost" className="w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
+      <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
         {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
       </Button>
     </>}
@@ -200,7 +200,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const setup = device.localSetup?.kind === 'uninitialized'
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
     <p className="text-meta text-muted-foreground">其他方式</p>
-    <div className="flex flex-wrap gap-2">
+    <div className="-ms-3 flex flex-wrap gap-2">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : '这台电脑'}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />已有设备？用加入链接</Button> : null}
@@ -320,7 +320,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
           <span className="font-normal text-muted-foreground">至少 12 个字符，忘了就无法找回</span>
         </Field>
         <div className="flex justify-between gap-2">
-          <Button type="button" variant="ghost" onClick={onBack}>上一步</Button>
+          <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
           <Button type="submit">{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
         </div>
       </fieldset>
@@ -338,7 +338,7 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
     <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
-      <Button type="button" variant="ghost" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
+      <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
       <Button type="button" disabled={!saved || busy} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
     </div>
   </Panel>
@@ -353,7 +353,7 @@ function BrowserJoin() {
     <p className="text-muted-foreground">在管理设备上比对安全码</p>
     {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
-    <Button type="button" variant="ghost" className="w-fit" onClick={device.cancelJoin}>取消</Button>
+    <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details>
       <DetailRow label="这个浏览器" value={device.identity?.deviceId ?? ''} mono />
       <DetailRow label="加入请求" value={joining.join_id} mono />

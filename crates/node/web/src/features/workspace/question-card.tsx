@@ -85,7 +85,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
         })}
       </div> : null}
       {session ? null : <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>
-        <Input aria-label="回答" placeholder="输入回答" className="h-9 bg-background max-md:h-11" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
+        <Input aria-label="回答" placeholder="输入回答" className="bg-background" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
         <Button type="submit" variant="outline" size="icon" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
       </form>}
     </>}

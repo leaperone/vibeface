@@ -91,7 +91,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             <Link to="/" className="text-heading font-semibold tracking-tight">vibeface</Link>
           </div>
         </SidebarHeader>
-        <SidebarContent className="gap-1 px-2 pb-3">
+        <SidebarContent className="gap-1 pb-3">
           <SidebarGroup className="pb-0">
             <SidebarMenu>
               <NavItem to="/inbox" icon={Inbox} label="待处理" active={pathname === "/inbox"} badge={waiting || undefined} />
@@ -128,19 +128,19 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         </SidebarFooter>
       </Sidebar>
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
-        <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(0.75rem,env(safe-area-inset-left))] pe-[max(0.75rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
-          {back ? <Button asChild variant="ghost" size="icon" className="md:hidden"><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
-          <SidebarTrigger aria-label="菜单" title="菜单" className="max-md:hidden" />
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
+          {back ? <Button asChild variant="ghost" size="icon" className="-ms-3 md:hidden"><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
+          <SidebarTrigger aria-label="菜单" title="菜单" className="-ms-2.5 max-md:hidden" />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             {chatRoute ? <AssistantPanelButton /> : null}
             <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
           </div>
-          {back ? <Button asChild variant="ghost" size="icon" className="relative md:hidden">
+          {back ? <Button asChild variant="ghost" size="icon" className="relative -me-3 md:hidden">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
               <Inbox aria-hidden="true" />
               {waiting ? <span className="absolute top-1 right-1 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[11px] leading-4 font-semibold text-background">{waiting}</span> : null}
             </Link>
-          </Button> : <div className="flex md:hidden">
+          </Button> : <div className="-me-3 flex md:hidden">
             <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? "设备，需要留意" : "设备"} title="设备">
                 <MonitorSmartphone aria-hidden="true" />

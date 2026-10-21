@@ -31,14 +31,14 @@ export function ConversationList() {
   else if (!workspace.joined) assistants = <EmptyState icon={Bot} title="还没有助手" />
   else if (!workspace.writable) assistants = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else assistants = <EmptyState icon={Bot} title="还没有助手" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新建助手</Button>} />
-  return <div className="mx-auto grid w-full max-w-3xl gap-2">
+  return <div className="mx-auto grid w-full max-w-3xl gap-2 max-md:-mx-3 max-md:w-auto">
     <Row to="/inbox" icon={Inbox} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : "没有要你决定的事"} />
-    <div className="flex items-center justify-between ps-3">
+    <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">助手</h2>
-      <Button type="button" variant="ghost" size="icon" className="max-md:size-11" aria-label="新助手" title="新助手" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
+      <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新助手" title="新助手" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
     </div>
     {assistants}
-    <div className="mt-4 md:hidden"><ConnectionCapsule /></div>
+    <div className="mt-4 px-1 md:hidden"><ConnectionCapsule /></div>
   </div>
 }
 
