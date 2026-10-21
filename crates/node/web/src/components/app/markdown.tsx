@@ -20,6 +20,6 @@ export function Markdown({ text, className }: { text: string; className?: string
 /** User messages: only inline code and line breaks. */
 export function PlainText({ text }: { text: string }) {
   return <span className="whitespace-pre-wrap break-words">{text.split(/(`[^`\n]+`)/).map((part, index) => part.length > 2 && part.startsWith("`") && part.endsWith("`")
-    ? <code key={index} className="rounded bg-foreground/10 px-1 font-mono text-[0.9em]">{part.slice(1, -1)}</code>
+    ? <code key={index} className="rounded bg-current/15 px-1 font-mono text-[0.9em]">{part.slice(1, -1)}</code>
     : part)}</span>
 }
