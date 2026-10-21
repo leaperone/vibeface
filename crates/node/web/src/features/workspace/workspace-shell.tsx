@@ -36,7 +36,7 @@ const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-assistant form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
 
-const titles: Record<string, string> = { "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置" }
+const titles: Record<string, string> = { "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
 
 function WorkspaceLayout({ children }: { children: ReactNode }) {
   const workspace = useWorkspace()
@@ -122,7 +122,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         <SidebarFooter className="shrink-0 gap-1 px-2 py-3">
           <ConnectionCapsule />
           <SidebarMenu>
-            <NavItem to="/settings" icon={Settings} label="设置" active={pathname === "/settings"} />
+            <NavItem to="/settings" icon={Settings} label="设置" active={pathname.startsWith("/settings")} />
           </SidebarMenu>
         </SidebarFooter>
       </Sidebar>

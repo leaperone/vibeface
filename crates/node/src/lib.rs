@@ -6,6 +6,7 @@ pub mod config;
 pub mod crypto;
 pub mod identity;
 pub mod local_access;
+pub mod logging;
 pub mod maintenance;
 pub mod manager;
 pub mod model;

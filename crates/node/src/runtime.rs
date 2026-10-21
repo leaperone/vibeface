@@ -154,6 +154,8 @@ pub struct Runtime {
     pub(crate) triage: triage::TriageState,
     pub(crate) node_join: std::sync::Mutex<Option<crate::client::NodeJoinTask>>,
     rejoin: tokio::sync::Notify,
+    /// Budget of records browsers and local processes may add to the log.
+    pub(crate) log_intake: crate::logging::RateLimit,
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -264,7 +266,12 @@ impl Runtime {
             triage,
             node_join: std::sync::Mutex::new(None),
             rejoin: tokio::sync::Notify::new(),
+            log_intake: Default::default(),
         };
+        if let Some(token) = &node.entry_token {
+            crate::logging::add_secret(token);
+        }
+        crate::logging::add_secret(&node.cursor_callback_token);
         Ok(node)
     }
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {

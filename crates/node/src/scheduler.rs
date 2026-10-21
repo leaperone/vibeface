@@ -29,6 +29,7 @@ const CONSTRAINTS: &[&str] = &[
     "Your Shell has full access to this device. Hand longer coding work to Codex through dispatch_work; it registers the work with the Node, starts one Codex turn with full access on this device's App Server, the Node watches it, and its result comes back to you as a new turn.",
     "Your turn ends after you dispatch. Do not wait or poll for work to finish; tell the user what was started.",
     "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's assistant gets the task. continues names an earlier work to follow up on the same thread. In your Shell, `vibeface codex call <method> [json]` calls any App Server method, `vibeface codex send <thread> <text> --id <id>` adds a message to a thread (steering a running turn) and `vibeface codex watch <thread>` streams its events.",
+    "When something fails or behaves unexpectedly, record it with `vibeface log <warn|error|info> <message> --conversation <id> [--work <id>] [--thread <id>]` so it can be debugged later; never put secrets in it.",
     "Reuse call_ref only to retry the same dispatch; a retry never starts a second turn. An unknown outcome is settled by the Node, never by dispatching again.",
     "Use device names from nodes when talking about devices; Peer IDs belong in details.",
     "Never approve a request, grant authority or accept a deliverable for the human.",
@@ -118,6 +119,12 @@ pub async fn run(
     access: Access,
     conversation: String,
 ) -> Result<Option<Value>> {
+    use tracing::Instrument as _;
+    let span = tracing::info_span!("agent_turn", conversation_id = %conversation, work_id = tracing::field::Empty);
+    turn(node, access, conversation).instrument(span).await
+}
+
+async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Result<Option<Value>> {
     let _work = node.maintenance.enter()?;
     ensure!(
         access
@@ -158,6 +165,13 @@ pub async fn run(
         .attempt()
         .context("claimed scheduler attempt missing")?
         .clone();
+    if let Some(work_id) = trigger
+        .strip_prefix("work:")
+        .or_else(|| trigger.strip_prefix("task:"))
+    {
+        tracing::Span::current().record("work_id", work_id);
+    }
+    tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?kind, "agent turn started");
     let token = uuid::Uuid::new_v4().to_string();
     let partial = Arc::new(Mutex::new(PartialText::default()));
     let mut started = false;
@@ -324,6 +338,26 @@ pub async fn run(
     }
     .await;
     node.finish_manager_attempt(&attempt.id).await;
+    match (&final_result, &job.state) {
+        (Err(error), _) => {
+            tracing::error!(event = "agent.turn.finished", trigger, error = %format!("{error:#}"), "agent turn could not be recorded")
+        }
+        (Ok(_), JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. }) => {
+            tracing::warn!(
+                event = "agent.turn.finished",
+                trigger,
+                state = job.state.name(),
+                detail,
+                "agent turn ended without a reply"
+            )
+        }
+        (Ok(_), state) => tracing::info!(
+            event = "agent.turn.finished",
+            trigger,
+            state = state.name(),
+            "agent turn finished"
+        ),
+    }
     if final_result.is_ok() {
         publish_job(&node, &network, &conversation, &job);
     }

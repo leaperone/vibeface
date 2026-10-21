@@ -24,6 +24,29 @@ fn dispatch_value(dispatch: &Dispatch) -> Value {
 impl Runtime {
     /// The one entry for coordination tools: the Cursor SDK callback and `vibeface tool` both land here.
     pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
+        let conversation_id = access.conversation_id.clone();
+        let asked_work = args["work_id"].as_str().map(str::to_owned);
+        let result = self.run_tool(access, name, args).await;
+        let conversation_id = conversation_id.as_deref();
+        match &result {
+            Ok(value) => {
+                let work_id = value["work_id"].as_str().or(asked_work.as_deref());
+                tracing::info!(
+                    event = "agent.tool",
+                    conversation_id,
+                    work_id,
+                    tool = name,
+                    "agent called {name}"
+                )
+            }
+            Err(error) => {
+                tracing::warn!(event = "agent.tool_failed", conversation_id, work_id = asked_work.as_deref(), tool = name, error = %format!("{error:#}"), "agent call {name} failed")
+            }
+        }
+        result
+    }
+
+    async fn run_tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access

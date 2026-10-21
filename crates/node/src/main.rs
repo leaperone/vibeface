@@ -65,6 +65,10 @@ enum Action {
     Hooks(Hooks),
     /// The coordination Agent's triage answers: list pending events, raise or dismiss one.
     Triage(Triage),
+    /// Add a record to this device's Node log, e.g. from the coordination Agent or a script.
+    Log(LogRecord),
+    /// Read this device's Node log, newest last.
+    Logs(Logs),
     /// Call a node tool from a locally managed SDK process.
     Tool {
         name: String,
@@ -300,6 +304,59 @@ enum TriageAction {
 }
 
 #[derive(Args)]
+struct LogRecord {
+    /// trace, debug, info, warn or error.
+    level: vibeface::logging::Level,
+    message: String,
+    #[arg(long, env = "VIBEFACE_NODE_CONVERSATION")]
+    conversation: Option<String>,
+    #[arg(long)]
+    work: Option<String>,
+    /// Codex thread.
+    #[arg(long)]
+    thread: Option<String>,
+    /// Stable dotted name, e.g. `agent.retry`; defaults to `<source>.log`.
+    #[arg(long)]
+    event: Option<String>,
+    /// `agent` or `cli`; defaults to `agent` inside a coordination Agent's shell.
+    #[arg(long)]
+    source: Option<vibeface::logging::Source>,
+    #[command(flatten)]
+    local: LocalNode,
+}
+
+#[derive(Args)]
+struct Logs {
+    #[command(flatten)]
+    data: DataDir,
+    /// Age such as `30m`, `2h`, `1d`, or a Unix time in milliseconds.
+    #[arg(long)]
+    since: Option<String>,
+    /// The least severe level shown.
+    #[arg(long)]
+    level: Option<vibeface::logging::Level>,
+    /// node, web, agent, cli, codex or cursor; repeat for more.
+    #[arg(long)]
+    source: Vec<vibeface::logging::Source>,
+    #[arg(long)]
+    conversation: Option<String>,
+    #[arg(long)]
+    work: Option<String>,
+    /// Case-insensitive text in the message, event, ids or fields.
+    #[arg(long)]
+    grep: Option<String>,
+    /// Show at most this many of the newest records.
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
+    /// Keep printing new records as they are written.
+    #[arg(short, long)]
+    follow: bool,
+    /// Print the records as JSON lines.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct Access {
     #[command(flatten)]
     data: DataDir,
@@ -334,8 +391,8 @@ async fn main() -> Result<()> {
             })
         }
     };
-    logging(match &command {
-        Action::Serve(options) => Some(&options.data.data_dir),
+    vibeface::logging::init(match &command {
+        Action::Serve(options) => Some(options.data.data_dir.as_path()),
         _ => None,
     });
     match command {
@@ -454,7 +511,187 @@ async fn main() -> Result<()> {
         }
         Action::Hooks(options) => hooks(options).await,
         Action::Triage(options) => triage(options).await,
+        Action::Log(options) => log_record(options).await,
+        Action::Logs(options) => logs(options).await,
     }
+}
+
+async fn log_record(options: LogRecord) -> Result<()> {
+    use vibeface::logging::Source;
+    let source =
+        options
+            .source
+            .unwrap_or(match std::env::var_os(vibeface::runtime::TRIAGE_URL_ENV) {
+                Some(_) => Source::Agent,
+                None => Source::Cli,
+            });
+    ensure!(
+        matches!(source, Source::Agent | Source::Cli),
+        "--source is agent or cli"
+    );
+    let body = json!({"source":source,"records":[{"level":options.level,"message":options.message,
+        "event":options.event,"conversation_id":options.conversation,"work_id":options.work,
+        "thread_id":options.thread}]});
+    post_local(
+        &local_node_url(&options.local)?,
+        "api/log",
+        &body,
+        Duration::from_secs(10),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn logs(options: Logs) -> Result<()> {
+    use vibeface::logging::{self, Filter};
+    let dir = &options.data.data_dir;
+    ensure!(
+        dir.join(logging::FILE).exists(),
+        "no Node log in {}; start the Node with this --data-dir first",
+        dir.display()
+    );
+    let filter = Filter {
+        since_ms: options.since.as_deref().map(since_ms).transpose()?,
+        level: options.level,
+        sources: options.source,
+        conversation_id: options.conversation,
+        work_id: options.work,
+        text: options.grep,
+        limit: Some(options.limit),
+        ..Default::default()
+    };
+    let print = |record: &logging::Record| -> Result<()> {
+        let line = match options.json {
+            true => serde_json::to_string(record)?,
+            false => log_line(record),
+        };
+        let mut out = std::io::stdout().lock();
+        // A closed pipe, as with `| head`, ends the output quietly.
+        if writeln!(out, "{line}").is_err() {
+            std::process::exit(0);
+        }
+        Ok(())
+    };
+    for record in logging::read(dir, &filter)? {
+        print(&record)?;
+    }
+    if !options.follow {
+        return Ok(());
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let current = dir.join(logging::FILE);
+    let rotated = dir.join(format!("{}.1", logging::FILE));
+    let identity = |path: &Path| fs::metadata(path).ok().map(|m| (m.ino(), m.len()));
+    let (mut inode, mut offset) = identity(&current).unwrap_or_default();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Some((now_inode, len)) = identity(&current) else {
+            continue;
+        };
+        if now_inode != inode {
+            // The file rotated: finish the old one, now `node.log.1`, then start the new one.
+            if identity(&rotated).is_some_and(|(old, _)| old == inode) {
+                for record in tail_records(&rotated, offset)?.0 {
+                    filter
+                        .matches(&record)
+                        .then(|| print(&record))
+                        .transpose()?;
+                }
+            }
+            (inode, offset) = (now_inode, 0);
+        }
+        if len > offset {
+            let (records, read) = tail_records(&current, offset)?;
+            offset += read;
+            for record in records {
+                filter
+                    .matches(&record)
+                    .then(|| print(&record))
+                    .transpose()?;
+            }
+        }
+    }
+}
+
+/// Complete records after `offset`, and how many bytes they took; a half-written line waits.
+fn tail_records(path: &Path, offset: u64) -> Result<(Vec<vibeface::logging::Record>, u64)> {
+    use std::io::Seek as _;
+    let mut file = fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    let records = bytes[..complete]
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect();
+    Ok((records, complete as u64))
+}
+
+fn since_ms(text: &str) -> Result<i64> {
+    let (number, unit) = text.split_at(text.trim_end_matches(char::is_alphabetic).len());
+    let number: i64 = number
+        .parse()
+        .context("--since is like 30m, 2h, 1d or a time in ms")?;
+    let unit_ms = match unit {
+        "" => return Ok(number),
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => bail!("--since unit is s, m, h or d"),
+    };
+    Ok(vibeface::runtime::now_ms() - number * unit_ms)
+}
+
+fn log_line(record: &vibeface::logging::Record) -> String {
+    let mut line = format!(
+        "{} {:<5} {:<6} {} {}",
+        utc_time(record.ts_ms),
+        format!("{:?}", record.level).to_uppercase(),
+        format!("{:?}", record.source).to_lowercase(),
+        record.event,
+        record.message
+    );
+    for (name, id) in [
+        ("conversation", &record.conversation_id),
+        ("work", &record.work_id),
+        ("thread", &record.thread_id),
+    ] {
+        if let Some(id) = id {
+            line.push_str(&format!(" {name}={id}"));
+        }
+    }
+    if !record.fields.is_empty() {
+        line.push(' ');
+        line.push_str(&Value::Object(record.fields.clone()).to_string());
+    }
+    line
+}
+
+/// `2026-10-21T03:20:06.123Z`.
+fn utc_time(ms: i64) -> String {
+    let (days, rest) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // Howard Hinnant's days-to-civil conversion.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rest / 3_600_000,
+        rest / 60_000 % 60,
+        rest / 1000 % 60,
+        rest % 1000
+    )
 }
 
 async fn codex_requests(local: &LocalNode, body: serde_json::Value) -> Result<()> {
@@ -467,41 +704,6 @@ async fn codex_requests(local: &LocalNode, body: serde_json::Value) -> Result<()
     .await?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
-}
-
-/// Logs at info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. A running
-/// Node also appends to `node.log` in its data directory and copies to stderr only on a terminal,
-/// so a service's own stderr file keeps just crashes.
-fn logging(data_dir: Option<&PathBuf>) {
-    use std::io::IsTerminal as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-    let file = data_dir.and_then(|dir| {
-        let path = dir.join("node.log");
-        // ponytail: one rollover at start; a long-running Node grows past it until the next start.
-        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 16 << 20) {
-            let _ = fs::rename(&path, dir.join("node.log.1"));
-        }
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .ok()
-    });
-    let terminal = file.is_none() || std::io::stderr().is_terminal();
-    tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn,vibeface=info,vibeface_bridge=info")),
-        )
-        .with(file.map(|file| {
-            fmt::layer()
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-        }))
-        .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
-        .init();
 }
 
 /// Fails before any file is written, so a busy port never leaves a half-made data directory.

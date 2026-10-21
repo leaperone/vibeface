@@ -617,7 +617,27 @@ async fn dispatch(
         "diagnostics" => {
             node_operator(node, session).await?;
             let principal = principal(node, session).await?;
-            node.diagnostics(&principal.network_id).await
+            let range = (params["since_ms"].as_i64(), params["until_ms"].as_i64());
+            node.diagnostics(&principal.network_id, range).await
+        }
+        "log" => {
+            let accepted = crate::logging::submit(
+                &node.log_intake,
+                &session.device_id,
+                crate::logging::Source::Web,
+                &params["records"],
+                crate::runtime::now_ms(),
+            )?;
+            Ok(json!({"accepted":accepted}))
+        }
+        "logs" => {
+            node_operator(node, session).await?;
+            let filter: crate::logging::Filter =
+                serde_json::from_value(params).context("invalid log filter")?;
+            let dir = node.data_dir.clone();
+            let records =
+                tokio::task::spawn_blocking(move || crate::logging::read(&dir, &filter)).await??;
+            Ok(json!({"records":records}))
         }
         "confirm_writable" => {
             node_operator(node, session).await?;
@@ -1559,6 +1579,91 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Member, Revocation};
+
+    #[tokio::test]
+    async fn log_intake_needs_a_member_and_bounded_records_and_reading_needs_management()
+    -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("log-intake-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.codex_socket = Some(dir.join("unavailable-codex.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let (root, admin, member) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&member, "browser", false)?,
+        )?)?;
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            })
+        };
+        let record =
+            json!({"level":"error","event":"web.uncaught","message":"TypeError: x is undefined"});
+        let mut stranger = session(&LocalIdentity::generate())?;
+        assert!(
+            dispatch(&node, &mut stranger, "log", json!({"records":[record]}))
+                .await
+                .is_err(),
+            "a browser outside the network cannot write"
+        );
+        let mut browser = session(&member)?;
+        let oversized =
+            json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
+        assert!(
+            dispatch(&node, &mut browser, "log", json!({"records":[oversized]}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            dispatch(&node, &mut browser, "log", json!({"records":[record]})).await?,
+            json!({"accepted":1})
+        );
+        assert!(
+            dispatch(&node, &mut browser, "logs", json!({}))
+                .await
+                .is_err(),
+            "reading needs management"
+        );
+        let mut manager = session(&admin)?;
+        assert!(
+            dispatch(&node, &mut manager, "logs", json!({"level":"warn"})).await?["records"]
+                .is_array()
+        );
+        assert!(
+            dispatch(&node, &mut manager, "logs", json!({"unknown":1}))
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()

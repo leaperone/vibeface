@@ -80,7 +80,14 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
                 Some(params) => serde_json::from_str(&params).context("params must be JSON")?,
                 None => json!({}),
             };
-            match session.request(&method, params).await {
+            let thread_id = params["threadId"].as_str().map(str::to_owned);
+            let reply = session.request(&method, params).await;
+            crate::logging::send_to_node(match &reply {
+                Ok(_) => json!({"level":"info","event":"codex.call","message":format!("{method} succeeded"),"thread_id":thread_id}),
+                Err(error) => json!({"level":"warn","event":"codex.call_failed","message":format!("{method} failed: {}", error.message),"thread_id":thread_id,"fields":{"uncertain":error.uncertain}}),
+            })
+            .await;
+            match reply {
                 Ok(result) => println!("{result}"),
                 Err(error) if error.uncertain => bail!(
                     "{}; the result is unknown, read the state back before calling again",
@@ -118,6 +125,13 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
                     delivery
                 }
             };
+            let level = match delivery {
+                Delivery::Delivered { .. } => "info",
+                _ => "warn",
+            };
+            crate::logging::send_to_node(json!({"level":level,"event":"codex.send","message":format!("message to thread: {}", serde_json::to_string(&delivery)?),
+                "thread_id":outgoing.thread_id,"fields":{"client_id":outgoing.client_id}}))
+            .await;
             println!(
                 "{}",
                 json!({"client_id":outgoing.client_id,"delivery":delivery})

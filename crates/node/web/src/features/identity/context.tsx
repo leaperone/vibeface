@@ -15,6 +15,7 @@ import type { Link, LinkEvent } from '@/lib/link'
 import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '@/lib/entrances'
 import type { Entrance, OpenEntrance } from '@/lib/entrances'
 import { joinTabs } from '@/lib/tabs'
+import { connectLogSink, reportLog } from '@/lib/web-log'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
@@ -222,7 +223,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   function own() { const value = identityRef.current; if (!value) throw new Error('浏览器密钥尚未初始化。'); return value }
   async function callSession(active: Session, method: string, params: Record<string, unknown> = {}) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    const result = await active.channel.request(method, params)
+    let result: unknown
+    try { result = await active.channel.request(method, params) } catch (cause) {
+      if (method !== 'log') reportLog({ level: 'warn', event: 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method } })
+      throw cause
+    }
     if (session.current !== active || active.generation !== generation.current) throw changed()
     return result
   }
@@ -749,6 +754,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     } finally { opened.release(); input.oldPassword = ''; input.password = '' }
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
+  useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
   useEffect(() => {
     let mounted = true
     let version = generation.current

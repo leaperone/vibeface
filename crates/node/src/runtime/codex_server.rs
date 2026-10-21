@@ -199,11 +199,26 @@ impl Managed {
             .arg(format!("unix://{}", self.socket.display()))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .process_group(0);
-        let child = tokio::process::Command::from(command)
+        let mut child = tokio::process::Command::from(command)
             .kill_on_drop(true)
             .spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(crate::logging::forward_lines(
+                stderr,
+                usize::MAX >> 1,
+                |line| {
+                    let thread = crate::logging::thread_hint(line);
+                    crate::logging::child_line(
+                        crate::logging::Source::Codex,
+                        "codex.app_server.stderr",
+                        line,
+                        thread.as_deref(),
+                    )
+                },
+            ));
+        }
         let group = child.id().context("App Server exited at once")? as i32;
         config::private_write(&self.pidfile, group.to_string().as_bytes())?;
         *self.group.lock().expect("group lock") = Some(group);

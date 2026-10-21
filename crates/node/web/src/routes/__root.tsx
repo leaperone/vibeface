@@ -4,6 +4,7 @@ import { Toaster } from '@/components/app/kit'
 import { DeviceProvider } from '@/features/identity/context'
 import { ViewportHeight } from '@/components/viewport-height'
 import { registerShell } from '@/lib/offline'
+import { installErrorReporting } from '@/lib/web-log'
 import { themeScript } from '@/lib/theme'
 
 import appCss from '../styles.css?url'
@@ -43,6 +44,7 @@ function RootLayout() {
 
 function RootDocument({ children }: { children: React.ReactNode }) {
   useEffect(registerShell, [])
+  useEffect(installErrorReporting, [])
   return (
     <html lang="zh-CN">
       <head>
