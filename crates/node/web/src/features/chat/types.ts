@@ -8,6 +8,8 @@ export type TranscriptMessage = {
   in_reply_to?: string
   status?: ReplyStatus
   blobs?: { hash: string; size: number }[]
+  /** On a user message: the question it answers. */
+  answers?: string
 }
 export type PendingMessage = {
   message_id: string

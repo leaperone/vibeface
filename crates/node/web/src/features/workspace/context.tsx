@@ -13,11 +13,12 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseAlerts, parseDecision, pendingChecks,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, pendingChecks,
 } from "./model"
+import { answerBody, answerId, answerScope } from "./questions"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
-  Alert, ConversationPayload, NodeInfo, NotificationRecord,
+  AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus,
 } from "./types"
 
@@ -57,8 +58,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
-  const [alerts, setAlerts] = useState<Alert[]>([])
-  const alertsRef = useRef<Alert[]>([])
+  const [questions, setQuestions] = useState<Question[]>([])
+  /** Answers this browser saw land, by question, until the network's own reads show them. */
+  const [answered, setAnswered] = useState<Readonly<Record<string, string>>>({})
+  const [pendingAnswers, setPendingAnswers] = useState<PendingAnswer[]>([])
+  const answersRef = useRef<PendingAnswer[]>([])
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([])
   const [bots, setBots] = useState<BotRecord[]>([])
   const [pendingBot, setPendingBot] = useState<PendingBot | null>(null)
@@ -105,14 +109,18 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
-  /** Unconfirmed messages as the page shows them, read back from the outbox. */
+  /** Unconfirmed messages and answers as the page shows them, read back from the outbox. */
   const syncPending = async () => {
-    const next: PendingMessage[] = (await outbox.all()).filter((item) => item.method === "message").map((item) => ({
+    const items = await outbox.all()
+    const next: PendingMessage[] = items.filter((item) => item.method === "message").map((item) => ({
       message_id: String(item.params.message_id), conversation_id: String(item.params.conversation_id), text: String(item.params.text),
       report_results: item.params.report_results !== false, ...(item.rejected === undefined ? {} : { rejected: item.rejected }),
     }))
+    const answers: PendingAnswer[] = items.filter((item) => item.method === "answer" && item.rejected === undefined)
+      .map((item) => ({ question_id: String(item.params.question_id), text: String(item.params.text) }))
     messagesRef.current = next
-    if (alive.current) setPendingMessages(next)
+    answersRef.current = answers
+    if (alive.current) { setPendingMessages(next); setPendingAnswers(answers) }
   }
   const outboxChanged = async () => { await syncPending(); tabs.post({ type: "outbox", networkId }) }
   /** Keeps the signed request until the entry answers; an unknown outcome stays for the next check. */
@@ -150,10 +158,12 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     }
     dataRef.current = next
     setData(next)
-    // A message settles once the Node's own history holds it.
+    // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
-    if (current() && messagesRef.current.some(admitted)) {
+    const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id)))
+    if (current() && (messagesRef.current.some(admitted) || landed.length)) {
       for (const item of messagesRef.current.filter(admitted)) await outbox.delete(outboxKey("message", item.message_id))
+      for (const item of landed) await outbox.delete(outboxKey("answer", item.question_id))
       await outboxChanged()
     }
     // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
@@ -199,7 +209,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       if (seen.has(item.notification_id)) continue
       seen.add(item.notification_id)
       try {
-        const popup = new Notification("Vibeface · 进展", { body: item.text, tag: item.notification_id })
+        const popup = new Notification(item.kind === "question" ? "Vibeface · 需要你回答" : "Vibeface · 进展", { body: item.text, tag: item.notification_id })
         popup.onclick = () => {
           if (!current()) { popup.close(); return }
           window.focus(); openConversation(item.conversation_id)
@@ -223,14 +233,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawNotifications, rawBots, rawWrite, rawAlerts] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("alerts"),
+      const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions] = await Promise.all([
+        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("questions"),
       ])
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
-      const nextBots = parseBots(rawBots), nextAlerts = parseAlerts(rawAlerts)
-      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setWriteState(parseWriteStatus(rawWrite))
-      alertsRef.current = nextAlerts; setAlerts(nextAlerts)
+      const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
@@ -264,7 +273,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const recorded = async (item: OutboxItem) => {
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
     if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
-    if (item.method === "resolve_alert") return parseAlerts(await connection.rpc("alerts")).some((alert) => alert.alert_id === item.params.alert_id && alert.resolution !== null)
+    // Every unanswered question is listed, so one missing from the list has its answer.
+    if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
@@ -442,7 +452,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, alerts, bots, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
@@ -528,24 +538,31 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       if (activeId.current === id) await refreshRef.current()
     }),
     /**
-     * The person's answer to a triaged session, through the same downlink Grok Bot uses.
-     * Retrying with the same decision_id only reads back what the session already has.
+     * The person's answer to a question: a message whose ID comes from the question, so any retry is the same write.
+     * An unknown outcome stays in the outbox; trying again sends the stored request without signing anew.
      */
-    sendDecision: (alert: Alert, decisionId: string, answer: { text: string } | { choice: number }) => withMutation(`decision:${alert.alert_id}`, async () => {
-      const thread = alert.thread_id ?? alert.session_id
-      const params = "text" in answer ? { text: inputText(answer.text, "回复", 65536) } : { choice: answer.choice }
-      const result = parseDecision(await connection.rpc("send_decision", { node: alert.node, thread_id: thread, decision_id: decisionId, alert_id: alert.alert_id, ...params }))
-      requireCurrent()
-      if (result.decision_id !== decisionId) throw new Error("送达结果和这次回复对不上，请再查一次。")
+    answer: (question: Question, input: string) => withMutation(`answer:${question.question_id}`, async (): Promise<AnswerResult> => {
+      const text = inputText(input, "回答", 65536)
+      const key = outboxKey("answer", question.question_id)
+      let item = (await outbox.all()).find((entry) => entry.key === key)
+      if (item?.rejected !== undefined) { await outbox.delete(key); item = undefined }
+      if (item && item.params.text !== text) throw new Error("上一个回答还没确认送达，先再试一次。")
+      item ??= await enqueue(outbox, {
+        key, method: "answer", created_at_ms: Date.now(),
+        params: { question_id: question.question_id, text, attestation: await attest(answerScope(question), answerBody(question.question_id, text)) },
+      })
+      await outboxChanged()
+      let result: AnswerResult
+      try { result = parseAnswer(await connection.rpc("answer", item.params), question.question_id) }
+      catch (caught) {
+        if (responded(caught)) { await outbox.delete(key); await outboxChanged() }
+        throw caught
+      }
+      await outbox.delete(key)
+      await outboxChanged()
+      setAnswered((previous) => ({ ...previous, [question.question_id]: result.text }))
       scheduleRefresh()
       return result
-    }),
-    resolveAlert: (alert: Alert, resolution: "decided" | "dismissed") => withMutation(`alert:${alert.alert_id}`, async () => {
-      if (alertsRef.current.find((item) => item.alert_id === alert.alert_id)?.resolution) return
-      const attestation = await attest("attention", { type: "attention_resolved", alert_id: alert.alert_id, resolution })
-      await signedWrite("alert", alert.alert_id, "resolve_alert", { alert_id: alert.alert_id, resolution, attestation })
-      requireCurrent()
-      await refreshRef.current()
     }),
     /** An unverified work: the person's signed choice settles it. */
     resolveCheck: (check: Extract<PendingCheck, { kind: "work" }>, choice: "completed" | "interrupted", note: string) => withMutation(`pending-check:${check.check_id}`, async () => {

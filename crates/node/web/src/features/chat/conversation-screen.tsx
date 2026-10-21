@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, Laptop, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, Laptop, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -9,11 +9,12 @@ import { humanError } from '@/lib/errors'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
-import { AlertCard } from '@/features/workspace/alert-card'
+import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
-import type { AssistantChangeRecord, ManagerJob, WorkRecord } from '@/features/workspace/types'
+import type { AssistantChangeRecord, ManagerJob, SessionHandoff, WorkRecord } from '@/features/workspace/types'
 import { placeChanges, routineName, routineTrigger } from '@/features/workspace/assistant'
 import { pendingChecks } from '@/features/workspace/model'
+import { agentName, foldAnswers, placeByTime, projectName } from '@/features/workspace/questions'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import { Message, type ChatMessage } from './elements/message'
@@ -64,14 +65,23 @@ export function ConversationScreen() {
   const placedChanges = placeChanges(data?.messages ?? [], changes)
   const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={data?.assistant?.routines ?? []} /> })
 
+  // Questions and hand-offs sit where they happened; an answer shows inside its question, not as a bubble.
+  const questions = data?.questions ?? []
+  const folded = foldAnswers(data?.messages ?? [], questions)
+  const asides = placeByTime(data?.messages ?? [], [
+    ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <QuestionCard question={question} answer={folded.answers.get(question.question_id)} /> })),
+    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} /> })),
+  ])
+
   const entries: ChatEntry[] = []
   for (const message of data?.messages ?? []) {
+    for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
     const routine = message.role === 'user' ? null : routineTrigger(message.in_reply_to)
     if (routine) {
       // A routine run has no message of the person; its reply stands alone and the tasks it started follow it.
       entries.push({ key: message.message_id, node: <Message message={message} routine={routineName(routine, data?.assistant, changes)} /> })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
-    } else entries.push(pendingRow(message))
+    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
@@ -81,6 +91,7 @@ export function ConversationScreen() {
     const turn = placedChanges.after.get(message.message_id)
     if (turn) entries.push(changeRow(turn))
   }
+  entries.push(...asides.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
   for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
   for (const turn of placedChanges.rest) entries.push(changeRow(turn))
@@ -107,9 +118,6 @@ export function ConversationScreen() {
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
     }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
-    // A decision whose Codex thread runs a task of this chat shows here too; without that link it stays in 待处理 only.
-    ...workspace.alerts.filter((alert) => alert.resolution === null && alert.thread_id && works.some((work) => !work.outcome && work.target_node === alert.node && work.thread_id === alert.thread_id))
-      .map((alert) => <AlertCard key={alert.alert_id} alert={alert} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
@@ -214,6 +222,17 @@ function TaskMeta({ device, state, className = '' }: { device: string; state: st
     <span aria-hidden="true">·</span>
     <span className="shrink-0">{taskLabel(state)}</span>
   </span>
+}
+
+/** A session handed to this assistant: from here on its questions come to this chat. */
+function HandoffRow({ session }: { session: SessionHandoff }) {
+  return <p className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
+    <ArrowDownToLine aria-hidden="true" className="size-4 shrink-0" />
+    <span className="shrink-0 text-foreground">接手 {agentName(session.agent)} 会话</span>
+    <span aria-hidden="true">·</span>
+    <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
+    {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
+  </p>
 }
 
 function JobLine({ job }: { job: ManagerJob }) {

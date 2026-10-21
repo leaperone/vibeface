@@ -47,6 +47,7 @@ fn user(net: &Net, id: &str, text: &str) -> EventBody {
                 report_results: Some(true),
                 in_reply_to: None,
                 status: None,
+                answers: None,
                 attestation: None,
             },
         )
@@ -921,6 +922,7 @@ fn assistant_reply(id: &str, to: &str) -> EventBody {
         report_results: None,
         in_reply_to: Some(to.into()),
         status: Some(ReplyStatus::Completed),
+        answers: None,
         attestation: None,
     }
 }
@@ -1856,5 +1858,211 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
     );
     assert_eq!(store.messages(&net.network, "c")?.len(), 1);
     assert_eq!(ledgers(&store)?, before);
+    Ok(())
+}
+
+fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
+    Ok(EventBody::QuestionAsked {
+        question_id: id.into(),
+        severity: Severity::Attention,
+        text: "要继续吗？".into(),
+        choices: vec![Choice {
+            label: "继续".into(),
+            conversation_id: None,
+        }],
+        about: Subject {
+            node: net.a.device_id()?,
+            agent: "codex".into(),
+            session_id: session.into(),
+            cwd: "/w".into(),
+            summary: "tests fail".into(),
+            request_id: None,
+        },
+    })
+}
+
+/// The client's signature on the one answer to `question`, as the web sends it.
+fn answer_signature(net: &Net, scope: &str, question: &str, text: &str) -> Result<Attestation> {
+    net.a
+        .fixture_admin()
+        .attest(
+            &net.network,
+            scope,
+            EventBody::MessagePosted {
+                message_id: questions::answer_id(question),
+                role: Role::User,
+                text: text.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: Some(question.into()),
+                attestation: None,
+            },
+        )?
+        .attestation()
+        .cloned()
+        .context("signed answer")
+}
+
+fn sync(from: &Store, to: &mut Store, net: &Net) -> Result<()> {
+    let envelopes: Vec<SignedEvent> = from
+        .connection
+        .prepare("SELECT envelope FROM events WHERE network_id=? ORDER BY author,seq")?
+        .query_map([&net.network], |r| r.get::<_, String>(0))?
+        .map(|row| Ok(serde_json::from_str(&row?)?))
+        .collect::<Result<_>>()?;
+    to.ingest_events(&net.network, &envelopes)?;
+    Ok(())
+}
+
+fn unanswered(store: &Store, net: &Net) -> Result<Vec<String>> {
+    let mut ids: Vec<String> = store
+        .unanswered_questions(&net.network)?
+        .iter()
+        .map(|question| {
+            question["question_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+/// The web's signed answer, its retry, a webhook's different unsigned answer, a restart and a
+/// redelivery to the owner: one answer stands and one `answer` turn is admitted.
+#[test]
+fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> {
+    let net = net()?;
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("store-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let path = dir.join("node.sqlite3");
+    let result = (|| -> Result<()> {
+        let mut store = Store::open(&path)?;
+        store.install_trust_bundle(&net.network, &net.state)?;
+        conversation(&mut store, &net)?;
+        store.ask(&net.a, &net.network, "c", question(&net, "q-1", "t1")?, 2)?;
+        let signed = Some(answer_signature(&net, "c", "q-1", "允许")?);
+        let first = store.accept_answer(&net.a, &net.network, "q-1", "允许", signed.clone(), 3)?;
+        assert!(!first.already_answered && first.receipt.is_some());
+        let retry = store.accept_answer(&net.a, &net.network, "q-1", "允许", signed, 4)?;
+        assert!(!retry.already_answered && retry.message == first.message);
+        let webhook = store.accept_answer(&net.a, &net.network, "q-1", "拒绝", None, 5)?;
+        assert!(webhook.already_answered && webhook.message.text == "允许");
+        drop(store);
+        let mut store = Store::open(&path)?;
+        let trigger = message_trigger(&questions::answer_id("q-1"));
+        store.admit_delivery(&net.a.device_id()?, &net.network, "c", &trigger)?;
+        let jobs = store.scheduler_jobs("c")?;
+        assert_eq!(
+            jobs.iter()
+                .map(|job| (job.trigger.clone(), job.kind))
+                .collect::<Vec<_>>(),
+            vec![(trigger, TriggerKind::Answer)]
+        );
+        let answers = store
+            .context(&net.network, "c", None)?
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event.body,
+                    EventBody::MessagePosted {
+                        answers: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(answers, 1, "one answer event");
+        assert!(unanswered(&store, &net)?.is_empty());
+        Ok(())
+    })();
+    std::fs::remove_dir_all(dir)?;
+    result
+}
+
+/// An answer given through a device that does not schedule the conversation reaches its owner
+/// as an `answer` turn, and every reader sees the same answer.
+#[test]
+fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
+    let net = net()?;
+    let (mut a, mut b) = (store(&net)?, store(&net)?);
+    conversation(&mut a, &net)?;
+    a.ask(&net.a, &net.network, "c", question(&net, "q-1", "t1")?, 2)?;
+    sync(&a, &mut b, &net)?;
+    assert_eq!(unanswered(&b, &net)?, vec!["q-1".to_owned()]);
+    let signed = Some(answer_signature(&net, "c", "q-1", "继续")?);
+    let answered = b.accept_answer(&net.b, &net.network, "q-1", "继续", signed, 3)?;
+    assert!(b.scheduler_jobs("c")?.is_empty());
+    let delivery = b.scheduler_outbox()?;
+    assert_eq!(
+        delivery
+            .iter()
+            .map(|entry| entry.trigger.clone())
+            .collect::<Vec<_>>(),
+        vec![answered.receipt.context("queued for the owner")?.trigger]
+    );
+    sync(&b, &mut a, &net)?;
+    let trigger = &delivery[0].trigger;
+    a.admit_delivery(&net.a.device_id()?, &net.network, "c", trigger)?;
+    assert_eq!(a.scheduler_jobs("c")?[0].kind, TriggerKind::Answer);
+    for store in [&a, &b] {
+        assert!(unanswered(store, &net)?.is_empty());
+        let questions = store.conversation_questions(&net.network, "c")?;
+        assert_eq!(questions[0]["answer"]["text"], "继续");
+        assert_eq!(questions[0]["answer"]["message_id"], "a-q-1");
+    }
+    Ok(())
+}
+
+/// Answered and unanswered questions in two conversations and the sessions scope: the pending
+/// list holds exactly the unanswered ones, and a chat shows its own with their answers.
+#[test]
+fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let owner = net
+        .a
+        .owner_fixture(&net.network, "d", &net.a.device_id()?)?;
+    store.create_conversation(&net.a, &net.network, "d", "t", owner, 1)?;
+    for (scope, id) in [
+        ("c", "q-1"),
+        ("c", "q-2"),
+        ("d", "q-3"),
+        (SESSIONS_SCOPE, "s-1"),
+        (SESSIONS_SCOPE, "s-2"),
+    ] {
+        store.ask(&net.a, &net.network, scope, question(&net, id, id)?, 2)?;
+    }
+    let signed = Some(answer_signature(&net, "c", "q-2", "继续")?);
+    store.accept_answer(&net.a, &net.network, "q-2", "继续", signed, 3)?;
+    let ignored = store.accept_answer(&net.a, &net.network, "s-2", "忽略", None, 4)?;
+    assert!(
+        ignored.receipt.is_none(),
+        "a session question starts no turn"
+    );
+    assert_eq!(unanswered(&store, &net)?, vec!["q-1", "q-3", "s-1"]);
+    let pending = store.unanswered_questions(&net.network)?;
+    let session = pending
+        .iter()
+        .find(|q| q["question_id"] == "s-1")
+        .context("s-1")?;
+    assert!(session["conversation_id"].is_null() && session["answer"].is_null());
+    let chat = store.conversation_questions(&net.network, "c")?;
+    assert_eq!(
+        chat.iter()
+            .map(|q| (q["question_id"].clone(), q["answer"]["text"].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (serde_json::json!("q-1"), Value::Null),
+            (serde_json::json!("q-2"), serde_json::json!("继续"))
+        ]
+    );
     Ok(())
 }

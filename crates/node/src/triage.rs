@@ -1,16 +1,15 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
-//! scans, matter dedupe, outlet choice, webhook signing and delivery, and hook installation. The
-//! coordination Agent judges; nothing here decides what matters.
+//! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
+//! installation. The coordination Agent judges; nothing here decides what matters.
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_MESSAGE: usize = 4000;
 pub const MAX_DETAIL: usize = 2000;
-pub const MATTER_WINDOW_MS: i64 = 30 * 60 * 1000;
 pub const MAX_ATTEMPTS: u32 = 8;
 pub const FIRST_BACKOFF_MS: i64 = 10_000;
 
@@ -70,43 +69,6 @@ pub struct AgentEvent {
     pub request_id: Option<String>,
 }
 
-/// One answer a decision card offers: the label the user sees, and the JSON result sent to the
-/// App Server request the card holds (or the label as a message when it holds none).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Choice {
-    pub label: String,
-    #[serde(default)]
-    pub reply: Value,
-}
-
-/// What a raised card needs locally to take a decision: kept on the device that raised it.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct Card {
-    pub thread_id: Option<String>,
-    pub request_id: Option<String>,
-    pub choices: Vec<Choice>,
-}
-
-/// `label=<json>`, as `vibeface triage raise --choice` takes it; a non-JSON value is a string.
-pub fn parse_choice(text: &str) -> Result<Choice> {
-    let (label, reply) = text
-        .split_once('=')
-        .map_or((text, ""), |(label, reply)| (label, reply));
-    ensure!(
-        !label.trim().is_empty() && label.len() <= 120,
-        "a choice needs a label of at most 120 bytes"
-    );
-    let reply = match reply {
-        "" => Value::Null,
-        reply => serde_json::from_str(reply).unwrap_or_else(|_| Value::String(reply.into())),
-    };
-    Ok(Choice {
-        label: label.trim().into(),
-        reply,
-    })
-}
-
 fn clip(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
@@ -118,6 +80,16 @@ fn hex32(parts: &[&str]) -> String {
         hash.update([0]);
     }
     hex::encode(hash.finalize())[..32].to_owned()
+}
+
+/// An assistant's question about an event: one per event wherever it is raised.
+pub fn question_id(node: &str, event_id: &str) -> String {
+    format!("q-{}", hex32(&[node, event_id]))
+}
+
+/// The one question about a session no assistant owns, so its answer holds for the session.
+pub fn session_question_id(node: &str, session: &str) -> String {
+    format!("s-{}", hex32(&[node, session]))
 }
 
 impl AgentEvent {
@@ -280,106 +252,66 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
 pub use crate::model::Severity;
 
 /// The coordination Agent's turn when new events wait: it decides, then answers through
-/// `vibeface triage raise|dismiss`. Events it leaves alone stay pending.
-pub fn wake_prompt(events: &[AgentEvent], cli: &str, answer_within_secs: u64) -> Result<String> {
+/// `vibeface triage raise|dismiss`. Each event comes with the assistant whose chat owns its session.
+pub fn wake_prompt(
+    events: &[(AgentEvent, Value)],
+    cli: &str,
+    answer_within_secs: u64,
+) -> Result<String> {
     let items: Vec<Value> = events
         .iter()
-        .map(|e| {
+        .map(|(e, assistant)| {
             json!({"event_id":e.event_id,"agent":e.agent,"event":e.event,"status":e.status,
             "session_id":e.session_id,"turn_id":e.turn_id,"cwd":e.cwd,"repo":e.repo,
             "git_branch":e.git_branch,"last_message":clip(&e.last_message, 1500),
-            "detail":clip(&e.detail, 500),"request_id":e.request_id})
+            "detail":clip(&e.detail, 500),"request_id":e.request_id,"assistant":assistant})
         })
         .collect();
     Ok(format!(
         "New events from the user's local coding agent sessions are waiting. Decide for each \
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
-- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --summary \"one line in the user's language\" --matter KEY`. \
-Use the same short KEY for events about the same matter (for example `codex:<session_id>`); \
-a repeat only updates the card and is re-sent when the severity rises.\n\
+- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question \"the question, in the user's language\" [--choice LABEL]...`. \
+It asks in the chat of the event's assistant. Each --choice is one short answer the user can pick (at most 8); \
+the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
+The answer comes back to that assistant as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \
 shows its full params. Answer it yourself with `{cli} codex respond REQUEST_ID 'RESULT_JSON'` \
-(the thread already runs with full access). Only when the user must decide, raise a decision card: \
-add `--request-id REQUEST_ID --thread THREAD_ID --choice 'LABEL=RESULT_JSON'` (repeat --choice) \
-to the raise; the request then waits for the user's choice. A request neither answered nor \
-carded is declined after {answer_within_secs} seconds or when this turn ends.\n\
+(the thread already runs with full access). Only when the user must decide, add `--request-id REQUEST_ID` \
+to the raise: the request then waits for the answer, and the assistant has {answer_within_secs} seconds \
+after it to respond. A request neither answered nor raised is declined after {answer_within_secs} seconds \
+or when this turn ends.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
         serde_json::to_string_pretty(&items)?
     ))
 }
 
-/// What a matter last raised; merging keeps one card per matter within the window.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Matter {
-    pub key: String,
-    pub alert_id: String,
-    pub severity: Severity,
-    pub count: u64,
-    pub last_ms: i64,
+/// One turn that picks the assistant for a session the user chose to handle.
+pub fn routing_prompt(
+    question: &Value,
+    answer: &str,
+    assistants: &[Value],
+    cli: &str,
+) -> Result<String> {
+    Ok(format!(
+        "A session no assistant started needs an owner. The user answered {answer:?} to the question \
+about it. Pick the assistant whose project and work fit the session best, by its cwd and what it \
+was doing, then run `{cli} triage assign --question {} --assistant CONVERSATION_ID` once. Do nothing else.\n\n\
+Session:\n{}\n\nAssistants:\n{}",
+        question["question_id"].as_str().unwrap_or_default(),
+        serde_json::to_string_pretty(&question["about"])?,
+        serde_json::to_string_pretty(assistants)?
+    ))
 }
 
-/// Records `verdict` against the matter's previous state; true when it should be sent out.
-pub fn merge(
-    previous: Option<&Matter>,
-    key: &str,
-    alert_id: &str,
-    severity: Severity,
-    now_ms: i64,
-) -> (Matter, bool) {
-    match previous {
-        Some(old) if now_ms - old.last_ms < MATTER_WINDOW_MS => {
-            let escalated = severity > old.severity;
-            (
-                Matter {
-                    key: key.into(),
-                    alert_id: if escalated {
-                        alert_id.into()
-                    } else {
-                        old.alert_id.clone()
-                    },
-                    severity: severity.max(old.severity),
-                    count: old.count + 1,
-                    last_ms: now_ms,
-                },
-                escalated,
-            )
-        }
-        _ => (
-            Matter {
-                key: key.into(),
-                alert_id: alert_id.into(),
-                severity,
-                count: 1,
-                last_ms: now_ms,
-            },
-            true,
-        ),
-    }
-}
-
-pub fn matter_key(node: &str, matter: &str) -> String {
-    hex32(&[node, matter])
-}
-
+/// A question is always recorded; `both` also sends it to the webhook.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Outlet {
     #[default]
     Record,
-    Webhook,
     Both,
-    Off,
-}
-
-impl Outlet {
-    pub fn record(self) -> bool {
-        matches!(self, Self::Record | Self::Both)
-    }
-    pub fn webhook(self) -> bool {
-        matches!(self, Self::Webhook | Self::Both)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -713,26 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn matters_emit_only_when_new_or_worse() {
-        let (first, emit) = merge(None, "k", "a1", Severity::Attention, 0);
-        assert!(emit);
-        let (second, emit) = merge(Some(&first), "k", "a2", Severity::Info, 1000);
-        assert!(!emit && second.count == 2 && second.alert_id == "a1");
-        let (third, emit) = merge(Some(&second), "k", "a3", Severity::Urgent, 2000);
-        assert!(emit && third.alert_id == "a3" && third.severity == Severity::Urgent);
-        assert!(
-            merge(
-                Some(&third),
-                "k",
-                "a4",
-                Severity::Info,
-                2000 + MATTER_WINDOW_MS
-            )
-            .1
-        );
-    }
-
-    #[test]
     fn outbox_retries_transient_failures_and_dead_letters_the_rest() {
         let mut entry = OutboxEntry::new("e", "{}".into(), 0);
         entry.record(Some(503), None, 0);
@@ -761,18 +673,19 @@ mod tests {
             projects: vec![
                 ProjectOutlet {
                     prefix: "/w".into(),
-                    outlet: Outlet::Off,
+                    outlet: Outlet::Both,
                 },
                 ProjectOutlet {
                     prefix: "/w/app".into(),
-                    outlet: Outlet::Webhook,
+                    outlet: Outlet::Record,
                 },
             ],
             ..Default::default()
         };
-        assert_eq!(config.outlet_for("/w/app/src"), Outlet::Webhook);
-        assert_eq!(config.outlet_for("/w/apps"), Outlet::Off);
+        assert_eq!(config.outlet_for("/w/app/src"), Outlet::Record);
+        assert_eq!(config.outlet_for("/w/apps"), Outlet::Both);
         assert_eq!(config.outlet_for("/x"), Outlet::Record);
+        assert!(serde_json::from_value::<Outlet>(json!("webhook")).is_err());
         for url in ["http://hook.example/x", "https://u:p@hook.example/"] {
             assert!(
                 TriageConfig {

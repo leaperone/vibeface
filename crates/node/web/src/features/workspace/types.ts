@@ -31,7 +31,7 @@ export type WorkRecord = {
   outcome: WorkOutcome | null
   result_text: string
   failure_reason: string | null
-  /** The Codex thread running it; a decision card names the same thread. */
+  /** The Codex thread running it. */
   thread_id?: string
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
@@ -95,6 +95,9 @@ export type ConversationPayload = {
   /** Oldest first. */
   changes: AssistantChangeRecord[]
   assistant: AssistantView
+  /** This chat's questions, answered ones included. */
+  questions: Question[]
+  sessions: SessionHandoff[]
 }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
 export type WorkspaceView = "chat" | "other"
@@ -114,27 +117,35 @@ export type PendingBot = CreateBotRequest & {
 }
 
 export type Severity = "info" | "attention" | "urgent"
-/** A triaged session that needs the person; `choices` turns it into a decision with fixed answers. */
-export type Alert = {
-  alert_id: string
-  matter: string
-  agent: string
-  session_id: string
-  thread_id?: string
-  request_id?: string
-  choices: { label: string }[]
-  turn_id?: string
-  cwd: string
+/** The device, project and session a question is about. `agent` is "codex" or "claude". */
+export type QuestionSubject = { node: string; agent: string; session_id: string; cwd: string; summary: string; request_id?: string }
+/** `conversation_id` only on a session question: choosing it hands the session to that assistant. */
+export type QuestionChoice = { label: string; conversation_id?: string }
+export type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
+/**
+ * Something only the person can settle, asked in an assistant's chat. `conversation_id` null: a session no assistant
+ * started, shown in 待处理 only. Text answers are always allowed; a choice answers with its label.
+ */
+export type Question = {
+  question_id: string
+  conversation_id: string | null
+  assistant: { bot_id: string; name: string } | null
   severity: Severity
-  summary: string
-  count: number
-  node: string
+  text: string
+  choices: QuestionChoice[]
+  about: QuestionSubject
+  author: string
   created_at_ms: number
-  resolution: "decided" | "dismissed" | null
+  answer: QuestionAnswer | null
 }
-/** `unknown`: the session may have it; sending again with the same decision_id only reads back. */
-export type DecisionResult = { decision_id: string; status: "delivered" | "unknown" | "rejected"; reason?: string }
-export type Outlet = "record" | "webhook" | "both" | "off"
+/** `already_answered`: another answer stood first; `text` is the one that stands. */
+export type AnswerResult = { status: "answered" | "already_answered"; text: string }
+/** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
+export type PendingAnswer = { question_id: string; text: string }
+/** A session handed to this assistant, shown where it happened. */
+export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; question_id: string; created_at_ms: number }
+/** Where questions go besides the web: "both" also sends them to Grok Bot. */
+export type Outlet = "record" | "both"
 export type TriageSettings = {
   default_outlet: Outlet
   projects: { prefix: string; outlet: Outlet }[]

@@ -77,22 +77,34 @@ pub enum Severity {
     Urgent,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AlertResolution {
-    /// A decision went back to the session.
-    Decided,
-    Dismissed,
+/// Scope of the questions about sessions no assistant owns; they show only on the pending page.
+pub const SESSIONS_SCOPE: &str = "sessions";
+
+/// The device, project and session a question is about.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Subject {
+    pub node: DeviceId,
+    /// `codex` or `claude`.
+    pub agent: String,
+    /// A Codex thread ID or a Claude Code session ID.
+    pub session_id: String,
+    pub cwd: String,
+    /// One line: what the session last said.
+    pub summary: String,
+    /// The App Server request `node` holds until the question is answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ChoiceLabel {
+pub struct Choice {
     pub label: String,
+    /// Session questions only: choosing it attributes the session to this assistant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<ScopeId>,
 }
-
-/// Scope of the triage cards every device shows.
-pub const ATTENTION_SCOPE: &str = "attention";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
@@ -317,6 +329,9 @@ pub enum EventBody {
         in_reply_to: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ReplyStatus>,
+        /// A user message answering this question; its `message_id` is `a-<question_id>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
@@ -362,34 +377,25 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// A triaged session that needs the user, in scope `attention`; a later raise of the same
-    /// `matter` (an escalation) replaces the card.
-    AttentionRaised {
-        alert_id: String,
-        matter: String,
+    /// In the conversation of the assistant that owns the session, or in `SESSIONS_SCOPE` for a
+    /// session no assistant owns. Its one answer is the user message `a-<question_id>`.
+    QuestionAsked {
+        question_id: String,
+        severity: Severity,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<Choice>,
+        about: Subject,
+    },
+    /// In the chosen assistant's conversation: that assistant owns the session from now on.
+    SessionAttributed {
+        node: DeviceId,
         agent: String,
         session_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<String>,
         cwd: String,
-        severity: Severity,
         summary: String,
-        count: u64,
-        /// The Codex thread a decision goes to.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thread_id: Option<String>,
-        /// The App Server request this card holds until the user chooses.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<String>,
-        /// Labels only; what each choice sends stays on the device that raised the card.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        choices: Vec<ChoiceLabel>,
-    },
-    AttentionResolved {
-        alert_id: String,
-        resolution: AlertResolution,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
+        /// The session question that led to it.
+        question_id: String,
     },
     /// Written by the owner in a turn the user's message `cause` started; that message is one
     /// of its parents. `change_id` derives from the turn and the tool's `call_ref`.
@@ -416,8 +422,7 @@ impl EventBody {
             | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
-            | Self::NotificationAcked { attestation, .. }
-            | Self::AttentionResolved { attestation, .. } => attestation.as_ref(),
+            | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
@@ -555,6 +560,8 @@ pub struct Message {
     pub in_reply_to: Option<String>,
     pub status: Option<ReplyStatus>,
     pub report_results: Option<bool>,
+    /// The question this user message answers.
+    pub answers: Option<String>,
     pub blobs: Vec<BlobRef>,
 }
 /// Derived from the event that raised it; its ID is that event's hash.

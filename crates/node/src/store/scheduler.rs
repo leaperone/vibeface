@@ -588,6 +588,7 @@ fn end_job_from(
                 report_results: None,
                 in_reply_to: Some(job.reply_to.clone()),
                 status: Some(status),
+                answers: None,
                 attestation: None,
             },
             vec![],
@@ -720,6 +721,7 @@ impl Store {
         if let Some(existing) = message_from(&tx, network, conversation, message_id)? {
             ensure!(
                 existing.role == Role::User
+                    && existing.answers.is_none()
                     && existing.text == text
                     && existing.blobs == blobs
                     && existing.report_results == Some(report_results),
@@ -740,6 +742,7 @@ impl Store {
                     report_results: Some(report_results),
                     in_reply_to: None,
                     status: None,
+                    answers: None,
                     attestation: Some(attestation),
                 },
                 blobs,
@@ -886,7 +889,12 @@ impl Store {
             }
             queued.push(job);
         }
-        queued.sort_by_key(|job| (job.kind != TriggerKind::Human, job.sequence));
+        queued.sort_by_key(|job| {
+            (
+                !matches!(job.kind, TriggerKind::Human | TriggerKind::Answer),
+                job.sequence,
+            )
+        });
         let mut selected = None;
         for mut job in queued {
             let evidence = match job.kind {

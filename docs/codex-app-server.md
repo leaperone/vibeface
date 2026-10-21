@@ -10,7 +10,7 @@
 |---|---|---|
 | `initialize` | 隐藏 | 连接建立时由客户端发送，不对外暴露 |
 | `thread/start` | 写 | `dispatch_work` 先登记再发；协调 Agent 也可用 `vibeface codex call` 自开线程 |
-| `thread/resume` | 写 | Node 订阅观察；`send_decision` 先 resume |
+| `thread/resume` | 写 | Node 订阅观察；`vibeface codex send` 先 resume |
 | `thread/fork` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/archive` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/delete` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
@@ -71,8 +71,8 @@
 | `skills/config/write` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/install` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/uninstall` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `turn/start` | 写 | `dispatch_work`、`vibeface codex send` 与 `send_decision` 发送，带 `clientUserMessageId` |
-| `turn/steer` | 写 | `vibeface codex send` 与 `send_decision` 共用同一发送函数，带 `clientUserMessageId` |
+| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 发送，带 `clientUserMessageId` |
+| `turn/steer` | 写 | `vibeface codex send` 发送，带 `clientUserMessageId` |
 | `turn/interrupt` | 写 | 停止按钮经 Node 发送；协调 Agent 也可直接调用 |
 | `review/start` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `model/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
@@ -122,7 +122,7 @@
 
 ## 服务端请求
 
-工作线程用 `approvalPolicy=never` 和 `danger-full-access` 启动，正常不会收到审批。Node 订阅的线程上的请求和不属于线程的请求都没有固定策略：Node 挂起请求，记一行日志（方法和线程，不含命令文本），立即唤醒本机协调 Agent。Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答；需要本人拍板时用 `vibeface triage raise --request-id` 生成拍板卡片，卡片挂住请求直到本人选择，忽略卡片等于拒绝。没有协调 Agent、唤醒失败或 120 秒内没有回答也没有卡片时，按下表兜底并记录。Node 没有订阅的线程留给原客户端回答。
+工作线程用 `approvalPolicy=never` 和 `danger-full-access` 启动，正常不会收到审批。Node 订阅的线程上的请求和不属于线程的请求都没有固定策略：Node 挂起请求，记一行日志（方法和线程，不含命令文本），立即唤醒本机协调 Agent。Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答；需要本人拍板时用 `vibeface triage raise --request-id` 在负责该线程的助手聊天里提问，提问挂住请求直到有回答，回答后该助手有 120 秒应答。线程不属于任何助手时立即兜底。没有协调 Agent、唤醒失败或 120 秒内没有回答也没有提问时，按下表兜底并记录。Node 没有订阅的线程留给原客户端回答。
 
 | 方法 | 兜底回复 |
 |---|---|

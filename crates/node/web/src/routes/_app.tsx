@@ -3,6 +3,7 @@ import { Outlet, createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useDevice } from '@/features/identity/context'
 import { useOnboarding } from '@/features/identity/onboarding-flag'
 import { WorkspaceProvider } from '@/features/workspace/context'
+import { SESSIONS_SCOPE } from '@/features/workspace/questions'
 import { ShellSkeleton, WorkspaceShell } from '@/features/workspace/workspace-shell'
 
 // Setup, pairing and recovery only load for browsers that aren't connected yet.
@@ -21,7 +22,7 @@ function AppLayout() {
   if (!ready && (phase === 'initializing' || phase === 'connecting' && entries.length > 0 && !initialInvitation)) return <ShellSkeleton />
   if (!ready) return <Suspense fallback={<ShellSkeleton />}><ConnectionScreen /></Suspense>
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
-  return <WorkspaceProvider key={key} connection={ready} tabs={tabs} openConversation={(id) => { void navigate({ to: '/', search: { conversation: id } }) }}>
+  return <WorkspaceProvider key={key} connection={ready} tabs={tabs} openConversation={(id) => { void (id === SESSIONS_SCOPE ? navigate({ to: '/inbox' }) : navigate({ to: '/', search: { conversation: id } })) }}>
     {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

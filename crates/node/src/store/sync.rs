@@ -272,14 +272,11 @@ impl Store {
                     message.role == Role::User,
                     "only user messages are delivered"
                 );
-                admit_from(
-                    &tx,
-                    network,
-                    conversation,
-                    trigger,
-                    TriggerKind::Human,
-                    message_id,
-                )?
+                let kind = match message.answers {
+                    Some(_) => TriggerKind::Answer,
+                    None => TriggerKind::Human,
+                };
+                admit_from(&tx, network, conversation, trigger, kind, message_id)?
             }
             Some(("work", work_id)) => {
                 let outcome = super::reduce::works_from(&tx, network, conversation)?

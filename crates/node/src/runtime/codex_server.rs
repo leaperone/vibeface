@@ -302,3 +302,18 @@ impl CodexServer {
         let _ = std::fs::remove_file(&managed.pidfile);
     }
 }
+
+impl Runtime {
+    /// The web's view of Codex on this device, or on the device `node` names. The web never
+    /// calls App Server methods.
+    pub(super) async fn codex_state(&self, network: &str, input: &Value) -> Result<Value> {
+        if let Some(node) = input["node"].as_str()
+            && node != self.identity.device_id()?
+        {
+            return self
+                .peer_request(network, node, json!({"type":"codex_state","human":true}))
+                .await;
+        }
+        Ok(self.codex.status().await)
+    }
+}

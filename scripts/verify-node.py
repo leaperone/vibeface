@@ -375,6 +375,12 @@ class Client:
                     "instructions": arguments.get("instructions", "")}
             if arguments.get("project") is not None:
                 body["project"] = arguments["project"]
+        elif method == "answer":
+            # The question's chat, or the sessions scope; the Node takes it from the question.
+            scope = arguments.pop("scope_id")
+            body = {"type": "message_posted", "message_id": "a-" + arguments["question_id"], "role": "user",
+                    "text": arguments["text"], "report_results": True, "answers": arguments["question_id"]}
+            return self.command("attest", network_id=self.network_id, scope_id=scope, body=body)
         elif method == "set_owner":
             body = {"type": "conversation_owner", "scheduler_node": arguments["scheduler_node"], "epoch": arguments["epoch"]}
         elif method == "resolve" and arguments["check_id"].startswith("work:"):
@@ -1021,6 +1027,7 @@ def fixture_codex(arguments):
 
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_routine", "remove_routine"}
 TRIAGE_WAKE = "New events from the user's local coding agent sessions"
+ROUTING = "A session no assistant started needs an owner."
 
 
 def fixture_cli(initial, *arguments, check=True):
@@ -1033,7 +1040,7 @@ def fixture_cli(initial, *arguments, check=True):
 
 
 def fixture_triage(run, initial, prompt, emit):
-    """The coordination Agent's triage turn: answer, card or dismiss each event per the fixture thread's directive."""
+    """The coordination Agent's triage turn: answer, ask about or dismiss each event per the fixture thread's directive."""
     events = json.loads(prompt[prompt.index("Events:\n") + len("Events:\n"):])
     state_path = run / "fixture-codex-state.json"
     threads = json.loads(state_path.read_text())["threads"] if state_path.exists() else {}
@@ -1050,19 +1057,17 @@ def fixture_triage(run, initial, prompt, emit):
                 answers = [json.loads(fixture_cli(initial, "codex", "respond", event["request_id"],
                                                   json.dumps({"decision": "accept"})).stdout) for _ in range(2)]
                 action.update(action="respond", answers=answers)
-            elif mode == "card":
-                fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "urgent",
-                            "--summary", "Codex 想运行一条命令，需要你拍板", "--matter", "codex:" + event["session_id"],
-                            "--thread", event["session_id"], "--request-id", event["request_id"],
-                            "--choice", "允许=" + json.dumps({"decision": "accept"}),
-                            "--choice", "拒绝=" + json.dumps({"decision": "decline"}))
-                action.update(action="card")
+            elif mode == "ask":
+                asked = [json.loads(fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "urgent",
+                                                "--question", "Codex 想运行一条命令，允许吗？", "--request-id", event["request_id"],
+                                                "--choice", "允许", "--choice", "拒绝").stdout) for _ in range(2)]
+                action.update(action="ask", asked=asked)
             else:
                 action.update(action="ignore")
         elif "triage-raise" in event["cwd"] or "needs-human" in event.get("last_message", ""):
-            fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "attention",
-                        "--summary", "会话停下等你回复", "--matter", "codex:" + event["session_id"])
-            action.update(action="raise")
+            asked = json.loads(fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "attention",
+                                           "--question", "会话停下等你回复：下一步做什么？").stdout)
+            action.update(action="raise", asked=asked)
         else:
             fixture_cli(initial, "triage", "dismiss", "--event-id", event["event_id"])
             action.update(action="dismiss")
@@ -1090,6 +1095,16 @@ def fixture_manager(arguments):
         fixture_record(run, "triage-invocations.jsonl", {"pid": os.getpid(), "native_session_id": native})
         initial["session_id"] = native
         fixture_triage(run, initial, prompt, emit)
+        return
+    if prompt.startswith(ROUTING):
+        question = re.search(r"--question (\S+)", prompt).group(1)
+        assistants = json.loads(prompt[prompt.index("Assistants:\n") + len("Assistants:\n"):])
+        chosen = assistants[0]["conversation_id"]
+        assigned = [json.loads(fixture_cli(initial, "triage", "assign", "--question", question, "--assistant", chosen).stdout)
+                    for _ in range(2)]
+        fixture_record(run, "routing-actions.jsonl", {"question_id": question, "assistant": chosen, "assigned": assigned,
+                                                     "pid": os.getpid()})
+        emit({"type": "result", "session_id": native, "final_response": "已认领"})
         return
     start = prompt.rfind("\n\n{")
     require(start >= 0, "fixture receives explicit management context")
@@ -1173,6 +1188,19 @@ def fixture_manager(arguments):
                 "dispatch_work from the Shell has its expected outcome: " + completed.stderr[-300:])
         return json.loads(completed.stdout) if accepted else None
 
+    if kind == "answer":
+        # The user's answer goes where the question came from, once however often it is sent.
+        question, answer = context["trigger"]["question"], body["text"]
+        about = question["about"]
+        if about.get("request_id"):
+            result = json.dumps({"decision": "accept" if answer == "允许" else "decline"})
+            replies = [json.loads(fixture_cli(initial, "codex", "respond", about["request_id"], result, "--node", about["node"]).stdout)
+                       for _ in range(2)]
+        else:
+            replies = [json.loads(fixture_cli(initial, "codex", "send", about["session_id"], answer, "--id", body["message_id"]).stdout)
+                       for _ in range(2)]
+        fixture_record(run, "answer-actions.jsonl", {"conversation_id": context["conversation_id"], "trigger": trigger,
+                       "question_id": question["question_id"], "answer": answer, "replies": replies, "pid": os.getpid()})
     host_command = directive.get("host_command")
     if host_command:
         fixture_record(run, "fixture-invocations.jsonl", {"native_session_id": native,
@@ -1654,27 +1682,40 @@ def work_checks(run, workspace, a, network, passed):
             "a request the Agent neither answers nor cards is declined once when its turn ends")
     passed("a request left alone is declined deterministically and recorded", work_id=work_id)
 
-    name = "chat-work-card"
+    name = "chat-work-question"
     directory, receipt, work_id = start(name, gate_open=True,
-                                        native={"request": "item/commandExecution/requestApproval", "request_mode": "card"})
-    alert = wait_for("the Agent raises a decision card for the request", lambda: next(
-        (row for row in a.client.rpc("alerts")["alerts"] if row.get("request_id") and row["resolution"] is None
-         and row["session_id"] == (work(name, work_id) or {}).get("thread_id")), None), timeout=90)
-    require([choice["label"] for choice in alert["choices"]] == ["允许", "拒绝"] and "reply" not in json.dumps(alert["choices"]),
-            "the card offers the Agent's choices without their raw replies")
-    require_quiet("a carded request waits for the user", lambda: in_state(name, work_id, "running") and not answers(alert["thread_id"]))
-    decision = {"thread_id": alert["thread_id"], "decision_id": "decision-card-1", "alert_id": alert["alert_id"], "choice": 1}
-    first = a.client.rpc("send_decision", **decision)
-    retry = a.client.rpc("send_decision", **decision)
-    require(first["status"] == "delivered" and first["mode"] == "answer" and retry == first,
-            "a choice answers the held request; the same decision_id returns the first result")
-    finished = wait_for("the decided work finishes", lambda: in_state(name, work_id, "finished"))
+                                        native={"request": "item/commandExecution/requestApproval", "request_mode": "ask"})
+    question = wait_for("the Agent asks in the work's chat about the held request", lambda: next(
+        (row for row in a.client.rpc("questions")["questions"] if row["conversation_id"] == name), None), timeout=90)
+    thread_id, question_id = question["about"]["session_id"], question["question_id"]
+    asked = [row for row in fixture_records(run, "triage-actions.jsonl") if row["session_id"] == thread_id]
+    require([choice["label"] for choice in question["choices"]] == ["允许", "拒绝"] and question["about"]["request_id"]
+            and thread_id == (work(name, work_id) or {}).get("thread_id") and len(asked) == 1
+            and asked[0]["asked"][0]["question_id"] == asked[0]["asked"][1]["question_id"] == question_id,
+            "the question about the request lands once in the chat that owns the thread")
+    require(any(row["question_id"] == question_id and row["answer"] is None for row in snapshot(name)["questions"]),
+            "the conversation shows the unanswered question")
+    require_quiet("a request a question holds waits for the answer", lambda: in_state(name, work_id, "running") and not answers(thread_id))
+    first = a.client.rpc("answer", question_id=question_id, text="拒绝", scope_id=name)
+    retry = a.client.rpc("answer", question_id=question_id, text="拒绝", scope_id=name)
+    other = a.client.rpc("answer", question_id=question_id, text="允许", scope_id=name)
+    require(first["status"] == retry["status"] == "answered" and retry["message"] == first["message"]
+            and first["message"]["message_id"] == "a-" + question_id and first["message"]["answers"] == question_id
+            and other["status"] == "already_answered" and other["message"]["text"] == "拒绝",
+            "the answer is written once; a retry reads it back and a different answer finds the first")
+    finished = wait_for("the assistant acts on the answer and the work finishes", lambda: in_state(name, work_id, "finished"), timeout=90)
     replies = answers(finished["thread_id"])
-    require(len(replies) == 1 and replies[0]["result"] == {"decision": "decline"}, "the user's choice reaches Codex once")
-    resolved = wait_for("the card shows as decided", lambda: next((row for row in a.client.rpc("alerts")["alerts"]
-                        if row["alert_id"] == alert["alert_id"] and row["resolution"] == "decided"), None))
-    passed("a decision card holds the request until the user's choice answers it once", work_id=work_id,
-           alert=resolved["alert_id"])
+    turns = [row for row in fixture_records(run) if row["kind"] == "answer" and row["conversation_id"] == name]
+    acted = [row for row in fixture_records(run, "answer-actions.jsonl") if row["question_id"] == question_id]
+    require(len(replies) == 1 and replies[0]["result"] == {"decision": "decline"} and len(turns) == 1
+            and turns[0]["trigger"] == "message:a-" + question_id and len(acted) == 1
+            and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
+            "the answer is one turn of the assistant, whose codex respond reaches Codex once")
+    require(all(row["question_id"] != question_id for row in a.client.rpc("questions")["questions"])
+            and any(row["question_id"] == question_id and row["answer"]["text"] == "拒绝" for row in snapshot(name)["questions"]),
+            "the answered question leaves the pending list and shows its answer in the chat")
+    passed("a question in the chat holds the request until the user's answer reaches it once through the assistant",
+           work_id=work_id, question=question_id)
 
     name = "chat-work-interrupt"
     directory, receipt, work_id = start(name)
@@ -1763,7 +1804,7 @@ class WebhookReceiver:
                 expected = "v1=" + hmac.new(receiver.secret, (timestamp + ".").encode() + body, hashlib.sha256).hexdigest()
                 valid = hmac.compare_digest(expected, self.headers["X-Vibeface-Signature"]) and abs(time.time() - int(timestamp)) < 300
                 payload = json.loads(body)
-                statuses = [200] if payload.get("test") else receiver.scripted.get((payload.get("event") or {}).get("session_id"), [500, 200])
+                statuses = [200] if payload.get("test") else receiver.scripted.get((payload.get("about") or {}).get("session_id"), [500, 200])
                 seen = sum(row["event_id"] == event_id for row in receiver.deliveries)
                 status = statuses[min(seen, len(statuses) - 1)] if valid else 401
                 receiver.deliveries.append({"event_id": event_id, "valid": valid, "status": status, "body": payload})
@@ -1782,22 +1823,21 @@ class WebhookReceiver:
 
 
 def triage_checks(run, workspace, a, network, passed):
-    """Hooks feed the Agent's triage; cards reach the web record and the signed webhook; a decision returns once."""
+    """Hooks feed the Agent's triage; questions reach the owning chat and the signed webhook; an answer returns once."""
     secret = uuid.uuid4().hex + uuid.uuid4().hex
     receiver = WebhookReceiver(secret, {"dead-session": [400]})
     try:
-        raise_dir, dead_dir = workspace / "triage-raise", workspace / "triage-dead"
+        raise_dir = workspace / "triage-raise"
         raise_dir.mkdir()
-        dead_dir.mkdir()
         settings = a.client.call("configure_triage", {"default_outlet": "both", "webhook_url": receiver.url,
-                                 "projects": [{"prefix": str(dead_dir), "outlet": "webhook"}], "scan_codex_sessions": True,
-                                 "webhook_secret": secret})
+                                 "scan_codex_sessions": True, "webhook_secret": secret})
         require(settings["webhook_secret_set"] and secret not in json.dumps(settings)
                 and secret not in (a.directory / "config.json").read_text(), "the webhook secret is write-only and stays out of config")
         tested = a.client.call("test_webhook")
         require(tested["ok"] and receiver.deliveries[-1]["valid"], "the test button sends one signed request")
         threads = json.loads((run / "fixture-codex-state.json").read_text())["threads"]
-        thread_id = next(thread_id for thread_id, thread in threads.items() if thread["cwd"].endswith("chat-work-dedup"))
+        owner = "chat-work-dedup"
+        thread_id = next(thread_id for thread_id, thread in threads.items() if thread["cwd"].endswith(owner))
         completed_turn = threads[thread_id]["turns"][-1]["id"]
         replayed = node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id,
                             "turn_id": completed_turn, "cwd": threads[thread_id]["cwd"], "last_assistant_message": "done"}))
@@ -1807,52 +1847,121 @@ def triage_checks(run, workspace, a, network, passed):
             node_cli(a, "hook", "codex", stdin=json.dumps(hook))
         tested_hook = json.loads(node_cli(a, "hook", "codex", "--test").stdout)
         require(tested_hook["status"] == "accepted" and replayed.returncode == 0, "the hook CLI reaches the local Node")
-        alert = wait_for("the Agent raises a card from the hook", lambda: next(
-            (row for row in a.client.rpc("alerts")["alerts"] if row["cwd"] == str(raise_dir)), None), timeout=90)
+        question = wait_for("the Agent asks in the chat that owns the session", lambda: next(
+            (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == str(raise_dir)), None), timeout=90)
+        question_id = question["question_id"]
+        require(question["conversation_id"] == owner and question["severity"] == "attention"
+                and question["about"]["session_id"] == thread_id and question["about"]["node"] == a.device_id,
+                "the question names the chat, session and device it is about")
         actions = fixture_records(run, "triage-actions.jsonl")
         raised = [row for row in actions if row["cwd"] == str(raise_dir) and row["session_id"] == thread_id]
         same_turn = [row for row in actions if row["session_id"] == thread_id and row["cwd"] != str(raise_dir)
                      and not row.get("request_id")]
         require(len(raised) == 1 and len(same_turn) == 1,
                 "a repeated hook and the App Server's report of the same turn reach the Agent once")
-        signed = wait_for("the webhook gets the card after one retry", lambda: (lambda rows: rows if len(rows) >= 2 else None)(
-            [row for row in receiver.deliveries if row["body"].get("alert_id") == alert["alert_id"]]), timeout=60)
+        signed = wait_for("the webhook gets the question after one retry", lambda: (lambda rows: rows if len(rows) >= 2 else None)(
+            [row for row in receiver.deliveries if row["event_id"] == question_id]), timeout=60)
         require(all(row["valid"] for row in signed) and [row["status"] for row in signed] == [500, 200]
-                and len({row["event_id"] for row in signed}) == 1, "a 5xx is retried with the same event_id until accepted")
-        dead_hook = {"hook_event_name": "Stop", "session_id": "dead-session", "turn_id": "dead-turn", "cwd": str(dead_dir),
+                and signed[-1]["body"]["type"] == "question" and signed[-1]["body"]["answer"]["question_id"] == question_id,
+                "a 5xx is retried with the same event_id until accepted")
+        dead_hook = {"hook_event_name": "Stop", "session_id": "dead-session", "turn_id": "dead-turn", "cwd": str(raise_dir),
                      "last_assistant_message": "dead-letter needs-human"}
         node_cli(a, "hook", "codex", stdin=json.dumps(dead_hook))
         wait_for("a 4xx goes to the dead letters", lambda: a.client.call("triage_settings")["outbox"]["dead"] >= 1, timeout=90)
-        require(not any(row["cwd"] == str(dead_dir) for row in a.client.rpc("alerts")["alerts"]),
-                "a webhook-only project writes no card to the record")
-        decision = {"thread_id": thread_id, "decision_id": "decision-text-1", "alert_id": alert["alert_id"], "text": "继续，先跑测试"}
-        first = a.client.rpc("send_decision", **decision)
-        retry = a.client.rpc("send_decision", **decision)
+        foreign = next(row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == "dead-session")
+        require(foreign["conversation_id"] is None and not any(row["session_id"] == "dead-session" for row in
+                fixture_records(run, "triage-actions.jsonl")), "a session no assistant started is asked about, not triaged")
+
+        first = a.client.rpc("answer", question_id=question_id, text="继续，先跑测试", scope_id=owner)
+        retry = a.client.rpc("answer", question_id=question_id, text="继续，先跑测试", scope_id=owner)
+        acted = wait_for("the assistant passes the answer on", lambda: [row for row in fixture_records(run, "answer-actions.jsonl")
+                         if row["question_id"] == question_id] or None, timeout=90)
         sends = [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") in ("turn/start", "turn/steer")
-                 and row["message"]["params"].get("clientUserMessageId") == "decision-text-1"]
-        require(first["status"] == "delivered" and first["mode"] in ("start", "steer") and retry == first and len(sends) == 1,
-                "a text decision reaches the session once; the same decision_id returns the first result")
-        a.client.rpc("send_decision", **{**decision, "text": "换个说法"}, status=400)
-        wait_for("the decided card closes", lambda: next((row for row in a.client.rpc("alerts")["alerts"]
-                 if row["alert_id"] == alert["alert_id"] and row["resolution"] == "decided"), None))
+                 and row["message"]["params"].get("clientUserMessageId") == "a-" + question_id]
+        require(first["status"] == "answered" and retry["message"] == first["message"] and len(acted) == 1
+                and acted[0]["replies"][0]["delivery"] == acted[0]["replies"][1]["delivery"] and len(sends) == 1,
+                "a text answer reaches the session once through the assistant; a retry reads it back")
+        told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
+                        if row["event_id"] == "answered-" + question_id and row["status"] == 200] or None, timeout=60)
+        require(told[-1]["body"] == {"schema_version": 2, "type": "answered", "event_id": "answered-" + question_id,
+                                     "question_id": question_id, "text": "继续，先跑测试"}, "the webhook learns the answer given in the web")
+
         tokens = a.client.call("create_decision_token", {"label": "grok"})
         listed = a.client.call("triage_settings")
         require(tokens["token"] not in json.dumps(listed) and tokens["token"] not in (a.directory / "decision-tokens.json").read_text(),
                 "a decision token is shown once and stored hashed")
-        posted = a.client.request("/api/decision", {"device_id": a.device_id, "thread_id": thread_id, "decision_id": "decision-http-1",
-                                  "text": "通过 HTTP 送达"}, origin=False, headers={"Authorization": "Bearer " + tokens["token"]})
-        a.client.request("/api/decision", {"device_id": a.device_id, "thread_id": thread_id, "decision_id": "decision-http-2",
-                         "text": "x"}, origin=False, headers={"Authorization": "Bearer wrong"}, status=401)
-        require(posted["status"] == "delivered", "a scoped decision token sends one decision over HTTP")
+        decision = {"device_id": a.device_id, "question_id": foreign["question_id"], "choice": 0}
+        bearer = {"Authorization": "Bearer " + tokens["token"]}
+        posted = a.client.request("/api/decision", decision, origin=False, headers=bearer)
+        again = a.client.request("/api/decision", decision, origin=False, headers=bearer)
+        a.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer wrong"}, status=401)
+        require(posted == again == {"question_id": foreign["question_id"], "answer_id": "a-" + foreign["question_id"],
+                                    "status": "answered", "text": "忽略"}, "a decision token answers one question over HTTP once")
         a.client.call("revoke_decision_token", {"token_id": tokens["token_id"]})
-        a.client.request("/api/decision", {"device_id": a.device_id, "thread_id": thread_id, "decision_id": "decision-http-3",
-                         "text": "x"}, origin=False, headers={"Authorization": "Bearer " + tokens["token"]}, status=401)
+        a.client.request("/api/decision", decision, origin=False, headers=bearer, status=401)
         log = (a.directory / "process.log").read_text(errors="replace")
         require(secret not in log and tokens["token"] not in log, "logs carry neither the webhook secret nor the token")
-        passed("hooks reach the Agent once; cards go to the record and a signed, retried webhook; decisions return once",
-               alert=alert["alert_id"], webhook_deliveries=len(receiver.deliveries), decision=first["mode"])
+        passed("hooks reach the Agent once; questions go to the owning chat and a signed, retried webhook; answers return once",
+               question=question_id, webhook_deliveries=len(receiver.deliveries))
     finally:
         receiver.close()
+
+
+def foreign_session_checks(run, workspace, a, network, passed):
+    """A session no assistant started is asked about once; 忽略 keeps it quiet, 交给 and 处理 hand it over once."""
+    sessions = {label: "foreign-" + label + "-" + uuid.uuid4().hex[:8] for label in ("ignore", "hand", "route")}
+    directory = workspace / "foreign"
+    directory.mkdir()
+
+    def hook(session, turn, message="tests fail"):
+        node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": session, "turn_id": turn,
+                                                       "cwd": str(directory), "last_assistant_message": message}))
+
+    def asked(session):
+        return [row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == session]
+
+    def owned(conversation):
+        return [row["session_id"] for row in a.client.rpc("conversation", conversation_id=conversation)["sessions"]]
+
+    for session in sessions.values():
+        hook(session, "t1")
+        hook(session, "t2")
+    questions = {label: wait_for("one question about each session", lambda: (lambda rows: rows[0] if len(rows) == 1 else None)(
+        asked(session))) for label, session in sessions.items()}
+    expected = [{"label": "忽略"}, {"label": "处理"}, {"label": "交给 Alpha", "conversation_id": "bot-history-alpha"},
+                {"label": "交给 Beta", "conversation_id": "bot-history-beta"}]
+    require(all(row["conversation_id"] is None and row["text"] == "这个 Codex 会话不是助手发起的：处理还是忽略？"
+                and row["choices"] == expected and row["about"]["summary"] == "tests fail" for row in questions.values()),
+            "the question offers 忽略, 处理 and each assistant, and shows only on the pending list")
+    require_quiet("events of an unowned session never reach the Agent", lambda: not any(
+        row["session_id"] in sessions.values() for row in fixture_records(run, "triage-actions.jsonl")))
+
+    for label, text in (("ignore", "忽略"), ("hand", "交给 Beta"), ("route", "处理")):
+        a.client.rpc("answer", question_id=questions[label]["question_id"], text=text, scope_id="sessions")
+    wait_for("交给 hands the session to that assistant", lambda: sessions["hand"] in owned("bot-history-beta"), timeout=60)
+    routed = wait_for("处理 runs one routing turn", lambda: [row for row in fixture_records(run, "routing-actions.jsonl")
+                      if row["question_id"] == questions["route"]["question_id"]] or None, timeout=90)
+    require(len(routed) == 1 and routed[0]["assistant"] == "bot-history-alpha"
+            and [row["attributed"] for row in routed[0]["assigned"]] == [True, False]
+            and {row["conversation_id"] for row in routed[0]["assigned"]} == {"bot-history-alpha"}
+            and sessions["route"] in owned("bot-history-alpha"), "the routing turn's assign hands the session over once")
+    require_quiet("an ignored session stays unowned and each hand-over is written once", lambda: sessions["ignore"] not in
+                  owned("bot-history-alpha") + owned("bot-history-beta") and len(routed) == len([row for row in fixture_records(
+                      run, "routing-actions.jsonl") if row["question_id"] == questions["route"]["question_id"]]))
+    attributed = [event for scope in ("bot-history-alpha", "bot-history-beta") for event in scope_events(a, network, scope)
+                  if event["body"]["type"] == "session_attributed"]
+    require(sorted(event["body"]["session_id"] for event in attributed) == sorted([sessions["hand"], sessions["route"]]),
+            "each handed-over session has exactly one attribution")
+
+    hook(sessions["ignore"], "t3", "needs-human")
+    hook(sessions["hand"], "t3", "needs-human")
+    later = wait_for("a later question about the handed-over session lands in its assistant's chat", lambda: next(
+        (row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == sessions["hand"]
+         and row["conversation_id"] == "bot-history-beta"), None), timeout=90)
+    require(len(asked(sessions["ignore"])) == 0 and not any(row["session_id"] == sessions["ignore"]
+            for row in fixture_records(run, "triage-actions.jsonl")), "an ignored session stays quiet")
+    passed("a session no assistant started is asked about once and handed over once", ignored=sessions["ignore"],
+           handed=sessions["hand"], routed=sessions["route"], later=later["question_id"])
 
 
 def no_agent_checks(run, a, passed):
@@ -1994,6 +2103,7 @@ def chat_agent_acceptance(options):
         bot_checks(run, workspace, a, network, passed, outsider)
         work_checks(run, workspace, a, network, passed)
         triage_checks(run, workspace, a, network, passed)
+        foreign_session_checks(run, workspace, a, network, passed)
         assistant_checks(run, a, network, passed)
         report["manager_invocations"] = len(fixture_records(run))
         report["triage_invocations"] = len(fixture_records(run, "triage-invocations.jsonl"))
@@ -2722,7 +2832,7 @@ def phase4_acceptance(options):
         task_directive = {"label": "p4-task", "gate": str(task_dir / "task-release"),
                           "dispatch": {"label": "p4-task-child", "cwd": str(task_dir),
                                        "native": {"gate": str(task_dir / "release"), "request": "item/commandExecution/requestApproval",
-                                                  "request_mode": "card"}},
+                                                  "request_mode": "ask"}},
                           "tools": [{"name": "answer_approval", "arguments": {"work_id": "any", "request_id": "any"},
                                      "accepted": False, "rejection": "unknown or unavailable"}]}
         r3 = send(a.client, "p4-m3", {"label": "p4-m3", "dispatch": {"label": "p4-task", "cwd": str(task_dir),
@@ -2731,23 +2841,27 @@ def phase4_acceptance(options):
         turn(a, r3["trigger"])
         child = dispatched(b, "p4-task-child")
         (task_dir / "release").touch()
-        card = wait_for("A shows the decision card B's Agent raised for its App Server request", lambda: next(
-            (row for row in a.client.rpc("alerts")["alerts"] if row["node"] == b.device_id and row.get("request_id")
-             and row["resolution"] is None), None), timeout=90)
+        question = wait_for("A shows the question B's Agent asked about its App Server request", lambda: next(
+            (row for row in a.client.rpc("questions")["questions"] if row["about"]["node"] == b.device_id
+             and row["about"].get("request_id")), None), timeout=90)
+        question_id = question["question_id"]
+        require(question["conversation_id"] == conversation, "B's question lands in the chat that owns the child's thread")
         task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
         require(task_turn["kind"] == "agent_task", "B's own Agent runs the task")
         refused = [row for row in records(b, "manager-tool-errors.jsonl") if row["trigger"] == "task:" + task]
         require(len(refused) == 1, "B's Agent has no tool to answer for the user")
-        decision = {"node": b.device_id, "thread_id": card["thread_id"], "decision_id": "p4-decision",
-                    "alert_id": card["alert_id"], "choice": 0}
-        decided = a.client.rpc("send_decision", **decision)
-        require(decided["status"] == "delivered" and decided["mode"] == "answer"
-                and a.client.rpc("send_decision", **decision) == decided, "A's choice answers B's held request once")
-        wait_for("the decided child finishes", lambda: work_in(a.client, child, "finished"), timeout=60)
+        answered = a.client.rpc("answer", question_id=question_id, text="允许", scope_id=conversation)
+        require(answered["status"] == "answered" and a.client.rpc("answer", question_id=question_id, text="允许",
+                scope_id=conversation)["message"] == answered["message"], "the user's answer at entrance A is written once")
+        answer_turn = turn(a, "message:a-" + question_id)
+        require(answer_turn["kind"] == "answer", "the answer is a turn of A's assistant")
+        wait_for("the answered child finishes", lambda: work_in(a.client, child, "finished"), timeout=60)
         answers = [row for row in records(b, "codex-rpc.jsonl") if "method" not in row["message"]
                    and str(row["message"].get("id", "")).startswith("req-")]
-        require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"},
-                "the user's choice at entrance A reaches B's App Server once")
+        acted = [row for row in records(a, "answer-actions.jsonl") if row["question_id"] == question_id]
+        require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"} and len(acted) == 1
+                and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
+                "A's assistant answers B's held request once with codex respond --node")
         starts = [row for row in codex_rpc(b, "thread/start") if row["message"]["params"]["cwd"] == str(task_dir)]
         require(len(starts) == 1 and starts[0]["message"]["params"].get("approvalPolicy") == "never",
                 "B's Agent starts the child itself with full access")
@@ -2756,13 +2870,13 @@ def phase4_acceptance(options):
         require(finished["outcome"] == "completed" and "p4-task:complete" in finished["result_text"], "the task reports B's Agent result")
         turn(a, "work:" + task)
         wait_for("B's events reach A", lambda: converged(members, network), timeout=60)
-        # B also entered the user's own signed message p4-m2; everything else it wrote is work.
+        # B also entered the user's own signed message p4-m2; everything else it wrote is work or its question.
         by_b = {event["body"]["type"] for event in scope_events(a, network, conversation) if event["author"] == b.device_id
                 and not (event["body"]["type"] == "message_posted" and event["body"]["role"] == "user")}
-        require(by_b and by_b <= {"work_dispatched", "work_progress", "work_finished"},
-                "B's Agent writes only work events to the conversation")
-        passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b), card=card["alert_id"],
-               decision=decided["mode"])
+        require(by_b and by_b <= {"work_dispatched", "work_progress", "work_finished", "question_asked"},
+                "B's Agent writes only work events and its question to the conversation")
+        passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b), question=question_id,
+               answer_turn=answer_turn["trigger"])
 
         r4 = send(a.client, "p4-m4", {"label": "p4-m4", "tools": [
             {"name": "dispatch_work", "arguments": {"title": "outside", "prompt": "outside", "cwd": str(run), "call_ref": "outside-codex"},
@@ -3031,18 +3145,27 @@ def public_entry_acceptance(options):
         thread_id = wait_for("M's Agent starts a Codex thread", lambda: next((thread_id for thread_id, thread in json.loads(
             (fixture / "fixture-codex-state.json").read_text())["threads"].items() if thread["cwd"] == str(work_dir)), None)
             if (fixture / "fixture-codex-state.json").exists() else None, timeout=60)
+        local_post(m, "/api/hooks", {"source": "codex_hook", "agent": "codex", "event": "turn_end", "session_id": thread_id,
+                                     "turn_id": "pe-hook", "cwd": str(work_dir), "last_message": "需要你决定 needs-human"})
+        question = wait_for("M's Agent asks in the chat that owns the thread", lambda: next(
+            (row for row in m.client.rpc("questions")["questions"] if row["about"]["session_id"] == thread_id), None), timeout=90)
+        question_id = question["question_id"]
         token = m.client.call("create_decision_token", {"label": "grok"})["token"]
-        decision = {"device_id": m.device_id, "thread_id": thread_id, "decision_id": "pe-decision", "text": "经入口送达的决定"}
+        decision = {"device_id": m.device_id, "question_id": question_id, "text": "经入口送达的回答"}
         sent = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
         again = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
-        p.client.request("/api/decision", {**decision, "decision_id": "pe-forged"}, origin=False,
+        p.client.request("/api/decision", decision, origin=False,
                          headers={"Authorization": "Bearer vfd_" + "0" * 64}, status=401, timeout=60)
+        acted = wait_for("M's assistant passes the answer on", lambda: [row for row in fixture_records(fixture, "answer-actions.jsonl")
+                         if row["question_id"] == question_id] or None, timeout=90)
         sends = [row for row in fixture_records(fixture, "codex-rpc.jsonl") if row["message"].get("method") in ("turn/start", "turn/steer")
-                 and row["message"]["params"].get("clientUserMessageId") == "pe-decision"]
-        require(sent["status"] == "delivered" and again == sent and len(sends) == 1,
-                "a decision token's POST through P reaches M's thread once; a wrong token gets 401")
+                 and row["message"]["params"].get("clientUserMessageId") == "a-" + question_id]
+        require(sent == again == {"question_id": question_id, "answer_id": "a-" + question_id, "status": "answered",
+                                  "text": "经入口送达的回答"} and question["conversation_id"] == conversation
+                and len(acted) == 1 and len(sends) == 1,
+                "a decision token's POST through P answers M's question once and the answer reaches the thread once; a wrong token gets 401")
         require(token not in (p.directory / "process.log").read_text(errors="replace"), "P does not log the token")
-        passed("decision-through-the-public-entry", mode=sent["mode"], thread=thread_id[:24])
+        passed("decision-through-the-public-entry", question=question_id, thread=thread_id[:24])
 
         rows = entry_rows(p.directory / "node.sqlite3")
         require(all(count == 0 for count in rows.values()), "P stores no events, conversations or logs")

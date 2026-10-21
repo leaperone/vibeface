@@ -21,7 +21,6 @@ mod bots;
 mod chat_controls;
 mod codex_server;
 mod cursor;
-pub mod decision;
 mod followup;
 mod manager_control;
 mod observation;
@@ -565,13 +564,13 @@ impl Runtime {
                 self.stop_work(network, &scope, &id(&input, "work_id")?)
                     .await
             }
-            "codex_state" | "send_decision" => {
+            "codex_state" => {
                 ensure!(access.human, "only the user reaches the App Server");
-                self.codex_rpc(network, method, &input).await
+                self.codex_state(network, &input).await
             }
             "bots" => self.bots(&access).await,
-            "alerts" => self.alerts(&access).await,
-            "resolve_alert" => self.resolve_alert(&access, &input).await,
+            "questions" => self.questions(&access).await,
+            "answer" => self.answer_question(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "resolve" => self.resolve_check(&access, &input).await,

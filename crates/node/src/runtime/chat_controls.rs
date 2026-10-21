@@ -194,6 +194,8 @@ impl Runtime {
             messages.push(value);
         }
         let changes = store.assistant_changes(network, scope)?;
+        let questions = store.conversation_questions(network, scope)?;
+        let sessions = store.attributed_sessions(network, scope)?;
         let now = now_ms();
         let skills: Vec<_> = store
             .skills(network)?
@@ -220,6 +222,8 @@ impl Runtime {
             "works":works,
             "deliveries":deliveries,
             "changes":changes,
+            "questions":questions,
+            "sessions":sessions,
             "assistant":{"skills":skills,"routines":routines},
             "checks":checks,
             "local_node":self.identity.device_id()?,

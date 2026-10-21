@@ -18,6 +18,7 @@ use std::{
 pub(crate) mod assistant;
 pub(crate) mod bots;
 mod log;
+pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
 mod sync;
@@ -505,32 +506,6 @@ impl Store {
             .execute("UPDATE temp.write_gate SET state=?", [state.as_str()])?;
         Ok(())
     }
-    /// Triage cards: open ones first, newest first, at most `limit`.
-    pub fn alerts(&self, network_id: &str, limit: usize) -> Result<Vec<Value>> {
-        let mut statement = self.connection.prepare(
-            "SELECT a.raise,a.node,a.created_at_ms,r.resolution FROM alerts a LEFT JOIN alert_resolutions r ON r.network_id=a.network_id AND r.alert_id=a.alert_id WHERE a.network_id=? ORDER BY r.resolution IS NOT NULL, a.rank DESC LIMIT ?",
-        )?;
-        let rows = statement.query_map(params![network_id, limit as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (raise, node, created_at_ms, resolution) = row?;
-            let mut alert: Value = serde_json::from_str(&raise)?;
-            alert["node"] = node.into();
-            alert["created_at_ms"] = created_at_ms.into();
-            alert["resolution"] = resolution.map_or(Value::Null, Value::String);
-            if let Some(object) = alert.as_object_mut() {
-                object.remove("type");
-            }
-            Ok(alert)
-        })
-        .collect()
-    }
     pub fn pending_notifications(
         &self,
         network_id: &str,
@@ -685,8 +660,7 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str =
-    "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
@@ -699,6 +673,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let created_at_ms: i64 = r.get(5)?;
     let in_reply_to: Option<String> = r.get(6)?;
     let report_results: Option<bool> = r.get(8)?;
+    let answers: Option<String> = r.get(10)?;
     Ok((|| {
         Ok(Message {
             message_id,
@@ -712,6 +687,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
                 .map(|status| serde_json::from_value(Value::String(status)))
                 .transpose()?,
             report_results,
+            answers,
             blobs: serde_json::from_str(&blobs)?,
         })
     })())
