@@ -1950,7 +1950,7 @@ def foreign_session_checks(run, workspace, a, network, passed):
     require_quiet("events of an unowned session never reach the Agent", lambda: not any(
         row["session_id"] in sessions.values() for row in fixture_records(run, "triage-actions.jsonl")))
     require(a.client.rpc("bots")["primary"] == "bot-history-alpha", "the first assistant created is the primary one")
-    a.client.rpc("message", conversation_id="bot-history-beta", message_id="foreign-context-" + marker,
+    a.client.rpc("message", conversation_id="bot-history-beta", message_id="foreign-context-" + uuid.uuid4().hex[:8],
                  text="看看" + marker + "为什么慢")
 
     for label, text in (("ignore", "忽略"), ("hand", "交给 Beta"), ("route", "处理"), ("keep", "处理")):
