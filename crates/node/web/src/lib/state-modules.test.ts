@@ -121,6 +121,7 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.match(humanError('client response timed out; outcome may be unknown'), /结果未知/)
   assert.equal(humanError('已断开设备连接。'), '已断开设备连接。')
   assert.match(humanError('peer did not answer in time'), /另一台设备没有回应/)
+  assert.match(humanError('Codex rejected request: {"code":-32600,"message":"no rollout found for thread id 01a15c84"}'), /新对话还没准备好/)
   assert.equal(humanError('something nobody mapped'), '这次操作没有成功，请再试一次。')
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功，请再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')

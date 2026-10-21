@@ -190,7 +190,7 @@ type TaskRow = { id: string; state: string; device: string; summary: string; tri
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string; device: string; open: boolean }) {
   const failed = task.state === 'failed' || task.state === 'interrupted' || task.state === 'rejected' || task.state === 'dispatch_rejected'
-  const result = (task.work.result_text || task.work.failure_reason || '').split('\n')[0]
+  const result = (task.work.result_text || (task.work.failure_reason ? humanError(task.work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
