@@ -370,7 +370,7 @@ impl Store {
             .context("work not found in this conversation")?;
         ensure!(
             work.outcome == Some(WorkOutcome::Unverified) || unvouched && work.outcome.is_none(),
-            "this result no longer needs your confirmation"
+            "这个结果已经不需要你确认了"
         );
         log::append_from(
             &tx,

@@ -1441,7 +1441,11 @@ impl Runtime {
                         .lock()
                         .await
                         .remove_outbox(&entry.conversation_id, &entry.trigger)?;
-                    self.publish_changed(&network, &entry.conversation_id, Changed::Job(&entry.trigger));
+                    self.publish_changed(
+                        &network,
+                        &entry.conversation_id,
+                        Changed::Job(&entry.trigger),
+                    );
                     self.schedule_wakeup.notify_one();
                 }
                 Ok(_) => {

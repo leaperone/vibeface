@@ -388,7 +388,6 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
     })
 }
 
-
 /// Bytes each index of the assistant's skills and routines takes in the prompt.
 const INDEX_BUDGET: usize = 3_000;
 

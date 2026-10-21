@@ -839,7 +839,10 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             14,
         )
     };
-    assert!(settle(false).is_err(), "a device that can report is waited for");
+    assert!(
+        settle(false).is_err(),
+        "a device that can report is waited for"
+    );
     settle(true)?.context("the settled result reports back")?;
     let (_, receipt) = store.apply_work_signal(
         &net.a,

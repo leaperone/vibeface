@@ -267,7 +267,11 @@ impl Runtime {
             created,
             "work dispatched to this device"
         );
-        self.publish_changed(network, &record.conversation, Changed::Work(&record.work_id));
+        self.publish_changed(
+            network,
+            &record.conversation,
+            Changed::Work(&record.work_id),
+        );
         if created && record.kind == WorkKind::Task {
             self.wake_scheduler()?;
         }
@@ -362,7 +366,11 @@ impl Runtime {
         }
         let dispatch = Dispatch { state, ..dispatch };
         self.store.lock().await.save_dispatch(&dispatch)?;
-        self.publish_changed(network, &dispatch.spec.conversation, Changed::Work(&dispatch.spec.work_id));
+        self.publish_changed(
+            network,
+            &dispatch.spec.conversation,
+            Changed::Work(&dispatch.spec.work_id),
+        );
         Ok(dispatch)
     }
 
@@ -716,7 +724,11 @@ impl Runtime {
             } else {
                 continue;
             }
-            self.publish_changed(network, &request.conversation, Changed::Work(&request.work_id));
+            self.publish_changed(
+                network,
+                &request.conversation,
+                Changed::Work(&request.work_id),
+            );
         }
         Ok(())
     }

@@ -217,7 +217,11 @@ impl Runtime {
             .lock()
             .await
             .resolve_pending_check(&check.attempt_id)?;
-        self.publish_changed(network, &check.conversation_id, Changed::Job(&check.trigger));
+        self.publish_changed(
+            network,
+            &check.conversation_id,
+            Changed::Job(&check.trigger),
+        );
         Ok(())
     }
 
@@ -296,10 +300,10 @@ impl Runtime {
             .context("work not found in this conversation")?;
         match work.outcome {
             Some(WorkOutcome::Unverified) => {}
-            Some(_) => bail!("this result no longer needs your confirmation"),
+            Some(_) => bail!("这个结果已经不需要你确认了"),
             None => ensure!(
                 !self.target_vouches(network, &work).await?,
-                "its device can still report this work; wait for its result"
+                "它的设备还能报回结果，请等它报告"
             ),
         }
         let unvouched = work.outcome.is_none();

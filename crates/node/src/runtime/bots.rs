@@ -117,7 +117,11 @@ impl Runtime {
             )
             .await?;
         tracing::info!(event = "assistant.primary", "primary assistant set");
-        self.publish_changed(&access.network_id, ASSISTANTS_SCOPE, Changed::Event(&event.hash));
+        self.publish_changed(
+            &access.network_id,
+            ASSISTANTS_SCOPE,
+            Changed::Event(&event.hash),
+        );
         Ok(json!({"primary":self.store.lock().await.primary_assistant(&access.network_id)?}))
     }
 
