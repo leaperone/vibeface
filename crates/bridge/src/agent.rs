@@ -43,6 +43,8 @@ pub struct SdkTurn {
     pub executable: PathBuf,
     pub workspace: PathBuf,
     pub api_key: String,
+    /// The engine's own variables for the bridge process; a different set starts a new bridge.
+    pub env: BTreeMap<String, String>,
     pub model: String,
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
@@ -324,15 +326,22 @@ impl SdkBridge {
     }
 
     /// Starts the bridge before the first turn needs it.
-    pub async fn prewarm(&self, executable: &Path, workspace: &Path, api_key: &str) -> Result<()> {
+    pub async fn prewarm(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        api_key: &str,
+        env: &BTreeMap<String, String>,
+    ) -> Result<()> {
         validate_api_key(api_key)?;
-        self.admit(executable, workspace, api_key)
+        validate_launch_env(env)?;
+        self.admit(executable, workspace, api_key, env)
             .await
             .map(drop)
             .map_err(|error| {
                 anyhow!(redact_text(
                     format!("{error:#}"),
-                    &self.secrets(api_key, "")
+                    &self.secrets(api_key, env, "")
                 ))
             })
     }
@@ -416,7 +425,7 @@ impl SdkBridge {
         let not_sent = |kind, message: String| AgentRunError {
             kind,
             session_id: previous_session_id.map(str::to_owned),
-            message: redact_text(message, &self.secrets(&turn.api_key, "")),
+            message: redact_text(message, &self.secrets(&turn.api_key, &turn.env, "")),
         };
         let cancelled_before_send = || {
             not_sent(
@@ -431,7 +440,7 @@ impl SdkBridge {
             return Err(cancelled_before_send());
         }
         let admission = tokio::select! {
-            admitted = self.admit(&turn.executable, &turn.workspace, &turn.api_key) => {
+            admitted = self.admit(&turn.executable, &turn.workspace, &turn.api_key, &turn.env) => {
                 admitted.map_err(|error| not_sent(AgentFailure::Failed, format!("{error:#}")))?
             }
             _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
@@ -453,7 +462,7 @@ impl SdkBridge {
             ));
         }
         let rpc = &live.rpc;
-        let secrets = self.secrets(&turn.api_key, &rpc.bearer);
+        let secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
         let mut agent_id = previous_session_id.map(str::to_owned);
         let mut state = RunState::default();
         let mut send_started = false;
@@ -579,8 +588,14 @@ impl SdkBridge {
     }
 
     /// The live bridge for this program, workspace and key, started if none answers.
-    async fn admit(&self, executable: &Path, workspace: &Path, api_key: &str) -> Result<Admission> {
-        let key = self.hasher.hash_one((executable, workspace, api_key));
+    async fn admit(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        api_key: &str,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Admission> {
+        let key = self.hasher.hash_one((executable, workspace, api_key, env));
         let mut slot = self.slot.lock().await;
         if let Some(live) = slot.live.clone() {
             // Counted before the retired check, so a concurrent retire cannot end it under this turn.
@@ -599,7 +614,7 @@ impl SdkBridge {
         if let Some(retry_at) = slot.retry_at {
             tokio::time::sleep_until(retry_at).await;
         }
-        match self.start(executable, workspace, api_key, key).await {
+        match self.start(executable, workspace, api_key, env, key).await {
             Ok(live) => {
                 let admission = live.admit();
                 slot.live = Some(live);
@@ -617,6 +632,7 @@ impl SdkBridge {
         executable: &Path,
         workspace: &Path,
         api_key: &str,
+        env: &BTreeMap<String, String>,
         key: u64,
     ) -> Result<Arc<Live>> {
         prepare_sdk_workspace(workspace).await?;
@@ -654,6 +670,7 @@ impl SdkBridge {
             }
         }
         command
+            .envs(env)
             .envs(&self.env)
             .env("CURSOR_API_KEY", api_key)
             .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
@@ -775,9 +792,15 @@ impl SdkBridge {
         Ok((rpc, agents))
     }
 
-    fn secrets<'a>(&'a self, api_key: &'a str, bearer: &'a str) -> Vec<&'a str> {
+    fn secrets<'a>(
+        &'a self,
+        api_key: &'a str,
+        env: &'a BTreeMap<String, String>,
+        bearer: &'a str,
+    ) -> Vec<&'a str> {
         let mut secrets = vec![api_key, bearer, self.callback.auth_token.as_str()];
         secrets.extend(self.env.values().map(String::as_str));
+        secrets.extend(env.values().map(String::as_str));
         secrets.retain(|secret| !secret.is_empty());
         secrets
     }
@@ -831,6 +854,7 @@ fn validate_turn(turn: &SdkTurn, prompt: &str, previous_session_id: Option<&str>
         "Cursor SDK requires an explicit model"
     );
     validate_api_key(&turn.api_key)?;
+    validate_launch_env(&turn.env)?;
     validate_tools(&turn.custom_tools)?;
     if let Some(id) = previous_session_id {
         validate_sdk_id(id)?;
@@ -843,6 +867,29 @@ fn validate_api_key(api_key: &str) -> Result<()> {
         !api_key.trim().is_empty() && api_key.len() <= 4096,
         "CURSOR_API_KEY is missing or invalid"
     );
+    Ok(())
+}
+
+/// The engine's variables may name anything but what the bridge itself sets.
+fn validate_launch_env(env: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(env.len() <= 64, "too many Cursor environment entries");
+    for (key, value) in env {
+        ensure!(
+            !key.is_empty()
+                && key.len() <= 256
+                && key.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_alphabetic()
+                        || (index > 0 && byte.is_ascii_digit())
+                })
+                && key != "CURSOR_API_KEY"
+                && !key.starts_with("CURSOR_SDK_")
+                && !key.starts_with("VIBEFACE_")
+                && value.len() <= 4096
+                && !value.contains('\0'),
+            "invalid or reserved Cursor environment entry"
+        );
+    }
     Ok(())
 }
 
@@ -1753,6 +1800,7 @@ mod tests {
             executable: "/sdk".into(),
             workspace: "/manager".into(),
             api_key: "fixture-key".into(),
+            env: BTreeMap::new(),
             timeout_secs: 5,
             model: "fixture-model".into(),
             process_started: None,

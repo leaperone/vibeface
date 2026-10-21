@@ -228,6 +228,13 @@ pub fn add_secret(secret: &str) {
     }
 }
 
+/// Sends this test process's log records to `dir` without a `tracing` subscriber.
+#[cfg(test)]
+pub(crate) fn capture(dir: &Path) -> Result<()> {
+    SINK.set(Arc::new(Sink::open(dir, MAX_FILE_BYTES, KEEP_FILES)?))
+        .map_err(|_| anyhow::anyhow!("the test log is already captured"))
+}
+
 pub fn write(record: &Record) {
     if let Some(sink) = SINK.get() {
         sink.write(record);

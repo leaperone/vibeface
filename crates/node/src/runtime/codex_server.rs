@@ -2,6 +2,7 @@
 //! A managed App Server runs in its own process group recorded in a pidfile, so a crash of
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
 use super::*;
+use crate::providers::CodexLaunch;
 use crate::work::Probe;
 use std::os::unix::process::CommandExt as _;
 use vibeface_bridge::codex::{CodexClient, CodexError};
@@ -109,9 +110,22 @@ pub(crate) struct CodexServer {
 struct Managed {
     socket: PathBuf,
     pidfile: PathBuf,
-    codex_bin: PathBuf,
+    /// What the next start runs; `None` while Codex does not serve the execution layer.
+    launch: std::sync::Mutex<Option<CodexLaunch>>,
+    /// Ends the running App Server so the supervisor starts the current launch.
+    relaunch: tokio::sync::Notify,
+    /// Why the last start failed or the App Server exited; cleared by a new launch.
+    failure: std::sync::Mutex<Option<String>>,
     group: std::sync::Mutex<Option<i32>>,
     stopping: std::sync::atomic::AtomicBool,
+}
+
+/// The managed App Server as the settings page shows it.
+pub(crate) enum Launch {
+    Off,
+    Starting,
+    Running,
+    Failed(String),
 }
 
 fn signal_group(group: i32, signal: i32) -> bool {
@@ -182,7 +196,7 @@ impl Managed {
         let _ = std::fs::remove_file(&self.pidfile);
     }
 
-    fn spawn(&self) -> Result<tokio::process::Child> {
+    fn spawn(&self, launch: &CodexLaunch) -> Result<tokio::process::Child> {
         if self.socket.exists() {
             use std::os::unix::fs::FileTypeExt;
             ensure!(
@@ -193,8 +207,9 @@ impl Managed {
             );
             std::fs::remove_file(&self.socket)?;
         }
-        let mut command = std::process::Command::new(&self.codex_bin);
+        let mut command = std::process::Command::new(&launch.bin);
         command
+            .envs(&launch.env)
             .args(["app-server", "--listen"])
             .arg(format!("unix://{}", self.socket.display()))
             .stdin(std::process::Stdio::null())
@@ -225,28 +240,74 @@ impl Managed {
         Ok(child)
     }
 
-    /// Restarts the App Server with backoff until the Node stops.
+    fn fail(&self, reason: String) {
+        *self.failure.lock().expect("failure lock") = Some(reason);
+    }
+
+    /// Restarts the App Server with backoff until the Node stops. A new launch ends the running
+    /// one the way a crash would: its turns are settled by probes on the next App Server.
     async fn supervise(self: Arc<Self>) {
         let mut backoff = 1;
         while !self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            let Some(launch) = self.launch.lock().expect("launch lock").clone() else {
+                self.relaunch.notified().await;
+                continue;
+            };
             let started = Instant::now();
-            match self.spawn() {
+            let mut relaunched = false;
+            match self.spawn(&launch) {
                 Ok(mut child) => {
-                    let status = child.wait().await;
-                    if let Some(group) = self.group.lock().expect("group lock").take() {
-                        // Tools the App Server started share its group and die with it.
-                        signal_group(group, libc::SIGKILL);
+                    let status = tokio::select! {
+                        status = child.wait() => Some(status),
+                        () = self.relaunch.notified() => None,
+                    };
+                    let group = self.group.lock().expect("group lock").take();
+                    match status {
+                        Some(status) => {
+                            if let Some(group) = group {
+                                // Tools the App Server started share its group and die with it.
+                                signal_group(group, libc::SIGKILL);
+                            }
+                            tracing::warn!(?status, "App Server exited");
+                            if !self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                                self.fail(match status {
+                                    Ok(status) => format!("App Server exited: {status}"),
+                                    Err(error) => format!("App Server exited: {error}"),
+                                });
+                            }
+                        }
+                        None => {
+                            if let Some(group) = group {
+                                signal_group(group, libc::SIGTERM);
+                                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait())
+                                    .await;
+                                signal_group(group, libc::SIGKILL);
+                            }
+                            let _ = child.wait().await;
+                            tracing::info!("App Server restarts with new provider settings");
+                            relaunched = true;
+                        }
                     }
                     let _ = std::fs::remove_file(&self.pidfile);
-                    tracing::warn!(?status, "App Server exited");
                 }
-                Err(error) => tracing::warn!(%error, "App Server could not start"),
+                Err(error) => {
+                    tracing::warn!(%error, "App Server could not start");
+                    self.fail(format!("App Server could not start: {error}"));
+                }
+            }
+            if relaunched {
+                backoff = 1;
+                continue;
             }
             if started.elapsed() > Duration::from_secs(60) {
                 backoff = 1;
             }
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(30);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {
+                    backoff = (backoff * 2).min(30);
+                }
+                () = self.relaunch.notified() => backoff = 1,
+            }
         }
     }
 }
@@ -254,6 +315,7 @@ impl Managed {
 impl CodexServer {
     pub(super) fn open(
         config: &Config,
+        launch: Option<CodexLaunch>,
         identity: &LocalIdentity,
         data_dir: &Path,
         events: mpsc::UnboundedSender<Value>,
@@ -266,7 +328,9 @@ impl CodexServer {
                 let managed = Managed {
                     socket: socket.clone(),
                     pidfile: data_dir.join("codex-app-server.pid"),
-                    codex_bin: config.codex_bin.clone(),
+                    launch: std::sync::Mutex::new(launch),
+                    relaunch: tokio::sync::Notify::new(),
+                    failure: std::sync::Mutex::new(None),
                     group: std::sync::Mutex::new(None),
                     stopping: std::sync::atomic::AtomicBool::new(false),
                 };
@@ -285,6 +349,38 @@ impl CodexServer {
         if let Some(managed) = &self.managed {
             tokio::spawn(managed.clone().supervise());
         }
+    }
+
+    /// Starts `launch` in place of the running App Server, or stops it for `None`. A socket
+    /// the Node does not manage is left alone.
+    pub(crate) fn relaunch(&self, launch: Option<CodexLaunch>) {
+        let Some(managed) = &self.managed else {
+            return;
+        };
+        let mut current = managed.launch.lock().expect("launch lock");
+        if *current == launch {
+            return;
+        }
+        *current = launch;
+        *managed.failure.lock().expect("failure lock") = None;
+        managed.relaunch.notify_one();
+    }
+
+    /// The managed App Server's state; `None` for a socket the Node does not manage.
+    pub(crate) async fn launch_state(&self) -> Option<Launch> {
+        let managed = self.managed.as_ref()?;
+        if managed.launch.lock().expect("launch lock").is_none() {
+            return Some(Launch::Off);
+        }
+        if self.client.status().await["connection"]["state"] == "connected" {
+            return Some(Launch::Running);
+        }
+        Some(
+            match managed.failure.lock().expect("failure lock").clone() {
+                Some(reason) => Launch::Failed(reason),
+                None => Launch::Starting,
+            },
+        )
     }
 
     /// Stops the managed App Server group; called on SIGTERM before the Node exits.
@@ -315,5 +411,102 @@ impl Runtime {
                 .await;
         }
         Ok(self.codex.status().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{Local, Provider, ProviderEnv, Role};
+
+    async fn lines(path: &Path, count: usize) -> Vec<String> {
+        for _ in 0..100 {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            if lines.len() >= count {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("App Server fixture did not start {count} times");
+    }
+
+    async fn ended(group: i32) -> bool {
+        for _ in 0..100 {
+            if !group_alive(group) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn the_app_server_runs_with_only_codex_variables_and_restarts_on_a_new_launch()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("codex-launch-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let out = dir.join("starts");
+        let fixture = dir.join("fake-codex");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\necho \"$$ ${CPA_API_KEY:-none} ${FIXTURE_CURSOR_ONLY:-none}\" >> \"$FIXTURE_OUT\"\nexec sleep 60\n",
+        )?;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))?;
+        let mut env = ProviderEnv::default();
+        env.apply(
+            Provider::Codex,
+            BTreeMap::from([
+                ("CPA_API_KEY".into(), Some("fixture-codex-key".into())),
+                ("FIXTURE_OUT".into(), Some(out.display().to_string())),
+            ]),
+        )?;
+        env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("FIXTURE_CURSOR_ONLY".into(), Some("leaked".into()))]),
+        )?;
+        let mut local = Local {
+            switches: Default::default(),
+            codex_bin: fixture.clone(),
+            env,
+        };
+        let config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        let identity = LocalIdentity::generate();
+        let (events, _events) = mpsc::unbounded_channel();
+        let server = CodexServer::open(&config, local.codex_launch(), &identity, &dir, events)?;
+        server.start();
+        let first = lines(&out, 1).await;
+        let (pid, rest) = first[0].split_once(' ').unwrap();
+        assert_eq!(
+            rest, "fixture-codex-key none",
+            "only Codex variables reach it"
+        );
+
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([("CPA_API_KEY".into(), Some("fixture-replaced-key".into()))]),
+        )?;
+        server.relaunch(local.codex_launch());
+        let second = lines(&out, 2).await;
+        assert!(second[1].ends_with(" fixture-replaced-key none"));
+        assert!(ended(pid.parse()?).await, "the old App Server ends");
+
+        local.switches.codex.roles.remove(&Role::Execution);
+        server.relaunch(local.codex_launch());
+        let second_group: i32 = second[1].split_once(' ').unwrap().0.parse()?;
+        assert!(ended(second_group).await, "Codex off stops the App Server");
+        assert!(matches!(server.launch_state().await, Some(Launch::Off)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            lines(&out, 2).await.len(),
+            2,
+            "nothing starts while it is off"
+        );
+        server.stop().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

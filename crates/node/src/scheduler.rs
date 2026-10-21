@@ -13,7 +13,7 @@ use crate::{
     store::Store,
     tools::{Effect, Tool},
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::{
@@ -134,9 +134,13 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         "conversation access denied"
     );
     let local_settings = node.settings_snapshot();
-    let settings = local_settings
-        .manager
-        .context("this Node has no configured management SDK")?;
+    let settings = match node.assistant() {
+        Some(settings) => settings,
+        None if local_settings.manager.is_some() => {
+            bail!("the assistant's provider is turned off on this Node")
+        }
+        None => bail!("this Node has no configured management SDK"),
+    };
     let kind = settings.provider;
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
     // Claiming before the tool listener exists would turn a startup race into a failed job.
@@ -216,8 +220,9 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             timeout_secs: node.config.timeout_secs,
             cursor_sdk_bin: settings.cursor_sdk_bin,
             node_bin: settings.node_bin,
-            codex_bin: node.config.codex_bin.clone(),
+            codex_bin: node.providers().codex_bin,
             codex_sdk_script: settings.codex_sdk_script,
+            provider_env: node.provider_env(kind),
             custom_tools: tools(job.kind),
             tool_cli: Some(std::env::current_exe()?),
             tool_env,

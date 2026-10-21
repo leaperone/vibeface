@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod manager;
 pub mod model;
 pub mod net;
+pub mod providers;
 pub mod runtime;
 pub mod scheduler;
 pub mod scheduling;

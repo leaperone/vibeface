@@ -30,10 +30,20 @@ export type JoinRequest = {
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string; name?: string } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; device_id: string; token: string } }
 export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string; node_bin: string; codex_sdk_script: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
+export type ProviderId = 'codex' | 'cursor'
+export type ProviderRole = 'agent' | 'execution'
+export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env_missing'; name: string } | { code: 'launch_failed'; detail: string } | { code: 'config_invalid' }
+/** One local provider of the connected Node. Variable values never come back, only whether each is set. */
+export type ProviderStatus = {
+  provider: ProviderId; enabled: boolean; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; assistant: boolean
+  env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
+  state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
+}
 export type NodeSettingsResponse = {
   settings: NodeSettings
   defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin' | 'node_bin' | 'codex_sdk_script'>
-  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[] }
+  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites' | 'provider_off'; missing: string[] }
+  providers: ProviderStatus[]
 }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -134,11 +144,38 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('助手设置格式不对。')
     manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
   }
-  if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
+  if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites' && readiness.manager !== 'provider_off') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
     defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
     readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)) },
+    providers: array(v.providers).map(parseProvider),
+  }
+}
+const providerIds: ProviderId[] = ['codex', 'cursor'], providerRoles: ProviderRole[] = ['agent', 'execution']
+const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
+function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
+  if (!options.includes(value as T)) throw new Error('AI 服务状态格式不对。')
+  return value as T
+}
+function parseIssue(value: unknown): ProviderIssue {
+  const v = record(value)
+  switch (v.code) {
+    case 'bin_missing': return { code: v.code, path: text(v.path) }
+    case 'env_missing': return { code: v.code, name: text(v.name) }
+    case 'launch_failed': return { code: v.code, detail: text(v.detail) }
+    case 'config_invalid': return { code: v.code }
+    default: throw new Error('AI 服务状态格式不对。')
+  }
+}
+function parseProvider(value: unknown): ProviderStatus {
+  const v = record(value)
+  return {
+    provider: oneOf(v.provider, providerIds), enabled: boolean(v.enabled), assistant: boolean(v.assistant),
+    roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
+    bin: v.bin === null ? null : text(v.bin),
+    env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
+    state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
   }
 }
 export function canonical(value: unknown): string {

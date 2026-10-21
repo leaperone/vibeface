@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleCheck, CircleX, FolderOpen, LoaderCircle, Plus, X } from "lucide-react"
+import { CircleAlert, CircleCheck, CircleX, FolderOpen, LoaderCircle, Plus, X } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, Details, InlineError, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@/features/identity/context"
 import { parseNodeSettings, type NodeSettings, type NodeSettingsResponse } from "@/lib/node"
+import { issueText, openProvider, providerNames } from "./provider-settings"
 
 type Provider = "disabled" | "codex_sdk" | "cursor_sdk"
 type Draft = NodeSettingsResponse["defaults"] & { provider: Provider; model: string; roots: string[] }
@@ -33,7 +34,7 @@ const providers = [["codex_sdk", "Codex"], ["cursor_sdk", "Cursor"], ["disabled"
  * Assistant checklist for the device this browser is connected to. Other devices can't be configured yet.
  * Choosing a service or changing folders saves right away, so the check below always describes the saved choice.
  */
-export function AssistantSettings({ onboarding = false }: { onboarding?: boolean }) {
+export function AssistantSettings({ onboarding = false, update, onChange }: { onboarding?: boolean; update?: NodeSettingsResponse | null; onChange?(value: NodeSettingsResponse): void }) {
   const { ready } = useDevice()
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -59,6 +60,7 @@ export function AssistantSettings({ onboarding = false }: { onboarding?: boolean
       const parsed = parseNodeSettings(await (settings ? connection.request("configure_node", settings) : connection.request("node_settings")))
       if (owner !== sequence.current || !connection.isCurrent()) return
       latest.current = parsed; setResponse(parsed); setDraft(draftOf(parsed))
+      if (save) onChange?.(parsed)
     } catch (cause) {
       if (owner === sequence.current && connection.isCurrent()) {
         setError(cause)
@@ -70,6 +72,7 @@ export function AssistantSettings({ onboarding = false }: { onboarding?: boolean
     }
   }
   useEffect(() => { setResponse(null); setDraft(null); void load(null); return () => { sequence.current += 1 } }, [ready])
+  useEffect(() => { if (update) { latest.current = update; setResponse(update); setDraft((value) => value && { ...draftOf(update), ...value, provider: draftOf(update).provider, roots: update.settings.roots }) } }, [update])
 
   if (!draft || !response) return error ? <InlineError error={error} action={{ label: "重试", onClick: () => void load(null) }} /> : <div className="grid gap-2"><Skeleton className="h-9 w-48" /><Skeleton className="h-24" /></div>
   const saved = draftOf(response)
@@ -82,6 +85,8 @@ export function AssistantSettings({ onboarding = false }: { onboarding?: boolean
   }
   const addFolder = () => { const path = folder.trim(); setFolder(""); if (path && !draft.roots.includes(path)) void load({ ...draft, roots: [...draft.roots, path] }) }
   const missing = savedProvider === "disabled" ? [] : checks[savedProvider].filter((item) => response.readiness.missing.includes(item.key))
+  const service = savedProvider === "disabled" ? undefined : response.providers.find((item) => item.provider === (savedProvider === "codex_sdk" ? "codex" : "cursor"))
+  const serviceIssue = service?.state === "needs_setup" ? service.issues[0] : undefined
 
   return <form className="grid gap-5" onSubmit={(event) => { event.preventDefault(); void load(draft) }}>
     <fieldset disabled={busy} className="grid gap-2">
@@ -95,6 +100,14 @@ export function AssistantSettings({ onboarding = false }: { onboarding?: boolean
     {draft.provider !== "disabled" ? <div className="grid gap-2">
       {busy && draft.provider !== savedProvider ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在检查</p>
         : draft.provider !== savedProvider ? null
+        : service && response.readiness.manager === "provider_off" ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta text-warning">
+          <CircleAlert aria-hidden="true" className="size-4 shrink-0" />{providerNames[service.provider]} 已关闭，助手暂停
+          {onboarding ? null : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(service.provider)}>去开启</button>}
+        </p>
+        : service && serviceIssue ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta text-warning">
+          <CircleAlert aria-hidden="true" className="size-4 shrink-0" />{issueText(service.provider, serviceIssue)}
+          {onboarding ? null : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(service.provider)}>去设置</button>}
+        </p>
         : missing.length ? <ul className="grid gap-1.5">{missing.map((item) => <li key={item.key} className="flex min-w-0 items-center gap-2 text-meta">
           <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
           <span className="min-w-0 truncate">{item.label}</span>

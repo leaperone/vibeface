@@ -268,7 +268,7 @@ impl Runtime {
         }
         // Nothing is triaged before the Node joins a network.
         let network = self.network_id().await?;
-        if self.settings_snapshot().manager.is_none() {
+        if self.assistant().is_none() {
             return Ok(json!({"status":"dropped","event_id":event.event_id}));
         }
         let mut store = self.store.lock().await;
@@ -606,7 +606,7 @@ impl Runtime {
 
     /// One turn of this device's coordination Agent; it acts through the `vibeface` CLI.
     async fn coordination_turn(&self, prompt: impl FnOnce(&str) -> Result<String>) -> Result<()> {
-        let Some(settings) = self.settings_snapshot().manager else {
+        let Some(settings) = self.assistant() else {
             return Ok(());
         };
         let program = std::env::current_exe()?;
@@ -618,8 +618,9 @@ impl Runtime {
             timeout_secs: self.config.timeout_secs,
             cursor_sdk_bin: settings.cursor_sdk_bin,
             node_bin: settings.node_bin,
-            codex_bin: self.config.codex_bin.clone(),
+            codex_bin: self.providers().codex_bin,
             codex_sdk_script: settings.codex_sdk_script,
+            provider_env: self.provider_env(settings.provider),
             tool_cli: Some(program),
             tool_env: self.agent_env(),
             cursor: self.cursor.get().cloned(),
@@ -643,7 +644,7 @@ impl Runtime {
     /// what it leaves alone is dropped after the turn, and a request it neither answered nor
     /// raised gets the fallback answer.
     async fn wake_agent(&self) -> Result<()> {
-        if self.settings_snapshot().manager.is_none() {
+        if self.assistant().is_none() {
             return Ok(());
         }
         let fresh: Vec<AgentEvent> = self

@@ -241,6 +241,13 @@ impl Runtime {
             let dispatch = self.send_dispatch(network, spec).await?;
             return Ok(dispatch_value(&dispatch));
         }
+        ensure!(
+            self.providers().serves(
+                crate::providers::Provider::Codex,
+                crate::providers::Role::Execution
+            ),
+            "Codex execution is turned off on this device"
+        );
         let cwd = spec.cwd.clone();
         let continues = spec.continues.clone();
         let (record, created) = self.accept_dispatch(network, spec).await?;

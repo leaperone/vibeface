@@ -55,6 +55,9 @@ pub struct Config {
     /// Where triaged local sessions go; the webhook secret is a separate private file.
     #[serde(default)]
     pub triage: crate::triage::TriageConfig,
+    /// Which local providers are on and the roles each serves; their keys are a separate file.
+    #[serde(default)]
+    pub providers: crate::providers::Providers,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +87,7 @@ impl Config {
             timeout_secs: 600,
             daily_decision_limit: 20,
             triage: Default::default(),
+            providers: Default::default(),
         }
     }
     pub fn load(dir: &Path) -> Result<Self> {
@@ -132,6 +136,11 @@ impl Config {
             );
         }
         self.triage.validate()?;
+        self.providers.validate()?;
+        ensure!(
+            !self.codex_bin.as_os_str().is_empty(),
+            "the Codex program path must not be empty"
+        );
         if let Some(m) = &self.manager {
             ensure!(m.workspace.is_dir(), "manager workspace does not exist");
         }

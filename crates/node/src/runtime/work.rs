@@ -227,7 +227,7 @@ impl Runtime {
                 "an agent task goes to another device"
             );
             ensure!(
-                self.settings_snapshot().manager.is_some(),
+                self.assistant().is_some(),
                 "this device has no assistant to take the task"
             );
         }

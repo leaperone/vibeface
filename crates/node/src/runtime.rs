@@ -110,6 +110,7 @@ pub struct Runtime {
     pub config: Config,
     pub(crate) data_dir: PathBuf,
     settings: std::sync::Mutex<NodeSettings>,
+    providers: std::sync::Mutex<crate::providers::Local>,
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
@@ -215,8 +216,17 @@ impl Runtime {
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
+        let providers = crate::providers::Local {
+            switches: config.providers.clone(),
+            codex_bin: config.codex_bin.clone(),
+            env: crate::providers::ProviderEnv::load(dir)?,
+        };
         let codex = Arc::new(codex_server::CodexServer::open(
-            &config, &identity, dir, tx,
+            &config,
+            providers.codex_launch(),
+            &identity,
+            dir,
+            tx,
         )?);
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,
@@ -229,6 +239,7 @@ impl Runtime {
                 roots: config.roots.clone(),
                 manager: config.manager.clone(),
             }),
+            providers: std::sync::Mutex::new(providers),
             config_save: Mutex::new(()),
             config,
             identity,
@@ -322,7 +333,7 @@ impl Runtime {
         node_display_names(&self.membership_state().await.ok()?).remove(&device)
     }
     pub fn info(&self) -> Value {
-        let manager_available = self.settings_snapshot().manager.is_some();
+        let manager_available = self.assistant().is_some();
         json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
@@ -440,13 +451,19 @@ impl Runtime {
             hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
+    /// What this Node offers its peers right now; a provider that is off is not offered.
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
-        let manager = settings.manager.as_ref().map(|m| m.provider);
+        let manager = self.assistant().map(|m| m.provider);
+        let mut codex = self.codex.capability().await;
+        codex["enabled"] = json!(self.providers().serves(
+            crate::providers::Provider::Codex,
+            crate::providers::Role::Execution
+        ));
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
             "manager_capabilities":manager.map(|kind|kind.capabilities()),
-            "codex":self.codex.capability().await})
+            "codex":codex})
     }
 
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
