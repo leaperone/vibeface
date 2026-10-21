@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, ChevronRight, CircleAlert, CircleCheck, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
+import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { BusyIcon, Details, InlineError, Skeleton, StatusPill, type Tone } from "@/components/app/kit"
+import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@/features/identity/context"
@@ -14,6 +14,7 @@ const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon:
   ready: { label: "可用", tone: "success", icon: CircleCheck },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
   starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
+  unused: { label: "未使用", tone: "neutral", icon: CircleDashed },
   off: { label: "已关闭", tone: "neutral", icon: Power },
 }
 
@@ -176,6 +177,7 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
     openProvider(item.provider)
   }
   const setVariable = (key: string, name: string, next: string | null) => save(key, { env: { [name]: next } })
+    .then((ok) => { if (ok) toast(next === null ? `已删除 ${name}` : `已保存 ${name}`, { tone: "success" }); return ok })
   const addName = newName.trim().toUpperCase()
 
   return <li className="overflow-hidden rounded-xl border">
@@ -227,7 +229,7 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
         <div className="grid gap-2">
           <p className="text-meta font-medium text-muted-foreground">环境变量</p>
           {item.env.length ? <ul className="grid gap-1">{item.env.map((row) => {
-            const missing = !row.set && !row.inherited && row.required
+            const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
             return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
               <div className="flex min-h-8 min-w-0 items-center gap-2">
                 <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>

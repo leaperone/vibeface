@@ -84,6 +84,13 @@ impl Runtime {
         let launches = provider == Provider::Cursor
             || switch.roles.contains(&Role::Agent)
             || app_server.mode == AppServerMode::Spawn;
+        let assistant = settings
+            .manager
+            .as_ref()
+            .is_some_and(|m| Provider::of(m.provider) == provider);
+        // A provider nothing runs on yet has nothing to set up; its checks start once it is chosen.
+        let in_use =
+            assistant || provider == Provider::Codex && switch.roles.contains(&Role::Execution);
         let mut issues = Vec::new();
         let (bin, required) = match provider {
             Provider::Codex => {
@@ -113,7 +120,7 @@ impl Runtime {
             .collect();
         let mut starting = false;
         let link = (provider == Provider::Codex).then_some(self.codex.link().await);
-        if switch.enabled {
+        if switch.enabled && in_use {
             if launches && !executable(&bin) {
                 issues.push(json!({"code":"bin_missing","path":bin}));
             }
@@ -140,6 +147,8 @@ impl Runtime {
         }
         let state = if !switch.enabled {
             "off"
+        } else if !in_use {
+            "unused"
         } else if !issues.is_empty() {
             "needs_setup"
         } else if starting {
@@ -153,7 +162,7 @@ impl Runtime {
             "bin":(provider == Provider::Codex).then_some(&local.codex_bin),
             "app_server":(provider == Provider::Codex).then(|| json!({"mode":app_server.mode,
                 "socket":app_server.socket,"link":link})),
-            "assistant":settings.manager.as_ref().is_some_and(|m| Provider::of(m.provider) == provider),
+            "assistant":assistant,
             "env":env, "state":state, "issues":issues,
         })
     }
