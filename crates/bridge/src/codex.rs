@@ -1627,4 +1627,64 @@ mod tests {
             std::fs::remove_file(socket).unwrap();
         }).await.expect("send must finish");
     }
+
+    #[tokio::test]
+    async fn dispatch_to_a_new_thread_delivers_the_first_turn() {
+        timeout(Duration::from_secs(5), async {
+            let socket = std::env::temp_dir().join(format!("vibeface-fresh-{}-{}.sock", std::process::id(), now_ms()));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut turns: HashMap<String, Vec<Value>> = HashMap::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = server.next().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let Some(method) = request["method"].as_str().map(str::to_owned) else { continue };
+                        if request.get("id").is_none() { continue }
+                        let thread = request["params"]["threadId"].as_str().unwrap_or_default().to_owned();
+                        let reply = match method.as_str() {
+                            "thread/start" => {
+                                let id = format!("fresh-{}", turns.len());
+                                turns.insert(id.clone(), Vec::new());
+                                json!({"result":{"thread":{"id":id,"status":{"type":"idle"},"turns":[]}}})
+                            }
+                            "thread/resume" if turns[&thread].is_empty() =>
+                                json!({"error":{"code":-32600,"message":format!("no rollout found for thread id {thread}")}}),
+                            "turn/start" => {
+                                let turn = json!({"id":format!("turn-{thread}"),"status":"inProgress",
+                                    "items":[{"type":"userMessage","clientId":request["params"]["clientUserMessageId"]}]});
+                                turns.get_mut(&thread).unwrap().push(turn.clone());
+                                json!({"result":{"turn":turn}})
+                            }
+                            "thread/read" | "thread/resume" =>
+                                json!({"result":{"thread":{"id":thread,"status":{"type":"idle"},"turns":turns[&thread]}}}),
+                            _ => json!({"result":{}}),
+                        };
+                        let mut reply = reply;
+                        reply["id"] = request["id"].clone();
+                        server.send(Message::Text(reply.to_string().into())).await.unwrap();
+                    }
+                }
+            });
+            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let started = session.request("thread/start", json!({"cwd":"/project","approvalPolicy":"never","sandbox":"danger-full-access"})).await.unwrap();
+            let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+            let outgoing = Outgoing { thread_id: thread, text: "do the work".into(), client_id: "w1".into(), start_only: true, full_access: true, ..Default::default() };
+            assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: "start".into(), turn_id: "turn-fresh-0".into() },
+                "the thread this session started gets its first turn");
+            session.close().await;
+
+            let mut session = DirectSession::connect(&socket).await.unwrap();
+            session.request("thread/start", json!({"cwd":"/project"})).await.unwrap();
+            session.close().await;
+            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let outgoing = Outgoing { thread_id: "fresh-1".into(), text: "hello".into(), client_id: "m1".into(), ..Default::default() };
+            assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: "start".into(), turn_id: "turn-fresh-1".into() },
+                "a thread started elsewhere without a rollout yet still gets its first turn");
+            session.close().await;
+            server.abort();
+            std::fs::remove_file(socket).unwrap();
+        }).await.expect("send must finish");
+    }
 }

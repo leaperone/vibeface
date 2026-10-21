@@ -944,6 +944,8 @@ def fixture_codex(arguments):
                         error = {"code": -32601, "message": "fixture does not implement " + method}
                     elif thread is None:
                         error = {"code": -32600, "message": "thread not found: " + str(thread_id)}
+                    elif method == "thread/resume" and not thread["turns"]:
+                        error = {"code": -32600, "message": "no rollout found for thread id " + thread_id}
                     elif method == "turn/start":
                         if thread["status"]["type"] == "active":
                             error = {"code": -32600, "message": "a turn is already running"}
