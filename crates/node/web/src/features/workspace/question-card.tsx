@@ -76,17 +76,18 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
     </p> : <>
       {question.choices.length ? <div className="flex flex-wrap gap-2">
-        {question.choices.map((choice) => {
+        {/* 交给 the primary assistant repeats 处理. */}
+        {question.choices.filter((choice) => !session || !choice.conversation_id || choice.conversation_id !== workspace.primary).map((choice) => {
           const key = `choice:${choice.label}`
           // 处理 lets the primary assistant decide, the step most sessions want.
           const main = session && choice.label === "处理"
           return <Button key={choice.label} type="button" variant={main ? "default" : "outline"} title={main ? "让主助手来分派" : undefined} disabled={disabled} aria-busy={action.busy === key || undefined} onClick={() => void send(key, choice.label)}><BusyIcon busy={action.busy === key} />{choice.label}</Button>
         })}
       </div> : null}
-      <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>
+      {session ? null : <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>
         <Input aria-label="回答" placeholder="输入回答" className="h-9 bg-background max-md:h-11" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
         <Button type="submit" variant="outline" size="icon" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
-      </form>
+      </form>}
     </>}
     <InlineError error={pending ? null : action.error} />
   </ActionCard>

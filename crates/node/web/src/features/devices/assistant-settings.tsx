@@ -90,8 +90,8 @@ export function AssistantSettings({ onboarding = false, update, onChange }: { on
 
   return <form className="grid gap-5" onSubmit={(event) => { event.preventDefault(); void load(draft) }}>
     <fieldset disabled={busy} className="grid gap-2">
-      <legend className="mb-2 text-meta font-medium text-muted-foreground">AI 服务</legend>
-      <div role="radiogroup" aria-label="AI 服务" className="flex w-fit flex-wrap gap-1 rounded-lg bg-muted p-1">
+      <legend className="mb-2 text-meta font-medium text-muted-foreground">用哪个</legend>
+      <div role="radiogroup" aria-label="助手用哪个 AI 服务" className="flex w-fit flex-wrap gap-1 rounded-lg bg-muted p-1">
         {providers.filter(([value]) => !onboarding || value !== "disabled").map(([value, label]) => <Button key={value} type="button" role="radio" aria-checked={draft.provider === value}
           variant={draft.provider === value ? "outline" : "ghost"} className={cn(draft.provider === value && "shadow-xs")} onClick={() => choose(value)}>{label}</Button>)}
       </div>

@@ -55,6 +55,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [error, setError] = useState<{ text: string; retry?: () => void } | null>(null)
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("other")
+  // Read synchronously: the chat route selects its conversation in the same commit that sets the view.
+  const viewRef = useRef<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
   const [conversationId, setConversationId] = useState("")
@@ -185,7 +187,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
-    if (joined && current() && readConnection.current === connection && view === "chat" && !document.hidden) {
+    if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && !document.hidden) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
@@ -457,7 +459,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => { viewRef.current = next; setView(next); clearMessages(); if (next === "chat") scheduleRefresh() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
