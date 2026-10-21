@@ -112,8 +112,7 @@ impl LocalIdentity {
             | EventBody::BotCreated { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
-            | EventBody::NotificationAcked { attestation, .. }
-            | EventBody::AttentionResolved { attestation, .. } => *attestation = value,
+            | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -262,21 +261,25 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -
 /// The user's own writes must carry their device signature; nothing else may carry one.
 enum UserSignature {
     Required,
-    /// The user's settlement of an unverified work result.
+    /// The user's settlement of an unverified work result, or an answer.
     Optional,
     Forbidden,
 }
 
 fn validate_attestation(event: &Event) -> Result<()> {
     let rule = match &event.body {
+        // The web signs an answer; one that comes through a decision token is the Node's own.
+        EventBody::MessagePosted {
+            role: Role::User,
+            answers: Some(_),
+            ..
+        } => UserSignature::Optional,
         EventBody::MessagePosted {
             role: Role::User, ..
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
         | EventBody::NotificationAcked { .. } => UserSignature::Required,
-        // The user dismisses with a signature; the device that delivered a decision closes it.
-        EventBody::AttentionResolved { .. } => UserSignature::Optional,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -306,6 +309,31 @@ pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) ->
         &attestation.signature,
     )
     .context("the device signature does not match this write")
+}
+
+/// Assistants' questions start with `q-`; questions about sessions no assistant owns with `s-`.
+fn question_id(scope: &str, question: &str) -> Result<()> {
+    vibeface_protocol::validate_id(question).map_err(anyhow::Error::msg)?;
+    let prefix = if scope == SESSIONS_SCOPE { "s-" } else { "q-" };
+    ensure!(
+        question.starts_with(prefix),
+        "a question ID in this scope starts with {prefix}"
+    );
+    Ok(())
+}
+
+fn subject(node: &str, agent: &str, session: &str, cwd: &str, summary: &str) -> Result<()> {
+    decode32(node)?;
+    ensure!(
+        !agent.is_empty()
+            && agent.len() <= 32
+            && !session.is_empty()
+            && session.len() <= 256
+            && cwd.len() <= 4096
+            && summary.len() <= 1024,
+        "invalid session subject"
+    );
+    Ok(())
 }
 
 pub fn validate_event_shape(event: &Event) -> Result<()> {
@@ -360,20 +388,37 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             report_results,
             in_reply_to,
             status,
+            answers,
             ..
         } => {
             id(message_id)?;
+            ensure!(
+                answers.is_some() || event.scope_id != SESSIONS_SCOPE,
+                "only answers are posted to the sessions scope"
+            );
             match role {
-                Role::User => ensure!(
-                    report_results.is_some()
-                        && in_reply_to.is_none()
-                        && status.is_none()
-                        && *attachments == event.blobs,
-                    "a user message carries only its reporting choice and its signed attachments"
-                ),
+                Role::User => {
+                    ensure!(
+                        report_results.is_some()
+                            && in_reply_to.is_none()
+                            && status.is_none()
+                            && *attachments == event.blobs,
+                        "a user message carries only its reporting choice and its signed attachments"
+                    );
+                    if let Some(question) = answers {
+                        question_id(&event.scope_id, question)?;
+                        ensure!(
+                            *message_id == format!("a-{question}"),
+                            "an answer's message ID is derived from its question"
+                        );
+                    }
+                }
                 Role::Assistant => {
                     ensure!(
-                        report_results.is_none() && status.is_some() && attachments.is_empty(),
+                        report_results.is_none()
+                            && status.is_some()
+                            && attachments.is_empty()
+                            && answers.is_none(),
                         "an assistant reply carries its turn status"
                     );
                     if let Some(answered) = in_reply_to
@@ -419,49 +464,65 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         EventBody::WorkProgress { work_id, .. } | EventBody::WorkFinished { work_id, .. } => {
             id(work_id)?
         }
-        EventBody::AttentionRaised {
-            alert_id,
-            matter,
-            session_id,
-            summary,
-            cwd,
-            agent,
-            thread_id,
-            request_id,
+        EventBody::ConversationCreated { .. } => ensure!(
+            event.scope_id != SESSIONS_SCOPE,
+            "the sessions scope is not a conversation"
+        ),
+        EventBody::QuestionAsked {
+            question_id: question,
+            text,
             choices,
+            about,
             ..
         } => {
+            question_id(&event.scope_id, question)?;
             ensure!(
-                event.scope_id == ATTENTION_SCOPE,
-                "triage cards live in the attention scope"
+                !text.trim().is_empty() && text.len() <= 1024,
+                "a question is 1-1024 bytes"
             );
-            id(alert_id)?;
-            id(matter)?;
-            ensure!(
-                !session_id.is_empty()
-                    && session_id.len() <= 256
-                    && summary.len() <= 1024
-                    && cwd.len() <= 4096
-                    && agent.len() <= 32,
-                "invalid triage card"
-            );
-            for value in thread_id.iter().chain(request_id.iter()) {
-                id(value)?;
+            subject(
+                &about.node,
+                &about.agent,
+                &about.session_id,
+                &about.cwd,
+                &about.summary,
+            )?;
+            about.request_id.as_deref().map(id).transpose()?;
+            ensure!(choices.len() <= 8, "at most 8 choices");
+            for (index, choice) in choices.iter().enumerate() {
+                ensure!(
+                    !choice.label.trim().is_empty()
+                        && choice.label.chars().count() <= 120
+                        && choices[..index].iter().all(|c| c.label != choice.label),
+                    "choice labels are 1-120 characters and unique"
+                );
+                if let Some(conversation) = &choice.conversation_id {
+                    ensure!(
+                        event.scope_id == SESSIONS_SCOPE && conversation != SESSIONS_SCOPE,
+                        "only a session question hands a session to an assistant"
+                    );
+                    id(conversation)?;
+                }
             }
-            ensure!(
-                choices.len() <= 8
-                    && choices
-                        .iter()
-                        .all(|choice| !choice.label.trim().is_empty() && choice.label.len() <= 120),
-                "invalid card choices"
-            );
         }
-        EventBody::AttentionResolved { alert_id, .. } => {
+        EventBody::SessionAttributed {
+            node,
+            agent,
+            session_id,
+            cwd,
+            summary,
+            question_id: question,
+        } => {
             ensure!(
-                event.scope_id == ATTENTION_SCOPE,
-                "triage cards live in the attention scope"
+                event.scope_id != SESSIONS_SCOPE,
+                "a session is attributed in its assistant's conversation"
             );
-            id(alert_id)?;
+            ensure!(
+                *node == event.author,
+                "only the device running a session hands it over"
+            );
+            question_id(SESSIONS_SCOPE, question)?;
+            subject(node, agent, session_id, cwd, summary)?;
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {
@@ -540,6 +601,7 @@ mod tests {
             report_results,
             in_reply_to: None,
             status,
+            answers: None,
             attestation: None,
         };
         let network = identity.fixture_network_id()?;
@@ -594,6 +656,32 @@ mod tests {
         );
         event.body = message(Role::User, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
+        // An answer may come unsigned through a decision token, under the ID its question fixes.
+        let answer = |id: &str, role, report_results, status| {
+            let mut body = message(role, report_results, status);
+            if let EventBody::MessagePosted {
+                message_id,
+                answers,
+                ..
+            } = &mut body
+            {
+                *message_id = id.into();
+                *answers = Some("q-1".into());
+            }
+            body
+        };
+        event.body = answer("a-q-1", Role::User, Some(true), None);
+        assert!(identity.sign_event(event.clone()).is_ok());
+        event.body = answer("m-1", Role::User, Some(true), None);
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = answer("a-q-1", Role::Assistant, None, Some(ReplyStatus::Stopped));
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.scope_id = SESSIONS_SCOPE.into();
+        assert!(
+            identity.sign_event(event.clone()).is_err(),
+            "q- questions live in conversations"
+        );
+        event.scope_id = "conversation".into();
         event.body = message(Role::Assistant, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = message(Role::Assistant, None, Some(ReplyStatus::Stopped));

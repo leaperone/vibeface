@@ -243,7 +243,7 @@ fn authorize_change(connection: &Connection, network: &str, event: &Event) -> Re
         let parent: Event = serde_json::from_str(&envelope.canonical_body)?;
         if parent.scope_id == event.scope_id
             && matches!(&parent.body, EventBody::MessagePosted {
-                message_id, role: Role::User, attestation: Some(_), ..
+                message_id, role: Role::User, answers: None, attestation: Some(_), ..
             } if message_id == cause)
         {
             return Ok(());

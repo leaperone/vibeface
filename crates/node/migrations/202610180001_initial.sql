@@ -23,9 +23,11 @@ CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missin
 -- Create "conversations" table
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
-CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `blobs` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
+CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `blobs` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
 -- Create index "messages_order" to table: "messages"
 CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `rank`);
+-- Create index "messages_answers" to table: "messages"
+CREATE INDEX `messages_answers` ON `messages` (`network_id`, `answers`);
 -- Create "bots" table
 CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "assistant_profiles" table
@@ -48,10 +50,14 @@ CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 -- Create "notification_acks" table
 CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
--- Create "alerts" table
-CREATE TABLE `alerts` (`network_id` text NOT NULL, `matter` text NOT NULL, `alert_id` text NOT NULL, `raise` text NOT NULL, `rank` text NOT NULL, `node` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `matter`));
--- Create "alert_resolutions" table
-CREATE TABLE `alert_resolutions` (`network_id` text NOT NULL, `alert_id` text NOT NULL, `resolution` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `alert_id`));
+-- Create "questions" table
+CREATE TABLE `questions` (`network_id` text NOT NULL, `question_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `created_at_ms` integer NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `request_id` text NULL, `body` text NOT NULL, PRIMARY KEY (`network_id`, `question_id`));
+-- Create index "questions_session" to table: "questions"
+CREATE INDEX `questions_session` ON `questions` (`network_id`, `node`, `session_id`);
+-- Create index "questions_conversation" to table: "questions"
+CREATE INDEX `questions_conversation` ON `questions` (`network_id`, `conversation_id`, `rank`);
+-- Create "session_owners" table
+CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `attribution` text NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `node`, `session_id`));
 -- Create "budget_days" table
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 -- Create "triage_seen" table
@@ -60,16 +66,10 @@ CREATE TABLE `triage_seen` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, 
 CREATE TABLE `triage_queue` (`ts_ms` integer NOT NULL, `event_id` text NOT NULL, `request_id` text NULL, `event` text NOT NULL, PRIMARY KEY (`ts_ms`, `event_id`));
 -- Create "triage_handled" table
 CREATE TABLE `triage_handled` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, `result` text NOT NULL, PRIMARY KEY (`event_id`));
--- Create "triage_matters" table
-CREATE TABLE `triage_matters` (`key` text NOT NULL, `alert_id` text NOT NULL, `severity` text NOT NULL, `count` integer NOT NULL, `last_ms` integer NOT NULL, PRIMARY KEY (`key`));
--- Create "triage_cards" table
-CREATE TABLE `triage_cards` (`alert_id` text NOT NULL, `thread_id` text NULL, `request_id` text NULL, `choices` text NOT NULL, PRIMARY KEY (`alert_id`));
 -- Create "triage_outbox" table
 CREATE TABLE `triage_outbox` (`event_id` text NOT NULL, `body` text NOT NULL, `state` text NOT NULL, `attempts` integer NOT NULL, `next_ms` integer NOT NULL, `created_ms` integer NOT NULL, `last_error` text NULL, PRIMARY KEY (`event_id`));
 -- Create "triage_scans" table
 CREATE TABLE `triage_scans` (`rollout` text NOT NULL, `scanned_to` integer NOT NULL, PRIMARY KEY (`rollout`));
--- Create "decision_journal" table
-CREATE TABLE `decision_journal` (`decision_id` text NOT NULL, `thread_id` text NOT NULL, `text` text NOT NULL, `delivery` text NULL, PRIMARY KEY (`decision_id`));
 -- Create "addresses" table
 CREATE TABLE `addresses` (`device_id` text NOT NULL, `record` text NOT NULL, PRIMARY KEY (`device_id`));
 -- Create "blob_offsets" table
@@ -102,4 +102,4 @@ CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `conversation_id` text 
 -- Create "work_stops" table
 CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));
 
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;

@@ -63,7 +63,7 @@ enum Action {
     Hook(Hook),
     /// Install, remove, check or test this Node's Codex and Claude Code hooks.
     Hooks(Hooks),
-    /// The coordination Agent's triage answers: list pending events, raise or dismiss one.
+    /// The coordination Agent's triage answers: list pending events, ask about, dismiss or assign one.
     Triage(Triage),
     /// Add a record to this device's Node log, e.g. from the coordination Agent or a script.
     Log(LogRecord),
@@ -127,6 +127,9 @@ enum CodexCommand {
     Respond {
         request_id: String,
         result: String,
+        /// The device holding the request, when it is not this one.
+        #[arg(long, value_name = "DEVICE")]
+        node: Option<String>,
         #[command(flatten)]
         local: LocalNode,
     },
@@ -221,7 +224,7 @@ struct LocalNode {
     data: DataDir,
     /// This device's local Node; defaults to `$VIBEFACE_TRIAGE_URL`, then the configured local listener.
     #[arg(long, value_name = "URL")]
-    node: Option<String>,
+    node_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -275,31 +278,33 @@ enum TriageAction {
         #[arg(long, value_name = "MS")]
         since: Option<i64>,
     },
-    /// The user should look: record the card and send it to the project's outlet.
+    /// The user should decide: ask in the chat of the assistant that owns the event's session.
     Raise {
         #[arg(long)]
         event_id: String,
         #[arg(long, value_parser = ["info", "attention", "urgent"])]
         severity: String,
         #[arg(long)]
-        summary: String,
-        /// Same key for events about the same matter.
-        #[arg(long)]
-        matter: String,
-        /// Codex thread a decision on this card is sent to; defaults to the event's thread.
-        #[arg(long)]
-        thread: Option<String>,
-        /// Hold this App Server request for the user; a choice answers it, dismissing declines.
+        question: String,
+        /// Hold this App Server request until the question is answered.
         #[arg(long)]
         request_id: Option<String>,
-        /// `label=<json>`: a button and the reply it sends; repeat for more.
-        #[arg(long = "choice", value_parser = vibeface::triage::parse_choice)]
-        choices: Vec<vibeface::triage::Choice>,
+        /// An answer the user can pick; repeat for more.
+        #[arg(long = "choice", value_name = "LABEL")]
+        choices: Vec<String>,
     },
     /// Handled silently.
     Dismiss {
         #[arg(long)]
         event_id: String,
+    },
+    /// Hand the session a session question is about to an assistant; a repeat returns the owner.
+    Assign {
+        #[arg(long)]
+        question: String,
+        /// The assistant's conversation ID.
+        #[arg(long)]
+        assistant: String,
     },
 }
 
@@ -494,11 +499,12 @@ async fn main() -> Result<()> {
                 CodexCommand::Respond {
                     request_id,
                     result,
+                    node,
                     local,
                 } => {
                     let result: serde_json::Value =
                         serde_json::from_str(&result).context("result must be JSON")?;
-                    let body = json!({"action":"respond","request_id":request_id,"result":result});
+                    let body = json!({"action":"respond","request_id":request_id,"result":result,"node":node});
                     codex_requests(&local, body).await
                 }
             }
@@ -1267,7 +1273,7 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
 }
 
 fn local_node_url(local: &LocalNode) -> Result<Url> {
-    let url = match &local.node {
+    let url = match &local.node_url {
         Some(url) => url.clone(),
         None => match std::env::var(vibeface::runtime::TRIAGE_URL_ENV) {
             Ok(url) => url,
@@ -1514,16 +1520,18 @@ async fn triage(options: Triage) -> Result<()> {
         TriageAction::Raise {
             event_id,
             severity,
-            summary,
-            matter,
-            thread,
+            question,
             request_id,
             choices,
         } => {
-            json!({"action":"raise","event_id":event_id,"severity":severity,"summary":summary,
-                "matter":matter,"thread_id":thread,"request_id":request_id,"choices":choices})
+            json!({"action":"raise","event_id":event_id,"severity":severity,"question":question,
+                "request_id":request_id,"choices":choices})
         }
         TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
+        TriageAction::Assign {
+            question,
+            assistant,
+        } => json!({"action":"assign","question_id":question,"conversation_id":assistant}),
     };
     let result = post_local(
         &local_node_url(&options.local)?,

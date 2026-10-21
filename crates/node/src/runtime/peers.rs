@@ -433,12 +433,18 @@ impl Runtime {
                 );
                 self.interrupt_work(network, work_id).await
             }
-            "codex_state" | "send_decision" => {
+            "codex_state" => {
                 ensure!(
                     input["human"] == true,
                     "the App Server answers the user only"
                 );
-                self.codex_rpc(network, kind, input).await
+                self.codex_state(network, input).await
+            }
+            // Another device's coordination Agent answers a request this device holds.
+            "codex_respond" => {
+                let result = input.get("result").cloned().context("result is required")?;
+                self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
+                    .await
             }
             "cancel_manager" | "resolve" => {
                 ensure!(
@@ -1694,6 +1700,7 @@ mod tests {
                     report_results: Some(true),
                     in_reply_to: None,
                     status: None,
+                    answers: None,
                     attestation: None,
                 },
             )?
@@ -1725,6 +1732,7 @@ mod tests {
                 report_results: Some(true),
                 in_reply_to: None,
                 status: None,
+                answers: None,
                 attestation: Some(user(&ia, &network, id)?),
             })
         };

@@ -484,20 +484,30 @@ fn suffix(text: &str, max_bytes: usize) -> &str {
 }
 
 fn message_row(offset: usize, event: &Event) -> Option<Value> {
-    let EventBody::MessagePosted {
-        role,
-        text,
-        attachments,
-        status,
-        ..
-    } = &event.body
-    else {
-        return None;
-    };
-    Some(
-        json!({"offset":offset,"role":role,"author":event.author,"created_at_ms":event.created_at_ms,
-        "text":prefix(text,4_000),"status":status,"attachments":attachments}),
-    )
+    match &event.body {
+        EventBody::MessagePosted {
+            role,
+            text,
+            attachments,
+            status,
+            answers,
+            ..
+        } => Some(
+            json!({"offset":offset,"role":role,"author":event.author,"created_at_ms":event.created_at_ms,
+            "text":prefix(text,4_000),"status":status,"attachments":attachments,"answers":answers}),
+        ),
+        EventBody::QuestionAsked {
+            question_id,
+            text,
+            choices,
+            about,
+            ..
+        } => Some(
+            json!({"offset":offset,"role":"question","author":event.author,"created_at_ms":event.created_at_ms,
+            "question_id":question_id,"text":text,"choices":choices,"about":about}),
+        ),
+        _ => None,
+    }
 }
 
 /// The newest checkpoint in shared order, with the vector it covers.
@@ -565,14 +575,19 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
             continue;
         }
         match &event.event.body {
-            EventBody::MessagePosted { role, text, .. } => {
+            EventBody::MessagePosted {
+                role,
+                text,
+                answers,
+                ..
+            } => {
                 let speaker = if *role == Role::User {
                     "用户"
                 } else {
                     "助手"
                 };
                 lines.push(format!("{speaker}：{}", prefix(text, 280)));
-                if *role == Role::User {
+                if *role == Role::User && answers.is_none() {
                     standing.push(prefix(text, 300).to_owned());
                 }
             }
@@ -642,6 +657,22 @@ fn materialize(
         };
         matches.then(|| json!({"offset":offset,"body":bounded(&agent_event_body(&event.event.body),4_000),"blobs":event.event.blobs}))
     }));
+    let answered = events.iter().find_map(|event| match &event.event.body {
+        EventBody::MessagePosted {
+            message_id,
+            answers: Some(question),
+            ..
+        } if job.trigger == crate::scheduling::message_trigger(message_id) => Some(question),
+        _ => None,
+    });
+    let question = answered.and_then(|answered| {
+        events.iter().find_map(|event| match &event.event.body {
+            body @ EventBody::QuestionAsked { question_id, .. } if question_id == answered => {
+                Some(bounded(&agent_event_body(body), 4_000))
+            }
+            _ => None,
+        })
+    });
     let empty = VersionVector::new();
     let (checkpoint, since) = match (resumed, latest_checkpoint(context)) {
         (Some(covers), _) => (Value::Null, covers),
@@ -673,7 +704,7 @@ fn materialize(
         "conversation":{"resumed_session":resumed.is_some(),"checkpoint":checkpoint,
             "messages":messages,"earlier_messages_omitted":omitted},
         "works":bounded(&json!(works.iter().map(work_row).collect::<Vec<_>>()),8_000),
-        "trigger":{"trigger":job.trigger,"kind":job.kind,"event":trigger_event},
+        "trigger":{"trigger":job.trigger,"kind":job.kind,"event":trigger_event,"question":question},
         "local_work_roots":roots,
     });
     let role = match (job.kind, routine) {
@@ -682,6 +713,7 @@ fn materialize(
             "You are this user's chat assistant, running the routine named {:?} that the user set up in this conversation; the trigger event holds its prompt. Do what it asks: read this host with the SDK's native tools and change it through dispatch_work. Your reply is this run's result, in the user's language. A routine run cannot change your settings.",
             entry.routine.name
         ),
+        (TriggerKind::Answer, _) => "You are this user's chat assistant. The trigger event is the user's answer to a question you asked (trigger.question, about a session on question.about.node): act on it now. Pass it on with `vibeface codex send <thread> <text> --id <the answer's message_id>`, or answer a held App Server request with `vibeface codex respond <request_id> <json> --node <question.about.node>`. Reusing the answer's message_id as --id makes a retry only read back. Reply in the user's language; an answer cannot change your settings.".to_owned(),
         _ => "You are this user's chat assistant. Read this host with the SDK's native tools and change it through dispatch_work. Reply in the user's language.".to_owned(),
     };
     let prompt = format!(
@@ -749,6 +781,7 @@ mod tests {
                 .filter(|tool| tool.effect() == Effect::Settings)
         };
         for kind in [
+            TriggerKind::Answer,
             TriggerKind::WorkResult,
             TriggerKind::AgentTask,
             TriggerKind::Routine,

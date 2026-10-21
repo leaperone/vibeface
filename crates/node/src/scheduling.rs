@@ -10,6 +10,8 @@ pub const MAX_PENDING_JOBS: usize = 256;
 #[serde(rename_all = "snake_case")]
 pub enum TriggerKind {
     Human,
+    /// The user's answer to a question this conversation asked; it changes no settings.
+    Answer,
     WorkResult,
     /// A `task` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
     AgentTask,

@@ -59,9 +59,28 @@ pub(crate) const TABLES: [&str; 12] = [
     "works",
     "notifications",
     "notification_acks",
-    "alerts",
-    "alert_resolutions",
+    "questions",
+    "session_owners",
 ];
+
+/// The first record of a session by rank decides which assistant owns it.
+#[allow(clippy::too_many_arguments)]
+fn own_session(
+    connection: &Connection,
+    network: &str,
+    node: &str,
+    session: &str,
+    scope: &str,
+    rank: &str,
+    attribution: Option<String>,
+    created_at_ms: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,created_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,node,session_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,attribution=excluded.attribution,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
+        params![network, node, session, scope, rank, attribution, created_at_ms],
+    )?;
+    Ok(())
+}
 
 pub(crate) fn clear(connection: &Connection, network: &str) -> Result<()> {
     for table in TABLES {
@@ -117,10 +136,11 @@ pub(crate) fn apply(
             report_results,
             in_reply_to,
             status,
+            answers,
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,blobs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,blobs=excluded.blobs WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,blobs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,blobs=excluded.blobs WHERE excluded.rank<rank",
                 params![
                     network,
                     scope,
@@ -134,6 +154,7 @@ pub(crate) fn apply(
                     in_reply_to,
                     status.map(text).transpose()?,
                     report_results,
+                    answers,
                     serde_json::to_string(&event.blobs)?
                 ],
             )?;
@@ -162,6 +183,18 @@ pub(crate) fn apply(
                 "INSERT INTO works(network_id,work_id,conversation_id,progress,progress_rank,thread_id,turn_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,work_id) DO UPDATE SET thread_id=COALESCE(thread_id,excluded.thread_id),turn_id=COALESCE(turn_id,excluded.turn_id),progress=CASE WHEN progress_rank IS NULL OR excluded.progress_rank>progress_rank THEN excluded.progress ELSE progress END,progress_rank=max(COALESCE(progress_rank,''),excluded.progress_rank)",
                 params![network, work_id, scope, serde_json::to_string(&event.body)?, rank, thread_id, turn_id],
             )?;
+            if let Some(thread_id) = thread_id {
+                own_session(
+                    connection,
+                    network,
+                    &event.author,
+                    thread_id,
+                    scope,
+                    rank,
+                    None,
+                    event.created_at_ms,
+                )?;
+            }
         }
         EventBody::WorkFinished {
             work_id,
@@ -216,22 +249,38 @@ pub(crate) fn apply(
                 params![network, notification_id, client_id],
             )?;
         }
-        EventBody::AttentionRaised {
-            matter, alert_id, ..
-        } => {
-            connection.execute(
-                "INSERT INTO alerts(network_id,matter,alert_id,raise,rank,node,created_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,matter) DO UPDATE SET alert_id=excluded.alert_id,raise=excluded.raise,rank=excluded.rank,node=excluded.node,created_at_ms=excluded.created_at_ms WHERE excluded.rank>rank",
-                params![network, matter, alert_id, serde_json::to_string(&event.body)?, rank, event.author, event.created_at_ms],
-            )?;
-        }
-        EventBody::AttentionResolved {
-            alert_id,
-            resolution,
+        EventBody::QuestionAsked {
+            question_id,
+            text: question,
+            about,
             ..
         } => {
             connection.execute(
-                "INSERT INTO alert_resolutions(network_id,alert_id,resolution,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,alert_id) DO UPDATE SET resolution=excluded.resolution,rank=excluded.rank WHERE excluded.rank<rank",
-                params![network, alert_id, text(resolution)?, rank],
+                "INSERT INTO questions(network_id,question_id,conversation_id,event_hash,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
+                params![network, question_id, scope, hash, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
+            )?;
+            if scope != SESSIONS_SCOPE {
+                notify(connection, network, hash, scope, "question", question, rank)?;
+            }
+        }
+        EventBody::SessionAttributed {
+            node,
+            agent,
+            session_id,
+            cwd,
+            summary,
+            question_id,
+        } => {
+            let attribution = serde_json::json!({"agent":agent,"cwd":cwd,"summary":summary,"question_id":question_id});
+            own_session(
+                connection,
+                network,
+                node,
+                session_id,
+                scope,
+                rank,
+                Some(attribution.to_string()),
+                event.created_at_ms,
             )?;
         }
         EventBody::AssistantChanged {

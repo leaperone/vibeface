@@ -257,6 +257,10 @@ table "messages" {
     null = true
     type = integer
   }
+  column "answers" {
+    null = true
+    type = text
+  }
   column "blobs" {
     null = false
     type = text
@@ -266,6 +270,9 @@ table "messages" {
   }
   index "messages_order" {
     columns = [column.network_id, column.conversation_id, column.rank]
+  }
+  index "messages_answers" {
+    columns = [column.network_id, column.answers]
   }
 }
 table "bots" {
@@ -533,21 +540,21 @@ table "notification_acks" {
     columns = [column.network_id, column.notification_id, column.client_id]
   }
 }
-table "alerts" {
+table "questions" {
   schema = schema.main
   column "network_id" {
     null = false
     type = text
   }
-  column "matter" {
+  column "question_id" {
     null = false
     type = text
   }
-  column "alert_id" {
+  column "conversation_id" {
     null = false
     type = text
   }
-  column "raise" {
+  column "event_hash" {
     null = false
     type = text
   }
@@ -555,7 +562,7 @@ table "alerts" {
     null = false
     type = text
   }
-  column "node" {
+  column "author" {
     null = false
     type = text
   }
@@ -563,21 +570,47 @@ table "alerts" {
     null = false
     type = integer
   }
+  column "node" {
+    null = false
+    type = text
+  }
+  column "session_id" {
+    null = false
+    type = text
+  }
+  column "request_id" {
+    null = true
+    type = text
+  }
+  column "body" {
+    null = false
+    type = text
+  }
   primary_key {
-    columns = [column.network_id, column.matter]
+    columns = [column.network_id, column.question_id]
+  }
+  index "questions_session" {
+    columns = [column.network_id, column.node, column.session_id]
+  }
+  index "questions_conversation" {
+    columns = [column.network_id, column.conversation_id, column.rank]
   }
 }
-table "alert_resolutions" {
+table "session_owners" {
   schema = schema.main
   column "network_id" {
     null = false
     type = text
   }
-  column "alert_id" {
+  column "node" {
     null = false
     type = text
   }
-  column "resolution" {
+  column "session_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
     null = false
     type = text
   }
@@ -585,8 +618,16 @@ table "alert_resolutions" {
     null = false
     type = text
   }
+  column "attribution" {
+    null = true
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = integer
+  }
   primary_key {
-    columns = [column.network_id, column.alert_id]
+    columns = [column.network_id, column.node, column.session_id]
   }
 }
 table "budget_days" {
@@ -661,54 +702,6 @@ table "triage_handled" {
     columns = [column.event_id]
   }
 }
-table "triage_matters" {
-  schema = schema.main
-  column "key" {
-    null = false
-    type = text
-  }
-  column "alert_id" {
-    null = false
-    type = text
-  }
-  column "severity" {
-    null = false
-    type = text
-  }
-  column "count" {
-    null = false
-    type = integer
-  }
-  column "last_ms" {
-    null = false
-    type = integer
-  }
-  primary_key {
-    columns = [column.key]
-  }
-}
-table "triage_cards" {
-  schema = schema.main
-  column "alert_id" {
-    null = false
-    type = text
-  }
-  column "thread_id" {
-    null = true
-    type = text
-  }
-  column "request_id" {
-    null = true
-    type = text
-  }
-  column "choices" {
-    null = false
-    type = text
-  }
-  primary_key {
-    columns = [column.alert_id]
-  }
-}
 table "triage_outbox" {
   schema = schema.main
   column "event_id" {
@@ -755,28 +748,6 @@ table "triage_scans" {
   }
   primary_key {
     columns = [column.rollout]
-  }
-}
-table "decision_journal" {
-  schema = schema.main
-  column "decision_id" {
-    null = false
-    type = text
-  }
-  column "thread_id" {
-    null = false
-    type = text
-  }
-  column "text" {
-    null = false
-    type = text
-  }
-  column "delivery" {
-    null = true
-    type = text
-  }
-  primary_key {
-    columns = [column.decision_id]
   }
 }
 table "addresses" {
