@@ -170,6 +170,22 @@ fn queued(connection: &Connection) -> Result<Vec<AgentEvent>> {
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
+/// The assistant that owns this device's session. A thread this device's work bound counts at
+/// once: the App Server can ask before the turn's start is recorded.
+fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Result<Option<String>> {
+    if let Some(owner) = store.session_owner(network, &event.node, &event.session_id)? {
+        return Ok(Some(owner));
+    }
+    Ok(store
+        .connection
+        .query_row(
+            "SELECT conversation_id FROM work_runs WHERE thread_id=? ORDER BY work_id LIMIT 1",
+            [&event.session_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
     connection.execute(
         "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
@@ -245,10 +261,7 @@ impl Runtime {
             return Ok(json!({"status":"dropped","event_id":event.event_id}));
         }
         let mut store = self.store.lock().await;
-        if store
-            .session_owner(&network, &event.node, &event.session_id)?
-            .is_none()
-        {
+        if owner(&store, &network, &event)?.is_none() {
             let question = self.ask_about_session(&mut store, &network, &event)?;
             drop(store);
             if let Some((question, hash)) = question {
@@ -633,7 +646,7 @@ impl Runtime {
         {
             let store = self.store.lock().await;
             for event in &fresh {
-                let owner = store.session_owner(&network, &event.node, &event.session_id)?;
+                let owner = owner(&store, &network, event)?;
                 let name = match &owner {
                     Some(scope) => match store.bot_for_conversation(&network, scope)? {
                         Some(bot) => Some(bot.name),
@@ -783,9 +796,7 @@ impl Runtime {
     async fn raise(&self, network: &str, event: &AgentEvent, question: EventBody) -> Result<Value> {
         let (asked, hash, owner) = {
             let mut store = self.store.lock().await;
-            let owner = store
-                .session_owner(network, &event.node, &event.session_id)?
-                .context("no assistant owns this session")?;
+            let owner = owner(&store, network, event)?.context("no assistant owns this session")?;
             let (asked, written) =
                 store.ask(&self.identity, network, &owner, question, now_ms())?;
             (asked, written.map(|event| event.hash), owner)
@@ -1915,11 +1926,13 @@ mod tests {
             assert_eq!((raised["asked"].clone(), raised["queued_webhook"].clone()), (json!(true), json!(true)));
             assert_eq!(node.triage_command(raise).await?, raised, "a repeated raise answers the same");
             let pending = node.triage_command(json!({"action":"events"})).await?;
-            let rest: Vec<String> = pending["events"].as_array().unwrap().iter().map(|e| e["event_id"].as_str().unwrap().to_owned()).collect();
-            let same_session = node.triage_command(json!({"action":"raise","event_id":rest[0],"severity":"info","question":"again"})).await?;
+            let rest = |session: &str| {
+                pending["events"].as_array().unwrap().iter().find(|e| e["session_id"] == session).unwrap()["event_id"].clone()
+            };
+            let same_session = node.triage_command(json!({"action":"raise","event_id":rest("s1"),"severity":"info","question":"again"})).await?;
             assert_eq!((same_session["asked"].clone(), same_session["question_id"].clone()), (json!(false), raised["question_id"].clone()),
                 "an unanswered question about the session stands");
-            let quiet = node.triage_command(json!({"action":"dismiss","event_id":rest[1]})).await?;
+            let quiet = node.triage_command(json!({"action":"dismiss","event_id":rest("s2")})).await?;
             assert_eq!(quiet["dismissed"], true);
             assert!(node.triage_command(json!({"action":"raise","event_id":"unknown","severity":"info","question":"x"})).await.is_err());
             assert_eq!(node.triage_command(json!({"action":"events"})).await?["events"], json!([]));
