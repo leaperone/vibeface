@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, QrCode, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -75,6 +75,23 @@ function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: strin
   </section>
 }
 
+const REJOIN = `vibeface service stop
+mv ~/.vibeface ~/.vibeface-removed
+vibeface init
+vibeface join '加入链接'
+vibeface service start`
+
+function Removed() {
+  const [copied, setCopied] = useState(false)
+  return <Panel icon={MonitorX} title="这台设备已被移出">
+    <p className="text-muted-foreground">它不再同步，也不能再用。要继续用这台电脑，先在管理设备上点“添加设备”复制加入链接，再在这台电脑上运行下面的命令。旧数据会留在 <code>~/.vibeface-removed</code>。</p>
+    <pre className="overflow-x-auto rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{REJOIN}</pre>
+    <Button type="button" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(REJOIN).then(() => setCopied(true)) }}>
+      {copied ? <CircleCheck aria-hidden="true" /> : null}{copied ? '已复制' : '复制重新加入的命令'}
+    </Button>
+  </Panel>
+}
+
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 }
@@ -109,7 +126,7 @@ export function ConnectionScreen() {
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup) })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
-  const usable = !!device.identity && !['blocked', 'key_lost', 'initializing'].includes(device.phase)
+  const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed'].includes(device.phase)
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
   useEffect(() => { if (device.initialInvitation) setInvitation((current) => current.trim() ? current : device.initialInvitation) }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
@@ -156,6 +173,7 @@ export function ConnectionScreen() {
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
   </Panel>
+  else if (device.phase === 'removed') body = <Removed />
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />

@@ -231,6 +231,31 @@ impl Runtime {
         }
     }
 
+    async fn removed_here(&self, device: &str) -> bool {
+        self.membership_state()
+            .await
+            .and_then(|state| state.project())
+            .is_ok_and(|view| view.revocation(device).is_some())
+    }
+
+    /// A member Node refusing this one hands back the signed history that removed it. Installing
+    /// it checks that history against the one held here, so a forged removal changes nothing.
+    pub(super) async fn accept_removal(&self, network: &str, reply: &Value) -> Result<()> {
+        let incoming: NetworkState =
+            serde_json::from_value(reply["state"].clone()).context("invalid membership")?;
+        ensure!(
+            incoming.genesis.network_id == network,
+            "wrong membership network"
+        );
+        let view = self.install_membership(incoming).await?;
+        ensure!(
+            view.revocation(&self.identity.device_id()?).is_some(),
+            "the peer refused this Node without a removal"
+        );
+        tracing::warn!("this Node has been removed from the personal network");
+        Ok(())
+    }
+
     /// The network ID, if `device` is a current member Node.
     async fn member_node(&self, device: &str) -> Result<String> {
         let network = self.membership_state().await?.genesis.network_id;
@@ -260,6 +285,24 @@ impl Runtime {
         }
         let network = match self.member_node(&remote).await {
             Ok(network) => network,
+            Err(_) if alpn == net::SYNC && self.removed_here(&remote).await => {
+                // A removed Node learns why from the signed history; it checks every signature.
+                let state = self.membership_state().await?;
+                let reply =
+                    json!({"type":"revoked","network_id":state.genesis.network_id,"state":state});
+                net::serve_streams(connection, move |request: Value| {
+                    let reply = reply.clone();
+                    async move {
+                        ensure!(
+                            request["network_id"] == reply["network_id"],
+                            "wrong personal network"
+                        );
+                        Ok(reply)
+                    }
+                })
+                .await;
+                return Ok(());
+            }
             Err(error) => {
                 tracing::debug!(%remote, "refused a connection from a non-member");
                 connection.close(1u32.into(), b"not a member Node of this personal network");
@@ -579,6 +622,10 @@ impl Runtime {
                 continue;
             };
             let Ok(view) = state.project() else { continue };
+            let local = self.identity.device_id().unwrap_or_default();
+            if view.revocation(&local).is_some() {
+                continue;
+            }
             let network = view.network_id.clone();
             // A new path (say, the relay came up) reaches peers now, not at the next Hello.
             match self.refresh_own_address(&network).await {
@@ -586,7 +633,6 @@ impl Runtime {
                 Ok(false) => {}
                 Err(error) => tracing::debug!(%error, "address record refresh pending"),
             }
-            let local = self.identity.device_id().unwrap_or_default();
             let now = Instant::now();
             let peers: Vec<String> = view
                 .members
@@ -652,6 +698,9 @@ impl Runtime {
         let net = self.net()?.clone();
         let ours = self.hello(network).await?;
         let theirs = net.request(peer, net::SYNC, &ours, PEER_TIMEOUT).await?;
+        if theirs["type"] == "revoked" {
+            return self.accept_removal(network, &theirs).await;
+        }
         ensure!(
             theirs["network_id"].as_str() == Some(network),
             "peer answered for another personal network"
@@ -1808,6 +1857,69 @@ mod tests {
         .await;
         drop(a);
         let _ = std::fs::remove_dir_all(dir);
+        result
+    }
+
+    /// A Node removed while away learns it from the next member Node it syncs with, and only from
+    /// history signed by a manager it already trusts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_node_learns_its_removal_only_from_signed_history() -> Result<()> {
+        use crate::identity::{GovernanceAction, GovernanceEvent, Revocation};
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (member, removed) = (ia.device_id()?, ib.device_id()?);
+        let state = ia.sign_network_fixture(1, vec![member.clone(), removed.clone()])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+            }
+            let revocation = Revocation::new(&removed, None)?;
+            let admin = ia.fixture_admin().device_id()?;
+            let action = GovernanceAction::Revoke(revocation.clone());
+            let unsigned = GovernanceEvent::unsigned(&state.project()?, &admin, action.clone())?;
+            let impostor = GovernanceEvent::unsigned(&state.project()?, &admin, action)?
+                .sign(&LocalIdentity::generate().fixture_admin())?;
+            for event in [unsigned, impostor] {
+                let mut forged = state.clone();
+                forged.events.push(event);
+                let reply = json!({"type":"revoked","network_id":network,"state":forged});
+                assert!(b.accept_removal(&network, &reply).await.is_err());
+            }
+            let bare = json!({"type":"revoked","network_id":network});
+            assert!(b.accept_removal(&network, &bare).await.is_err());
+            let held = b.membership_state().await?.project()?;
+            assert_eq!(
+                held.revocation(&removed),
+                None,
+                "a forged removal changes nothing"
+            );
+
+            let mut next = state.clone();
+            next.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &state.project()?,
+                revocation.clone(),
+            )?)?;
+            a.install_membership(next).await?;
+            for node in [&a, &b] {
+                node.start_network().await?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            b.sync_peer(&network, &member).await?;
+            let held = b.membership_state().await?.project()?;
+            assert_eq!(held.revocation(&removed), Some(&revocation));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&a, &b] {
+            node.stop_network().await;
+        }
+        drop((a, b));
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         result
     }
 

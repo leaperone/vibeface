@@ -9,14 +9,14 @@ import { localBrowserEntry } from '@/lib/local-access'
 import { parseChanged } from '@/lib/progress'
 import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
-import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyState } from '@/lib/secure'
+import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } from '@/lib/secure'
 import { nextLink } from '@/lib/link'
 import type { Link, LinkEvent } from '@/lib/link'
 import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '@/lib/entrances'
 import type { Entrance, OpenEntrance } from '@/lib/entrances'
 import { joinTabs } from '@/lib/tabs'
 
-type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'ready'
+type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
@@ -309,6 +309,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       try {
         active = await open(candidate, true, list.length > 1 ? 5000 : 10000)
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
+        if (candidate === target.entry && removed(auth, active, target.networkId)) return true
         if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
         if (auth.principal === null) throw new Error('这个访问地址还没同步到这个浏览器。')
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
@@ -388,12 +389,20 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   async function connect(candidate: ConnectionEntry) {
     const active = await open(candidate)
-    const auth = record(await scoped(active)('authenticate', { network_id: load(`network-for.${active.entry.device_id}`) ?? '' }))
+    const pinned = load(`network-for.${active.entry.device_id}`)
+    const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
+    if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return
     if (auth.principal === null) {
       setError(auth.revoked === true ? '这个浏览器已被移除。请在管理设备上重新添加。' : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : '这个浏览器还没加入。请用加入链接，或用恢复文件找回。')
       return
     }
     await authenticate(auth, active)
+  }
+  /** A device removed from the network shows only that, once its signed removal checks out. */
+  function removed(auth: unknown, active: Session, networkId: string) {
+    try { if (!verifyRemoval(auth, active.entry.device_id, networkId)) return false } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
+    resetConnection(); setPhase('removed')
+    return true
   }
   async function refreshDirectory() {
     if (!ready?.isCurrent()) return
