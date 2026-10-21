@@ -17,7 +17,7 @@ import { pendingChecks } from '@/features/workspace/model'
 import { agentName, foldAnswers, placeByTime, projectName } from '@/features/workspace/questions'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
-import { Message, type ChatMessage } from './elements/message'
+import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
 import { canSend, composerHint } from './protocol'
 import './chat.css'
@@ -47,7 +47,7 @@ export function ConversationScreen() {
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
-  const pendingRow = (message: ChatMessage) => ({ key: message.message_id, anchor: message.role === 'user', node: <Message message={message} /> })
+  const pendingRow = (message: ChatMessage): ChatEntry => ({ key: message.message_id, anchor: message.role === 'user', message })
   const interruptedRow = (reply: (typeof workspace.interrupted)[number]): ChatMessage => ({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: 0, state: 'interrupted' })
 
   // Tasks sit right after the message that started them.
@@ -65,7 +65,7 @@ export function ConversationScreen() {
   const placedChanges = placeChanges(data?.messages ?? [], changes)
   const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={data?.assistant?.routines ?? []} /> })
 
-  // Questions and hand-offs sit where they happened; an answer shows inside its question, not as a bubble.
+  // Questions and hand-offs sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
@@ -79,7 +79,7 @@ export function ConversationScreen() {
     const routine = message.role === 'user' ? null : routineTrigger(message.in_reply_to)
     if (routine) {
       // A routine run has no message of the person; its reply stands alone and the tasks it started follow it.
-      entries.push({ key: message.message_id, node: <Message message={message} routine={routineName(routine, data?.assistant, changes)} /> })
+      entries.push({ key: message.message_id, message, routine: routineName(routine, data?.assistant, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
     for (const job of jobs) {
