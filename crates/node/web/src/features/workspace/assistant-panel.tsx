@@ -17,7 +17,7 @@ export function AssistantPanelButton() {
   const view = workspace.data?.assistant
   if (!bot) return null
   return <>
-    <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 text-muted-foreground" aria-label="助手信息" title="助手信息" disabled={!view} onClick={() => setOpen(true)}>
+    <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="助手信息" title="助手信息" disabled={!view} onClick={() => setOpen(true)}>
       <Bot aria-hidden="true" />
     </Button>
     <Sheet open={open && Boolean(view)} onOpenChange={setOpen}>

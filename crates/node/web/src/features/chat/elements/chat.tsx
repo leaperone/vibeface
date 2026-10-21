@@ -17,7 +17,7 @@ export type ChatEntry =
 
 type Sender = 'user' | 'assistant'
 const sender = (entry: ChatEntry | undefined): Sender | null => entry && 'message' in entry ? (entry.message.role === 'user' ? 'user' : 'assistant') : null
-/** A routine run's reply stands alone, so it always opens a group. */
+/** A routine run's reply stands alone, so it always opens a group. The time shows once, at the end of a group. */
 const continues = (entry: ChatEntry, previous: ChatEntry | undefined) => !('routine' in entry && entry.routine) && sender(entry) !== null && sender(entry) === sender(previous)
 
 export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNode }) {
@@ -36,12 +36,11 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
         <MessageScrollerViewport aria-label="聊天记录">
           <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-0 px-4 py-6 sm:px-6 lg:px-8">
             {entries.map((entry, index) => {
-              const first = !continues(entry, entries[index - 1])
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)
               return (
-                <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={index === 0 ? undefined : first ? 'mt-5' : 'mt-1'}>
-                  {'message' in entry ? <Message message={entry.message} routine={entry.routine} first={first} last={last} /> : entry.node}
+                <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={index === 0 ? undefined : 'mt-6'}>
+                  {'message' in entry ? <Message message={entry.message} routine={entry.routine} last={last} /> : entry.node}
                 </MessageScrollerItem>
               )
             })}
