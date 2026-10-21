@@ -256,7 +256,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     </form>}
     {publicEntry || thisComputer
       ? <p className="text-meta text-muted-foreground">在{thisComputer ? '已有设备' : '你的电脑'}上打开 vibeface，点“添加设备”，再{thisComputer ? '粘贴它给的链接或扫它的二维码' : '扫它显示的二维码'}。</p>
-      : <p className="text-meta text-muted-foreground">加入一台电脑：在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p>}
+      : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">

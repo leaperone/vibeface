@@ -29,7 +29,7 @@ export function issueText(provider: ProviderId, issue: ProviderIssue): string {
   }
 }
 
-const modes: [AppServerMode, string, LucideIcon][] = [["system", "系统", Monitor], ["spawn", "自行启动", Play]]
+const modes: [AppServerMode, string, LucideIcon][] = [["system", "用已在运行的", Monitor], ["spawn", "自己启动", Play]]
 const spawnServer = { mode: "spawn", socket: null } as const
 
 /** One line for an App Server state, from the device or a fresh test. */
@@ -65,9 +65,9 @@ function AppServerSettings({ server, working, busy, save, test }: {
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
 
   return <div className="grid gap-2">
-    <p className="text-meta font-medium text-muted-foreground">App Server</p>
+    <p className="text-meta font-medium text-muted-foreground">连接方式</p>
     <div className="flex min-w-0 flex-wrap items-center gap-2">
-      <div role="radiogroup" aria-label="App Server" className="flex w-fit gap-1 rounded-lg bg-muted p-1">
+      <div role="radiogroup" aria-label="连接方式" className="flex w-fit gap-1 rounded-lg bg-muted p-1">
         {modes.map(([mode, text, Icon]) => <Button key={mode} type="button" role="radio" aria-checked={server.mode === mode} disabled={working}
           variant={server.mode === mode ? "outline" : "ghost"} className={cn(server.mode === mode && "shadow-xs")} onClick={() => setMode(mode)}>
           <Icon aria-hidden="true" />{text}
@@ -79,10 +79,10 @@ function AppServerSettings({ server, working, busy, save, test }: {
     </div>
     <LinkLine link={shown} prefix={tested ? "测试：" : ""} />
     {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <code className="font-mono text-meta break-all text-muted-foreground">{shown.reason}</code> : null}
-    {server.mode === "system" ? <Details label="Socket">
+    {server.mode === "system" ? <Details label="手动指定">
       {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
       <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
-        <Input aria-label="指定 Socket 路径" className="min-w-0 font-mono" placeholder="自动查找" spellCheck={false} value={socket} disabled={working} onChange={(event) => setSocket(event.target.value)} />
+        <Input aria-label="指定连接路径" className="min-w-0 font-mono" placeholder="自动查找" spellCheck={false} value={socket} disabled={working} onChange={(event) => setSocket(event.target.value)} />
         {socket.trim() !== (server.socket ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
       </form>
     </Details> : null}
@@ -193,7 +193,7 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="font-medium text-foreground underline underline-offset-4" disabled={working}
-        onClick={() => void save("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自行启动</button>
+        onClick={() => void save("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
         : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : null}
     <details id={`provider-${item.provider}`} className="details border-t">
@@ -258,7 +258,7 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
             </div>
           </form>
           <p className="text-meta text-muted-foreground">只存在这台电脑上，只给 {name} 用，保存后看不到原值</p>
-          {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">系统 App Server 用它自己的设置，这些变量只在自行启动时传给 App Server</p> : null}
+          {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
         </div>
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>

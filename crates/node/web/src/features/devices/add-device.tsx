@@ -72,16 +72,17 @@ export function AddDevice() {
           {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           <JoinRequests issuing={result !== null} />
           {result ? <div className="grid gap-3">
-            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在你的公网网页里扫码"} /> : null}
-            {result.publicEntry ? <p className="text-meta text-muted-foreground">用手机相机扫码，或在你的公网网页里扫码</p> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
-              <p>用手机打开你的公网网页，点“扫码”扫这个二维码</p>
-              <p className="flex items-center gap-1.5 text-muted-foreground"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{local ? "手机相机打不开本机地址" : "还没设置公网地址，手机相机打不开"}</p>
-              <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置公网地址</Link></Button>
+            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在手机上的 vibeface 里扫码"} /> : null}
+            {result.publicEntry ? <p className="text-meta text-muted-foreground">用手机相机扫码</p> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
+              <p>在手机上打开 vibeface 的访问地址，点“扫码”扫这里</p>
+              <p className="flex items-center gap-1.5 text-muted-foreground"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{local ? "手机相机打不开本机地址" : "还没设置访问地址，手机相机打不开"}</p>
+              <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置访问地址</Link></Button>
             </div>}
             <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button>
-            <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p>
+            <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</p>
             <Details label="链接原文">
               <Textarea readOnly className="min-h-24 font-mono text-meta" value={result.link} onFocus={(event) => event.target.select()} />
+              <p className="text-meta text-muted-foreground">另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p>
             </Details>
           </div> : null}
           {status ? <p role="status" className="text-meta text-success">{status}</p> : null}

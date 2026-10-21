@@ -578,24 +578,27 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function join(linkText: string, nameValue: string) {
     const name = deviceName(nameValue)
     const link: JoinLink = await parseJoinLink(linkText)
-    // This page's own entry first: a scanned code's address is only a hint, the device key is the check.
-    const addresses = [...new Set([location.origin, ...link.origin ? [link.origin] : []])]
-    let active: Session | null = null
-    for (const [index, address] of addresses.entries()) {
-      try { active = await open({ address, device_id: link.entryId }) }
-      catch (cause) { if (index === addresses.length - 1 || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
-      if (active) break
-    }
-    if (!active) throw new Error('连不上这台设备。')
-    const me = own().deviceId
-    const nonce = randomHex()
-    let response: ReturnType<typeof parseJoinRequest>
-    try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
-    finally { link.secret = '' }
-    if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入回执与邀请或此浏览器不一致。')
-    if (response.status === 'rejected' || response.status === 'expired') throw new Error('此邀请已失效。请在管理设备上重新邀请。')
-    setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
-    await checkJoin()
+    // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
+    try {
+      // This page's own entry first: a scanned code's address is only a hint, the device key is the check.
+      const addresses = [...new Set([location.origin, ...link.origin ? [link.origin] : []])]
+      let active: Session | null = null
+      for (const [index, address] of addresses.entries()) {
+        try { active = await open({ address, device_id: link.entryId }) }
+        catch (cause) { if (index === addresses.length - 1 || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
+        if (active) break
+      }
+      if (!active) throw new Error('连不上这台设备。')
+      const me = own().deviceId
+      const nonce = randomHex()
+      let response: ReturnType<typeof parseJoinRequest>
+      try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
+      finally { link.secret = '' }
+      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入回执与邀请或此浏览器不一致。')
+      if (response.status === 'rejected' || response.status === 'expired') throw new Error('此邀请已失效。请在管理设备上重新邀请。')
+      setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
+      await checkJoin()
+    } catch (cause) { setError(messageOf(cause)); throw cause }
   }
   async function checkJoin() {
     const pending = joiningRef.current
