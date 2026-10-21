@@ -34,6 +34,14 @@ export function verifyAuthentication(value: unknown, own: PublicIdentity, expect
   if (!member || revoked(own.deviceId) || member.kind !== 'client' || principal.can_manage !== member.manage) throw new Error('设备权限没通过校验。')
   return { auth, principal, view }
 }
+/** Whether the device answered that it was removed, proven by the signed directory that removed it. */
+export function verifyRemoval(value: unknown, nodeId: string, networkId: string): boolean {
+  const auth = record(value)
+  if (auth.node_revoked !== true) return false
+  if (networkId && auth.network_id !== networkId) throw new Error('这台设备属于另一组设备。请先确认连接的是自己的设备。')
+  if (!verifiedView(auth.state, text(auth.network_id)).revoked.some(item => item.device_id === nodeId)) throw new Error('设备说它已被移出，但记录没通过校验。')
+  return true
+}
 export function passphrase(password: string, confirmation: string): string {
   if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 12 个字符。')
   if (password !== confirmation) throw new Error('两次密码不一样。')

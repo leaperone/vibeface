@@ -112,6 +112,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   let verifications = 0, released = 0
   const secure = {
     verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: localSession && !management ? 'local_session' : 'membership', network_id: network, device_id: subject, epoch: 1, can_manage: management }, view: membership } },
+    verifyRemoval: () => false,
     verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] }),
     openPackage: async () => ({ networkId: network, epoch: 1, payload: { genesis }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },

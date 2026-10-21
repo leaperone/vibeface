@@ -928,6 +928,11 @@ fn notify_join(node: &Runtime, request: &JoinRequest) {
 /// Reads membership; a member wins over a local cookie.
 async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
     let view = node.membership_state().await?.project()?;
+    let node_id = node.identity.device_id()?;
+    ensure!(
+        view.revocation(&node_id).is_none(),
+        "this Node has been removed from the personal network"
+    );
     if let Ok(member) = view.client(&session.device_id) {
         return Ok(Principal {
             source: "membership",
@@ -941,7 +946,6 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
         .cookie
         .as_deref()
         .context("this device is not a member of the personal network")?;
-    let node_id = node.identity.device_id()?;
     view.node(&node_id)?;
     let local = node
         .local_access
@@ -996,6 +1000,15 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
         Ok(principal) => Ok(
             json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"local_auto_access":node.local_access.enabled()}),
         ),
+        // This Node's own browsers get the signed history that removed it, to check themselves.
+        Err(_)
+            if view.revocation(&node.identity.device_id()?).is_some()
+                && (session.cookie.is_some() || view.client(&session.device_id).is_ok()) =>
+        {
+            Ok(
+                json!({"principal":null,"initialized":true,"network_id":view.network_id,"node_revoked":true,"state":state}),
+            )
+        }
         Err(_) => Ok(
             json!({"principal":null,"initialized":true,"network_id":view.network_id,"revoked":view.cutoff(&session.device_id).is_some()}),
         ),
