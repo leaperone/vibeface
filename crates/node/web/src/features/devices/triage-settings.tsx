@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { BellOff, CircleCheck, CircleX, Clock, Copy, Inbox, KeyRound, Layers, Plus, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
+import { CircleCheck, CircleX, Clock, Copy, Inbox, KeyRound, Layers, Plus, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, InlineError, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -9,7 +9,7 @@ import { useDevice } from "@/features/identity/context"
 import { parseTriageSettings } from "@/features/workspace/model"
 import type { Outlet, TriageSettings as Settings } from "@/features/workspace/types"
 
-const outlets: [Outlet, string, LucideIcon][] = [["record", "网页", Inbox], ["webhook", "Grok Bot", Webhook], ["both", "都发", Layers], ["off", "不发", BellOff]]
+const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "网页和 Grok", Layers]]
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions">
 
 /** Where this device sends sessions that need the person, plus the Grok Bot channel both ways. Saves on each change. */
@@ -55,7 +55,8 @@ export function TriageSettings() {
   const addProject = () => {
     const path = prefix.trim()
     setPrefix("")
-    if (path && !config.projects.some((item) => item.prefix === path)) void save("projects", { projects: [...config.projects, { prefix: path, outlet: "webhook" }] })
+    // A project is added to differ from the default.
+    if (path && !config.projects.some((item) => item.prefix === path)) void save("projects", { projects: [...config.projects, { prefix: path, outlet: config.default_outlet === "both" ? "record" : "both" }] })
   }
   const { pending, delivered, dead } = settings.outbox
 

@@ -41,7 +41,8 @@ const titles: Record<string, string> = { "/inbox": "待处理", "/devices": "我
 function WorkspaceLayout({ children }: { children: ReactNode }) {
   const workspace = useWorkspace()
   const device = useDevice()
-  const inbox = useInbox()
+  // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
+  const waiting = useInbox().filter((item) => !item.done).length
   const { setOpenMobile } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
@@ -90,7 +91,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         <SidebarContent className="gap-1 px-2 pb-3">
           <SidebarGroup className="pb-0">
             <SidebarMenu>
-              <NavItem to="/inbox" icon={Inbox} label="待处理" active={pathname === "/inbox"} badge={inbox.length || undefined} />
+              <NavItem to="/inbox" icon={Inbox} label="待处理" active={pathname === "/inbox"} badge={waiting || undefined} />
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
@@ -134,9 +135,9 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             {chatRoute ? <AssistantPanelButton /> : null}
           </div>
           <Button asChild variant="ghost" size="icon" className="relative md:hidden">
-            <Link to="/inbox" aria-label={inbox.length ? `待处理 ${inbox.length}` : "待处理"}>
+            <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
               <Inbox aria-hidden="true" />
-              {inbox.length ? <span className="absolute top-1 right-1 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[11px] leading-4 font-semibold text-background">{inbox.length}</span> : null}
+              {waiting ? <span className="absolute top-1 right-1 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[11px] leading-4 font-semibold text-background">{waiting}</span> : null}
             </Link>
           </Button>
         </header>

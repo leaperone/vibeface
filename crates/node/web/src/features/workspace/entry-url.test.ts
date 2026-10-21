@@ -8,14 +8,15 @@ import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
 import { nodeName } from "./labels.ts"
-import { inputText, parseAlerts, parseArtifactPage, parseConversation, pendingChecks, parseDecision, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
+import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
 import { placeChanges, routineName, routineTrigger } from "./assistant.ts"
+import { agentName, foldAnswers, placeByTime, projectName } from "./questions.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] },
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] }, questions: [], sessions: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
 })
@@ -75,15 +76,6 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.throws(() => parseConversation({ ...context, deliveries: [{ work_id: "w", target_node: "n", state: "waiting_for_device" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
   assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }] } }).scheduler?.jobs[0].state, "pending_delivery")
-})
-test("alerts and decision results fail closed on shapes the web cannot show", () => {
-  const alert = { alert_id: "a", matter: "m", agent: "codex", session_id: "s", cwd: "/p", severity: "urgent", summary: "失败了", count: 1, node: "n", created_at_ms: 1, resolution: null }
-  assert.deepEqual(parseAlerts({ alerts: [alert] })[0].choices, [], "an alert without choices takes a reply")
-  assert.equal(parseAlerts({ alerts: [{ ...alert, choices: [{ label: "批准" }] }] })[0].choices[0].label, "批准")
-  assert.throws(() => parseAlerts({ alerts: [{ ...alert, severity: "loud" }] }))
-  assert.throws(() => parseAlerts({ alerts: [{ ...alert, resolution: "maybe" }] }))
-  assert.equal(parseDecision({ decision_id: "d", thread_id: "t", status: "unknown" }).status, "unknown")
-  assert.throws(() => parseDecision({ decision_id: "d", status: "sent" }))
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
@@ -186,10 +178,11 @@ test("workspace preserves bot and message requests while routing native decision
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
   let failControl = false, failBotCheck = false, failMessage = false
-  const alertRow = { alert_id: "alert", matter: "m", agent: "codex", session_id: "thread", choices: [{ label: "批准" }, { label: "拒绝" }], cwd: "/project", severity: "attention", summary: "要不要继续", count: 1, node: "worker", created_at_ms: 1, resolution: null }
-  let alertRows: Record<string, unknown>[] = [alertRow]
-  const decisions: Record<string, unknown>[] = []
-  let decisionOutcome: "delivered" | "unknown" | "lost" = "unknown"
+  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, assistant: { bot_id: "bot", name: "助手" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
+  const sessionRow = { ...questionRow, question_id: "s1", conversation_id: null, assistant: null }
+  let questionRows: Record<string, unknown>[] = [questionRow, sessionRow]
+  const answers: Record<string, unknown>[] = []
+  let answerOutcome: "answered" | "already_answered" | "lost" = "lost"
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
@@ -201,9 +194,13 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "nodes") return { nodes: [] }
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }
       if (method === "notifications") return { notifications: unreadNotifications }
-      if (method === "alerts") return { alerts: alertRows }
-      if (method === "send_decision") { decisions.push(JSON.parse(JSON.stringify(body))); if (decisionOutcome === "lost") throw new Error("connection lost"); return { decision_id: body.decision_id, thread_id: body.thread_id, status: decisionOutcome } }
-      if (method === "resolve_alert") { controls.push(JSON.parse(JSON.stringify({ method, ...body }))); alertRows = alertRows.map((row) => row.alert_id === body.alert_id ? { ...row, resolution: body.resolution } : row); return { event_hash: "resolved" } }
+      if (method === "questions") return { questions: questionRows }
+      if (method === "answer") {
+        answers.push(JSON.parse(JSON.stringify(body)))
+        if (answerOutcome === "lost") throw new Error("connection lost")
+        questionRows = questionRows.filter((row) => row.question_id !== body.question_id)
+        return { status: answerOutcome, message: { message_id: `a-${body.question_id}`, role: "user", text: answerOutcome === "answered" ? body.text : "停下", answers: body.question_id } }
+      }
       if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
       if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: transcript, works: [work] }
       if (method === "create_bot") {
@@ -269,24 +266,38 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().messagePending, null)
     await render().interruptWork("work")
     assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
-    const [alert] = render().alerts
-    assert.equal(alert.summary, "要不要继续")
-    decisionOutcome = "lost"
-    await assert.rejects(render().sendDecision(alert, "d1", { choice: 0 }), /connection lost/)
-    decisionOutcome = "unknown"
-    assert.equal((await render().sendDecision(alert, "d1", { choice: 0 })).status, "unknown")
-    decisionOutcome = "delivered"
-    assert.equal((await render().sendDecision(alert, "d1", { choice: 0 })).status, "delivered")
-    assert.deepEqual(decisions.map((item) => item.decision_id), ["d1", "d1", "d1"], "a retry sends the same decision_id")
-    assert.deepEqual(decisions[0], { node: "worker", thread_id: "thread", decision_id: "d1", alert_id: "alert", choice: 0 })
-    await assert.rejects(render().sendDecision(alert, "d2", { text: "  " }), /不能为空/)
-    await render().resolveAlert(alert, "decided")
-    assert.deepEqual(controls.pop(), { method: "resolve_alert", alert_id: "alert", resolution: "decided", attestation })
-    assert.equal(signed.at(-1), 'attestation|network|attention|{"type":"attention_resolved","alert_id":"alert","resolution":"decided"}', "the dismissal is signed for the shared attention scope")
-    assert.equal(render().alerts[0].resolution, "decided")
-    const resolved = controls.length
-    await render().resolveAlert(alert, "dismissed")
-    assert.equal(controls.length, resolved, "a resolved alert is not resolved twice")
+    const [question, session] = render().questions
+    assert.equal(question.text, "要不要继续")
+    await assert.rejects(render().answer(question, "  "), /不能为空/)
+    await assert.rejects(render().answer(question, " 继续 "), /connection lost/)
+    assert.deepEqual(JSON.parse(JSON.stringify(render().pendingAnswers)), [{ question_id: "q1", text: "继续" }], "an unknown outcome waits in the outbox")
+    assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"message_posted","message_id":"a-q1","role":"user","text":"继续","report_results":true,"answers":"q1"}', "the answer is signed as the chat message the Node writes")
+    const signatures = signed.length
+    await assert.rejects(render().answer(question, "停下"), /还没确认送达/)
+    assert.equal(answers.length, 1, "another answer waits until the first is settled")
+    answerOutcome = "answered"
+    assert.deepEqual(JSON.parse(JSON.stringify(await render().answer(question, "继续"))), { status: "answered", text: "继续" })
+    assert.deepEqual(answers, [{ question_id: "q1", text: "继续", attestation }, { question_id: "q1", text: "继续", attestation }], "trying again sends the stored request")
+    assert.equal(signed.length, signatures, "nothing is signed anew")
+    assert.deepEqual(render().pendingAnswers, [])
+    assert.equal(render().answered.q1, "继续", "the answer shows before the next read")
+    answerOutcome = "already_answered"
+    assert.equal((await render().answer(session, "处理")).text, "停下", "the answer that stood first is the one shown")
+    assert.equal(signed.at(-1), 'attestation|network|sessions|{"type":"message_posted","message_id":"a-s1","role":"user","text":"处理","report_results":true,"answers":"s1"}', "a session question is answered for sessions")
+    // After a new connection the outbox asks the questions list before sending an unknown answer again.
+    const later = { ...questionRow, question_id: "q2" }, elsewhere = { ...questionRow, question_id: "q3" }
+    questionRows = [later, elsewhere]
+    await render().refresh()
+    answerOutcome = "lost"
+    await assert.rejects(render().answer(render().questions[0], "继续"), /connection lost/)
+    await assert.rejects(render().answer(render().questions[1], "继续"), /connection lost/)
+    questionRows = [later]
+    answerOutcome = "answered"
+    const beforeSettle = answers.length
+    await reload()
+    for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
+    assert.deepEqual(answers.slice(beforeSettle).map((item) => item.question_id), ["q2"], "an answer whose question is still open is sent again; one already answered is not")
+    assert.deepEqual(render().pendingAnswers, [])
     await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker" }, "completed", " 设备上已看到结果 ")
     assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
     assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
@@ -471,32 +482,43 @@ const pendingResult = () => {
 }
 const settleComponent = () => new Promise(setImmediate)
 
-test("alert cards answer with a fixed choice or a short reply and keep the decision id until the session confirms", async () => {
-  const sent: unknown[][] = [], resolved: unknown[][] = []
-  let status = "unknown"
-  const workspace = { generation: 1, writable: true, nodes: [], run: (action: () => Promise<void>) => action(), announce() {},
-    sendDecision: async (...args: unknown[]) => { sent.push(args); return { decision_id: args[1], status } }, resolveAlert: async (...args: unknown[]) => { resolved.push(args) } }
-  const app = componentHarness('./alert-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备' }, './storage': { newId: () => `id-${sent.length}` } })
-  const alert = { alert_id: 'alert', matter: 'm', agent: 'codex', session_id: 'thread', choices: [{ label: '批准' }, { label: '拒绝' }], cwd: '/p', severity: 'attention', summary: '要不要继续', count: 2, node: 'worker', created_at_ms: 1, resolution: null }
-  const button = (elements: { props: Record<string, unknown> }[], label: string) => elements.find(({ props }) => props.children === label)
+test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
+  const sent: unknown[][] = []
+  const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
+    answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
+  const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
+  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName }, '@/components/app/kit': kit })
+  const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
+  type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
+  const labelled = (elements: Element[], label: string) => elements.find(({ props }) => [props.children].flat().includes(label))
+  const words = (elements: Element[]) => elements.flatMap(({ props }) => [props.children].flat()).filter((child) => typeof child === 'string').join('')
+  const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
   try {
-    let elements = app.render('AlertCard', { alert })
-    assert.equal(elements.some(({ type }) => type === 'form'), false, 'a decision with choices has no free text')
-    await (button(elements, '拒绝')?.props.action as () => Promise<void>)()
-    const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
-    assert.deepEqual(plain(sent[0]), [alert, 'id-0', { choice: 1 }])
-    elements = app.render('AlertCard', { alert })
-    assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'an unconfirmed send says so')
-    status = 'delivered'
-    await (button(app.render('AlertCard', { alert }), '拒绝')?.props.action as () => Promise<void>)()
-    assert.deepEqual(plain(sent[1]), [alert, 'id-0', { choice: 1 }], 'the same answer reuses the decision id')
-    assert.deepEqual(resolved, [], 'the device resolves a delivered decision itself')
-    elements = app.render('AlertCard', { alert: { ...alert, choices: [] } })
-    assert.equal(elements.some(({ type }) => type === 'form'), true, 'a Codex session without choices takes a reply')
-    elements = app.render('AlertCard', { alert: { ...alert, choices: [], agent: 'claude' } })
-    assert.equal(elements.some(({ type }) => type === 'form'), false, 'a Claude Code session has no channel back')
-    elements = app.render('AlertCard', { alert: { ...alert, resolution: 'dismissed' } })
-    assert.equal(button(elements, '批准'), undefined, 'a handled alert offers no answers')
+    let elements: Element[] = app.render('QuestionCard', { question })
+    assert.match(words(elements), /web/, 'the meta line names the project')
+    assert.match(words(elements), /Mac mini/, 'and the device')
+    assert.equal(elements.some(({ type }) => type === 'Link'), false, 'in its own chat the card does not link to it')
+    labelled(elements, '停下')?.props.onClick?.(); await settleComponent()
+    assert.deepEqual(plain(sent[0]), [question, '停下'], 'a choice answers with its label')
+    app.render('QuestionCard', { question }).find(({ props }) => props['aria-label'] === '回答')?.props.onChange?.({ target: { value: '先等等' } })
+    app.render('QuestionCard', { question }).find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {} }); await settleComponent()
+    assert.deepEqual(plain(sent[1]), [question, '先等等'], 'typed text answers too')
+    elements = app.render('QuestionCard', { question, inbox: true })
+    assert.equal(elements.find(({ type }) => type === 'Link')?.props.params && plain(elements.find(({ type }) => type === 'Link')?.props.params).botId, 'bot', '待处理 links to the chat')
+    workspace.pendingAnswers = [{ question_id: 'q1', text: '继续' }]
+    elements = app.render('QuestionCard', { question })
+    assert.equal(labelled(elements, '停下'), undefined, 'an unconfirmed answer is not replaced by another')
+    assert.match(words(elements), /没确认送达/)
+    labelled(elements, '再试')?.props.onClick?.(); await settleComponent()
+    assert.deepEqual(plain(sent[2]), [question, '继续'], 'trying again sends the same answer')
+    workspace.pendingAnswers = []
+    elements = app.render('QuestionCard', { question, answer: '继续' })
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'form'), false, 'an answered question offers nothing to press')
+    assert.match(words(elements), /已回答 · 继续/)
+    workspace.answered = { q1: '停下' }
+    elements = app.render('QuestionCard', { question })
+    assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
+    assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
   } finally { app.close() }
 })
 
@@ -560,11 +582,11 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], alerts: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -689,11 +711,11 @@ test("conversation blocks sending until an online node can run the manager Agent
   let sent = 0
   const workspace = (nodes: unknown[]) => ({
     generation: 1, isCurrent: () => true, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], alerts: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()

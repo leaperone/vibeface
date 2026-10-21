@@ -1,10 +1,11 @@
 import type { TranscriptMessage } from "../chat/types"
 import type { ReplyStatus } from "../chat/types"
 import type {
-  Alert, ConversationPayload, ConversationSummary, DecisionResult, NodeInfo, NotificationRecord, Outlet, Severity, TriageSettings,
+  AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit,
 } from "./types"
+import { answerId } from "./questions.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
   const normalized = value.trim()
@@ -58,7 +59,7 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
 }
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs), answers: optionalText(data.answers) }
 }
 function replyStatus(value: unknown): ReplyStatus {
   switch (value) {
@@ -132,6 +133,8 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     local_node: text(data.local_node),
     changes: list(data.changes).map(changeRecord),
     assistant: assistantView(data.assistant),
+    questions: list(data.questions).map(question),
+    sessions: list(data.sessions).map(sessionHandoff),
   }
 }
 function edit(value: unknown): FieldEdit | undefined {
@@ -239,29 +242,45 @@ export function parseWriteStatus(value: unknown): WriteStatus {
 }
 
 function severity(value: unknown): Severity {
-  if (value !== "info" && value !== "attention" && value !== "urgent") throw new Error("提醒的紧急程度无法识别。")
+  if (value !== "info" && value !== "attention" && value !== "urgent") throw new Error("问题的紧急程度无法识别。")
   return value
 }
-export function parseAlerts(value: unknown): Alert[] {
-  return list(record(value).alerts).map((item) => {
-    const data = record(item), resolution = data.resolution
-    if (resolution !== null && resolution !== "decided" && resolution !== "dismissed") throw new Error("提醒的处理结果无法识别。")
-    return {
-      alert_id: text(data.alert_id), matter: text(data.matter), agent: text(data.agent), session_id: text(data.session_id),
-      thread_id: optionalText(data.thread_id), request_id: optionalText(data.request_id), turn_id: optionalText(data.turn_id),
-      choices: data.choices == null ? [] : list(data.choices).map((choice) => ({ label: text(record(choice).label) })),
-      cwd: text(data.cwd), severity: severity(data.severity), summary: text(data.summary), count: number(data.count), node: text(data.node),
-      created_at_ms: number(data.created_at_ms), resolution,
-    }
-  })
+function subject(value: unknown): QuestionSubject {
+  const data = record(value)
+  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), ...(data.request_id == null ? {} : { request_id: text(data.request_id) }) }
 }
-export function parseDecision(value: unknown): DecisionResult {
-  const data = record(value), status = data.status
-  if (status !== "delivered" && status !== "unknown" && status !== "rejected") throw new Error("送达结果无法识别。")
-  return { decision_id: text(data.decision_id), status, reason: optionalText(data.reason) }
+function question(value: unknown): Question {
+  const data = record(value)
+  const assistant = data.assistant == null ? null : record(data.assistant), answer = data.answer == null ? null : record(data.answer)
+  return {
+    question_id: text(data.question_id), conversation_id: data.conversation_id == null ? null : text(data.conversation_id),
+    assistant: assistant && { bot_id: text(assistant.bot_id), name: text(assistant.name) },
+    severity: severity(data.severity), text: text(data.text),
+    choices: list(data.choices).map((item) => {
+      const choice = record(item)
+      return { label: text(choice.label), ...(choice.conversation_id == null ? {} : { conversation_id: text(choice.conversation_id) }) }
+    }),
+    about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
+    answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },
+  }
+}
+function sessionHandoff(value: unknown): SessionHandoff {
+  const data = record(value)
+  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), question_id: text(data.question_id), created_at_ms: number(data.created_at_ms) }
+}
+/** Every unanswered question across the network. */
+export function parseQuestions(value: unknown): Question[] {
+  return list(record(value).questions).map(question)
+}
+/** The answer that stands for this question, whether this browser's or one written first. */
+export function parseAnswer(value: unknown, questionId: string): AnswerResult {
+  const data = record(value), message = record(data.message), status = data.status
+  if (status !== "answered" && status !== "already_answered") throw new Error("回答结果无法识别。")
+  if (message.message_id !== answerId(questionId)) throw new Error("回答结果和这个问题对不上，请再查一次。")
+  return { status, text: text(message.text) }
 }
 function outlet(value: unknown): Outlet {
-  if (value !== "record" && value !== "webhook" && value !== "both" && value !== "off") throw new Error("提醒去向无法识别。")
+  if (value !== "record" && value !== "both") throw new Error("提醒去向无法识别。")
   return value
 }
 export function parseTriageSettings(value: unknown): TriageSettings {
