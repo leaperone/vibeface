@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { AssistantSettings } from "@/features/devices/assistant-settings"
 import { useWorkspace } from "@/features/workspace/context"
-import { finishOnboarding } from "./onboarding-flag"
+import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding-flag"
 
 function Dots({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
@@ -19,7 +19,7 @@ function Dots({ step }: { step: number }) {
 export function Onboarding() {
   const workspace = useWorkspace()
   const navigate = useNavigate()
-  const [step, setStep] = useState(3)
+  const step = useOnboarding() ?? 3
   const [name, setName] = useState("我的助手")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>(null)
@@ -41,8 +41,8 @@ export function Onboarding() {
         <h2 className="flex items-center gap-2 text-heading font-semibold"><Bot aria-hidden="true" className="size-5 text-muted-foreground" />让这台电脑运行助手</h2>
         <AssistantSettings onboarding />
         <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" className="-ms-3" onClick={() => setStep(4)}>稍后设置</Button>
-          <Button type="button" onClick={() => setStep(4)}>下一步</Button>
+          <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(4)}>稍后设置</Button>
+          <Button type="button" onClick={() => setOnboardingStep(4)}>下一步</Button>
         </div>
       </section> : <section className="grid gap-4 rounded-xl border bg-card p-5">
         <h2 className="flex items-center gap-2 text-heading font-semibold"><MessageSquarePlus aria-hidden="true" className="size-5 text-muted-foreground" />创建第一个助手</h2>

@@ -192,12 +192,11 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     })
   }
 
-  // Not being a member yet is the normal state on this screen, so it reads as a hint rather than an error.
-  const alert = error || device.error && !['reconnecting', 'unpaired'].includes(device.phase) ? <InlineError error={error || device.error} />
-    : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p>
+  const alert = error || device.error && device.phase !== 'reconnecting' ? <InlineError error={error || device.error} />
     : notice ? <p role="status" className="text-meta text-muted-foreground">{notice}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
+  const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
     <p className="text-meta text-muted-foreground">其他方式</p>
     <div className="-ms-3 flex flex-wrap gap-2">
@@ -250,7 +249,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         </p>}
         {thisComputer
           ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={formerName || defaultComputerName()} /></Field>
-          : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>}
+          : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName(device.identity?.deviceId)} /></Field>}
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
     </form>}
@@ -264,13 +263,13 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       <header className="grid gap-3">
         <span className="text-heading font-semibold tracking-tight">vibeface</span>
         {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 vibeface 和浏览器分开保存登录信息，需要在这里再加入一次。</p> : null}
-        {active === 'local' && setup && !focused ? <Steps step={names ? 2 : 1} /> : device.review?.kind === 'bootstrap' ? <Steps step={2} /> : null}
+        {step ? <Steps step={step} /> : null}
       </header>
       {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
       {alert}
       {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
       {other}
-      {device.identity && !focused ? <Details>
+      {device.identity && !focused ? <Details key={step ?? active}>
         <DetailRow label="这个浏览器的设备编号" value={device.identity.deviceId} mono />
         {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
           <fieldset disabled={linking} className="grid gap-3">

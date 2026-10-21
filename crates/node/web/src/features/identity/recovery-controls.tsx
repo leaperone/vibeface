@@ -107,7 +107,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="恢复密码"><Input type="password" name="password" autoComplete="off" required /></Label>
-        <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
+        <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName(device.identity?.deviceId)} /></Label>
         <Details label="连接到哪台电脑" open={!target}>
           <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>

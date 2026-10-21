@@ -1,6 +1,6 @@
-import { Link, createFileRoute } from '@tanstack/react-router'
+import { createFileRoute } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bot, ChevronDown, ChevronLeft, CircleX, Code, Copy, Globe, Info, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Server, Terminal, TriangleAlert, X, type LucideIcon } from 'lucide-react'
+import { Bot, ChevronDown, CircleX, Code, Copy, Globe, Info, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Server, Terminal, TriangleAlert, X, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -59,8 +59,7 @@ function LogsPage() {
   }
   if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机打开的页面可以查看日志。" />
   return <div className="mx-auto grid w-full max-w-3xl gap-4">
-    <div className="flex items-center justify-between gap-2">
-      <Button asChild variant="ghost" className="-ms-3"><Link to="/settings"><ChevronLeft aria-hidden="true" />设置</Link></Button>
+    <div className="flex items-center justify-end gap-2">
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
       </Button>
@@ -115,7 +114,6 @@ function LogRow({ record, chat, open, onToggle, onCopyAll }: { record: LogRecord
         <span className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
           <time className="shrink-0 tabular-nums" dateTime={new Date(record.ts_ms).toISOString()}>{time(record.ts_ms)}</time>
           <span className="shrink-0">{sourceLabel[record.source]}</span>
-          <span className="min-w-0 truncate font-mono text-xs">{record.event}</span>
         </span>
       </span>
       <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')} />

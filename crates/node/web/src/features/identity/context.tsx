@@ -47,7 +47,7 @@ type DeviceContextValue = {
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
-  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
@@ -306,6 +306,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       step({ type: 'lost', reason: '所有访问地址都连不上。' })
       setPhase('reconnecting'); scheduleReconnect()
     }, delay)
+  }
+  /** Skips the wait before the next reconnect attempt. */
+  function retryNow() {
+    if (reconnectTimer.current === null) return
+    clearTimeout(reconnectTimer.current); reconnectTimer.current = null
+    scheduleReconnect(true)
   }
   async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {
     if (target.entry.local) {
@@ -781,8 +787,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (!invitation && (localLaunch || load('local-origin') === true)) {
         const local = await localBrowserEntry(me, localLaunch)
         if (!mounted || version !== generation.current) return
-        store('local-origin', local ? true : null)
-        if (local) { const opening = connect(local); version = generation.current; await opening; return }
+        // Kept while the Node is down, so the next load on this origin still asks it.
+        if (local) { store('local-origin', true); const opening = connect(local); version = generation.current; await opening; return }
       }
       const pending = invitation ? null : loadJoining()
       if (pending) {
@@ -862,7 +868,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },

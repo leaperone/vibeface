@@ -131,7 +131,7 @@ export function AssistantSettings({ onboarding = false, update, onChange }: { on
       <p className="text-meta font-medium text-muted-foreground">可用文件夹</p>
       {draft.roots.length ? <ul className="grid gap-1">{draft.roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
         <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-mono text-meta" title={root}>{root}</span>
+        <FolderPath path={root} />
         <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => void load({ ...draft, roots: draft.roots.filter((item) => item !== root) })}><X aria-hidden="true" /></Button>
       </li>)}</ul> : <p className="text-meta text-muted-foreground">还没有，助手只能在自己的文件夹里工作</p>}
       <div className="flex min-w-0 gap-2">
@@ -141,4 +141,12 @@ export function AssistantSettings({ onboarding = false, update, onChange }: { on
     </div>
     <InlineError error={error} />
   </form>
+}
+
+/** A long path gives up its parent folders first, so the folder's own name stays readable. */
+function FolderPath({ path }: { path: string }) {
+  const cut = path.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
+  return <span className="flex min-w-0 flex-1 font-mono text-meta" title={path}>
+    <span className="min-w-0 truncate text-muted-foreground">{path.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{path.slice(cut)}</span>
+  </span>
 }

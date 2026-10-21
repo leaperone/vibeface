@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, RotateCw, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
@@ -49,6 +49,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const back = backTo(pathname)
+  const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
   const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? "我的设备" : "")
@@ -129,8 +130,9 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       </Sidebar>
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
         <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
-          {back ? <Button asChild variant="ghost" size="icon" className="-ms-3 md:hidden"><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
-          <SidebarTrigger aria-label="菜单" title="菜单" className="-ms-2.5 max-md:hidden" />
+          {/* A page inside another page goes back from its header at any width; the sidebar covers the rest on wide screens. */}
+          {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
+          <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", !nested && "-ms-2.5")} />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             {chatRoute ? <AssistantPanelButton /> : null}
             <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
@@ -214,7 +216,8 @@ export function ConnectionCapsule() {
       <Popover.Content side="top" align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
         <p className="font-medium">访问地址</p>
         <p className="break-all text-muted-foreground">{address}</p>
-        {link.kind === "offline" ? <p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
+        {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
+          <Button type="button" size="sm" className="w-fit" onClick={device.retryNow}><RotateCw aria-hidden="true" />立即重连</Button></div>
           : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><ShieldCheck aria-hidden="true" className="size-4" />端到端加密，已验证设备</p> : null}
         {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}
         {others.length ? <>
@@ -240,7 +243,7 @@ export function ConnectionCapsule() {
 
 /** Same layout as the workspace, shown while the browser loads its keys and connects. */
 /** `home`: the conversation list loads on a phone, the last conversation on a wide screen. */
-export function ShellSkeleton({ retry = null, onLeave, home = false }: { retry?: number | null; onLeave?: () => void; home?: boolean } = {}) {
+export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: { retry?: number | null; onRetry?: () => void; onLeave?: () => void; home?: boolean } = {}) {
   const status = retry === null
     ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
     : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
@@ -252,7 +255,10 @@ export function ShellSkeleton({ retry = null, onLeave, home = false }: { retry?:
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
-      {retry !== null && onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
+      {retry !== null && onLeave ? <div className="flex flex-wrap justify-center gap-2 px-4 pt-6">
+        {onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
+        <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button>
+      </div> : null}
       {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}
       <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>
     </div>

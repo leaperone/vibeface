@@ -38,7 +38,7 @@ export function ConversationList() {
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新助手" title="新助手" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
     </div>
     {assistants}
-    <div className="mt-4 px-1 md:hidden"><ConnectionCapsule /></div>
+    <footer className="mt-6 border-t px-1 pt-2 md:hidden"><ConnectionCapsule /></footer>
   </div>
 }
 
