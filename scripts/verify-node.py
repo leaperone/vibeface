@@ -1668,16 +1668,24 @@ def work_checks(run, workspace, a, network, passed):
                        socket=socket_path)
     require(any(row["id"] == running["thread_id"] for row in listed["data"]) and models["data"][0]["id"] == "fixture-model"
             and renamed.returncode == 0, "codex call passes any App Server method through")
+    def resumes():
+        return len([row for row in rpc("thread/resume") if row["message"]["params"].get("threadId") == running["thread_id"]])
+
+    resumed = resumes()
     watcher = subprocess.Popen([str(a.binary), "codex", "watch", running["thread_id"]], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, text=True, env={**a.environment(), "VIBEFACE_CODEX_SOCKET": socket_path})
+                               stderr=subprocess.DEVNULL, env={**a.environment(), "VIBEFACE_CODEX_SOCKET": socket_path})
     try:
+        wait_for("codex watch subscribes to the thread", lambda: resumes() > resumed)
         (directory / "release").touch()
-        watched = []
+        watched = b""
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not any('"turn/completed"' in line for line in watched):
+        while time.monotonic() < deadline and b'"turn/completed"' not in watched:
             if select.select([watcher.stdout], [], [], 1)[0]:
-                watched.append(watcher.stdout.readline())
-        require(any('"turn/completed"' in line for line in watched), "codex watch streams the thread's notifications")
+                chunk = os.read(watcher.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                watched += chunk
+        require(b'"turn/completed"' in watched, "codex watch streams the thread's notifications")
     finally:
         watcher.kill()
         watcher.wait(timeout=5)
