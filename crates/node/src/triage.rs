@@ -271,9 +271,11 @@ pub fn wake_prompt(
         "New events from the user's local coding agent sessions are waiting. Decide for each \
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
-- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question \"the question, in the user's language\" [--choice LABEL]...`. \
-It asks in the chat of the event's assistant. Each --choice is one short answer the user can pick (at most 8); \
-the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
+- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]...`. \
+It asks in the chat of the event's assistant. Write TEXT in the user's language and plain words: what is happening and what \
+they need to decide, in one or two sentences, never a shell command, code or raw output. Each --choice is one short action \
+the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the likely answer first and never a destructive \
+one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
 The answer comes back to that assistant as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \

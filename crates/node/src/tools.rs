@@ -105,7 +105,8 @@ impl Tool {
             Tool::DispatchWork => (
                 "Start work in cwd on target_node (default: this device). On this device the CLI registers the work with the Node, then starts one Codex turn with full access through the App Server; on another device that device's assistant gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up. thread sends the prompt into an existing Codex thread on this device instead, steering its running turn or starting one. model, effort and images (local image paths) pass to the turn.",
                 json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
-                "prompt":string(),"cwd":string(),"call_ref":string(),"target_node":string(),
+                "prompt":{"type":"string","minLength":1,"description":"The task as Codex should read it: goal, where, limits, what done means; a required result format with a short example. Not a relay of the chat"},
+                "cwd":string(),"call_ref":string(),"target_node":string(),
                 "parent":string(),"continues":string(),
                 "thread":{"type":"string","minLength":1,"description":"An existing Codex thread on this device: prompt goes into it, steering its running turn or starting one; cwd is taken from the thread"},
                 "model":string(),
