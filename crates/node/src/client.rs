@@ -1978,7 +1978,10 @@ mod tests {
         );
         assert_eq!(read["providers"][1]["env"][0]["set"], true);
         assert_eq!(
-            (read["providers"][1]["state"].clone(), read["providers"][1]["issues"].clone()),
+            (
+                read["providers"][1]["state"].clone(),
+                read["providers"][1]["issues"].clone()
+            ),
             (json!("unused"), json!([])),
             "Cursor runs nothing until the assistant uses it"
         );
