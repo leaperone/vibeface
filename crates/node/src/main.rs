@@ -53,8 +53,8 @@ enum Action {
     Status(Access),
     /// Manage this user's installed node service and update timer.
     Service(service::Service),
-    /// Display this node's local browser entry.
-    Access(Access),
+    /// Display this node's local browser entry, or turn opening it without confirmation on or off.
+    Access(LocalEntry),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
     /// Join a personal network with an invite link from a management device.
@@ -363,6 +363,18 @@ struct Access {
     data: DataDir,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct LocalEntry {
+    #[command(flatten)]
+    access: Access,
+    /// Let browsers on this computer open the Node without confirming, then print the entry.
+    #[arg(long, conflicts_with = "disable")]
+    enable: bool,
+    /// Require confirmation for browsers on this computer; signs out their local sessions.
+    #[arg(long)]
+    disable: bool,
 }
 
 #[derive(Args)]
@@ -1026,14 +1038,33 @@ fn is_loopback(url: &Url) -> bool {
     })
 }
 
-async fn access(options: Access) -> Result<()> {
+async fn access(entry: LocalEntry) -> Result<()> {
+    let options = entry.access;
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
         epoch == json!({"data_epoch":crate::config::DATA_EPOCH}),
         "data directory uses another format; existing data was preserved"
     );
-    let configuration = Config::load(dir)?;
+    let mut configuration = Config::load(dir)?;
+    if entry.enable || entry.disable {
+        ensure!(
+            !configuration.public_entry,
+            "a public entry has no local browser access"
+        );
+        let running = set_local_access(dir, entry.enable).await?;
+        if entry.disable || !running {
+            let state = if entry.enable { "on" } else { "off" };
+            let note = if running {
+                ""
+            } else {
+                "; the node applies it when it starts"
+            };
+            println!("local browser access without confirmation is {state}{note}");
+            return Ok(());
+        }
+        configuration = Config::load(dir)?;
+    }
     let identity = config::identity(dir)?;
     if configuration.public_entry {
         if options.json {
@@ -1144,6 +1175,28 @@ async fn access(options: Access) -> Result<()> {
         println!("{url}");
     }
     Ok(())
+}
+
+/// Tells the running Node, which saves and applies it at once; a stopped Node only has its
+/// configuration changed. Returns whether a Node was running.
+async fn set_local_access(dir: &Path, enabled: bool) -> Result<bool> {
+    match maintenance::set_local_access(dir, enabled).await {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+            }) =>
+        {
+            let mut configuration = Config::load(dir)?;
+            configuration.local_auto_access = enabled;
+            configuration.save(dir)?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -1696,6 +1749,9 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["vibeface", "access", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "access", "--enable"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "access", "--enable", "--disable"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "status", "--enable"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "status", "--json"]).is_ok());
         for action in [
             "install",

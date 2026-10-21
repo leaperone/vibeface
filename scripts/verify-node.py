@@ -3516,6 +3516,16 @@ def auto_route_acceptance(options):
         network = target.bootstrap()
         passed("genesis", network=network, target=target.device_id)
 
+        def local_entry():
+            return json.loads(node_cli(target, "access", "--json", "--data-dir", str(target.directory)).stdout)
+        require(local_entry().get("local") is True, "a new network opens local browser access without confirmation")
+        node_cli(target, "access", "--disable", "--data-dir", str(target.directory))
+        require(not json.loads((target.directory / "config.json").read_text())["local_auto_access"]
+                and local_entry().get("local") is None, "access --disable turns it off in the running Node")
+        node_cli(target, "access", "--enable", "--data-dir", str(target.directory))
+        require(local_entry().get("local") is True, "access --enable turns it back on without a restart")
+        passed("access-cli-toggle", node=target.device_id)
+
         impostor = fresh(target.url)
         other_id = impostor.own_id()
         refused = impostor.connect(other_id, check=False)
