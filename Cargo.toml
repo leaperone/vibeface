@@ -3,7 +3,7 @@ members = ["crates/protocol", "crates/bridge", "crates/node", "crates/secure"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.1-nightly.20261021.4"
+version = "0.0.1-nightly.20261021.5"
 edition = "2024"
 rust-version = "1.91"
 
