@@ -152,6 +152,8 @@ pub struct Runtime {
     _process_lock: Arc<std::fs::File>,
     codex_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
     pub(crate) triage: triage::TriageState,
+    pub(crate) node_join: std::sync::Mutex<Option<crate::client::NodeJoinTask>>,
+    rejoin: tokio::sync::Notify,
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -260,6 +262,8 @@ impl Runtime {
             _process_lock: process_lock,
             codex_rx: Mutex::new(Some(rx)),
             triage,
+            node_join: std::sync::Mutex::new(None),
+            rejoin: tokio::sync::Notify::new(),
         };
         Ok(node)
     }
@@ -284,6 +288,19 @@ impl Runtime {
         self.align(&network).await;
         self.wake_sync_all();
         Ok(view)
+    }
+
+    /// Asks the serving process to set this removed Node's data aside and start fresh. The short
+    /// wait lets the reply reach the local page first.
+    pub(crate) fn request_rejoin(self: &Arc<Self>) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            node.rejoin.notify_one();
+        });
+    }
+    pub async fn rejoin_requested(&self) {
+        self.rejoin.notified().await
     }
 
     pub async fn has_membership(&self) -> Result<bool> {

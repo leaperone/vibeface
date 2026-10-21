@@ -358,14 +358,19 @@ async fn main() -> Result<()> {
             }
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut rejoin = false;
             let result = tokio::select! {
                 result = api::serve(runtime.clone()) => result,
-                result = maintenance::serve(runtime.clone(), options.data.data_dir) => result,
+                result = maintenance::serve(runtime.clone(), options.data.data_dir.clone()) => result,
+                _ = runtime.rejoin_requested() => { rejoin = true; Ok(()) }
                 _ = terminate.recv() => Ok(()),
                 _ = tokio::signal::ctrl_c() => Ok(()),
             };
             // The App Server group must not outlive the Node that manages it.
             runtime.shutdown().await;
+            if rejoin {
+                return restart_fresh(&options.data.data_dir);
+            }
             result
         }
         Action::Access(options) => access(options).await,
@@ -716,6 +721,73 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
         );
     }
     Ok(())
+}
+
+/// Restarts this removed Node fresh. Replacing the process image keeps its PID, so a service
+/// manager sees no exit and a Node started by hand keeps running; nothing of the old runtime
+/// survives to write into the data set aside.
+fn restart_fresh(dir: &Path) -> Result<()> {
+    match start_over(dir) {
+        Ok(archive) => tracing::warn!(archive = %archive.display(), "removed Node data set aside"),
+        Err(error) => tracing::error!(%error, "removed Node data could not be set aside"),
+    }
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error).context("restart the Node")
+}
+
+/// Renames the data directory to `<name>-removed-<local time>`, never deleting it, and puts a
+/// fresh Node with the same settings in its place. The new directory is complete before either
+/// rename, so a failure leaves the old data where it was.
+fn start_over(dir: &Path) -> Result<PathBuf> {
+    let configuration = Config::load(dir)?;
+    let entry_token = configuration
+        .network
+        .entry
+        .is_some()
+        .then(|| net::read_token_file(&dir.join(net::ENTRY_TOKEN_FILE)))
+        .transpose()?;
+    let name = dir
+        .file_name()
+        .context("data directory has no name")?
+        .to_string_lossy();
+    let stamp = local_time_stamp();
+    let archive = dir.with_file_name(format!("{name}-removed-{stamp}"));
+    let fresh = dir.with_file_name(format!(".{name}-fresh-{stamp}"));
+    ensure!(
+        !archive.exists() && !fresh.exists(),
+        "{} already exists",
+        archive.display()
+    );
+    if let Err(error) = initialize(&fresh, configuration, entry_token) {
+        let _ = fs::remove_dir_all(&fresh);
+        return Err(error);
+    }
+    fs::rename(dir, &archive)?;
+    if let Err(error) = fs::rename(&fresh, dir) {
+        fs::rename(&archive, dir)?;
+        return Err(error.into());
+    }
+    Ok(archive)
+}
+
+fn local_time_stamp() -> String {
+    let mut buffer = [0u8; 32];
+    // SAFETY: `localtime_r` fills `tm` from `now`; `strftime` writes at most `buffer.len()` bytes.
+    let written = unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        libc::strftime(
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            c"%Y%m%d-%H%M%S".as_ptr(),
+            &tm,
+        )
+    };
+    String::from_utf8_lossy(&buffer[..written]).into_owned()
 }
 
 fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {

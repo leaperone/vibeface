@@ -2,8 +2,8 @@ export function shouldAutoConnect(input: { hasInvitation: boolean; savedCount: n
   return !input.hasInvitation && input.savedCount === 1
 }
 
-export function primaryLane(input: { hasInvitation: boolean; savedCount: number; hasLocalSetup: boolean }): 'local' | 'invite' | 'saved' {
-  if (input.hasInvitation) return 'invite'
+export function primaryLane(input: { hasInvitation: boolean; savedCount: number; hasLocalSetup: boolean; rejoined?: boolean }): 'local' | 'invite' | 'saved' {
+  if (input.hasInvitation || input.rejoined) return 'invite'
   if (input.hasLocalSetup) return 'local'
   if (input.savedCount === 0) return 'invite'
   return 'saved'

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { connectDevice, initClient, parseJoinLink, signClient, validTarget } from '../../../transport.js'
+import { connectDevice, initClient, joinTicket, parseJoinLink, signClient, validTarget } from '../../../transport.js'
 import type { DeviceChannel, JoinLink } from '../../../transport.js'
 import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, parseLocalSetup, record, same, text } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PublicIdentity, ReadyConnection } from '@/lib/node'
@@ -16,7 +16,7 @@ import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, ve
 import type { Entrance, OpenEntrance } from '@/lib/entrances'
 import { joinTabs } from '@/lib/tabs'
 
-type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'ready'
+type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
@@ -28,6 +28,8 @@ type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
  */
 export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; reason?: string | null }
 type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
+/** This computer's own join, as the Node reports it while the manager approves. */
+export type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string }
 /** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
 type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 /** A fresh invitation; without a public HTTPS entry a phone scans `ticket` from its public entry's page. */
@@ -41,6 +43,9 @@ type DeviceContextValue = {
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
+  /** Set on the local page of a removed Node, which alone may start it over. */
+  removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
+  rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<void>
   connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
@@ -144,6 +149,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [review, setReview] = useState<Review | null>(null)
   const [initialInvitation, setInitialInvitation] = useState('')
   const [localSetup, setLocalSetup] = useState<LocalSetup | null>(null)
+  const [removedFrom, setRemovedFrom] = useState<ConnectionEntry | null>(null)
+  const [rejoined, setRejoined] = useState(false)
+  const [nodeJoining, setNodeJoining] = useState<NodeJoining | null>(null)
   const [localAutoAccess, setLocalAutoAccessState] = useState<boolean | null>(null)
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
@@ -401,8 +409,53 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   /** A device removed from the network shows only that, once its signed removal checks out. */
   function removed(auth: unknown, active: Session, networkId: string) {
     try { if (!verifyRemoval(auth, active.entry.device_id, networkId)) return false } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
-    resetConnection(); setPhase('removed')
+    resetConnection(); setPhase('removed'); setRemovedFrom(active.entry)
     return true
+  }
+  /** Sets this removed computer's data aside and waits for it to come back fresh, then offers the join. */
+  async function rejoin() {
+    const entry = removedFrom
+    if (!entry?.local) throw new Error('请在这台电脑上打开它的本机页面，再重新加入。')
+    try { await callSession(await open(entry, true), 'rejoin') }
+    catch (cause) { resetConnection(); setPhase('removed'); throw cause }
+    resetConnection(); setPhase('restarting')
+    const version = generation.current
+    removeEntry(entry)
+    const deadline = Date.now() + 60_000
+    let setup: LocalSetup | null = null
+    while (setup?.kind !== 'uninitialized' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      if (version !== generation.current) throw changed()
+      try { setup = await discoverLocalSetup(new AbortController().signal) } catch { setup = null }
+    }
+    if (version !== generation.current) throw changed()
+    if (setup?.kind !== 'uninitialized') { setPhase('removed'); throw new Error('这台电脑还没重新开始。请刷新页面看看，或用下面的命令。') }
+    setLocalSetup(setup); setRejoined(true); setPhase('disconnected')
+  }
+  /** Joins this computer, not this browser, with an invite; the Node runs the join and shows the short code. */
+  async function joinThisComputer(linkText: string, nameValue: string) {
+    if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。')
+    const name = deviceName(nameValue)
+    const found = joinTicket(linkText)
+    if (!found) throw new Error('这不是有效的加入链接。')
+    const link = `${found.origin ?? location.origin}/join#${found.ticket}`
+    const { capability, entry } = localSetup
+    const active = await open(entry)
+    setNodeJoining({ status: 'waiting' })
+    try {
+      for (;;) {
+        const reply = record(await callSession(active, 'node_join', { capability, link, name }))
+        if (reply.status === 'failed') throw new Error('没能加入。链接可能已过期或被拒绝，请在已有设备上重新添加。')
+        if (reply.status === 'joined') break
+        if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这台电脑返回了未知的加入状态。')
+        setNodeJoining({ status: reply.status, code: typeof reply.code === 'string' ? reply.code : undefined })
+        await new Promise(resolve => setTimeout(resolve, 2000))
+      }
+      setNodeJoining({ status: 'joined' })
+      const setup = await discoverLocalSetup(new AbortController().signal)
+      if (setup?.kind !== 'initialized' || setup.entry.device_id !== entry.device_id) throw new Error('已加入，但本机页面没变。请刷新页面。')
+      launchLocal(setup)
+    } finally { setNodeJoining(null) }
   }
   async function refreshDirectory() {
     if (!ready?.isCurrent()) return
@@ -606,6 +659,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (version !== generation.current) throw changed()
     if (setup?.kind !== 'initialized' || setup.entry.device_id !== localSetup.entry.device_id) throw new Error('本机页面对应的电脑已变化，请刷新页面。')
     setLocalSetup(setup)
+    launchLocal(setup)
+  }
+  function launchLocal(setup: Extract<LocalSetup, { kind: 'initialized' }>) {
     if (!setup.local_launch) throw new Error('本机免确认打开已关闭。请用加入链接或恢复文件。')
     const url = new URL(setup.local_launch.url)
     url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id }).toString()
@@ -784,6 +840,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
+    removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer,
     connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },

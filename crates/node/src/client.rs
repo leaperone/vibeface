@@ -533,13 +533,15 @@ async fn serve_session(
 }
 
 /// Methods a device that is not (or no longer) a member may call.
-const GUEST_METHODS: [&str; 6] = [
+const GUEST_METHODS: [&str; 8] = [
     "info",
     "authenticate",
     "join",
     "join_status",
     "recovery_state",
     "recover",
+    "node_join",
+    "rejoin",
 ];
 
 /// Domain of the recovery root's short-lived permission to read the membership state.
@@ -844,6 +846,14 @@ async fn dispatch(
             recover(node, session, &params).await?;
             authentication(node, session).await
         }
+        "node_join" => Ok(serde_json::to_value(
+            join_from_local_page(node, &params).await?,
+        )?),
+        "rejoin" => {
+            removed_and_local(node, session).await?;
+            node.request_rejoin();
+            Ok(json!({"restarting":true}))
+        }
         _ => bail!("unknown client method"),
     }
 }
@@ -961,6 +971,28 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
         epoch: view.epoch,
         can_manage: false,
     })
+}
+
+/// Starting over is for the owner at this computer, once the signed removal is installed here.
+async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
+    let view = node.membership_state().await?.project()?;
+    let node_id = node.identity.device_id()?;
+    ensure!(
+        view.revocation(&node_id).is_some(),
+        "this Node has not been removed from the personal network"
+    );
+    let cookie = session
+        .cookie
+        .as_deref()
+        .context("only this computer's local page can rejoin")?;
+    let local = node
+        .local_access
+        .session(cookie, &node_id, &view.network_id)?;
+    ensure!(
+        local.device_id == session.device_id,
+        "local browser session belongs to another device"
+    );
+    Ok(())
 }
 
 async fn is_local_only(node: &Runtime, session: &Session) -> Result<bool> {
@@ -1150,13 +1182,102 @@ impl JoinLink {
 
 /// `vibeface join`: this Node asks the ticket's entry to admit it and waits for approval.
 pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkState> {
-    let (_, ticket) = parse_join_link(link)?;
     let node = Runtime::open(dir).await?;
+    join_as_node(&node, link, name, |progress| match progress {
+        NodeJoin::Confirming { code } => println!("短码：{code}。请在管理设备上核对相同后批准。"),
+        _ => println!("已提交加入请求，等待管理设备批准。"),
+    })
+    .await
+}
+
+/// How far this Node's own join has come; the local page shows it while the manager approves.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum NodeJoin {
+    Waiting,
+    Confirming { code: String },
+    Joined,
+    Failed,
+}
+
+/// The join this Node runs for its own local page, one at a time.
+pub(crate) struct NodeJoinTask {
+    link: String,
+    status: NodeJoin,
+    task: tokio::task::AbortHandle,
+}
+
+/// Starts, or reports, this fresh Node's join from its local page. A new link replaces an
+/// unfinished join; its commitment was never revealed for the new invite.
+async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
     ensure!(
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
     );
-    let path = dir.join("join.json");
+    node.store
+        .lock()
+        .await
+        .verify_bootstrap_capability(text(params, "capability")?)?;
+    let link = text(params, "link")?.trim().to_owned();
+    let name = text(params, "name")?.to_owned();
+    ensure!(name.chars().count() <= 128, "device name is too long");
+    let mut slot = node
+        .node_join
+        .lock()
+        .map_err(|_| anyhow!("join state unavailable"))?;
+    if let Some(current) = slot.as_ref()
+        && current.link == link
+        && !matches!(current.status, NodeJoin::Failed)
+    {
+        return Ok(current.status.clone());
+    }
+    if let Some(previous) = slot.take() {
+        previous.task.abort();
+        let _ = std::fs::remove_file(node.data_dir.join("join.json"));
+    }
+    parse_join_link(&link)?;
+    let runner = node.clone();
+    let joining = link.clone();
+    let task = tokio::spawn(async move {
+        let report = |status: NodeJoin| {
+            if let Ok(mut slot) = runner.node_join.lock()
+                && let Some(current) = slot.as_mut()
+                && current.link == joining
+            {
+                current.status = status;
+            }
+        };
+        match join_as_node(&runner, &joining, &name, &report).await {
+            Ok(_) => report(NodeJoin::Joined),
+            Err(error) => {
+                tracing::warn!(%error, "joining from the local page failed");
+                let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
+                report(NodeJoin::Failed);
+            }
+        }
+    })
+    .abort_handle();
+    *slot = Some(NodeJoinTask {
+        link,
+        status: NodeJoin::Waiting,
+        task,
+    });
+    Ok(NodeJoin::Waiting)
+}
+
+/// Joins `node` to the network of the invite, resuming a join this Node already committed to.
+async fn join_as_node(
+    node: &Runtime,
+    link: &str,
+    name: &str,
+    report: impl Fn(NodeJoin),
+) -> Result<NetworkState> {
+    let (_, ticket) = parse_join_link(link)?;
+    ensure!(
+        !node.has_membership().await?,
+        "this Node already belongs to a personal network"
+    );
+    let path = node.data_dir.join("join.json");
     let mut pending = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice::<PendingJoin>(&bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingJoin {
@@ -1173,7 +1294,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
     );
     crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
     let device = node.identity.device_id()?;
-    let client = JoinLink::open(&node, &ticket).await?;
+    let client = JoinLink::open(node, &ticket).await?;
     let request: JoinRequest = serde_json::from_value(
         client
             .call(
@@ -1188,7 +1309,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
         "entry answered for another invite"
     );
     let join_id = request.join_id;
-    println!("已提交加入请求，等待管理设备批准。");
+    report(NodeJoin::Waiting);
     let deadline = Instant::now() + Duration::from_secs(11 * 60);
     let mut shown = false;
     loop {
@@ -1251,7 +1372,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
                     admin_nonce,
                     &pending.nonce,
                 )?;
-                println!("短码：{code}。请在管理设备上核对相同后批准。");
+                report(NodeJoin::Confirming { code });
                 client
                     .call(
                         "join_status",
@@ -1542,6 +1663,91 @@ mod tests {
         drop(reopened);
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    /// Only the owner at the removed computer may start it over: a member browser elsewhere, or a
+    /// local page while this Node is still a member, is refused.
+    #[tokio::test]
+    async fn only_a_local_page_of_a_removed_node_can_rejoin() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("rejoin-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let mut config = crate::config::Config::local("127.0.0.1:4791".parse()?, vec![], false);
+        config.local_listen = "127.0.0.1:4792".parse()?;
+        config.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let (root, admin, browser) = (
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+            );
+            let mut state = NetworkState::new(Genesis::create(
+                &root,
+                Member::client(&admin, "admin", true)?,
+                Member::node(&node.identity, "node")?,
+            )?)?;
+            let network = state.genesis.network_id.clone();
+            let node_id = node.identity.device_id()?;
+            node.install_membership(state.clone()).await?;
+            node.local_access
+                .publish_listener("http://127.0.0.1:4792".into(), node_id.clone())?;
+            let token = node
+                .local_access
+                .issue_from_local_setup(&node_id, &network)?;
+            let cookie =
+                node.local_access
+                    .exchange(&token, &node_id, &network, &browser.device_id()?)?;
+            let mut local = Session {
+                device_id: browser.device_id()?,
+                cookie: Some(cookie),
+                subscribed: false,
+                observation: None,
+            };
+            let mut remote_manager = Session {
+                device_id: admin.device_id()?,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            };
+            assert!(
+                dispatch(&node, &mut local, "rejoin", json!({}))
+                    .await
+                    .is_err(),
+                "a Node that is still a member keeps its data"
+            );
+            state.append(GovernanceEvent::revoke(
+                &admin,
+                &state.project()?,
+                Revocation::new(&node_id, None)?,
+            )?)?;
+            node.install_membership(state).await?;
+            assert!(
+                dispatch(&node, &mut remote_manager, "rejoin", json!({}))
+                    .await
+                    .is_err(),
+                "a browser that is not at this computer cannot start it over"
+            );
+            assert_eq!(
+                dispatch(&node, &mut local, "rejoin", json!({})).await?,
+                json!({"restarting":true})
+            );
+            tokio::time::timeout(Duration::from_secs(5), node.rejoin_requested()).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     #[tokio::test]
