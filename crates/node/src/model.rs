@@ -354,6 +354,9 @@ pub enum EventBody {
         continues: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<String>,
+        /// An existing App Server thread the prompt went into.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<String>,
     },
     WorkProgress {
         work_id: String,
@@ -598,6 +601,8 @@ pub struct WorkProjection {
     pub call_ref: String,
     pub continues: Option<String>,
     pub parent: Option<String>,
+    /// The existing thread a send went into; `thread_id` is the thread the work runs in.
+    pub thread: Option<String>,
     pub phase: Option<WorkPhase>,
     pub summary: String,
     pub thread_id: Option<String>,

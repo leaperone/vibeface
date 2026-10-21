@@ -585,9 +585,18 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         prompt: "p".into(),
         continues: None,
         parent: None,
+        thread: None,
     };
     assert!(store.accept_work(&net.a, &net.network, spec.clone(), 3)?.1);
     assert!(!store.accept_work(&net.a, &net.network, spec.clone(), 4)?.1);
+    let moved = WorkSpec {
+        thread: Some("other".into()),
+        ..spec.clone()
+    };
+    assert!(
+        store.accept_work(&net.a, &net.network, moved, 4).is_err(),
+        "the same work ID into another thread is a different request"
+    );
     let id = spec.work_id.clone();
     store.apply_work_signal(
         &net.a,
@@ -667,6 +676,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             prompt: "p".into(),
             continues: None,
             parent: None,
+            thread: None,
         })
     };
     let outcome = |store: &Store, id: &str| -> Result<Option<WorkOutcome>> {

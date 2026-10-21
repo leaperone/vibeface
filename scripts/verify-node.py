@@ -916,6 +916,10 @@ def fixture_codex(arguments):
                         terminal = (*identity, turn["status"])
                         if turn["status"] != "inProgress" and terminal not in emitted:
                             emitted.add(terminal)
+                            for item in turn["items"]:
+                                if item["type"] == "agentMessage":
+                                    websocket_send(stream, {"method": "item/completed", "params": {
+                                        "threadId": thread_id, "turnId": turn["id"], "item": item}})
                             event = {"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}}
                             websocket_send(stream, event)
                             websocket_send(stream, event)
@@ -1092,8 +1096,7 @@ def fixture_manager(arguments):
     initial = json.loads(sys.stdin.readline())
     require(initial["type"] == "init", "fixture receives sidecar initialization")
     prompt = initial["prompt"]
-    require({"VIBEFACE_CODEX_SOCKET", "VIBEFACE_DATA_DIR"} <= set(initial["tool_env"]),
-            "the coordination Agent's Shell reaches the App Server socket and the Node's send log")
+    require("VIBEFACE_CODEX_SOCKET" in initial["tool_env"], "the coordination Agent's Shell reaches the App Server socket")
     emit = lambda value: print(json.dumps(value), flush=True)
     native = initial.get("session_id") or "fixture-native-" + uuid.uuid4().hex
     emit({"type": "ready", "session_id": initial.get("session_id")})
@@ -1242,6 +1245,14 @@ def fixture_manager(arguments):
             dispatch_cli({**arguments, "prompt": "different work"}, expected=False, rejection=dispatch["changed"])
         fixture_record(run, "manager-native-work.jsonl", {"trigger": trigger, "label": dispatch["label"],
                        "work_id": found["work_id"], "first": work})
+    send = directive.get("send")
+    if send:
+        command = ("codex", "send", send["thread"], send["text"], "--id", send["id"])
+        sent = [json.loads(fixture_cli(initial, *command).stdout) for _ in range(send.get("repeat", 1))]
+        conflict = fixture_cli(initial, *command[:3], send["conflict_text"], *command[4:], check=False) \
+            if send.get("conflict_text") else None
+        fixture_record(run, "manager-sends.jsonl", {"trigger": trigger, "label": label, "sent": sent,
+                       "conflict": None if conflict is None else {"code": conflict.returncode, "error": conflict.stderr[-500:]}})
     if kind == "routine":
         tool("update_profile", {"call_ref": "routine-rename", "name": "forbidden"}, expected=False,
              rejection="user's own message")
@@ -1523,7 +1534,6 @@ def node_cli(node, *arguments, socket=None, check=True, timeout=60, stdin=None):
     if socket:
         environment["VIBEFACE_CODEX_SOCKET"] = str(socket)
     environment["VIBEFACE_TRIAGE_URL"] = f"http://127.0.0.1:{node.local_port}"
-    environment["VIBEFACE_DATA_DIR"] = str(node.directory)
     completed = subprocess.run([str(node.binary), *arguments], capture_output=True, text=True, timeout=timeout,
                                env=environment, input=stdin)
     require(not check or completed.returncode == 0, "vibeface " + " ".join(arguments[:2]) + " succeeds: " + completed.stderr[-400:])
@@ -1631,17 +1641,27 @@ def work_checks(run, workspace, a, network, passed):
     name = "chat-work-steer"
     directory, receipt, work_id = start(name)
     running = wait_for("the steered work is running", lambda: in_state(name, work_id, "running"))
-    sent = json.loads(node_cli(a, "codex", "send", running["thread_id"], "补充：只改测试", "--id", "steer-1",
-                               socket=socket_path).stdout)
-    again = json.loads(node_cli(a, "codex", "send", running["thread_id"], "补充：只改测试", "--id", "steer-1",
-                                socket=socket_path).stdout)
+    shell = node_cli(a, "codex", "send", running["thread_id"], "x", "--id", "shell-1", socket=socket_path, check=False)
+    require(shell.returncode != 0 and "assistant turn" in shell.stderr, "codex send outside an assistant turn is refused")
+    steer_label = name + "-send"
+    steer_receipt = a.client.rpc("message", conversation_id=name, message_id=steer_label, report_results=True,
+        text=json.dumps({"chat_agent": True, "label": steer_label, "send": {
+            "thread": running["thread_id"], "text": "补充：只改测试", "id": "steer-1", "repeat": 2, "conflict_text": "换个说法"}}))
+    action = wait_for("the assistant sends into the running thread", lambda: next(
+        (row for row in fixture_records(run, "manager-sends.jsonl") if row["label"] == steer_label), None))
+    send_id = action["sent"][0]["work_id"]
     steers = [row for row in rpc("turn/steer") if row["message"]["params"]["threadId"] == running["thread_id"]]
-    require(sent["delivery"]["status"] == "delivered" and sent["delivery"]["mode"] == "steer"
-            and again["delivery"] == sent["delivery"]
-            and "different message" in node_cli(a, "codex", "send", running["thread_id"], "换个说法", "--id", "steer-1",
-                                                socket=socket_path, check=False).stderr
-            and len(steers) == 1 and steers[0]["message"]["params"]["expectedTurnId"] == running["turn_id"],
-            "codex send steers the running turn once; the same --id never sends again")
+    require(action["sent"][1]["work_id"] == send_id and action["sent"][1]["may_send"] is False
+            and action["conflict"]["code"] != 0 and "reused with a different request" in action["conflict"]["error"]
+            and len(steers) == 1 and steers[0]["message"]["params"]["expectedTurnId"] == running["turn_id"]
+            and steers[0]["message"]["params"]["clientUserMessageId"] == send_id
+            and not [row for row in rpc("turn/start") if row["message"]["params"].get("clientUserMessageId") == send_id],
+            "codex send is a work that steers the running turn once; the same --id never sends again")
+    steered = wait_for("the send work runs in the steered turn", lambda: in_state(name, send_id, "running"))
+    require(steered["thread_id"] == running["thread_id"] and steered["turn_id"] == running["turn_id"]
+            and steered["trigger"] == steer_receipt["trigger"], "the send work is bound to the turn it steered")
+    wait_for("the sending turn ends after the send", lambda:
+        (scheduler_record(a, network, steer_receipt["trigger"]) or {}).get("state") == "completed")
     listed = json.loads(node_cli(a, "codex", "call", "thread/list", "{}", socket=socket_path).stdout)
     models = json.loads(node_cli(a, "codex", "call", "model/list", socket=socket_path).stdout)
     renamed = node_cli(a, "codex", "call", "thread/name/set", json.dumps({"threadId": running["thread_id"], "name": "steered"}),
@@ -1661,9 +1681,14 @@ def work_checks(run, workspace, a, network, passed):
     finally:
         watcher.kill()
         watcher.wait(timeout=5)
-    wait_for("the steered work finishes", lambda: in_state(name, work_id, "finished"))
-    passed("the Agent's Shell steers, lists, calls and watches the App Server directly", work_id=work_id,
-           steer_turn=running["turn_id"])
+    shared = [wait_for("both works finish with the shared turn", lambda: in_state(name, work, "finished"))
+              for work in (work_id, send_id)]
+    require(all(row["result_text"] == "fixture Codex terminal result" for row in shared),
+            "every work in a shared turn receives the turn's answer")
+    wait_for("the steered work reports its result", lambda: result_job(work_id))
+    wait_for("the send work reports its own result", lambda: result_job(send_id))
+    passed("a send steers the running turn as its own work; the Shell lists, calls and watches the App Server directly",
+           work_id=work_id, send_work=send_id, steer_turn=running["turn_id"])
 
     name = "chat-work-unknown"
     directory, receipt, work_id = start(name, gate_open=True, native={"drop_reply": True})
@@ -1888,11 +1913,12 @@ def triage_checks(run, workspace, a, network, passed):
         retry = a.client.rpc("answer", question_id=question_id, text="继续，先跑测试", scope_id=owner)
         acted = wait_for("the assistant passes the answer on", lambda: [row for row in fixture_records(run, "answer-actions.jsonl")
                          if row["question_id"] == question_id] or None, timeout=90)
+        answer_work = acted[0]["replies"][0]["work_id"]
         sends = [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") in ("turn/start", "turn/steer")
-                 and row["message"]["params"].get("clientUserMessageId") == "a-" + question_id]
+                 and row["message"]["params"].get("clientUserMessageId") == answer_work]
         require(first["status"] == "answered" and retry["message"] == first["message"] and len(acted) == 1
-                and acted[0]["replies"][0]["delivery"] == acted[0]["replies"][1]["delivery"] and len(sends) == 1,
-                "a text answer reaches the session once through the assistant; a retry reads it back")
+                and acted[0]["replies"][1]["work_id"] == answer_work and len(sends) == 1,
+                "a text answer reaches the session once as the assistant's work; a retry reads it back")
         told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
                         if row["event_id"].startswith("answered-" + question_id + "-") and row["status"] == 200] or None, timeout=60)
         require(told[-1]["body"] == {"schema_version": 2, "type": "answered", "event_id": told[-1]["event_id"],
@@ -3205,8 +3231,10 @@ def public_entry_acceptance(options):
                          headers={"Authorization": "Bearer vfd_" + "0" * 64}, status=401, timeout=60)
         acted = wait_for("M's assistant passes the answer on", lambda: [row for row in fixture_records(fixture, "answer-actions.jsonl")
                          if row["question_id"] == question_id] or None, timeout=90)
+        answer_work = acted[0]["replies"][0]["work_id"]
         sends = [row for row in fixture_records(fixture, "codex-rpc.jsonl") if row["message"].get("method") in ("turn/start", "turn/steer")
-                 and row["message"]["params"].get("clientUserMessageId") == "a-" + question_id]
+                 and row["message"]["params"].get("clientUserMessageId") == answer_work
+                 and acted[0]["replies"][1]["work_id"] == answer_work]
         require(sent == again == {"question_id": question_id, "answer_id": "a-" + question_id, "status": "answered",
                                   "text": "经入口送达的回答"} and question["conversation_id"] == conversation
                 and len(acted) == 1 and len(sends) == 1,

@@ -61,7 +61,7 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 10，数据库 `user_version` 为 10。运行时日志写在同一目录的 `node.log`。不注册网站账号，也不保存个人根私钥。`serve` 和 `join` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 11，数据库 `user_version` 为 11。运行时日志写在同一目录的 `node.log`。不注册网站账号，也不保存个人根私钥。`serve` 和 `join` 用目录锁独占该目录。
 
 在本机可信浏览器打开 `http://localhost:4790`，填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络。初始化材料由本机页面自动取得，无需运行 `access` 或复制邀请。已有网络的节点不会因浏览器未授权而另建网络；新浏览器可使用本机自动访问，永久成员授权仍需成员邀请或恢复包。`vibeface access --data-dir "$HOME/.vibeface"` 保留为备用入口。
 

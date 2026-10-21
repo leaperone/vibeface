@@ -95,13 +95,14 @@ enum CodexCommand {
         method: String,
         params: Option<String>,
     },
-    /// Add a message to a thread: steer its running turn or start one. Reusing --id only reads back.
+    /// Add a message to a thread as a work of this assistant turn: it steers the running turn or
+    /// starts one, and its result comes back like dispatch_work's. Reusing --id only reads back.
     Send {
         thread: String,
         text: String,
-        /// Message ID (`clientUserMessageId`); keep it to retry an unknown result.
+        /// The work's call_ref, unique within this turn; keep it to retry an unknown result.
         #[arg(long)]
-        id: Option<String>,
+        id: String,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -109,12 +110,6 @@ enum CodexCommand {
         /// Local image path or URL; repeat for more.
         #[arg(long)]
         image: Vec<String>,
-        /// Directory of the send log that keeps each --id to one send; defaults to
-        /// `codex-sends` in the Node data directory named by VIBEFACE_DATA_DIR.
-        #[arg(long)]
-        log: Option<PathBuf>,
-        #[arg(long, env = "VIBEFACE_DATA_DIR", hide = true)]
-        data_dir: Option<PathBuf>,
     },
     /// Print the thread's notifications as JSON lines.
     Watch { thread: String },
@@ -465,31 +460,16 @@ async fn main() -> Result<()> {
                     model,
                     effort,
                     image,
-                    log,
-                    data_dir,
                 } => {
-                    let log = log
-                        .or_else(|| data_dir.map(|dir| dir.join("codex-sends")))
-                        .context(
-                            "--log or VIBEFACE_DATA_DIR is required to keep each --id to one send",
-                        )?;
-                    run(
-                        &socket()?,
-                        Command::Send(
-                            log,
-                            vibeface_bridge::codex::Outgoing {
-                                thread_id: thread,
-                                text,
-                                client_id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                                model,
-                                effort,
-                                images: image,
-                                start_only: false,
-                                full_access: true,
-                            },
-                        ),
-                    )
-                    .await
+                    ensure!(
+                        std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
+                        "codex send runs inside an assistant turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one use `vibeface codex call turn/start`"
+                    );
+                    let args = json!({"thread":thread,"prompt":text,"call_ref":id,
+                        "model":model,"effort":effort,"images":image});
+                    let result = dispatch_work(&args, &id, &socket()?).await?;
+                    println!("{}", serde_json::to_string(&result)?);
+                    Ok(())
                 }
                 CodexCommand::Watch { thread } => {
                     run(&socket()?, Command::Watch { thread_id: thread }).await
@@ -1215,18 +1195,23 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     let result = if tool == vibeface::tools::Tool::DispatchWork {
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET")
             .context("VIBEFACE_CODEX_SOCKET is required")?;
-        vibeface::agent_cli::dispatch(
-            &arguments,
-            |args| post_tool("track_work", args, &call_id),
-            |args| post_tool("bind_work", args, &call_id),
-            Path::new(&socket),
-        )
-        .await?
+        dispatch_work(&arguments, &call_id, Path::new(&socket)).await?
     } else {
         post_tool(&name, arguments, &call_id).await?
     };
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
+}
+
+/// `dispatch_work` and `codex send`: the Node tracks and watches the work; the CLI sends it.
+async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Result<Value> {
+    vibeface::agent_cli::dispatch(
+        arguments,
+        |args| post_tool("track_work", args, call_id),
+        |args| post_tool("bind_work", args, call_id),
+        socket,
+    )
+    .await
 }
 
 async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value> {

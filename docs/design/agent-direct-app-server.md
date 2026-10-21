@@ -84,10 +84,10 @@ Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的�
 | 命令 | 作用 |
 |---|---|
 | `vibeface codex call <method> [json]` | 调用名单里的任意方法，原样打印结果；写方法结果不明时报错并提示先回读 |
-| `vibeface codex send <thread> <text> [--id ID] [--model M] [--effort E] [--image PATH]...` | `thread/resume` 后先按 `clientId` 回读；回合进行中时 `turn/steer`，否则 `turn/start`；再回读确认。输出 `{client_id, delivery}` |
+| `vibeface codex send <thread> <text> --id ID [--model M] [--effort E] [--image PATH]...` | 带 `thread` 的 `dispatch_work`：登记工作后 `thread/resume`，回合进行中时 `turn/steer`，否则 `turn/start`；输出与 `dispatch_work` 相同 |
 | `vibeface codex watch <thread>` | `thread/resume` 后逐行打印通知 |
 
-`send` 即 `DirectSession::send`。同一 `--id` 再次执行先回读，消息已在线程里时返回 `existing`，不会发第二次。CLI 自身无状态：回读不到时会再发一次，所以结果不明时要先 `vibeface codex call thread/read` 确认。助手转达本人的回答时以回答消息的 `message_id` 作 `--id`。
+`send` 是一项工作，`--id` 即 `call_ref`。同一轮同一 `--id` 再次执行只拿回原工作，不会发第二次；结果不明时由 Node 按 `clientUserMessageId` 对账。助手转达本人的回答时以回答消息的 `message_id` 作 `--id`。
 
 ### 2.3 派发流程
 

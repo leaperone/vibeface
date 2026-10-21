@@ -219,6 +219,18 @@ impl Runtime {
             Some(_) => local.clone(),
             None => optional("target_node").unwrap_or_else(|| local.clone()),
         };
+        let thread = optional("thread");
+        if let Some(thread) = &thread {
+            vibeface_protocol::validate_id(thread).map_err(anyhow::Error::msg)?;
+            ensure!(
+                target == local,
+                "a thread is sent to on its own device; give another device a task instead"
+            );
+            ensure!(
+                args["continues"].is_null(),
+                "thread and continues are exclusive"
+            );
+        }
         let spec = WorkSpec {
             work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
             conversation: scope.into(),
@@ -231,11 +243,16 @@ impl Runtime {
             } else {
                 WorkKind::Task
             },
-            cwd: field(args, "cwd")?.into(),
+            // A thread's directory is only informational and may be unknown.
+            cwd: match &thread {
+                Some(_) => optional("cwd").unwrap_or_default(),
+                None => field(args, "cwd")?.into(),
+            },
             title: field(args, "title")?.chars().take(120).collect(),
             prompt: field(args, "prompt")?.into(),
             continues: optional("continues"),
             parent: task.map(String::from).or_else(|| optional("parent")),
+            thread: thread.clone(),
         };
         if target != local {
             let dispatch = self.send_dispatch(network, spec).await?;
@@ -252,6 +269,7 @@ impl Runtime {
         let continues = spec.continues.clone();
         let (record, created) = self.accept_dispatch(network, spec).await?;
         let thread = match &continues {
+            None => thread,
             Some(original) => self
                 .store
                 .lock()
@@ -260,7 +278,6 @@ impl Runtime {
                 .into_iter()
                 .find(|work| &work.work_id == original)
                 .and_then(|work| work.thread_id),
-            None => None,
         };
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,

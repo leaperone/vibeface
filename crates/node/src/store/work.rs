@@ -267,6 +267,7 @@ impl Store {
                     && work.prompt == spec.prompt
                     && work.continues == spec.continues
                     && work.parent == spec.parent
+                    && work.thread == spec.thread
             });
             ensure!(same, "work ID reused with a different request");
             return Ok((existing, false));

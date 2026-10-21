@@ -369,6 +369,7 @@ pub(crate) fn works_from(
             call_ref,
             continues,
             parent,
+            thread,
             ..
         } = serde_json::from_str(&dispatch)?
         else {
@@ -401,6 +402,7 @@ pub(crate) fn works_from(
             call_ref,
             continues,
             parent,
+            thread,
             phase,
             summary,
             thread_id,
