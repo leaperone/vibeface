@@ -49,9 +49,9 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   // Answered in 待处理, the card leaves; the toast says where the work went and leads there.
   const settledToast = (value: string) => {
     if (session && value === "忽略") return toast("已忽略这个会话", { tone: "success" })
-    const to = session ? question.choices.find((choice) => choice.label === value)?.conversation_id ?? workspace.primary : question.conversation_id
-    const bot = workspace.bots.find((item) => item.conversation_id === to)
-    toast(session ? `已交给 ${bot?.name ?? "主助手"}` : "已回答", {
+    const chosen = session ? question.choices.find((choice) => choice.label === value)?.conversation_id : question.conversation_id
+    const bot = workspace.bots.find((item) => item.conversation_id === (chosen ?? workspace.primary))
+    toast(!session ? "已回答" : chosen ? `已交给 ${bot?.name ?? "助手"}` : "已交给主助手分派", {
       tone: "success", action: bot ? { label: "查看", onClick: () => { void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) } } : undefined,
     })
   }

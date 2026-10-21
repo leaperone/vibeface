@@ -526,7 +526,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     const session = { ...question, question_id: 'q2', conversation_id: null, assistant: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目助手', conversation_id: 'chat' }] }
     for (const label of ['处理', '交给 项目助手', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
     await settleComponent()
-    assert.deepEqual(toasts.map(({ text }) => text), ['已交给 主助手甲', '已交给 项目助手', '已忽略这个会话'], '待处理 says where each session went')
+    assert.deepEqual(toasts.map(({ text }) => text), ['已交给主助手分派', '已交给 项目助手', '已忽略这个会话'], '待处理 says where each session went')
     toasts[0].action?.onClick()
     assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'main-bot' } }], 'and leads to the chat that took it')
   } finally { app.close() }
