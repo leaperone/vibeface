@@ -813,7 +813,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (first) {
           // Resume this browser's network through its entrances, starting with the last one used.
           reconnect.current = first; resumeQueue.current = rest
-          setPhase('reconnecting'); scheduleReconnect(true)
+          step({ type: 'ready', joined: true }); setPhase('reconnecting'); scheduleReconnect(true)
           return
         }
         if (!shouldAutoConnect({ hasInvitation: false, savedCount: savedEntries().length })) return
