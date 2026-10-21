@@ -939,12 +939,19 @@ fn initialize_params(title: &str) -> Value {
 pub struct DirectSession {
     stream: WebSocketStream<UnixStream>,
     next_id: u64,
+    /// Threads started on this connection. They have no rollout before their first turn, so they
+    /// are not resumed.
+    started: HashSet<String>,
 }
 
 impl DirectSession {
     pub async fn connect(socket: &Path) -> Result<Self, CodexError> {
         let stream = connect(socket).await.map_err(rejected)?;
-        let mut session = Self { stream, next_id: 0 };
+        let mut session = Self {
+            stream,
+            next_id: 0,
+            started: HashSet::new(),
+        };
         session
             .call("initialize", initialize_params("Vibeface Agent CLI"))
             .await
@@ -961,7 +968,29 @@ impl DirectSession {
 
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
         validate_request(method, &params)?;
-        self.call(method, params).await
+        let result = self.call(method, params).await?;
+        if method == "thread/start"
+            && let Some(id) = result["thread"]["id"].as_str()
+        {
+            self.started.insert(id.to_owned());
+        }
+        Ok(result)
+    }
+
+    /// `thread/resume` to receive a thread's events. A thread without a rollout yet is retried
+    /// until its first turn persists one.
+    pub async fn subscribe(&mut self, thread: &str) -> Result<Value, CodexError> {
+        loop {
+            match self
+                .request("thread/resume", json!({"threadId":thread}))
+                .await
+            {
+                Err(error) if no_rollout(&error) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
@@ -1102,6 +1131,11 @@ fn input(outgoing: &Outgoing) -> Value {
     json!(input)
 }
 
+/// Codex writes a thread's rollout when its first turn starts; resuming a thread before that fails.
+fn no_rollout(error: &CodexError) -> bool {
+    error.message.contains("no rollout found")
+}
+
 /// The turn holding the user message sent with `client_id`, if any.
 fn delivered(thread: &Value, client_id: &str) -> Option<String> {
     thread["turns"].as_array()?.iter().find_map(|turn| {
@@ -1133,12 +1167,18 @@ impl DirectSession {
     /// already in the thread is reported, not sent again; an unknown result is never resent.
     pub async fn send(&mut self, outgoing: &Outgoing) -> Delivery {
         let rejected = |reason: String| Delivery::Rejected { reason };
-        let resumed = match self
-            .request("thread/resume", json!({"threadId":outgoing.thread_id}))
-            .await
-        {
-            Ok(resumed) => resumed,
-            Err(error) => return rejected(error.message),
+        // A thread without a rollout has no turns: nothing to find or steer.
+        let resumed = if self.started.contains(&outgoing.thread_id) {
+            json!({})
+        } else {
+            match self
+                .request("thread/resume", json!({"threadId":outgoing.thread_id}))
+                .await
+            {
+                Ok(resumed) => resumed,
+                Err(error) if no_rollout(&error) => json!({}),
+                Err(error) => return rejected(error.message),
+            }
         };
         if let Some(turn_id) = delivered(&resumed["thread"], &outgoing.client_id) {
             return Delivery::Delivered {
@@ -1624,6 +1664,66 @@ mod tests {
                 session.close().await;
             }
             assert_eq!(server.await.unwrap(), 1, "a repeated send only reads back");
+            std::fs::remove_file(socket).unwrap();
+        }).await.expect("send must finish");
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_a_new_thread_delivers_the_first_turn() {
+        timeout(Duration::from_secs(5), async {
+            let socket = std::env::temp_dir().join(format!("vibeface-fresh-{}-{}.sock", std::process::id(), now_ms()));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut turns: HashMap<String, Vec<Value>> = HashMap::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = server.next().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let Some(method) = request["method"].as_str().map(str::to_owned) else { continue };
+                        if request.get("id").is_none() { continue }
+                        let thread = request["params"]["threadId"].as_str().unwrap_or_default().to_owned();
+                        let reply = match method.as_str() {
+                            "thread/start" => {
+                                let id = format!("fresh-{}", turns.len());
+                                turns.insert(id.clone(), Vec::new());
+                                json!({"result":{"thread":{"id":id,"status":{"type":"idle"},"turns":[]}}})
+                            }
+                            "thread/resume" if turns[&thread].is_empty() =>
+                                json!({"error":{"code":-32600,"message":format!("no rollout found for thread id {thread}")}}),
+                            "turn/start" => {
+                                let turn = json!({"id":format!("turn-{thread}"),"status":"inProgress",
+                                    "items":[{"type":"userMessage","clientId":request["params"]["clientUserMessageId"]}]});
+                                turns.get_mut(&thread).unwrap().push(turn.clone());
+                                json!({"result":{"turn":turn}})
+                            }
+                            "thread/read" | "thread/resume" =>
+                                json!({"result":{"thread":{"id":thread,"status":{"type":"idle"},"turns":turns[&thread]}}}),
+                            _ => json!({"result":{}}),
+                        };
+                        let mut reply = reply;
+                        reply["id"] = request["id"].clone();
+                        server.send(Message::Text(reply.to_string().into())).await.unwrap();
+                    }
+                }
+            });
+            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let started = session.request("thread/start", json!({"cwd":"/project","approvalPolicy":"never","sandbox":"danger-full-access"})).await.unwrap();
+            let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+            let outgoing = Outgoing { thread_id: thread, text: "do the work".into(), client_id: "w1".into(), start_only: true, full_access: true, ..Default::default() };
+            assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: "start".into(), turn_id: "turn-fresh-0".into() },
+                "the thread this session started gets its first turn");
+            session.close().await;
+
+            let mut session = DirectSession::connect(&socket).await.unwrap();
+            session.request("thread/start", json!({"cwd":"/project"})).await.unwrap();
+            session.close().await;
+            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let outgoing = Outgoing { thread_id: "fresh-1".into(), text: "hello".into(), client_id: "m1".into(), ..Default::default() };
+            assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: "start".into(), turn_id: "turn-fresh-1".into() },
+                "a thread started elsewhere without a rollout yet still gets its first turn");
+            session.close().await;
+            server.abort();
             std::fs::remove_file(socket).unwrap();
         }).await.expect("send must finish");
     }

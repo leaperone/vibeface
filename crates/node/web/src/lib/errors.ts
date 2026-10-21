@@ -19,6 +19,7 @@ const patterns: [RegExp, string][] = [
   [/configured executable was not found|no configured management SDK/i, '这台设备上的助手程序找不到了。去设备页检查助手设置。'],
   [/Cursor SDK|cursor-sdk-bridge/i, 'Cursor 没能完成这次回复。请再发一次；一直不行就去设备页检查 Cursor。'],
   [/answered meanwhile|no App Server request is waiting/i, '这个请求已经回答过或已过期。'],
+  [/no rollout found/i, 'Codex 新对话还没准备好，任务没有开始。请再派一次。'],
   [/Codex SDK|Codex rejected|App Server/i, 'Codex 没能完成这次回复。请再发一次；一直不行就去设备页检查 Codex。'],
   [/peer (did not answer|is unreachable|connection closed|closed the stream|stream failed)|target connection closed|client target refused/i, '另一台设备没有回应，可能关机或断网了。等它上线后再试。'],
   [/client disconnected|client channel idle|membership state closed/i, '连接断开了，正在重新连接。'],

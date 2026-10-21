@@ -4,6 +4,7 @@ import { ListChecks, Square, X } from "lucide-react"
 import { Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
+import { humanError, rawError } from "@/lib/errors"
 import { useWorkspace } from "./context"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "./labels"
 
@@ -29,7 +30,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
     return () => window.removeEventListener("keydown", onKey)
   }, [botId])
   // The last progress line is stale once a task ends, so it never stands in for a result.
-  const result = work?.result_text || work?.failure_reason || ""
+  const result = work?.result_text || (work?.failure_reason ? humanError(work.failure_reason, undefined, "这个任务") : "")
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
 
   return <aside aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background md:static md:z-auto md:w-[420px] md:shrink-0 md:border-l">
@@ -50,6 +51,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       </div> : null}
       <Details>
         {work.prompt ? <DetailRow label="交代的事" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} /> : null}
+        {work.failure_reason && rawError(work.failure_reason) ? <DetailRow label="原始错误" value={<span className="break-words">{work.failure_reason}</span>} /> : null}
         <DetailRow label="任务编号" value={work.work_id} mono />
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
         {device ? <DetailRow label="设备编号" value={device} mono /> : null}
