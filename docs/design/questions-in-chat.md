@@ -14,8 +14,8 @@
 
 Codex 线程或 Claude Code 会话（统称 session）属于某个助手，只有两种已记录的事实：
 
-1. 工作记录：`WorkProgress { thread_id }` 由目标设备写入工作所在会话。派发即归属，不新增字段。
-2. 认领：`SessionAttributed` 事件，写入被认领助手的会话。
+1. 工作记录：`WorkProgress { thread_id }` 由目标设备写入工作所在会话。派发即归属，不新增字段。App Server 的请求可能先于这条记录到达，所以运行它的设备在记录写入前以本机工作已绑定的线程为准。
+2. 认领：`SessionAttributed` 事件，写入被认领助手的会话。只有运行该 session 的设备能写，签名形状要求 `node` 等于作者。
 
 `vibeface codex send` 的本地发送日志只存 `client_id → thread_id/text`，没有会话信息，不作为归属依据。
 
@@ -93,7 +93,7 @@ Agent 侧（CLI → `/api/triage`）：
 - `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R]`：写入拥有该 session 的助手会话。同一 session 同一请求已有未答问题时返回原问题。带 `--request-id` 时请求挂起到回答为止，回答后再给助手 120 秒应答，超时按方法回退。
 - `vibeface triage dismiss --event-id ID`：不变。
 - `vibeface triage assign --question QID --assistant CONVERSATION_ID`：路由轮认领外来会话，重复调用返回同一归属。
-- `vibeface codex respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。
+- `vibeface codex respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
 
 用户侧 RPC：
 

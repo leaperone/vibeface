@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=9`，数据库 `user_version=9`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=10`，数据库 `user_version=10`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -70,8 +70,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":9}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=9` |
+| `data-epoch.json` | `{"data_epoch":10}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=10` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -145,7 +145,7 @@
 
 加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
-浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、本人结清的 `WorkFinished` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。Node 和协调 Agent 不能代写这些事件。
+浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、本人结清的 `WorkFinished` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`；回答提问的 `MessagePosted(user, answers)` 签名可选，Grok 经 decision token 的回答由 Node 无签名写入。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。除回答外，Node 和协调 Agent 不能代写这些事件。
 
 恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`，加密正文包含根私钥、`genesis`、`recovery_epoch` 和解密材料，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文根私钥不发给 Node。根恢复默认保留现有管理设备。业务正文和项目文件不在恢复包中。
 
@@ -162,14 +162,15 @@
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |
-| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`assistant`、`checks`、`local_node` 和调度队列 |
+| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`assistant`、`checks`、`questions`（本会话的提问及回答）、`sessions`（交给本助手的外来会话）、`local_node` 和调度队列 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作 |
 | `interrupt_work` | `conversation_id`、`work_id` | 中断工作及它委派出的工作；目标在其他 Node 时由入口转发和重试 |
 | `codex` | `method`、可选 `params`、`node` | 调用 App Server 名单里非 `hidden` 的方法，结果经 `sanitize`；`node` 为其他设备时经成员连接转发 |
 | `codex_state` | 可选 `node` | App Server 状态摘要 `{connection, threads: [{thread_id, name, status, cwd, plan, reasoning, token_usage}], rate_limits}`；网页不调用 App Server 方法 |
-| `send_decision` | `thread_id`、`decision_id`、可选 `text`、`alert_id`、`choice`、`node`、`model`、`effort`、`images` | 把本人的决定送进会话：回合进行中时插话，否则开新回合；`choice` 选中挂住服务端请求的卡片选项时改为回答该请求（`mode=answer`）。送达后卡片记为 `decided`。同一 `decision_id` 不重发，结果不明后只回读 |
+| `questions` | 无 | 全网未回答的提问：`{questions: [{question_id, severity, text, choices: [{label, conversation_id?}], about, conversation_id, assistant, author, created_at_ms, answer}]}`；外来会话的提问 `conversation_id` 为 `null` |
+| `answer` | `question_id`、`text`、`attestation` | 写该提问唯一的回答消息 `a-<question_id>`，签名作用域是提问所在会话或 `sessions`。会话里的回答按 `answer` 触发准入，或转交调度 Node。返回 `{status, question_id, message, receipt}`；已有不同回答时 `status = "already_answered"`，返回已有回答 |
 | `resolve` | `conversation_id`、`check_id`、工作项另带 `outcome` 与可选备注 | 本人一键结清：管理进程确认已停止；工作项写一条带本人签名的 `WorkFinished`。不重做原触发 |
 | `upload_attachment` | `conversation_id`、`hash`、`size`、`offset`、`data` | 按 1 MiB 分块上传附件，返回已落盘的偏移 |
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit`、`binary` | 分页读取该会话实际引用的附件 |
@@ -227,7 +228,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组。全部退出�
 
 Node 接纳工作时核对派发方是成员 Node 且处于进行中的调度轮次，并核对 `cwd` 位于自己的 `roots` 内。本机工作（`kind=codex`）：`track_work` 写 `WorkDispatched` 并返回 `{work_id, call_ref, state, may_send, send_by_ms, cwd, thread_id?}`，只有第一次登记 `may_send=true`；CLI 用 `thread/start`（`approvalPolicy=never`、`danger-full-access`）开线程，`bind_work {work_id, thread_id}` 绑定后才发 `turn/start`，`clientUserMessageId` 为 `work_id`，再 `bind_work {work_id, turn_id | unknown | failed}`。`send_by_ms` 为登记后 60 秒，之后不再发送；再过 30 秒仍没有回合时 Node 按 `clientId` 复查线程，找不到就记为 `rejected`。`target_node` 是其他设备时，任务（`kind=task`）作为那台设备协调 Agent 的一轮执行，由它在本机直连派发。`continues` 在原工作的 thread 上开新 turn，原目标不可达时报错，不改派。
 
-Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线程的请求由 Node 挂起并交给协调 Agent：Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答，需要本人时用 `vibeface triage raise --request-id … --choice '<标签>=<json>'` 生成拍板卡片，卡片挂住请求直到本人选择，忽略即拒绝。没有协调 Agent 或 120 秒内无人处理时按方法拒绝并记录（见 `docs/codex-app-server.md`）。其他客户端的请求留给原客户端。Node 不自动重试写请求。
+Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线程的请求由 Node 挂起并交给协调 Agent：Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答，需要本人时用 `vibeface triage raise --request-id … --question … --choice <标签>` 在负责该会话的助手聊天里提问，提问挂住请求直到有回答，回答后助手有 120 秒用 `vibeface codex respond … --node <设备>` 应答。不属于任何助手的会话上的请求立即兜底。没有协调 Agent 或 120 秒内无人处理时按方法拒绝并记录（见 `docs/codex-app-server.md`）。其他客户端的请求留给原客户端。Node 不自动重试写请求。
 
 工作状态为 `accepted`、`starting`、`running`、`interrupting`、`finished` 和 `unverified`。每次转换在同一事务更新本机日志并追加对应事件。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`；只有 `unverified` 可以被本人签名的 `WorkFinished` 取代。工作结束时若原消息的 `report_results` 不为 `false`，负责人把 `work:<work_id>` 入队，下一轮向本人汇报。
 
@@ -255,17 +256,19 @@ Event {
 | `conversation_created` | `title` | 入口 Node |
 | `conversation_owner` | `scheduler_node`、`epoch`、`attestation` | 入口 Node |
 | `bot_created` | `bot_id`、`name`、`instructions`、`project?`、`attestation` | 入口 Node |
-| `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`attestation?` | 本人消息由入口写，回答由负责人写 |
+| `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`answers?`、`attestation?` | 本人消息由入口写，回答由负责人写；`answers` 只在本人消息上，`message_id` 为 `a-<question_id>` |
 | `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind`（`codex` 或 `task`）、`cwd`、`title`、`prompt`、`continues?`、`parent?` | 目标 Node |
 | `work_progress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node |
 | `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
+| `question_asked` | `question_id`、`severity`、`text`、`choices: [{label, conversation_id?}]`、`about {node, agent, session_id, cwd, summary, request_id?}` | 提问的 Node；写在拥有该会话的助手会话，外来会话写在 `sessions` |
+| `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary`、`question_id` | 运行该会话的 Node，写在被认领助手的会话 |
 | `assistant_changed` | `change_id`、`cause`、`change` | 负责人 |
 | `context_checkpoint` | `covers`、`summary`、`standing_instructions`、`open_work`、`decisions` | 负责人 |
 
 `assistant_changed.change` 按 `kind` 区分：`profile { name?, instructions? }` 的每项为 `{ before, after }`；`skill { skill_id, before, after }` 与 `routine { routine_id, before, after }` 的 `after` 为 `null` 表示删除。skill 为 `{ name, description, body }`，名称最多 64 字符，说明最多 512 字节，正文最多 16 KiB；例行任务为 `{ name, prompt, first_run_at_ms, every_minutes, enabled }`，名称最多 120 字符，说明最多 8 KiB，`every_minutes` 为 5 至 40320。说明（instructions）最多 8192 字节。这个事件不带 `attestation`，入库时要求 `prev` 或 `deps` 中有同一会话、`message_id` 等于 `cause` 且带 `attestation` 的本人消息，否则拒绝。投影只比较 rank：名称和说明逐项后写者胜并合并进机器人定义，skill 全网按 `skill_id`、例行任务按 `routine_id` 后写者胜并保留删除，修改记录按 `change_id` 取 rank 最小者。
 
-通知由 `work_finished` 派生，通知 ID 即该事件 hash。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
+通知由 `work_finished` 和会话里的 `question_asked` 派生，通知 ID 即该事件 hash。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`，先到者胜。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 
 入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
 
@@ -340,7 +343,8 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `progress_read` | 读取管理轮和原生工作的临时进度 |
 | `dispatch_work` | 派发方请求目标接纳工作 |
 | `interrupt_work` | 停止目标上的工作 |
-| `codex_state`、`send_decision` | 转发本人读状态和送决定，要求 `human: true` |
+| `codex_state` | 转发本人读状态，要求 `human: true` |
+| `codex_respond` | 另一台设备的助手应答本设备挂起的 App Server 请求，同一请求只应答一次 |
 | `cancel_manager`、`resolve` | 转发本人的管理控制，要求 `human: true` |
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 
