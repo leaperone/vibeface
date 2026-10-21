@@ -65,11 +65,32 @@ impl Switch {
     }
 }
 
+/// Which Codex App Server this Node uses: the one already running on this computer, so its
+/// sessions are shared, or one the Node starts and stops itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppServerMode {
+    #[default]
+    System,
+    Spawn,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppServer {
+    pub mode: AppServerMode,
+    /// The system App Server's socket when discovery should not choose it. Kept while the
+    /// Node starts its own, so switching back restores it.
+    pub socket: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {
     pub codex: Switch,
     pub cursor: Switch,
+    #[serde(default)]
+    pub codex_app_server: AppServer,
 }
 
 impl Default for Providers {
@@ -77,6 +98,7 @@ impl Default for Providers {
         Self {
             codex: Switch::all(Provider::Codex),
             cursor: Switch::all(Provider::Cursor),
+            codex_app_server: AppServer::default(),
         }
     }
 }
@@ -99,6 +121,13 @@ impl Providers {
         switch.enabled && switch.roles.contains(&role)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(socket) = &self.codex_app_server.socket {
+            let text = socket.to_string_lossy();
+            ensure!(
+                socket.is_absolute() && text.len() <= 1024 && !text.contains('\0'),
+                "the App Server socket must be an absolute path"
+            );
+        }
         for provider in Provider::ALL {
             ensure!(
                 self.get(provider)
@@ -225,6 +254,16 @@ pub struct CodexLaunch {
     pub env: BTreeMap<String, String>,
 }
 
+/// The App Server the Node talks to right now.
+#[derive(Clone, PartialEq)]
+pub enum CodexTarget {
+    /// Codex does not serve the execution layer.
+    Off,
+    /// The App Server already running on this computer; `None` discovers its socket.
+    System(Option<PathBuf>),
+    Spawn(CodexLaunch),
+}
+
 /// Everything about the providers that only this machine knows.
 #[derive(Clone)]
 pub struct Local {
@@ -238,13 +277,21 @@ impl Local {
         self.switches.serves(provider, role)
     }
 
-    /// The App Server runs only while Codex serves the execution layer.
-    pub fn codex_launch(&self) -> Option<CodexLaunch> {
-        self.serves(Provider::Codex, Role::Execution)
-            .then(|| CodexLaunch {
+    /// The App Server is used only while Codex serves the execution layer. The variables reach
+    /// only an App Server the Node starts; the system one keeps its own.
+    pub fn codex_target(&self) -> CodexTarget {
+        let app_server = &self.switches.codex_app_server;
+        match (
+            self.serves(Provider::Codex, Role::Execution),
+            app_server.mode,
+        ) {
+            (false, _) => CodexTarget::Off,
+            (true, AppServerMode::System) => CodexTarget::System(app_server.socket.clone()),
+            (true, AppServerMode::Spawn) => CodexTarget::Spawn(CodexLaunch {
                 bin: self.codex_bin.clone(),
                 env: self.env.codex.clone(),
-            })
+            }),
+        }
     }
 }
 
@@ -319,6 +366,38 @@ mod tests {
             codex_bin: "codex".into(),
             env: ProviderEnv::default(),
         };
-        assert!(local.codex_launch().is_none());
+        assert!(local.codex_target() == CodexTarget::Off);
+    }
+
+    #[test]
+    fn codex_uses_the_system_app_server_unless_told_to_start_its_own() -> Result<()> {
+        let saved: Providers = serde_json::from_value(serde_json::json!({
+            "codex":{"enabled":true,"roles":["agent","execution"]},
+            "cursor":{"enabled":true,"roles":["agent"]},
+        }))?;
+        let mut env = ProviderEnv::default();
+        env.apply(
+            Provider::Codex,
+            BTreeMap::from([("CPA_API_KEY".into(), Some("fixture-value".into()))]),
+        )?;
+        let mut local = Local {
+            switches: saved,
+            codex_bin: "codex".into(),
+            env,
+        };
+        assert!(local.codex_target() == CodexTarget::System(None));
+        local.switches.codex_app_server = AppServer {
+            mode: AppServerMode::Spawn,
+            socket: Some("/tmp/kept.sock".into()),
+        };
+        let CodexTarget::Spawn(launch) = local.codex_target() else {
+            panic!("spawn mode starts the Node's own App Server");
+        };
+        assert_eq!(launch.env["CPA_API_KEY"], "fixture-value");
+        local.switches.codex_app_server.mode = AppServerMode::System;
+        assert!(local.codex_target() == CodexTarget::System(Some("/tmp/kept.sock".into())));
+        local.switches.codex_app_server.socket = Some("relative.sock".into());
+        assert!(local.switches.validate().is_err());
+        Ok(())
     }
 }

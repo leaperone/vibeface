@@ -1676,7 +1676,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.network = network;
-        configuration.codex_socket = Some(dir.join("unavailable.sock"));
+        configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
         configuration.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),

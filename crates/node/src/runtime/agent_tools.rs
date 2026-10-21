@@ -154,7 +154,7 @@ impl Runtime {
             Tool::BindWork => self.bind_work(network, &scope, &args).await,
             // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
             Tool::DispatchWork => {
-                let socket = self.codex.socket.clone();
+                let socket = self.codex.socket();
                 let (access, scope) = (&access, scope.as_str());
                 crate::agent_cli::dispatch(
                     &args,

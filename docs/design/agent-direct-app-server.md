@@ -67,6 +67,16 @@
 
 Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的路径、审批转发和逐方法包装。工作只分两类，记在 `WorkDispatched.kind`：`codex` 是本机协调 Agent 发出、Node 观察的 Codex 回合；`task` 是交给某台设备协调 Agent 的一轮任务。
 
+### 2.1a 用哪个 App Server
+
+用户决定（2026-10-21）：默认用这台电脑上已经运行的 App Server，会话与本人的 Codex 共用；Node 自己启动一个只作为本人可选的后备。设置在 `config.json` 的 `providers.codex_app_server`：`{"mode":"system"|"spawn","socket":null|"<路径>"}`，网页在“设备 → AI 服务 → Codex”里切换并测试连接。
+
+- `system`（默认）：Node 不启动也不结束它。`socket` 为空时按 Codex 自己的约定找控制 socket：先 Node 环境里的 `$CODEX_HOME`，再 `~/.codex`，路径是 `<home>/app-server-control/app-server-control.sock`。`codex app-server proxy` 和 `codex app-server daemon version` 用的就是它；桌面应用的 daemon 把它做成指向 `/tmp/codex-daemon-<uid>/<hash>` 中活着那个 socket 的软链。`/tmp/codex-daemon-<uid>/` 里留着很多旧 socket，Node 不扫描那个目录。每个候选都做一次真实的 `initialize` 握手：不存在、拒绝连接或路径过长的跳过，握手失败的报 `handshake_failed`，都不通时报 `not_found`。连上后断开 5 秒就重新查找，按 1 至 30 秒退避；App Server 被重启或换了 socket 时自动跟过去。
+- `spawn`：沿用原来的托管方式，`codex_bin` 和 `provider-env.json` 里的 Codex 变量只在这个模式传给 App Server。
+- Agent 的 `VIBEFACE_CODEX_SOCKET` 固定是 `/tmp/vibeface-<identity>/app-server.sock`，Node 把它软链到正在用的 socket，切换模式或 App Server 换位置时 Agent 的环境不用变。
+- 线程被另一个进程写着时（Codex 报 `already has an active writer`），写请求按“没有发出”报错，不自动重发；观察改为读取 turn，不再反复 `thread/resume`。
+- 网页的 `test_codex_app_server` 做一次独立握手，返回与状态相同的 `{state, socket, user_agent | reason | candidates}`。
+
 ### 2.2 薄 CLI
 
 `vibeface codex` 直接连 `VIBEFACE_CODEX_SOCKET`（Node 把 App Server socket 放进协调 Agent 的工具环境），不经 Node：

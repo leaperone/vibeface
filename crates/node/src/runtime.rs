@@ -222,8 +222,8 @@ impl Runtime {
             env: crate::providers::ProviderEnv::load(dir)?,
         };
         let codex = Arc::new(codex_server::CodexServer::open(
-            &config,
-            providers.codex_launch(),
+            providers.codex_target(),
+            codex_server::system_candidates(),
             &identity,
             dir,
             tx,

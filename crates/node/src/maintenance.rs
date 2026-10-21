@@ -484,7 +484,7 @@ mod tests {
             &crate::config::data_epoch_marker(),
         )?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
-        config.codex_socket = Some(dir.join("unavailable.sock"));
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;
         config::private_write(
             &dir.join("identity.json"),
@@ -563,7 +563,7 @@ mod tests {
         drop(node);
         let socket = socket_path(&dir)?;
         std::fs::remove_file(&socket)?;
-        std::fs::remove_dir(socket.parent().unwrap())?;
+        std::fs::remove_dir_all(socket.parent().unwrap())?;
         std::fs::remove_dir_all(&dir)?;
         result
     }

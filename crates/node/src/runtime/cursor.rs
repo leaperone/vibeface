@@ -18,7 +18,7 @@ impl Runtime {
             ),
             (
                 "VIBEFACE_CODEX_SOCKET".into(),
-                self.codex.socket.display().to_string(),
+                self.codex.socket().display().to_string(),
             ),
             (
                 "VIBEFACE_DATA_DIR".into(),
@@ -107,7 +107,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vibeface-cursor-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
-        configuration.codex_socket = Some(dir.join("unavailable.sock"));
+        configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
         configuration.save(&dir)?;
         config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
         config::private_write(
