@@ -49,12 +49,14 @@ impl Store {
             .is_some())
     }
 
-    /// The first fork events, each beside the main-chain event at the same place.
+    /// The first fork events, each beside the main-chain event at the same place. A removed
+    /// device's fork is settled by its revocation cutoff, so it is left out.
     pub fn conflicts(&self, network: &str) -> Result<Vec<serde_json::Value>> {
+        let view = super::membership_from(&self.connection, network)?;
         let mut statement = self.connection.prepare(
             "SELECT c.author,c.seq,c.envelope,e.envelope FROM events c LEFT JOIN events e
              ON e.network_id=c.network_id AND e.author=c.author AND e.seq=c.seq AND e.main=1
-             WHERE c.network_id=? AND c.main=0 ORDER BY c.author,c.seq,c.hash LIMIT 20",
+             WHERE c.network_id=? AND c.main=0 ORDER BY c.author,c.seq,c.hash",
         )?;
         let rows = statement.query_map([network], |r| {
             Ok((
@@ -75,6 +77,12 @@ impl Store {
         let mut conflicts = Vec::new();
         for row in rows {
             let (author, seq, other, kept) = row?;
+            if view.revocation(&author).is_some() {
+                continue;
+            }
+            if conflicts.len() == 20 {
+                break;
+            }
             conflicts.push(serde_json::json!({"author":author,"seq":seq,
                 "kept":kept.as_deref().map(version).transpose()?,"other":version(&other)?}));
         }

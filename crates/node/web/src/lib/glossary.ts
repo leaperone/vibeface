@@ -1,5 +1,5 @@
 import {
-  Ban, Bot, CircleAlert, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Inbox,
+  Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Inbox,
   Laptop, Link, ListChecks, Lock, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
   Smartphone, Sparkles, ArchiveRestore,
 } from "lucide-react"
@@ -29,6 +29,7 @@ export const terms = {
   inbox: { label: "待处理", icon: Inbox },
   folders: { label: "可用文件夹", icon: FolderOpen },
   readOnly: { label: "只读", icon: Lock },
+  paused: { label: "已暂停", icon: CirclePause },
   syncing: { label: "同步中", icon: RefreshCw },
   sending: { label: "发送中", icon: Clock },
   undelivered: { label: "未送达", icon: CircleAlert },

@@ -15,7 +15,7 @@ function Dots({ step }: { step: number }) {
   </div>
 }
 
-/** Steps 3 and 4 after creating a network here. Both can be skipped; 待处理 keeps a setup hint. */
+/** Steps 3 and 4 after creating a network here. Skipping step 3 still offers step 4; 待处理 and the composer point back to the AI service. */
 export function Onboarding() {
   const workspace = useWorkspace()
   const navigate = useNavigate()
@@ -41,7 +41,7 @@ export function Onboarding() {
         <h2 className="flex items-center gap-2 text-heading font-semibold"><Bot aria-hidden="true" className="size-5 text-muted-foreground" />让这台电脑运行助手</h2>
         <AssistantSettings onboarding />
         <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" onClick={done}>稍后设置</Button>
+          <Button type="button" variant="ghost" onClick={() => setStep(4)}>稍后设置</Button>
           <Button type="button" onClick={() => setStep(4)}>下一步</Button>
         </div>
       </section> : <section className="grid gap-4 rounded-xl border bg-card p-5">

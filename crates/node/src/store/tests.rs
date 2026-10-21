@@ -1712,6 +1712,7 @@ fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
         vec![true, true, false, false, false, false, true]
     );
     assert!(both.has_conflicts_by(&net.network, &fleet.x.device_id()?)?);
+    assert!(!both.conflicts(&net.network)?.is_empty());
 
     let picked = revoke(&fleet, &net.state, &fleet.x, Some(&x4b))?;
     let pieces = [
@@ -1724,6 +1725,10 @@ fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
     assert_eq!(
         effective(&reference, net, &all)?,
         vec![true, true, false, false, true, true, true]
+    );
+    assert!(
+        reference.conflicts(&net.network)?.is_empty(),
+        "once removed, its fork no longer asks the user to act"
     );
     Ok(())
 }

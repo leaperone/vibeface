@@ -91,7 +91,7 @@ function work(value: unknown): WorkRecord {
   return {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
-    failure_reason: data.failure_reason == null ? null : text(data.failure_reason),
+    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), thread_id: optionalText(data.thread_id),
   }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */

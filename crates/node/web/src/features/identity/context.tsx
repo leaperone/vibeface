@@ -495,6 +495,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     finally { verified.free() }
     event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
     await request('revoke', { event }); await refreshDirectory()
+    for (const entry of savedEntries().filter(item => item.device_id === deviceId)) removeEntry(entry)
   }
   /** Joins through a ticket link: commit, wait for the manager's nonce, reveal, show the short code. */
   async function join(linkText: string, nameValue: string) {
