@@ -10,7 +10,7 @@ import type { WorkRecord } from "./types.ts"
 import { nodeName } from "./labels.ts"
 import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
 import { placeChanges, routineName, routineTrigger } from "./assistant.ts"
-import { agentName, foldAnswers, placeByTime, projectName } from "./questions.ts"
+import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "./questions.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
@@ -487,7 +487,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName }, '@/components/app/kit': kit })
+  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit })
   const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const labelled = (elements: Element[], label: string) => elements.find(({ props }) => [props.children].flat().includes(label))

@@ -80,6 +80,10 @@ pub enum Severity {
 /// Scope of the questions about sessions no assistant owns; they show only on the pending page.
 pub const SESSIONS_SCOPE: &str = "sessions";
 
+/// Scope of the user's choice of primary assistant, the one that judges what comes in without an
+/// owner. Its latest event by rank stands; nothing projects it.
+pub const ASSISTANTS_SCOPE: &str = "assistants";
+
 /// The device, project and session a question is about.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -397,6 +401,12 @@ pub enum EventBody {
         /// The session question that led to it.
         question_id: String,
     },
+    /// In `ASSISTANTS_SCOPE`: the user makes this conversation's assistant the primary one.
+    PrimaryAssistantSet {
+        conversation_id: ScopeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
     /// Written by the owner in a turn the user's message `cause` started; that message is one
     /// of its parents. `change_id` derives from the turn and the tool's `call_ref`.
     AssistantChanged {
@@ -422,7 +432,8 @@ impl EventBody {
             | Self::BotCreated { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
-            | Self::NotificationAcked { attestation, .. } => attestation.as_ref(),
+            | Self::NotificationAcked { attestation, .. }
+            | Self::PrimaryAssistantSet { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }

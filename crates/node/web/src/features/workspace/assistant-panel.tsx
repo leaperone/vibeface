@@ -1,11 +1,12 @@
 "use client"
 
 import { useRef, useState, type ReactNode } from "react"
-import { BookOpen, Bot, CirclePause, Repeat, ScrollText, type LucideIcon } from "lucide-react"
+import { BookOpen, Bot, CirclePause, Repeat, ScrollText, Star, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { formatWhen, routineFrequency } from "./assistant"
 import { useWorkspace } from "./context"
+import { ActionButton } from "./present"
 
 /** Header button for the chat route; opens a read-only view of the assistant (docs/design/assistant-config.md section 5). */
 export function AssistantPanelButton() {
@@ -24,6 +25,9 @@ export function AssistantPanelButton() {
         <SheetHeader className="pr-14">
           <SheetTitle className="break-words">{bot.name}</SheetTitle>
           <SheetDescription>在聊天里说一声就能改。</SheetDescription>
+          {workspace.primary === bot.conversation_id
+            ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Star aria-hidden="true" className="size-3.5 fill-current" />主助手</p>
+            : <ActionButton className="justify-self-start" disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主助手</ActionButton>}
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <Section icon={ScrollText} title="说明">

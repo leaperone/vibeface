@@ -158,7 +158,8 @@
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
 | `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测 |
-| `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改 |
+| `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改；`primary` 为主助手的会话 ID |
+| `set_primary_assistant` | `conversation_id`、`attestation` | 本人选定主助手，写入 `assistants` scope |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |

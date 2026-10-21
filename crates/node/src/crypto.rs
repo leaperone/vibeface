@@ -112,7 +112,8 @@ impl LocalIdentity {
             | EventBody::BotCreated { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
-            | EventBody::NotificationAcked { attestation, .. } => *attestation = value,
+            | EventBody::NotificationAcked { attestation, .. }
+            | EventBody::PrimaryAssistantSet { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -279,7 +280,8 @@ fn validate_attestation(event: &Event) -> Result<()> {
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
-        | EventBody::NotificationAcked { .. } => UserSignature::Required,
+        | EventBody::NotificationAcked { .. }
+        | EventBody::PrimaryAssistantSet { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -465,9 +467,18 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(work_id)?
         }
         EventBody::ConversationCreated { .. } => ensure!(
-            event.scope_id != SESSIONS_SCOPE,
-            "the sessions scope is not a conversation"
+            event.scope_id != SESSIONS_SCOPE && event.scope_id != ASSISTANTS_SCOPE,
+            "the sessions and assistants scopes are not conversations"
         ),
+        EventBody::PrimaryAssistantSet {
+            conversation_id, ..
+        } => {
+            ensure!(
+                event.scope_id == ASSISTANTS_SCOPE,
+                "the primary assistant is set in the assistants scope"
+            );
+            id(conversation_id)?;
+        }
         EventBody::QuestionAsked {
             question_id: question,
             text,

@@ -12,7 +12,7 @@ import { mergeProgress, type LiveProgress } from "@/lib/progress"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
-  parseBot, parseBots, parseCreateBot, parsePendingBot, record,
+  parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, pendingChecks,
 } from "./model"
 import { answerBody, answerId, answerScope } from "./questions"
@@ -65,6 +65,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const answersRef = useRef<PendingAnswer[]>([])
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([])
   const [bots, setBots] = useState<BotRecord[]>([])
+  const [primary, setPrimary] = useState<string | null>(null)
   const [pendingBot, setPendingBot] = useState<PendingBot | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [messageBusy, setMessageBusy] = useState(false)
@@ -239,7 +240,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
-      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
@@ -274,6 +275,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
     if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
     // Every unanswered question is listed, so one missing from the list has its answer.
+    if (item.method === "set_primary_assistant") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -452,7 +454,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
@@ -514,6 +516,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       else if (receipt.cancel_requested === true) setNoticeText("已请求停止回复，已开始的任务会继续。")
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
+    }),
+    makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
+      const attestation = await attest("assistants", { type: "primary_assistant_set", conversation_id: id })
+      try { await signedWrite("primary", id, "set_primary_assistant", { conversation_id: id, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      await refreshRef.current()
     }),
     takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
       const id = activeId.current, context = requireBotContext(id)

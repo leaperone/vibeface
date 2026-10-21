@@ -74,7 +74,41 @@ impl Runtime {
                     .is_none_or(|scope| scope == &bot.conversation_id)
             })
             .collect::<Vec<_>>();
-        Ok(json!({"bots":bots}))
+        Ok(json!({"bots":bots,"primary":store.primary_assistant(&access.network_id)?}))
+    }
+
+    /// The user's choice of the assistant that judges what comes in without an owner.
+    pub(super) async fn set_primary_assistant(
+        &self,
+        access: &Access,
+        input: &Value,
+    ) -> Result<Value> {
+        ensure!(access.human, "only the user picks the primary assistant");
+        let scope = id(input, "conversation_id")?;
+        if let Some(allowed) = &access.conversation_id {
+            ensure!(allowed == &scope, "outside this client's conversation");
+        }
+        ensure!(
+            self.store
+                .lock()
+                .await
+                .bot_for_conversation(&access.network_id, &scope)?
+                .is_some(),
+            "no such assistant"
+        );
+        let event = self
+            .append(
+                &access.network_id,
+                ASSISTANTS_SCOPE,
+                EventBody::PrimaryAssistantSet {
+                    conversation_id: scope,
+                    attestation: Some(attestation(input)?),
+                },
+            )
+            .await?;
+        tracing::info!(event = "assistant.primary", "primary assistant set");
+        self.publish_changed(&access.network_id, ASSISTANTS_SCOPE, &event.hash);
+        Ok(json!({"primary":self.store.lock().await.primary_assistant(&access.network_id)?}))
     }
 
     async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {

@@ -24,9 +24,18 @@ Codex 线程或 Claude Code 会话（统称 session）属于某个助手，只�
 外来会话：
 
 - 第一个事件到来时，运行它的 Node 直接写一个确定性的会话提问（不经 Agent），问题是“这个 Codex 会话不是助手发起的：处理还是忽略？”，附 cwd 和一行摘要。选项为 `忽略`、`处理`，以及每个助手一项 `交给 <助手名>`。它只出现在待处理页和 Grok，不进任何聊天。
-- 提问未回答或回答为 `忽略` 时，该 session 之后的事件静默丢弃。`忽略` 按 session 记住，因为问题 ID 由 session 派生。
-- 回答 `交给 <助手>` 时，Node 直接写 `SessionAttributed`。回答 `处理` 或其他文字时，Node 让本机协调 Agent 跑一轮路由，按 cwd、项目和近期会话选择助手，用 `vibeface triage assign` 认领。Agent 未认领时按最长项目路径前缀、再按最早创建的助手兜底。
+- 提问未回答或回答为 `忽略` 时，该 session 之后的事件静默丢弃。`忽略` 按 session 记住，因为问题 ID 由 session 派生。运行它的 Node 把已忽略的 session 记在内存里，事件不碰数据库就丢弃；认领或绑定工作时移出。重启后从数据库重新得知。
+- 回答 `交给 <助手>` 时，Node 直接写 `SessionAttributed`。回答 `处理` 或其他文字时，交给主助手判断。
 - 认领后该 session 的事件和提问都进入那个助手的聊天，聊天里显示一张交接卡片。
+
+主助手：
+
+- 每个个人网络一个，由用户在助手页“设为主助手”选定，是同步的设置。未选或所选助手已不存在时，用最早创建的助手。
+- 没有归属的东西都先交给主助手判断。目前就是回答了 `处理` 的外来会话。
+- 判断在主助手自己的聊天里跑一轮（触发类型 `route`，触发 ID `route:<问题 ID>`），用户能看到它的理由。这一轮拿到会话提问全文，以及其他每个助手的名称、项目和最近 5 条消息摘要。
+- 它要么留下（`vibeface triage assign` 指向自己），要么交给另一个助手。交接卡片出现在双方聊天里，主助手聊天里写明交给了谁。
+- 这一轮结束仍无人认领，或回答后 10 分钟内主助手没有回复时，会话归主助手。不再按项目路径前缀兜底。
+- 换主助手后，下一个外来会话的判断轮在新主助手的聊天里跑。已经开始的判断轮不受影响。
 
 外来会话上的 App Server 请求不等人：Node 写会话提问（若尚无）并立即按方法回退应答。
 
@@ -34,6 +43,11 @@ Codex 线程或 Claude Code 会话（统称 session）属于某个助手，只�
 
 ```text
 const SESSIONS_SCOPE = "sessions"     // 外来会话的提问只住在这里
+const ASSISTANTS_SCOPE = "assistants" // 网络级的助手设置
+
+PrimaryAssistantSet {                 // 写在 ASSISTANTS_SCOPE，须本人签名
+	conversation_id: ScopeId,         // 主助手的会话
+}
 
 Subject {                             // 问题所涉的设备、项目和 session
 	node: DeviceId,                   // 运行该 session 的设备
@@ -84,6 +98,8 @@ SessionAttributed {                   // 写在被认领助手的会话 scope
 
 未回答 = `questions` 左连接 `messages.answers` 为空。不另设“已回答”状态。
 
+主助手不建表，也不改数据纪元。读取时取 `ASSISTANTS_SCOPE` 里 rank 最大的 `PrimaryAssistantSet`，所指助手仍在则用它，否则用最早创建的助手。旧版本 Node 不认识这个事件，升级前会拒收。
+
 删除：`AttentionRaised`、`AttentionResolved`、`AlertResolution`、`ChoiceLabel`、`ATTENTION_SCOPE`，表 `alerts`、`alert_resolutions`、`triage_cards`、`triage_matters`、`decision_journal`，`runtime/decision.rs`，RPC `alerts`、`resolve_alert`、`send_decision`，以及 matter 合并窗口。
 
 ## 4. 接口
@@ -92,14 +108,16 @@ Agent 侧（CLI → `/api/triage`）：
 
 - `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R]`：写入拥有该 session 的助手会话。同一 session 同一请求已有未答问题时返回原问题。带 `--request-id` 时请求挂起到回答为止，回答后再给助手 120 秒应答，超时按方法回退。
 - `vibeface triage dismiss --event-id ID`：不变。
-- `vibeface triage assign --question QID --assistant CONVERSATION_ID`：路由轮认领外来会话，重复调用返回同一归属。
+- `vibeface triage assign --question QID --assistant CONVERSATION_ID`：主助手的判断轮认领外来会话，重复调用返回同一归属。会话不在本机时转给运行它的设备写入。
 - `vibeface codex respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
 
 用户侧 RPC：
 
 - `questions`：全网未回答问题，含所属会话与助手名。
 - `answer { question_id, text, attestation }`：写回答消息。会话问题按普通消息准入或转交调度 Node；同一问题已有不同回答时返回已有回答，`status = "already_answered"`。
-- `conversation` 快照新增 `questions`（含回答）和 `sessions`（交接卡片）。
+- `conversation` 快照新增 `questions`（含回答）和 `sessions`（交接卡片，`conversation_id` 为认领方；主助手聊天里也列出它交出去的会话）。
+- `bots` 返回 `primary`，即主助手的会话 ID，没有助手时为 `null`。
+- `set_primary_assistant { conversation_id, attestation }`：本人选定主助手，签名事件体为 `{"type":"primary_assistant_set", conversation_id}`，scope 为 `assistants`。
 
 Grok 侧：
 

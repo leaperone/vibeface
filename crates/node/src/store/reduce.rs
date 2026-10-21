@@ -320,7 +320,8 @@ pub(crate) fn apply(
                 }
             }
         }
-        EventBody::ContextCheckpoint { .. } => {}
+        // Read from the log by rank; see `store::bots::primary_assistant_from`.
+        EventBody::ContextCheckpoint { .. } | EventBody::PrimaryAssistantSet { .. } => {}
     }
     Ok(())
 }

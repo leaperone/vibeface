@@ -361,6 +361,37 @@ pub(crate) fn admit_from(
     Ok(job.receipt(network))
 }
 
+impl Store {
+    /// Queues the turn in which `conversation`'s assistant routes the session `question` is about,
+    /// once. Only the Node that schedules the conversation admits it; returns whether it is new.
+    pub fn admit_route(
+        &mut self,
+        local: &str,
+        network: &str,
+        conversation: &str,
+        question: &str,
+    ) -> Result<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let trigger = route_trigger(question);
+        let owner = conversation_from(&tx, network, conversation)?.and_then(|c| c.owner);
+        if owner.as_deref() != Some(local) || load_job(&tx, conversation, &trigger)?.is_some() {
+            return Ok(false);
+        }
+        admit_from(
+            &tx,
+            network,
+            conversation,
+            &trigger,
+            TriggerKind::Route,
+            question,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+}
+
 /// The enabled routine a routine job runs, if it still belongs to the job's conversation.
 pub(crate) fn live_routine(
     connection: &Connection,

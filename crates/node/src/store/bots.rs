@@ -1,7 +1,7 @@
 use super::{Store, authorize_node_from, create_conversation_from, log};
 use crate::{crypto::LocalIdentity, model::*};
 use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::{Component, Path};
 
 fn valid_id(value: &str) -> bool {
@@ -192,4 +192,43 @@ impl Store {
     pub fn bot_for_conversation(&self, network: &str, scope: &str) -> Result<Option<Bot>> {
         bot_for_conversation_from(&self.connection, network, scope)
     }
+
+    pub fn primary_assistant(&self, network: &str) -> Result<Option<ScopeId>> {
+        primary_assistant_from(&self.connection, network)
+    }
+}
+
+/// The assistant that judges what comes in without an owner: the user's latest choice while it
+/// is an assistant, otherwise the first assistant created.
+pub(crate) fn primary_assistant_from(
+    connection: &Connection,
+    network: &str,
+) -> Result<Option<ScopeId>> {
+    let chosen = connection
+        .query_row(
+            "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1
+             ORDER BY lamport DESC,created_at_ms DESC,hash DESC LIMIT 1",
+            params![network, ASSISTANTS_SCOPE],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|envelope| -> Result<Option<ScopeId>> {
+            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            Ok(match event.body {
+                EventBody::PrimaryAssistantSet {
+                    conversation_id, ..
+                } => Some(conversation_id),
+                _ => None,
+            })
+        })
+        .transpose()?
+        .flatten();
+    Ok(connection
+        .query_row(
+            "SELECT conversation_id FROM bots WHERE network_id=?1 ORDER BY conversation_id IS ?2 DESC, rank LIMIT 1",
+            params![network, chosen],
+            |r| r.get(0),
+        )
+        .optional()?)
 }

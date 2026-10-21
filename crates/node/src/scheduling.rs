@@ -17,10 +17,17 @@ pub enum TriggerKind {
     AgentTask,
     /// A scheduled run of a routine the user set up in this conversation.
     Routine,
+    /// The primary assistant judges who owns a session the user chose to handle.
+    Route,
 }
 
 pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
+}
+
+/// The turn in which the primary assistant routes the session a session question is about.
+pub fn route_trigger(question_id: &str) -> String {
+    format!("route:{question_id}")
 }
 
 pub fn work_trigger(work_id: &str) -> String {
