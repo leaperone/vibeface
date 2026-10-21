@@ -181,6 +181,7 @@ struct Init {
     node_bin: PathBuf,
     #[arg(long)]
     codex_sdk_script: Option<PathBuf>,
+    /// The system Codex App Server's socket, when discovery should not choose it.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
@@ -823,7 +824,7 @@ fn init(options: Init) -> Result<()> {
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
     configuration.local_listen = options.local_listen;
     configuration.local_auto_access = !options.no_local_auto_access;
-    configuration.codex_socket = options.codex_socket;
+    configuration.providers.codex_app_server.socket = options.codex_socket;
     configuration.codex_bin = options.codex_bin;
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();

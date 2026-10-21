@@ -2,7 +2,7 @@
 //! A managed App Server runs in its own process group recorded in a pidfile, so a crash of
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
 use super::*;
-use crate::providers::CodexLaunch;
+use crate::providers::{CodexLaunch, CodexTarget};
 use crate::work::Probe;
 use std::os::unix::process::CommandExt as _;
 use vibeface_bridge::codex::{CodexClient, CodexError};
@@ -99,33 +99,119 @@ impl CodexServer {
 }
 
 /// The Node's own client observes, probes and interrupts; the coordination Agent sends turns on
-/// its own connection to the same socket.
+/// its own connection to the same App Server. That App Server is the one already running on this
+/// computer, whose sessions the owner shares, or one the Node starts itself.
 pub(crate) struct CodexServer {
     client: CodexClient,
-    /// The App Server socket; the coordination Agent connects to it directly.
-    pub socket: PathBuf,
-    managed: Option<Arc<Managed>>,
+    inner: Arc<Inner>,
 }
 
-struct Managed {
-    socket: PathBuf,
+struct Inner {
+    client: CodexClient,
+    /// The socket the client connects to; the supervisor moves it.
+    endpoint: tokio::sync::watch::Sender<Option<PathBuf>>,
+    target: std::sync::Mutex<CodexTarget>,
+    /// Wakes the supervisor for a new target.
+    changed: tokio::sync::Notify,
+    /// Where the system App Server's control socket may be, in order.
+    candidates: Vec<PathBuf>,
+    /// Where an App Server the Node starts listens.
+    spawn_socket: PathBuf,
+    /// A link to the socket in use. The coordination Agent's tools keep this one path while the
+    /// App Server moves.
+    agent_socket: PathBuf,
     pidfile: PathBuf,
-    /// What the next start runs; `None` while Codex does not serve the execution layer.
-    launch: std::sync::Mutex<Option<CodexLaunch>>,
-    /// Ends the running App Server so the supervisor starts the current launch.
-    relaunch: tokio::sync::Notify,
-    /// Why the last start failed or the App Server exited; cleared by a new launch.
-    failure: std::sync::Mutex<Option<String>>,
+    link: std::sync::Mutex<Link>,
     group: std::sync::Mutex<Option<i32>>,
     stopping: std::sync::atomic::AtomicBool,
 }
 
-/// The managed App Server as the settings page shows it.
-pub(crate) enum Launch {
+/// The App Server as the settings page shows it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Link {
     Off,
+    /// Looking for the system App Server, or starting the Node's own.
     Starting,
-    Running,
-    Failed(String),
+    Connected {
+        socket: PathBuf,
+        user_agent: String,
+    },
+    /// No live App Server at any of these sockets.
+    NotFound {
+        candidates: Vec<PathBuf>,
+    },
+    /// A socket answered but the `initialize` handshake did not complete.
+    HandshakeFailed {
+        socket: PathBuf,
+        reason: String,
+    },
+    /// The App Server the Node starts could not start or exited.
+    LaunchFailed {
+        reason: String,
+    },
+}
+
+/// What the system App Server's control socket answered.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Discovery {
+    Live { socket: PathBuf, user_agent: String },
+    NotFound { candidates: Vec<PathBuf> },
+    HandshakeFailed { socket: PathBuf, reason: String },
+}
+
+/// Codex itself reaches its running App Server through
+/// `$CODEX_HOME/app-server-control/app-server-control.sock` (`codex app-server proxy` and
+/// `daemon version` use it); the desktop app's daemon keeps it a symlink to its live socket under
+/// `/tmp/codex-daemon-<uid>/`. `CODEX_HOME` of the Node's own environment goes first, then
+/// `~/.codex`. Unit tests never reach the operator's App Server.
+pub(crate) fn system_candidates() -> Vec<PathBuf> {
+    if cfg!(test) {
+        return vec![];
+    }
+    let control = |home: PathBuf| home.join("app-server-control/app-server-control.sock");
+    let mut candidates: Vec<PathBuf> = std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| control(home.into()))
+        .into_iter()
+        .chain(std::env::var_os("HOME").map(|home| control(PathBuf::from(home).join(".codex"))))
+        .collect();
+    candidates.dedup();
+    candidates
+}
+
+/// A socket file nobody listens on, or a link to one, is what a stopped App Server leaves.
+fn stale(error: &str) -> bool {
+    ["No such file", "Connection refused", "Not a directory"]
+        .iter()
+        .any(|cause| error.contains(cause))
+}
+
+/// The first candidate that completes an `initialize` handshake. Stale sockets are skipped.
+pub(crate) async fn discover(candidates: &[PathBuf]) -> Discovery {
+    let mut failed = None;
+    for socket in candidates {
+        match vibeface_bridge::codex::DirectSession::connect(socket).await {
+            Ok(session) => {
+                let user_agent = session.user_agent.clone();
+                session.close().await;
+                return Discovery::Live {
+                    socket: socket.clone(),
+                    user_agent,
+                };
+            }
+            Err(error) if stale(&error.message) => {}
+            Err(error) => {
+                failed.get_or_insert(Discovery::HandshakeFailed {
+                    socket: socket.clone(),
+                    reason: error.message,
+                });
+            }
+        }
+    }
+    failed.unwrap_or_else(|| Discovery::NotFound {
+        candidates: candidates.to_vec(),
+    })
 }
 
 fn signal_group(group: i32, signal: i32) -> bool {
@@ -172,10 +258,41 @@ fn socket_dir(identity: &LocalIdentity, data_dir: &Path) -> Result<PathBuf> {
     Ok(directory)
 }
 
-impl Managed {
+impl Inner {
+    fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_link(&self, link: Link) {
+        *self.link.lock().expect("link lock") = link;
+    }
+
+    /// Points the client and the Agent's link at `socket`. Pointing again at the same socket
+    /// cuts the client's reconnect backoff short.
+    fn point(&self, socket: Option<PathBuf>) {
+        if let Some(socket) = &socket {
+            let next = self.agent_socket.with_extension("next");
+            let _ = std::fs::remove_file(&next);
+            if let Err(error) = std::os::unix::fs::symlink(socket, &next)
+                .and_then(|()| std::fs::rename(&next, &self.agent_socket))
+            {
+                tracing::warn!(%error, "the Agent's App Server link was not updated");
+            }
+        }
+        self.endpoint.send_replace(socket);
+    }
+
+    /// Sleeps `seconds` unless the target changes first; `true` means it changed.
+    async fn wait(&self, seconds: u64) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(seconds)) => false,
+            () = self.changed.notified() => true,
+        }
+    }
+
     /// A group recorded by an earlier run is killed, not adopted: its requests belong to a
-    /// dead epoch and its turns are settled by probes on the new App Server. This runs before
-    /// the client exists, so nothing talks to the orphan.
+    /// dead epoch and its turns are settled by probes on the new App Server. Only a group whose
+    /// command names the Node's own socket is touched, never the system App Server.
     fn kill_orphan(&self) {
         let Some(group) = std::fs::read_to_string(&self.pidfile)
             .ok()
@@ -189,7 +306,9 @@ impl Managed {
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
             .unwrap_or_default();
-        if command.contains("app-server") && command.contains(&self.socket.display().to_string()) {
+        if command.contains("app-server")
+            && command.contains(&self.spawn_socket.display().to_string())
+        {
             tracing::info!(group, "stopping App Server left by an earlier run");
             kill_group(group);
         }
@@ -197,21 +316,21 @@ impl Managed {
     }
 
     fn spawn(&self, launch: &CodexLaunch) -> Result<tokio::process::Child> {
-        if self.socket.exists() {
+        if self.spawn_socket.exists() {
             use std::os::unix::fs::FileTypeExt;
             ensure!(
-                std::fs::symlink_metadata(&self.socket)?
+                std::fs::symlink_metadata(&self.spawn_socket)?
                     .file_type()
                     .is_socket(),
                 "private Codex socket path is occupied by another file"
             );
-            std::fs::remove_file(&self.socket)?;
+            std::fs::remove_file(&self.spawn_socket)?;
         }
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
             .args(["app-server", "--listen"])
-            .arg(format!("unix://{}", self.socket.display()))
+            .arg(format!("unix://{}", self.spawn_socket.display()))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -240,73 +359,145 @@ impl Managed {
         Ok(child)
     }
 
-    fn fail(&self, reason: String) {
-        *self.failure.lock().expect("failure lock") = Some(reason);
+    /// Runs the Node's own App Server once. `true` when a new target ended it; its turns are
+    /// settled by probes on the next App Server, as after a crash.
+    async fn run_spawned(&self, launch: &CodexLaunch) -> bool {
+        self.point(Some(self.spawn_socket.clone()));
+        let mut child = match self.spawn(launch) {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::warn!(%error, "App Server could not start");
+                self.set_link(Link::LaunchFailed {
+                    reason: format!("App Server could not start: {error}"),
+                });
+                return false;
+            }
+        };
+        self.set_link(Link::Starting);
+        let status = tokio::select! {
+            status = child.wait() => Some(status),
+            () = self.changed.notified() => None,
+        };
+        let group = self.group.lock().expect("group lock").take();
+        let replaced = match status {
+            Some(status) => {
+                if let Some(group) = group {
+                    // Tools the App Server started share its group and die with it.
+                    signal_group(group, libc::SIGKILL);
+                }
+                tracing::warn!(?status, "App Server exited");
+                if !self.stopping() {
+                    self.set_link(Link::LaunchFailed {
+                        reason: match status {
+                            Ok(status) => format!("App Server exited: {status}"),
+                            Err(error) => format!("App Server exited: {error}"),
+                        },
+                    });
+                }
+                false
+            }
+            None => {
+                if let Some(group) = group {
+                    signal_group(group, libc::SIGTERM);
+                    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                    signal_group(group, libc::SIGKILL);
+                }
+                let _ = child.wait().await;
+                tracing::info!("App Server restarts with new provider settings");
+                true
+            }
+        };
+        let _ = std::fs::remove_file(&self.pidfile);
+        replaced
     }
 
-    /// Restarts the App Server with backoff until the Node stops. A new launch ends the running
-    /// one the way a crash would: its turns are settled by probes on the next App Server.
+    /// Uses the system App Server until it goes away. It is never started or stopped here; a
+    /// restart by its owner, even onto another socket, is found again. `true` when a new
+    /// target ended it.
+    async fn use_system(&self, socket: Option<&Path>) -> bool {
+        let found = match socket {
+            // The owner named it: the client keeps trying it, and its handshake is the check.
+            Some(socket) => {
+                if !socket.exists() {
+                    self.set_link(Link::NotFound {
+                        candidates: vec![socket.to_owned()],
+                    });
+                }
+                Discovery::Live {
+                    socket: socket.to_owned(),
+                    user_agent: String::new(),
+                }
+            }
+            None => discover(&self.candidates).await,
+        };
+        let socket = match found {
+            Discovery::Live { socket, .. } => socket,
+            Discovery::NotFound { candidates } => {
+                self.point(None);
+                self.set_link(Link::NotFound { candidates });
+                return false;
+            }
+            Discovery::HandshakeFailed { socket, reason } => {
+                self.point(None);
+                self.set_link(Link::HandshakeFailed { socket, reason });
+                return false;
+            }
+        };
+        self.point(Some(socket.clone()));
+        let mut away = 0;
+        loop {
+            if self.wait(1).await {
+                return true;
+            }
+            let connection = self.client.status().await["connection"].clone();
+            if connection["state"] == "connected" {
+                away = 0;
+                continue;
+            }
+            away += 1;
+            if away < 5 {
+                continue;
+            }
+            // Away for five seconds: look again, in case it moved or stopped.
+            match connection["error"].as_str() {
+                Some(reason) if !stale(reason) => self.set_link(Link::HandshakeFailed {
+                    socket,
+                    reason: reason.into(),
+                }),
+                _ => self.set_link(Link::NotFound {
+                    candidates: vec![socket],
+                }),
+            }
+            return false;
+        }
+    }
+
+    /// Follows the target until the Node stops, retrying with backoff.
     async fn supervise(self: Arc<Self>) {
         let mut backoff = 1;
-        while !self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-            let Some(launch) = self.launch.lock().expect("launch lock").clone() else {
-                self.relaunch.notified().await;
-                continue;
-            };
+        while !self.stopping() {
+            let target = self.target.lock().expect("target lock").clone();
             let started = Instant::now();
-            let mut relaunched = false;
-            match self.spawn(&launch) {
-                Ok(mut child) => {
-                    let status = tokio::select! {
-                        status = child.wait() => Some(status),
-                        () = self.relaunch.notified() => None,
-                    };
-                    let group = self.group.lock().expect("group lock").take();
-                    match status {
-                        Some(status) => {
-                            if let Some(group) = group {
-                                // Tools the App Server started share its group and die with it.
-                                signal_group(group, libc::SIGKILL);
-                            }
-                            tracing::warn!(?status, "App Server exited");
-                            if !self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                                self.fail(match status {
-                                    Ok(status) => format!("App Server exited: {status}"),
-                                    Err(error) => format!("App Server exited: {error}"),
-                                });
-                            }
-                        }
-                        None => {
-                            if let Some(group) = group {
-                                signal_group(group, libc::SIGTERM);
-                                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait())
-                                    .await;
-                                signal_group(group, libc::SIGKILL);
-                            }
-                            let _ = child.wait().await;
-                            tracing::info!("App Server restarts with new provider settings");
-                            relaunched = true;
-                        }
-                    }
-                    let _ = std::fs::remove_file(&self.pidfile);
+            let replaced = match &target {
+                CodexTarget::Off => {
+                    self.point(None);
+                    self.set_link(Link::Off);
+                    self.changed.notified().await;
+                    true
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "App Server could not start");
-                    self.fail(format!("App Server could not start: {error}"));
-                }
-            }
-            if relaunched {
+                CodexTarget::Spawn(launch) => self.run_spawned(launch).await,
+                CodexTarget::System(socket) => self.use_system(socket.as_deref()).await,
+            };
+            if replaced || started.elapsed() > Duration::from_secs(60) {
                 backoff = 1;
+            }
+            if replaced {
                 continue;
             }
-            if started.elapsed() > Duration::from_secs(60) {
+            if self.wait(backoff).await {
                 backoff = 1;
-            }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(backoff)) => {
-                    backoff = (backoff * 2).min(30);
-                }
-                () = self.relaunch.notified() => backoff = 1,
+            } else {
+                backoff = (backoff * 2).min(30);
             }
         }
     }
@@ -314,88 +505,115 @@ impl Managed {
 
 impl CodexServer {
     pub(super) fn open(
-        config: &Config,
-        launch: Option<CodexLaunch>,
+        target: CodexTarget,
+        candidates: Vec<PathBuf>,
         identity: &LocalIdentity,
         data_dir: &Path,
         events: mpsc::UnboundedSender<Value>,
     ) -> Result<Self> {
-        let (socket, managed) = match &config.codex_socket {
-            // A configured socket belongs to someone else (tests, a user's own App Server).
-            Some(socket) => (socket.clone(), None),
-            None => {
-                let socket = socket_dir(identity, data_dir)?.join("codex.sock");
-                let managed = Managed {
-                    socket: socket.clone(),
-                    pidfile: data_dir.join("codex-app-server.pid"),
-                    launch: std::sync::Mutex::new(launch),
-                    relaunch: tokio::sync::Notify::new(),
-                    failure: std::sync::Mutex::new(None),
-                    group: std::sync::Mutex::new(None),
-                    stopping: std::sync::atomic::AtomicBool::new(false),
-                };
-                managed.kill_orphan();
-                (socket, Some(Arc::new(managed)))
-            }
+        let directory = socket_dir(identity, data_dir)?;
+        let (endpoint, receiver) = tokio::sync::watch::channel(None);
+        let client = CodexClient::start(receiver, events);
+        let named = match &target {
+            CodexTarget::System(Some(socket)) => Some(socket.clone()),
+            _ => None,
         };
+        let inner = Inner {
+            client: client.clone(),
+            endpoint,
+            target: std::sync::Mutex::new(target),
+            changed: tokio::sync::Notify::new(),
+            candidates,
+            spawn_socket: directory.join("codex.sock"),
+            agent_socket: directory.join("app-server.sock"),
+            pidfile: data_dir.join("codex-app-server.pid"),
+            link: std::sync::Mutex::new(Link::Starting),
+            group: std::sync::Mutex::new(None),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+        };
+        inner.kill_orphan();
+        inner.point(named);
         Ok(Self {
-            client: CodexClient::start(socket.clone(), events),
-            socket,
-            managed,
+            client,
+            inner: Arc::new(inner),
         })
     }
 
     pub(super) fn start(&self) {
-        if let Some(managed) = &self.managed {
-            tokio::spawn(managed.clone().supervise());
-        }
+        tokio::spawn(self.inner.clone().supervise());
     }
 
-    /// Starts `launch` in place of the running App Server, or stops it for `None`. A socket
-    /// the Node does not manage is left alone.
-    pub(crate) fn relaunch(&self, launch: Option<CodexLaunch>) {
-        let Some(managed) = &self.managed else {
+    /// The socket the coordination Agent connects to; it follows the App Server in use.
+    pub(crate) fn socket(&self) -> PathBuf {
+        self.inner.agent_socket.clone()
+    }
+
+    /// Switches to `target`. A new launch ends the App Server the Node started; the system App
+    /// Server is left running whatever the target.
+    pub(crate) fn retarget(&self, target: CodexTarget) {
+        let mut current = self.inner.target.lock().expect("target lock");
+        if *current == target {
             return;
+        }
+        *current = target;
+        self.inner.set_link(Link::Starting);
+        self.inner.changed.notify_one();
+    }
+
+    pub(crate) async fn link(&self) -> Link {
+        let status = self.client.status().await;
+        if status["connection"]["state"] == "connected"
+            && let Some(socket) = self.inner.endpoint.borrow().clone()
+        {
+            return Link::Connected {
+                socket,
+                user_agent: status["connection"]["user_agent"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+            };
+        }
+        self.inner.link.lock().expect("link lock").clone()
+    }
+
+    /// A fresh handshake with the App Server the current target uses, beside the client's own
+    /// connection. A live one the client is backing off from is retried now.
+    pub(crate) async fn test(&self) -> Link {
+        let target = self.inner.target.lock().expect("target lock").clone();
+        let candidates = match &target {
+            CodexTarget::Off => return Link::Off,
+            CodexTarget::Spawn(_) => vec![self.inner.spawn_socket.clone()],
+            CodexTarget::System(Some(socket)) => vec![socket.clone()],
+            CodexTarget::System(None) => self.inner.candidates.clone(),
         };
-        let mut current = managed.launch.lock().expect("launch lock");
-        if *current == launch {
-            return;
+        let system = matches!(target, CodexTarget::System(_));
+        match discover(&candidates).await {
+            Discovery::Live { socket, user_agent } => {
+                if self.inner.endpoint.borrow().as_ref() == Some(&socket) {
+                    self.inner.point(Some(socket.clone()));
+                } else if system {
+                    self.inner.changed.notify_one();
+                }
+                Link::Connected { socket, user_agent }
+            }
+            Discovery::NotFound { candidates } => Link::NotFound { candidates },
+            Discovery::HandshakeFailed { socket, reason } => {
+                Link::HandshakeFailed { socket, reason }
+            }
         }
-        *current = launch;
-        *managed.failure.lock().expect("failure lock") = None;
-        managed.relaunch.notify_one();
     }
 
-    /// The managed App Server's state; `None` for a socket the Node does not manage.
-    pub(crate) async fn launch_state(&self) -> Option<Launch> {
-        let managed = self.managed.as_ref()?;
-        if managed.launch.lock().expect("launch lock").is_none() {
-            return Some(Launch::Off);
-        }
-        if self.client.status().await["connection"]["state"] == "connected" {
-            return Some(Launch::Running);
-        }
-        Some(
-            match managed.failure.lock().expect("failure lock").clone() {
-                Some(reason) => Launch::Failed(reason),
-                None => Launch::Starting,
-            },
-        )
-    }
-
-    /// Stops the managed App Server group; called on SIGTERM before the Node exits.
+    /// Stops the App Server the Node started; called on SIGTERM before the Node exits. The
+    /// system App Server is never stopped.
     pub(crate) async fn stop(&self) {
-        let Some(managed) = &self.managed else {
-            return;
-        };
-        managed
+        self.inner
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let group = managed.group.lock().expect("group lock").take();
+        let group = self.inner.group.lock().expect("group lock").take();
         if let Some(group) = group {
             kill_group(group);
         }
-        let _ = std::fs::remove_file(&managed.pidfile);
+        let _ = std::fs::remove_file(&self.inner.pidfile);
     }
 }
 
@@ -417,7 +635,9 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{Local, Provider, ProviderEnv, Role};
+    use crate::providers::{AppServerMode, Local, Provider, ProviderEnv, Role};
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use std::os::unix::fs::PermissionsExt;
 
     async fn lines(path: &Path, count: usize) -> Vec<String> {
         for _ in 0..100 {
@@ -441,14 +661,86 @@ mod tests {
         false
     }
 
+    fn artifacts(name: &str) -> Result<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        Ok(dir)
+    }
+
+    /// Unix socket paths stay short, so fixture sockets live under `/tmp`.
+    fn sockets() -> Result<PathBuf> {
+        let dir = PathBuf::from(format!(
+            "/tmp/vf-app-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..10]
+        ));
+        config::private_dir(&dir)?;
+        Ok(dir)
+    }
+
+    /// A program that only records that it ran: `codex app-server` must never start.
+    fn recording_codex(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let (program, out) = (dir.join("fake-codex"), dir.join("ran"));
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\nexec sleep 60\n",
+                out.display()
+            ),
+        )?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        Ok((program, out))
+    }
+
+    /// An App Server that answers `initialize` on every connection. Aborting it ends the
+    /// listener and every connection, as a stopped App Server would.
+    fn system_app_server(socket: &Path, user_agent: &'static str) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).expect("fixture socket");
+        tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.spawn(async move {
+                    let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = server.next().await {
+                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                        else {
+                            continue;
+                        };
+                        if request["method"] == "initialize" {
+                            let reply =
+                                json!({"id":request["id"],"result":{"userAgent":user_agent}});
+                            let _ = server.send(reply.to_string().into()).await;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// A socket file nobody listens on, as a stopped App Server leaves it.
+    fn stale_socket(path: &Path) -> Result<()> {
+        drop(std::os::unix::net::UnixListener::bind(path)?);
+        Ok(())
+    }
+
+    async fn link_becomes(server: &CodexServer, wanted: impl Fn(&Link) -> bool) -> Link {
+        for _ in 0..200 {
+            let link = server.link().await;
+            if wanted(&link) {
+                return link;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("App Server link stayed {:?}", server.link().await);
+    }
+
     #[tokio::test]
     async fn the_app_server_runs_with_only_codex_variables_and_restarts_on_a_new_launch()
     -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts")
-            .join(format!("codex-launch-{}", uuid::Uuid::new_v4()));
-        config::private_dir(&dir)?;
+        let dir = artifacts("codex-launch")?;
         let out = dir.join("starts");
         let fixture = dir.join("fake-codex");
         std::fs::write(
@@ -473,10 +765,10 @@ mod tests {
             codex_bin: fixture.clone(),
             env,
         };
-        let config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        local.switches.codex_app_server.mode = AppServerMode::Spawn;
         let identity = LocalIdentity::generate();
         let (events, _events) = mpsc::unbounded_channel();
-        let server = CodexServer::open(&config, local.codex_launch(), &identity, &dir, events)?;
+        let server = CodexServer::open(local.codex_target(), vec![], &identity, &dir, events)?;
         server.start();
         let first = lines(&out, 1).await;
         let (pid, rest) = first[0].split_once(' ').unwrap();
@@ -489,16 +781,16 @@ mod tests {
             Provider::Codex,
             BTreeMap::from([("CPA_API_KEY".into(), Some("fixture-replaced-key".into()))]),
         )?;
-        server.relaunch(local.codex_launch());
+        server.retarget(local.codex_target());
         let second = lines(&out, 2).await;
         assert!(second[1].ends_with(" fixture-replaced-key none"));
         assert!(ended(pid.parse()?).await, "the old App Server ends");
 
         local.switches.codex.roles.remove(&Role::Execution);
-        server.relaunch(local.codex_launch());
+        server.retarget(local.codex_target());
         let second_group: i32 = second[1].split_once(' ').unwrap().0.parse()?;
         assert!(ended(second_group).await, "Codex off stops the App Server");
-        assert!(matches!(server.launch_state().await, Some(Launch::Off)));
+        link_becomes(&server, |link| *link == Link::Off).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             lines(&out, 2).await.len(),
@@ -506,6 +798,165 @@ mod tests {
             "nothing starts while it is off"
         );
         server.stop().await;
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_skips_stale_sockets_and_names_a_failed_handshake() -> Result<()> {
+        let dir = sockets()?;
+        let (missing, stale, live, mute) = (
+            dir.join("missing.sock"),
+            dir.join("stale.sock"),
+            dir.join("live.sock"),
+            dir.join("mute.sock"),
+        );
+        stale_socket(&stale)?;
+        let fixture = system_app_server(&live, "codex/fixture");
+        let found = discover(&[missing.clone(), stale.clone(), live.clone()]).await;
+        assert_eq!(
+            found,
+            Discovery::Live {
+                socket: live.clone(),
+                user_agent: "codex/fixture".into()
+            },
+            "stale and missing sockets are skipped"
+        );
+        assert_eq!(
+            discover(&[missing.clone(), stale.clone()]).await,
+            Discovery::NotFound {
+                candidates: vec![missing.clone(), stale.clone()]
+            }
+        );
+        // Accepts, then closes before any handshake: something listens, but not an App Server.
+        let listener = tokio::net::UnixListener::bind(&mute)?;
+        let closer = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        assert!(matches!(
+            discover(&[stale, mute.clone()]).await,
+            Discovery::HandshakeFailed { socket, .. } if socket == mute
+        ));
+        fixture.abort();
+        closer.abort();
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn system_mode_never_starts_or_stops_the_app_server_and_follows_its_restart() -> Result<()>
+    {
+        let dir = artifacts("codex-system")?;
+        let (program, ran) = recording_codex(&dir)?;
+        let sockets = sockets()?;
+        let control = sockets.join("control.sock");
+        let (stale, first, second) = (
+            sockets.join("stale.sock"),
+            sockets.join("first.sock"),
+            sockets.join("second.sock"),
+        );
+        stale_socket(&stale)?;
+        let fixture = system_app_server(&first, "codex/first");
+        std::os::unix::fs::symlink(&first, &control)?;
+        let local = Local {
+            switches: Default::default(),
+            codex_bin: program,
+            env: ProviderEnv::default(),
+        };
+        assert_eq!(
+            local.switches.codex_app_server.mode,
+            AppServerMode::System,
+            "the system App Server is the default"
+        );
+        let identity = LocalIdentity::generate();
+        let (events, _events) = mpsc::unbounded_channel();
+        let server = CodexServer::open(
+            local.codex_target(),
+            vec![stale.clone(), control.clone()],
+            &identity,
+            &dir,
+            events,
+        )?;
+        server.start();
+        let connected = link_becomes(&server, |link| matches!(link, Link::Connected { .. })).await;
+        assert_eq!(
+            connected,
+            Link::Connected {
+                socket: control.clone(),
+                user_agent: "codex/first".into()
+            }
+        );
+        assert_eq!(
+            std::fs::read_link(server.socket())?,
+            control,
+            "the Agent's link names the system App Server"
+        );
+
+        // Its owner restarts it onto another socket and moves the control link.
+        fixture.abort();
+        let _ = fixture.await;
+        std::fs::remove_file(&first)?;
+        link_becomes(&server, |link| !matches!(link, Link::Connected { .. })).await;
+        let restarted = system_app_server(&second, "codex/second");
+        std::fs::remove_file(&control)?;
+        std::os::unix::fs::symlink(&second, &control)?;
+        link_becomes(&server, |link| {
+            matches!(link, Link::Connected { user_agent, .. } if user_agent == "codex/second")
+        })
+        .await;
+        assert!(matches!(server.test().await, Link::Connected { socket, .. } if socket == control));
+
+        server.retarget(CodexTarget::Off);
+        link_becomes(&server, |link| *link == Link::Off).await;
+        server.stop().await;
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        assert!(
+            vibeface_bridge::codex::DirectSession::connect(&control)
+                .await
+                .is_ok(),
+            "the system App Server outlives the Node"
+        );
+        assert!(!ran.exists(), "the Node never started an App Server");
+        assert!(!dir.join("codex-app-server.pid").exists());
+        restarted.abort();
+        std::fs::remove_dir_all(sockets)?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_a_system_app_server_the_link_says_not_found() -> Result<()> {
+        let dir = artifacts("codex-none")?;
+        let sockets = sockets()?;
+        let local = Local {
+            switches: Default::default(),
+            codex_bin: "codex".into(),
+            env: ProviderEnv::default(),
+        };
+        let identity = LocalIdentity::generate();
+        let (events, _events) = mpsc::unbounded_channel();
+        let candidate = sockets.join("control.sock");
+        let server = CodexServer::open(
+            local.codex_target(),
+            vec![candidate.clone()],
+            &identity,
+            &dir,
+            events,
+        )?;
+        server.start();
+        let link = link_becomes(&server, |link| matches!(link, Link::NotFound { .. })).await;
+        assert_eq!(
+            link,
+            Link::NotFound {
+                candidates: vec![candidate]
+            }
+        );
+        server.stop().await;
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        std::fs::remove_dir_all(sockets)?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

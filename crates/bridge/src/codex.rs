@@ -33,6 +33,29 @@ impl fmt::Display for CodexError {
 
 impl std::error::Error for CodexError {}
 
+/// Codex keeps one writer per thread across processes; another App Server (a terminal `codex`,
+/// say) holding the thread rejects every write here until it lets go.
+const WRITER_BUSY: &str = "already has an active writer";
+
+/// Whether Codex refused because another process is writing the thread. Nothing was sent, and
+/// retrying does not help until that process lets go.
+pub fn writer_busy(message: &str) -> bool {
+    message.contains(WRITER_BUSY)
+}
+
+fn server_error(error: &Value) -> String {
+    let detail = error["message"]
+        .as_str()
+        .map_or_else(|| error.to_string(), str::to_owned);
+    if writer_busy(&detail) {
+        format!(
+            "another Codex process is writing this thread ({detail}); nothing was sent, close it there or wait"
+        )
+    } else {
+        format!("Codex rejected request: {error}")
+    }
+}
+
 fn rejected(message: impl Into<String>) -> CodexError {
     CodexError {
         uncertain: false,
@@ -48,12 +71,17 @@ pub struct CodexClient {
 }
 
 impl CodexClient {
-    pub fn start(socket: PathBuf, events: mpsc::UnboundedSender<Value>) -> Self {
+    /// Connects to whatever socket `endpoint` names and follows it when it changes; `None` stays
+    /// disconnected. Setting the same path again cuts a reconnect backoff short.
+    pub fn start(
+        endpoint: watch::Receiver<Option<PathBuf>>,
+        events: mpsc::UnboundedSender<Value>,
+    ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         let cache = Arc::new(RwLock::new(Cache::default()));
         let (observed_threads, observed) = watch::channel(BTreeSet::new());
         tokio::spawn(connection_loop(
-            socket,
+            endpoint,
             receiver,
             observed,
             cache.clone(),
@@ -600,6 +628,8 @@ struct Session {
     pending: HashMap<RpcId, Pending>,
     subscribed: HashSet<String>,
     resuming: HashSet<String>,
+    /// Threads another process writes: they cannot be resumed here, so their turns are read.
+    polled: HashSet<String>,
     retry_observation_at: HashMap<String, Instant>,
 }
 
@@ -684,6 +714,10 @@ impl Session {
                     message: reason.into(),
                 }));
             }
+            PendingKind::SubscribeThread(thread) if writer_busy(reason) => {
+                self.resuming.remove(&thread);
+                self.polled.insert(thread);
+            }
             PendingKind::SubscribeThread(thread)
             | PendingKind::ObserveThread(thread)
             | PendingKind::ObserveTurns(thread) => {
@@ -704,8 +738,15 @@ impl Session {
     }
 }
 
+/// Waits for the next endpoint change; a dropped sender never changes it again.
+async fn endpoint_changed(endpoint: &mut watch::Receiver<Option<PathBuf>>) {
+    if endpoint.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn connection_loop(
-    socket: PathBuf,
+    mut endpoint: watch::Receiver<Option<PathBuf>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     observed: watch::Receiver<BTreeSet<String>>,
     cache: Arc<RwLock<Cache>>,
@@ -713,7 +754,13 @@ async fn connection_loop(
 ) {
     let mut backoff = 1;
     loop {
-        let connect = connect(&socket);
+        let socket = endpoint.borrow_and_update().clone();
+        let connect = async {
+            match &socket {
+                Some(socket) => connect(socket).await,
+                None => Err("no Codex App Server is selected".to_string()),
+            }
+        };
         tokio::pin!(connect);
         let result = loop {
             tokio::select! {
@@ -726,7 +773,18 @@ async fn connection_loop(
         };
         let reason = match result {
             Ok(stream) => {
-                let reason = run_session(stream, &mut commands, &observed, &cache, &events).await;
+                let session = run_session(stream, &mut commands, &observed, &cache, &events);
+                tokio::pin!(session);
+                let reason = loop {
+                    tokio::select! {
+                        reason = &mut session => break reason,
+                        () = endpoint_changed(&mut endpoint) => {
+                            if *endpoint.borrow() != socket {
+                                break "the Codex App Server endpoint changed".to_string();
+                            }
+                        }
+                    }
+                };
                 if cache.read().await.connection["state"] == "connected" {
                     backoff = 1;
                 }
@@ -741,13 +799,17 @@ async fn connection_loop(
         loop {
             tokio::select! {
                 _ = &mut delay => break,
+                () = endpoint_changed(&mut endpoint) => {
+                    backoff = 0;
+                    break;
+                }
                 command = commands.recv() => match command {
                     Some(command) => command.reject("Codex is disconnected"),
                     None => return,
                 }
             }
         }
-        backoff = (backoff * 2).min(30);
+        backoff = (backoff * 2).clamp(1, 30);
     }
 }
 
@@ -849,7 +911,7 @@ async fn run_session(
                 let Some(pending) = state.pending.remove(&id) else { continue };
                 if let Some(error) = message.get("error") {
                     let initialization = matches!(pending.kind, PendingKind::Initialize);
-                    state.fail(pending, &format!("Codex rejected request: {error}"), false);
+                    state.fail(pending, &server_error(error), false);
                     if initialization { break "Codex initialization rejected".into(); }
                     continue;
                 }
@@ -866,7 +928,7 @@ async fn run_session(
                     }
                     PendingKind::ObserveThread(thread_id) => {
                         cache.write().await.observe_thread(&result["thread"]);
-                        if !state.subscribed.contains(&thread_id)
+                        if !state.subscribed.contains(&thread_id) && !state.polled.contains(&thread_id)
                             && matches!(result["thread"]["status"]["type"].as_str(), Some("idle" | "active" | "systemError")) {
                             if let Err(reason) = state.request(&writer, "thread/resume", json!({"threadId":thread_id,"excludeTurns":true}), PendingKind::SubscribeThread(thread_id), false) { break reason; }
                         } else if let Err(reason) = state.request(&writer, "thread/turns/list", json!({"threadId":thread_id,"limit":20,"itemsView":"full","sortDirection":"desc"}), PendingKind::ObserveTurns(thread_id), false) { break reason; }
@@ -942,6 +1004,8 @@ pub struct DirectSession {
     /// Threads started on this connection. They have no rollout before their first turn, so they
     /// are not resumed.
     started: HashSet<String>,
+    /// The `userAgent` the App Server answered `initialize` with.
+    pub user_agent: String,
 }
 
 impl DirectSession {
@@ -951,11 +1015,13 @@ impl DirectSession {
             stream,
             next_id: 0,
             started: HashSet::new(),
+            user_agent: String::new(),
         };
-        session
+        let initialized = session
             .call("initialize", initialize_params("Vibeface Agent CLI"))
             .await
             .map_err(|error| rejected(error.message))?;
+        session.user_agent = initialized["userAgent"].as_str().unwrap_or_default().into();
         session
             .stream
             .send(Message::Text(
@@ -1038,7 +1104,7 @@ impl DirectSession {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                return Err(rejected(format!("Codex rejected request: {error}")));
+                return Err(rejected(server_error(error)));
             }
             return message
                 .get("result")
@@ -1328,12 +1394,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_thread_another_process_writes_is_read_and_a_new_endpoint_is_followed() {
+        timeout(Duration::from_secs(8), async {
+            let path = |name: &str| std::env::temp_dir().join(format!("vibeface-{name}-{}-{}.sock", std::process::id(), now_ms()));
+            let (first, second) = (path("endpoint-a"), path("endpoint-b"));
+            let (listener_a, listener_b) = (tokio::net::UnixListener::bind(&first).unwrap(), tokio::net::UnixListener::bind(&second).unwrap());
+            let (endpoint, receiver) = watch::channel(Some(first.clone()));
+            let (events, _events) = mpsc::unbounded_channel();
+            let client = CodexClient::start(receiver, events);
+            client.set_observed_threads(vec!["busy".into()]).unwrap();
+            let mut server = tokio_tungstenite::accept_async(listener_a.accept().await.unwrap().0).await.unwrap();
+            let initialize = next(&mut server).await;
+            server.send(Message::Text(json!({"id":initialize["id"],"result":{"userAgent":"a"}}).to_string().into())).await.unwrap();
+            assert_eq!(next(&mut server).await["method"], "initialized");
+            let read = next(&mut server).await;
+            server.send(Message::Text(json!({"id":read["id"],"result":{"thread":{"id":"busy","status":{"type":"idle"}}}}).to_string().into())).await.unwrap();
+            let resume = next(&mut server).await;
+            assert_eq!(resume["method"], "thread/resume");
+            server.send(Message::Text(json!({"id":resume["id"],"error":{"code":-32600,"message":"thread busy already has an active writer"}}).to_string().into())).await.unwrap();
+            let read = next(&mut server).await;
+            server.send(Message::Text(json!({"id":read["id"],"result":{"thread":{"id":"busy","status":{"type":"idle"}}}}).to_string().into())).await.unwrap();
+            assert_eq!(next(&mut server).await["method"], "thread/turns/list", "a thread another process writes is read, not resumed again");
+
+            endpoint.send_replace(Some(second.clone()));
+            let mut moved = tokio_tungstenite::accept_async(listener_b.accept().await.unwrap().0).await.unwrap();
+            assert_eq!(next(&mut moved).await["method"], "initialize", "the client follows the new endpoint");
+            assert!(!matches!(timeout(Duration::from_secs(2), server.next()).await.unwrap(), Some(Ok(Message::Text(_)))), "the old connection ends");
+            std::fs::remove_file(first).unwrap();
+            std::fs::remove_file(second).unwrap();
+        }).await.expect("endpoint test must finish");
+    }
+
+    #[tokio::test]
     async fn known_threads_resubscribe_after_disconnect_without_replaying_a_turn() {
         timeout(Duration::from_secs(8), async {
             let socket = std::env::temp_dir().join(format!("vibeface-subscribe-{}-{}.sock", std::process::id(), now_ms()));
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
             let (events, mut received_events) = mpsc::unbounded_channel();
-            let client = CodexClient::start(socket.clone(), events);
+            let client = CodexClient::start(watch::channel(Some(socket.clone())).1, events);
             client.set_observed_threads(vec!["known".into()]).unwrap();
             let mut sent_turns = 0;
             for connection in 0..3 {

@@ -670,6 +670,10 @@ async fn dispatch(
             node.configure_provider(change, &session.device_id, cookie)
                 .await
         }
+        "test_codex_app_server" => {
+            node_operator(node, session).await?;
+            Ok(json!(node.codex.test().await))
+        }
         "triage_settings" => {
             node_operator(node, session).await?;
             node.triage_settings().await
@@ -1599,7 +1603,7 @@ mod tests {
             .join(format!("log-intake-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
-        config.codex_socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -1684,7 +1688,7 @@ mod tests {
             .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
-        config.codex_socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -1887,7 +1891,7 @@ mod tests {
         config::private_dir(&logs)?;
         crate::logging::capture(&logs)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
-        config.codex_socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -1973,6 +1977,22 @@ mod tests {
                 {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
         );
         assert_eq!(read["providers"][1]["env"][0]["set"], true);
+        assert_eq!(codex["app_server"]["mode"], "system");
+        assert_eq!(read["providers"][1]["app_server"], Value::Null);
+        let spawn = json!({"provider":"codex","app_server":{"mode":"spawn","socket":null}});
+        let moved = dispatch(&node, &mut owner, "configure_provider", spawn).await?;
+        assert_eq!(moved["providers"][0]["app_server"]["mode"], "spawn");
+        assert_eq!(
+            Config::load(&dir)?.providers.codex_app_server.mode,
+            crate::providers::AppServerMode::Spawn
+        );
+        let cursor_server =
+            json!({"provider":"cursor","app_server":{"mode":"spawn","socket":null}});
+        assert!(
+            dispatch(&node, &mut owner, "configure_provider", cursor_server)
+                .await
+                .is_err()
+        );
 
         let codex_env = node.provider_env(ManagerKind::CodexSdk);
         let cursor_env = node.provider_env(ManagerKind::CursorSdk);

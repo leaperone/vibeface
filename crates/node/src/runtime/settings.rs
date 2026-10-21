@@ -1,8 +1,8 @@
 use super::Runtime;
-use super::codex_server::Launch;
+use super::codex_server::Link;
 use crate::config::{Config, ManagerSettings};
 use crate::manager::ManagerKind;
-use crate::providers::{self, Provider, Role};
+use crate::providers::{self, AppServer, AppServerMode, Provider, Role};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +26,8 @@ pub struct ProviderChange {
     roles: Option<BTreeSet<Role>>,
     /// The Codex program; empty restores the default.
     bin: Option<PathBuf>,
+    /// Which Codex App Server to use.
+    app_server: Option<AppServer>,
     #[serde(default)]
     env: BTreeMap<String, Option<String>>,
 }
@@ -76,6 +78,12 @@ impl Runtime {
     ) -> Value {
         let switch = local.switches.get(provider);
         let configured = local.env.get(provider);
+        let app_server = &local.switches.codex_app_server;
+        // The system App Server runs with its own program and variables; the assistant still
+        // runs the Codex program with them.
+        let launches = provider == Provider::Cursor
+            || switch.roles.contains(&Role::Agent)
+            || app_server.mode == AppServerMode::Spawn;
         let mut issues = Vec::new();
         let (bin, required) = match provider {
             Provider::Codex => {
@@ -104,21 +112,28 @@ impl Runtime {
             })
             .collect();
         let mut starting = false;
+        let link = (provider == Provider::Codex).then_some(self.codex.link().await);
         if switch.enabled {
-            if !executable(&bin) {
+            if launches && !executable(&bin) {
                 issues.push(json!({"code":"bin_missing","path":bin}));
             }
-            for name in &required {
+            for name in required.iter().filter(|_| launches) {
                 if !configured.contains_key(name) && !inherited(name) {
                     issues.push(json!({"code":"env_missing","name":name}));
                 }
             }
             if provider == Provider::Codex && switch.roles.contains(&Role::Execution) {
-                match self.codex.launch_state().await {
-                    Some(Launch::Failed(detail)) if issues.is_empty() => {
-                        issues.push(json!({"code":"launch_failed","detail":detail}))
+                match &link {
+                    Some(Link::LaunchFailed { reason }) if issues.is_empty() => {
+                        issues.push(json!({"code":"launch_failed","detail":reason}))
                     }
-                    Some(Launch::Starting) => starting = true,
+                    Some(Link::NotFound { .. }) => {
+                        issues.push(json!({"code":"app_server_not_found"}))
+                    }
+                    Some(Link::HandshakeFailed { reason, .. }) => {
+                        issues.push(json!({"code":"app_server_unreachable","detail":reason}))
+                    }
+                    Some(Link::Starting) => starting = true,
                     _ => {}
                 }
             }
@@ -136,6 +151,8 @@ impl Runtime {
             "provider":provider, "enabled":switch.enabled, "roles":switch.roles,
             "supports":provider.supports(),
             "bin":(provider == Provider::Codex).then_some(&local.codex_bin),
+            "app_server":(provider == Provider::Codex).then(|| json!({"mode":app_server.mode,
+                "socket":app_server.socket,"link":link})),
             "assistant":settings.manager.as_ref().is_some_and(|m| Provider::of(m.provider) == provider),
             "env":env, "state":state, "issues":issues,
         })
@@ -259,6 +276,14 @@ impl Runtime {
                 trimmed => trimmed.into(),
             };
         }
+        if let Some(app_server) = change.app_server {
+            ensure!(
+                change.provider == Provider::Codex,
+                "only Codex has an App Server"
+            );
+            next.switches.codex_app_server = app_server;
+            next.switches.validate()?;
+        }
         next.env.apply(change.provider, change.env)?;
         if next.switches != previous.switches || next.codex_bin != previous.codex_bin {
             let mut configuration = Config::load(&self.data_dir)?;
@@ -273,7 +298,7 @@ impl Runtime {
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
-        self.codex.relaunch(next.codex_launch());
+        self.codex.retarget(next.codex_target());
         if next.switches.cursor != previous.switches.cursor
             || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor)
         {

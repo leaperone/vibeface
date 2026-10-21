@@ -533,10 +533,12 @@ class Node:
         require(self.access["device_id"], "local access pins the Node identity")
         self.device_id = self.client.device_id = self.access["device_id"]
 
-    def configure(self, **values):
+    def configure(self, *, app_server=None, **values):
         path = self.directory / "config.json"
         configuration = json.loads(path.read_text())
         configuration.update(values)
+        if app_server is not None:
+            configuration["providers"]["codex_app_server"] = app_server
         private_json(path, configuration)
 
     def configure_network(self, **values):
@@ -747,6 +749,8 @@ def websocket_send(stream, value):
 
 DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
                            (Path(__file__).resolve().parents[1] / "crates/node/src/config.rs").read_text(), re.M)[1])
+# These runs drive a fixture App Server the Node starts itself, not one already on the machine.
+SPAWN_APP_SERVER = {"mode": "spawn", "socket": None}
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"
 # Methods whose answer depends on fixture thread state; every other client request gets a canned answer.
 FIXTURE_STATEFUL = {"initialize", "thread/start", "thread/resume", "thread/read", "thread/turns/list", "thread/list",
@@ -2123,7 +2127,8 @@ def chat_agent_acceptance(options):
         for name in ("A", "BOT-OTHER-NETWORK"):
             node = Node(run, name, binary, workspace, fixture, helper, module)
             node.configure(timeout_secs=600, manager=fixture_manager_settings(run, workspace) if name == "A" else None,
-                           codex_bin=str(codex) if name == "A" else sys.executable, daily_decision_limit=100)
+                           codex_bin=str(codex) if name == "A" else sys.executable, app_server=SPAWN_APP_SERVER,
+                           daily_decision_limit=100)
             nodes.append(node)
         a, outsider = nodes
         a.start()
@@ -2267,7 +2272,8 @@ def phase1_acceptance(options):
     try:
         a = Node(run, "A", binary, workspace, fixture, helper, module)
         nodes.append(a)
-        a.configure(timeout_secs=600, manager=manager, codex_bin=str(codex), daily_decision_limit=100)
+        a.configure(timeout_secs=600, manager=manager, codex_bin=str(codex), app_server=SPAWN_APP_SERVER,
+                    daily_decision_limit=100)
         a.start()
         network = a.bootstrap()
         a.client.call("subscribe")
@@ -2426,7 +2432,7 @@ def web_acceptance(options):
     node = None
     try:
         node = Node(run, "WEB", binary, workspace, None, None, module)
-        node.configure(codex_socket=str(run / "unavailable.sock"))
+        node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
         node.start()
         verify_web_assets(node, module)
         require(node.process.poll() is None, "packaged Node remains running after Web checks")
@@ -2517,7 +2523,8 @@ def acceptance(options):
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
             nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
         a, p, b, c, outsider = nodes
-        a.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable, daily_decision_limit=100)
+        a.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable,
+                    app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.configure_network(relays=[relay_url])
         c.configure_network(relays=[relay_url])
@@ -2772,6 +2779,7 @@ def phase4_acceptance(options):
             root.mkdir(mode=0o700)
             node.configure(timeout_secs=600, daily_decision_limit=100,
                            codex_bin=str(fixture_wrapper(root, "fixture-codex", "--fixture-codex")),
+                           app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace))
             node.configure_network(relays=[relay_url])
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
@@ -3119,7 +3127,8 @@ def public_entry_acceptance(options):
         for node in (m, x):
             node.configure_network(relay_paths_only=True)
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
-                    codex_bin=str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex")))
+                    codex_bin=str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex")),
+                    app_server=SPAWN_APP_SERVER)
         for node in nodes:
             node.start()
         info = p.client.request("/api/info")
@@ -3279,7 +3288,7 @@ def phase5_acceptance(options):
         b = Node(run, "B", binary, workspace, None, helper, module)
         nodes += [a, b]
         for node in nodes:
-            node.configure(codex_socket=str(run / "unavailable.sock"))
+            node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
         b.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.configure_network(relays=[relay_url])
         a.start()
@@ -3457,7 +3466,7 @@ def auto_route_acceptance(options):
         target = Node(run, "TARGET", binary, workspace, fixture, helper, module)
         nodes.append(target)
         target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable,
-                         daily_decision_limit=100, allowed_origins=[allowed])
+                         app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
         target.start()
         network = target.bootstrap()
         passed("genesis", network=network, target=target.device_id)

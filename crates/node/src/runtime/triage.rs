@@ -1557,7 +1557,7 @@ mod tests {
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
-        configuration.codex_socket = Some(socket.into());
+        configuration.providers.codex_app_server.socket = Some(socket.into());
         configuration.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -1651,6 +1651,14 @@ mod tests {
 
     type Server = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
 
+    fn named_socket(node: &Runtime) -> PathBuf {
+        node.providers()
+            .switches
+            .codex_app_server
+            .socket
+            .expect("a named socket")
+    }
+
     async fn read(server: &mut Server) -> Value {
         use futures_util::StreamExt as _;
         let message = server.next().await.unwrap().unwrap();
@@ -1661,7 +1669,7 @@ mod tests {
     /// which the bridge hands to the Node.
     async fn app_server(node: &Runtime) -> Result<(Server, Value)> {
         use futures_util::SinkExt as _;
-        let listener = tokio::net::UnixListener::bind(&node.codex.socket)?;
+        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
         let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
         let mut server = tokio_tungstenite::accept_async(stream).await?;
         let initialize = read(&mut server).await;
@@ -1689,7 +1697,7 @@ mod tests {
     }
 
     async fn cleanup(node: Arc<Runtime>, dir: PathBuf) -> Result<()> {
-        let _ = std::fs::remove_file(&node.codex.socket);
+        let _ = std::fs::remove_file(named_socket(&node));
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
