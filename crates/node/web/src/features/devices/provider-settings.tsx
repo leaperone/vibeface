@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, ChevronRight, CircleAlert, CircleCheck, LoaderCircle, MousePointer2, Pencil, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
+import { Check, ChevronRight, CircleAlert, CircleCheck, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, Details, InlineError, Skeleton, StatusPill, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@/features/identity/context"
-import { parseNodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderRole, type ProviderStatus } from "@/lib/node"
+import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderRole, type ProviderStatus } from "@/lib/node"
 
 export const providerNames: Record<ProviderId, string> = { codex: "Codex", cursor: "Cursor" }
 const icons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
@@ -24,7 +24,69 @@ export function issueText(provider: ProviderId, issue: ProviderIssue): string {
     case "env_missing": return `缺少 ${issue.name}`
     case "launch_failed": return `${name} 没能启动`
     case "config_invalid": return `${name} 的配置文件读不了`
+    case "app_server_not_found": return "没找到这台电脑上运行的 Codex"
+    case "app_server_unreachable": return "连不上这台电脑上的 Codex"
   }
+}
+
+const modes: [AppServerMode, string, LucideIcon][] = [["system", "系统", Monitor], ["spawn", "自行启动", Play]]
+const spawnServer = { mode: "spawn", socket: null } as const
+
+/** One line for an App Server state, from the device or a fresh test. */
+function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string }) {
+  const [tone, Icon, label] = {
+    connected: ["text-success", CircleCheck, "已连接"],
+    starting: ["text-muted-foreground", LoaderCircle, "连接中"],
+    off: ["text-muted-foreground", Power, "未用于执行任务"],
+    not_found: ["text-warning", CircleAlert, "未找到"],
+    handshake_failed: ["text-warning", CircleAlert, "连不上"],
+    launch_failed: ["text-warning", CircleAlert, "没能启动"],
+  }[link.state] as [string, LucideIcon, string]
+  return <span role="status" className={cn("flex min-w-0 items-center gap-1.5 text-meta", tone)}>
+    <Icon aria-hidden="true" className={cn("size-4 shrink-0", link.state === "starting" && "animate-spin")} />
+    <span className="min-w-0 truncate">{prefix}{label}{link.state === "connected" && link.user_agent ? ` · ${link.user_agent}` : ""}</span>
+  </span>
+}
+
+/** Where Codex work runs: the App Server already running on this computer, or one the device starts. */
+function AppServerSettings({ server, working, busy, save, test }: {
+  server: AppServer; working: boolean; busy: string
+  save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>
+}) {
+  const [socket, setSocket] = useState(server.socket ?? "")
+  const [tested, setTested] = useState<AppServerLink | null>(null)
+  const [testing, setTesting] = useState(false)
+  useEffect(() => setSocket(server.socket ?? ""), [server.socket])
+  useEffect(() => setTested(null), [server.mode, server.socket])
+  const link = server.link
+  const shown = tested ?? link
+  const inUse = shown.state === "connected" || shown.state === "handshake_failed" ? [shown.socket] : shown.state === "not_found" ? shown.candidates : []
+  const setMode = (mode: AppServerMode) => { if (mode !== server.mode) void save("app_server", { app_server: { mode, socket: server.socket } }) }
+  const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
+
+  return <div className="grid gap-2">
+    <p className="text-meta font-medium text-muted-foreground">App Server</p>
+    <div className="flex min-w-0 flex-wrap items-center gap-2">
+      <div role="radiogroup" aria-label="App Server" className="flex w-fit gap-1 rounded-lg bg-muted p-1">
+        {modes.map(([mode, text, Icon]) => <Button key={mode} type="button" role="radio" aria-checked={server.mode === mode} disabled={working}
+          variant={server.mode === mode ? "outline" : "ghost"} className={cn(server.mode === mode && "shadow-xs")} onClick={() => setMode(mode)}>
+          <Icon aria-hidden="true" />{text}
+        </Button>)}
+      </div>
+      <Button type="button" variant="ghost" disabled={working || testing || link.state === "off"} onClick={() => void runTest()}>
+        <BusyIcon busy={testing} icon={PlugZap} />测试连接
+      </Button>
+    </div>
+    <LinkLine link={shown} prefix={tested ? "测试：" : ""} />
+    {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <code className="font-mono text-meta break-all text-muted-foreground">{shown.reason}</code> : null}
+    {server.mode === "system" ? <Details label="Socket">
+      {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
+      <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
+        <Input aria-label="指定 Socket 路径" className="min-w-0 font-mono" placeholder="自动查找" spellCheck={false} value={socket} disabled={working} onChange={(event) => setSocket(event.target.value)} />
+        {socket.trim() !== (server.socket ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
+      </form>
+    </Details> : null}
+  </div>
 }
 
 /** Opens a provider's settings on this page and moves focus into them; every fix action lands here. */
@@ -43,7 +105,7 @@ export function openProvider(provider: ProviderId) {
   card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
 }
 
-type Change = { provider: ProviderId; enabled?: boolean; roles?: ProviderRole[]; bin?: string; env?: Record<string, string | null> }
+type Change = { provider: ProviderId; enabled?: boolean; roles?: ProviderRole[]; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 
 /**
  * Codex and Cursor on the device this browser is connected to: on or off, what each is used for,
@@ -74,6 +136,17 @@ export function ProviderSettings({ update, onChange }: { update?: NodeSettingsRe
     }
   }
   useEffect(() => { setResponse(null); void call("load", null); return () => { sequence.current += 1 } }, [ready])
+  async function test(): Promise<AppServerLink | null> {
+    if (!ready?.isCurrent()) return null
+    try {
+      const link = parseAppServerLink(await ready.request("test_codex_app_server"))
+      void call("load", null)
+      return link
+    } catch (cause) {
+      setError({ provider: "codex", cause })
+      return null
+    }
+  }
   useEffect(() => { if (update) setResponse(update) }, [update])
   const starting = response?.providers.some((item) => item.state === "starting")
   useEffect(() => {
@@ -84,11 +157,11 @@ export function ProviderSettings({ update, onChange }: { update?: NodeSettingsRe
 
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void call("load", null) }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   return <ul className="grid gap-3">
-    {response.providers.map((item) => <ProviderCard key={item.provider} item={item} busy={busy} error={error?.provider === item.provider ? error.cause : null} save={(key, change) => call(`${item.provider}:${key}`, { provider: item.provider, ...change })} />)}
+    {response.providers.map((item) => <ProviderCard key={item.provider} item={item} busy={busy} error={error?.provider === item.provider ? error.cause : null} save={(key, change) => call(`${item.provider}:${key}`, { provider: item.provider, ...change })} test={test} />)}
   </ul>
 }
 
-function ProviderCard({ item, busy, error, save }: { item: ProviderStatus; busy: string; error: unknown; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
+function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus; busy: string; error: unknown; save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null> }) {
   const name = providerNames[item.provider], Icon = icons[item.provider], state = states[item.state]
   const [editing, setEditing] = useState<string | null>(null)
   const [value, setValue] = useState("")
@@ -119,13 +192,16 @@ function ProviderCard({ item, busy, error, save }: { item: ProviderStatus; busy:
     {item.state === "needs_setup" && issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
-      <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>
+      {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="font-medium text-foreground underline underline-offset-4" disabled={working}
+        onClick={() => void save("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自行启动</button>
+        : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : null}
     <details id={`provider-${item.provider}`} className="details border-t">
       <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
       <div className="grid gap-4 px-3 pb-3">
+        {item.app_server ? <AppServerSettings server={item.app_server} working={working || !item.enabled} busy={busy} save={save} test={test} /> : null}
         {item.supports.length > 1 ? <fieldset disabled={working || !item.enabled} className="grid gap-2">
           <legend className="mb-2 text-meta font-medium text-muted-foreground">用于</legend>
           <div className="flex flex-wrap gap-2">
@@ -182,6 +258,7 @@ function ProviderCard({ item, busy, error, save }: { item: ProviderStatus; busy:
             </div>
           </form>
           <p className="text-meta text-muted-foreground">只存在这台电脑上，只给 {name} 用，保存后看不到原值</p>
+          {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">系统 App Server 用它自己的设置，这些变量只在自行启动时传给 App Server</p> : null}
         </div>
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>

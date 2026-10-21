@@ -180,11 +180,17 @@ pub(crate) fn system_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-/// A socket file nobody listens on, or a link to one, is what a stopped App Server leaves.
+/// Nothing listens there: no file, a socket file or link a stopped App Server left, or a path
+/// too long for any socket.
 fn stale(error: &str) -> bool {
-    ["No such file", "Connection refused", "Not a directory"]
-        .iter()
-        .any(|cause| error.contains(cause))
+    [
+        "No such file",
+        "Connection refused",
+        "Not a directory",
+        "SUN_LEN",
+    ]
+    .iter()
+    .any(|cause| error.contains(cause))
 }
 
 /// The first candidate that completes an `initialize` handshake. Stale sockets are skipped.

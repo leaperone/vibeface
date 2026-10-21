@@ -33,9 +33,16 @@ export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor'
 export type ProviderRole = 'agent' | 'execution'
 export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env_missing'; name: string } | { code: 'launch_failed'; detail: string } | { code: 'config_invalid' }
+  | { code: 'app_server_not_found' } | { code: 'app_server_unreachable'; detail: string }
+/** The Codex App Server as the device sees it, live or from a fresh handshake. */
+export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 'connected'; socket: string; user_agent: string }
+  | { state: 'not_found'; candidates: string[] } | { state: 'handshake_failed'; socket: string; reason: string } | { state: 'launch_failed'; reason: string }
+export type AppServerMode = 'system' | 'spawn'
+/** `socket` is the owner's choice for the system App Server; `null` finds it. */
+export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 /** One local provider of the connected Node. Variable values never come back, only whether each is set. */
 export type ProviderStatus = {
-  provider: ProviderId; enabled: boolean; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; assistant: boolean
+  provider: ProviderId; enabled: boolean; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; assistant: boolean; app_server: AppServer | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
   state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
 }
@@ -165,15 +172,33 @@ function parseIssue(value: unknown): ProviderIssue {
     case 'env_missing': return { code: v.code, name: text(v.name) }
     case 'launch_failed': return { code: v.code, detail: text(v.detail) }
     case 'config_invalid': return { code: v.code }
+    case 'app_server_not_found': return { code: v.code }
+    case 'app_server_unreachable': return { code: v.code, detail: text(v.detail) }
     default: throw new Error('AI 服务状态格式不对。')
   }
+}
+export function parseAppServerLink(value: unknown): AppServerLink {
+  const v = record(value, 'App Server 状态')
+  switch (v.state) {
+    case 'off': case 'starting': return { state: v.state }
+    case 'connected': return { state: v.state, socket: text(v.socket), user_agent: text(v.user_agent) }
+    case 'not_found': return { state: v.state, candidates: strings(v.candidates) }
+    case 'handshake_failed': return { state: v.state, socket: text(v.socket), reason: text(v.reason) }
+    case 'launch_failed': return { state: v.state, reason: text(v.reason) }
+    default: throw new Error('App Server 状态格式不对。')
+  }
+}
+function parseAppServer(value: unknown): AppServer | null {
+  if (value === null || value === undefined) return null
+  const v = record(value, 'App Server 设置')
+  return { mode: oneOf(v.mode, ['system', 'spawn'] as const), socket: v.socket === null ? null : text(v.socket), link: parseAppServerLink(v.link) }
 }
 function parseProvider(value: unknown): ProviderStatus {
   const v = record(value)
   return {
     provider: oneOf(v.provider, providerIds), enabled: boolean(v.enabled), assistant: boolean(v.assistant),
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
-    bin: v.bin === null ? null : text(v.bin),
+    bin: v.bin === null ? null : text(v.bin), app_server: parseAppServer(v.app_server),
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
   }
