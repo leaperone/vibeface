@@ -19,6 +19,7 @@ function Home() {
     ?? workspace.bots.find((item) => item.conversation_id === workspace.conversationId)
     ?? workspace.bots[0]
   if (bot) return <Navigate to="/b/$botId" params={{ botId: bot.bot_id }} replace />
+  if (!workspace.joined) return <EmptyState icon={Bot} title="还没有助手" />
   if (!workspace.writable && !workspace.bots.length) return <div className="mx-auto grid max-w-md gap-3 py-16"><Skeleton className="mx-auto size-8" /><Skeleton className="mx-auto h-5 w-40" /></div>
   return <EmptyState icon={Bot} title="还没有助手" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新建助手</Button>} />
 }

@@ -225,7 +225,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
     let result: unknown
     try { result = await active.channel.request(method, params) } catch (cause) {
-      if (method !== 'log') reportLog({ level: 'warn', event: 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method } })
+      if (method !== 'log') reportLog({ level: 'warn', event: 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: location.origin } })
       throw cause
     }
     if (session.current !== active || active.generation !== generation.current) throw changed()

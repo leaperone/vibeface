@@ -133,6 +133,12 @@ test('a browser in a local session sees the workspace read-only and is told to j
     await assert.rejects(view.answer(question, '继续'), /这个浏览器还没加入/)
     assert.equal(app.rpcs.includes('answer'), false, 'nothing is sent to be refused')
   } finally { app.close() }
+  const load = loader({}, () => undefined)
+  const { NotJoined } = load(fileURLToPath(new URL('./not-joined.tsx', import.meta.url))) as { NotJoined: (props: { onJoin(): void }) => unknown }
+  const { createElement } = nodeRequire('react'), { renderToStaticMarkup } = nodeRequire('react-dom/server')
+  const html: string = renderToStaticMarkup(createElement(NotJoined, { onJoin() {} }))
+  assert.match(html, /这个浏览器还没加入/)
+  assert.match(html, /<button[^>]*>.*用加入链接加入<\/button>/)
 })
 
 test('a browser that is not a member never sends a read receipt, so nothing retries on every refresh', async () => {

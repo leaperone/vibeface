@@ -532,7 +532,7 @@ struct Submitted {
     fields: Map<String, Value>,
 }
 
-fn submitted(source: Source, value: &Value, now_ms: i64) -> Result<Record> {
+fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result<Record> {
     ensure!(
         value.to_string().len() <= MAX_RECORD_BYTES,
         "log record is larger than {MAX_RECORD_BYTES} bytes"
@@ -556,6 +556,11 @@ fn submitted(source: Source, value: &Value, now_ms: i64) -> Result<Record> {
         ensure!(name(id, "-_.:"), "invalid id in log record");
     }
     let source_name = serde_json::to_value(source)?;
+    let mut fields = input.fields;
+    // A browser's records name the device that authenticated the channel, not one the page claims.
+    if source == Source::Web {
+        fields.insert("device_id".to_owned(), Value::String(sender.to_owned()));
+    }
     Ok(Record {
         ts_ms: now_ms,
         level: input.level,
@@ -567,7 +572,7 @@ fn submitted(source: Source, value: &Value, now_ms: i64) -> Result<Record> {
         conversation_id: input.conversation_id,
         work_id: input.work_id,
         thread_id: input.thread_id,
-        fields: input.fields,
+        fields,
     })
 }
 
@@ -605,7 +610,7 @@ pub fn submit(
     );
     let records = records
         .iter()
-        .map(|record| submitted(source, record, now_ms))
+        .map(|record| submitted(source, sender, record, now_ms))
         .collect::<Result<Vec<_>>>()?;
     ensure!(
         limit.take(sender, records.len() as u32, now_ms),
@@ -871,6 +876,17 @@ mod tests {
             ["turn started", "noise"]
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn browser_records_name_the_authenticated_device() {
+        let claimed = json!({"level":"warn","event":"web.rpc_failed","message":"m","fields":{"device_id":"spoof","origin":"http://127.0.0.1:4791"}});
+        let record = submitted(Source::Web, "browser-1", &claimed, 0).unwrap();
+        assert_eq!(record.fields["device_id"], "browser-1");
+        assert_eq!(record.fields["origin"], "http://127.0.0.1:4791");
+        let cli = json!({"level":"info","message":"m"});
+        let record = submitted(Source::Cli, "local-Cli", &cli, 0).unwrap();
+        assert!(!record.fields.contains_key("device_id"));
     }
 
     #[test]
