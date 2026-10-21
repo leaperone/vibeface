@@ -107,11 +107,14 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
 function NodeJoin() {
   const device = useDevice()
   const joining = device.nodeJoining!
+  const [cancelling, setCancelling] = useState(false)
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : '等待批准'}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
       <p className="text-muted-foreground">在管理设备上比对安全码，相同再批准</p>
       {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
-      <Button type="button" variant="ghost" className="w-fit" onClick={device.disconnect}>取消</Button>
+      <Button type="button" variant="ghost" className="w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
+        {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
+      </Button>
     </>}
   </Panel>
 }
@@ -233,7 +236,7 @@ export function ConnectionScreen() {
           <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
         </p>}
         {thisComputer
-          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
+          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={device.localSetup?.kind === 'uninitialized' && device.localSetup.name || defaultComputerName()} /></Field>
           : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>}
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>

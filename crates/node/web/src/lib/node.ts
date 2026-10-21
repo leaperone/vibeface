@@ -27,7 +27,7 @@ export type JoinRequest = {
   join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
   admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
-export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; device_id: string; token: string } }
+export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string; name?: string } | { kind: 'initialized'; entry: ConnectionEntry; local_launch?: { url: string; device_id: string; token: string } }
 export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string; node_bin: string; codex_sdk_script: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type NodeSettingsResponse = {
@@ -112,6 +112,7 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
   if (v.kind === 'uninitialized') {
     const invitation = record(v.invitation, '本机初始化')
     setup = { kind: 'uninitialized', entry: parseEntry({ address: invitation.url, device_id: invitation.device_id }), capability: validTarget(invitation.capability) }
+    if (typeof v.name === 'string') setup.name = v.name
   } else if (v.kind === 'initialized') {
     const entry = parseEntry(v.entry)
     setup = { kind: 'initialized', entry }

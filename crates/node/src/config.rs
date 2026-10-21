@@ -8,6 +8,8 @@ use std::{
 
 /// Bumped whenever stored data stops being readable by the previous build.
 pub const DATA_EPOCH: u32 = 9;
+/// The name a removed Node had, which its fresh data directory offers when it joins again.
+pub const FORMER_NAME_FILE: &str = "former-name";
 
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()

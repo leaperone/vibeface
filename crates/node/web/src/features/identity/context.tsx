@@ -45,7 +45,7 @@ type DeviceContextValue = {
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
-  rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<void>
+  rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<void>; cancelNodeJoin(): Promise<void>
   connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
@@ -445,6 +445,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     try {
       for (;;) {
         const reply = record(await callSession(active, 'node_join', { capability, link, name }))
+        if (reply.status === 'cancelled') return
         if (reply.status === 'failed') throw new Error('没能加入。链接可能已过期或被拒绝，请在已有设备上重新添加。')
         if (reply.status === 'joined') break
         if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这台电脑返回了未知的加入状态。')
@@ -456,6 +457,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (setup?.kind !== 'initialized' || setup.entry.device_id !== entry.device_id) throw new Error('已加入，但本机页面没变。请刷新页面。')
       launchLocal(setup)
     } finally { setNodeJoining(null) }
+  }
+  /** Stops this computer's join on the Node; the join's own polling then reports how it ended. */
+  async function cancelNodeJoin() {
+    const active = session.current
+    if (!active || localSetup?.kind !== 'uninitialized') return
+    await callSession(active, 'node_join_cancel', { capability: localSetup.capability })
   }
   async function refreshDirectory() {
     if (!ready?.isCurrent()) return
@@ -840,7 +847,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
-    removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer,
+    removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },
