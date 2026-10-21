@@ -38,7 +38,7 @@ export function ConversationScreen() {
   const text = drafts.get(conversationId) ?? ''
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
-  const checks = pendingChecks(data)
+  const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
@@ -52,8 +52,8 @@ export function ConversationScreen() {
 
   // Tasks sit right after the message that started them.
   const works = data?.works ?? []
-  const tasks: TaskRow[] = works.map((work) => ({ id: work.work_id, state: shownState(work), device: work.target_node, summary: work.summary, trigger: work.trigger, work }))
-  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'unverified')
+  const tasks: TaskRow[] = works.map((work) => ({ id: work.work_id, state: shownState(work, workspace.nodes), device: work.target_node, summary: work.summary, trigger: work.trigger, work }))
+  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'awaiting_confirmation')
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)

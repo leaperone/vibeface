@@ -997,6 +997,9 @@ impl Store {
                 TriggerKind::Routine if live_routine(&tx, network, &job)?.is_none() => {
                     Some("例行任务已暂停或删除")
                 }
+                TriggerKind::AgentTask if super::work::run_finished(&tx, &job.reply_to)? => {
+                    Some("任务结果已由你确认")
+                }
                 _ => None,
             };
             if let Some(evidence) = evidence {

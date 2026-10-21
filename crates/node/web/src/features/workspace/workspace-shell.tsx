@@ -247,7 +247,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
   const status = retry === null
     ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
     : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
-  return <div className="flex h-dvh" aria-busy="true">
+  return <div className="flex h-dvh" aria-busy={retry === null}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
       <span className="text-heading font-semibold">vibeface</span>
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
@@ -255,8 +255,8 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
-      {retry !== null && onLeave ? <div className="flex flex-wrap justify-center gap-2 px-4 pt-6">
-        {onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
+      {onLeave ? <div className="flex flex-wrap justify-center gap-2 px-4 pt-6">
+        {retry !== null && onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
         <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button>
       </div> : null}
       {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}

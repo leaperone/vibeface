@@ -488,7 +488,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             WorkOutcome::Interrupted,
             Some("助手进程已退出，任务没有做完".into()),
         ),
-        (Unverified { .. }, Signal::Settled(outcome)) => {
+        (Unverified { .. } | Accepted | Starting { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
             None
         }

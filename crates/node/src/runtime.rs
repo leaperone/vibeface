@@ -101,6 +101,18 @@ pub struct Access {
     pub manager: Option<ManagerAccess>,
 }
 
+/// What changed in a conversation, so each client session can push the affected records.
+pub(crate) enum Changed<'a> {
+    /// A stored event, by hash.
+    Event(&'a str),
+    /// A work row, or this Node's dispatch and stop requests for it.
+    Work(&'a str),
+    /// This Node's scheduler job for the trigger, and its reply once written.
+    Job(&'a str),
+    /// Clients re-read the conversation.
+    Reload,
+}
+
 #[derive(Clone)]
 pub struct Update {
     pub network_id: String,
@@ -412,7 +424,7 @@ impl Runtime {
             blobs,
             now_ms(),
         )?;
-        self.publish_changed(network, scope, &event.hash);
+        self.publish_changed(network, scope, Changed::Event(&event.hash));
         Ok(event)
     }
     /// Which events count changed, so every conversation may read differently now.
@@ -422,10 +434,17 @@ impl Runtime {
             payload: json!({"type":"changed"}),
         });
     }
-    fn publish_changed(&self, network: &str, scope: &str, event_hash: &str) {
+    pub(crate) fn publish_changed(&self, network: &str, scope: &str, change: Changed) {
+        let mut payload = json!({"type":"changed","conversation_id":scope});
+        match change {
+            Changed::Event(hash) => payload["event_hash"] = json!(hash),
+            Changed::Work(work_id) => payload["work_id"] = json!(work_id),
+            Changed::Job(trigger) => payload["trigger"] = json!(trigger),
+            Changed::Reload => {}
+        }
         let _ = self.events.send(Update {
             network_id: network.into(),
-            payload: json!({"type":"changed","conversation_id":scope,"event_hash":event_hash}),
+            payload,
         });
         self.have_wakeup.notify_one();
     }
@@ -564,10 +583,14 @@ impl Runtime {
                     first_owner(&input)?,
                     now_ms(),
                 )?;
-                self.publish_changed(network, &scope, &scope);
+                self.publish_changed(network, &scope, Changed::Reload);
                 Ok(json!(conversation))
             }
             "conversation" => self.conversation_snapshot(&access, &input).await,
+            "open_works" => {
+                ensure!(access.human, "only clients list open works");
+                Ok(json!({"works":self.store.lock().await.open_works(network)?}))
+            }
             "message" => self.accept_chat_message(&access, &input).await,
             "set_owner" => {
                 let scope = scope.context("conversation_id is required")?;

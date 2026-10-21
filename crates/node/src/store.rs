@@ -518,6 +518,25 @@ impl Store {
     pub fn works(&self, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
         reduce::works_from(&self.connection, network, scope)
     }
+    /// Works in every conversation that have no result yet or whose result waits for the user.
+    pub fn open_works(&self, network: &str) -> Result<Vec<WorkProjection>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT conversation_id FROM works WHERE network_id=? AND dispatch IS NOT NULL
+             AND (finish IS NULL OR json_extract(finish,'$.outcome')='unverified')",
+        )?;
+        let scopes = statement
+            .query_map([network], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut open = Vec::new();
+        for scope in scopes {
+            open.extend(
+                self.works(network, &scope)?
+                    .into_iter()
+                    .filter(|work| work.outcome.is_none_or(|o| o == WorkOutcome::Unverified)),
+            );
+        }
+        Ok(open)
+    }
     /// Every local append checks this gate; it lives only as long as this connection.
     pub fn set_write_state(&mut self, state: WriteState) -> Result<()> {
         self.connection
@@ -678,7 +697,7 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers,rank";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
@@ -692,6 +711,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let in_reply_to: Option<String> = r.get(6)?;
     let report_results: Option<bool> = r.get(8)?;
     let answers: Option<String> = r.get(10)?;
+    let rank: String = r.get(11)?;
     Ok((|| {
         Ok(Message {
             message_id,
@@ -707,6 +727,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
             report_results,
             answers,
             blobs: serde_json::from_str(&blobs)?,
+            rank,
         })
     })())
 }

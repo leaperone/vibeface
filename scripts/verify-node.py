@@ -2342,6 +2342,12 @@ def phase1_acceptance(options):
         require(all(row["source_node"] == a.device_id and row["invocation_id"] and row["sequence"] > 0
                     and row["progress"]["type"] == "text_snapshot" for row in progress),
                 "progress carries the invocation identity and normalized text snapshots")
+        pushed = wait_for("the client receives the posted message as records, not a reload", lambda:
+            [event["payload"] for event in a.client.command("events") if event.get("payload", {}).get("type") == "records"
+             and event["payload"]["conversation_id"] == name
+             and any(row["message_id"] == "queue-first" and row["rank"] for row in event["payload"]["messages"])])
+        require(all(isinstance(row["jobs"], list) and isinstance(row["works"], list) for row in pushed),
+                "pushed records carry the conversation's jobs and changed works")
         active_before = state(first, "running")
         require(active_before, "original reply remains running before queued cancellation")
         cancelled_reply = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled_queued["trigger"])
@@ -3515,6 +3521,16 @@ def auto_route_acceptance(options):
         target.start()
         network = target.bootstrap()
         passed("genesis", network=network, target=target.device_id)
+
+        def local_entry():
+            return json.loads(node_cli(target, "access", "--json", "--data-dir", str(target.directory)).stdout)
+        require(local_entry().get("local") is True, "a new network opens local browser access without confirmation")
+        node_cli(target, "access", "--disable", "--data-dir", str(target.directory))
+        require(not json.loads((target.directory / "config.json").read_text())["local_auto_access"]
+                and local_entry().get("local") is None, "access --disable turns it off in the running Node")
+        node_cli(target, "access", "--enable", "--data-dir", str(target.directory))
+        require(local_entry().get("local") is True, "access --enable turns it back on without a restart")
+        passed("access-cli-toggle", node=target.device_id)
 
         impostor = fresh(target.url)
         other_id = impostor.own_id()

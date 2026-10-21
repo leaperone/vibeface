@@ -720,6 +720,27 @@ test('a reload resumes the last network through its entrances even with several 
   } finally { app.close() }
 })
 
+test('a reload while the Node is down shows the browser offline, and retrying now tries again at once', async () => {
+  const storage = new Map([['vibeface.connections', JSON.stringify([entry])], ['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])
+  const app = deviceHarness({ storage })
+  try {
+    app.render(); await settle()
+    const down = deferred(); app.holds.set('open', down)
+    const [id, resume] = [...app.timers.entries()][0]
+    app.timers.delete(id); resume(); await settle()
+    down.reject(new Error('connection refused')); await settle()
+    const link = app.render().link
+    assert.equal(link.kind, 'offline', 'a first load that cannot reach the Node says so instead of connecting forever')
+    assert.equal(app.render().phase, 'reconnecting')
+    assert.equal(app.timers.size, 1)
+    app.holds.delete('open')
+    app.render().retryNow(); await settle()
+    const [now, again] = [...app.timers.entries()][0]
+    app.timers.delete(now); again(); await settle()
+    assert.equal(app.render().ready?.entry.device_id, target)
+  } finally { app.close() }
+})
+
 const pageAccess = (app: ReturnType<typeof deviceHarness>) => {
   const device = app.render()
   return accessOf({ ready: Boolean(device.ready), phase: device.phase, joining: Boolean(device.joining), savedEntries: device.entries.length, invitation: Boolean(device.initialInvitation), offlineRetryMs: null }).kind

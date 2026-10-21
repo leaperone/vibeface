@@ -3,7 +3,7 @@ import type { ReplyStatus } from "../chat/types"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit,
+  AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
 } from "./types"
 import { answerId } from "./questions.ts"
 
@@ -47,7 +47,7 @@ export function parseNodes(value: unknown): NodeInfo[] {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
-      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), relay: capabilities.relay === true, roots: texts(capabilities.roots) } : undefined,
+      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
     }
   })
 }
@@ -59,7 +59,7 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
 }
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs), answers: optionalText(data.answers) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs), answers: optionalText(data.answers), rank: optionalText(data.rank) }
 }
 function replyStatus(value: unknown): ReplyStatus {
   switch (value) {
@@ -87,16 +87,21 @@ function workOutcome(value: unknown): WorkOutcome | null {
     default: throw new Error("任务结果无法识别。")
   }
 }
+function workKind(value: unknown): WorkRecord["kind"] {
+  if (value == null) return undefined
+  if (value !== "codex" && value !== "task") throw new Error("任务类型无法识别。")
+  return value
+}
 function work(value: unknown): WorkRecord {
   const data = record(value)
   return {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
-    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), thread_id: optionalText(data.thread_id),
+    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), kind: workKind(data.kind), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id),
   }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
-function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
+export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
   const rows = [...works]
   for (const item of list(value)) {
     const data = record(item), state = data.state, work_id = text(data.work_id), target_node = text(data.target_node)
@@ -113,13 +118,48 @@ function coordinationCheck(value: unknown): CoordinationCheck {
   const data = record(value)
   return { check_id: text(data.check_id), conversation_id: text(data.conversation_id), trigger: text(data.trigger), attempt_id: text(data.attempt_id), detail: text(data.detail), process_groups: list(data.process_groups).map(number), created_at_ms: number(data.created_at_ms) }
 }
-/** One card per thing the person must settle: each unverified work, then each coordination process still alive. */
-export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"> | null | undefined): PendingCheck[] {
+/**
+ * Why a work waits for the person, or null when its device can still report it. An unfinished work waits only once
+ * its device is known to be offline, or its App Server disconnected for a Codex turn; an unknown device is not judged.
+ * A task runs in its device's assistant, which reports without the App Server, so only offline applies to it.
+ */
+export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReason | null {
+  if (item.state === "unverified") return "unverified"
+  if (item.outcome || item.state === "finished" || item.state === "dispatch_waiting" || item.state === "dispatch_rejected") return null
+  const node = nodes.find((candidate) => candidate.device_id === item.target_node)
+  if (!node || node.revoked) return null
+  if (!node.online) return "offline"
+  return item.kind === "codex" && node.capabilities?.codex_connected === false ? "disconnected" : null
+}
+/** One card per thing the person must settle: each work waiting for confirmation, then each coordination process still alive. */
+export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"> | null | undefined, nodes: NodeInfo[], conversationId: string): PendingCheck[] {
   if (!data) return []
   return [
-    ...data.works.filter((item) => item.state === "unverified").map((item): PendingCheck => ({ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node })),
+    ...workChecks(data.works.map((item) => ({ ...item, conversation_id: conversationId })), nodes),
     ...data.checks.map((check): PendingCheck => ({ kind: "process", check_id: check.check_id, detail: check.detail })),
   ]
+}
+export type WorkCheck = Extract<PendingCheck, { kind: "work" }>
+export function workChecks(works: OpenWork[], nodes: NodeInfo[]): WorkCheck[] {
+  return works.flatMap((item): WorkCheck[] => {
+    const reason = confirmReason(item, nodes)
+    return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, title: item.title, reason }] : []
+  })
+}
+export function parseOpenWorks(value: unknown): OpenWork[] {
+  return list(record(value).works).map((item) => ({ ...work(item), conversation_id: text(record(item).conversation_id) }))
+}
+/** A pushed change: the records it touched, or null when it carries none. */
+export function parseRecords(value: unknown): ConversationRecords {
+  const data = record(value)
+  const last = data.last_message == null ? null : record(data.last_message)
+  return {
+    conversation_id: text(data.conversation_id), messages: list(data.messages).map(message), works: list(data.works).map(work),
+    last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) },
+    questions: list(data.questions).map(question), notifications: parseNotifications(data),
+    deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
+    jobs: schedulerSnapshot({ jobs: data.jobs })?.jobs ?? [],
+  }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
   const data = record(value)

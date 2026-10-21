@@ -577,6 +577,8 @@ pub struct Message {
     /// The question this user message answers.
     pub answers: Option<String>,
     pub blobs: Vec<BlobRef>,
+    /// Its place in the conversation's shared order; clients merge pushed messages by it.
+    pub rank: String,
 }
 /// Derived from the event that raised it; its ID is that event's hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

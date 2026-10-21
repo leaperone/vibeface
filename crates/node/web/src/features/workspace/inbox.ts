@@ -3,17 +3,17 @@ import { useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@/features/identity/context"
 import type { JoinRequest } from "@/lib/node"
 import { useWorkspace } from "./context"
-import { pendingChecks } from "./model"
+import { workChecks } from "./model"
 import { openQuestions } from "./questions"
-import type { Question } from "./types"
+import type { PendingCheck, Question } from "./types"
 import type { WriteCardKind } from "./write-card"
 
 /** `done`: a question this browser just answered, shown collapsed until the network's list drops it. */
-export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write"; question?: Question; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
+export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
 
 /**
  * Everything waiting on the person: write state, then every unanswered question newest first, then the rest.
- * ponytail: checks come from the open conversation only; other assistants surface through their notifications.
+ * Every work waiting for confirmation shows as its own card; leftover processes come from the open conversation only.
  */
 export function useInbox(): InboxItem[] {
   const workspace = useWorkspace()
@@ -31,7 +31,8 @@ export function useInbox(): InboxItem[] {
     key: `question:${question.question_id}`, icon: MessageCircleQuestionMark, title: question.text, meta: question.assistant?.name,
     to: question.assistant ? `/b/${question.assistant.bot_id}` : "/inbox", kind: "question", question, done: question.question_id in workspace.answered,
   })
-  const checks = pendingChecks(data).length
+  for (const check of workChecks(workspace.openWorks, workspace.nodes)) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", meta: check.title || undefined, to: "/inbox", kind: "confirm", check })
+  const checks = data?.checks.length ?? 0
   if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
   for (const join of joins) items.push({ key: `join:${join.join_id}`, icon: MonitorSmartphone, title: `${join.name || "新设备"} 想加入`, to: "/devices", kind: "join", join })

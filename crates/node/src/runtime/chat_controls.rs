@@ -1,5 +1,5 @@
 use super::*;
-use crate::work::DispatchState;
+use crate::{scheduling::PendingCheck, work::DispatchState};
 
 const ARTIFACT_PAGE: usize = 65_536;
 /// Raw bytes per upload request, well inside the client channel's message limit.
@@ -144,55 +144,15 @@ impl Runtime {
         let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
         let store = self.store.lock().await;
         let works = store.works(network, scope)?;
-        // One card per work: an unverified agent task's coordination check is answered by its work card.
-        let unverified: BTreeSet<_> = works
-            .iter()
-            .filter(|work| work.state == WorkStatus::Unverified)
-            .map(|work| crate::scheduling::task_trigger(&work.work_id))
-            .collect();
-        let checks: Vec<_> = checks
-            .into_iter()
-            .filter(|check| !unverified.contains(&check.trigger))
-            .collect();
-        // Requests this device still carries to another one; the DAG learns of them only once
-        // the target answers.
-        let mut deliveries = Vec::new();
-        for dispatch in store.dispatches()? {
-            let spec = &dispatch.spec;
-            let state = match &dispatch.state {
-                DispatchState::Accepted => continue,
-                DispatchState::Pending => "dispatch_waiting",
-                DispatchState::Rejected { .. } => "dispatch_rejected",
-            };
-            if spec.conversation != scope || works.iter().any(|w| w.work_id == spec.work_id) {
-                continue;
-            }
-            let reason = match &dispatch.state {
-                DispatchState::Rejected { reason } => Some(reason),
-                _ => None,
-            };
-            deliveries.push(
-                json!({"work_id":spec.work_id,"target_node":spec.target,"state":state,
-                "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":reason}),
-            );
-        }
-        for stop in store.stop_requests()? {
-            if stop.conversation == scope {
-                deliveries.push(json!({"work_id":stop.work_id,"target_node":stop.target,
-                    "state":if stop.timed_out {"stop_timed_out"} else {"stop_waiting"}}));
-            }
-        }
+        let checks = without_work_checks(checks, &works);
+        let deliveries = deliveries(&store, scope, &works)?;
         let conversation = store.conversation(network, scope)?;
         let bot = store.bot_for_conversation(network, scope)?;
-        let mut messages = Vec::new();
-        for message in store.messages(network, scope)? {
-            let mut value = json!(message);
-            let attachments = store.event_blobs(network, &message.event_hash)?;
-            if !attachments.is_empty() {
-                value["blobs"] = json!(attachments);
-            }
-            messages.push(value);
-        }
+        let messages = store
+            .messages(network, scope)?
+            .into_iter()
+            .map(|message| message_value(&store, network, message))
+            .collect::<Result<Vec<_>>>()?;
         let changes = store.assistant_changes(network, scope)?;
         let questions = store.conversation_questions(network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
@@ -231,4 +191,127 @@ impl Runtime {
                 "capabilities":manager.map(|m| m.provider.capabilities())},
         }))
     }
+
+    /// The records one change touched, in the shapes `conversation` returns, so a client merges
+    /// them without a reload: the changed message or work, and the conversation's small lists
+    /// whole. `None` when the client should re-read the conversation instead.
+    pub(crate) async fn changed_records(
+        &self,
+        network: &str,
+        client: &str,
+        change: &Value,
+    ) -> Result<Option<Value>> {
+        let scope = field(change, "conversation_id")?;
+        let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let store = self.store.lock().await;
+        let mut message_id = None;
+        let mut work_id = change["work_id"].as_str().map(str::to_owned);
+        if let Some(hash) = change["event_hash"].as_str() {
+            let Some(event) = store.event(network, hash)? else {
+                return Ok(None);
+            };
+            let event: Event = serde_json::from_str(&event.canonical_body)?;
+            match &event.body {
+                EventBody::MessagePosted { message_id: id, .. } => message_id = Some(id.clone()),
+                EventBody::QuestionAsked { .. } | EventBody::NotificationAcked { .. } => {}
+                body => match body.work_id() {
+                    Some(id) => work_id = Some(id.into()),
+                    None => return Ok(None),
+                },
+            }
+        } else if let Some(trigger) = change["trigger"].as_str() {
+            message_id = store
+                .scheduler_job(scope, trigger)?
+                .map(|job| job.message_id);
+        } else if work_id.is_none() {
+            return Ok(None);
+        }
+        let message = match message_id {
+            Some(id) => store.message(network, scope, &id)?,
+            None => None,
+        };
+        let last_message = match message {
+            Some(_) => store.last_messages(network)?.remove(scope),
+            None => None,
+        };
+        let messages = message
+            .map(|message| message_value(&store, network, message))
+            .transpose()?;
+        let works = store.works(network, scope)?;
+        let changed: Vec<_> = works
+            .iter()
+            .filter(|work| work_id.as_deref() == Some(work.work_id.as_str()))
+            .collect();
+        let notifications: Vec<_> = store
+            .pending_notifications(network, client)?
+            .into_iter()
+            .filter(|notification| notification.conversation_id == scope)
+            .collect();
+        Ok(Some(json!({
+            "type":"records",
+            "conversation_id":scope,
+            "messages":messages.into_iter().collect::<Vec<_>>(),
+            "works":changed,
+            "last_message":last_message,
+            "questions":store.conversation_questions(network, scope)?,
+            "notifications":notifications,
+            "deliveries":deliveries(&store, scope, &works)?,
+            "checks":without_work_checks(checks, &works),
+            "jobs":jobs,
+        })))
+    }
+}
+
+/// One card per work: an unverified agent task's coordination check is answered by its work card.
+fn without_work_checks(checks: Vec<PendingCheck>, works: &[WorkProjection]) -> Vec<PendingCheck> {
+    let unverified: BTreeSet<_> = works
+        .iter()
+        .filter(|work| work.state == WorkStatus::Unverified)
+        .map(|work| crate::scheduling::task_trigger(&work.work_id))
+        .collect();
+    checks
+        .into_iter()
+        .filter(|check| !unverified.contains(&check.trigger))
+        .collect()
+}
+
+/// Requests this device still carries to another one; the DAG learns of them only once the
+/// target answers.
+fn deliveries(store: &Store, scope: &str, works: &[WorkProjection]) -> Result<Vec<Value>> {
+    let mut deliveries = Vec::new();
+    for dispatch in store.dispatches()? {
+        let spec = &dispatch.spec;
+        let state = match &dispatch.state {
+            DispatchState::Accepted => continue,
+            DispatchState::Pending => "dispatch_waiting",
+            DispatchState::Rejected { .. } => "dispatch_rejected",
+        };
+        if spec.conversation != scope || works.iter().any(|w| w.work_id == spec.work_id) {
+            continue;
+        }
+        let reason = match &dispatch.state {
+            DispatchState::Rejected { reason } => Some(reason),
+            _ => None,
+        };
+        deliveries.push(
+            json!({"work_id":spec.work_id,"target_node":spec.target,"state":state,
+            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":reason}),
+        );
+    }
+    for stop in store.stop_requests()? {
+        if stop.conversation == scope {
+            deliveries.push(json!({"work_id":stop.work_id,"target_node":stop.target,
+                "state":if stop.timed_out {"stop_timed_out"} else {"stop_waiting"}}));
+        }
+    }
+    Ok(deliveries)
+}
+
+fn message_value(store: &Store, network: &str, message: Message) -> Result<Value> {
+    let attachments = store.event_blobs(network, &message.event_hash)?;
+    let mut value = json!(message);
+    if !attachments.is_empty() {
+        value["blobs"] = json!(attachments);
+    }
+    Ok(value)
 }

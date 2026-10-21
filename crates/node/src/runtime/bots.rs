@@ -48,7 +48,7 @@ impl Runtime {
             },
             now_ms(),
         )?;
-        self.publish_changed(&access.network_id, &scope, &bot.event_hash);
+        self.publish_changed(&access.network_id, &scope, Changed::Event(&bot.event_hash));
         Ok(json!({"bot":bot}))
     }
 
@@ -117,7 +117,11 @@ impl Runtime {
             )
             .await?;
         tracing::info!(event = "assistant.primary", "primary assistant set");
-        self.publish_changed(&access.network_id, ASSISTANTS_SCOPE, &event.hash);
+        self.publish_changed(
+            &access.network_id,
+            ASSISTANTS_SCOPE,
+            Changed::Event(&event.hash),
+        );
         Ok(json!({"primary":self.store.lock().await.primary_assistant(&access.network_id)?}))
     }
 

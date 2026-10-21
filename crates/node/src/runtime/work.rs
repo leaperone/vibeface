@@ -96,7 +96,7 @@ impl Runtime {
                 ),
             }
         }
-        self.publish_changed(network, &record.conversation, work_id);
+        self.publish_changed(network, &record.conversation, Changed::Work(work_id));
         if receipt.is_some() {
             self.wake_scheduler()?;
         }
@@ -113,7 +113,7 @@ impl Runtime {
                     now_ms(),
                 );
                 if let Ok((record, _)) = result {
-                    node.publish_changed(&network, &record.conversation, &work_id);
+                    node.publish_changed(&network, &record.conversation, Changed::Work(&work_id));
                 }
             });
         }
@@ -267,7 +267,11 @@ impl Runtime {
             created,
             "work dispatched to this device"
         );
-        self.publish_changed(network, &record.conversation, &record.work_id);
+        self.publish_changed(
+            network,
+            &record.conversation,
+            Changed::Work(&record.work_id),
+        );
         if created && record.kind == WorkKind::Task {
             self.wake_scheduler()?;
         }
@@ -362,7 +366,11 @@ impl Runtime {
         }
         let dispatch = Dispatch { state, ..dispatch };
         self.store.lock().await.save_dispatch(&dispatch)?;
-        self.publish_changed(network, &dispatch.spec.conversation, &dispatch.spec.work_id);
+        self.publish_changed(
+            network,
+            &dispatch.spec.conversation,
+            Changed::Work(&dispatch.spec.work_id),
+        );
         Ok(dispatch)
     }
 
@@ -598,7 +606,7 @@ impl Runtime {
                 {
                     self.fence_manager_attempt(&attempt.id).await?;
                 }
-                self.publish_changed(network, &record.conversation, work_id);
+                self.publish_changed(network, &record.conversation, Changed::Work(work_id));
             }
             _ => {}
         }
@@ -656,7 +664,7 @@ impl Runtime {
             failed => {
                 tracing::debug!(?failed, "stop request waits for its device");
                 self.store.lock().await.save_stop_request(&request)?;
-                self.publish_changed(network, scope, work_id);
+                self.publish_changed(network, scope, Changed::Work(work_id));
                 Ok(
                     json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_device":true}),
                 )
@@ -716,7 +724,11 @@ impl Runtime {
             } else {
                 continue;
             }
-            self.publish_changed(network, &request.conversation, &request.work_id);
+            self.publish_changed(
+                network,
+                &request.conversation,
+                Changed::Work(&request.work_id),
+            );
         }
         Ok(())
     }

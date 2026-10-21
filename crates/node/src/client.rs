@@ -501,7 +501,16 @@ async fn serve_session(
             event = events.recv(), if session.subscribed => {
                 let principal = principal(&node, &session).await?;
                 match event {
-                    Ok(event) if event.network_id == principal.network_id => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":event.payload})).await?,
+                    Ok(event) if event.network_id == principal.network_id => {
+                        // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
+                        let payload = if events.len() > PUSH_BURST {
+                            while events.try_recv().is_ok() {}
+                            json!({"type":"changed"})
+                        } else {
+                            pushed(&node, &principal.network_id, &session.device_id, event.payload).await
+                        };
+                        send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {},
@@ -973,6 +982,25 @@ pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) ->
     };
     notify_join(node, &request);
     Ok(serde_json::to_value(request)?)
+}
+
+/// Queued changes past which a session asks its client to re-read instead.
+const PUSH_BURST: usize = 32;
+
+/// A conversation change goes out as the records it touched; one this session cannot build
+/// asks the client to re-read that conversation.
+async fn pushed(node: &Runtime, network: &str, client: &str, payload: Value) -> Value {
+    if payload["type"] != "changed" || !payload["conversation_id"].is_string() {
+        return payload;
+    }
+    match node.changed_records(network, client, &payload).await {
+        Ok(Some(records)) => records,
+        Ok(None) => json!({"type":"changed","conversation_id":payload["conversation_id"]}),
+        Err(error) => {
+            tracing::debug!(%error, "change pushed as a reload");
+            json!({"type":"changed","conversation_id":payload["conversation_id"]})
+        }
+    }
 }
 
 fn notify_join(node: &Runtime, request: &JoinRequest) {

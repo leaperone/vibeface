@@ -1233,7 +1233,7 @@ impl Runtime {
         match result {
             Ok(abandoned) => {
                 for (scope, work_id) in &abandoned {
-                    self.publish_changed(network, scope, work_id);
+                    self.publish_changed(network, scope, Changed::Work(work_id));
                 }
                 if !abandoned.is_empty() {
                     self.schedule_wakeup.notify_one();
@@ -1441,7 +1441,11 @@ impl Runtime {
                         .lock()
                         .await
                         .remove_outbox(&entry.conversation_id, &entry.trigger)?;
-                    self.publish_changed(&network, &entry.conversation_id, &entry.trigger);
+                    self.publish_changed(
+                        &network,
+                        &entry.conversation_id,
+                        Changed::Job(&entry.trigger),
+                    );
                     self.schedule_wakeup.notify_one();
                 }
                 Ok(_) => {
@@ -1479,7 +1483,7 @@ impl Runtime {
         }
         let receipt = receipt.context("the message has not reached the scheduling Node yet")?;
         self.schedule_wakeup.notify_one();
-        self.publish_changed(network, &scope, trigger);
+        self.publish_changed(network, &scope, Changed::Job(trigger));
         Ok(json!({"receipt":receipt}))
     }
 
@@ -1987,8 +1991,21 @@ mod tests {
                 a.store.lock().await.accept_message(&ia, &network, "c", id, id, vec![], true,
                     user(&ia, &network, id)?, now_ms())?;
             }
+            let mut updates = b.events.subscribe();
             b.sync_peer(&network, &ia.device_id()?).await?;
             b.sync_peer(&network, &ia.device_id()?).await?;
+            let mut pushed = Vec::new();
+            while let Ok(update) = updates.try_recv() {
+                let records = b.changed_records(&network, "browser", &update.payload).await?
+                    .context("an ingested message is pushed as records")?;
+                assert_eq!((&records["type"], &records["conversation_id"]), (&json!("records"), &json!("c")));
+                for message in records["messages"].as_array().context("messages")? {
+                    assert!(message["rank"].is_string(), "clients order pushed messages by rank");
+                    pushed.push(message["message_id"].clone());
+                }
+            }
+            pushed.sort_by_key(|id| id.to_string());
+            assert_eq!(pushed, [json!("m2"), json!("m3")], "each ingested message is pushed once");
             assert_eq!(b.store.lock().await.heads(&network)?, a.store.lock().await.heads(&network)?);
             assert_eq!(b.store.lock().await.messages(&network, "c")?.len(), 3);
             assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());

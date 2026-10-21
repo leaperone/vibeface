@@ -190,6 +190,8 @@ enum Command {
     Acquire,
     Probe,
     Commit,
+    /// Turn local browser access without confirmation on or off.
+    LocalAccess(bool),
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,6 +331,16 @@ pub async fn commit(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Applies the setting in the running Node; only this user can reach the socket.
+pub async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<()> {
+    let (_, response) = request(data_dir, Command::LocalAccess(enabled)).await?;
+    ensure!(
+        response.status == Status::Healthy,
+        "node did not apply local browser access"
+    );
+    Ok(())
+}
+
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let socket = socket_path(&data_dir)?;
@@ -376,6 +388,17 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
     };
     match request.command {
         Command::Probe => write_packet(&mut stream, &response).await?,
+        Command::LocalAccess(enabled) => {
+            let result = {
+                let _save = runtime.config_save.lock().await;
+                runtime.local_access.set_enabled(enabled)
+            };
+            if let Err(error) = result {
+                response.status = Status::Error;
+                response.error = Some(error.to_string());
+            }
+            write_packet(&mut stream, &response).await?;
+        }
         Command::Commit => {
             let result = runtime.maintenance.commit(&pending);
             response.status = if result.is_ok() {
@@ -504,6 +527,19 @@ mod tests {
             let health = probe(&dir).await?;
             assert_eq!(health.device_id, node.identity.device_id()?);
             assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
+            for enabled in [false, true] {
+                set_local_access(&dir, enabled).await?;
+                assert_eq!(
+                    node.local_access.enabled(),
+                    enabled,
+                    "the running Node applies it"
+                );
+                assert_eq!(
+                    Config::load(&dir)?.local_auto_access,
+                    enabled,
+                    "and saves it"
+                );
+            }
             assert!(commit(&dir).await.is_err());
             config::private_write(
                 &dir.join("update-pending.json"),

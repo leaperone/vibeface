@@ -71,7 +71,7 @@ function workspace(source: 'membership' | 'local_session') {
     all: async () => [...writes.values()], put: async (item: { key: string }) => { writes.set(item.key, structuredClone(item)) }, delete: async (key: string) => { writes.delete(key) },
   }
   const reads: Record<string, unknown> = {
-    nodes: { nodes: [] }, bots: { bots: [bot], primary: conversationId }, questions: { questions: [question] }, conversation,
+    nodes: { nodes: [] }, bots: { bots: [bot], primary: conversationId }, questions: { questions: [question] }, conversation, open_works: { works: [] },
     notifications: { notifications: [{ notification_id: 'n-1', conversation_id: conversationId, kind: 'progress', text: '有新进展' }] },
   }
   const connection = {

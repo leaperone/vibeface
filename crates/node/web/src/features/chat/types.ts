@@ -10,6 +10,8 @@ export type TranscriptMessage = {
   blobs?: { hash: string; size: number }[]
   /** On a user message: the question it answers. */
   answers?: string
+  /** Its place in the conversation's shared order. */
+  rank?: string
 }
 export type PendingMessage = {
   message_id: string

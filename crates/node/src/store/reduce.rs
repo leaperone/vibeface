@@ -416,6 +416,28 @@ pub(crate) fn works_from(
     Ok(works)
 }
 
+/// Whether the result that stands for this work is the user's signed settlement.
+pub(crate) fn settled_by_user(
+    connection: &Connection,
+    network: &str,
+    work_id: &str,
+) -> Result<bool> {
+    let finish: Option<String> = connection
+        .query_row(
+            "SELECT finish FROM works WHERE network_id=? AND work_id=?",
+            params![network, work_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(
+        match finish.map(|f| serde_json::from_str(&f)).transpose()? {
+            Some(EventBody::WorkFinished { attestation, .. }) => attestation.is_some(),
+            _ => false,
+        },
+    )
+}
+
 /// One work's projection, wherever its conversation is.
 pub(crate) fn work_from(
     connection: &Connection,

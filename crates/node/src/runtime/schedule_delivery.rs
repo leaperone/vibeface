@@ -69,7 +69,7 @@ impl Runtime {
                 .await
                 .admit_due_routines(&self.identity, &network, now_ms())?;
         for (scope, trigger) in admitted {
-            self.publish_changed(&network, &scope, &trigger);
+            self.publish_changed(&network, &scope, Changed::Job(&trigger));
             self.schedule_wakeup.notify_one();
         }
         Ok(())
@@ -116,7 +116,7 @@ impl Runtime {
                 now_ms(),
             )?;
             self.finish_manager_attempt(&attempt).await;
-            self.publish_changed(&network, &scope, &trigger);
+            self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
         if self.assistant().is_some() {
             let scopes = self.store.lock().await.pending_scheduler_conversations()?;
@@ -162,7 +162,7 @@ impl Runtime {
                 return Ok(());
             };
             if let Some(trigger) = result["trigger"].as_str() {
-                self.publish_changed(network, scope, trigger);
+                self.publish_changed(network, scope, Changed::Job(trigger));
             }
         }
     }
@@ -202,7 +202,7 @@ impl Runtime {
             attestation(input)?,
             now_ms(),
         )?;
-        self.publish_changed(network, &scope, &message.event_hash);
+        self.publish_changed(network, &scope, Changed::Event(&message.event_hash));
         self.wake_scheduler()?;
         Ok(
             json!({"accepted":true,"state":receipt.state,"trigger":receipt.trigger,

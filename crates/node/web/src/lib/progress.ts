@@ -5,7 +5,14 @@ export type ProgressUpdate =
 type ProgressFields = { conversation_id: string; sequence: number; progress: ProgressUpdate }
 export type ManagerProgressEvent = ProgressFields & { type: 'manager_progress'; trigger: string; source_node: string; invocation_id?: string }
 export type NativeProgressEvent = ProgressFields & { type: 'native_progress'; work_id: string; target_node: string }
-export type ChangedEvent = { type: 'invalidate' } | ManagerProgressEvent | NativeProgressEvent
+/**
+ * `records`: what one change touched in a conversation, merged in place; `value` is parsed by the workspace.
+ * `invalidate`: reload; with a conversation, only what that conversation shows.
+ */
+export type ChangedEvent =
+  | { type: 'invalidate'; conversation_id?: string }
+  | { type: 'records'; conversation_id: string; value: Record<string, unknown> }
+  | ManagerProgressEvent | NativeProgressEvent
 type LiveProgressFields = {
   key: string; conversation_id: string
   sequence: number; text: string; status?: string; items: { item_id: string; text: string }[]; needsRefresh: boolean
@@ -42,7 +49,10 @@ function parseProgress(value: unknown): ProgressUpdate {
 
 export function parseChanged(value: unknown): ChangedEvent {
   try {
-    if (!isRecord(value) || value.type !== 'manager_progress' && value.type !== 'native_progress') return { type: 'invalidate' }
+    if (!isRecord(value)) return { type: 'invalidate' }
+    if (value.type === 'records') return { type: 'records', conversation_id: requiredText(value.conversation_id), value }
+    if (value.type === 'changed' && typeof value.conversation_id === 'string') return { type: 'invalidate', conversation_id: value.conversation_id }
+    if (value.type !== 'manager_progress' && value.type !== 'native_progress') return { type: 'invalidate' }
     const conversation_id = requiredText(value.conversation_id), progress = parseProgress(value.progress)
     const sequence = value.sequence
     if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 1) return { type: 'invalidate' }
@@ -52,7 +62,7 @@ export function parseChanged(value: unknown): ChangedEvent {
 }
 
 export function mergeProgress(previous: LiveProgress[], event: ChangedEvent): LiveProgress[] {
-  if (event.type === 'invalidate') return previous
+  if (event.type === 'invalidate' || event.type === 'records') return previous
   const key = event.type === 'manager_progress'
     ? JSON.stringify(['manager', event.conversation_id, event.source_node, event.trigger])
     : JSON.stringify(['native', event.conversation_id, event.target_node, event.work_id])

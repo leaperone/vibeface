@@ -1,5 +1,5 @@
-use super::{Access, Runtime, now_ms};
-use crate::model::WorkOutcome;
+use super::{Access, Changed, Runtime, now_ms};
+use crate::model::{WorkKind, WorkOutcome, WorkProjection};
 use crate::scheduling::{JobState, PendingCheck};
 use crate::work::{Signal, WorkState};
 use anyhow::{Context, Result, bail, ensure};
@@ -180,7 +180,7 @@ impl Runtime {
             job.state,
             JobState::Cancelling { .. } | JobState::Cancelled { .. }
         );
-        self.publish_changed(network, scope, trigger);
+        self.publish_changed(network, scope, Changed::Job(trigger));
         Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
@@ -217,7 +217,11 @@ impl Runtime {
             .lock()
             .await
             .resolve_pending_check(&check.attempt_id)?;
-        self.publish_changed(network, &check.conversation_id, &check.trigger);
+        self.publish_changed(
+            network,
+            &check.conversation_id,
+            Changed::Job(&check.trigger),
+        );
         Ok(())
     }
 
@@ -248,6 +252,30 @@ impl Runtime {
         Ok(json!({"check_id":check_id,"resolved":true}))
     }
 
+    /// Whether the work's device can still report it: this Node with the run on record, or a
+    /// reachable one; a Codex work also needs that device's App Server connected.
+    async fn target_vouches(&self, network: &str, work: &WorkProjection) -> Result<bool> {
+        let codex = if work.target_node == self.identity.device_id()? {
+            let run = self.store.lock().await.work_record(&work.work_id)?;
+            if run.is_none_or(|run| matches!(run.state, WorkState::Unverified { .. })) {
+                return Ok(false);
+            }
+            self.codex.capability().await
+        } else {
+            let request = json!({"type":"capabilities"});
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.peer_request(network, &work.target_node, request),
+            )
+            .await
+            {
+                Ok(Ok(capabilities)) => capabilities["codex"].clone(),
+                _ => return Ok(false),
+            }
+        };
+        Ok(work.kind == WorkKind::Task || codex["connected"] == true)
+    }
+
     async fn settle_work_check(
         self: &Arc<Self>,
         network: &str,
@@ -262,6 +290,23 @@ impl Runtime {
         };
         let note = input["note"].as_str().unwrap_or("").trim();
         ensure!(note.len() <= 4096, "note must be at most 4096 bytes");
+        let work = self
+            .store
+            .lock()
+            .await
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == work_id)
+            .context("work not found in this conversation")?;
+        match work.outcome {
+            Some(WorkOutcome::Unverified) => {}
+            Some(_) => bail!("这个结果已经不需要你确认了"),
+            None => ensure!(
+                !self.target_vouches(network, &work).await?,
+                "它的设备还能报回结果，请等它报告"
+            ),
+        }
+        let unvouched = work.outcome.is_none();
         // An agent task's coordination process has its own check here; the work card answers both.
         let manager = self
             .store
@@ -281,9 +326,10 @@ impl Runtime {
             outcome,
             note,
             super::attestation(input)?,
+            unvouched,
             now_ms(),
         )?;
-        self.publish_changed(network, scope, work_id);
+        self.publish_changed(network, scope, Changed::Work(work_id));
         if receipt.is_some() {
             self.wake_scheduler()?;
         }

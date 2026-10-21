@@ -63,8 +63,8 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.throws(() => parseConversation({ ...context, checks: [{ ...check, attempt_id: undefined }] }))
   assert.throws(() => parseConversation({ ...context, checks: undefined }))
   const unverified = parseConversation({ ...context, works: [{ ...work, state: "unverified", outcome: "unverified", failure_reason: "无法证明结果" }], checks: [check] })
-  assert.deepEqual(pendingChecks(unverified), [
-    { kind: "work", check_id: "work:work", detail: "无法证明结果", work_id: "work", target_node: "worker" },
+  assert.deepEqual(pendingChecks(unverified, [], "chat"), [
+    { kind: "work", check_id: "work:work", detail: "无法证明结果", work_id: "work", target_node: "worker", conversation_id: "chat", title: "检查项目", reason: "unverified" },
     { kind: "process", check_id: "manager:attempt", detail: "进程还在运行" },
   ], "an unverified work is its own card; a coordination check is confirmed stopped")
   const delivered = parseConversation({ ...context, works: [work], deliveries: [
@@ -195,6 +195,7 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }
       if (method === "notifications") return { notifications: unreadNotifications }
       if (method === "questions") return { questions: questionRows }
+      if (method === "open_works") return { works: [] }
       if (method === "answer") {
         answers.push(JSON.parse(JSON.stringify(body)))
         if (answerOutcome === "lost") throw new Error("connection lost")
@@ -298,7 +299,7 @@ test("workspace preserves bot and message requests while routing native decision
     for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
     assert.deepEqual(answers.slice(beforeSettle).map((item) => item.question_id), ["q2"], "an answer whose question is still open is sent again; one already answered is not")
     assert.deepEqual(render().pendingAnswers, [])
-    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker" }, "completed", " 设备上已看到结果 ")
+    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker", conversation_id: "chat", title: "", reason: "offline" }, "completed", " 设备上已看到结果 ")
     assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
     assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
     await assert.rejects(render().interruptWork("other-work"), /停不了/)
@@ -493,7 +494,8 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
-  const labelled = (elements: Element[], label: string) => elements.find(({ props }) => [props.children].flat().includes(label))
+  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
+  const labelled = (elements: Element[], label: string) => elements.find(({ props }) => props.onClick && text(props.children).includes(label))
   const words = (elements: Element[]) => elements.flatMap(({ props }) => [props.children].flat()).filter((child) => typeof child === 'string').join('')
   const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
   try {
@@ -503,9 +505,11 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.equal(elements.some(({ type }) => type === 'Link'), false, 'in its own chat the card does not link to it')
     labelled(elements, '停下')?.props.onClick?.(); await settleComponent()
     assert.deepEqual(plain(sent[0]), [question, '停下'], 'a choice answers with its label')
-    app.render('QuestionCard', { question }).find(({ props }) => props['aria-label'] === '回答')?.props.onChange?.({ target: { value: '先等等' } })
+    app.render('QuestionCard', { question }).find(({ props }) => props['aria-label'] === '其他回答')?.props.onChange?.({ target: { value: '先等等' } })
     app.render('QuestionCard', { question }).find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {} }); await settleComponent()
     assert.deepEqual(plain(sent[1]), [question, '先等等'], 'typed text answers too')
+    ;(app.render('QuestionCard', { question }).find(({ props }) => props.role === 'group')?.props.onKeyDown as (event: unknown) => void)({ key: '1', preventDefault() {} }); await settleComponent()
+    assert.deepEqual(plain(sent[2]), [question, '继续'], 'a focused choice answers by its number')
     elements = app.render('QuestionCard', { question, inbox: true })
     assert.equal(elements.find(({ type }) => type === 'Link')?.props.params && plain(elements.find(({ type }) => type === 'Link')?.props.params).botId, 'bot', '待处理 links to the chat')
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续' }]
@@ -513,7 +517,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.equal(labelled(elements, '停下'), undefined, 'an unconfirmed answer is not replaced by another')
     assert.match(words(elements), /没确认送达/)
     labelled(elements, '再试')?.props.onClick?.(); await settleComponent()
-    assert.deepEqual(plain(sent[2]), [question, '继续'], 'trying again sends the same answer')
+    assert.deepEqual(plain(sent[3]), [question, '继续'], 'trying again sends the same answer')
     workspace.pendingAnswers = []
     elements = app.render('QuestionCard', { question, answer: '继续' })
     assert.equal(elements.some(({ type }) => type === 'Button' || type === 'form'), false, 'an answered question offers nothing to press')
@@ -524,6 +528,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
     assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
     const session = { ...question, question_id: 'q2', conversation_id: null, assistant: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目助手', conversation_id: 'chat' }] }
+    assert.ok(app.render('QuestionCard', { question: session }).some(({ props }) => props['aria-label'] === '其他回答'), 'a session question takes a typed answer too')
     for (const label of ['处理', '交给 项目助手', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
     await settleComponent()
     assert.deepEqual(toasts.map(({ text }) => text), ['已交给主助手分派', '已交给 项目助手', '已忽略这个会话'], '待处理 says where each session went')
@@ -549,6 +554,19 @@ test("any entrance stops an unfinished task once, even on another device", async
     ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work'])
+    const words = (elements: { props: Record<string, unknown> }[]) => elements.flatMap(({ props }) => [props.children].flat()).filter((child) => typeof child === 'string' || typeof child === 'number').join('')
+    const turn = { thread_id: 'th', turn_id: 'tu' }
+    data.works = [{ ...work, ...turn }, { ...work, ...turn, work_id: 'steered' }]
+    let elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.match(words(elements), /和另外 1 个任务共用一个回合，停止会一起停掉。/)
+    ;(stop(elements)?.props.onClick as () => void)()
+    await settleComponent()
+    assert.deepEqual(stopped, ['work'], 'a shared turn asks once more before stopping')
+    elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.match(words(elements), /确认一起停止/)
+    ;(stop(elements)?.props.onClick as () => void)()
+    await settleComponent()
+    assert.deepEqual(stopped, ['work', 'work'])
   } finally { app.close() }
 })
 

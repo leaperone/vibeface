@@ -2,7 +2,7 @@
 //! ask the user in the chat of the assistant that owns each session, deliver webhooks from a
 //! local outbox, hold App Server requests for the Agent, and hand sessions no assistant started
 //! to the assistant the user chooses.
-use super::{Access, Runtime, now_ms};
+use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
     manager::{self, ManagerConfig},
@@ -282,7 +282,7 @@ impl Runtime {
                     question_id = question["question_id"].as_str(),
                     "asked whether to handle a session no assistant started"
                 );
-                self.publish_changed(&network, SESSIONS_SCOPE, &hash);
+                self.publish_changed(&network, SESSIONS_SCOPE, Changed::Event(&hash));
                 self.send_question(&question, &event.cwd).await?;
             }
             return Ok(json!({"status":"foreign","event_id":event.event_id}));
@@ -851,7 +851,7 @@ impl Runtime {
                 question_id,
                 "question asked in the assistant chat"
             );
-            self.publish_changed(network, &owner, hash);
+            self.publish_changed(network, &owner, Changed::Event(hash));
             sent = self.send_question(&asked, &event.cwd).await?;
         }
         Ok(
@@ -972,7 +972,7 @@ impl Runtime {
                 question_id = question,
                 "session handed to an assistant"
             );
-            self.publish_changed(network, &owner, &event.hash);
+            self.publish_changed(network, &owner, Changed::Event(&event.hash));
         }
         Ok(json!({"question_id":question,"conversation_id":owner,"attributed":event.is_some()}))
     }
@@ -1385,7 +1385,7 @@ impl Runtime {
         self.publish_changed(
             network,
             &answered.conversation_id,
-            &answered.message.event_hash,
+            Changed::Event(&answered.message.event_hash),
         );
         if answered.receipt.is_some() {
             self.wake_scheduler()?;

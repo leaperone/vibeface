@@ -58,7 +58,7 @@ bash scripts/build-web.sh
 
 本机会话可使用本机业务、配置本机 Agent 和项目目录，并通过正常授权路由发送任务；不能签署成员授权、登录其他 Node 或替代网络管理客户端。已有签名管理身份继续保留管理权限。
 
-可在网页的设备设置关闭本机自动访问，也可把 `config.json` 的 `local_auto_access` 改为 `false` 后重启。初始化时加 `--no-local-auto-access` 可直接关闭。关闭会撤销已有本机会话和待兑换 token；普通配对身份仍可使用。重新开启由管理客户端或本机配置完成，不恢复旧凭据。
+可在网页的设备设置关闭本机自动访问，也可在本机执行 `vibeface access --disable`。`vibeface access --enable` 重新开启并输出本机入口。命令经同一用户才能访问的维护 socket 交给运行中的 Node，立即生效，无需改配置或重启；Node 未运行时只写入配置，启动后生效。初始化时加 `--no-local-auto-access` 可直接关闭。关闭会撤销已有本机会话和待兑换 token；普通配对身份仍可使用。重新开启不恢复旧凭据。
 
 本机会话兑换使用固定回环端口 `local_listen`（默认 `127.0.0.1:4791`），重启后本机 origin 和浏览器存储不变；端口被占用时 `init` 先报错并提示用 `--local-listen` 更换，不写数据目录。固定 localhost 网页只有通过实际 loopback 来源、字面 Host、精确 Origin 且不含转发头的设置请求，才能取得短期启动材料。一般公开请求仅伪造 `Host: localhost` 或代理头不能取得本机访问权。自动访问关闭时仍使用签名成员邀请或恢复包。反向代理应只转发公开 listener。
 

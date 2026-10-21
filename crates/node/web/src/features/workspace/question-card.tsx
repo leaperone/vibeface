@@ -2,10 +2,9 @@
 
 import { useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, MessageCircleQuestionMark, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
@@ -43,8 +42,6 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const session = question.conversation_id === null
   // 交给 the primary assistant repeats 处理.
   const shown = question.choices.filter((choice) => !session || !choice.conversation_id || choice.conversation_id !== workspace.primary)
-  // 处理 lets the primary assistant decide, the step most sessions want; otherwise the asker lists the expected answer first.
-  const primary = shown.find((choice) => choice.label === "处理") ?? shown[0]
   const send = (key: string, value: string) => action.run(key, async () => {
     const result = await workspace.answer(question, value)
     if (result.status === "already_answered" && result.text !== value.trim()) workspace.announce("这个问题已经回答过了")
@@ -78,22 +75,34 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       <span className="min-w-0 truncate text-foreground">{pending.text}</span>
       <span aria-hidden="true">·</span>没确认送达<span aria-hidden="true">·</span>
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
-    </p> : <>
-      {question.choices.length ? <div className="flex flex-wrap gap-2">
-        {shown.map((choice) => {
+    </p> : <div className="grid gap-2">
+      {shown.length ? <div role="group" aria-label="选一个回答" className="grid gap-2" onKeyDown={(event) => {
+        // A focused choice row also answers by its number.
+        const choice = !event.altKey && !event.ctrlKey && !event.metaKey ? shown[Number(event.key) - 1] : undefined
+        if (choice && !disabled) { event.preventDefault(); void send(`choice:${choice.label}`, choice.label) }
+      }}>
+        {shown.map((choice, index) => {
           const key = `choice:${choice.label}`
-          const main = choice === primary
-          return <Button key={choice.label} type="button" variant={main ? "default" : "outline"} title={session && choice.label === "处理" ? "让主助手来分派" : undefined} disabled={disabled} aria-busy={action.busy === key || undefined} onClick={() => void send(key, choice.label)}><BusyIcon busy={action.busy === key} />{choice.label}</Button>
+          const suggested = session && choice.label === "处理"
+          return <button key={choice.label} type="button" className={row} disabled={disabled} aria-busy={action.busy === key || undefined} aria-keyshortcuts={index < 9 ? String(index + 1) : undefined} onClick={() => void send(key, choice.label)}>
+            <span aria-hidden="true" className={`${badge} ${suggested ? "bg-primary/10 text-foreground ring-1 ring-primary/25" : "bg-muted text-muted-foreground"}`}>{action.busy === key ? <LoaderCircle className="size-4 animate-spin" /> : index + 1}</span>
+            <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{choice.label}</span>
+            {suggested ? <span className="shrink-0 text-meta font-normal text-muted-foreground">主助手分派</span> : null}
+          </button>
         })}
       </div> : null}
-      {session ? null : <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>
-        <Input aria-label="回答" placeholder="输入回答" className="bg-background" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
-        <Button type="submit" variant="outline" size="icon" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
-      </form>}
-    </>}
+      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-background ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>
+        <span aria-hidden="true" className={`${badge} bg-muted text-muted-foreground`}><PencilLine className="size-4" /></span>
+        <input aria-label="其他回答" placeholder={shown.length ? "其他回答" : "输入回答"} className="h-11 min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed md:text-sm" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
+        <Button type="submit" variant="ghost" size="icon" className="size-10 max-md:size-10" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
+      </form>
+    </div>}
     <InlineError error={pending ? null : action.error} />
   </ActionCard>
 }
+
+const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-background px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
+const badge = "grid size-7 shrink-0 place-items-center rounded-md text-meta font-semibold tabular-nums"
 
 function Meta({ icon: Icon, label, title, children }: { icon: LucideIcon; label: string; title?: string; children: ReactNode }) {
   return <span className="inline-flex min-w-0 items-center gap-1" title={title}>

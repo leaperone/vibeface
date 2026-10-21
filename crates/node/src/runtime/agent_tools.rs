@@ -146,7 +146,7 @@ impl Runtime {
                     now_ms(),
                 )?;
                 if written {
-                    self.publish_changed(network, &scope, &record.event_hash);
+                    self.publish_changed(network, &scope, Changed::Event(&record.event_hash));
                 }
                 Ok(json!(record))
             }
