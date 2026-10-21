@@ -184,6 +184,8 @@ function ConnectionCapsule() {
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
+      : workspace.writeState.state === "forked"
+      ? { label: terms.paused.label, icon: terms.paused.icon, tone: "text-warning" }
       : workspace.readOnlyNotice && workspace.writeState.state !== "aligning"
       ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
       : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.writeState.state === "aligning" || workspace.data && workspace.incomplete

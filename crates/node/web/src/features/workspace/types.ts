@@ -31,6 +31,8 @@ export type WorkRecord = {
   outcome: WorkOutcome | null
   result_text: string
   failure_reason: string | null
+  /** The Codex thread running it; a decision card names the same thread. */
+  thread_id?: string
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
 }

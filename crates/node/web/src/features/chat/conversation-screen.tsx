@@ -27,7 +27,7 @@ const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancell
 
 export function ConversationScreen() {
   const workspace = useWorkspace()
-  const { directory } = useDevice()
+  const { directory, ready } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
@@ -107,9 +107,8 @@ export function ConversationScreen() {
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
     }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
-    // A decision a running task of this chat waits on shows here too, not only in 待处理.
-    // ponytail: matched by node (and cwd when the alert has one); match thread_id if works ever carry it.
-    ...workspace.alerts.filter((alert) => alert.resolution === null && works.some((work) => !work.outcome && work.target_node === alert.node && (!alert.cwd || work.cwd === alert.cwd)))
+    // A decision whose Codex thread runs a task of this chat shows here too; without that link it stays in 待处理 only.
+    ...workspace.alerts.filter((alert) => alert.resolution === null && alert.thread_id && works.some((work) => !work.outcome && work.target_node === alert.node && work.thread_id === alert.thread_id))
       .map((alert) => <AlertCard key={alert.alert_id} alert={alert} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
@@ -159,7 +158,7 @@ export function ConversationScreen() {
           <Bot aria-hidden="true" className="size-8 text-muted-foreground" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
           <div className="flex flex-wrap justify-center gap-2">
-            {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => setText(example)}>{example}</Button>)}
+            {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
           </div>
         </div> : null}
       />
@@ -180,7 +179,7 @@ export function ConversationScreen() {
       >
         <InlineError error={sendError} />
         {cards.length ? <button type="button" className="w-fit font-medium text-foreground underline underline-offset-4" onClick={() => document.getElementById('chat-waiting')?.scrollIntoView({ block: 'end', behavior: 'smooth' })}>去处理</button> : null}
-        {needsSetup ? <Link to="/devices" className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
+        {needsSetup ? <Link to={managerOffline || !ready ? '/devices' : '/devices/$deviceId'} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
       </PromptInput>
     </section>
   )
