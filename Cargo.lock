@@ -4461,6 +4461,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tracing",
  "vibeface-protocol",
 ]
 

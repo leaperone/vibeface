@@ -23,6 +23,7 @@ pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool
 const MAX_CLIENT_SOCKETS: usize = 256;
 const HOOKS: &str = "/api/hooks";
 const TRIAGE: &str = "/api/triage";
+const LOG: &str = "/api/log";
 
 #[derive(Clone)]
 struct App {
@@ -220,7 +221,8 @@ fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
             .route("/api/local/exchange", post(local_exchange))
             .route("/api/local/ws", get(local_websocket))
             .route("/api/hooks", post(hooks))
-            .route(TRIAGE, post(triage));
+            .route(TRIAGE, post(triage))
+            .route(LOG, post(log));
     }
     routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -317,7 +319,7 @@ async fn check_boundary(
     if path == "/api/local/setup" {
         check_local_setup(site, headers, ip)?;
     }
-    if path == HOOKS || path == TRIAGE {
+    if path == HOOKS || path == TRIAGE || path == LOG {
         check_hook(headers, ip)?;
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
@@ -332,7 +334,10 @@ async fn check_boundary(
             ));
         }
         let is_tool = path == TOOL_PATH || path == "/api/local/launch" || path == "/api/decision";
-        let bearer_call = (is_tool && bearer(headers).is_some()) || path == HOOKS || path == TRIAGE;
+        let bearer_call = (is_tool && bearer(headers).is_some())
+            || path == HOOKS
+            || path == TRIAGE
+            || path == LOG;
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
@@ -705,6 +710,24 @@ async fn triage(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<J
             .await
             .map_err(ApiError::bad)?,
     ))
+}
+
+/// Records from `vibeface log` on this device: the coordination Agent or a script.
+async fn log(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json<Value>> {
+    use crate::logging::Source;
+    let source: Source = serde_json::from_value(input["source"].clone())
+        .ok()
+        .filter(|source| matches!(source, Source::Agent | Source::Cli))
+        .ok_or_else(|| ApiError::bad("source must be agent or cli"))?;
+    let accepted = crate::logging::submit(
+        &app.node.log_intake,
+        &format!("local-{source:?}"),
+        source,
+        &input["records"],
+        crate::runtime::now_ms(),
+    )
+    .map_err(ApiError::bad)?;
+    Ok(Json(json!({"accepted":accepted})))
 }
 
 async fn decision(

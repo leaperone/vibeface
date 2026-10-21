@@ -952,27 +952,44 @@ impl Runtime {
     }
 
     /// The troubleshooting export: versions, configuration (it holds no secrets), write and peer
-    /// state, and the end of this Node's logs with invites and the entry token blanked.
-    pub(crate) async fn diagnostics(&self, network: &str) -> Result<Value> {
+    /// state, the structured log over a time range (the last day by default), and the end of the
+    /// service's stderr, both redacted.
+    pub(crate) async fn diagnostics(
+        &self,
+        network: &str,
+        (since_ms, until_ms): (Option<i64>, Option<i64>),
+    ) -> Result<Value> {
         let conflicts = self.store.lock().await.conflicts(network)?.len();
-        let logs: serde_json::Map<String, Value> = [("node.log", 400), ("service.stderr.log", 50)]
+        let until_ms = until_ms.unwrap_or_else(now_ms);
+        let since_ms = since_ms.unwrap_or(until_ms - 86_400_000);
+        let filter = crate::logging::Filter {
+            since_ms: Some(since_ms),
+            until_ms: Some(until_ms),
+            limit: Some(crate::logging::MAX_READ),
+            ..Default::default()
+        };
+        let dir = self.data_dir.clone();
+        let records =
+            tokio::task::spawn_blocking(move || crate::logging::read(&dir, &filter)).await??;
+        let secrets: Vec<String> = self.entry_token.iter().cloned().collect();
+        let stderr: Vec<String> = std::fs::read_to_string(self.data_dir.join("service.stderr.log"))
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .take(50)
+            .map(|line| crate::logging::redact(line, &secrets))
+            .collect::<Vec<_>>()
             .into_iter()
-            .filter_map(|(name, keep)| {
-                let text = std::fs::read_to_string(self.data_dir.join(name)).ok()?;
-                let lines: Vec<&str> = text.lines().collect();
-                let tail = lines[lines.len().saturating_sub(keep)..]
-                    .iter()
-                    .map(|line| redact(line, self.entry_token.as_deref()))
-                    .collect();
-                Some((name.to_owned(), Value::Array(tail)))
-            })
+            .rev()
             .collect();
         Ok(json!({
             "generated_at_ms":now_ms(), "version":env!("CARGO_PKG_VERSION"),
             "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
             "device_id":self.identity.device_id()?, "config":self.config,
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
-            "peers":self.peer_health().await, "logs":logs,
+            "peers":self.peer_health().await,
+            "range":{"since_ms":since_ms,"until_ms":until_ms},
+            "logs":{"node.log":records,"service.stderr.log":stderr},
         }))
     }
 
@@ -1619,34 +1636,10 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
     Ok(())
 }
 
-/// Blanks the entry token and anything shaped like an invite ticket.
-fn redact(line: &str, token: Option<&str>) -> Value {
-    let mut line = match token {
-        Some(token) => line.replace(token, "[redacted]"),
-        None => line.to_owned(),
-    };
-    while let Some(start) = line.find("vibeface1") {
-        let end = line[start..]
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .map_or(line.len(), |length| start + length);
-        line.replace_range(start..end, "[invite]");
-    }
-    Value::String(line)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn diagnostics_blank_tokens_and_invites() {
-        let token = "ab".repeat(32);
-        let line = format!("join https://e.example/join#vibeface1qq2ww3 failed; token {token}.");
-        assert_eq!(
-            redact(&line, Some(&token)),
-            "join https://e.example/join#[invite] failed; token [redacted]."
-        );
-    }
     use crate::{config, crypto::LocalIdentity};
 
     async fn node(identity: &LocalIdentity) -> Result<(Arc<Runtime>, PathBuf)> {

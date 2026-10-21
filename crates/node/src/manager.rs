@@ -272,18 +272,21 @@ where
         .stderr
         .take()
         .context("Codex SDK diagnostic stream unavailable")?;
-    let mut stderr_task = tokio::spawn(async move {
-        let mut limited = stderr.take((MAX_STREAM + 1) as u64);
-        let mut discarded = Vec::new();
-        limited.read_to_end(&mut discarded).await?;
-        ensure!(
-            discarded.len() <= MAX_STREAM,
-            "Codex SDK diagnostic stream exceeded the size limit"
-        );
-        Ok::<(), anyhow::Error>(())
-    });
-    let mut sent = false;
     let secrets = secret_values(config);
+    let stderr_secrets = secrets.clone();
+    let mut stderr_task = tokio::spawn(tracing::Instrument::instrument(
+        crate::logging::forward_lines(stderr, MAX_STREAM, move |line| {
+            let line = crate::logging::redact(line, &stderr_secrets);
+            crate::logging::child_line(
+                crate::logging::Source::Codex,
+                "codex.sdk.stderr",
+                &line,
+                None,
+            )
+        }),
+        tracing::Span::current(),
+    ));
+    let mut sent = false;
     let mut reader = BufReader::new(stdout);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,

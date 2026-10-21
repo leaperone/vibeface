@@ -118,6 +118,12 @@ pub async fn run(
     access: Access,
     conversation: String,
 ) -> Result<Option<Value>> {
+    use tracing::Instrument as _;
+    let span = tracing::info_span!("agent_turn", conversation_id = %conversation, work_id = tracing::field::Empty);
+    turn(node, access, conversation).instrument(span).await
+}
+
+async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Result<Option<Value>> {
     let _work = node.maintenance.enter()?;
     ensure!(
         access
@@ -158,6 +164,13 @@ pub async fn run(
         .attempt()
         .context("claimed scheduler attempt missing")?
         .clone();
+    if let Some(work_id) = trigger
+        .strip_prefix("work:")
+        .or_else(|| trigger.strip_prefix("task:"))
+    {
+        tracing::Span::current().record("work_id", work_id);
+    }
+    tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?kind, "agent turn started");
     let token = uuid::Uuid::new_v4().to_string();
     let partial = Arc::new(Mutex::new(PartialText::default()));
     let mut started = false;
@@ -324,6 +337,26 @@ pub async fn run(
     }
     .await;
     node.finish_manager_attempt(&attempt.id).await;
+    match (&final_result, &job.state) {
+        (Err(error), _) => {
+            tracing::error!(event = "agent.turn.finished", trigger, error = %format!("{error:#}"), "agent turn could not be recorded")
+        }
+        (Ok(_), JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. }) => {
+            tracing::warn!(
+                event = "agent.turn.finished",
+                trigger,
+                state = job.state.name(),
+                detail,
+                "agent turn ended without a reply"
+            )
+        }
+        (Ok(_), state) => tracing::info!(
+            event = "agent.turn.finished",
+            trigger,
+            state = state.name(),
+            "agent turn finished"
+        ),
+    }
     if final_result.is_ok() {
         publish_job(&node, &network, &conversation, &job);
     }

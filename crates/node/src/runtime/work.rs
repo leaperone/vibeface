@@ -48,6 +48,7 @@ impl Runtime {
         work_id: &str,
         signal: Signal,
     ) -> Result<WorkRecord> {
+        let quiet = matches!(signal, Signal::Text(_) | Signal::Progress { .. });
         let (record, receipt) = self.store.lock().await.apply_work_signal(
             &self.identity,
             network,
@@ -55,6 +56,21 @@ impl Runtime {
             signal,
             now_ms(),
         )?;
+        if !quiet {
+            let thread_id = match &record.state {
+                WorkState::Starting { thread } => thread.as_deref(),
+                state => state.handle().map(|handle| handle.thread_id.as_str()),
+            };
+            tracing::info!(
+                event = "work.state",
+                conversation_id = record.conversation,
+                work_id,
+                thread_id,
+                state = record.state.name(),
+                "work {}",
+                record.state.name()
+            );
+        }
         self.publish_changed(network, &record.conversation, work_id);
         if receipt.is_some() {
             self.wake_scheduler()?;

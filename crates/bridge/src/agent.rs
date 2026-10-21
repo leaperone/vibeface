@@ -1010,7 +1010,27 @@ async fn read_discovery(
             let discovery = serde_json::from_slice(payload)
                 .map_err(|_| anyhow!("Cursor SDK emitted invalid discovery JSON"));
             let _ = ready.send(discovery);
-            return drain(reader).await;
+            return forward(reader).await;
+        }
+    }
+}
+
+/// The bridge's diagnostics after discovery, one log record per line.
+async fn forward(mut reader: impl AsyncBufRead + Unpin) -> Result<()> {
+    loop {
+        let mut line = Vec::new();
+        if (&mut reader)
+            .take(16_384)
+            .read_until(b'\n', &mut line)
+            .await?
+            == 0
+        {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&line);
+        let line = line.trim_end();
+        if !line.is_empty() {
+            tracing::info!(source = "cursor", event = "cursor.stderr", "{line}");
         }
     }
 }
