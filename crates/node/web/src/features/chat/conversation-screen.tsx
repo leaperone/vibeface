@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, Import, Laptop, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleX, Laptop, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -227,7 +227,7 @@ function TaskMeta({ device, state, className = '' }: { device: string; state: st
 /** A session handed to this assistant: from here on its questions come to this chat. */
 function HandoffRow({ session }: { session: SessionHandoff }) {
   return <p className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
-    <Import aria-hidden="true" className="size-4 shrink-0" />
+    <ArrowDownToLine aria-hidden="true" className="size-4 shrink-0" />
     <span className="shrink-0 text-foreground">接手 {agentName(session.agent)} 会话</span>
     <span aria-hidden="true">·</span>
     <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
