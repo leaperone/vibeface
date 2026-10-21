@@ -16,7 +16,8 @@ function AppLayout() {
   const { ready, phase, entries, initialInvitation, tabs, joining, link, disconnect } = useDevice()
   const navigate = useNavigate()
   const onboarding = useOnboarding()
-  const here = useRouterState({ select: (state) => state.location.href })
+  // The page that asked, not the connect page this layout is already leaving for.
+  const here = useRouterState({ select: (state) => (state.resolvedLocation ?? state.location).href })
   const home = useRouterState({ select: (state) => state.location.pathname === '/' })
   const access = accessOf({ ready: Boolean(ready), phase, joining: Boolean(joining), savedEntries: entries.length, invitation: Boolean(initialInvitation), offlineRetryMs: link.kind === 'offline' ? link.retryInMs : null })
   if (access.kind === 'auth') return <Navigate to="/connect" search={here === '/' ? {} : { redirect: here }} replace />
