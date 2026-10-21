@@ -137,6 +137,9 @@ function usePublicEntry() {
   return publicEntry
 }
 
+/** Opened from the Home Screen: iOS keeps such an app's storage apart from Safari's. */
+const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true)
+
 /** `lane`: the way in to show first, as the join page does. */
 export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const device = useDevice()
@@ -260,6 +263,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
       <header className="grid gap-3">
         <span className="text-heading font-semibold tracking-tight">vibeface</span>
+        {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 vibeface 和浏览器分开保存登录信息，需要在这里再加入一次。</p> : null}
         {active === 'local' && setup && !focused ? <Steps step={names ? 2 : 1} /> : device.review?.kind === 'bootstrap' ? <Steps step={2} /> : null}
       </header>
       {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}

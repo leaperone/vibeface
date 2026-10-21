@@ -2121,3 +2121,58 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
     }
     Ok(())
 }
+
+/// The conversation list shows each assistant's newest message, cut to a short preview.
+#[test]
+fn last_messages_preview_each_assistants_newest_message() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
+    assert_eq!(store.last_messages(&net.network)?.get("c"), None);
+
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m1", "hello"),
+        vec![],
+        3,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        assistant_reply("a1", "m1"),
+        vec![],
+        4,
+    )?;
+    let last = store
+        .last_messages(&net.network)?
+        .remove("c")
+        .expect("newest message");
+    assert_eq!(
+        (last.text.as_str(), last.role.as_str(), last.created_at_ms),
+        ("ok", "assistant", 4)
+    );
+
+    let long = "长".repeat(200);
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m2", &long),
+        vec![],
+        5,
+    )?;
+    let last = store
+        .last_messages(&net.network)?
+        .remove("c")
+        .expect("newest message");
+    assert_eq!(last.text, format!("{}…", "长".repeat(120)));
+    assert_eq!(
+        (last.role.as_str(), last.author),
+        ("user", net.a.device_id()?)
+    );
+    Ok(())
+}

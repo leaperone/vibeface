@@ -110,7 +110,9 @@ export type { PendingMessage }
 
 export type BotProject = { target_node: string; cwd: string }
 export type CreateBotRequest = { bot_id: string; conversation_id: string; name: string; instructions: string; project?: BotProject }
-export type BotRecord = CreateBotRequest & { event_hash: string }
+/** An assistant conversation's newest message, cut short by the Node for the conversation list. */
+export type LastMessage = { text: string; role: string; created_at_ms: number }
+export type BotRecord = CreateBotRequest & { event_hash: string; last_message: LastMessage | null }
 
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }

@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
@@ -19,6 +19,7 @@ import { useWorkspace } from "./context"
 import { AssistantPanelButton } from "./assistant-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
+import { backTo } from "./home"
 import { addressName } from "./labels"
 import { NotJoined } from "./not-joined"
 
@@ -37,7 +38,7 @@ const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-assistant form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
 
-const titles: Record<string, string> = { "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
+const titles: Record<string, string> = { "/": "消息", "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
 
 function WorkspaceLayout({ children }: { children: ReactNode }) {
   const workspace = useWorkspace()
@@ -47,6 +48,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const { setOpenMobile } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
+  const back = backTo(pathname)
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
   const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? "我的设备" : "")
@@ -127,17 +129,26 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       </Sidebar>
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
         <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(0.75rem,env(safe-area-inset-left))] pe-[max(0.75rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
-          <SidebarTrigger aria-label="菜单" title="菜单" />
+          {back ? <Button asChild variant="ghost" size="icon" className="md:hidden"><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
+          <SidebarTrigger aria-label="菜单" title="菜单" className="max-md:hidden" />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             {chatRoute ? <AssistantPanelButton /> : null}
             <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
           </div>
-          <Button asChild variant="ghost" size="icon" className="relative md:hidden">
+          {back ? <Button asChild variant="ghost" size="icon" className="relative md:hidden">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
               <Inbox aria-hidden="true" />
               {waiting ? <span className="absolute top-1 right-1 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[11px] leading-4 font-semibold text-background">{waiting}</span> : null}
             </Link>
-          </Button>
+          </Button> : <div className="flex md:hidden">
+            <Button asChild variant="ghost" size="icon" className="relative">
+              <Link to="/devices" aria-label={devicesAttention ? "设备，需要留意" : "设备"} title="设备">
+                <MonitorSmartphone aria-hidden="true" />
+                {devicesAttention ? <span className="absolute top-1.5 right-1.5 size-2 rounded-full bg-warning" /> : null}
+              </Link>
+            </Button>
+            <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label="设置" title="设置"><Settings aria-hidden="true" /></Link></Button>
+          </div>}
         </header>
         {workspace.joined ? null : <NotJoined onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
@@ -170,7 +181,7 @@ function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; ic
   </SidebarMenuItem>
 }
 
-function ConnectionCapsule() {
+export function ConnectionCapsule() {
   const workspace = useWorkspace()
   const device = useDevice()
   const { link, entrances } = device
@@ -228,7 +239,8 @@ function ConnectionCapsule() {
 }
 
 /** Same layout as the workspace, shown while the browser loads its keys and connects. */
-export function ShellSkeleton({ retry = null, onLeave }: { retry?: number | null; onLeave?: () => void } = {}) {
+/** `home`: the conversation list loads on a phone, the last conversation on a wide screen. */
+export function ShellSkeleton({ retry = null, onLeave, home = false }: { retry?: number | null; onLeave?: () => void; home?: boolean } = {}) {
   const status = retry === null
     ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
     : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
@@ -239,9 +251,10 @@ export function ShellSkeleton({ retry = null, onLeave }: { retry?: number | null
       <div className={cn("mt-auto flex items-center gap-2 px-2 text-meta", retry === null ? "text-info" : "text-muted-foreground")} role="status">{status}</div>
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex h-14 items-center gap-3 border-b px-4"><Skeleton className="h-5 w-32" /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
+      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
       {retry !== null && onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
-      <ChatSkeleton />
+      {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}
+      <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>
     </div>
   </div>
 }
