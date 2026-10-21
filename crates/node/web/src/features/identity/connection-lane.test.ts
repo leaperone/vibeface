@@ -7,6 +7,7 @@ import { createContext, Script } from 'node:vm'
 import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import type { ConnectionEntry } from '../../lib/node.ts'
 import { primaryLane, shouldAutoConnect } from './connection-lane.ts'
+import { accessOf } from './access.ts'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -716,7 +717,35 @@ test('a reload resumes the last network through its entrances even with several 
   } finally { app.close() }
 })
 
-test('revoked authorization stops reconnection and releases the rejected session', async () => {
+const pageAccess = (app: ReturnType<typeof deviceHarness>) => {
+  const device = app.render()
+  return accessOf({ ready: Boolean(device.ready), phase: device.phase, joining: Boolean(device.joining), savedEntries: device.entries.length, invitation: Boolean(device.initialInvitation), offlineRetryMs: null }).kind
+}
+
+test('a Node error while reconnecting keeps the credentials and the page, and retries', async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle(); app.render()
+    const saved = app.stored.get('vibeface.last-authenticated')
+    app.sockets[0].drop()
+    const hold = deferred(); app.holds.set('authenticate', hold)
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    hold.reject(Object.assign(new Error('database is locked'), { responded: true })); await settle()
+    assert.equal(app.render().phase, 'reconnecting')
+    assert.equal(app.render().ready?.isCurrent(), false)
+    assert.equal(pageAccess(app), 'member', 'the workspace stays on screen with what it last showed')
+    assert.equal(app.stored.get('vibeface.last-authenticated'), saved)
+    assert.equal(app.timers.size, 1)
+    app.holds.delete('authenticate')
+    const [next, again] = [...app.timers.entries()][0]
+    app.timers.delete(next); again(); await settle()
+    assert.equal(app.render().ready?.entry.device_id, target)
+    assert.equal(pageAccess(app), 'member')
+  } finally { app.close() }
+})
+
+test('a revoked browser stops reconnecting, forgets the network and goes to the connect page', async () => {
   const app = deviceHarness({ saved: true })
   try {
     app.render(); await settle(); app.render()
@@ -724,10 +753,11 @@ test('revoked authorization stops reconnection and releases the rejected session
     const hold = deferred(); app.holds.set('authenticate', hold)
     const [id, retry] = [...app.timers.entries()][0]
     app.timers.delete(id); retry(); await settle()
-    hold.reject(Object.assign(new Error('authorization revoked'), { responded: true })); await settle()
+    hold.resolve({ ...notMember, revoked: true }); await settle()
     assert.equal(app.render().ready, null)
     assert.equal(app.render().phase, 'unpaired')
-    assert.match(app.render().error, /无法恢复原来的连接/)
+    assert.equal(pageAccess(app), 'auth')
+    assert.match(app.render().error, /已被移除/)
     assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
     assert.equal(app.timers.size, 0)
     app.sockets[1].drop(); assert.equal(app.timers.size, 0)

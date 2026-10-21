@@ -321,6 +321,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       let active: Session | null = null
       try {
         active = await open(candidate, true, list.length > 1 ? 5000 : 10000)
+        if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台设备已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (candidate === target.entry && removed(auth, active, target.networkId)) return true
         if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
@@ -330,7 +331,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         return true
       } catch (cause) {
         if (reconnect.current !== target) return true
-        if (candidate === target.entry && (isResponseError(cause) || cause instanceof AuthenticationError)) {
+        // Only a definite answer about this browser's identity ends the resume; a Node error, timeout or drop is retried.
+        if (candidate === target.entry && cause instanceof AuthenticationError) {
           const next = resumeQueue.current.shift()
           if (next) {
             // A saved target this browser can no longer use, such as an old device at the same address, is dropped.
@@ -342,7 +344,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           resetConnection(); setPhase('unpaired')
           let detail = messageOf(cause)
           try { store('last-authenticated', null) } catch (storageError) { detail += ` ${messageOf(storageError)}` }
-          setError(cause instanceof AuthenticationError ? detail : `无法恢复原来的连接。请检查设备后重新连接，或用加入链接加入。${detail}`)
+          setError(detail)
           return true
         }
         // An entrance that cannot serve this browser yet is skipped; the next one gets its turn.
