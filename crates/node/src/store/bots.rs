@@ -2,7 +2,20 @@ use super::{Store, authorize_node_from, create_conversation_from, log};
 use crate::{crypto::LocalIdentity, model::*};
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
+
+const PREVIEW_CHARS: usize = 120;
+
+/// The newest message of an assistant's conversation, cut short for a conversation list.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LastMessage {
+    pub text: String,
+    pub author: String,
+    pub role: String,
+    pub created_at_ms: i64,
+}
 
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
@@ -187,6 +200,33 @@ impl Store {
     /// Bots with the name and instructions the chat last set.
     pub fn bots(&self, network: &str) -> Result<Vec<Bot>> {
         bots_where(&self.connection, network, "AND ?2=''", "")
+    }
+
+    /// Each assistant conversation's newest message, by conversation; one indexed lookup per assistant.
+    pub fn last_messages(&self, network: &str) -> Result<BTreeMap<String, LastMessage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT m.conversation_id,m.text,m.author,m.role,m.created_at_ms FROM bots b
+             JOIN messages m ON m.network_id=b.network_id AND m.conversation_id=b.conversation_id
+              AND m.rank=(SELECT max(x.rank) FROM messages x WHERE x.network_id=b.network_id AND x.conversation_id=b.conversation_id)
+             WHERE b.network_id=?1",
+        )?;
+        let rows = statement.query_map(params![network], |r| {
+            let text: String = r.get(1)?;
+            let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
+            if preview.len() < text.len() {
+                preview.push('…');
+            }
+            Ok((
+                r.get(0)?,
+                LastMessage {
+                    text: preview,
+                    author: r.get(2)?,
+                    role: r.get(3)?,
+                    created_at_ms: r.get(4)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn bot_for_conversation(&self, network: &str, scope: &str) -> Result<Option<Bot>> {

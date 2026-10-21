@@ -74,6 +74,16 @@ impl Runtime {
                     .is_none_or(|scope| scope == &bot.conversation_id)
             })
             .collect::<Vec<_>>();
+        let mut last = store.last_messages(&access.network_id)?;
+        let bots: Vec<_> = bots
+            .into_iter()
+            .map(|bot| {
+                let last_message = last.remove(bot.conversation_id.as_str());
+                let mut value = json!(bot);
+                value["last_message"] = json!(last_message);
+                value
+            })
+            .collect();
         Ok(json!({"bots":bots,"primary":store.primary_assistant(&access.network_id)?}))
     }
 

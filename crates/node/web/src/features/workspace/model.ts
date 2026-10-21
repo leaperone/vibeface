@@ -212,7 +212,8 @@ export function parseCreateBot(value: unknown): CreateBotRequest {
   return { bot_id: text(data.bot_id), conversation_id: text(data.conversation_id), name: text(data.name), instructions: text(data.instructions), project: project ? { target_node: text(project.target_node), cwd: text(project.cwd) } : undefined }
 }
 export function parseBot(value: unknown): BotRecord {
-  return { ...parseCreateBot(value), event_hash: text(record(value).event_hash) }
+  const data = record(value), last = data.last_message == null ? null : record(data.last_message)
+  return { ...parseCreateBot(value), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) } }
 }
 export function parseBots(value: unknown): BotRecord[] {
   return list(record(value).bots).map(parseBot)

@@ -163,7 +163,7 @@ test("workspace preserves bot and message requests while routing native decision
   const workspaceModule = load(fileURLToPath(new URL("./context.tsx", import.meta.url)))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
-  const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event" }
+  const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event", last_message: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []

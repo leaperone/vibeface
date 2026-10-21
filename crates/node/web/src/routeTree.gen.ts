@@ -10,8 +10,8 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
+import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as JoinRouteImport } from './routes/join'
-import { Route as SetupRouteImport } from './routes/setup'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
@@ -25,14 +25,14 @@ const AppRoute = AppRouteImport.update({
   id: '/_app',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ConnectRoute = ConnectRouteImport.update({
+  id: '/connect',
+  path: '/connect',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const JoinRoute = JoinRouteImport.update({
   id: '/join',
   path: '/join',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const SetupRoute = SetupRouteImport.update({
-  id: '/setup',
-  path: '/setup',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AppIndexRoute = AppIndexRouteImport.update({
@@ -78,8 +78,8 @@ const AppBBotIdWorkWorkIdRoute = AppBBotIdWorkWorkIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
+  '/connect': typeof ConnectRoute
   '/join': typeof JoinRoute
-  '/setup': typeof SetupRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
@@ -89,8 +89,8 @@ export interface FileRoutesByFullPath {
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesByTo {
+  '/connect': typeof ConnectRoute
   '/join': typeof JoinRoute
-  '/setup': typeof SetupRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/': typeof AppIndexRoute
@@ -103,8 +103,8 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
+  '/connect': typeof ConnectRoute
   '/join': typeof JoinRoute
-  '/setup': typeof SetupRoute
   '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/': typeof AppIndexRoute
@@ -118,8 +118,8 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/connect'
     | '/join'
-    | '/setup'
     | '/inbox'
     | '/settings'
     | '/b/$botId'
@@ -129,8 +129,8 @@ export interface FileRouteTypes {
     | '/b/$botId/work/$workId'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/connect'
     | '/join'
-    | '/setup'
     | '/inbox'
     | '/settings'
     | '/'
@@ -142,8 +142,8 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/_app'
+    | '/connect'
     | '/join'
-    | '/setup'
     | '/_app/inbox'
     | '/_app/settings'
     | '/_app/'
@@ -156,8 +156,8 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   AppRoute: typeof AppRouteWithChildren
+  ConnectRoute: typeof ConnectRoute
   JoinRoute: typeof JoinRoute
-  SetupRoute: typeof SetupRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -169,18 +169,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/connect': {
+      id: '/connect'
+      path: '/connect'
+      fullPath: '/connect'
+      preLoaderRoute: typeof ConnectRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/join': {
       id: '/join'
       path: '/join'
       fullPath: '/join'
       preLoaderRoute: typeof JoinRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/setup': {
-      id: '/setup'
-      path: '/setup'
-      fullPath: '/setup'
-      preLoaderRoute: typeof SetupRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_app/': {
@@ -278,8 +278,8 @@ const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
 
 const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
+  ConnectRoute: ConnectRoute,
   JoinRoute: JoinRoute,
-  SetupRoute: SetupRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
