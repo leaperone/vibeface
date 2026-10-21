@@ -181,7 +181,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           </Button>
         </div>
         {action.errorKey === "remove" ? <InlineError error={action.error} /> : null}
-      </> : <Button type="button" variant="ghost" className="w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button>}
+      </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button>}
     </section> : null}
   </div>
 }

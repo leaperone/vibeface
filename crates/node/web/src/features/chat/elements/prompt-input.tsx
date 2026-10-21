@@ -57,7 +57,7 @@ export function PromptInput({
           aria-label="给助手发消息"
           aria-describedby={hint ? 'manager-hint' : undefined}
           title="Enter 发送，Shift+Enter 换行"
-          className="min-h-14 max-h-[min(12rem,30dvh)] overflow-y-auto p-3"
+          className="min-h-14 max-h-[min(12rem,30dvh)] overflow-y-auto px-4 py-3"
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
           onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
             if (isSubmitKey(event.nativeEvent)) {
@@ -66,7 +66,7 @@ export function PromptInput({
             }
           }}
         />
-        <InputGroupAddon align="block-end" className="flex-wrap pt-1">
+        <InputGroupAddon align="block-end" className="flex-wrap ps-0.5 pt-1">
           {onFiles ? <>
             <input ref={pickerRef} type="file" multiple hidden onChange={(event) => { onFiles([...files, ...event.target.files ?? []]); event.target.value = '' }} />
             <InputGroupButton type="button" variant="ghost" size="icon-sm" className="size-11 rounded-full" aria-label="添加附件" title="添加附件" disabled={disabled || busy} onClick={() => pickerRef.current?.click()}>

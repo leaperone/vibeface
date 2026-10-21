@@ -199,6 +199,9 @@ body {
   :where(.grid) > * { min-width: 0; }
 }
 [hidden] { display: none !important; }
+/* Optical centering: these glyphs carry their weight off the box center. Percentages follow the icon size. */
+svg.lucide-play { translate: 6% 0; }
+svg.lucide-star, svg.lucide-download { translate: 0 -5%; }
 .skip-link { position: absolute; top: .5rem; left: 1rem; transform: translateY(-200%); z-index: 50; padding: .75rem; background: var(--background); }
 .skip-link:focus { transform: translateY(0); }
 .workspace-shell { height: var(--app-height, 100dvh); min-height: 0; max-width: 100%; overflow: hidden; align-items: stretch; }

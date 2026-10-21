@@ -204,7 +204,7 @@ function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string;
   const result = (task.work.result_text || (task.work.failure_reason ? humanError(task.work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
-  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
     <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
@@ -230,7 +230,7 @@ function TaskMeta({ device, state, className = '' }: { device: string; state: st
 /** A session handed to this assistant, or by this primary assistant to another one. */
 function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name: string; bot_id?: string } | null }) {
   const Icon = owner ? Forward : ArrowDownToLine
-  return <p className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
+  return <p className="flex min-h-9 min-w-0 items-center gap-2 text-meta text-muted-foreground">
     <Icon aria-hidden="true" className="size-4 shrink-0" />
     {owner ? <span className="shrink-0 text-foreground">{agentName(session.agent)} 会话交给了 {owner.bot_id
       ? <Link to="/b/$botId" params={{ botId: owner.bot_id }} className="font-medium underline-offset-4 hover:underline">{owner.name}</Link> : owner.name}</span>
@@ -247,7 +247,7 @@ function ReplyCause({ raw }: { raw: string }) {
 }
 
 function JobLine({ job }: { job: ManagerJob }) {
-  return <p className="flex min-w-0 items-center gap-2 px-2 text-meta text-danger">
+  return <p className="flex min-w-0 items-center gap-2 text-meta text-danger">
     <CircleX aria-hidden="true" className="size-4 shrink-0" />
     <span className="shrink-0">{replyStates[job.state] ?? '回复失败'}</span>
     {job.error ? <span className="min-w-0 truncate" title={job.error}>{humanError(job.error.split('\n')[0], undefined, '这次回复')}</span> : null}

@@ -52,7 +52,7 @@ function SettingsPage() {
       </Button>
       <p className="text-muted-foreground">诊断包里没有密钥和邀请，可以发给帮你排查的人。</p>
       <div className="flex flex-wrap items-center gap-2">
-        <NativeSelect aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))} className="max-md:[&_select]:h-11">
+        <NativeSelect aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))} className="[&_select]:h-9 max-md:[&_select]:h-11">
           {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
         </NativeSelect>
         <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics(Date.now() - range)), "导出诊断包") }}><Download aria-hidden="true" />导出诊断包</Button>
@@ -65,7 +65,7 @@ function SettingsPage() {
           <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
           <Button type="button" variant="destructive" onClick={() => device.disconnect()}><LogOut aria-hidden="true" />断开</Button>
         </div>
-      </> : <Button type="button" variant="ghost" className="w-fit text-muted-foreground" onClick={() => setLeaving(true)}><LogOut aria-hidden="true" />断开这个浏览器</Button>}
+      </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-muted-foreground" onClick={() => setLeaving(true)}><LogOut aria-hidden="true" />断开这个浏览器</Button>}
     </section>
   </div>
 }

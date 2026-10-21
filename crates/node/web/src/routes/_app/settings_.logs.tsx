@@ -60,8 +60,8 @@ function LogsPage() {
   if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机打开的页面可以查看日志。" />
   return <div className="mx-auto grid w-full max-w-3xl gap-4">
     <div className="flex items-center justify-between gap-2">
-      <Button asChild variant="ghost" className="-ms-2"><Link to="/settings"><ChevronLeft aria-hidden="true" />设置</Link></Button>
-      <Button type="button" variant="ghost" size="icon" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
+      <Button asChild variant="ghost" className="-ms-3"><Link to="/settings"><ChevronLeft aria-hidden="true" />设置</Link></Button>
+      <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
       </Button>
     </div>

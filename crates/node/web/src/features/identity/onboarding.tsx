@@ -41,7 +41,7 @@ export function Onboarding() {
         <h2 className="flex items-center gap-2 text-heading font-semibold"><Bot aria-hidden="true" className="size-5 text-muted-foreground" />让这台电脑运行助手</h2>
         <AssistantSettings onboarding />
         <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" onClick={() => setStep(4)}>稍后设置</Button>
+          <Button type="button" variant="ghost" className="-ms-3" onClick={() => setStep(4)}>稍后设置</Button>
           <Button type="button" onClick={() => setStep(4)}>下一步</Button>
         </div>
       </section> : <section className="grid gap-4 rounded-xl border bg-card p-5">
@@ -50,7 +50,7 @@ export function Onboarding() {
           <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
           <InlineError error={error} />
           <div className="flex justify-between gap-2">
-            <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
+            <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={done}>跳过</Button>
             <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />开始对话</Button>
           </div>
         </form>
