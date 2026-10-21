@@ -1,9 +1,9 @@
 "use client"
 
 import { useState, type ReactNode } from "react"
-import { Link } from "@tanstack/react-router"
+import { Link, useNavigate } from "@tanstack/react-router"
 import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, MessageCircleQuestionMark, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
-import { ActionCard, BusyIcon, InlineError, useAction, type Tone } from "@/components/app/kit"
+import { ActionCard, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "../identity/context"
@@ -26,6 +26,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const action = useAction()
+  const navigate = useNavigate()
   const [text, setText] = useState("")
   const id = question.question_id
   const standing = answer ?? question.answer?.text
@@ -43,7 +44,17 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const send = (key: string, value: string) => action.run(key, async () => {
     const result = await workspace.answer(question, value)
     if (result.status === "already_answered" && result.text !== value.trim()) workspace.announce("这个问题已经回答过了")
+    else if (inbox) settledToast(value)
   })
+  // Answered in 待处理, the card leaves; the toast says where the work went and leads there.
+  const settledToast = (value: string) => {
+    if (session && value === "忽略") return toast("已忽略这个会话", { tone: "success" })
+    const to = session ? question.choices.find((choice) => choice.label === value)?.conversation_id ?? workspace.primary : question.conversation_id
+    const bot = workspace.bots.find((item) => item.conversation_id === to)
+    toast(session ? `已交给 ${bot?.name ?? "主助手"}` : "已回答", {
+      tone: "success", action: bot ? { label: "查看", onClick: () => { void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) } } : undefined,
+    })
+  }
   return <ActionCard
     icon={icon}
     tone={tone}
@@ -51,7 +62,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   >
     <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-meta text-muted-foreground">
       {session ? <Meta icon={SquareTerminal} label="会话">{agentName(question.about.agent)}</Meta> : null}
-      <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta>
+      {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={Laptop} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
       {inbox && question.assistant ? <Link to="/b/$botId" params={{ botId: question.assistant.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
         <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{question.assistant.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" />
@@ -67,7 +78,9 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       {question.choices.length ? <div className="flex flex-wrap gap-2">
         {question.choices.map((choice) => {
           const key = `choice:${choice.label}`
-          return <Button key={choice.label} type="button" variant="outline" disabled={disabled} aria-busy={action.busy === key || undefined} onClick={() => void send(key, choice.label)}><BusyIcon busy={action.busy === key} />{choice.label}</Button>
+          // 处理 lets the primary assistant decide, the step most sessions want.
+          const main = session && choice.label === "处理"
+          return <Button key={choice.label} type="button" variant={main ? "default" : "outline"} title={main ? "让主助手来分派" : undefined} disabled={disabled} aria-busy={action.busy === key || undefined} onClick={() => void send(key, choice.label)}><BusyIcon busy={action.busy === key} />{choice.label}</Button>
         })}
       </div> : null}
       <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>

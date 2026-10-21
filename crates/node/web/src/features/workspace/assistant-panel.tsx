@@ -27,7 +27,8 @@ export function AssistantPanelButton() {
           <SheetDescription>在聊天里说一声就能改。</SheetDescription>
           {workspace.primary === bot.conversation_id
             ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Star aria-hidden="true" className="size-3.5 fill-current" />主助手</p>
-            : <ActionButton className="justify-self-start" disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主助手</ActionButton>}
+            : <ActionButton className="justify-self-start" disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主助手</ActionButton>}
+          <p className="text-meta text-muted-foreground">没有助手负责的 Codex 会话，由主助手分派。</p>
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <Section icon={ScrollText} title="说明">

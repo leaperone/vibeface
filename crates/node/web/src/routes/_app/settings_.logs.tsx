@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bot, ChevronDown, ChevronLeft, CircleX, Code, Copy, Globe, Info, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Server, Terminal, TriangleAlert, type LucideIcon } from 'lucide-react'
+import { Bot, ChevronDown, ChevronLeft, CircleX, Code, Copy, Globe, Info, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Server, Terminal, TriangleAlert, X, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -86,11 +86,12 @@ function LogsPage() {
     </div>
     <InlineError error={error} />
     {records === null ? null : records.length === 0
-      ? <EmptyState icon={ScrollText} title="没有符合条件的记录" description="换个级别、来源或关键词试试。" />
+      ? <EmptyState icon={ScrollText} title="没有符合条件的记录" description="换个级别、来源或关键词试试。"
+        action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
         <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}，新的在上面</p>
         <ul className="divide-y overflow-hidden rounded-xl border bg-card">
-          {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
+          {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
         </ul>
       </>}
   </div>
@@ -102,9 +103,10 @@ function time(ms: number) {
   return today ? clock : `${date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${clock}`
 }
 
-function LogRow({ record, open, onToggle, onCopyAll }: { record: LogRecord; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
+/** `chat`: the assistant whose chat the record belongs to, shown instead of its ID. */
+function LogRow({ record, chat, open, onToggle, onCopyAll }: { record: LogRecord; chat?: string; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
   const look = levelLook[record.level]
-  const ids: Array<[string, string | undefined]> = [['会话', record.conversation_id], ['任务', record.work_id], ['线程', record.thread_id]]
+  const ids: Array<[string, string | undefined]> = [['对话', chat ?? record.conversation_id], ['任务', record.work_id], ['Codex 会话', record.thread_id]]
   return <li>
     <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-muted/50 focus-visible:bg-muted/50 outline-none">
       <look.icon aria-label={look.label} className={cn('mt-0.5 size-4 shrink-0', look.tone)} />
@@ -126,7 +128,7 @@ function LogRow({ record, open, onToggle, onCopyAll }: { record: LogRecord; open
       {record.fields && Object.keys(record.fields).length ? <pre className="max-h-64 overflow-auto rounded-lg bg-muted p-3 font-mono text-xs whitespace-pre-wrap break-all">{JSON.stringify(record.fields, null, 2)}</pre> : null}
       <div className="flex flex-wrap gap-2">
         <Button type="button" size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(JSON.stringify(record)).then(() => toast('已复制这条记录', { tone: 'success' })) }}><Copy aria-hidden="true" />复制这条</Button>
-        {record.conversation_id ? <Button type="button" size="sm" variant="outline" onClick={() => { void onCopyAll({ conversation_id: record.conversation_id }, '会话') }}><MessagesSquare aria-hidden="true" />复制整个会话</Button> : null}
+        {record.conversation_id ? <Button type="button" size="sm" variant="outline" onClick={() => { void onCopyAll({ conversation_id: record.conversation_id }, '对话') }}><MessagesSquare aria-hidden="true" />复制整个对话</Button> : null}
         {record.work_id ? <Button type="button" size="sm" variant="outline" onClick={() => { void onCopyAll({ work_id: record.work_id }, '任务') }}><ListChecks aria-hidden="true" />复制整个任务</Button> : null}
       </div>
     </div> : null}

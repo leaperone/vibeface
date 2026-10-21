@@ -1,7 +1,7 @@
 import { useEffect } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ListChecks, Square, X } from "lucide-react"
-import { Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
+import { ListChecks, RotateCw, Square, X } from "lucide-react"
+import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
 import { humanError, rawError } from "@/lib/errors"
@@ -47,6 +47,12 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">结果</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}
       {stop ? <div className="grid gap-2">
         <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop)}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "停止任务"}</Button>
+        <InlineError error={action.error} />
+      </div> : null}
+      {["failed", "interrupted", "rejected"].includes(state) ? <div className="grid gap-2">
+        <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
+          if (await workspace.sendMessage(`再试一次「${work.title || "这个任务"}」`)) close()
+        })}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />让助手再试</Button>
         <InlineError error={action.error} />
       </div> : null}
       <Details>

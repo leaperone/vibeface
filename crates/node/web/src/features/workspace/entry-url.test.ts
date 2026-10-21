@@ -485,9 +485,12 @@ const settleComponent = () => new Promise(setImmediate)
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
+    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目助手' }, { bot_id: 'main-bot', conversation_id: 'main', name: '主助手甲' }], primary: 'main',
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
-  const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit })
+  const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
+  const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
+  const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
+  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const labelled = (elements: Element[], label: string) => elements.find(({ props }) => [props.children].flat().includes(label))
@@ -519,6 +522,13 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     elements = app.render('QuestionCard', { question })
     assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
+    assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
+    const session = { ...question, question_id: 'q2', conversation_id: null, assistant: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目助手', conversation_id: 'chat' }] }
+    for (const label of ['处理', '交给 项目助手', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
+    await settleComponent()
+    assert.deepEqual(toasts.map(({ text }) => text), ['已交给 主助手甲', '已交给 项目助手', '已忽略这个会话'], '待处理 says where each session went')
+    toasts[0].action?.onClick()
+    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'main-bot' } }], 'and leads to the chat that took it')
   } finally { app.close() }
 })
 
