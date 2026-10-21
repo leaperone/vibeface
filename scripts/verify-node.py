@@ -1733,7 +1733,8 @@ def work_checks(run, workspace, a, network, passed):
     question = wait_for("the Agent asks in the work's chat about the held request", lambda: next(
         (row for row in a.client.rpc("questions")["questions"] if row["conversation_id"] == name), None), timeout=90)
     thread_id, question_id = question["about"]["session_id"], question["question_id"]
-    asked = [row for row in fixture_records(run, "triage-actions.jsonl") if row["session_id"] == thread_id]
+    asked = wait_for("the triage turn records its question", lambda: [row for row in fixture_records(run, "triage-actions.jsonl")
+                     if row["session_id"] == thread_id])
     require([choice["label"] for choice in question["choices"]] == ["允许", "拒绝"] and question["about"]["request_id"]
             and thread_id == (work(name, work_id) or {}).get("thread_id") and len(asked) == 1
             and asked[0]["asked"][0]["question_id"] == asked[0]["asked"][1]["question_id"] == question_id,
@@ -1751,7 +1752,8 @@ def work_checks(run, workspace, a, network, passed):
     finished = wait_for("the assistant acts on the answer and the work finishes", lambda: in_state(name, work_id, "finished"), timeout=90)
     replies = answers(finished["thread_id"])
     turns = [row for row in fixture_records(run) if row["kind"] == "answer" and row["conversation_id"] == name]
-    acted = [row for row in fixture_records(run, "answer-actions.jsonl") if row["question_id"] == question_id]
+    acted = wait_for("the answer turn records its replies", lambda: [row for row in fixture_records(run, "answer-actions.jsonl")
+                     if row["question_id"] == question_id])
     require(len(replies) == 1 and replies[0]["result"] == {"decision": "decline"} and len(turns) == 1
             and turns[0]["trigger"] == "message:a-" + question_id and len(acted) == 1
             and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
@@ -1898,6 +1900,8 @@ def triage_checks(run, workspace, a, network, passed):
         require(question["conversation_id"] == owner and question["severity"] == "attention"
                 and question["about"]["session_id"] == thread_id and question["about"]["node"] == a.device_id,
                 "the question names the chat, session and device it is about")
+        wait_for("the triage turn records its question", lambda: any(row["cwd"] == str(raise_dir) and row["session_id"] == thread_id
+                 for row in fixture_records(run, "triage-actions.jsonl")))
         actions = fixture_records(run, "triage-actions.jsonl")
         raised = [row for row in actions if row["cwd"] == str(raise_dir) and row["session_id"] == thread_id]
         same_turn = [row for row in actions if row["session_id"] == thread_id and row["cwd"] != str(raise_dir)
