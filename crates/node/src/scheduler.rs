@@ -673,6 +673,10 @@ pub(crate) fn route_context(
 /// The layered prompt: the assistant's configuration, the conversation since the last
 /// checkpoint (or since what the resumed native session has seen), the works, then the trigger.
 /// Built only from the DAG at the job's basis, so every entry and owner reads the same context.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a routine or a route turn adds its own trigger input"
+)]
 fn materialize(
     context: &Context,
     job: &SchedulerJob,
