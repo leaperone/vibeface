@@ -1765,6 +1765,123 @@ mod tests {
         result
     }
 
+    /// The local page's cancel ends a join still waiting for its entry, and forgets its
+    /// commitment; a join the manager already approved is reported as joined, never cancelled.
+    #[tokio::test]
+    async fn the_local_page_cancels_a_waiting_join_but_not_an_approved_one() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:4793".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let mut ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
+            ticket.entry.direct_addrs = vec!["127.0.0.1:9".parse()?];
+            let params = json!({
+                "capability": capability.capability,
+                "link": format!("http://127.0.0.1:4793/join#{}", ticket.encode()?),
+                "name": "工作室 Mac",
+            });
+            let mut page = Session {
+                device_id: LocalIdentity::generate().device_id()?,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            };
+            let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
+            assert_eq!(
+                status(dispatch(&node, &mut page, "node_join", params.clone()).await?),
+                "waiting"
+            );
+            for _ in 0..50 {
+                if dir.join("join.json").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                dir.join("join.json").exists(),
+                "the join committed to a nonce"
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut page,
+                    "node_join_cancel",
+                    json!({"capability": "0".repeat(64)})
+                )
+                .await
+                .is_err(),
+                "only the page that started the join can cancel it"
+            );
+            assert_eq!(
+                status(
+                    dispatch(
+                        &node,
+                        &mut page,
+                        "node_join_cancel",
+                        json!({"capability": capability.capability})
+                    )
+                    .await?
+                ),
+                "waiting"
+            );
+            let mut seen = String::new();
+            for _ in 0..50 {
+                seen = status(dispatch(&node, &mut page, "node_join", params.clone()).await?);
+                if seen != "waiting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                seen, "cancelled",
+                "cancel ends the wait on the Node, not just the page"
+            );
+            assert!(
+                !dir.join("join.json").exists(),
+                "a cancelled join leaves no commitment"
+            );
+
+            dispatch(&node, &mut page, "node_join", params.clone()).await?;
+            node.node_join
+                .lock()
+                .map_err(|_| anyhow!("poisoned"))?
+                .as_mut()
+                .context("slot")?
+                .status = NodeJoin::Joined;
+            assert_eq!(
+                status(
+                    dispatch(
+                        &node,
+                        &mut page,
+                        "node_join_cancel",
+                        json!({"capability": capability.capability})
+                    )
+                    .await?
+                ),
+                "joined",
+                "an approved join is not reported as cancelled"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
     #[tokio::test]
     async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()
     -> Result<()> {
