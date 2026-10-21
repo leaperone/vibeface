@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -46,6 +46,9 @@ pub(crate) struct TriageState {
     threads: std::sync::Mutex<HashMap<String, (String, String)>>,
     /// Held while answered session questions are acted on, so routing turns never overlap.
     routing: tokio::sync::Mutex<()>,
+    /// This device's sessions the user chose to ignore, so their events drop without the store.
+    /// A restart learns them again from the answers.
+    ignored: std::sync::Mutex<HashSet<String>>,
     started_ms: i64,
 }
 
@@ -59,6 +62,7 @@ impl TriageState {
             outbox: Default::default(),
             threads: Default::default(),
             routing: Default::default(),
+            ignored: Default::default(),
             started_ms: now_ms(),
         }
     }
@@ -233,6 +237,11 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 impl Runtime {
+    /// A session that gained an owner is no longer ignored.
+    pub(super) fn forget_ignored(&self, session: &str) {
+        lock(&self.triage.ignored).remove(session);
+    }
+
     async fn network_id(&self) -> Result<String> {
         Ok(self.membership_state().await?.genesis.network_id)
     }
@@ -254,6 +263,9 @@ impl Runtime {
         if event.test {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
+        }
+        if lock(&self.triage.ignored).contains(&event.session_id) {
+            return Ok(json!({"status":"foreign","event_id":event.event_id}));
         }
         // Nothing is triaged before the Node joins a network.
         let network = self.network_id().await?;
@@ -305,7 +317,10 @@ impl Runtime {
         event: &AgentEvent,
     ) -> Result<Option<(Value, String)>> {
         let question_id = triage::session_question_id(&event.node, &event.session_id);
-        if store.question(network, &question_id)?.is_some() {
+        if let Some(standing) = store.question(network, &question_id)? {
+            if standing["answer"]["text"] == IGNORE {
+                lock(&self.triage.ignored).insert(event.session_id.clone());
+            }
             return Ok(None);
         }
         let mut choices = [IGNORE, HANDLE]
@@ -910,13 +925,28 @@ impl Runtime {
         question: &str,
         conversation: &str,
     ) -> Result<Value> {
-        let (owner, event) = self.store.lock().await.attribute_session(
-            &self.identity,
-            network,
-            question,
-            conversation,
-            now_ms(),
-        )?;
+        let (owner, event, session) = {
+            let mut store = self.store.lock().await;
+            let (owner, event) = store.attribute_session(
+                &self.identity,
+                network,
+                question,
+                conversation,
+                now_ms(),
+            )?;
+            let asked = store
+                .question(network, question)?
+                .context("question missing")?;
+            (
+                owner,
+                event,
+                asked["about"]["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        self.forget_ignored(&session);
         if let Some(event) = &event {
             tracing::info!(
                 event = "session.attributed",
@@ -1913,6 +1943,47 @@ mod tests {
             let chat = node.store.lock().await.conversation_questions(&network, "c")?;
             assert_eq!(chat.len(), 1);
             assert_eq!((chat[0]["assistant"]["name"].clone(), chat[0]["about"]["session_id"].clone()), (json!("前端"), json!("s1")));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// An ignored session's events drop without waiting for the store; once the session is
+    /// handed over they reach the Agent again.
+    #[tokio::test]
+    async fn an_ignored_session_drops_its_events_without_the_store() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            assistant(&node, &admin, "c", "前端", &[]).await?;
+            let question = triage::session_question_id(&node.identity.device_id()?, "s1");
+            node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            assert_eq!(answer(&node, &question, "忽略").await?, "answered");
+            assert_eq!(
+                node.ingest_agent_event(turn("s1", "t2", "/w")).await?["status"],
+                "foreign"
+            );
+            let busy = node.store.lock().await;
+            let dropped = tokio::time::timeout(
+                Duration::from_secs(2),
+                node.ingest_agent_event(turn("s1", "t3", "/w")),
+            )
+            .await;
+            drop(busy);
+            assert_eq!(
+                dropped.context("an ignored session's event waited for the store")??["status"],
+                "foreign"
+            );
+            node.triage_command(
+                json!({"action":"assign","question_id":question,"conversation_id":"c"}),
+            )
+            .await?;
+            assert_eq!(
+                node.ingest_agent_event(turn("s1", "t4", "/w")).await?["status"],
+                "accepted"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;
