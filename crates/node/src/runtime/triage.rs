@@ -265,6 +265,12 @@ impl Runtime {
             let question = self.ask_about_session(&mut store, &network, &event)?;
             drop(store);
             if let Some((question, hash)) = question {
+                tracing::info!(
+                    event = "session.foreign",
+                    thread_id = event.session_id,
+                    question_id = question["question_id"].as_str(),
+                    "asked whether to handle a session no assistant started"
+                );
                 self.publish_changed(&network, SESSIONS_SCOPE, &hash);
                 self.send_question(&question, &event.cwd).await?;
             }
@@ -811,6 +817,13 @@ impl Runtime {
         }
         let mut sent = false;
         if let Some(hash) = &hash {
+            tracing::info!(
+                event = "question.asked",
+                conversation_id = owner,
+                thread_id = event.session_id,
+                question_id,
+                "question asked in the assistant chat"
+            );
             self.publish_changed(network, &owner, hash);
             sent = self.send_question(&asked, &event.cwd).await?;
         }
@@ -905,6 +918,12 @@ impl Runtime {
             now_ms(),
         )?;
         if let Some(event) = &event {
+            tracing::info!(
+                event = "session.attributed",
+                conversation_id = owner,
+                question_id = question,
+                "session handed to an assistant"
+            );
             self.publish_changed(network, &owner, &event.hash);
         }
         Ok(json!({"question_id":question,"conversation_id":owner,"attributed":event.is_some()}))
@@ -963,6 +982,12 @@ impl Runtime {
                 .iter()
                 .map(|bot| json!({"conversation_id":bot.conversation_id,"name":bot.name,"project":bot.project}))
                 .collect();
+            tracing::info!(
+                event = "session.routing",
+                question_id,
+                thread_id = question["about"]["session_id"].as_str(),
+                "routing a session to an assistant"
+            );
             if let Err(error) = self
                 .coordination_turn(|cli| {
                     triage::routing_prompt(&question, &answer, &assistants, cli)
@@ -981,23 +1006,37 @@ impl Runtime {
             {
                 continue;
             }
-            let closest = bots
-                .iter()
-                .filter_map(|bot| Some((bot, bot.project.as_ref()?)))
-                .filter(|(_, project)| {
-                    project.target_node == about.node
-                        && Path::new(&about.cwd).starts_with(&project.cwd)
-                })
-                .max_by_key(|(_, project)| project.cwd.len())
-                .map(|(bot, _)| bot.conversation_id.clone());
-            let conversation = match closest {
-                Some(conversation) => conversation,
-                None => self.store.lock().await.connection.query_row(
-                    "SELECT conversation_id FROM bots WHERE network_id=? ORDER BY rank LIMIT 1",
-                    [&network],
-                    |r| r.get(0),
-                )?,
+            let ranked: Vec<String> = {
+                let store = self.store.lock().await;
+                let mut statement = store
+                    .connection
+                    .prepare("SELECT conversation_id FROM bots WHERE network_id=? ORDER BY rank")?;
+                statement
+                    .query_map([&network], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
             };
+            // The longest project path that holds the session, the earliest assistant on a tie.
+            let depth = |conversation: &String| {
+                bots.iter()
+                    .find(|bot| &bot.conversation_id == conversation)
+                    .and_then(|bot| bot.project.as_ref())
+                    .filter(|project| {
+                        project.target_node == about.node
+                            && Path::new(&about.cwd).starts_with(&project.cwd)
+                    })
+                    .map_or(0, |project| project.cwd.len() + 1)
+            };
+            let conversation = ranked
+                .iter()
+                .fold(None, |best: Option<(&String, usize)>, conversation| {
+                    let deeper = depth(conversation);
+                    match best {
+                        Some((_, depth)) if depth >= deeper => best,
+                        _ => Some((conversation, deeper)),
+                    }
+                })
+                .map(|(conversation, _)| conversation.clone())
+                .context("no assistant to hand the session to")?;
             self.attribute_session(&network, &question_id, &conversation)
                 .await?;
         }
@@ -1316,6 +1355,12 @@ impl Runtime {
         if answered.already_answered {
             return Ok(("already_answered", answered.message, None));
         }
+        tracing::info!(
+            event = "question.answered",
+            conversation_id = answered.conversation_id,
+            question_id = question,
+            "question answered"
+        );
         self.publish_changed(
             network,
             &answered.conversation_id,
