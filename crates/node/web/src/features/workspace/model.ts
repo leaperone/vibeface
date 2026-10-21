@@ -121,6 +121,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
 /**
  * Why a work waits for the person, or null when its device can still report it. An unfinished work waits only once
  * its device is known to be offline, or its App Server disconnected for a Codex turn; an unknown device is not judged.
+ * A task runs in its device's assistant, which reports without the App Server, so only offline applies to it.
  */
 export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
@@ -142,7 +143,7 @@ export type WorkCheck = Extract<PendingCheck, { kind: "work" }>
 export function workChecks(works: OpenWork[], nodes: NodeInfo[]): WorkCheck[] {
   return works.flatMap((item): WorkCheck[] => {
     const reason = confirmReason(item, nodes)
-    return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, reason }] : []
+    return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, title: item.title, reason }] : []
   })
 }
 export function parseOpenWorks(value: unknown): OpenWork[] {

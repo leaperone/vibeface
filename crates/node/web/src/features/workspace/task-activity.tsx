@@ -8,13 +8,20 @@ import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
 import { ActionButton } from "./present"
+import type { WorkCheck } from "./model"
 import type { PendingCheck } from "./types"
 
 /** Plain-language reason; the original text stays in the details. */
-export function checkReason(check: PendingCheck): string {
+export function checkReason(check: Pick<PendingCheck, "detail">): string {
   if (/restart/i.test(check.detail)) return "设备在助手工作时重启了，系统不会自动重做。"
   if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和助手的连接断了，系统不会自动重做。"
   return "这次的结果没法自动确认，系统不会自动重做。"
+}
+
+export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device: string): string {
+  return check.reason === "offline" ? `${device} 离线了，报不回这个任务的结果。`
+    : check.reason === "disconnected" ? `${device} 上的 Codex 断开了，报不回这个任务的结果。`
+    : checkReason(check)
 }
 
 const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
@@ -38,12 +45,10 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   </ActionCard>
   const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note) }
   const device = nodeName(check.target_node, lookup)
-  const reason = check.reason === "offline" ? `${device} 离线了，报不回这个任务的结果。`
-    : check.reason === "disconnected" ? `${device} 上的 Codex 断开了，报不回这个任务的结果。`
-    : checkReason(check)
+  const reason = confirmText(check, device)
   return <ActionCard
     icon={confirmIcons[check.reason]}
-    title="待确认 · 任务结果"
+    title={`待确认 · ${check.title || "任务结果"}`}
     meta={device}
     actions={<>
       <ActionButton disabled={disabled} action={answer("interrupted")}>没做完</ActionButton>

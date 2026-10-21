@@ -31,7 +31,7 @@ export function useInbox(): InboxItem[] {
     key: `question:${question.question_id}`, icon: MessageCircleQuestionMark, title: question.text, meta: question.assistant?.name,
     to: question.assistant ? `/b/${question.assistant.bot_id}` : "/inbox", kind: "question", question, done: question.question_id in workspace.answered,
   })
-  for (const check of workChecks(workspace.openWorks, workspace.nodes)) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", to: "/inbox", kind: "confirm", check })
+  for (const check of workChecks(workspace.openWorks, workspace.nodes)) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", meta: check.title || undefined, to: "/inbox", kind: "confirm", check })
   const checks = data?.checks.length ?? 0
   if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })

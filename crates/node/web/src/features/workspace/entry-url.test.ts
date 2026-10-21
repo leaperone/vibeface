@@ -64,7 +64,7 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.throws(() => parseConversation({ ...context, checks: undefined }))
   const unverified = parseConversation({ ...context, works: [{ ...work, state: "unverified", outcome: "unverified", failure_reason: "无法证明结果" }], checks: [check] })
   assert.deepEqual(pendingChecks(unverified, [], "chat"), [
-    { kind: "work", check_id: "work:work", detail: "无法证明结果", work_id: "work", target_node: "worker", conversation_id: "chat", reason: "unverified" },
+    { kind: "work", check_id: "work:work", detail: "无法证明结果", work_id: "work", target_node: "worker", conversation_id: "chat", title: "检查项目", reason: "unverified" },
     { kind: "process", check_id: "manager:attempt", detail: "进程还在运行" },
   ], "an unverified work is its own card; a coordination check is confirmed stopped")
   const delivered = parseConversation({ ...context, works: [work], deliveries: [
@@ -299,7 +299,7 @@ test("workspace preserves bot and message requests while routing native decision
     for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
     assert.deepEqual(answers.slice(beforeSettle).map((item) => item.question_id), ["q2"], "an answer whose question is still open is sent again; one already answered is not")
     assert.deepEqual(render().pendingAnswers, [])
-    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker", conversation_id: "chat", reason: "offline" }, "completed", " 设备上已看到结果 ")
+    await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker", conversation_id: "chat", title: "", reason: "offline" }, "completed", " 设备上已看到结果 ")
     assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
     assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
     await assert.rejects(render().interruptWork("other-work"), /停不了/)

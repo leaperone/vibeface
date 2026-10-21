@@ -87,7 +87,7 @@ export type ConversationRecords = {
  * `work`: a work waiting for the person's confirmation, answered completed or interrupted. `process`: a coordination process the person confirms stopped.
  */
 export type PendingCheck =
-  | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string; conversation_id: string; reason: ConfirmReason }
+  | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string; conversation_id: string; title: string; reason: ConfirmReason }
   | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type FieldEdit = { before: string; after: string }
