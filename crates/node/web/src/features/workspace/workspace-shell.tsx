@@ -247,7 +247,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
   const status = retry === null
     ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
     : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
-  return <div className="flex h-dvh" aria-busy="true">
+  return <div className="flex h-dvh" aria-busy={retry === null}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
       <span className="text-heading font-semibold">vibeface</span>
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
