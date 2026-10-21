@@ -44,6 +44,11 @@ import urllib.request
 import uuid
 
 
+def definitions_of(bots):
+    """Listed Bots without the read-only preview of their latest message."""
+    return [{key: value for key, value in bot.items() if key != "last_message"} for bot in bots]
+
+
 def require(condition, description):
     if not condition:
         raise AssertionError(description)
@@ -1470,12 +1475,12 @@ def bot_checks(run, workspace, a, network, passed, outsider):
             a.client.rpc("create_bot", **{**definition, key: replacement}, status=400)
         a.client.rpc("create_bot", **{**definition, "bot_id": definition["bot_id"] + "-duplicate"}, status=400)
         stored.append(original)
-    require(sorted(a.client.rpc("bots")["bots"], key=lambda bot: bot["bot_id"]) == stored,
+    require(sorted(definitions_of(a.client.rpc("bots")["bots"]), key=lambda bot: bot["bot_id"]) == stored,
             "Bot listing contains the two exact persisted definitions")
     require(outsider.client.rpc("bots")["bots"] == [], "another personal network cannot list these Bots")
     independent = outsider.client.rpc("create_bot", **{**definitions[0], "name": "Other network", "project": None})["bot"]
-    require(outsider.client.rpc("bots")["bots"] == [independent]
-            and sorted(a.client.rpc("bots")["bots"], key=lambda bot: bot["bot_id"]) == stored,
+    require(definitions_of(outsider.client.rpc("bots")["bots"]) == [independent]
+            and sorted(definitions_of(a.client.rpc("bots")["bots"]), key=lambda bot: bot["bot_id"]) == stored,
             "the same Bot identity in another network cannot replace or reveal this network's definition")
     require_quiet("creating Bot definitions does not launch a model", lambda: len(fixture_records(run)) == before_calls)
 
@@ -1502,7 +1507,7 @@ def bot_checks(run, workspace, a, network, passed, outsider):
     a.client.connect()
     a.client.authenticate()
     require_quiet("a restart never runs a model from Bot history", lambda: len(fixture_records(run)) == before_calls)
-    require(sorted(a.client.rpc("bots")["bots"], key=lambda bot: bot["bot_id"]) == stored,
+    require(sorted(definitions_of(a.client.rpc("bots")["bots"]), key=lambda bot: bot["bot_id"]) == stored,
             "Bot definitions and their signed identity survive restart")
     resumed = send(definitions[0], "bot-alpha-after-restart")
     require(resumed["resumed"] and resumed["native_session_id"] == first[0]["native_session_id"]
@@ -2829,7 +2834,7 @@ def phase4_acceptance(options):
         wait_for("P's creation, whose answer was lost, reaches B", lambda: any(
             bot["bot_id"] == "p4-bot" for bot in at_b.rpc("bots")["bots"]), timeout=60)
         retried = at_b.call("rpc", request)["bot"]
-        original = next(bot for bot in at_p.rpc("bots")["bots"] if bot["bot_id"] == "p4-bot")
+        original = next(bot for bot in definitions_of(at_p.rpc("bots")["bots"]) if bot["bot_id"] == "p4-bot")
         require(retried == original, "the same signed creation through another entrance returns the original")
         wait_for("the conversation reaches A", lambda: converged(members, network), timeout=60)
         owners = {client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] for client in (a.client, at_b, at_p)}
