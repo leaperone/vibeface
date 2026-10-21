@@ -52,7 +52,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
       {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">结果</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}
       {state === "awaiting_confirmation" ? <p className="text-meta text-muted-foreground">{confirmText({ reason: confirmReason(work, workspace.nodes) ?? "unverified", detail: work.failure_reason ?? "" }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。</p> : null}
-      {sharing ? <p className="text-meta text-muted-foreground">和另外 {sharing} 个任务共用一个回合，停止会一起停掉。</p> : null}
+      {sharing && stop ? <p className="text-meta text-muted-foreground">和另外 {sharing} 个任务共用一个回合，停止会一起停掉。</p> : null}
       {stop ? <div className="grid gap-2">
         <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop)}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : confirming ? "确认一起停止" : "停止任务"}</Button>
         <InlineError error={action.error} />
