@@ -81,6 +81,8 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   }
   if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry, join_id: 'join', invite_id: inviteId, nonce: joinNonce, name: 'browser', pinned: { network_id: network, admin_id: target, admin_nonce: '2'.repeat(64) } }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
+  // A cookie-bound local session only exists after a launch on this origin, which the browser remembers.
+  if (localSession) stored.set('vibeface.local-origin', 'true')
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
     initClient: async () => ({ deviceId: subject }), signClient: async () => 'signature',
@@ -128,6 +130,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
     location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, Uint8Array, Error, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
+      if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
         ? { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, device_id: subject, network_id: network, entry: sessionEntry }) }
         : { ok: false, status: 404 }

@@ -777,9 +777,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (version !== generation.current) return
       // A browser that was in its network resumes it; the join page must not flash in between.
       setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
-      if (!invitation) {
+      // Only the local launcher's origin serves /api/local/info; a browser learns it is on one from a launch link.
+      if (!invitation && (localLaunch || load('local-origin') === true)) {
         const local = await localBrowserEntry(me, localLaunch)
         if (!mounted || version !== generation.current) return
+        store('local-origin', local ? true : null)
         if (local) { const opening = connect(local); version = generation.current; await opening; return }
       }
       const pending = invitation ? null : loadJoining()
