@@ -106,10 +106,7 @@ export function ConversationScreen() {
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const needsConfirm = checks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
-  if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <div className="flex items-start gap-2">
-    <span aria-hidden="true" className="flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground"><Bot className="size-4" /></span>
-    <p role="status" className="flex min-h-7 items-center gap-2 px-1 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p>
-  </div> })
+  if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{status ? progressLabel(status) : '思考中'}</p> })
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
@@ -246,7 +243,7 @@ function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name
 
 /** The provider's own words behind a failed reply, folded under it. */
 function ReplyCause({ raw }: { raw: string }) {
-  return <Details className="-mt-1 pl-9">{raw}</Details>
+  return <Details className="-mt-2">{raw}</Details>
 }
 
 function JobLine({ job }: { job: ManagerJob }) {

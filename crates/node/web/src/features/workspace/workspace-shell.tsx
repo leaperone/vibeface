@@ -116,15 +116,11 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
-          <SidebarGroup className="pt-0">
-            <SidebarMenu>
-              <NavItem to="/devices" icon={MonitorSmartphone} label="设备" active={pathname.startsWith("/devices")} dot={devicesAttention} />
-            </SidebarMenu>
-          </SidebarGroup>
         </SidebarContent>
         <SidebarFooter className="shrink-0 gap-1 px-2 py-3">
           <ConnectionCapsule />
           <SidebarMenu>
+            <NavItem to="/devices" icon={MonitorSmartphone} label="设备" active={pathname.startsWith("/devices")} dot={devicesAttention} />
             <NavItem to="/settings" icon={Settings} label="设置" active={pathname.startsWith("/settings")} />
           </SidebarMenu>
         </SidebarFooter>
@@ -132,9 +128,9 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
         <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(0.75rem,env(safe-area-inset-left))] pe-[max(0.75rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
           <SidebarTrigger aria-label="菜单" title="菜单" />
-          <div className="flex min-w-0 flex-1 items-center gap-1">
-            <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
             {chatRoute ? <AssistantPanelButton /> : null}
+            <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
           </div>
           <Button asChild variant="ghost" size="icon" className="relative md:hidden">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
