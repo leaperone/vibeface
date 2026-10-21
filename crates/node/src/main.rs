@@ -369,7 +369,8 @@ async fn main() -> Result<()> {
             // The App Server group must not outlive the Node that manages it.
             runtime.shutdown().await;
             if rejoin {
-                return restart_fresh(&options.data.data_dir);
+                let name = runtime.member_name().await;
+                return restart_fresh(&options.data.data_dir, name.as_deref());
             }
             result
         }
@@ -525,7 +526,7 @@ fn prepare_start(dir: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if empty {
-        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false), None)?;
+        initialize_announced(dir, Config::local(DEFAULT_LISTEN, vec![], false), None)?;
     }
     Ok(())
 }
@@ -670,10 +671,29 @@ fn init(options: Init) -> Result<()> {
             },
         });
     }
-    initialize(dir, configuration, entry_token)
+    initialize_announced(dir, configuration, entry_token)
 }
 
-fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
+fn initialize_announced(
+    dir: &Path,
+    configuration: Config,
+    entry_token: Option<String>,
+) -> Result<()> {
+    let public_entry = configuration.public_entry;
+    let peer = initialize(dir, configuration, entry_token)?;
+    println!("Initialized device with Peer ID {peer}");
+    println!("Configuration: {}", dir.join("config.json").display());
+    if public_entry {
+        println!(
+            "Relay token: {} (copy it to your Node and pass --relay-token-file)",
+            dir.join(net::ENTRY_TOKEN_FILE).display()
+        );
+    }
+    Ok(())
+}
+
+/// Writes a fresh data directory and returns its Peer ID.
+fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<String> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
         "node already initialized; existing identity and configuration were preserved"
@@ -712,22 +732,14 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
         &dir.join("data-epoch.json"),
         &crate::config::data_epoch_marker(),
     )?;
-    println!("Initialized device with Peer ID {}", identity.device_id()?);
-    println!("Configuration: {}", dir.join("config.json").display());
-    if configuration.public_entry {
-        println!(
-            "Relay token: {} (copy it to your Node and pass --relay-token-file)",
-            dir.join(net::ENTRY_TOKEN_FILE).display()
-        );
-    }
-    Ok(())
+    identity.device_id()
 }
 
 /// Restarts this removed Node fresh. Replacing the process image keeps its PID, so a service
 /// manager sees no exit and a Node started by hand keeps running; nothing of the old runtime
 /// survives to write into the data set aside.
-fn restart_fresh(dir: &Path) -> Result<()> {
-    match start_over(dir) {
+fn restart_fresh(dir: &Path, name: Option<&str>) -> Result<()> {
+    match start_over(dir, name) {
         Ok(archive) => tracing::warn!(archive = %archive.display(), "removed Node data set aside"),
         Err(error) => tracing::error!(%error, "removed Node data could not be set aside"),
     }
@@ -739,9 +751,9 @@ fn restart_fresh(dir: &Path) -> Result<()> {
 }
 
 /// Renames the data directory to `<name>-removed-<local time>`, never deleting it, and puts a
-/// fresh Node with the same settings in its place. The new directory is complete before either
-/// rename, so a failure leaves the old data where it was.
-fn start_over(dir: &Path) -> Result<PathBuf> {
+/// fresh Node with the same settings and the former `name` in its place. The new directory is
+/// complete before either rename, so a failure leaves the old data where it was.
+fn start_over(dir: &Path, former_name: Option<&str>) -> Result<PathBuf> {
     let configuration = Config::load(dir)?;
     let entry_token = configuration
         .network
@@ -761,7 +773,11 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         "{} already exists",
         archive.display()
     );
-    if let Err(error) = initialize(&fresh, configuration, entry_token) {
+    let made = initialize(&fresh, configuration, entry_token).and_then(|_| match former_name {
+        Some(name) => config::private_write(&fresh.join(config::FORMER_NAME_FILE), name.as_bytes()),
+        None => Ok(()),
+    });
+    if let Err(error) = made {
         let _ = fs::remove_dir_all(&fresh);
         return Err(error);
     }

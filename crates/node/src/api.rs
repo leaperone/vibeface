@@ -537,6 +537,9 @@ struct LocalSetupRequest {}
 enum LocalSetup {
     Uninitialized {
         invitation: BootstrapInvitation,
+        /// What this computer was called before it was removed, the default when it joins again.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     Initialized {
         entry: LocalEntry,
@@ -644,6 +647,9 @@ async fn local_setup(
             device_id,
             capability: capability.capability,
         },
+        name: std::fs::read_to_string(app.node.data_dir.join(crate::config::FORMER_NAME_FILE))
+            .ok()
+            .filter(|name| !name.is_empty() && name.chars().count() <= 128),
     }))
 }
 

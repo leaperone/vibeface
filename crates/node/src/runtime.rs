@@ -310,6 +310,11 @@ impl Runtime {
     pub async fn membership_state(&self) -> Result<NetworkState> {
         self.store.lock().await.public_state()
     }
+    /// The name this Node had in its network, kept after its removal.
+    pub async fn member_name(&self) -> Option<String> {
+        let device = self.identity.device_id().ok()?;
+        node_display_names(&self.membership_state().await.ok()?).remove(&device)
+    }
     pub fn info(&self) -> Value {
         let manager_available = self.settings_snapshot().manager.is_some();
         json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})

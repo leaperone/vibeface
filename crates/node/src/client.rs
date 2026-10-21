@@ -533,7 +533,7 @@ async fn serve_session(
 }
 
 /// Methods a device that is not (or no longer) a member may call.
-const GUEST_METHODS: [&str; 8] = [
+const GUEST_METHODS: [&str; 9] = [
     "info",
     "authenticate",
     "join",
@@ -541,6 +541,7 @@ const GUEST_METHODS: [&str; 8] = [
     "recovery_state",
     "recover",
     "node_join",
+    "node_join_cancel",
     "rejoin",
 ];
 
@@ -849,6 +850,7 @@ async fn dispatch(
         "node_join" => Ok(serde_json::to_value(
             join_from_local_page(node, &params).await?,
         )?),
+        "node_join_cancel" => Ok(serde_json::to_value(cancel_node_join(node, &params)?)?),
         "rejoin" => {
             removed_and_local(node, session).await?;
             node.request_rejoin();
@@ -1183,11 +1185,11 @@ impl JoinLink {
 /// `vibeface join`: this Node asks the ticket's entry to admit it and waits for approval.
 pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkState> {
     let node = Runtime::open(dir).await?;
-    join_as_node(&node, link, name, |progress| match progress {
+    let report = |progress| match progress {
         NodeJoin::Confirming { code } => println!("短码：{code}。请在管理设备上核对相同后批准。"),
         _ => println!("已提交加入请求，等待管理设备批准。"),
-    })
-    .await
+    };
+    join_as_node(&node, link, name, report, &tokio::sync::Notify::new()).await
 }
 
 /// How far this Node's own join has come; the local page shows it while the manager approves.
@@ -1198,7 +1200,18 @@ pub(crate) enum NodeJoin {
     Confirming { code: String },
     Joined,
     Failed,
+    Cancelled,
 }
+
+/// The local page withdrew this join before the manager approved it.
+#[derive(Debug)]
+struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("join cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
 
 /// The join this Node runs for its own local page, one at a time.
 pub(crate) struct NodeJoinTask {
@@ -1207,6 +1220,7 @@ pub(crate) struct NodeJoinTask {
     capability: String,
     status: NodeJoin,
     task: tokio::task::AbortHandle,
+    cancel: Arc<tokio::sync::Notify>,
 }
 
 /// Starts, or reports, this fresh Node's join from its local page. A new link replaces an
@@ -1221,13 +1235,13 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
             .node_join
             .lock()
             .map_err(|_| anyhow!("join state unavailable"))?;
-        // A failure is reported once; asking again after that starts over.
+        // An end without joining is reported once; asking again after that starts over.
         if let Some(current) = slot.as_ref()
             && current.link == link
             && current.capability == capability
         {
             let status = current.status.clone();
-            if matches!(status, NodeJoin::Failed) {
+            if matches!(status, NodeJoin::Failed | NodeJoin::Cancelled) {
                 *slot = None;
             }
             return Ok(status);
@@ -1252,6 +1266,8 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
     parse_join_link(&link)?;
     let runner = node.clone();
     let joining = link.clone();
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let cancelled = cancel.clone();
     let task = tokio::spawn(async move {
         let report = |status: NodeJoin| {
             if let Ok(mut slot) = runner.node_join.lock()
@@ -1261,8 +1277,12 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
                 current.status = status;
             }
         };
-        match join_as_node(&runner, &joining, &name, &report).await {
+        match join_as_node(&runner, &joining, &name, &report, &cancelled).await {
             Ok(_) => report(NodeJoin::Joined),
+            Err(error) if error.is::<Cancelled>() => {
+                let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
+                report(NodeJoin::Cancelled);
+            }
             Err(error) => {
                 tracing::warn!(%error, "joining from the local page failed");
                 let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
@@ -1276,8 +1296,35 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
         capability,
         status: NodeJoin::Waiting,
         task,
+        cancel,
     });
     Ok(NodeJoin::Waiting)
+}
+
+/// Withdraws this Node's join for the page holding its local setup capability. Only waiting is
+/// cut short: once the manager approved, the join installs and the reply says so.
+fn cancel_node_join(node: &Runtime, params: &Value) -> Result<NodeJoin> {
+    let capability = text(params, "capability")?;
+    let slot = node
+        .node_join
+        .lock()
+        .map_err(|_| anyhow!("join state unavailable"))?;
+    let current = slot
+        .as_ref()
+        .filter(|current| current.capability == capability)
+        .context("no join from this page is running")?;
+    current.cancel.notify_one();
+    Ok(current.status.clone())
+}
+
+async fn unless_cancelled<T>(
+    cancel: &tokio::sync::Notify,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        result = work => result,
+        () = cancel.notified() => Err(Cancelled.into()),
+    }
 }
 
 /// Joins `node` to the network of the invite, resuming a join this Node already committed to.
@@ -1286,6 +1333,7 @@ async fn join_as_node(
     link: &str,
     name: &str,
     report: impl Fn(NodeJoin),
+    cancel: &tokio::sync::Notify,
 ) -> Result<NetworkState> {
     let (_, ticket) = parse_join_link(link)?;
     ensure!(
@@ -1309,14 +1357,16 @@ async fn join_as_node(
     );
     crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
     let device = node.identity.device_id()?;
-    let client = JoinLink::open(node, &ticket).await?;
+    let client = unless_cancelled(cancel, JoinLink::open(node, &ticket)).await?;
     let request: JoinRequest = serde_json::from_value(
-        client
-            .call(
+        unless_cancelled(
+            cancel,
+            client.call(
                 "join",
                 json!({"secret":hex::encode(ticket.secret),"public_key":device,"kind":IdentityKind::Node,"name":name,"commit":join_commit(&device, &pending.nonce)?}),
-            )
-            .await?,
+            ),
+        )
+        .await?,
     )?;
     let invite = invite_id(&ticket.invite_hash())?;
     ensure!(
@@ -1332,9 +1382,11 @@ async fn join_as_node(
             Instant::now() < deadline,
             "approval timed out; run the same command again to resume"
         );
-        let status = client
-            .call("join_status", json!({"join_id":join_id}))
-            .await?;
+        let status = unless_cancelled(
+            cancel,
+            client.call("join_status", json!({"join_id":join_id})),
+        )
+        .await?;
         let request: JoinRequest = serde_json::from_value(status.clone())?;
         match request.status {
             JoinStatus::Joined => {
@@ -1388,15 +1440,23 @@ async fn join_as_node(
                     &pending.nonce,
                 )?;
                 report(NodeJoin::Confirming { code });
-                client
-                    .call(
+                unless_cancelled(
+                    cancel,
+                    client.call(
                         "join_status",
                         json!({"join_id":join_id,"reveal":pending.nonce}),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 shown = true;
             }
-            _ => tokio::time::sleep(Duration::from_secs(2)).await,
+            _ => {
+                unless_cancelled(cancel, async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok(())
+                })
+                .await?
+            }
         }
     }
 }
@@ -1757,6 +1817,123 @@ mod tests {
                 json!({"restarting":true})
             );
             tokio::time::timeout(Duration::from_secs(5), node.rejoin_requested()).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    /// The local page's cancel ends a join still waiting for its entry, and forgets its
+    /// commitment; a join the manager already approved is reported as joined, never cancelled.
+    #[tokio::test]
+    async fn the_local_page_cancels_a_waiting_join_but_not_an_approved_one() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:4793".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let mut ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
+            ticket.entry.direct_addrs = vec!["127.0.0.1:9".parse()?];
+            let params = json!({
+                "capability": capability.capability,
+                "link": format!("http://127.0.0.1:4793/join#{}", ticket.encode()?),
+                "name": "工作室 Mac",
+            });
+            let mut page = Session {
+                device_id: LocalIdentity::generate().device_id()?,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            };
+            let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
+            assert_eq!(
+                status(dispatch(&node, &mut page, "node_join", params.clone()).await?),
+                "waiting"
+            );
+            for _ in 0..50 {
+                if dir.join("join.json").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                dir.join("join.json").exists(),
+                "the join committed to a nonce"
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut page,
+                    "node_join_cancel",
+                    json!({"capability": "0".repeat(64)})
+                )
+                .await
+                .is_err(),
+                "only the page that started the join can cancel it"
+            );
+            assert_eq!(
+                status(
+                    dispatch(
+                        &node,
+                        &mut page,
+                        "node_join_cancel",
+                        json!({"capability": capability.capability})
+                    )
+                    .await?
+                ),
+                "waiting"
+            );
+            let mut seen = String::new();
+            for _ in 0..50 {
+                seen = status(dispatch(&node, &mut page, "node_join", params.clone()).await?);
+                if seen != "waiting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                seen, "cancelled",
+                "cancel ends the wait on the Node, not just the page"
+            );
+            assert!(
+                !dir.join("join.json").exists(),
+                "a cancelled join leaves no commitment"
+            );
+
+            dispatch(&node, &mut page, "node_join", params.clone()).await?;
+            node.node_join
+                .lock()
+                .map_err(|_| anyhow!("poisoned"))?
+                .as_mut()
+                .context("slot")?
+                .status = NodeJoin::Joined;
+            assert_eq!(
+                status(
+                    dispatch(
+                        &node,
+                        &mut page,
+                        "node_join_cancel",
+                        json!({"capability": capability.capability})
+                    )
+                    .await?
+                ),
+                "joined",
+                "an approved join is not reported as cancelled"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;
