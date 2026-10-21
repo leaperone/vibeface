@@ -92,6 +92,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
       options.signal.addEventListener('abort', close)
       if (holds.has('open')) await holds.get('open')?.promise
       return { deviceId: candidate.device_id, close, async request(method: string, params: Record<string, unknown> = {}) {
+        if (method === 'log') return { accepted: 1 }
         calls.push(method)
         requests.push({ method, params })
         if (holds.has(method)) return holds.get(method)?.promise

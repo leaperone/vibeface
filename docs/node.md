@@ -310,7 +310,7 @@ Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理�
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机：CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发。`continues` 填原工作编号时，在原工作的 thread 上继续。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 
-协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的任意方法，`vibeface codex send <thread> <text> --id <id>` 给会话插话或开新回合（每个 `--id` 发送前先记入 Node 数据目录的 `codex-sends`，由 `VIBEFACE_DATA_DIR` 给出；同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝；没有数据目录时须用 `--log DIR` 指定日志目录），`vibeface codex watch <thread>` 查看事件。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
+协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的任意方法，`vibeface codex send <thread> <text> --id <id>` 给会话插话或开新回合（每个 `--id` 发送前先记入 Node 数据目录的 `codex-sends`，由 `VIBEFACE_DATA_DIR` 给出；同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝；没有数据目录时须用 `--log DIR` 指定日志目录），`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks` 相同）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
 Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface codex requests` 查看，`vibeface codex respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --choice '批准={"decision":"accept"}' --choice '拒绝={"decision":"decline"}' ...` 生成拍板卡片，或经 webhook 转发 Grok Bot；卡片挂住请求直到本人选择，忽略卡片等于拒绝。没有协调 Agent，或它 120 秒内既没回答也没生成卡片时，Node 按方法拒绝并记录。没有协调 Agent 时分诊事件直接丢弃。
 
@@ -367,7 +367,7 @@ vibeface service start --data-dir "$HOME/.vibeface"
 vibeface service restart --data-dir "$HOME/.vibeface"
 ```
 
-macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
+macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`（JSON lines，用 `vibeface logs` 查看）；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
 后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 和 sidecar 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
 

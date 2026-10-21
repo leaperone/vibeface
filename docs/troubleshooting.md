@@ -27,7 +27,32 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 ## 看日志
 
-运行中的 Node 把日志追加到数据目录的 `node.log`（权限 600）。默认级别是 vibeface 的 info 和依赖库的 warn，可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`。前台在终端运行时日志同时打印到终端。启动时 `node.log` 超过 16 MiB 会改名为 `node.log.1`，只保留一份旧日志。
+运行中的 Node 把日志追加到数据目录的 `node.log`（权限 600），每行一条 JSON 记录：
+
+| 字段 | 含义 |
+|---|---|
+| `ts_ms` | 毫秒时间戳 |
+| `level` | `trace`、`debug`、`info`、`warn` 或 `error` |
+| `source` | `node`、`web`（浏览器）、`agent`（协调 Agent）、`cli`（命令行）、`codex` 或 `cursor` |
+| `event` | 事件名，例如 `work.dispatched` |
+| `message` | 说明 |
+| `conversation_id`、`work_id`、`thread_id` | 知道时才有 |
+| `fields` | 其余字段 |
+
+默认级别是 vibeface 的 info 和依赖库的 warn，可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
+
+同一个日志还收这些来源的记录：
+
+- 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话；
+- 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex send` 和 `vibeface codex call` 自动记下结果；
+- Codex App Server、Codex SDK 和 Cursor 桥的标准错误逐行记录，能看出 thread 时带上 `thread_id`。
+
+每条外来记录不超过 8 KiB，一次最多 20 条，每个来源每分钟最多 120 条，超出整批拒绝。
+
+查看日志：
+
+- 命令行：`vibeface logs` 读本机数据目录，支持 `--since 30m`、`--level warn`、`--source web`（可重复）、`--conversation`、`--work`、`--grep`、`--limit`、`--json` 和 `-f` 持续跟踪；
+- 网页：**设置**的**排障**里点**日志**，可按级别、来源和关键词筛选，展开一条后能复制它、整个会话或整个任务的全部记录。管理设备和本机会话可以查看。
 
 作为后台服务运行时，标准错误不是终端，日志只写 `node.log`。macOS 的 `service.stderr.log` 和 Linux 用户 journal 里只剩崩溃输出。更新器的日志在 `update.stdout.log` 和 `update.stderr.log`。
 
@@ -41,19 +66,26 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `refused a connection from a non-member` | 非成员设备试图连接，debug 级别 |
 | `work changed a file outside its directory` | 工作改动了它目录之外的文件，只记录，不拦截 |
 | `relay started` | 本机 relay 已启动，`listen` 字段是它的地址 |
+| `work.dispatched`、`work.dispatch_rejected` | 工作被接纳或派发被拒绝，带 `work_id` 和原因 |
+| `work.turn_started`、`work.start_failed`、`work.start_unknown` | Codex 回合开始、被拒绝或结果未知 |
+| `work.state` | 工作状态变化，结束时带 `outcome` |
+| `agent.turn.started`、`agent.turn.finished` | 协调 Agent 一轮开始和结束 |
+| `agent.tool`、`agent.tool_failed` | 协调 Agent 调用的工具 |
+| `codex.send`、`codex.call`、`codex.call_failed` | Agent 经命令行给 Codex 发的消息和请求 |
+| `codex.app_server.stderr`、`codex.sdk.stderr`、`cursor.stderr` | 子进程的标准错误 |
 
-日志不记录邀请链接、加入 secret、入口令牌、本机启动 token 或模型密钥。
+写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、入口令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
 
 ## 导出诊断包
 
-在网页**设置**的**排障**里点**导出诊断包**，浏览器保存一个 `vibeface-diagnostics-<日期>.json`。管理设备和本机会话可以导出。诊断包来自当前连接的那台 Node，包含：
+在网页**设置**的**排障**里选时间范围（最近 1 小时、1 天或 7 天），点**导出诊断包**，浏览器保存一个 `vibeface-diagnostics-<日期>.json`。管理设备和本机会话可以导出。诊断包来自当前连接的那台 Node，包含：
 
 - 版本、操作系统、CPU 架构和设备编号；
 - `config.json` 的内容，其中没有密钥；
 - 写入状态、冲突数量和每台对端的连通情况；
-- `node.log` 最后 400 行和 `service.stderr.log` 最后 50 行。
+- 时间范围内的 `node.log` 记录（最多 20000 条，已脱敏）和 `service.stderr.log` 最后 50 行。
 
-导出前日志中的邀请链接片段替换为 `[invite]`，入口令牌替换为 `[redacted]`。
+`service.stderr.log` 导出前同样脱敏。
 
 ## 写入状态
 

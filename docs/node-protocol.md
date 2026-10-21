@@ -79,7 +79,7 @@
 | `join.json` | `vibeface join` 进行中的请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
-| `node.log`、`node.log.1` | Node 日志，0600，启动时超过 16 MiB 轮转一次 |
+| `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
 
 运行中的 Node 用目录锁独占数据目录，并在私有维护 socket 上回答 `vibeface status`。
@@ -127,7 +127,9 @@
 | `rpc` | 下节业务对象 | 业务读写 |
 | `write_state` | `{}` | 写入状态和本机记下的冲突，见 [写入保护](#写入保护) |
 | `confirm_writable` | `{}` | 本人确认数据目录不是从备份恢复的，只读或对齐中的 Node 进入可写 |
-| `diagnostics` | `{}` | 脱敏诊断包，见 [排障](troubleshooting.md) |
+| `diagnostics` | 可选 `since_ms`、`until_ms`，默认最近一天 | 脱敏诊断包，见 [排障](troubleshooting.md) |
+| `log` | `records`：1 到 20 条 `{level, event, message, conversation_id?, work_id?, fields?}` | 浏览器写日志，来源记为 `web`，每条 JSON 不超过 8 KiB，每台设备每分钟 120 条 |
+| `logs` | 可选 `since_ms`、`until_ms`、`level`、`sources`、`conversation_id`、`work_id`、`text`、`limit` | 读本机日志，返回 `records`，最多 20000 条 |
 | `node_settings` | `{}` | 读取本机 manager、roots 和依赖准备状态 |
 | `configure_node` | `manager`、`roots` | 保存本机设置 |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
@@ -139,7 +141,7 @@
 | `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的两分钟签名读取当前目录 `state` 和本机各作者主分支的头 `heads`，新 checkpoint 据此为没有保留的 Node 写 `retired` |
 | `recover` | `genesis`、`checkpoint`、`capability` | 空 Node 安装根签目录，已建网 Node 安装更高 epoch checkpoint |
 
-未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证 `RootCheckpoint` 的根签名并要求 epoch 更高，验证前没有副作用。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
+未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证 `RootCheckpoint` 的根签名并要求 epoch 更高，验证前没有副作用。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
 
 加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 

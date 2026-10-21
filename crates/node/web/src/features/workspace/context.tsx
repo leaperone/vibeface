@@ -5,6 +5,7 @@ import type { ReadyConnection } from "@/lib/node"
 import { attestationPayload } from "../../../generated/vibeface_secure.js"
 import { signClient } from "../../../transport.js"
 import { messageOf } from "@/lib/node"
+import { parseLogs, reportLog, type LogFilter } from "@/lib/web-log"
 import { enqueue, indexedOutbox, settle, type OutboxItem, type OutboxStore } from "@/lib/outbox"
 import type { Tabs } from "@/features/identity/context"
 import { mergeProgress, type LiveProgress } from "@/lib/progress"
@@ -333,7 +334,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const clearMessages = () => { if (current()) { setError(null); setNoticeText("") } }
   const run = async (action: () => Promise<void>, label?: string) => {
     clearMessages()
-    try { await action() } catch (caught) { showError(caught, label) }
+    if (label) reportLog({ level: "info", event: "web.action", message: label })
+    try { await action() } catch (caught) {
+      reportLog({ level: "warn", event: "web.action_failed", message: messageOf(caught), fields: { action: label } })
+      showError(caught, label)
+    }
   }
   const requireControlRefresh = () => {
     if (!current()) return
@@ -442,7 +447,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
-    diagnostics: () => { requireCurrent(); return connection.request("diagnostics") },
+    diagnostics: (sinceMs: number) => { requireCurrent(); return connection.request("diagnostics", { since_ms: sinceMs }) },
+    logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台设备上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,

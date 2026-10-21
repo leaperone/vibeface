@@ -29,6 +29,7 @@ const CONSTRAINTS: &[&str] = &[
     "Your Shell has full access to this device. Hand longer coding work to Codex through dispatch_work; it registers the work with the Node, starts one Codex turn with full access on this device's App Server, the Node watches it, and its result comes back to you as a new turn.",
     "Your turn ends after you dispatch. Do not wait or poll for work to finish; tell the user what was started.",
     "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's assistant gets the task. continues names an earlier work to follow up on the same thread. In your Shell, `vibeface codex call <method> [json]` calls any App Server method, `vibeface codex send <thread> <text> --id <id>` adds a message to a thread (steering a running turn) and `vibeface codex watch <thread>` streams its events.",
+    "When something fails or behaves unexpectedly, record it with `vibeface log <warn|error|info> <message> --conversation <id> [--work <id>] [--thread <id>]` so it can be debugged later; never put secrets in it.",
     "Reuse call_ref only to retry the same dispatch; a retry never starts a second turn. An unknown outcome is settled by the Node, never by dispatching again.",
     "Use device names from nodes when talking about devices; Peer IDs belong in details.",
     "Never approve a request, grant authority or accept a deliverable for the human.",

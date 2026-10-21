@@ -127,7 +127,7 @@ vibeface init --entry https://vb.example.com --relay-token-file /path/to/entry-t
 
 反向代理和令牌的处理见 [配置公共入口](node.md#配置公共入口)。
 
-前台运行时日志同时写到数据目录的 `node.log`。`vibeface status` 显示写入状态和每台对端最近一次同步，出问题时先看 [排障](troubleshooting.md)。
+前台运行时日志同时写到数据目录的 `node.log`，用 `vibeface logs` 查看。`vibeface status` 显示写入状态和每台对端最近一次同步，出问题时先看 [排障](troubleshooting.md)。
 
 ## 用 CLI 管理后台服务
 

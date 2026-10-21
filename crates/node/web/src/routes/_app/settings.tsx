@@ -1,7 +1,8 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { Link, createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { ArchiveRestore, Bell, BellRing, Download, Globe, LifeBuoy, LogOut, Palette } from 'lucide-react'
+import { ArchiveRestore, Bell, BellRing, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
@@ -11,6 +12,8 @@ import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
 export const Route = createFileRoute('/_app/settings')({ component: SettingsPage })
 
+const ranges: Array<[number, string]> = [[3_600_000, '最近 1 小时'], [86_400_000, '最近 1 天'], [7 * 86_400_000, '最近 7 天']]
+
 const themes: Array<[Theme, string]> = [['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']]
 
 function SettingsPage() {
@@ -18,6 +21,7 @@ function SettingsPage() {
   const device = useDevice()
   const [theme, setThemeState] = useState(readTheme)
   const [leaving, setLeaving] = useState(false)
+  const [range, setRange] = useState(86_400_000)
   return <div className="mx-auto grid max-w-2xl gap-6">
     <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><Bell aria-hidden="true" className="size-5" />提醒</h2>
@@ -43,8 +47,16 @@ function SettingsPage() {
     </section> : null}
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><LifeBuoy aria-hidden="true" className="size-5" />排障</h2>
+      <Button asChild variant="outline" className="h-auto justify-start gap-3 py-3 max-md:h-auto">
+        <Link to="/settings/logs"><ScrollText aria-hidden="true" /><span className="grid flex-1 text-left"><span>日志</span><span className="text-meta font-normal text-muted-foreground whitespace-normal">这台设备、网页和助手的运行记录</span></span><ChevronRight aria-hidden="true" className="text-muted-foreground" /></Link>
+      </Button>
       <p className="text-muted-foreground">诊断包里没有密钥和邀请，可以发给帮你排查的人。</p>
-      <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics()), "导出诊断包") }}><Download aria-hidden="true" />导出诊断包</Button>
+      <div className="flex flex-wrap items-center gap-2">
+        <NativeSelect aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))} className="max-md:[&_select]:h-11">
+          {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
+        </NativeSelect>
+        <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics(Date.now() - range)), "导出诊断包") }}><Download aria-hidden="true" />导出诊断包</Button>
+      </div>
     </section> : null}
     <section className="grid gap-3 border-t pt-6">
       {leaving ? <>

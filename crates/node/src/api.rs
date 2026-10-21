@@ -1097,16 +1097,16 @@ mod tests {
         }
         let client = reqwest::Client::builder().no_proxy().build()?;
         let result = async {
-            for path in ["/api/hooks", "/api/triage"] {
+            for path in ["/api/hooks", "/api/triage", LOG] {
                 let url = format!("{}{path}", origins[0]);
                 let event = json!({"session_id":"s","turn_id":"t","action":"events"});
                 let status = |request: reqwest::RequestBuilder| async {
                     Ok::<_, anyhow::Error>(request.send().await?.status())
                 };
-                let body = if path == "/api/hooks" {
-                    json!({"session_id":"s","turn_id":"t"})
-                } else {
-                    event
+                let body = match path {
+                    "/api/hooks" => json!({"session_id":"s","turn_id":"t"}),
+                    LOG => json!({"source":"node","records":[]}),
+                    _ => event,
                 };
                 // Passes the boundary; this Node has no network yet.
                 assert_eq!(

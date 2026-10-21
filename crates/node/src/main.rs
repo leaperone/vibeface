@@ -308,7 +308,7 @@ struct LogRecord {
     /// trace, debug, info, warn or error.
     level: vibeface::logging::Level,
     message: String,
-    #[arg(long)]
+    #[arg(long, env = "VIBEFACE_NODE_CONVERSATION")]
     conversation: Option<String>,
     #[arg(long)]
     work: Option<String>,

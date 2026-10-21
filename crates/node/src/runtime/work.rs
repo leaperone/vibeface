@@ -61,15 +61,40 @@ impl Runtime {
                 WorkState::Starting { thread } => thread.as_deref(),
                 state => state.handle().map(|handle| handle.thread_id.as_str()),
             };
-            tracing::info!(
-                event = "work.state",
-                conversation_id = record.conversation,
-                work_id,
-                thread_id,
-                state = record.state.name(),
-                "work {}",
-                record.state.name()
-            );
+            let (conversation_id, state) = (record.conversation.as_str(), record.state.name());
+            match &record.state {
+                WorkState::Finished {
+                    outcome: crate::model::WorkOutcome::Completed,
+                } => tracing::info!(
+                    event = "work.state",
+                    conversation_id,
+                    work_id,
+                    thread_id,
+                    state,
+                    outcome = "completed",
+                    "work finished"
+                ),
+                WorkState::Finished { outcome } => {
+                    tracing::warn!(event = "work.state", conversation_id, work_id, thread_id, state, outcome = ?outcome, "work finished {outcome:?}")
+                }
+                WorkState::Unverified { evidence, .. } => tracing::warn!(
+                    event = "work.state",
+                    conversation_id,
+                    work_id,
+                    thread_id,
+                    state,
+                    evidence,
+                    "work result unverified"
+                ),
+                _ => tracing::info!(
+                    event = "work.state",
+                    conversation_id,
+                    work_id,
+                    thread_id,
+                    state,
+                    "work {state}"
+                ),
+            }
         }
         self.publish_changed(network, &record.conversation, work_id);
         if receipt.is_some() {
@@ -231,6 +256,14 @@ impl Runtime {
                 .lock()
                 .await
                 .accept_work(&self.identity, network, spec, now_ms())?;
+        tracing::info!(
+            event = "work.dispatched",
+            conversation_id = record.conversation,
+            work_id = record.work_id,
+            kind = ?record.kind,
+            created,
+            "work dispatched to this device"
+        );
         self.publish_changed(network, &record.conversation, &record.work_id);
         if created && record.kind == WorkKind::Task {
             self.wake_scheduler()?;
@@ -306,6 +339,24 @@ impl Runtime {
                 return Ok(dispatch);
             }
         };
+        let spec = &dispatch.spec;
+        match &state {
+            DispatchState::Rejected { reason } => tracing::warn!(
+                event = "work.dispatch_rejected",
+                conversation_id = spec.conversation,
+                work_id = spec.work_id,
+                target = spec.target,
+                reason,
+                "another device refused the work"
+            ),
+            _ => tracing::info!(
+                event = "work.dispatched",
+                conversation_id = spec.conversation,
+                work_id = spec.work_id,
+                target = spec.target,
+                "another device accepted the work"
+            ),
+        }
         let dispatch = Dispatch { state, ..dispatch };
         self.store.lock().await.save_dispatch(&dispatch)?;
         self.publish_changed(network, &dispatch.spec.conversation, &dispatch.spec.work_id);
@@ -321,6 +372,40 @@ impl Runtime {
         args: &Value,
     ) -> Result<Value> {
         let work_id = field(args, "work_id")?;
+        let thread_id = args["thread_id"].as_str();
+        if let Some(turn_id) = args["turn_id"].as_str() {
+            tracing::info!(
+                event = "work.turn_started",
+                conversation_id = scope,
+                work_id,
+                turn_id,
+                "Codex turn started"
+            );
+        } else if let Some(reason) = args["failed"].as_str() {
+            tracing::warn!(
+                event = "work.start_failed",
+                conversation_id = scope,
+                work_id,
+                reason,
+                "Codex did not start the work"
+            );
+        } else if let Some(reason) = args["unknown"].as_str() {
+            tracing::warn!(
+                event = "work.start_unknown",
+                conversation_id = scope,
+                work_id,
+                reason,
+                "unknown whether Codex started the work"
+            );
+        } else if thread_id.is_some() {
+            tracing::info!(
+                event = "work.thread_bound",
+                conversation_id = scope,
+                work_id,
+                thread_id,
+                "Codex thread bound to the work"
+            );
+        }
         let record = self
             .store
             .lock()
