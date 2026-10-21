@@ -73,10 +73,7 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
     let executable =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
     let bridge = SdkBridge::new(
-        BTreeMap::from([
-            ("FAKE_BRIDGE_STARTUP_MS".into(), startup_ms.to_string()),
-            ("FAKE_BRIDGE_LOG".into(), log.display().to_string()),
-        ]),
+        BTreeMap::from([("FAKE_BRIDGE_STARTUP_MS".into(), startup_ms.to_string())]),
         ToolCallbackConfig {
             url: "http://127.0.0.1:9".into(),
             auth_token: "fixture-callback-token-".repeat(2),
@@ -90,6 +87,7 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
         executable: executable.clone(),
         workspace: root.join("workspace"),
         api_key: "fixture-api-key".into(),
+        env: BTreeMap::from([("FAKE_BRIDGE_LOG".into(), log.display().to_string())]),
         model: "fixture-model".into(),
         timeout_secs: 10,
         custom_tools: BTreeMap::new(),
@@ -139,6 +137,18 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
         std::fs::read_to_string(&pidfile).unwrap(),
         format!("{last} {}\n", executable.display())
     );
+
+    turn.env
+        .insert("FIXTURE_ENGINE_VAR".into(), "changed".into());
+    let (fifth, _) = reply(&bridge, &turn, "fifth").await;
+    assert_eq!(fifth.unwrap(), "done: fifth");
+    let relaunched = starts(&log)[3];
+    assert_ne!(
+        relaunched, last,
+        "changed engine variables start a new bridge"
+    );
+    assert!(gone(last).await, "the bridge with the old variables ends");
+    let last = relaunched;
 
     bridge.stop().await;
     assert!(gone(last).await);

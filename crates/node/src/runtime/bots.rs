@@ -129,7 +129,7 @@ impl Runtime {
         );
         if project.target_node == self.identity.device_id()? {
             ensure!(
-                self.settings_snapshot().manager.is_some(),
+                self.assistant().is_some(),
                 "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;

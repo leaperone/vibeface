@@ -49,21 +49,25 @@ impl Runtime {
     }
 
     /// Retires the current bridge after its running turns, then starts one for the current
-    /// settings when Cursor is the manager and its key is set, so the next reply starts warm.
+    /// settings when Cursor is the assistant and its key is set, so the next reply starts warm.
+    /// A Cursor that is off only retires.
     pub(super) fn refresh_cursor(&self) {
         let Some(bridge) = self.cursor.get().cloned() else {
             return;
         };
         let launch = self
-            .settings_snapshot()
-            .manager
+            .assistant()
             .filter(|manager| manager.provider == ManagerKind::CursorSdk)
-            .zip(std::env::var("CURSOR_API_KEY").ok());
+            .and_then(|manager| {
+                let (key, env) =
+                    crate::providers::cursor_launch(&self.provider_env(manager.provider));
+                Some((manager, key?, env))
+            });
         tokio::spawn(async move {
             bridge.retire().await;
-            if let Some((manager, api_key)) = launch
+            if let Some((manager, api_key, env)) = launch
                 && let Err(error) = bridge
-                    .prewarm(&manager.cursor_sdk_bin, &manager.workspace, &api_key)
+                    .prewarm(&manager.cursor_sdk_bin, &manager.workspace, &api_key, &env)
                     .await
             {
                 tracing::warn!(%error, "Cursor SDK bridge did not start ahead of a reply");

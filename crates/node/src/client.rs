@@ -660,6 +660,16 @@ async fn dispatch(
             node.configure_node(settings, &session.device_id, cookie)
                 .await
         }
+        "configure_provider" => {
+            node_operator(node, session).await?;
+            let change = serde_json::from_value(params).context("invalid provider settings")?;
+            let cookie = match is_local_only(node, session).await? {
+                true => session.cookie.as_deref(),
+                false => None,
+            };
+            node.configure_provider(change, &session.device_id, cookie)
+                .await
+        }
         "triage_settings" => {
             node_operator(node, session).await?;
             node.triage_settings().await
@@ -1857,6 +1867,225 @@ mod tests {
         assert_eq!(
             serde_json::to_value(reopened.settings_snapshot())?,
             saved["settings"]
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Provider keys are write-only: they reach the provider's own processes and nothing else,
+    /// not the replies, the shared store, the config or the log.
+    #[tokio::test]
+    async fn provider_keys_stay_in_the_private_file_and_switches_gate_the_roles() -> Result<()> {
+        use crate::config::{self, Config};
+        use crate::manager::ManagerKind;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("provider-keys-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let logs = dir.join("logs");
+        config::private_dir(&logs)?;
+        crate::logging::capture(&logs)?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        config.codex_socket = Some(dir.join("unavailable-codex.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let client = LocalIdentity::generate();
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&client, "browser", false)?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            })
+        };
+        let codex_key = "fixture-codex-secret-0123456789";
+        let cursor_key = "fixture-cursor-secret-0123456789";
+        let codex_home = dir.join("codex-home");
+        config::private_dir(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
+        )?;
+        let set_codex = json!({"provider":"codex","bin":"/fixture/codex",
+            "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":codex_home}});
+        let mut member = session(&client)?;
+        assert!(
+            dispatch(&node, &mut member, "configure_provider", set_codex.clone())
+                .await
+                .is_err(),
+            "only the owner changes providers"
+        );
+        assert!(!dir.join(crate::providers::ENV_FILE).exists());
+
+        let mut owner = session(&admin)?;
+        let saved = dispatch(&node, &mut owner, "configure_provider", set_codex).await?;
+        let cursor = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","env":{"CURSOR_API_KEY":cursor_key}}),
+        )
+        .await?;
+        let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
+        for reply in [&saved, &cursor, &read] {
+            let text = reply.to_string();
+            assert!(
+                !text.contains(codex_key) && !text.contains(cursor_key),
+                "{text}"
+            );
+        }
+        let codex = &read["providers"][0];
+        assert_eq!(codex["provider"], "codex");
+        assert_eq!(codex["bin"], "/fixture/codex");
+        assert!(codex["env"].as_array().unwrap().contains(
+            &json!({"name":"FIXTURE_CODEX_KEY","set":true,"inherited":false,"required":false})
+        ));
+        assert!(codex["env"].as_array().unwrap().contains(
+            &json!({"name":"FIXTURE_PROVIDER_KEY","set":false,"inherited":false,"required":true})
+        ));
+        assert_eq!(codex["state"], "needs_setup");
+        assert_eq!(
+            codex["issues"],
+            json!([{"code":"bin_missing","path":"/fixture/codex"},
+                {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+        );
+        assert_eq!(read["providers"][1]["env"][0]["set"], true);
+
+        let codex_env = node.provider_env(ManagerKind::CodexSdk);
+        let cursor_env = node.provider_env(ManagerKind::CursorSdk);
+        assert_eq!(codex_env["FIXTURE_CODEX_KEY"], codex_key);
+        assert!(!codex_env.contains_key("CURSOR_API_KEY"));
+        assert_eq!(cursor_env["CURSOR_API_KEY"], cursor_key);
+        assert!(!cursor_env.contains_key("FIXTURE_CODEX_KEY"));
+
+        crate::logging::write(&crate::logging::Record {
+            ts_ms: 1,
+            level: crate::logging::Level::Warn,
+            source: crate::logging::Source::Codex,
+            event: "codex.app_server.stderr".into(),
+            message: format!("Missing environment variable after {codex_key} and {cursor_key}"),
+            conversation_id: None,
+            work_id: None,
+            thread_id: None,
+            fields: Default::default(),
+        });
+        let mut files = vec![dir.clone()];
+        let mut checked = 0;
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path)?.map(|entry| entry.unwrap().path()));
+                continue;
+            }
+            if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            for key in [codex_key, cursor_key] {
+                assert!(
+                    !bytes
+                        .windows(key.len())
+                        .any(|window| window == key.as_bytes()),
+                    "{} holds a provider key",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 3 && logs.join("node.log").is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        for invalid in [
+            json!({"provider":"cursor","roles":["execution"]}),
+            json!({"provider":"cursor","bin":"/fixture/cursor"}),
+            json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
+        ] {
+            assert!(
+                dispatch(&node, &mut owner, "configure_provider", invalid)
+                    .await
+                    .is_err()
+            );
+        }
+        let off = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"codex","roles":["agent"],"env":{"FIXTURE_CODEX_KEY":null}}),
+        )
+        .await?;
+        assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
+        assert!(
+            off["providers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["name"] != "FIXTURE_CODEX_KEY")
+        );
+        let nodes = node
+            .rpc(
+                Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"nodes"}),
+            )
+            .await?;
+        assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
+        let cursor_off = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","enabled":false}),
+        )
+        .await?;
+        assert_eq!(cursor_off["providers"][1]["state"], "off");
+
+        drop(node);
+        let reopened = Runtime::open(&dir).await?;
+        let providers = reopened.providers();
+        assert!(!providers.switches.cursor.enabled);
+        assert!(!providers.switches.serves(
+            crate::providers::Provider::Codex,
+            crate::providers::Role::Execution
+        ));
+        assert_eq!(
+            providers.codex_bin,
+            std::path::PathBuf::from("/fixture/codex")
+        );
+        assert_eq!(
+            reopened.provider_env(ManagerKind::CursorSdk)["CURSOR_API_KEY"],
+            cursor_key
         );
         drop(reopened);
         std::fs::remove_dir_all(dir)?;

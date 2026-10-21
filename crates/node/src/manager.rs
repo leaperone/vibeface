@@ -45,6 +45,9 @@ pub struct ManagerConfig {
     pub tool_cli: Option<PathBuf>,
     #[serde(skip)]
     pub tool_env: BTreeMap<String, String>,
+    /// The variables this Node set for the provider of `kind`, over its own environment.
+    #[serde(skip)]
+    pub provider_env: BTreeMap<String, String>,
     #[serde(skip)]
     pub process_started: Option<agent::ProcessStarted>,
     #[serde(skip)]
@@ -66,6 +69,7 @@ impl Default for ManagerConfig {
             custom_tools: BTreeMap::new(),
             tool_cli: None,
             tool_env: BTreeMap::new(),
+            provider_env: BTreeMap::new(),
             process_started: None,
             cursor: None,
         }
@@ -151,13 +155,15 @@ where
                 .cursor
                 .as_ref()
                 .ok_or_else(|| not_started("this Node has no Cursor SDK bridge yet"))?;
-            let api_key = std::env::var("CURSOR_API_KEY").map_err(|_| {
+            let (api_key, env) = crate::providers::cursor_launch(&config.provider_env);
+            let api_key = api_key.ok_or_else(|| {
                 not_started("CURSOR_API_KEY is required for the Cursor SDK manager")
             })?;
             let turn = SdkTurn {
                 executable: config.cursor_sdk_bin.clone(),
                 workspace: config.workspace.clone(),
                 api_key,
+                env,
                 model: config.model.clone(),
                 timeout_secs: config.timeout_secs,
                 custom_tools: config.custom_tools.clone(),
@@ -235,8 +241,13 @@ where
             })?;
     }
     let mut command = Command::new(&config.node_bin);
-    let provider_keys = provider_environment_keys()?;
+    // The sidecar hands Codex only the variables it is told about.
+    let mut provider_keys = provider_environment_keys(&config.provider_env)?;
+    provider_keys.extend(config.provider_env.keys().cloned());
+    provider_keys.sort();
+    provider_keys.dedup();
     command
+        .envs(&config.provider_env)
         .arg(&config.codex_sdk_script)
         .env(
             "VIBEFACE_CODEX_PROVIDER_ENV_KEYS",
@@ -540,6 +551,7 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
     let mut values: Vec<_> = config
         .tool_env
         .values()
+        .chain(config.provider_env.values())
         .filter(|value| value.len() >= 8)
         .cloned()
         .collect();
@@ -555,7 +567,7 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
             .map(|(_, value)| value),
     );
     if config.kind == ManagerKind::CodexSdk
-        && let Ok(keys) = provider_environment_keys()
+        && let Ok(keys) = provider_environment_keys(&config.provider_env)
     {
         values.extend(
             keys.iter()
@@ -565,9 +577,13 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
     }
     values
 }
-fn provider_environment_keys() -> Result<Vec<String>> {
-    let home = std::env::var_os("CODEX_HOME")
+/// The variables the active model provider of Codex's configuration reads; `env` is what this
+/// Node sets for Codex, which may point it at another `CODEX_HOME`.
+pub(crate) fn provider_environment_keys(env: &BTreeMap<String, String>) -> Result<Vec<String>> {
+    let home = env
+        .get("CODEX_HOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")));
     let Some(home) = home else {
         return Ok(vec![]);

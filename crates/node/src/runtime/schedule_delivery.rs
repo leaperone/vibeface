@@ -17,8 +17,7 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 
 impl Runtime {
     fn scheduler_manager_metadata(&self) -> Value {
-        let settings = self.settings_snapshot();
-        let Some(manager) = &settings.manager else {
+        let Some(manager) = &self.assistant() else {
             return Value::Null;
         };
         let mut capabilities = manager.provider.capabilities();
@@ -56,7 +55,7 @@ impl Runtime {
 
     /// Queues the routines that are due in conversations this Node schedules.
     async fn fire_routines(self: &Arc<Self>) -> Result<()> {
-        if self.settings_snapshot().manager.is_none() {
+        if self.assistant().is_none() {
             return Ok(());
         }
         let Some(network) = self.store.lock().await.network()? else {
@@ -117,7 +116,7 @@ impl Runtime {
             self.finish_manager_attempt(&attempt).await;
             self.publish_changed(&network, &scope, &trigger);
         }
-        if self.settings_snapshot().manager.is_some() {
+        if self.assistant().is_some() {
             let scopes = self.store.lock().await.pending_scheduler_conversations()?;
             for scope in scopes {
                 self.start_schedule_consumer(network.clone(), scope).await;

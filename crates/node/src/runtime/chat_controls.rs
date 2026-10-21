@@ -213,8 +213,8 @@ impl Runtime {
             })
             .collect();
         drop(store);
-        let settings = self.settings_snapshot();
-        let manager = settings.manager.as_ref();
+        let assistant = self.assistant();
+        let manager = assistant.as_ref();
         Ok(json!({
             "conversation":conversation,
             "bot":bot,
