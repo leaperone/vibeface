@@ -1203,6 +1203,8 @@ pub(crate) enum NodeJoin {
 /// The join this Node runs for its own local page, one at a time.
 pub(crate) struct NodeJoinTask {
     link: String,
+    /// The local setup capability that started it; joining installs the network and retires it.
+    capability: String,
     status: NodeJoin,
     task: tokio::task::AbortHandle,
 }
@@ -1210,6 +1212,27 @@ pub(crate) struct NodeJoinTask {
 /// Starts, or reports, this fresh Node's join from its local page. A new link replaces an
 /// unfinished join; its commitment was never revealed for the new invite.
 async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
+    let capability = text(params, "capability")?.to_owned();
+    let link = text(params, "link")?.trim().to_owned();
+    let name = text(params, "name")?.to_owned();
+    ensure!(name.chars().count() <= 128, "device name is too long");
+    {
+        let mut slot = node
+            .node_join
+            .lock()
+            .map_err(|_| anyhow!("join state unavailable"))?;
+        // A failure is reported once; asking again after that starts over.
+        if let Some(current) = slot.as_ref()
+            && current.link == link
+            && current.capability == capability
+        {
+            let status = current.status.clone();
+            if matches!(status, NodeJoin::Failed) {
+                *slot = None;
+            }
+            return Ok(status);
+        }
+    }
     ensure!(
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
@@ -1217,20 +1240,11 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
     node.store
         .lock()
         .await
-        .verify_bootstrap_capability(text(params, "capability")?)?;
-    let link = text(params, "link")?.trim().to_owned();
-    let name = text(params, "name")?.to_owned();
-    ensure!(name.chars().count() <= 128, "device name is too long");
+        .verify_bootstrap_capability(&capability)?;
     let mut slot = node
         .node_join
         .lock()
         .map_err(|_| anyhow!("join state unavailable"))?;
-    if let Some(current) = slot.as_ref()
-        && current.link == link
-        && !matches!(current.status, NodeJoin::Failed)
-    {
-        return Ok(current.status.clone());
-    }
     if let Some(previous) = slot.take() {
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
@@ -1259,6 +1273,7 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
     .abort_handle();
     *slot = Some(NodeJoinTask {
         link,
+        capability,
         status: NodeJoin::Waiting,
         task,
     });
