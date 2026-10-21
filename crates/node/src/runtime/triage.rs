@@ -873,24 +873,30 @@ impl Runtime {
         Ok(true)
     }
 
-    /// Tells the webhook once that a question it was sent has its answer, wherever it was given.
+    /// Tells the webhook once per answer that stands on a question it was sent, wherever it was
+    /// given. When answers race, sync replaces this device's answer with the winner; the winner
+    /// then goes out under its own event ID, and an unsent earlier one is dropped.
     async fn send_answered(&self) -> Result<()> {
         let Ok(network) = self.network_id().await else {
             return Ok(());
         };
-        let answered: Vec<(String, String)> = {
+        let answered: Vec<(String, String, String)> = {
             let store = self.store.lock().await;
             let mut statement = store.connection.prepare(
-                "SELECT q.question_id,m.text FROM triage_outbox o JOIN questions q ON q.network_id=?1 AND q.question_id=o.event_id
+                "SELECT q.question_id,m.text,'answered-'||q.question_id||'-'||substr(m.event_hash,1,16) FROM triage_outbox o
+                 JOIN questions q ON q.network_id=?1 AND q.question_id=o.event_id
                  JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id
-                 WHERE NOT EXISTS(SELECT 1 FROM triage_outbox a WHERE a.event_id='answered-'||o.event_id)",
+                 WHERE NOT EXISTS(SELECT 1 FROM triage_outbox a WHERE a.event_id='answered-'||q.question_id||'-'||substr(m.event_hash,1,16))",
             )?;
             statement
-                .query_map([&network], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map([&network], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        for (question_id, text) in answered {
-            let event_id = format!("answered-{question_id}");
+        for (question_id, text, event_id) in answered {
+            self.store.lock().await.connection.execute(
+                "DELETE FROM triage_outbox WHERE event_id LIKE 'answered-'||?||'-%' AND state=?",
+                params![question_id, name(Delivery::Pending)?],
+            )?;
             let body = json!({"schema_version":triage::SCHEMA_VERSION,"type":"answered",
                 "event_id":event_id,"question_id":question_id,"text":text});
             self.queue_webhook(&event_id, &body).await?;
@@ -1998,6 +2004,7 @@ mod tests {
             Vec::<(axum::http::HeaderMap, String)>::new(),
         ));
         let sink = received.clone();
+        let log = received.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/hook", listener.local_addr()?);
         let server = tokio::spawn(async move {
@@ -2074,9 +2081,26 @@ mod tests {
             assert_eq!((body["type"].clone(), body["choices"][1].clone()), (json!("question"), json!({"index":1,"label":"不修"})));
             assert_eq!(body["answer"], json!({"url":node.decision_url(),"device_id":node.identity.device_id()?,"question_id":question}));
             let answered: Value = serde_json::from_str(&received[1].1)?;
-            assert_eq!(answered, json!({"schema_version":2,"type":"answered","event_id":format!("answered-{question}"),
+            let network = node.network_id().await?;
+            let hash = node.store.lock().await.message(&network, "c", &format!("a-{question}"))?.context("answer")?.event_hash;
+            assert_eq!(answered, json!({"schema_version":2,"type":"answered","event_id":format!("answered-{question}-{}", &hash[..16]),
                 "question_id":question,"text":"修"}));
             assert_eq!(node.triage_settings().await?["outbox"]["delivered"], 2);
+
+            // Another device's answer to the same question won by rank and replaced this one.
+            let winner = "0".repeat(64);
+            node.store.lock().await.connection.execute(
+                "UPDATE messages SET text='不修',event_hash=?1 WHERE network_id=?2 AND message_id=?3",
+                params![winner, network, format!("a-{question}")],
+            )?;
+            node.send_answered().await?;
+            node.send_answered().await?;
+            node.deliver_webhooks().await?;
+            let received = log.lock().unwrap().clone();
+            assert_eq!(received.len(), 3, "the winning answer follows once");
+            let corrected: Value = serde_json::from_str(&received[2].1)?;
+            assert_eq!((corrected["event_id"].clone(), corrected["text"].clone()),
+                (json!(format!("answered-{question}-{}", &winner[..16])), json!("不修")));
             assert_eq!(node.test_webhook().await?["ok"], true);
             Ok::<_, anyhow::Error>(())
         }

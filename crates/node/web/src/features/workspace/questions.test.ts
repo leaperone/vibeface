@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerScope, foldAnswers, openQuestions, placeByTime, projectName } from "./questions.ts"
+import { answerBody, answerScope, foldAnswers, openQuestions, placeByTime, projectName, settledAnswer } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/Users/me/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -82,4 +82,12 @@ test("questions go to the web, or to the web and Grok; nothing else", () => {
   assert.equal(parseTriageSettings(settings("both")).default_outlet, "both")
   assert.equal(parseTriageSettings(settings("record")).default_outlet, "record")
   for (const old of ["webhook", "off"]) assert.throws(() => parseTriageSettings(settings(old)), /无法识别/)
+})
+
+test("an answer replaced by another side's says so instead of vanishing", () => {
+  assert.equal(settledAnswer(undefined, undefined), undefined, "an open question has nothing settled")
+  assert.deepEqual(settledAnswer(undefined, "继续"), { text: "继续", elsewhere: false }, "this browser's answer shows before the network has it")
+  assert.deepEqual(settledAnswer("继续", "继续"), { text: "继续", elsewhere: false })
+  assert.deepEqual(settledAnswer("停下", undefined), { text: "停下", elsewhere: false }, "an answer given elsewhere with nothing tried here")
+  assert.deepEqual(settledAnswer("停下", "继续"), { text: "停下", elsewhere: true }, "the other side's answer won the race")
 })

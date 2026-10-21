@@ -1882,8 +1882,8 @@ def triage_checks(run, workspace, a, network, passed):
                 and acted[0]["replies"][0]["delivery"] == acted[0]["replies"][1]["delivery"] and len(sends) == 1,
                 "a text answer reaches the session once through the assistant; a retry reads it back")
         told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
-                        if row["event_id"] == "answered-" + question_id and row["status"] == 200] or None, timeout=60)
-        require(told[-1]["body"] == {"schema_version": 2, "type": "answered", "event_id": "answered-" + question_id,
+                        if row["event_id"].startswith("answered-" + question_id + "-") and row["status"] == 200] or None, timeout=60)
+        require(told[-1]["body"] == {"schema_version": 2, "type": "answered", "event_id": told[-1]["event_id"],
                                      "question_id": question_id, "text": "继续，先跑测试"}, "the webhook learns the answer given in the web")
 
         tokens = a.client.call("create_decision_token", {"label": "grok"})

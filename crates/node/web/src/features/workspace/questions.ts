@@ -15,6 +15,16 @@ export function answerBody(questionId: string, text: string) {
   return { type: "message_posted", message_id: answerId(questionId), role: "user", text, report_results: true, answers: questionId }
 }
 
+/**
+ * What a settled question shows. `standing`: the answer the network holds. `mine`: what this browser answered.
+ * When answers raced and another side's won, `elsewhere` says so instead of the person's text vanishing.
+ */
+export function settledAnswer(standing: string | undefined, mine: string | undefined) {
+  const text = standing ?? mine
+  if (text === undefined) return undefined
+  return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
+}
+
 /** What 待处理 lists: questions nobody answered, newest first. */
 export function openQuestions(questions: readonly Question[]): Question[] {
   return questions.filter((question) => question.answer === null).sort((a, b) => b.created_at_ms - a.created_at_ms)

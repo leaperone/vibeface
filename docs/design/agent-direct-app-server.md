@@ -190,7 +190,7 @@ Codex SDK sidecar 的协调回合总是用 `sandboxMode=danger-full-access`、`a
 出口按项目选择：`config.json` 的 `triage.projects` 按 `cwd` 前缀匹配，最长前缀优先，没有匹配时用 `triage.default_outlet`。取值为 `record`（默认）和 `both`，提问总会写进聊天。
 
 - **record**：写一条 `QuestionAsked` 事件，作用域为拥有该会话的助手会话，随 DAG 同步；网页在聊天和“待处理”里显示。
-- **both**：另外 HMAC 签名 POST 到 `triage.webhook_url`。请求头 `X-Vibeface-Event-Id`、`X-Vibeface-Timestamp`（Unix 秒）、`X-Vibeface-Signature: v1=<hex>`，签名为 `HMAC-SHA256(key, timestamp + "." + body)`。正文为 `{"type":"question", question_id, severity, text, choices: [{index, label}], about, assistant, answer: {url, device_id, question_id}}`，`event_id` 为提问 ID；任一侧回答后，提问方 Node 再发 `{"type":"answered", question_id, text}`，`event_id` 为 `answered-` 加提问 ID。`schema_version` 为 2。接收方应拒绝 5 分钟以外的时间戳，并按 `event_id` 去重。发件箱存在本机 SQLite（不同步）：2xx 记为已送达；408、429 和 5xx 退避重试（10 秒起翻倍），最多 8 次后进入死信；其他 4xx 直接死信。同一 `event_id` 只入队一次。
+- **both**：另外 HMAC 签名 POST 到 `triage.webhook_url`。请求头 `X-Vibeface-Event-Id`、`X-Vibeface-Timestamp`（Unix 秒）、`X-Vibeface-Signature: v1=<hex>`，签名为 `HMAC-SHA256(key, timestamp + "." + body)`。正文为 `{"type":"question", question_id, severity, text, choices: [{index, label}], about, assistant, answer: {url, device_id, question_id}}`，`event_id` 为提问 ID；任一侧回答后，提问方 Node 再发 `{"type":"answered", question_id, text}`，`event_id` 为 `answered-<提问 ID>-<回答事件哈希前 16 位>`；并发回答被同步换成胜者时，按胜者再发一次。`schema_version` 为 2。接收方应拒绝 5 分钟以外的时间戳，并按 `event_id` 去重。发件箱存在本机 SQLite（不同步）：2xx 记为已送达；408、429 和 5xx 退避重试（10 秒起翻倍），最多 8 次后进入死信；其他 4xx 直接死信。同一 `event_id` 只入队一次。
 
 密钥只存在数据目录的 `triage-webhook.key`（0600），不进 `config.json`、DAG、日志和诊断包。网页只能设置或清除，读不回来。
 

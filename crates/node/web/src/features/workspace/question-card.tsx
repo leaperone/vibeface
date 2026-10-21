@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input"
 import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
-import { agentName, projectName } from "./questions"
+import { agentName, projectName, settledAnswer } from "./questions"
 import type { Question, Severity } from "./types"
 
 const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> = {
@@ -28,11 +28,12 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const action = useAction()
   const [text, setText] = useState("")
   const id = question.question_id
-  const settled = answer ?? question.answer?.text ?? workspace.answered[id]
-  if (settled !== undefined) return <p role={answer === undefined && !question.answer ? "status" : undefined} className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
-    <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
+  const standing = answer ?? question.answer?.text
+  const settled = settledAnswer(standing, workspace.answered[id])
+  if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
+    {settled.elsewhere ? <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
     <span className="min-w-0 flex-1 truncate" title={question.text}>{question.text}</span>
-    <span className="max-w-[50%] shrink-0 truncate text-foreground" title={settled}>已回答 · {settled}</span>
+    <span className="max-w-[50%] shrink-0 truncate text-foreground" title={settled.text}>{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
   </p>
 
   const pending = workspace.pendingAnswers.find((item) => item.question_id === id)

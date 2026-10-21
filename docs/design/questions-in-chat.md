@@ -6,7 +6,7 @@
 
 - 协调 Agent 要本人拍板时，在拥有该会话的助手聊天里发一条提问：问题、可选答案、所涉设备和项目。提问是会话事件，和消息一样同步。
 - 本人的回答（点选项或输入文字）是这个聊天里发给助手的一条消息。助手把它当作普通一轮的输入，输入里写明回答的是哪个问题，再自己执行，例如 `vibeface codex send|respond`。
-- 每个问题只有一个回答 ID，由问题 ID 派生。网页、Grok 或重试写的回答都是这一个 ID，所以“已回答”是一个事实，助手只为它跑一轮。
+- 每个问题只有一个回答 ID，由问题 ID 派生。网页、Grok 或重试写的回答都是这一个 ID，所以“已回答”是一个事实，助手只为它跑一轮。两端同时写下不同文字时 rank 小者胜，输方网页把自己的回答换成“已由另一端回答：<胜者文字>”，不让它悄悄消失。
 - Grok 经现有 webhook 发件箱收到同一个问题，经现有 `POST /api/decision` 回答，落成聊天里的同一条回答。任一侧回答后，提问方 Node 再经发件箱通知 Grok 已回答。
 - 待处理页列出全部会话里未回答的问题，可以就地回答，并能跳到对应聊天。
 
@@ -103,7 +103,7 @@ Agent 侧（CLI → `/api/triage`）：
 
 Grok 侧：
 
-- webhook 事件 `{"type":"question", question_id, severity, text, choices[{index,label}], about, assistant, answer:{url, device_id, question_id}}` 和 `{"type":"answered", question_id, text}`，`event_id` 分别为问题 ID 与 `answered-` + 问题 ID。
+- webhook 事件 `{"type":"question", question_id, severity, text, choices[{index,label}], about, assistant, answer:{url, device_id, question_id}}` 和 `{"type":"answered", question_id, text}`，`event_id` 分别为问题 ID 与 `answered-<问题 ID>-<回答事件哈希前 16 位>`。两端同时回答时 rank 小者胜，同步把输方本机的回答换成胜者；提问方 Node 按新的回答再发一次 `answered`，未送出的旧 `answered` 撤下。接收方以同一 `question_id` 最后收到的为准。
 - `POST /api/decision { device_id, question_id, choice | text }`：返回 `{question_id, answer_id, status: "answered" | "already_answered", text}`。重试同一请求只读回。
 
 助手一轮的输入：`trigger.event` 是回答消息，另附 `trigger.question`（问题全文、选项和 Subject），说明它回答哪个问题。提示要求助手用回答消息的 `message_id` 作为 `vibeface codex send --id`，结果未知时重试只读回。
