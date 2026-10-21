@@ -446,6 +446,15 @@ impl Runtime {
                 self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
+            // Another device's routing turn hands over a session this device runs.
+            "triage_assign" => {
+                self.attribute_session(
+                    network,
+                    field(input, "question_id")?,
+                    field(input, "conversation_id")?,
+                )
+                .await
+            }
             "cancel_manager" | "resolve" => {
                 ensure!(
                     input["human"] == true,

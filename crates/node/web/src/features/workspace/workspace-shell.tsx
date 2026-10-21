@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, Settings, ShieldCheck, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
@@ -106,6 +106,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
+                        {workspace.primary === bot.conversation_id ? <Star aria-label="主助手" className="size-3.5 shrink-0 fill-current text-muted-foreground" /> : null}
                         {marked ? <span aria-label="有新进展" className="size-2 shrink-0 rounded-full bg-warning" /> : null}
                       </Link>
                     </SidebarMenuButton>

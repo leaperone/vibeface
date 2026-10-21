@@ -70,7 +70,7 @@ export function ConversationScreen() {
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <QuestionCard question={question} answer={folded.answers.get(question.question_id)} /> })),
-    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} /> })),
+    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id)?.name ?? '另一个助手'} /> })),
   ])
 
   const entries: ChatEntry[] = []
@@ -224,11 +224,11 @@ function TaskMeta({ device, state, className = '' }: { device: string; state: st
   </span>
 }
 
-/** A session handed to this assistant: from here on its questions come to this chat. */
-function HandoffRow({ session }: { session: SessionHandoff }) {
+/** A session handed to this assistant, or by this primary assistant to another one. */
+function HandoffRow({ session, owner }: { session: SessionHandoff; owner: string | null }) {
   return <p className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
     <ArrowDownToLine aria-hidden="true" className="size-4 shrink-0" />
-    <span className="shrink-0 text-foreground">接手 {agentName(session.agent)} 会话</span>
+    <span className="shrink-0 text-foreground">{owner ? `${agentName(session.agent)} 会话交给了 ${owner}` : `接手 ${agentName(session.agent)} 会话`}</span>
     <span aria-hidden="true">·</span>
     <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
     {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}

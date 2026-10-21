@@ -88,7 +88,11 @@ fn questions_from(
         .collect()
 }
 
-fn question_from(connection: &Connection, network: &str, question: &str) -> Result<Option<Value>> {
+pub(super) fn question_from(
+    connection: &Connection,
+    network: &str,
+    question: &str,
+) -> Result<Option<Value>> {
     Ok(questions_from(
         connection,
         network,
@@ -147,22 +151,28 @@ impl Store {
         )
     }
 
-    /// Sessions handed to this conversation's assistant, for its handoff cards.
+    /// Sessions handed to this conversation's assistant, and those its routing turns handed to
+    /// another, for the handoff lines in its chat.
     pub fn attributed_sessions(&self, network: &str, scope: &str) -> Result<Vec<Value>> {
         let mut statement = self.connection.prepare(
-            "SELECT node,session_id,attribution,created_at_ms FROM session_owners WHERE network_id=? AND conversation_id=? AND attribution IS NOT NULL ORDER BY rank",
+            "SELECT o.node,o.session_id,o.attribution,o.created_at_ms,o.conversation_id FROM session_owners o
+             WHERE o.network_id=?1 AND o.attribution IS NOT NULL AND (o.conversation_id=?2 OR EXISTS(
+               SELECT 1 FROM messages m WHERE m.network_id=?1 AND m.conversation_id=?2 AND m.role='assistant'
+               AND m.in_reply_to=json_extract(o.attribution,'$.question_id')))
+             ORDER BY o.rank",
         )?;
-        let rows: Vec<(String, String, String, i64)> = statement
+        let rows: Vec<(String, String, String, i64, String)> = statement
             .query_map(params![network, scope], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
         rows.into_iter()
-            .map(|(node, session, attribution, created_at_ms)| {
+            .map(|(node, session, attribution, created_at_ms, owner)| {
                 let mut session_row: Value = serde_json::from_str(&attribution)?;
                 session_row["node"] = json!(node);
                 session_row["session_id"] = json!(session);
                 session_row["created_at_ms"] = json!(created_at_ms);
+                session_row["conversation_id"] = json!(owner);
                 Ok(session_row)
             })
             .collect()

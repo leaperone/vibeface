@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -27,6 +27,8 @@ const BATCH: usize = 20;
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 const SCAN_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const SEEN_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+/// How long the primary assistant has to route a session before it keeps the session itself.
+const ROUTE_WITHIN: Duration = Duration::from_secs(600);
 /// How long an App Server request waits for the coordination Agent before the fallback answer.
 pub(crate) const AGENT_ANSWER_WITHIN: Duration = Duration::from_secs(120);
 const WEBHOOK_KEY: &str = "triage-webhook.key";
@@ -44,8 +46,9 @@ pub(crate) struct TriageState {
     outbox: tokio::sync::Notify,
     /// App Server threads' working directory and last answer, for their turn-end events.
     threads: std::sync::Mutex<HashMap<String, (String, String)>>,
-    /// Held while answered session questions are acted on, so routing turns never overlap.
-    routing: tokio::sync::Mutex<()>,
+    /// This device's sessions the user chose to ignore, so their events drop without the store.
+    /// A restart learns them again from the answers.
+    ignored: std::sync::Mutex<HashSet<String>>,
     started_ms: i64,
 }
 
@@ -58,7 +61,7 @@ impl TriageState {
             wake: Default::default(),
             outbox: Default::default(),
             threads: Default::default(),
-            routing: Default::default(),
+            ignored: Default::default(),
             started_ms: now_ms(),
         }
     }
@@ -233,6 +236,11 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 impl Runtime {
+    /// A session that gained an owner is no longer ignored.
+    pub(super) fn forget_ignored(&self, session: &str) {
+        lock(&self.triage.ignored).remove(session);
+    }
+
     async fn network_id(&self) -> Result<String> {
         Ok(self.membership_state().await?.genesis.network_id)
     }
@@ -254,6 +262,9 @@ impl Runtime {
         if event.test {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
+        }
+        if lock(&self.triage.ignored).contains(&event.session_id) {
+            return Ok(json!({"status":"foreign","event_id":event.event_id}));
         }
         // Nothing is triaged before the Node joins a network.
         let network = self.network_id().await?;
@@ -305,7 +316,10 @@ impl Runtime {
         event: &AgentEvent,
     ) -> Result<Option<(Value, String)>> {
         let question_id = triage::session_question_id(&event.node, &event.session_id);
-        if store.question(network, &question_id)?.is_some() {
+        if let Some(standing) = store.question(network, &question_id)? {
+            if standing["answer"]["text"] == IGNORE {
+                lock(&self.triage.ignored).insert(event.session_id.clone());
+            }
             return Ok(None);
         }
         let mut choices = [IGNORE, HANDLE]
@@ -559,15 +573,9 @@ impl Runtime {
                 if let Err(error) = node.send_answered().await {
                     tracing::warn!(%error, "could not tell the webhook about answers");
                 }
-                // A routing turn takes as long as the Agent does; expiry keeps its own pace.
-                let routing = node.clone();
-                tokio::spawn(async move {
-                    if let Ok(_routing) = routing.triage.routing.try_lock()
-                        && let Err(error) = routing.route_sessions().await
-                    {
-                        tracing::warn!(%error, "could not hand over answered sessions");
-                    }
-                });
+                if let Err(error) = node.route_sessions().await {
+                    tracing::warn!(%error, "could not hand over answered sessions");
+                }
             }
         });
         let node = self.clone();
@@ -719,6 +727,24 @@ impl Runtime {
         if action == "assign" {
             let question = super::id(&input, "question_id")?;
             let conversation = super::id(&input, "conversation_id")?;
+            let asked = self
+                .store
+                .lock()
+                .await
+                .question(&network, &question)?
+                .context("no such question")?;
+            // The device running the session hands it over; a routing turn may run elsewhere.
+            if let Some(node) = asked["about"]["node"].as_str()
+                && node != self.identity.device_id()?
+            {
+                return self
+                    .peer_request(
+                        &network,
+                        node,
+                        json!({"type":"triage_assign","question_id":question,"conversation_id":conversation}),
+                    )
+                    .await;
+            }
             return self
                 .attribute_session(&network, &question, &conversation)
                 .await;
@@ -858,24 +884,30 @@ impl Runtime {
         Ok(true)
     }
 
-    /// Tells the webhook once that a question it was sent has its answer, wherever it was given.
+    /// Tells the webhook once per answer that stands on a question it was sent, wherever it was
+    /// given. When answers race, sync replaces this device's answer with the winner; the winner
+    /// then goes out under its own event ID, and an unsent earlier one is dropped.
     async fn send_answered(&self) -> Result<()> {
         let Ok(network) = self.network_id().await else {
             return Ok(());
         };
-        let answered: Vec<(String, String)> = {
+        let answered: Vec<(String, String, String)> = {
             let store = self.store.lock().await;
             let mut statement = store.connection.prepare(
-                "SELECT q.question_id,m.text FROM triage_outbox o JOIN questions q ON q.network_id=?1 AND q.question_id=o.event_id
+                "SELECT q.question_id,m.text,'answered-'||q.question_id||'-'||substr(m.event_hash,1,16) FROM triage_outbox o
+                 JOIN questions q ON q.network_id=?1 AND q.question_id=o.event_id
                  JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id
-                 WHERE NOT EXISTS(SELECT 1 FROM triage_outbox a WHERE a.event_id='answered-'||o.event_id)",
+                 WHERE NOT EXISTS(SELECT 1 FROM triage_outbox a WHERE a.event_id='answered-'||q.question_id||'-'||substr(m.event_hash,1,16))",
             )?;
             statement
-                .query_map([&network], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map([&network], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        for (question_id, text) in answered {
-            let event_id = format!("answered-{question_id}");
+        for (question_id, text, event_id) in answered {
+            self.store.lock().await.connection.execute(
+                "DELETE FROM triage_outbox WHERE event_id LIKE 'answered-'||?||'-%' AND state=?",
+                params![question_id, name(Delivery::Pending)?],
+            )?;
             let body = json!({"schema_version":triage::SCHEMA_VERSION,"type":"answered",
                 "event_id":event_id,"question_id":question_id,"text":text});
             self.queue_webhook(&event_id, &body).await?;
@@ -904,19 +936,34 @@ impl Runtime {
     }
 
     /// `triage assign`: the session a session question is about goes to this assistant, once.
-    async fn attribute_session(
+    pub(super) async fn attribute_session(
         &self,
         network: &str,
         question: &str,
         conversation: &str,
     ) -> Result<Value> {
-        let (owner, event) = self.store.lock().await.attribute_session(
-            &self.identity,
-            network,
-            question,
-            conversation,
-            now_ms(),
-        )?;
+        let (owner, event, session) = {
+            let mut store = self.store.lock().await;
+            let (owner, event) = store.attribute_session(
+                &self.identity,
+                network,
+                question,
+                conversation,
+                now_ms(),
+            )?;
+            let asked = store
+                .question(network, question)?
+                .context("question missing")?;
+            (
+                owner,
+                event,
+                asked["about"]["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        self.forget_ignored(&session);
         if let Some(event) = &event {
             tracing::info!(
                 event = "session.attributed",
@@ -929,116 +976,89 @@ impl Runtime {
         Ok(json!({"question_id":question,"conversation_id":owner,"attributed":event.is_some()}))
     }
 
-    /// Acts on answered questions about this device's sessions that no assistant owns yet:
-    /// `忽略` leaves them, a `交给` choice hands them over, anything else gets one routing turn
-    /// of the coordination Agent and then the closest assistant by project path, or the first.
+    /// Acts on answered questions about sessions no assistant owns yet, except `忽略`. The device
+    /// running the session hands it to a `交给` choice, or to the primary assistant once that
+    /// assistant's routing turn replied without handing it over, or after `ROUTE_WITHIN`. The
+    /// Node scheduling the primary assistant gives every other answer one routing turn there.
     async fn route_sessions(&self) -> Result<()> {
         let Ok(network) = self.network_id().await else {
             return Ok(());
         };
         let local = self.identity.device_id()?;
-        // ponytail: ignored sessions are read again every pass; mark them if they pile up.
-        let answered: Vec<(String, String)> = {
+        let answered: Vec<(String, String, String, i64)> = {
             let store = self.store.lock().await;
             let mut statement = store.connection.prepare(
-                "SELECT q.question_id,m.text FROM questions q
+                "SELECT q.question_id,m.text,q.node,m.created_at_ms FROM questions q
                  JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id
-                 WHERE q.network_id=?1 AND q.conversation_id=?2 AND q.node=?3 AND m.text<>?4
+                 WHERE q.network_id=?1 AND q.conversation_id=?2 AND m.text<>?3
                  AND NOT EXISTS(SELECT 1 FROM session_owners o WHERE o.network_id=q.network_id AND o.node=q.node AND o.session_id=q.session_id)
                  ORDER BY q.rank",
             )?;
             statement
-                .query_map(params![network, SESSIONS_SCOPE, local, IGNORE], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
+                .query_map(params![network, SESSIONS_SCOPE, IGNORE], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?
         };
-        for (question_id, answer) in answered {
-            let (question, bots) = {
+        for (question_id, answer, node, answered_at) in answered {
+            let (question, primary) = {
                 let store = self.store.lock().await;
                 (
                     store
                         .question(&network, &question_id)?
                         .context("question missing")?,
-                    store.bots(&network)?,
+                    store.primary_assistant(&network)?,
                 )
             };
-            if bots.is_empty() {
+            let Some(primary) = primary else {
                 tracing::info!(question = %question_id, "no assistant to hand the session to yet");
                 continue;
-            }
+            };
             let chosen = question["choices"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .find(|choice| choice["label"] == answer.as_str())
                 .and_then(|choice| choice["conversation_id"].as_str());
-            if let Some(conversation) = chosen {
-                self.attribute_session(&network, &question_id, conversation)
-                    .await?;
-                continue;
+            if node == local {
+                if let Some(conversation) = chosen {
+                    self.attribute_session(&network, &question_id, conversation)
+                        .await?;
+                    continue;
+                }
+                let replied = self.store.lock().await.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=? AND conversation_id=? AND role='assistant' AND in_reply_to=?)",
+                    params![network, primary, question_id],
+                    |r| r.get::<_, bool>(0),
+                )?;
+                if replied || now_ms() - answered_at > ROUTE_WITHIN.as_millis() as i64 {
+                    tracing::info!(
+                        event = "session.routing",
+                        question_id,
+                        conversation_id = primary,
+                        replied,
+                        "the primary assistant keeps the session"
+                    );
+                    self.attribute_session(&network, &question_id, &primary)
+                        .await?;
+                    continue;
+                }
             }
-            let assistants: Vec<Value> = bots
-                .iter()
-                .map(|bot| json!({"conversation_id":bot.conversation_id,"name":bot.name,"project":bot.project}))
-                .collect();
-            tracing::info!(
-                event = "session.routing",
-                question_id,
-                thread_id = question["about"]["session_id"].as_str(),
-                "routing a session to an assistant"
-            );
-            if let Err(error) = self
-                .coordination_turn(|cli| {
-                    triage::routing_prompt(&question, &answer, &assistants, cli)
-                })
-                .await
+            if chosen.is_none()
+                && self
+                    .store
+                    .lock()
+                    .await
+                    .admit_route(&local, &network, &primary, &question_id)?
             {
-                tracing::warn!(%error, question = %question_id, "routing turn failed");
+                tracing::info!(
+                    event = "session.routing",
+                    question_id,
+                    conversation_id = primary,
+                    "routing a session in the primary assistant's chat"
+                );
+                self.wake_scheduler()?;
             }
-            let about: Subject = serde_json::from_value(question["about"].clone())?;
-            if self
-                .store
-                .lock()
-                .await
-                .session_owner(&network, &about.node, &about.session_id)?
-                .is_some()
-            {
-                continue;
-            }
-            let ranked: Vec<String> = {
-                let store = self.store.lock().await;
-                let mut statement = store
-                    .connection
-                    .prepare("SELECT conversation_id FROM bots WHERE network_id=? ORDER BY rank")?;
-                statement
-                    .query_map([&network], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            // The longest project path that holds the session, the earliest assistant on a tie.
-            let depth = |conversation: &String| {
-                bots.iter()
-                    .find(|bot| &bot.conversation_id == conversation)
-                    .and_then(|bot| bot.project.as_ref())
-                    .filter(|project| {
-                        project.target_node == about.node
-                            && Path::new(&about.cwd).starts_with(&project.cwd)
-                    })
-                    .map_or(0, |project| project.cwd.len() + 1)
-            };
-            let conversation = ranked
-                .iter()
-                .fold(None, |best: Option<(&String, usize)>, conversation| {
-                    let deeper = depth(conversation);
-                    match best {
-                        Some((_, depth)) if depth >= deeper => best,
-                        _ => Some((conversation, deeper)),
-                    }
-                })
-                .map(|(conversation, _)| conversation.clone())
-                .context("no assistant to hand the session to")?;
-            self.attribute_session(&network, &question_id, &conversation)
-                .await?;
         }
         Ok(())
     }
@@ -1895,12 +1915,12 @@ mod tests {
                 async move { node.store.lock().await.session_owner(&network, &local, session) }
             };
             assert_eq!(owner("s1").await?.as_deref(), Some("c"));
-            assert_eq!(owner("s3").await?.as_deref(), Some("c"), "without a routing turn the first assistant takes it");
+            assert_eq!(owner("s3").await?, None, "处理 waits for the primary assistant's routing turn");
             assert_eq!(owner("s2").await?, None);
             let again = node.triage_command(json!({"action":"assign","question_id":s1,"conversation_id":"other"})).await?;
             assert_eq!((again["conversation_id"].clone(), again["attributed"].clone()), (json!("c"), json!(false)));
             let handed = node.store.lock().await.attributed_sessions(&network, "c")?;
-            assert_eq!(handed.iter().map(|s| s["session_id"].clone()).collect::<Vec<_>>(), vec![json!("s1"), json!("s3")]);
+            assert_eq!(handed.iter().map(|s| s["session_id"].clone()).collect::<Vec<_>>(), vec![json!("s1")]);
 
             assert_eq!(node.ingest_agent_event(turn("s2", "t2", "/w")).await?["status"], "foreign");
             let accepted = node.ingest_agent_event(turn("s1", "t3", "/w")).await?;
@@ -1920,6 +1940,253 @@ mod tests {
         result
     }
 
+    /// Ends the routing turn queued in `conversation` for `question` without a hand-over.
+    async fn end_routing_turn(node: &Runtime, conversation: &str, question: &str) -> Result<()> {
+        let network = node.network_id().await?;
+        let trigger = crate::scheduling::route_trigger(question);
+        let mut store = node.store.lock().await;
+        let claimed = store
+            .claim_next(&node.identity, &network, conversation, "boot", "cfg")?
+            .context("no routing turn queued")?;
+        assert_eq!(claimed.job.trigger, trigger);
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started(conversation, &trigger, &attempt)?;
+        store.finish_job(
+            &node.identity,
+            &network,
+            conversation,
+            &trigger,
+            &attempt,
+            crate::scheduling::JobOutcome::Failed("no answer".into()),
+            "",
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// `处理` gives the primary assistant one routing turn in its chat. A turn that ends without
+    /// a hand-over leaves the session with the primary; a hand-over shows in both chats. Picking
+    /// another primary sends the next session there.
+    #[tokio::test]
+    async fn an_unowned_session_goes_to_the_primary_assistant() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            assistant(&node, &admin, "c", "前端", &[]).await?;
+            assistant(&node, &admin, "d", "后端", &[]).await?;
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let owner = |session: &'static str| {
+                let node = node.clone();
+                let network = network.clone();
+                let local = local.clone();
+                async move {
+                    node.store
+                        .lock()
+                        .await
+                        .session_owner(&network, &local, session)
+                }
+            };
+            let handle = |session: &'static str| {
+                let node = node.clone();
+                let question = triage::session_question_id(&local, session);
+                async move {
+                    node.ingest_agent_event(turn(session, "t1", "/w")).await?;
+                    assert_eq!(answer(&node, &question, "处理").await?, "answered");
+                    node.route_sessions().await?;
+                    node.route_sessions().await?;
+                    Ok::<_, anyhow::Error>(question)
+                }
+            };
+            let routing = |conversation: &'static str| {
+                let node = node.clone();
+                async move {
+                    let jobs = node.store.lock().await.scheduler_jobs(conversation)?;
+                    Ok::<_, anyhow::Error>(
+                        jobs.into_iter().map(|job| job.trigger).collect::<Vec<_>>(),
+                    )
+                }
+            };
+
+            let s1 = handle("s1").await?;
+            assert_eq!(
+                routing("c").await?,
+                vec![crate::scheduling::route_trigger(&s1)],
+                "one routing turn in the first assistant's chat"
+            );
+            assert_eq!(owner("s1").await?, None);
+            end_routing_turn(&node, "c", &s1).await?;
+            node.route_sessions().await?;
+            assert_eq!(
+                owner("s1").await?.as_deref(),
+                Some("c"),
+                "the primary keeps a session its turn did not hand over"
+            );
+
+            let s2 = handle("s2").await?;
+            node.triage_command(json!({"action":"assign","question_id":s2,"conversation_id":"d"}))
+                .await?;
+            end_routing_turn(&node, "c", &s2).await?;
+            node.route_sessions().await?;
+            assert_eq!(
+                owner("s2").await?.as_deref(),
+                Some("d"),
+                "the routing turn handed it over"
+            );
+            let lines = |conversation: &'static str| {
+                let node = node.clone();
+                let network = network.clone();
+                async move {
+                    let rows = node
+                        .store
+                        .lock()
+                        .await
+                        .attributed_sessions(&network, conversation)?;
+                    Ok::<_, anyhow::Error>(
+                        rows.iter()
+                            .map(|row| (row["session_id"].clone(), row["conversation_id"].clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            };
+            assert_eq!(
+                lines("c").await?,
+                vec![(json!("s1"), json!("c")), (json!("s2"), json!("d"))],
+                "the primary's chat shows both outcomes"
+            );
+            assert_eq!(lines("d").await?, vec![(json!("s2"), json!("d"))]);
+
+            let set = admin.attest(
+                &network,
+                crate::model::ASSISTANTS_SCOPE,
+                EventBody::PrimaryAssistantSet {
+                    conversation_id: "d".into(),
+                    attestation: None,
+                },
+            )?;
+            node.store.lock().await.append_event(
+                &node.identity,
+                &network,
+                crate::model::ASSISTANTS_SCOPE,
+                set,
+                vec![],
+                now_ms(),
+            )?;
+            let s3 = handle("s3").await?;
+            assert_eq!(
+                routing("d").await?,
+                vec![crate::scheduling::route_trigger(&s3)],
+                "the next session goes to the new primary"
+            );
+            let text = "发票导出\n很慢";
+            let posted = admin.attest(
+                &network,
+                "c",
+                EventBody::MessagePosted {
+                    message_id: "m1".into(),
+                    role: crate::model::Role::User,
+                    text: text.into(),
+                    attachments: vec![],
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    answers: None,
+                    attestation: None,
+                },
+            )?;
+            let signed = posted.attestation().cloned().context("signed")?;
+            node.store.lock().await.accept_message(
+                &node.identity,
+                &network,
+                "c",
+                "m1",
+                text,
+                vec![],
+                true,
+                signed,
+                now_ms(),
+            )?;
+            let context =
+                crate::scheduler::route_context(&*node.store.lock().await, &network, "d", &s3)?;
+            assert_eq!(
+                (
+                    context["question"]["question_id"].clone(),
+                    context["question"]["answer"]["text"].clone()
+                ),
+                (json!(s3), json!("处理"))
+            );
+            let others = context["assistants"].as_array().context("assistants")?;
+            assert_eq!(
+                others.len(),
+                1,
+                "the routing turn sees every other assistant"
+            );
+            assert_eq!(
+                (
+                    others[0]["conversation_id"].clone(),
+                    others[0]["name"].clone(),
+                    others[0]["project"].clone()
+                ),
+                (json!("c"), json!("前端"), Value::Null)
+            );
+            assert_eq!(
+                others[0]["recent"]
+                    .as_array()
+                    .and_then(|recent| recent.last()),
+                Some(&json!({"role":"user","text":"发票导出 很慢"})),
+                "with what its chat said last"
+            );
+            end_routing_turn(&node, "d", &s3).await?;
+            node.route_sessions().await?;
+            assert_eq!(owner("s3").await?.as_deref(), Some("d"));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// An ignored session's events drop without waiting for the store; once the session is
+    /// handed over they reach the Agent again.
+    #[tokio::test]
+    async fn an_ignored_session_drops_its_events_without_the_store() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            assistant(&node, &admin, "c", "前端", &[]).await?;
+            let question = triage::session_question_id(&node.identity.device_id()?, "s1");
+            node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            assert_eq!(answer(&node, &question, "忽略").await?, "answered");
+            assert_eq!(
+                node.ingest_agent_event(turn("s1", "t2", "/w")).await?["status"],
+                "foreign"
+            );
+            let busy = node.store.lock().await;
+            let dropped = tokio::time::timeout(
+                Duration::from_secs(2),
+                node.ingest_agent_event(turn("s1", "t3", "/w")),
+            )
+            .await;
+            drop(busy);
+            assert_eq!(
+                dropped.context("an ignored session's event waited for the store")??["status"],
+                "foreign"
+            );
+            node.triage_command(
+                json!({"action":"assign","question_id":question,"conversation_id":"c"}),
+            )
+            .await?;
+            assert_eq!(
+                node.ingest_agent_event(turn("s1", "t4", "/w")).await?["status"],
+                "accepted"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
     #[tokio::test]
     async fn events_dedupe_and_questions_go_once_to_the_owner_and_signed_webhooks() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -1927,6 +2194,7 @@ mod tests {
             Vec::<(axum::http::HeaderMap, String)>::new(),
         ));
         let sink = received.clone();
+        let log = received.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/hook", listener.local_addr()?);
         let server = tokio::spawn(async move {
@@ -2003,9 +2271,26 @@ mod tests {
             assert_eq!((body["type"].clone(), body["choices"][1].clone()), (json!("question"), json!({"index":1,"label":"不修"})));
             assert_eq!(body["answer"], json!({"url":node.decision_url(),"device_id":node.identity.device_id()?,"question_id":question}));
             let answered: Value = serde_json::from_str(&received[1].1)?;
-            assert_eq!(answered, json!({"schema_version":2,"type":"answered","event_id":format!("answered-{question}"),
+            let network = node.network_id().await?;
+            let hash = node.store.lock().await.message(&network, "c", &format!("a-{question}"))?.context("answer")?.event_hash;
+            assert_eq!(answered, json!({"schema_version":2,"type":"answered","event_id":format!("answered-{question}-{}", &hash[..16]),
                 "question_id":question,"text":"修"}));
             assert_eq!(node.triage_settings().await?["outbox"]["delivered"], 2);
+
+            // Another device's answer to the same question won by rank and replaced this one.
+            let winner = "0".repeat(64);
+            node.store.lock().await.connection.execute(
+                "UPDATE messages SET text='不修',event_hash=?1 WHERE network_id=?2 AND message_id=?3",
+                params![winner, network, format!("a-{question}")],
+            )?;
+            node.send_answered().await?;
+            node.send_answered().await?;
+            node.deliver_webhooks().await?;
+            let received = log.lock().unwrap().clone();
+            assert_eq!(received.len(), 3, "the winning answer follows once");
+            let corrected: Value = serde_json::from_str(&received[2].1)?;
+            assert_eq!((corrected["event_id"].clone(), corrected["text"].clone()),
+                (json!(format!("answered-{question}-{}", &winner[..16])), json!("不修")));
             assert_eq!(node.test_webhook().await?["ok"], true);
             Ok::<_, anyhow::Error>(())
         }

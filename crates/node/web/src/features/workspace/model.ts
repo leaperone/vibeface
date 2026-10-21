@@ -217,6 +217,11 @@ export function parseBot(value: unknown): BotRecord {
 export function parseBots(value: unknown): BotRecord[] {
   return list(record(value).bots).map(parseBot)
 }
+/** The primary assistant's conversation: sessions no assistant started go there first. */
+export function parsePrimary(value: unknown): string | null {
+  const primary = record(value).primary
+  return primary == null ? null : text(primary)
+}
 
 export function parsePendingBot(value: unknown): PendingBot {
   const data = record(value), submission = record(data.submission)
@@ -266,7 +271,7 @@ function question(value: unknown): Question {
 }
 function sessionHandoff(value: unknown): SessionHandoff {
   const data = record(value)
-  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), question_id: text(data.question_id), created_at_ms: number(data.created_at_ms) }
+  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), question_id: text(data.question_id), conversation_id: text(data.conversation_id), created_at_ms: number(data.created_at_ms) }
 }
 /** Every unanswered question across the network. */
 export function parseQuestions(value: unknown): Question[] {

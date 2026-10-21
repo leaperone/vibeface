@@ -192,7 +192,11 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 ),
                 _ => None,
             };
-            materialize(&context, &job, &works, assistant, routine.as_ref(), &local_settings.roots, claimed.covers.as_ref())?
+            let route = match job.kind {
+                TriggerKind::Route => Some(route_context(&store, &network, &conversation, &job.reply_to)?),
+                _ => None,
+            };
+            materialize(&context, &job, &works, assistant, routine.as_ref(), route, &local_settings.roots, claimed.covers.as_ref())?
         };
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         let mut tool_env = node.agent_env();
@@ -631,15 +635,55 @@ fn work_row(work: &WorkProjection) -> Value {
         "failure_reason":work.failure_reason})
 }
 
+/// How many of each other assistant's latest messages a routing turn sees.
+const ROUTE_RECENT: usize = 5;
+
+/// What a routing turn decides on: the session question with its answer, and each other
+/// assistant with its project and what its chat said last.
+pub(crate) fn route_context(
+    store: &Store,
+    network: &str,
+    conversation: &str,
+    question: &str,
+) -> Result<Value> {
+    let asked = store
+        .question(network, question)?
+        .context("the routed question is gone")?;
+    let mut assistants = Vec::new();
+    for bot in store.bots(network)? {
+        if bot.conversation_id == conversation {
+            continue;
+        }
+        let recent: Vec<Value> = store
+            .recent_messages(network, &bot.conversation_id, ROUTE_RECENT)?
+            .into_iter()
+            .map(|(role, text)| {
+                let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                json!({"role":role,"text":prefix(&line, 200)})
+            })
+            .collect();
+        assistants.push(
+            json!({"conversation_id":bot.conversation_id,"name":bot.name,
+            "project":bot.project,"recent":recent}),
+        );
+    }
+    Ok(json!({"question":asked,"assistants":assistants}))
+}
+
 /// The layered prompt: the assistant's configuration, the conversation since the last
 /// checkpoint (or since what the resumed native session has seen), the works, then the trigger.
 /// Built only from the DAG at the job's basis, so every entry and owner reads the same context.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a routine or a route turn adds its own trigger input"
+)]
 fn materialize(
     context: &Context,
     job: &SchedulerJob,
     works: &[WorkProjection],
     assistant: Value,
     routine: Option<&RoutineEntry>,
+    route: Option<Value>,
     roots: &[std::path::PathBuf],
     resumed: Option<&VersionVector>,
 ) -> Result<String> {
@@ -673,6 +717,13 @@ fn materialize(
             _ => None,
         })
     });
+    let (question, assistants) = match route {
+        Some(route) => (
+            Some(bounded(&route["question"], 4_000)),
+            Some(bounded(&route["assistants"], 8_000)),
+        ),
+        None => (question, None),
+    };
     let empty = VersionVector::new();
     let (checkpoint, since) = match (resumed, latest_checkpoint(context)) {
         (Some(covers), _) => (Value::Null, covers),
@@ -704,7 +755,7 @@ fn materialize(
         "conversation":{"resumed_session":resumed.is_some(),"checkpoint":checkpoint,
             "messages":messages,"earlier_messages_omitted":omitted},
         "works":bounded(&json!(works.iter().map(work_row).collect::<Vec<_>>()),8_000),
-        "trigger":{"trigger":job.trigger,"kind":job.kind,"event":trigger_event,"question":question},
+        "trigger":{"trigger":job.trigger,"kind":job.kind,"event":trigger_event,"question":question,"assistants":assistants},
         "local_work_roots":roots,
     });
     let role = match (job.kind, routine) {
@@ -714,6 +765,7 @@ fn materialize(
             entry.routine.name
         ),
         (TriggerKind::Answer, _) => "You are this user's chat assistant. The trigger event is the user's answer to a question you asked (trigger.question, about a session on question.about.node): act on it now. Pass it on with `vibeface codex send <thread> <text> --id <the answer's message_id>`, or answer a held App Server request with `vibeface codex respond <request_id> <json> --node <question.about.node>`. Reusing the answer's message_id as --id makes a retry only read back. Reply in the user's language; an answer cannot change your settings.".to_owned(),
+        (TriggerKind::Route, _) => "You are this user's primary assistant: sessions no assistant started come to you. The user chose to handle one; trigger.question is the question about it (the session on question.about.node, its cwd and what it last said) and question.answer is the user's answer. Decide which assistant should own it, from the session's cwd and content and what each assistant in trigger.assistants works on (project, recent messages). Keep it with `vibeface triage assign --question <question_id> --assistant <this conversation_id>`, or hand it over with that assistant's conversation_id instead; run it once. Reply in the user's language with one line: who owns the session now and why. A routing turn cannot change your settings.".to_owned(),
         _ => "You are this user's chat assistant. Read this host with the SDK's native tools and change it through dispatch_work. Reply in the user's language.".to_owned(),
     };
     let prompt = format!(

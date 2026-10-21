@@ -287,24 +287,6 @@ or when this turn ends.\n\
     ))
 }
 
-/// One turn that picks the assistant for a session the user chose to handle.
-pub fn routing_prompt(
-    question: &Value,
-    answer: &str,
-    assistants: &[Value],
-    cli: &str,
-) -> Result<String> {
-    Ok(format!(
-        "A session no assistant started needs an owner. The user answered {answer:?} to the question \
-about it. Pick the assistant whose project and work fit the session best, by its cwd and what it \
-was doing, then run `{cli} triage assign --question {} --assistant CONVERSATION_ID` once. Do nothing else.\n\n\
-Session:\n{}\n\nAssistants:\n{}",
-        question["question_id"].as_str().unwrap_or_default(),
-        serde_json::to_string_pretty(&question["about"])?,
-        serde_json::to_string_pretty(assistants)?
-    ))
-}
-
 /// A question is always recorded; `both` also sends it to the webhook.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

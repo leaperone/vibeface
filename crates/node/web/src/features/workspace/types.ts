@@ -143,7 +143,7 @@ export type AnswerResult = { status: "answered" | "already_answered"; text: stri
 /** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
 export type PendingAnswer = { question_id: string; text: string }
 /** A session handed to this assistant, shown where it happened. */
-export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; question_id: string; created_at_ms: number }
+export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; question_id: string; conversation_id: string; created_at_ms: number }
 /** Where questions go besides the web: "both" also sends them to Grok Bot. */
 export type Outlet = "record" | "both"
 export type TriageSettings = {

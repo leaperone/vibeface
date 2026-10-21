@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { parseAnswer, parseConversation, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerScope, foldAnswers, openQuestions, placeByTime, projectName } from "./questions.ts"
+import { parseAnswer, parseConversation, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
+import { answerBody, answerScope, foldAnswers, openQuestions, placeByTime, projectName, settledAnswer } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/Users/me/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -25,15 +25,22 @@ test("questions parse from the list and the chat snapshot, and fail closed on sh
   const answered = row("q2", 3, { answer: { message_id: "a-q2", text: "继续", author: "client", created_at_ms: 4 } })
   const chat = parseConversation(snapshot({
     questions: [answered],
-    sessions: [{ node: "worker", agent: "codex", session_id: "s", cwd: "/w", summary: "改登录", question_id: "q2", created_at_ms: 2 }],
+    sessions: [{ node: "worker", agent: "codex", session_id: "s", cwd: "/w", summary: "改登录", question_id: "q2", conversation_id: "other", created_at_ms: 2 }],
     messages: [{ message_id: "a-q2", role: "user", text: "继续", author: "client", created_at_ms: 4, event_hash: "h", answers: "q2" }],
   }))
   assert.equal(chat.questions[0].answer?.text, "继续", "answered questions stay in the chat")
   assert.equal(chat.sessions[0].question_id, "q2")
+  assert.equal(chat.sessions[0].conversation_id, "other", "the primary's chat knows whom it handed the session to")
   assert.equal(chat.messages[0].answers, "q2")
   for (const bad of [{ severity: "loud" }, { about: null }, { answer: { text: "继续" } }, { choices: [{}] }, { conversation_id: 1 }])
     assert.throws(() => parseQuestions({ questions: [row("q", 1, bad)] }), Error, JSON.stringify(bad))
   assert.throws(() => parseConversation(snapshot({ sessions: [{ node: "worker" }] })))
+})
+
+test("the primary assistant comes with the assistant list, and none before any exists", () => {
+  assert.equal(parsePrimary({ bots: [], primary: "chat" }), "chat")
+  assert.equal(parsePrimary({ bots: [], primary: null }), null)
+  assert.throws(() => parsePrimary({ bots: [], primary: 1 }))
 })
 
 test("an answer result is the question's own message, or it is not trusted", () => {
@@ -82,4 +89,12 @@ test("questions go to the web, or to the web and Grok; nothing else", () => {
   assert.equal(parseTriageSettings(settings("both")).default_outlet, "both")
   assert.equal(parseTriageSettings(settings("record")).default_outlet, "record")
   for (const old of ["webhook", "off"]) assert.throws(() => parseTriageSettings(settings(old)), /无法识别/)
+})
+
+test("an answer replaced by another side's says so instead of vanishing", () => {
+  assert.equal(settledAnswer(undefined, undefined), undefined, "an open question has nothing settled")
+  assert.deepEqual(settledAnswer(undefined, "继续"), { text: "继续", elsewhere: false }, "this browser's answer shows before the network has it")
+  assert.deepEqual(settledAnswer("继续", "继续"), { text: "继续", elsewhere: false })
+  assert.deepEqual(settledAnswer("停下", undefined), { text: "停下", elsewhere: false }, "an answer given elsewhere with nothing tried here")
+  assert.deepEqual(settledAnswer("停下", "继续"), { text: "停下", elsewhere: true }, "the other side's answer won the race")
 })
