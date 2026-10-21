@@ -30,7 +30,7 @@
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | 管理 SDK 配置，未启用时为 `null` |
-| `codex_socket` | 外部自管的 Codex App Server Unix socket；为 `null` 时 Node 自行托管 App Server |
+| `providers.codex_app_server` | `{mode, socket}`：`system`（默认）连接本机已运行的 App Server，`socket` 为 `null` 时自动查找；`spawn` 时 Node 自行托管 |
 | `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制 |
@@ -233,7 +233,7 @@ Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线�
 
 工作状态为 `accepted`、`starting`、`running`、`interrupting`、`finished` 和 `unverified`。每次转换在同一事务更新本机日志并追加对应事件。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`；只有 `unverified` 可以被本人签名的 `WorkFinished` 取代。工作结束时若原消息的 `report_results` 不为 `false`，负责人把 `work:<work_id>` 入队，下一轮向本人汇报。
 
-Node 未配置 `codex_socket` 时托管 App Server：执行 `codex app-server --listen unix://<socket>`，socket 位于 0700 的 `/tmp/vibeface-<identity>/` 目录，App Server 放入独立进程组，进程组号写入 `codex-app-server.pid`。启动时先结束上次遗留且命令相符的进程组，退出时 SIGTERM，3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启。App Server 每次重连 epoch 加一。重连后对未结束的工作调用 `thread/read` 只读复查，读不到原 turn 时进入 `unverified`。同一用户的本机进程可以连接这个 socket，协调 Agent 经 `VIBEFACE_CODEX_SOCKET` 得到它。
+`providers.codex_app_server.mode` 为 `spawn` 时 Node 托管 App Server：执行 `codex app-server --listen unix://<socket>`，socket 位于 0700 的 `/tmp/vibeface-<identity>/` 目录，App Server 放入独立进程组，进程组号写入 `codex-app-server.pid`。启动时先结束上次遗留且命令相符的进程组，退出时 SIGTERM，3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启。App Server 每次重连 epoch 加一。重连后对未结束的工作调用 `thread/read` 只读复查，读不到原 turn 时进入 `unverified`。同一用户的本机进程可以连接这个 socket，协调 Agent 经 `VIBEFACE_CODEX_SOCKET` 得到它。
 
 ## 事件 DAG
 
