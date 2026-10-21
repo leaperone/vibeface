@@ -93,7 +93,7 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   return <Panel icon={MonitorX} title="这台设备已被移出">
     <p className="text-muted-foreground">它不再同步，也不能再用。</p>
     {device.removedLocally ? <>
-      <p className="text-muted-foreground">要继续用这台电脑，点“重新加入”。旧数据会改名保留在 <code>~/.vibeface-removed-时间</code>，不会删除。然后用已有设备上“添加设备”给的加入链接或二维码把它加回来。</p>
+      <p className="text-muted-foreground">点“重新加入”让这台电脑从头开始。旧数据会改名保留，不会删除。</p>
       <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
       <Details label="用命令重新加入">{commands}</Details>
     </> : <>
@@ -145,12 +145,15 @@ export function ConnectionScreen() {
   const busy = busyGeneration === generation
   const pending = useRef<number | null>(null)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(null)
   const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined })
+  // A removed computer that started over keeps its old name, and joining again is its next step.
+  const formerName = device.localSetup?.kind === 'uninitialized' ? device.localSetup.name : undefined
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName) })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -177,12 +180,18 @@ export function ConnectionScreen() {
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    void run(() => thisComputer ? device.joinThisComputer(invitation, value(form, 'name')) : device.join(invitation, value(form, 'name')))
+    setNotice('')
+    void run(async () => {
+      if (!thisComputer) return device.join(invitation, value(form, 'name'))
+      // The entry spent the invite on the cancelled request, so it cannot be used again.
+      if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+    })
   }
 
   // Not being a member yet is the normal state on this screen, so it reads as a hint rather than an error.
   const alert = error || device.error && !['reconnecting', 'unpaired'].includes(device.phase) ? <InlineError error={error || device.error} />
-    : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p> : null
+    : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p>
+    : notice ? <p role="status" className="text-meta text-muted-foreground">{notice}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
@@ -236,7 +245,7 @@ export function ConnectionScreen() {
           <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
         </p>}
         {thisComputer
-          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={device.localSetup?.kind === 'uninitialized' && device.localSetup.name || defaultComputerName()} /></Field>
+          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={formerName || defaultComputerName()} /></Field>
           : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>}
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
