@@ -212,6 +212,82 @@ fn a_wrong_reveal_or_a_rejection_voids_the_request() -> Result<()> {
 }
 
 #[test]
+fn only_the_joining_device_withdraws_and_a_withdrawn_request_cannot_be_approved() -> Result<()> {
+    let fixture = fixture()?;
+    let admin = fixture.admin.device_id()?;
+    let joiner = LocalIdentity::generate();
+    let device = joiner.device_id()?;
+    let nonce = random_hex(32);
+    let join_id = invite(&fixture, [4; 32])?;
+    fixture
+        .store
+        .join(&request(&joiner, [4; 32], &nonce)?, &device)?;
+    fixture
+        .store
+        .approve_nonce(&join_id, &admin, &random_hex(32))?;
+    fixture.store.join_status(&join_id, &device, Some(&nonce))?;
+    assert_eq!(fixture.store.pending_joins(&admin)?.len(), 1);
+
+    let other = LocalIdentity::generate().device_id()?;
+    assert!(
+        fixture.store.withdraw_join(&join_id, &other).is_err(),
+        "another device cannot withdraw this request"
+    );
+    assert!(fixture.store.withdraw_join(&join_id, &admin).is_err());
+    assert_eq!(fixture.store.pending_joins(&admin)?.len(), 1);
+
+    let withdrawn = fixture.store.withdraw_join(&join_id, &device)?;
+    assert_eq!(withdrawn.status, JoinStatus::Withdrawn);
+    assert_eq!(fixture.store.withdraw_join(&join_id, &device)?, withdrawn);
+    assert!(fixture.store.pending_joins(&admin)?.is_empty());
+    let view = fixture.store.public_state()?.project()?;
+    let grant = GovernanceEvent::grant(
+        &fixture.admin,
+        &view,
+        Member::client(&joiner, "phone", false)?,
+    )?;
+    assert!(
+        fixture
+            .store
+            .approve_grant(&join_id, &admin, grant.clone())
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .public_state()?
+            .project()?
+            .member(&device)
+            .is_err()
+    );
+
+    // Approved first: the withdrawal reports the join instead of undoing it.
+    let late = invite(&fixture, [5; 32])?;
+    let nonce = random_hex(32);
+    fixture
+        .store
+        .join(&request(&joiner, [5; 32], &nonce)?, &device)?;
+    fixture
+        .store
+        .approve_nonce(&late, &admin, &random_hex(32))?;
+    fixture.store.join_status(&late, &device, Some(&nonce))?;
+    invite(&fixture, [6; 32])?;
+    fixture
+        .store
+        .join(&request(&joiner, [6; 32], &random_hex(32))?, &device)?;
+    fixture.store.approve_grant(&late, &admin, grant)?;
+    assert!(
+        fixture.store.pending_joins(&admin)?.is_empty(),
+        "a request from a device that is already a member can no longer complete"
+    );
+    assert_eq!(
+        fixture.store.withdraw_join(&late, &device)?.status,
+        JoinStatus::Joined
+    );
+    Ok(())
+}
+
+#[test]
 fn bootstrap_capability_is_one_time_and_requires_a_manager_session() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("vibeface-bootstrap-{}", random_hex(8)));
     fs::create_dir_all(&dir)?;

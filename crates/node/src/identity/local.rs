@@ -1,7 +1,8 @@
 //! This Node's membership record, its one-time bootstrap capability, and join requests.
 //!
 //! A ticket's secret never reaches this database; invites are stored by `SHA256(secret)`.
-//! A join request moves `pending → confirming → joined`, or ends `rejected` or `expired`.
+//! A join request moves `pending → confirming → joined`, or ends `rejected`, `withdrawn` or
+//! `expired`.
 
 use super::{AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, NetworkState};
 use crate::crypto;
@@ -35,6 +36,7 @@ pub enum JoinStatus {
     Confirming,
     Joined,
     Rejected,
+    Withdrawn,
     Expired,
 }
 
@@ -307,10 +309,40 @@ impl Store {
         let ids = statement
             .query_map([now], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        ids.iter()
-            .filter_map(|id| load_request(&self.connection, "join_id", id).transpose())
-            .map(|row| row?.view(&view, now))
-            .collect()
+        let mut open = Vec::new();
+        for id in &ids {
+            if let Some(row) = load_request(&self.connection, "join_id", id)? {
+                let request = row.view(&view, now)?;
+                if matches!(request.status, JoinStatus::Pending | JoinStatus::Confirming) {
+                    open.push(request);
+                }
+            }
+        }
+        Ok(open)
+    }
+
+    /// The joining device takes back its own request; once it ended, the reply says how.
+    pub fn withdraw_join(&self, join_id: &str, device: &str) -> Result<JoinRequest> {
+        let now = now_ms();
+        self.transaction(|tx| {
+            let view = load_state(tx)?.project()?;
+            let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
+            ensure!(
+                row.device_id.as_deref() == Some(device),
+                "join request belongs to another device"
+            );
+            let current = row.view(&view, now)?;
+            if !matches!(current.status, JoinStatus::Pending | JoinStatus::Confirming) {
+                return Ok(current);
+            }
+            tx.execute(
+                "UPDATE invites SET status='withdrawn',reason='withdrawn' WHERE join_id=?",
+                [join_id],
+            )?;
+            load_request(tx, "join_id", join_id)?
+                .context("join request vanished")?
+                .view(&view, now)
+        })
     }
 
     /// First approval step: this manager's fresh nonce, sent only after the commitment exists.
@@ -364,6 +396,10 @@ impl Store {
                 );
                 return Ok((current, state));
             }
+            ensure!(
+                current.status != JoinStatus::Withdrawn,
+                "the new device withdrew this join request"
+            );
             ensure!(
                 current.status == JoinStatus::Confirming && row.joiner_nonce.is_some(),
                 "the new device has not confirmed its short code yet"
@@ -446,8 +482,13 @@ impl Row {
     fn view(&self, view: &AuthorizationView, now: i64) -> Result<JoinRequest> {
         let stored = self.status.as_deref().context("ticket has not been used")?;
         let mut status: JoinStatus = serde_json::from_value(serde_json::json!(stored))?;
+        let device = self.device_id.as_deref().context("join device missing")?;
+        // A device that got in another way, or was removed, can no longer be admitted by this one.
         if matches!(status, JoinStatus::Pending | JoinStatus::Confirming)
-            && (self.expires_at_ms <= now || self.epoch != view.epoch)
+            && (self.expires_at_ms <= now
+                || self.epoch != view.epoch
+                || view.member(device).is_ok()
+                || view.cutoff(device).is_some())
         {
             status = JoinStatus::Expired;
         }
@@ -456,7 +497,7 @@ impl Row {
             status,
             network_id: view.network_id.clone(),
             invite_id: self.join_id.clone(),
-            device_id: self.device_id.clone().context("join device missing")?,
+            device_id: device.to_owned(),
             kind: serde_json::from_value(serde_json::json!(self.kind))?,
             name: self.name.clone().unwrap_or_default(),
             commit: self.commit.clone().context("join commit missing")?,

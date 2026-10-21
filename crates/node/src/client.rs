@@ -385,15 +385,16 @@ pub async fn serve_forwarded(node: Arc<Runtime>, connection: Connection) -> Resu
     Ok(())
 }
 
-/// `vibeface/join/1`: any device may call `join` and `join_status`, nothing else. QUIC proves
-/// the caller's key, so the session's device is the connection's remote ID.
+/// `vibeface/join/1`: any device may call `join`, `join_status` and `join_withdraw`, nothing else.
+/// QUIC proves the caller's key, so the session's device is the connection's remote ID.
 pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: String) -> Result<()> {
     net::serve_streams(connection, move |request: Value| {
         let (node, remote) = (node.clone(), remote.clone());
         async move {
             let method = text(&request, "method")?;
             ensure!(
-                matches!(method, "join" | "join_status") && request["params"].is_object(),
+                matches!(method, "join" | "join_status" | "join_withdraw")
+                    && request["params"].is_object(),
                 "a join connection only joins"
             );
             let mut session = Session {
@@ -533,11 +534,12 @@ async fn serve_session(
 }
 
 /// Methods a device that is not (or no longer) a member may call.
-const GUEST_METHODS: [&str; 9] = [
+const GUEST_METHODS: [&str; 10] = [
     "info",
     "authenticate",
     "join",
     "join_status",
+    "join_withdraw",
     "recovery_state",
     "recover",
     "node_join",
@@ -793,6 +795,15 @@ async fn dispatch(
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
+        }
+        "join_withdraw" => {
+            let request = node
+                .store
+                .lock()
+                .await
+                .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
+            notify_join(node, &request);
+            Ok(serde_json::to_value(request)?)
         }
         "approve" => {
             manager_view(node, session).await?;
@@ -1376,86 +1387,93 @@ async fn join_as_node(
     let join_id = request.join_id;
     report(NodeJoin::Waiting);
     let deadline = Instant::now() + Duration::from_secs(11 * 60);
-    let mut shown = false;
-    loop {
-        ensure!(
-            Instant::now() < deadline,
-            "approval timed out; run the same command again to resume"
-        );
-        let status = unless_cancelled(
-            cancel,
-            client.call("join_status", json!({"join_id":join_id})),
-        )
-        .await?;
-        let request: JoinRequest = serde_json::from_value(status.clone())?;
-        match request.status {
-            JoinStatus::Joined => {
-                let state: NetworkState = from_field(&status, "state")?;
-                ensure!(
-                    pending.pinned.as_ref().map(|pin| pin.0.as_str())
-                        == Some(request.network_id.as_str())
-                        && state.genesis.network_id == request.network_id,
-                    "entry returned another personal network"
-                );
-                state.project()?.node(&device)?;
-                node.install_membership(state.clone()).await?;
-                let addresses: Vec<net::SignedAddress> =
-                    serde_json::from_value(status["addresses"].clone()).unwrap_or_default();
-                node.merge_addresses(&request.network_id, addresses).await?;
-                client.net.close().await;
-                let _ = std::fs::remove_file(&path);
-                return Ok(state);
-            }
-            JoinStatus::Rejected | JoinStatus::Expired => {
-                let _ = std::fs::remove_file(&path);
-                bail!(
-                    "join request {:?}: {}",
-                    request.status,
-                    request.reason.as_deref().unwrap_or("expired")
-                );
-            }
-            JoinStatus::Confirming if !shown => {
-                let seen = (
-                    request.network_id,
-                    request.admin_id.context("entry omitted the manager")?,
-                    request
-                        .admin_nonce
-                        .context("entry omitted the manager nonce")?,
-                );
-                if pending.pinned.is_none() {
-                    pending.pinned = Some(seen.clone());
-                    crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
-                }
-                let (network, admin, admin_nonce) = pending.pinned.as_ref().context("pinned")?;
-                ensure!(
-                    *network == seen.0 && *admin == seen.1 && *admin_nonce == seen.2,
-                    "the entry changed the join after the short code was fixed; delete join.json and ask for a new link"
-                );
-                let code = short_code(
-                    network,
-                    &invite,
-                    &device,
-                    admin,
-                    admin_nonce,
-                    &pending.nonce,
-                )?;
-                report(NodeJoin::Confirming { code });
-                unless_cancelled(
-                    cancel,
-                    client.call(
-                        "join_status",
-                        json!({"join_id":join_id,"reveal":pending.nonce}),
-                    ),
-                )
+    let approval = async {
+        let mut shown = false;
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "approval timed out; run the same command again to resume"
+            );
+            let status = client
+                .call("join_status", json!({"join_id":join_id}))
                 .await?;
-                shown = true;
+            let request: JoinRequest = serde_json::from_value(status.clone())?;
+            match request.status {
+                JoinStatus::Joined => {
+                    let state: NetworkState = from_field(&status, "state")?;
+                    ensure!(
+                        pending.pinned.as_ref().map(|pin| pin.0.as_str())
+                            == Some(request.network_id.as_str())
+                            && state.genesis.network_id == request.network_id,
+                        "entry returned another personal network"
+                    );
+                    state.project()?.node(&device)?;
+                    node.install_membership(state.clone()).await?;
+                    let addresses: Vec<net::SignedAddress> =
+                        serde_json::from_value(status["addresses"].clone()).unwrap_or_default();
+                    node.merge_addresses(&request.network_id, addresses).await?;
+                    client.net.close().await;
+                    let _ = std::fs::remove_file(&path);
+                    return anyhow::Ok(state);
+                }
+                JoinStatus::Rejected | JoinStatus::Withdrawn | JoinStatus::Expired => {
+                    let _ = std::fs::remove_file(&path);
+                    bail!(
+                        "join request {:?}: {}",
+                        request.status,
+                        request.reason.as_deref().unwrap_or("expired")
+                    );
+                }
+                JoinStatus::Confirming if !shown => {
+                    let seen = (
+                        request.network_id,
+                        request.admin_id.context("entry omitted the manager")?,
+                        request
+                            .admin_nonce
+                            .context("entry omitted the manager nonce")?,
+                    );
+                    if pending.pinned.is_none() {
+                        pending.pinned = Some(seen.clone());
+                        crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
+                    }
+                    let (network, admin, admin_nonce) =
+                        pending.pinned.as_ref().context("pinned")?;
+                    ensure!(
+                        *network == seen.0 && *admin == seen.1 && *admin_nonce == seen.2,
+                        "the entry changed the join after the short code was fixed; delete join.json and ask for a new link"
+                    );
+                    let code = short_code(
+                        network,
+                        &invite,
+                        &device,
+                        admin,
+                        admin_nonce,
+                        &pending.nonce,
+                    )?;
+                    report(NodeJoin::Confirming { code });
+                    client
+                        .call(
+                            "join_status",
+                            json!({"join_id":join_id,"reveal":pending.nonce}),
+                        )
+                        .await?;
+                    shown = true;
+                }
+                _ => tokio::time::sleep(Duration::from_secs(2)).await,
             }
-            _ => {
-                unless_cancelled(cancel, async {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    Ok(())
-                })
-                .await?
+        }
+    };
+    tokio::pin!(approval);
+    tokio::select! {
+        result = &mut approval => result,
+        () = cancel.notified() => {
+            // Withdrawn at the entry, the request leaves every manager's list; one approved
+            // first still completes here.
+            let reply = client.call("join_withdraw", json!({"join_id":join_id})).await?;
+            let request: JoinRequest = serde_json::from_value(reply)?;
+            match request.status {
+                JoinStatus::Joined => approval.await,
+                _ => Err(Cancelled.into()),
             }
         }
     }
