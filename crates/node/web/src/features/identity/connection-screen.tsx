@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -76,19 +76,43 @@ function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: strin
 }
 
 const REJOIN = `vibeface service stop
-mv ~/.vibeface ~/.vibeface-removed
+mv ~/.vibeface ~/.vibeface-removed-$(date +%Y%m%d-%H%M%S)
 vibeface init
 vibeface join '加入链接'
 vibeface service start`
 
-function Removed() {
+function Removed({ busy, run }: { busy: boolean; run: Run }) {
+  const device = useDevice()
   const [copied, setCopied] = useState(false)
-  return <Panel icon={MonitorX} title="这台设备已被移出">
-    <p className="text-muted-foreground">它不再同步，也不能再用。要继续用这台电脑，先在管理设备上点“添加设备”复制加入链接，再在这台电脑上运行下面的命令。旧数据会留在 <code>~/.vibeface-removed</code>。</p>
-    <pre className="overflow-x-auto rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{REJOIN}</pre>
-    <Button type="button" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(REJOIN).then(() => setCopied(true)) }}>
-      {copied ? <CircleCheck aria-hidden="true" /> : null}{copied ? '已复制' : '复制重新加入的命令'}
+  const commands = <>
+    <pre className="overflow-x-auto rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta text-foreground">{REJOIN}</pre>
+    <Button type="button" variant="outline" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(REJOIN).then(() => setCopied(true)) }}>
+      {copied ? <CircleCheck aria-hidden="true" /> : null}{copied ? '已复制' : '复制命令'}
     </Button>
+  </>
+  return <Panel icon={MonitorX} title="这台设备已被移出">
+    <p className="text-muted-foreground">它不再同步，也不能再用。</p>
+    {device.removedLocally ? <>
+      <p className="text-muted-foreground">要继续用这台电脑，点“重新加入”。旧数据会改名保留在 <code>~/.vibeface-removed-时间</code>，不会删除。然后用已有设备上“添加设备”给的加入链接或二维码把它加回来。</p>
+      <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
+      <Details label="用命令重新加入">{commands}</Details>
+    </> : <>
+      <p className="text-muted-foreground">要继续用这台电脑，在它上面打开本机页面点“重新加入”，或运行下面的命令。</p>
+      <Details label="用命令重新加入">{commands}</Details>
+    </>}
+  </Panel>
+}
+
+/** The Node's own join: it shows the short code the manager compares before approving. */
+function NodeJoin() {
+  const device = useDevice()
+  const joining = device.nodeJoining!
+  return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : '等待批准'}>
+    {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
+      <p className="text-muted-foreground">在管理设备上比对安全码，相同再批准</p>
+      {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
+      <Button type="button" variant="ghost" className="w-fit" onClick={device.disconnect}>取消</Button>
+    </>}
   </Panel>
 }
 
@@ -123,10 +147,11 @@ export function ConnectionScreen() {
   const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup) })
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
-  const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed'].includes(device.phase)
+  const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
+  const thisComputer = device.localSetup?.kind === 'uninitialized'
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
   useEffect(() => { if (device.initialInvitation) setInvitation((current) => current.trim() ? current : device.initialInvitation) }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
@@ -149,13 +174,13 @@ export function ConnectionScreen() {
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    void run(() => device.join(invitation, value(form, 'name')))
+    void run(() => thisComputer ? device.joinThisComputer(invitation, value(form, 'name')) : device.join(invitation, value(form, 'name')))
   }
 
   // Not being a member yet is the normal state on this screen, so it reads as a hint rather than an error.
   const alert = error || device.error && !['reconnecting', 'unpaired'].includes(device.phase) ? <InlineError error={error || device.error} />
     : device.error && device.phase === 'unpaired' ? <p role="status" className="text-meta text-muted-foreground">{device.error}</p> : null
-  const focused = Boolean(device.review || device.joining)
+  const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
     <p className="text-meta text-muted-foreground">其他方式</p>
@@ -173,7 +198,11 @@ export function ConnectionScreen() {
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
   </Panel>
-  else if (device.phase === 'removed') body = <Removed />
+  else if (device.phase === 'removed') body = <Removed busy={busy} run={run} />
+  else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} title="正在重新开始">
+    <p className="text-muted-foreground">旧数据已改名保留。这台电脑重启好后，用加入链接把它加回来。</p>
+  </Panel>
+  else if (device.nodeJoining) body = <NodeJoin />
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />
@@ -191,7 +220,7 @@ export function ConnectionScreen() {
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
-  else body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : '加入我的设备'}>
+  else body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : '加入我的设备'}>
     {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
       <fieldset disabled={linking || !usable} className="grid gap-4">
         {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
@@ -203,12 +232,14 @@ export function ConnectionScreen() {
           <span className="min-w-0 flex-1 truncate">{invitation.trim().startsWith('vibeface1') ? '已读取二维码' : '已读取加入链接'}</span>
           <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
         </p>}
-        <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
+        {thisComputer
+          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
+          : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>}
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
     </form>}
-    {publicEntry
-      ? <p className="text-meta text-muted-foreground">在你的电脑上打开 vibeface，点“添加设备”，再扫它显示的二维码。</p>
+    {publicEntry || thisComputer
+      ? <p className="text-meta text-muted-foreground">在{thisComputer ? '已有设备' : '你的电脑'}上打开 vibeface，点“添加设备”，再{thisComputer ? '粘贴它给的链接或扫它的二维码' : '扫它显示的二维码'}。</p>
       : <p className="text-meta text-muted-foreground">加入一台电脑：在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p>}
   </Panel>
 
