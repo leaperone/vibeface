@@ -6,8 +6,10 @@ use std::{future::Future, path::Path};
 use vibeface_bridge::codex::{Delivery, DirectSession, Outgoing};
 use vibeface_protocol::now_ms;
 
-/// Registers the work with the Node (`track`), starts its thread, binds the thread before
-/// `turn/start`, sends the prompt with `clientUserMessageId` = work ID and binds the result.
+/// Registers the work with the Node (`track`), binds its thread before the send, sends the prompt
+/// with `clientUserMessageId` = work ID and binds the result. Without `thread` the work starts a
+/// turn in a new thread (or the one it continues); with `thread` it goes into that existing
+/// thread, steering its running turn or starting one, and the thread's directory is read first.
 /// Only the registration that created the work sends, and only inside its window.
 pub async fn dispatch<T, TF, B, BF>(args: &Value, track: T, bind: B, socket: &Path) -> Result<Value>
 where
@@ -16,6 +18,32 @@ where
     B: Fn(Value) -> BF,
     BF: Future<Output = Result<Value>>,
 {
+    let mut args = args.clone();
+    let existing = args["thread"].as_str().map(str::to_owned);
+    // A send reads its thread before registering, so a missing thread leaves nothing behind.
+    if let Some(thread) = &existing {
+        let mut session = DirectSession::connect(socket)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let read = session
+            .request("thread/read", json!({"threadId":thread}))
+            .await;
+        session.close().await;
+        let read = read
+            .map_err(|error| anyhow::anyhow!("cannot read thread {thread}: {}", error.message))?;
+        args["cwd"] = json!(read["thread"]["cwd"].as_str().unwrap_or_default());
+        if args["title"]
+            .as_str()
+            .is_none_or(|title| title.trim().is_empty())
+        {
+            let text = args["prompt"].as_str().unwrap_or_default();
+            let line = text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(text);
+            args["title"] = json!(line.trim().chars().take(120).collect::<String>());
+        }
+    }
     let tracked = track(args.clone()).await?;
     if tracked["may_send"] != true {
         return Ok(tracked);
@@ -56,7 +84,7 @@ where
         model: args["model"].as_str().map(str::to_owned),
         effort: args["effort"].as_str().map(str::to_owned),
         images: serde_json::from_value(args["images"].clone()).unwrap_or_default(),
-        start_only: true,
+        start_only: existing.is_none(),
         full_access: true,
     };
     let delivery = session.send(&outgoing).await;
@@ -69,7 +97,7 @@ where
     bind(report).await
 }
 
-/// `vibeface codex call|send|watch`: a plain passthrough to the App Server socket.
+/// `vibeface codex call|watch`: a plain passthrough to the App Server socket.
 pub async fn run(socket: &Path, command: Command) -> Result<()> {
     let mut session = DirectSession::connect(socket)
         .await
@@ -96,47 +124,6 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
                 Err(error) => bail!(error.message),
             }
         }
-        Command::Send(log, outgoing) => {
-            let delivery = match claim(&log, &outgoing)? {
-                Claim::Done(delivery) => delivery,
-                Claim::ReadBack => {
-                    let delivery = match session
-                        .read_back(&outgoing.thread_id, &outgoing.client_id)
-                        .await
-                    {
-                        Ok(Some(turn_id)) => Delivery::Delivered {
-                            mode: "existing".into(),
-                            turn_id,
-                        },
-                        Ok(None) => Delivery::Unknown {
-                            reason: "the message is not in the thread; send it with a new --id"
-                                .into(),
-                        },
-                        Err(error) => Delivery::Unknown {
-                            reason: error.message,
-                        },
-                    };
-                    record(&log, &outgoing, &delivery)?;
-                    delivery
-                }
-                Claim::Send => {
-                    let delivery = session.send(&outgoing).await;
-                    record(&log, &outgoing, &delivery)?;
-                    delivery
-                }
-            };
-            let level = match delivery {
-                Delivery::Delivered { .. } => "info",
-                _ => "warn",
-            };
-            crate::logging::send_to_node(json!({"level":level,"event":"codex.send","message":format!("message to thread: {}", serde_json::to_string(&delivery)?),
-                "thread_id":outgoing.thread_id,"fields":{"client_id":outgoing.client_id}}))
-            .await;
-            println!(
-                "{}",
-                json!({"client_id":outgoing.client_id,"delivery":delivery})
-            );
-        }
         Command::Watch { thread_id } => {
             session
                 .subscribe(&thread_id)
@@ -155,114 +142,12 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq)]
-enum Claim {
-    Send,
-    ReadBack,
-    Done(Delivery),
-}
-
-fn entry_path(log: &Path, outgoing: &Outgoing) -> std::path::PathBuf {
-    log.join(crate::crypto::digest(outgoing.client_id.as_bytes()))
-}
-
-/// One send per client ID: the entry is created exclusively before the send, so a rerun, even
-/// a concurrent one, only reads back. The same ID for another message is refused.
-fn claim(log: &Path, outgoing: &Outgoing) -> Result<Claim> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(log)?;
-    let path = entry_path(log, outgoing);
-    let entry = json!({"thread_id":outgoing.thread_id,"text":outgoing.text});
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(entry.to_string().as_bytes())?;
-            file.sync_all()?;
-            Ok(Claim::Send)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing: Value = serde_json::from_slice(&std::fs::read(&path)?)
-                .context("unreadable send log entry")?;
-            anyhow::ensure!(
-                existing["thread_id"] == entry["thread_id"] && existing["text"] == entry["text"],
-                "message ID reused with a different message"
-            );
-            Ok(
-                match serde_json::from_value::<Delivery>(existing["delivery"].clone()) {
-                    Ok(delivery @ (Delivery::Delivered { .. } | Delivery::Rejected { .. })) => {
-                        Claim::Done(delivery)
-                    }
-                    _ => Claim::ReadBack,
-                },
-            )
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn record(log: &Path, outgoing: &Outgoing, delivery: &Delivery) -> Result<()> {
-    let entry = json!({"thread_id":outgoing.thread_id,"text":outgoing.text,"delivery":delivery});
-    crate::config::private_write(&entry_path(log, outgoing), entry.to_string().as_bytes())
-}
-
 pub enum Command {
     Call {
         method: String,
         params: Option<String>,
     },
-    /// The send log directory, then the message.
-    Send(std::path::PathBuf, Outgoing),
     Watch {
         thread_id: String,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_client_id_is_sent_once_and_then_only_read_back() -> Result<()> {
-        let log = std::env::temp_dir().join(format!("vibeface-sends-{}", uuid::Uuid::new_v4()));
-        let outgoing = Outgoing {
-            thread_id: "t".into(),
-            text: "go".into(),
-            client_id: "m1".into(),
-            ..Default::default()
-        };
-        assert_eq!(claim(&log, &outgoing)?, Claim::Send);
-        // Cut off before the result: a rerun reads back instead of sending again.
-        assert_eq!(claim(&log, &outgoing)?, Claim::ReadBack);
-        let unknown = Delivery::Unknown {
-            reason: "lost".into(),
-        };
-        record(&log, &outgoing, &unknown)?;
-        assert_eq!(claim(&log, &outgoing)?, Claim::ReadBack);
-        let delivered = Delivery::Delivered {
-            mode: "start".into(),
-            turn_id: "r".into(),
-        };
-        record(&log, &outgoing, &delivered)?;
-        assert_eq!(claim(&log, &outgoing)?, Claim::Done(delivered));
-        let other = Outgoing {
-            text: "different".into(),
-            ..outgoing.clone()
-        };
-        assert!(claim(&log, &other).is_err());
-        let moved = Outgoing {
-            thread_id: "u".into(),
-            ..outgoing
-        };
-        assert!(claim(&log, &moved).is_err());
-        std::fs::remove_dir_all(&log)?;
-        Ok(())
-    }
 }

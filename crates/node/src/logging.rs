@@ -676,7 +676,7 @@ pub fn child_line(source: Source, event: &str, line: &str, thread_id: Option<&st
     }
 }
 
-/// From a separate process such as `vibeface codex send`: adds one record to this device's Node
+/// From a separate process such as `vibeface codex call`: adds one record to this device's Node
 /// log through `/api/log` when the Node's local URL is in the environment, as it is in a
 /// coordination Agent's shell. Best effort; the command's own result never depends on it.
 pub async fn send_to_node(mut record: Value) {

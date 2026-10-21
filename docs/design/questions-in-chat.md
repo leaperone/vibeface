@@ -17,7 +17,7 @@ Codex 线程或 Claude Code 会话（统称 session）属于某个助手，只�
 1. 工作记录：`WorkProgress { thread_id }` 由目标设备写入工作所在会话。派发即归属，不新增字段。App Server 的请求可能先于这条记录到达，所以运行它的设备在记录写入前以本机工作已绑定的线程为准。
 2. 认领：`SessionAttributed` 事件，写入被认领助手的会话。只有运行该 session 的设备能写，签名形状要求 `node` 等于作者。
 
-`vibeface codex send` 的本地发送日志只存 `client_id → thread_id/text`，没有会话信息，不作为归属依据。
+`vibeface codex send` 是助手在本聊天里登记的工作，`WorkDispatched.thread` 记下目标线程；它和其他工作一样经 `WorkProgress` 归属。
 
 两者都投影到 `session_owners`，主键 `(network_id, node, session_id)`，先到（rank 最小）者胜。没有归属的 session 是“外来会话”。
 
@@ -124,4 +124,4 @@ Grok 侧：
 - webhook 事件 `{"type":"question", question_id, severity, text, choices[{index,label}], about, assistant, answer:{url, device_id, question_id}}` 和 `{"type":"answered", question_id, text}`，`event_id` 分别为问题 ID 与 `answered-<问题 ID>-<回答事件哈希前 16 位>`。两端同时回答时 rank 小者胜，同步把输方本机的回答换成胜者；提问方 Node 按新的回答再发一次 `answered`，未送出的旧 `answered` 撤下。接收方以同一 `question_id` 最后收到的为准。
 - `POST /api/decision { device_id, question_id, choice | text }`：返回 `{question_id, answer_id, status: "answered" | "already_answered", text}`。重试同一请求只读回。
 
-助手一轮的输入：`trigger.event` 是回答消息，另附 `trigger.question`（问题全文、选项和 Subject），说明它回答哪个问题。提示要求助手用回答消息的 `message_id` 作为 `vibeface codex send --id`，结果未知时重试只读回。
+助手一轮的输入：`trigger.event` 是回答消息，另附 `trigger.question`（问题全文、选项和 Subject），说明它回答哪个问题。提示要求助手用回答消息的 `message_id` 作为 `vibeface codex send --id`。这次发送是这一轮的工作，同一轮重试只读回；回合结束后结果作为 `work_result` 轮回到助手。

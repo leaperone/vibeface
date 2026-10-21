@@ -145,7 +145,10 @@ impl Runtime {
     /// carries the user's signed message or their permission to continue, the directory is in
     /// this Node's roots, and an agent task has an Agent to run it.
     async fn authorize_dispatch(&self, network: &str, spec: &WorkSpec) -> Result<()> {
-        self.allowed_path(&spec.cwd)?;
+        // A send goes into a thread that already exists, often outside the roots; it picks no directory.
+        if spec.thread.is_none() {
+            self.allowed_path(&spec.cwd)?;
+        }
         let store = self.store.lock().await;
         let conversation = store
             .conversation(network, &spec.conversation)?
@@ -762,39 +765,38 @@ impl Runtime {
         let turn = params["turnId"]
             .as_str()
             .or_else(|| params["turn"]["id"].as_str());
-        let Some(record) = records.into_iter().find(|record| {
-            record.state.handle().is_some_and(|h| {
-                Some(h.thread_id.as_str()) == thread && Some(h.turn_id.as_str()) == turn
+        let works: Vec<_> = records
+            .into_iter()
+            .filter(|record| {
+                record.state.handle().is_some_and(|h| {
+                    Some(h.thread_id.as_str()) == thread && Some(h.turn_id.as_str()) == turn
+                })
             })
-        }) else {
+            .collect();
+        if works.is_empty() {
             return Ok(());
-        };
-        let work_id = record.work_id.clone();
-        self.publish_progress(
-            network,
-            json!({"type":"native_progress","conversation_id":record.conversation,"work_id":work_id,
-                "target_node":self.identity.device_id()?,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                "progress":observation::native_progress(&event)}),
-        );
+        }
         let item = &params["item"];
         let signal = match method {
             "item/completed" if item["type"] == "agentMessage" && item["phase"] == "commentary" => {
-                Signal::Progress {
+                Some(Signal::Progress {
                     summary: item["text"].as_str().unwrap_or_default().into(),
                     at_ms: now_ms(),
-                }
+                })
             }
             "item/completed"
                 if item["type"] == "agentMessage"
                     && (item["phase"].is_null() || item["phase"] == "final_answer") =>
             {
-                Signal::Text(item["text"].as_str().unwrap_or_default().into())
+                Some(Signal::Text(
+                    item["text"].as_str().unwrap_or_default().into(),
+                ))
             }
-            "turn/plan/updated" => Signal::Progress {
+            "turn/plan/updated" => Some(Signal::Progress {
                 summary: plan_summary(params),
                 at_ms: now_ms(),
-            },
-            "turn/completed" => Signal::TurnCompleted {
+            }),
+            "turn/completed" => Some(Signal::TurnCompleted {
                 turn_id: turn.unwrap_or_default().into(),
                 status: params["turn"]["status"]
                     .as_str()
@@ -804,10 +806,22 @@ impl Runtime {
                 error: params["turn"]["error"]["message"]
                     .as_str()
                     .map(str::to_owned),
-            },
-            _ => return Ok(()),
+            }),
+            _ => None,
         };
-        self.signal_work(network, &work_id, signal).await?;
+        let target_node = self.identity.device_id()?;
+        // A send steered into a running turn shares it with the work that started it.
+        for record in works {
+            self.publish_progress(
+                network,
+                json!({"type":"native_progress","conversation_id":record.conversation,"work_id":record.work_id,
+                    "target_node":target_node,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                    "progress":observation::native_progress(&event)}),
+            );
+            if let Some(signal) = signal.clone() {
+                self.signal_work(network, &record.work_id, signal).await?;
+            }
+        }
         Ok(())
     }
 

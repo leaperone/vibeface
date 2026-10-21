@@ -20,10 +20,6 @@ impl Runtime {
                 "VIBEFACE_CODEX_SOCKET".into(),
                 self.codex.socket().display().to_string(),
             ),
-            (
-                "VIBEFACE_DATA_DIR".into(),
-                self.data_dir.display().to_string(),
-            ),
         ])
     }
 

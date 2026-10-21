@@ -446,6 +446,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             call_ref,
             continues,
             parent,
+            thread,
             ..
         } => {
             id(work_id)?;
@@ -459,7 +460,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             }
             id(call_ref)?;
             decode32(dispatcher)?;
-            for work in continues.iter().chain(parent.iter()) {
+            for work in continues.iter().chain(parent.iter()).chain(thread.iter()) {
                 id(work)?;
             }
         }

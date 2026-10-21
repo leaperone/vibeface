@@ -10,7 +10,7 @@
 |---|---|---|
 | `initialize` | 隐藏 | 连接建立时由客户端发送，不对外暴露 |
 | `thread/start` | 写 | `dispatch_work` 先登记再发；协调 Agent 也可用 `vibeface codex call` 自开线程 |
-| `thread/resume` | 写 | Node 订阅观察；`vibeface codex send` 先 resume |
+| `thread/resume` | 写 | Node 订阅观察；`vibeface codex send`（带 `thread` 的工作）先 resume |
 | `thread/fork` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/archive` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/delete` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
@@ -71,8 +71,8 @@
 | `skills/config/write` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/install` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/uninstall` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 发送，带 `clientUserMessageId` |
-| `turn/steer` | 写 | `vibeface codex send` 发送，带 `clientUserMessageId` |
+| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 先向 Node 登记工作再发，`clientUserMessageId` 为 `work_id` |
+| `turn/steer` | 写 | `vibeface codex send` 在回合进行中时发送，同样是登记过的工作，`clientUserMessageId` 为 `work_id` |
 | `turn/interrupt` | 写 | 停止按钮经 Node 发送；协调 Agent 也可直接调用 |
 | `review/start` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `model/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |

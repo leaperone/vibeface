@@ -19,6 +19,9 @@ pub struct WorkSpec {
     pub prompt: String,
     pub continues: Option<String>,
     pub parent: Option<String>,
+    /// An existing App Server thread the prompt goes into: it steers the running turn or starts
+    /// one. `None` starts a turn in a new thread, or in the thread of `continues`.
+    pub thread: Option<String>,
 }
 
 impl WorkSpec {
@@ -217,13 +220,20 @@ pub fn accept(spec: WorkSpec, at: i64) -> (WorkRecord, EventBody) {
         prompt: spec.prompt.clone(),
         continues: spec.continues.clone(),
         parent: spec.parent.clone(),
+        thread: spec.thread.clone(),
+    };
+    let state = match spec.thread {
+        Some(thread) => WorkState::Starting {
+            thread: Some(thread),
+        },
+        None => WorkState::Accepted,
     };
     (
         WorkRecord {
             work_id: spec.work_id,
             conversation: spec.conversation,
             kind: spec.kind,
-            state: WorkState::Accepted,
+            state,
             text: String::new(),
             send_by_ms: at + SEND_WINDOW_MS,
             progress: String::new(),
@@ -524,6 +534,7 @@ mod tests {
                 prompt: "do".into(),
                 continues: None,
                 parent: None,
+                thread: None,
             },
             0,
         )
