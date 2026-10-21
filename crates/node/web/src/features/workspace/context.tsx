@@ -39,6 +39,8 @@ const responded = (caught: unknown) => caught instanceof Error && "responded" in
 function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab) {
   const networkId = connection.principal.network_id
   const clientId = connection.principal.device_id
+  /** A local session reads this computer's records, but the network takes only a member's signature. */
+  const joined = connection.principal.source === "membership"
   const prefix = `${networkId}.${clientId}:`
   const outbox: OutboxStore = {
     all: async () => (await browserOutbox.all()).filter((item) => item.key.startsWith(prefix)),
@@ -105,6 +107,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const showRefreshError = (caught: unknown) => showError(caught, "读取最新内容", () => { void refreshRef.current().catch(showRefreshError) })
   const requireWritable = () => {
     requireCurrent()
+    if (!joined) throw new Error("这个浏览器还没加入，加入后才能操作。")
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
@@ -182,7 +185,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
-    if (current() && readConnection.current === connection && view === "chat" && !document.hidden) {
+    if (joined && current() && readConnection.current === connection && view === "chat" && !document.hidden) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
@@ -456,7 +459,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView: (next: WorkspaceView) => { setView(next); clearMessages() }, nodes, conversationId, data, notifications, questions, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
-    writable: booted && current() && readConnection.current === connection && writeState.state === "writable",
+    joined,
+    writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
     diagnostics: (sinceMs: number) => { requireCurrent(); return connection.request("diagnostics", { since_ms: sinceMs }) },

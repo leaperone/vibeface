@@ -137,7 +137,8 @@ function usePublicEntry() {
   return publicEntry
 }
 
-export function ConnectionScreen() {
+/** `lane`: the way in to show first, as the join page does. */
+export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const device = useDevice()
   const publicEntry = usePublicEntry()
   const generation = device.connectionGeneration()
@@ -147,7 +148,7 @@ export function ConnectionScreen() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [invitation, setInvitation] = useState(device.initialInvitation)
-  const [lane, setLane] = useState<Lane | null>(null)
+  const [lane, setLane] = useState<Lane | null>(firstLane ?? null)
   const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()

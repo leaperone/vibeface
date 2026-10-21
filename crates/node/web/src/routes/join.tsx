@@ -6,5 +6,5 @@ export const Route = createFileRoute('/join')({ component: Page })
 
 function Page() {
   const { ready } = useDevice()
-  return ready ? <Navigate to="/" replace /> : <ConnectionScreen />
+  return ready ? <Navigate to="/" replace /> : <ConnectionScreen lane="invite" />
 }

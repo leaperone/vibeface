@@ -20,6 +20,7 @@ import { AssistantPanelButton } from "./assistant-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { addressName } from "./labels"
+import { NotJoined } from "./not-joined"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
@@ -142,6 +143,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             </Link>
           </Button>
         </header>
+        {workspace.joined ? null : <NotJoined onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
