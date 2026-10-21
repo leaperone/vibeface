@@ -939,12 +939,19 @@ fn initialize_params(title: &str) -> Value {
 pub struct DirectSession {
     stream: WebSocketStream<UnixStream>,
     next_id: u64,
+    /// Threads started on this connection. They have no rollout before their first turn, so they
+    /// are not resumed.
+    started: HashSet<String>,
 }
 
 impl DirectSession {
     pub async fn connect(socket: &Path) -> Result<Self, CodexError> {
         let stream = connect(socket).await.map_err(rejected)?;
-        let mut session = Self { stream, next_id: 0 };
+        let mut session = Self {
+            stream,
+            next_id: 0,
+            started: HashSet::new(),
+        };
         session
             .call("initialize", initialize_params("Vibeface Agent CLI"))
             .await
@@ -961,7 +968,29 @@ impl DirectSession {
 
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
         validate_request(method, &params)?;
-        self.call(method, params).await
+        let result = self.call(method, params).await?;
+        if method == "thread/start"
+            && let Some(id) = result["thread"]["id"].as_str()
+        {
+            self.started.insert(id.to_owned());
+        }
+        Ok(result)
+    }
+
+    /// `thread/resume` to receive a thread's events. A thread without a rollout yet is retried
+    /// until its first turn persists one.
+    pub async fn subscribe(&mut self, thread: &str) -> Result<Value, CodexError> {
+        loop {
+            match self
+                .request("thread/resume", json!({"threadId":thread}))
+                .await
+            {
+                Err(error) if no_rollout(&error) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
@@ -1102,6 +1131,11 @@ fn input(outgoing: &Outgoing) -> Value {
     json!(input)
 }
 
+/// Codex writes a thread's rollout when its first turn starts; resuming a thread before that fails.
+fn no_rollout(error: &CodexError) -> bool {
+    error.message.contains("no rollout found")
+}
+
 /// The turn holding the user message sent with `client_id`, if any.
 fn delivered(thread: &Value, client_id: &str) -> Option<String> {
     thread["turns"].as_array()?.iter().find_map(|turn| {
@@ -1133,12 +1167,18 @@ impl DirectSession {
     /// already in the thread is reported, not sent again; an unknown result is never resent.
     pub async fn send(&mut self, outgoing: &Outgoing) -> Delivery {
         let rejected = |reason: String| Delivery::Rejected { reason };
-        let resumed = match self
-            .request("thread/resume", json!({"threadId":outgoing.thread_id}))
-            .await
-        {
-            Ok(resumed) => resumed,
-            Err(error) => return rejected(error.message),
+        // A thread without a rollout has no turns: nothing to find or steer.
+        let resumed = if self.started.contains(&outgoing.thread_id) {
+            json!({})
+        } else {
+            match self
+                .request("thread/resume", json!({"threadId":outgoing.thread_id}))
+                .await
+            {
+                Ok(resumed) => resumed,
+                Err(error) if no_rollout(&error) => json!({}),
+                Err(error) => return rejected(error.message),
+            }
         };
         if let Some(turn_id) = delivered(&resumed["thread"], &outgoing.client_id) {
             return Delivery::Delivered {

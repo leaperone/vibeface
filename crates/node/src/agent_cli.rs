@@ -139,7 +139,7 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
         }
         Command::Watch { thread_id } => {
             session
-                .request("thread/resume", json!({"threadId":thread_id}))
+                .subscribe(&thread_id)
                 .await
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             loop {
