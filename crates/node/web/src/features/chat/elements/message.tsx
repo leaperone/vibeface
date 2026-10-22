@@ -1,4 +1,4 @@
-import { CirclePause, LoaderCircle, Repeat } from 'lucide-react'
+import { Bot, CalendarClock, CirclePause, LoaderCircle } from 'lucide-react'
 import { Markdown, PlainText } from '@/components/app/markdown'
 import { messageKey, replyStatusLabel } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
@@ -14,10 +14,11 @@ function shortTime(when: Date) {
 }
 
 /**
- * One message: the person's in a bubble, the assistant's as plain text across the full width. `last` marks the end
- * of a run from the same sender, where the time shows. `routine` names the routine whose run produced this reply.
+ * One message: the person's in a bubble, the assistant's as plain text across the full width, another bot's in a
+ * card under its name. `last` marks the end of a run from the same sender, where the time shows. `schedule` names
+ * the schedule whose run produced this reply.
  */
-export function Message({ message, routine, last = true }: { message: ChatMessage; routine?: string; last?: boolean }) {
+export function Message({ message, schedule, last = true }: { message: ChatMessage; schedule?: string; last?: boolean }) {
   const { connectionOnline } = useWorkspace()
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
@@ -29,11 +30,22 @@ export function Message({ message, routine, last = true }: { message: ChatMessag
     {message.blobs?.map((blob) => <div key={blob.hash} className="min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact hash={blob.hash} size={blob.size} attachment /></div>)}
     {time}
   </div>
+  if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
+    <span className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
+      <Bot aria-hidden="true" className="size-4 shrink-0" />
+      <span className="min-w-0 truncate">{message.sender?.name ?? '另一个助手'}</span>
+    </span>
+    <div title={full} className="min-w-0 max-w-[85%] rounded-2xl border bg-muted px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]">
+      <span className="sr-only">{message.sender?.name ?? '另一个助手'}：</span>
+      <Markdown text={message.text} />
+    </div>
+    {time}
+  </div>
   return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
-    {routine ? <span className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
-      <Repeat aria-hidden="true" className="size-4 shrink-0" />
-      {routine === '例行任务' ? null : <span className="sr-only">例行任务：</span>}
-      <span className="min-w-0 truncate">{routine}</span>
+    {schedule ? <span className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
+      <CalendarClock aria-hidden="true" className="size-4 shrink-0" />
+      {schedule === '定时任务' ? null : <span className="sr-only">定时任务：</span>}
+      <span className="min-w-0 truncate">{schedule}</span>
     </span> : null}
     <div title={full} className="w-full min-w-0">
       <span className="sr-only">助手：</span>

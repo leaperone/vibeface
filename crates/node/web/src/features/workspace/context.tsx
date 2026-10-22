@@ -20,7 +20,7 @@ import { answerBody, answerId, answerScope } from "./questions"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus, OpenWork,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus, OpenWork, ScheduleAction,
 } from "./types"
 
 /** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
@@ -323,6 +323,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
+    if (item.method === "control_schedule") {
+      // Only schedules still ahead are listed, so a missing one is deleted or done either way.
+      const schedule = context.assistant.schedules.find((entry) => entry.schedule_id === item.params.schedule_id)
+      return !schedule || item.params.action !== "delete" && schedule.enabled === (item.params.action === "resume")
+    }
     if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
     if (item.method === "resolve") {
       const check = String(item.params.check_id), workId = check.startsWith("work:") ? check.slice(5) : null
@@ -582,6 +587,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       await refreshRef.current()
+    }),
+    controlSchedule: (scheduleId: string, action: ScheduleAction) => withMutation(`schedule:${scheduleId}`, async () => {
+      const id = activeId.current
+      const attestation = await attest(id, { type: "schedule_controlled", schedule_id: scheduleId, action })
+      try { await signedWrite("schedule", `${scheduleId}:${action}`, "control_schedule", { conversation_id: id, schedule_id: scheduleId, action, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
     }),
     takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
       const id = activeId.current, context = requireBotContext(id)

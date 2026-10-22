@@ -10,7 +10,7 @@ const row = (question_id: string, created_at_ms: number, extra: Record<string, u
 })
 const snapshot = (extra: Record<string, unknown>) => ({
   conversation: { conversation_id: "chat", title: "助手", owner: "gateway", owner_epoch: 1 }, messages: [], works: [], deliveries: [],
-  checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] }, questions: [], sessions: [], ...extra,
+  checks: [], local_node: "gateway", changes: [], assistant: { skills: [], schedules: [], memory: [] }, questions: [], sessions: [], ...extra,
 })
 
 test("questions parse from the list and the chat snapshot, and fail closed on shapes the web cannot show", () => {

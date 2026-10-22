@@ -1,14 +1,14 @@
 "use client"
 
 import { useRef, useState, type ReactNode } from "react"
-import { BookOpen, Bot, CirclePause, Repeat, ScrollText, Star, type LucideIcon } from "lucide-react"
+import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { formatWhen, routineFrequency } from "./assistant"
+import { formatWhen, scheduleFrequency } from "./assistant"
 import { useWorkspace } from "./context"
 import { ActionButton } from "./present"
 
-/** Header button for the chat route; opens a read-only view of the assistant (docs/design/assistant-config.md section 5). */
+/** Header button for the chat route; opens a view of the assistant where only schedules can be paused, resumed or deleted (docs/design/assistant-config.md section 5). */
 export function AssistantPanelButton() {
   const workspace = useWorkspace()
   const [open, setOpen] = useState(false)
@@ -35,16 +35,30 @@ export function AssistantPanelButton() {
               ? <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
               : <Empty>还没有说明</Empty>}
           </Section>
-          <Section icon={Repeat} title="例行任务" count={view.routines.length}>
-            {view.routines.length ? <ul className="grid gap-4">{view.routines.map((routine) => <li key={routine.routine_id} className="grid gap-0.5">
-              <p className="font-medium [overflow-wrap:anywhere]">{routine.name}</p>
-              <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
-                <span>{routineFrequency(routine)}</span>
-                {!routine.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
-                  : routine.next_run_at_ms !== null ? <span>下次 {formatWhen(routine.next_run_at_ms)}</span> : null}
-              </p>
-              <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]" title={routine.prompt}>{routine.prompt}</p>
-            </li>)}</ul> : <Empty>还没有例行任务</Empty>}
+          <Section icon={CalendarClock} title="定时任务" count={view.schedules.length}>
+            {view.schedules.length ? <ul className="grid gap-4">{view.schedules.map((schedule) => {
+              const Kind = schedule.every_minutes === undefined ? AlarmClock : Repeat
+              return <li key={schedule.schedule_id} className="flex items-start gap-3">
+                <Kind aria-label={schedule.every_minutes === undefined ? "一次" : "重复"} className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div className="grid min-w-0 flex-1 gap-0.5">
+                  <p className="font-medium [overflow-wrap:anywhere]">{schedule.name}</p>
+                  <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
+                    {!schedule.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
+                      : schedule.next_run_at_ms !== null ? <span>{formatWhen(schedule.next_run_at_ms)}</span> : null}
+                    <span>{scheduleFrequency(schedule)}</span>
+                  </p>
+                  <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]" title={schedule.prompt}>{schedule.prompt}</p>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  <ActionButton variant="ghost" label={schedule.enabled ? "暂停" : "恢复"} disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, schedule.enabled ? "pause" : "resume")}>
+                    {schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
+                  </ActionButton>
+                  <ActionButton variant="ghost" label="删除" disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, "delete")}>
+                    <Trash2 aria-hidden="true" />
+                  </ActionButton>
+                </div>
+              </li>
+            })}</ul> : <Empty>还没有定时任务</Empty>}
           </Section>
           <Section icon={BookOpen} title="共用 skill" count={view.skills.length}>
             {view.skills.length ? <ul className="grid gap-3">{view.skills.map((skill) => <li key={skill.skill_id} className="grid gap-0.5">

@@ -18,7 +18,7 @@ const shown = parseConversation({
   conversation: { conversation_id: "chat", title: "", owner: "gateway", owner_epoch: 1 },
   messages: [message("m1", 1), message("m3", 3)], works: [work("w1"), work("w2")],
   deliveries: [{ state: "dispatch_waiting", work_id: "w9", target_node: "worker", cwd: "/w" }, { state: "stop_waiting", work_id: "w1", target_node: "worker" }],
-  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] },
+  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], assistant: { skills: [], schedules: [], memory: [] },
   questions: [], sessions: [],
 }, "chat")
 const records = (extra: Record<string, unknown> = {}) => {

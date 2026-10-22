@@ -92,19 +92,24 @@ export type PendingCheck =
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type FieldEdit = { before: string; after: string }
 export type AssistantSkill = { name: string; description: string; body: string }
-/** Runs at `first_run_at_ms` and every `every_minutes` after it. */
-export type AssistantRoutine = { name: string; prompt: string; first_run_at_ms: number; every_minutes: number; enabled: boolean }
+/** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
+export type AssistantSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
+export type MemoryEntry = { memory_id: string; text: string }
 /** `before` null is a new item, `after` null a removed one (docs/design/assistant-config.md section 2). */
 export type AssistantChange =
   | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit }
   | { kind: "skill"; skill_id: string; before: AssistantSkill | null; after: AssistantSkill | null }
-  | { kind: "routine"; routine_id: string; before: AssistantRoutine | null; after: AssistantRoutine | null }
-/** A change applied from the person's message `cause`. */
-export type AssistantChangeRecord = { change_id: string; cause: string; event_hash: string; created_at_ms: number; change: AssistantChange }
+  | { kind: "schedule"; schedule_id: string; before: AssistantSchedule | null; after: AssistantSchedule | null }
+  | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
+/** The person's signed message a turn stood on; it may be in another bot's chat. */
+export type ChangeCause = { conversation_id: string; message_id: string }
+/** A change to the bot of `conversation_id`, applied from `cause`; null when the bot's own turn made it with no message behind it. */
+export type AssistantChangeRecord = { change_id: string; conversation_id: string; cause: ChangeCause | null; event_hash: string; created_at_ms: number; change: AssistantChange }
 export type SkillSummary = { skill_id: string; name: string; description: string }
-export type RoutineView = AssistantRoutine & { routine_id: string; next_run_at_ms: number | null }
-/** This assistant's routines and the skill library every assistant shares. */
-export type AssistantView = { skills: SkillSummary[]; routines: RoutineView[] }
+export type ScheduleView = AssistantSchedule & { schedule_id: string; next_run_at_ms: number | null }
+export type ScheduleAction = "pause" | "resume" | "delete"
+/** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
+export type AssistantView = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[] }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]

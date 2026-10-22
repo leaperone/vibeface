@@ -3,7 +3,7 @@ import type { ReplyStatus } from "../chat/types"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
+  AssistantChange, AssistantChangeRecord, AssistantSchedule, AssistantSkill, AssistantView, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
 } from "./types"
 import { answerId } from "./questions.ts"
 
@@ -59,7 +59,11 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
 }
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs), answers: optionalText(data.answers), rank: optionalText(data.rank) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender) }
+}
+function sender(value: unknown) {
+  const data = record(value)
+  return { conversation_id: text(data.conversation_id), name: text(data.name) }
 }
 function replyStatus(value: unknown): ReplyStatus {
   switch (value) {
@@ -186,11 +190,14 @@ function skill(value: unknown): AssistantSkill {
   const data = record(value)
   return { name: text(data.name), description: text(data.description), body: text(data.body) }
 }
-function routine(value: unknown): AssistantRoutine {
+function schedule(value: unknown): AssistantSchedule {
   const data = record(value)
-  const every = number(data.every_minutes)
-  if (every === 0) throw new Error("例行任务的间隔不对。")
-  return { name: text(data.name), prompt: text(data.prompt), first_run_at_ms: number(data.first_run_at_ms), every_minutes: every, enabled: flag(data.enabled) }
+  const every = data.every_minutes == null ? undefined : number(data.every_minutes)
+  if (every === 0) throw new Error("定时任务的间隔不对。")
+  return {
+    name: text(data.name), prompt: text(data.prompt), first_run_at_ms: number(data.first_run_at_ms), enabled: flag(data.enabled),
+    ...(every === undefined ? {} : { every_minutes: every }), ...(data.depth == null ? {} : { depth: number(data.depth) }),
+  }
 }
 function assistantChange(value: unknown): AssistantChange {
   const data = record(value)
@@ -199,25 +206,29 @@ function assistantChange(value: unknown): AssistantChange {
     if (!name && !instructions) throw new Error("助手修改记录是空的。")
     return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}) }
   }
-  if (data.kind !== "skill" && data.kind !== "routine") throw new Error("助手修改记录无法识别。")
   if (data.before == null && data.after == null) throw new Error("助手修改记录是空的。")
-  return data.kind === "skill"
-    ? { kind: "skill", skill_id: text(data.skill_id), before: side(skill, data.before), after: side(skill, data.after) }
-    : { kind: "routine", routine_id: text(data.routine_id), before: side(routine, data.before), after: side(routine, data.after) }
+  switch (data.kind) {
+    case "skill": return { kind: "skill", skill_id: text(data.skill_id), before: side(skill, data.before), after: side(skill, data.after) }
+    case "schedule": return { kind: "schedule", schedule_id: text(data.schedule_id), before: side(schedule, data.before), after: side(schedule, data.after) }
+    case "memory": return { kind: "memory", memory_id: text(data.memory_id), before: side(text, data.before), after: side(text, data.after) }
+    default: throw new Error("助手修改记录无法识别。")
+  }
 }
 function side<T>(read: (value: unknown) => T, value: unknown): T | null { return value == null ? null : read(value) }
 function changeRecord(value: unknown): AssistantChangeRecord {
   const data = record(value)
-  return { change_id: text(data.change_id), cause: text(data.cause), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), change: assistantChange(data.change) }
+  const cause = data.cause == null ? null : record(data.cause)
+  return { change_id: text(data.change_id), conversation_id: text(data.conversation_id), cause: cause && { conversation_id: text(cause.conversation_id), message_id: text(cause.message_id) }, event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), change: assistantChange(data.change) }
 }
 function assistantView(value: unknown): AssistantView {
   const data = record(value)
   return {
     skills: list(data.skills).map((item) => { const skill = record(item); return { skill_id: text(skill.skill_id), name: text(skill.name), description: text(skill.description) } }),
-    routines: list(data.routines).map((item) => {
+    schedules: list(data.schedules).map((item) => {
       const view = record(item)
-      return { ...routine(view), routine_id: text(view.routine_id), next_run_at_ms: view.next_run_at_ms === null ? null : number(view.next_run_at_ms) }
+      return { ...schedule(view), schedule_id: text(view.schedule_id), next_run_at_ms: view.next_run_at_ms == null ? null : number(view.next_run_at_ms) }
     }),
+    memory: list(data.memory).map((item) => { const entry = record(item); return { memory_id: text(entry.memory_id), text: text(entry.text) } }),
   }
 }
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {
