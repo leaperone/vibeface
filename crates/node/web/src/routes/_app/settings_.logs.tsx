@@ -85,10 +85,10 @@ function LogsPage() {
     </div>
     <InlineError error={error} />
     {records === null ? null : records.length === 0
-      ? <EmptyState icon={ScrollText} title="没有符合条件的记录" description="换个级别、来源或关键词试试。"
+      ? <EmptyState icon={ScrollText} title="没有符合条件的记录"
         action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
-        <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}，新的在上面</p>
+        <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
         <ul className="divide-y overflow-hidden rounded-xl border bg-card">
           {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
         </ul>

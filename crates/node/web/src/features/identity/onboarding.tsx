@@ -11,7 +11,7 @@ import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding
 function Dots({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
     <span className="flex gap-1.5" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={`size-2 rounded-full ${item <= step ? "bg-foreground" : "bg-muted-foreground/30"}`} />)}</span>
-    第 {step} 步，共 4 步
+    <span className="sr-only">第 {step} 步，共 4 步</span>
   </div>
 }
 

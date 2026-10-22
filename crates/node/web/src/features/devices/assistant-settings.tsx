@@ -90,7 +90,7 @@ export function AssistantSettings({ onboarding = false, update, onChange }: { on
 
   return <form className="grid gap-5" onSubmit={(event) => { event.preventDefault(); void load(draft) }}>
     <fieldset disabled={busy} className="grid gap-2">
-      <legend className="mb-2 text-meta font-medium text-muted-foreground">用哪个</legend>
+      <legend className="sr-only">用哪个</legend>
       <div role="radiogroup" aria-label="助手用哪个 AI 服务" className="flex w-fit flex-wrap gap-1 rounded-lg bg-muted p-1">
         {providers.filter(([value]) => !onboarding || value !== "disabled").map(([value, label]) => <Button key={value} type="button" role="radio" aria-checked={draft.provider === value}
           variant={draft.provider === value ? "outline" : "ghost"} className={cn(draft.provider === value && "shadow-xs")} onClick={() => choose(value)}>{label}</Button>)}
@@ -113,7 +113,7 @@ export function AssistantSettings({ onboarding = false, update, onChange }: { on
           <span className="min-w-0 truncate">{item.label}</span>
           <a className="shrink-0 font-medium underline underline-offset-4" href={docs + item.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
         </li>)}</ul>
-        : <p className="flex items-center gap-2 text-meta text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已就绪，登录在首次对话时确认</p>}
+        : <p className="flex items-center gap-2 text-meta text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已就绪</p>}
       <Details label="自定义路径">
         <label className="grid gap-1">模型<Input name="model" value={draft.model} maxLength={256} required={draft.provider === "cursor_sdk"} placeholder={draft.provider === "cursor_sdk" ? "auto" : "默认"} onChange={(event) => set({ model: event.target.value })} /></label>
         <label className="grid gap-1">助手工作文件夹<Input name="workspace" className="font-mono" value={draft.workspace} onChange={(event) => set({ workspace: event.target.value })} /></label>
@@ -133,7 +133,7 @@ export function AssistantSettings({ onboarding = false, update, onChange }: { on
         <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         <FolderPath path={root} />
         <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => void load({ ...draft, roots: draft.roots.filter((item) => item !== root) })}><X aria-hidden="true" /></Button>
-      </li>)}</ul> : <p className="text-meta text-muted-foreground">还没有，助手只能在自己的文件夹里工作</p>}
+      </li>)}</ul> : null}
       <div className="flex min-w-0 gap-2">
         <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="/Users/me/project" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addFolder() } }} />
         <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={addFolder}><Plus aria-hidden="true" />添加</Button>

@@ -29,12 +29,14 @@ export function DetailList({ pairs }: { pairs: Array<[string, string | undefined
 export function ActionButton({
   children,
   className,
+  title,
   variant = "secondary",
   disabled,
   action,
 }: {
   children: ReactNode
   className?: string
+  title?: string
   variant?: "default" | "secondary" | "ghost" | "destructive"
   disabled?: boolean
   action: () => Promise<void>
@@ -49,6 +51,7 @@ export function ActionButton({
       type="button"
       variant={variant}
       className={className}
+      title={title}
       disabled={disabled || busy}
       aria-busy={busy}
       onClick={() => {

@@ -45,9 +45,9 @@ function SettingsPage() {
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><LifeBuoy aria-hidden="true" className="size-5" />排障</h2>
       <Button asChild variant="outline" className="h-auto justify-start gap-3 py-3 max-md:h-auto">
-        <Link to="/settings/logs"><ScrollText aria-hidden="true" /><span className="grid flex-1 text-left"><span>日志</span><span className="text-meta font-normal text-muted-foreground whitespace-normal">这台设备、网页和助手的运行记录</span></span><ChevronRight aria-hidden="true" className="text-muted-foreground" /></Link>
+        <Link to="/settings/logs"><ScrollText aria-hidden="true" /><span className="flex-1 text-left">日志</span><ChevronRight aria-hidden="true" className="text-muted-foreground" /></Link>
       </Button>
-      <p className="text-muted-foreground">诊断包里没有密钥和邀请，可以发给帮你排查的人。</p>
+      <p className="text-meta text-muted-foreground">诊断包不含密钥和邀请</p>
       <div className="flex flex-wrap items-center gap-2">
         <NativeSelect aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))} className="[&_select]:h-9 max-md:[&_select]:h-11">
           {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}

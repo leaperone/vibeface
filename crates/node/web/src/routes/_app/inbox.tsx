@@ -11,7 +11,7 @@ export const Route = createFileRoute('/_app/inbox')({ component: InboxPage })
 
 function InboxPage() {
   const items = useInbox()
-  if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" description="需要你决定的事会出现在这里" />
+  if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" />
   return <ul className="mx-auto grid max-w-3xl gap-3">
     {items.map((item) => <li key={item.key} className="min-w-0">
       {item.write ? <WriteCard kind={item.write} /> : item.join ? <JoinCard request={item.join} /> : item.question ? <QuestionCard question={item.question} inbox /> : item.check ? <ConfirmCard check={item.check} /> : <Link to={item.to} className="flex min-h-14 items-center gap-3 rounded-xl border bg-card px-4 py-3 hover:bg-muted/50">

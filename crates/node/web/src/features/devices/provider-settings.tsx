@@ -259,7 +259,7 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
               <Button type="submit" variant="outline" disabled={working || !addName || !newValue}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
             </div>
           </form>
-          <p className="text-meta text-muted-foreground">只存在这台电脑上，只给 {name} 用，保存后看不到原值</p>
+          <p className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</p>
           {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
         </div>
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}

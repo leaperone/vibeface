@@ -119,7 +119,7 @@ export function ConversationScreen() {
     </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
     ownerAway && owner ? <ActionCard key="owner" icon={ArrowRightLeft} title={`${nodeName(owner, lookup)} 离线了，这个对话在等它`} actions={
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
-    }><p className="text-muted-foreground">交给这台设备后，排队的消息在这里继续回复。</p></ActionCard> : null,
+    } /> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
@@ -215,7 +215,7 @@ function TaskCard({ task, botId, device, open }: { task: TaskRow; botId: string;
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
     {taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} state={task.state} className="text-meta" /></span>{taskActive(task.state) && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
-    <span className="flex shrink-0 items-center text-meta text-muted-foreground">详情<ChevronRight aria-hidden="true" className="size-4" /></span>
+    <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
   </Link>
 }
 

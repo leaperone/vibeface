@@ -64,7 +64,7 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
 function Steps({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
     <span className="flex gap-1.5" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn('size-2 rounded-full', item <= step ? 'bg-foreground' : 'bg-muted-foreground/30')} />)}</span>
-    第 {step} 步，共 4 步
+    <span className="sr-only">第 {step} 步，共 4 步</span>
   </div>
 }
 
@@ -91,13 +91,12 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
     </Button>
   </>
   return <Panel icon={MonitorX} title="这台设备已被移出">
-    <p className="text-muted-foreground">它不再同步，也不能再用。</p>
     {device.removedLocally ? <>
-      <p className="text-muted-foreground">点“重新加入”让这台电脑从头开始。旧数据会改名保留，不会删除。</p>
+      <p className="text-muted-foreground">旧数据会改名保留，不会删除。</p>
       <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
       <Details label="用命令重新加入">{commands}</Details>
     </> : <>
-      <p className="text-muted-foreground">要继续用这台电脑，在它上面打开本机页面点“重新加入”，或运行下面的命令。</p>
+      <p className="text-muted-foreground">在它的本机页面点“重新加入”。</p>
       <Details label="用命令重新加入">{commands}</Details>
     </>}
   </Panel>
@@ -110,7 +109,7 @@ function NodeJoin() {
   const [cancelling, setCancelling] = useState(false)
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : '等待批准'}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
-      <p className="text-muted-foreground">在发链接的设备上比对安全码，相同再批准</p>
+      <p className="text-muted-foreground">在发链接的设备上比对安全码</p>
       {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
         {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
@@ -197,12 +196,11 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
-  const other = !focused && usable && !(active === 'local' && setup && names) ? <div className="grid gap-2">
-    <p className="text-meta text-muted-foreground">其他方式</p>
+  const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-2">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : '这台电脑'}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
-      {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />已有设备？用加入链接</Button> : null}
+      {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />用加入链接</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
     </div>
   </div> : null
@@ -240,7 +238,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       <fieldset disabled={linking || !usable} className="grid gap-4">
         {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
         {purpose === 'empty' || purpose === 'invalid' ? <>
-          <Field label={scannable ? '或粘贴加入链接' : '加入链接'}><Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder="粘贴在已有设备上复制的链接" onChange={(event) => setInvitation(event.target.value)} /></Field>
+          <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? '或粘贴加入链接' : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
           {purpose === 'invalid' ? <p role="alert" className="text-meta text-danger">这不是有效的加入链接</p> : null}
         </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
           <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
@@ -254,7 +252,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       </fieldset>
     </form>}
     {publicEntry || thisComputer
-      ? <p className="text-meta text-muted-foreground">在{thisComputer ? '已有设备' : '你的电脑'}上打开 vibeface，点“添加设备”，再{thisComputer ? '粘贴它给的链接或扫它的二维码' : '扫它显示的二维码'}。</p>
+      ? <p className="text-meta text-muted-foreground">链接来自{thisComputer ? '已有设备' : '你的电脑'}上的“添加设备”</p>
       : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
   </Panel>
 
@@ -262,7 +260,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
       <header className="grid gap-3">
         <span className="text-heading font-semibold tracking-tight">vibeface</span>
-        {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 vibeface 和浏览器分开保存登录信息，需要在这里再加入一次。</p> : null}
+        {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 vibeface 需要单独加入一次</p> : null}
         {step ? <Steps step={step} /> : null}
       </header>
       {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
@@ -273,7 +271,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         <DetailRow label="这个浏览器的设备编号" value={device.identity.deviceId} mono />
         {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
           <fieldset disabled={linking} className="grid gap-3">
-            <legend className="mb-3 text-foreground">手填访问地址</legend>
+            <legend className="sr-only">手填访问地址</legend>
             <Field label="访问地址"><Input type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
             <Field label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
@@ -336,7 +334,6 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const [downloaded, setDownloaded] = useState(false)
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存恢复文件">
-    <p className="text-muted-foreground">设备都丢了时，用它找回。</p>
     <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">

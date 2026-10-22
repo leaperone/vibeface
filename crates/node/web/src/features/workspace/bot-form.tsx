@@ -86,7 +86,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <SheetHeader className="pr-14">
           <SheetTitle>{pending ? "再试一次" : "新助手"}</SheetTitle>
-          <SheetDescription>{pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"}</SheetDescription>
+          <SheetDescription className={pending ? undefined : "sr-only"}>{pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"}</SheetDescription>
         </SheetHeader>
         <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" onSubmit={(event) => { void submit(event) }}>
           {pending && rejected && !busy ? <p role="status" className="rounded-lg bg-muted p-3 text-meta">上次没建成，确认后可以修改。</p> : null}
@@ -100,14 +100,14 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
           </Field>
           <Field>
             <FieldLabel htmlFor="bot-project">工作文件夹 <span className="font-normal text-muted-foreground">可选</span></FieldLabel>
-            {pending ? <Input id="bot-project" className="min-h-11" readOnly value={savedProjectLabel} aria-describedby="bot-project-help" /> : (
-              <NativeSelect id="bot-project" name="bot-project" className="w-full [&>select]:min-h-11" value={selectedProject} disabled={busy} onChange={(event) => setSelectedProject(event.target.value)} aria-describedby="bot-project-help">
+            {pending ? <Input id="bot-project" className="min-h-11" readOnly value={savedProjectLabel} aria-describedby={pending.project ? undefined : "bot-project-help"} /> : (
+              <NativeSelect id="bot-project" name="bot-project" className="w-full [&>select]:min-h-11" value={selectedProject} disabled={busy} onChange={(event) => setSelectedProject(event.target.value)} aria-describedby={projects.length ? undefined : "bot-project-help"}>
                 <NativeSelectOption value="">不选</NativeSelectOption>
                 {selectedProject && !projects.some((item) => item.key === selectedProject) ? <NativeSelectOption value={selectedProject} disabled>原来的文件夹用不了</NativeSelectOption> : null}
                 {projects.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect>
             )}
-            <FieldDescription id="bot-project-help">{projects.length || pending?.project ? "助手会在这台设备的这个文件夹里干活。" : "还没有可用的文件夹，可以先不选，之后在「设备」里添加。"}</FieldDescription>
+            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">还没有可用的文件夹，可在「设备」里添加</FieldDescription>}
           </Field>
           <InlineError error={error} />
           <div className="flex flex-wrap gap-3">
