@@ -1,27 +1,24 @@
-"use client"
-
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
-import type { ReadyConnection } from "@/lib/node"
-import { attestationPayload } from "../../../generated/vibeface_secure.js"
-import { signClient } from "../../../transport.js"
-import { messageOf } from "@/lib/node"
-import { parseLogs, reportLog, type LogFilter } from "@/lib/web-log"
-import { enqueue, indexedOutbox, settle, type OutboxItem, type OutboxStore } from "@/lib/outbox"
-import type { Tabs } from "@/features/identity/context"
-import { mergeProgress, type LiveProgress } from "@/lib/progress"
-import { isQueuedReceipt, prepareSend } from "../chat/protocol"
+import type { ReadyConnection } from "../lib/node.ts"
+import { messageOf } from "../lib/node.ts"
+import { parseLogs, reportLog, type LogFilter } from "../lib/web-log.ts"
+import { enqueue, settle, type OutboxItem, type OutboxStore } from "../lib/outbox.ts"
+import type { Platform } from "../lib/platform.ts"
+import type { Tabs } from "../identity/context.tsx"
+import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
+import { isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords,
-} from "./model"
-import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records"
-import { answerBody, answerId, answerScope } from "./questions"
-import { networkKey, newId, readStorage, writeStorage } from "./storage"
+} from "./model.ts"
+import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
+import { answerBody, answerId, answerScope } from "./questions.ts"
+import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus, OpenWork,
-} from "./types"
+} from "./types.ts"
 
 /** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
@@ -32,26 +29,30 @@ const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
 
 export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
 
-/** Signed writes this origin has not seen confirmed, shared by every tab (docs/design/unified-network.md 4.5). */
-const browserOutbox = indexedOutbox()
+/** A file the person attached: a browser `File` or a picked document on a phone. */
+export type Attachment = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
+type NotificationButton = { label: string; disabled: boolean }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 
-function useWorkspaceState(connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab) {
+function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
+  const { notifier } = platform
+  const { readStorage, writeStorage } = storageOf(platform.storage)
   const networkId = connection.principal.network_id
   const clientId = connection.principal.device_id
   /** A local session reads this computer's records, but the network takes only a member's signature. */
   const joined = connection.principal.source === "membership"
   const prefix = `${networkId}.${clientId}:`
+  /** Signed writes this device has not seen confirmed, shared by every tab (docs/design/unified-network.md 4.5). */
   const outbox: OutboxStore = {
-    all: async () => (await browserOutbox.all()).filter((item) => item.key.startsWith(prefix)),
-    put: (item) => browserOutbox.put(item),
-    delete: (key) => browserOutbox.delete(key),
+    all: async () => (await platform.outbox.all()).filter((item) => item.key.startsWith(prefix)),
+    put: (item) => platform.outbox.put(item),
+    delete: (key) => platform.outbox.delete(key),
   }
   const outboxKey = (kind: string, id: string) => `${prefix}${kind}:${id}`
   /** This device's signature over the exact event body the Node will write for it. */
   const attest = async (scope: string, body: Record<string, unknown>) =>
-    ({ device_id: clientId, signature: await signClient("attestation", attestationPayload(networkId, scope, JSON.stringify(body))) })
+    ({ device_id: clientId, signature: await platform.transport.signClient("attestation", platform.secure.attestationPayload(networkId, scope, JSON.stringify(body))) })
   const [booted, setBooted] = useState(false)
   const [error, setError] = useState<{ text: string; retry?: () => void } | null>(null)
   const [noticeText, setNoticeText] = useState("")
@@ -80,7 +81,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
   const liveRef = useRef<LiveProgress[]>([])
   liveRef.current = liveProgress
-  const [notificationButton, setNotificationButton] = useState({ label: "开启浏览器提醒", disabled: false })
+  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: false })
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
@@ -93,7 +94,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
   const refreshAgain = useRef(false)
-  const refreshTimer = useRef<number | null>(null)
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const refreshRef = useRef<() => Promise<void>>(async () => {})
   const current = () => alive.current && connection.isCurrent()
   const requireCurrent = () => { if (!current()) throw new Error("连接换了，请再查一次。") }
@@ -112,7 +113,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const showRefreshError = (caught: unknown) => showError(caught, "读取最新内容", () => { void refreshRef.current().catch(showRefreshError) })
   const requireWritable = () => {
     requireCurrent()
-    if (!joined) throw new Error("这个浏览器还没加入，加入后才能操作。")
+    if (!joined) throw new Error(`${platform.self}还没加入，加入后才能操作。`)
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
@@ -195,7 +196,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
-    if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && !document.hidden) {
+    if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && platform.foreground()) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
         try {
@@ -208,28 +209,26 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     }
     return next
   }
-  const refreshNotificationButton = () => {
-    if (!("Notification" in window)) { setNotificationButton({ label: "浏览器不支持提醒", disabled: true }); return }
+  const refreshNotificationButton = async () => {
+    const permission = await notifier.permission()
+    if (!current()) return
     const enabled = readStorage(networkKey("notify", networkId), false)
-    setNotificationButton(Notification.permission === "granted"
-      ? { label: enabled ? "浏览器提醒已开启" : "启用此网络提醒", disabled: enabled }
-      : Notification.permission === "denied" ? { label: "请在浏览器设置允许提醒", disabled: true }
-      : { label: "开启浏览器提醒", disabled: false })
+    setNotificationButton(permission === "unsupported" ? { label: `不支持${notifier.name}`, disabled: true }
+      : permission === "granted" ? { label: enabled ? `${notifier.name}已开启` : "启用此网络提醒", disabled: enabled }
+      : permission === "denied" ? { label: `请在设置里允许${notifier.name}`, disabled: true }
+      : { label: `开启${notifier.name}`, disabled: false })
   }
-  const notifyBrowser = (items: NotificationRecord[]) => {
-    if (!("Notification" in window) || Notification.permission !== "granted" || !readStorage(networkKey("notify", networkId), false)) return
+  const notify = async (items: NotificationRecord[]) => {
+    if (!items.length || !readStorage(networkKey("notify", networkId), false) || await notifier.permission() !== "granted") return
     const seen = new Set(readStorage<string[]>(networkKey("seen", networkId), []))
     for (const item of items) {
       if (seen.has(item.notification_id)) continue
       seen.add(item.notification_id)
       try {
-        const popup = new Notification(item.kind === "question" ? "Vibeface · 需要你回答" : "Vibeface · 进展", { body: item.text, tag: item.notification_id })
-        popup.onclick = () => {
-          if (!current()) { popup.close(); return }
-          window.focus(); openConversation(item.conversation_id)
-          popup.close()
-        }
-      } catch { /* The persisted inbox remains available when browser notifications fail. */ }
+        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
+          if (current()) openConversation(item.conversation_id)
+        })
+      } catch { /* The persisted inbox remains available when system alerts fail. */ }
     }
     writeStorage(networkKey("seen", networkId), [...seen].slice(-1000))
   }
@@ -242,7 +241,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   }
   const scheduleRefresh = () => {
     if (!current() || refreshTimer.current !== null) return
-    refreshTimer.current = window.setTimeout(() => {
+    refreshTimer.current = setTimeout(() => {
       refreshTimer.current = null
       void refreshRef.current().catch(showRefreshError)
     }, 350)
@@ -270,8 +269,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       readConnection.current = connection
-      notifyBrowser(nextNotifications)
-      refreshNotificationButton()
+      void notify(nextNotifications)
+      void refreshNotificationButton()
     } catch (caught) {
       if (current()) { readConnection.current = null; dataRef.current = null; setData(null) }
       throw caught
@@ -295,7 +294,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     const fresh = records.notifications.filter((item) => !notificationsRef.current.some((known) => known.notification_id === item.notification_id))
     notificationsRef.current = mergeNotifications(notificationsRef.current, records)
     setNotifications(notificationsRef.current)
-    notifyBrowser(fresh)
+    void notify(fresh)
     const shown = dataRef.current
     if (id === activeId.current && readConnection.current === connection && shown?.conversation?.conversation_id === id) await showConversation(id, mergeConversation(shown, records))
   }
@@ -348,9 +347,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
     try {
-      const url = new URL(window.location.href)
-      const routeBot = /^\/b\/([^/]+)/.exec(url.pathname)?.[1]
-      if (routeBot) writeStorage(scoped("selected-bot"), decodeURIComponent(routeBot))
+      if (initialBot) writeStorage(scoped("selected-bot"), initialBot)
       activeId.current = ""
       setConversationId(activeId.current)
       void loadPending().then(() => { if (alive.current) setBooted(true) }, (caught) => showError(caught, "读取待发消息"))
@@ -379,18 +376,17 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     })
     // Pushes carry every change; this catches a device going offline, which nothing pushes, and anything missed.
     let ticks = 0
-    const timer = window.setInterval(() => {
+    const timer = setInterval(() => {
       ticks += 1
       if (ticks % 20 === 0) scheduleRefresh()
       else if (openWorksRef.current.length) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
     }, 15000)
-    const visible = () => { if (!document.hidden) scheduleRefresh() }
-    document.addEventListener("visibilitychange", visible)
+    const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {
-      unsubscribe(); window.clearInterval(timer)
-      if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current)
+      unsubscribe(); clearInterval(timer)
+      if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
       refreshTimer.current = null
-      document.removeEventListener("visibilitychange", visible)
+      stopForeground()
     }
   }, [booted, connection])
 
@@ -419,7 +415,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   }
   /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
   /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
-  const uploadAttachment = async (id: string, file: File): Promise<BlobRef> => {
+  const uploadAttachment = async (id: string, file: Attachment): Promise<BlobRef> => {
     const bytes = new Uint8Array(await file.arrayBuffer())
     if (!bytes.length || bytes.length > 64 * 1024 * 1024) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
     const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
@@ -434,7 +430,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       offset = Number(reply.offset)
     }
   }
-  const submitMessage = async (text: string, files: File[] = []) => {
+  const submitMessage = async (text: string, files: Attachment[] = []) => {
     requireContext()
     const id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
@@ -500,7 +496,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     selectConversation(bot.conversation_id)
     await refreshRef.current()
   }
-  const sendMessage = (input: string, files: File[] = []) => withMutation(`message:${activeId.current}`, async () => {
+  const sendMessage = (input: string, files: Attachment[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个助手。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
@@ -679,14 +675,15 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       await outboxChanged()
       setNoticeText("已放弃这条消息，没有重发。")
     }),
-    enableBrowserNotifications: async () => {
+    enableNotifications: async () => {
       requireCurrent()
-      if (!("Notification" in window)) return
-      const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission()
+      const granted = await notifier.permission()
+      if (granted === "unsupported") return
+      const permission = granted === "granted" ? granted : await notifier.request()
       requireCurrent()
       writeStorage(networkKey("notify", networkId), permission === "granted")
-      if (permission === "granted") { writeStorage(networkKey("seen", networkId), notificationsRef.current.map((item) => item.notification_id)); setNoticeText("浏览器提醒已开启。已有未读提醒保留在对话列表中。") }
-      refreshNotificationButton()
+      if (permission === "granted") { writeStorage(networkKey("seen", networkId), notificationsRef.current.map((item) => item.notification_id)); setNoticeText(`${notifier.name}已开启。已有未读提醒保留在对话列表中。`) }
+      await refreshNotificationButton()
     },
   }
 }
@@ -697,7 +694,7 @@ export function useWorkspace() {
   if (!value) throw new Error("工作区组件缺少上下文。")
   return value
 }
-export function WorkspaceProvider({ connection, openConversation, tabs, children }: { connection: ReadyConnection; openConversation: (conversationId: string) => void; tabs: Tabs; children: ReactNode }) {
-  const value = useWorkspaceState(connection, openConversation, tabs)
+export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
+  const value = useWorkspaceState(platform, connection, openConversation, tabs, initialBot)
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

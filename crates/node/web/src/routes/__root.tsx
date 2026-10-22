@@ -1,10 +1,11 @@
 import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { Toaster } from '@/components/app/kit'
-import { DeviceProvider } from '@/features/identity/context'
+import { DeviceProvider } from '@vibeface/client/identity/context.tsx'
 import { ViewportHeight } from '@/components/viewport-height'
 import { registerShell } from '@/lib/offline'
-import { installErrorReporting } from '@/lib/web-log'
+import { installErrorReporting } from '@/lib/error-reporting'
+import { webPlatform } from '@/lib/platform'
 import { installValidityMessages } from '@/lib/validity'
 import { themeScript } from '@/lib/theme'
 
@@ -40,7 +41,7 @@ export const Route = createRootRoute({
 
 /** DeviceProvider reads and clears invitation hashes on mount, so it wraps every route including /join. */
 function RootLayout() {
-  return <DeviceProvider><Outlet /><Toaster /></DeviceProvider>
+  return <DeviceProvider platform={webPlatform}><Outlet /><Toaster /></DeviceProvider>
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {

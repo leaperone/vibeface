@@ -1,6 +1,6 @@
-import { validEndpoint, validTarget } from '../../transport.js'
-import type { ChangedEvent } from './progress'
-import { humanError } from './errors'
+import { validEndpoint, validTarget } from './transport.ts'
+import type { ChangedEvent } from './progress.ts'
+import { humanError } from './errors.ts'
 
 export type ConnectionEntry = { address: string; device_id: string; local?: boolean }
 export type PublicIdentity = { deviceId: string }
@@ -70,7 +70,7 @@ export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')
   const entry = { address: validEndpoint(text(v.address)), device_id: validTarget(v.device_id) }
   if (v.local === true) {
-    if (entry.address !== location.origin) throw new Error('本机打开时只能连这台电脑。')
+    if (entry.address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这台电脑。')
     return { ...entry, local: true }
   }
   return entry

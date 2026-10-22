@@ -5,8 +5,8 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { InlineError } from "@/components/app/kit"
-import { stateLabel } from "./labels"
-import { useWorkspace } from "./context"
+import { stateLabel } from "@vibeface/client/workspace/labels.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 
 export function StatusBadge({ value, label }: { value?: string; label?: string }) {
   const text = stateLabel(value, label)

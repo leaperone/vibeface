@@ -22,6 +22,9 @@ importers:
       '@tanstack/react-start':
         specifier: 1.169.3
         version: 1.169.3(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(rolldown@1.2.14)(vite@8.3.4(@types/node@22.20.5)(jiti@2.7.0))
+      '@vibeface/client':
+        specifier: workspace:*
+        version: link:../../../packages/client
       class-variance-authority:
         specifier: ^0.7.1
         version: 0.7.1

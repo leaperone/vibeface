@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react"
 import { ActionCard, Details, DetailRow, InlineError, SafetyCode, Skeleton, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
-import { useDevice } from "@/features/identity/context"
-import type { JoinRequest } from "@/lib/node"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import type { JoinRequest } from "@vibeface/client/lib/node.ts"
 import { deviceIcon } from "./devices"
 
 /** Requests an admin can still act on. */

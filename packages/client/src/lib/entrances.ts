@@ -1,4 +1,4 @@
-import type { ConnectionEntry, MembershipView } from './node'
+import type { ConnectionEntry, MembershipView } from './node.ts'
 
 /**
  * A member Gateway from its latest signed address record. `seq` is the highest record accepted, kept

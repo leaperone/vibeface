@@ -5,9 +5,9 @@ import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createContext, Script } from 'node:vm'
 import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
-import type { ConnectionEntry } from '../../lib/node.ts'
-import { primaryLane, shouldAutoConnect } from './connection-lane.ts'
-import { accessOf } from './access.ts'
+import type { ConnectionEntry } from '@vibeface/client/lib/node.ts'
+import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
+import { accessOf } from '@vibeface/client/identity/access.ts'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -125,13 +125,13 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
     governancePayload: () => new Uint8Array(), inviteSigningPayload: () => new Uint8Array(),
-    sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {},
+    sealPackage: () => new Uint8Array([1, 2, 3]),
     verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: () => '{}', createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
-    location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, Uint8Array, Error, crypto: globalThis.crypto,
+    location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
       if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
@@ -152,6 +152,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
   })
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
+  const clientRoot = fileURLToPath(new URL('../../../../../../packages/client/src/', import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
     if (cached) return cached.exports
@@ -160,21 +161,22 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     const require = (specifier: string) => {
       if (specifier === 'react') return react
       if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
-      if (specifier.endsWith('/transport.js')) return transport
-      if (specifier === '@/lib/secure') return secure
-      const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
+      if (specifier.endsWith('/lib/transport.ts')) return transport
+      if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure }
+      const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : specifier.startsWith('@vibeface/client/') ? resolve(clientRoot, specifier.slice(17)) : resolve(dirname(filename), specifier)
       return load(extname(path) ? path : `${path}.ts`)
     }
     new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
     return module.exports
   }
-  const Provider = load(fileURLToPath(new URL('./context.tsx', import.meta.url))).DeviceProvider
+  const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
+  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery() {} }
   assert.equal(typeof Provider, 'function')
-  type Device = ReturnType<typeof import('./context.tsx').useDevice>
+  type Device = ReturnType<typeof import('@vibeface/client/identity/context.tsx').useDevice>
   const render = (): Device => {
     cursor = 0
     assert.ok(typeof Provider === 'function')
-    const props = Provider({ children: null })
+    const props = Provider({ platform, children: null })
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
@@ -198,7 +200,7 @@ test('fresh localhost discovers its one-time capability and creates the network 
     await app.render().createLocalNetwork('browser', 'test-only-passphrase')
     assert.equal(app.render().review?.kind, 'bootstrap')
     assert.equal(app.calls.includes('recover'), false)
-    app.render().downloadBackup()
+    await app.render().downloadBackup()
     await app.render().confirmBootstrap(true)
     assert.equal(app.render().ready?.entry.address, localEntry.address)
     assert.equal(app.render().localSetup?.kind, 'initialized')
@@ -626,7 +628,7 @@ for (const stage of ['recover', 'subscribe']) test(`cancelSensitive during ${sta
   try {
     app.render(); await settle()
     await app.render().createLocalNetwork('browser', 'test-only-passphrase')
-    app.render().downloadBackup()
+    await app.render().downloadBackup()
     const hold = deferred(); app.holds.set(stage, hold)
     const confirming = app.render().confirmBootstrap(true)
     const rejected = assert.rejects(confirming, /切换|取消/)
@@ -650,7 +652,7 @@ for (const flow of ['join', 'sensitive']) test(`cancelling ${flow} after subscri
     if (flow === 'join') app.joinStatus.value = joinRequest('joined')
     if (flow === 'sensitive') {
       await app.render().createLocalNetwork('browser', 'test-only-passphrase')
-      app.render().downloadBackup()
+      await app.render().downloadBackup()
     }
     const hold = deferred(); app.holds.set('subscribe', hold)
     const checking = flow === 'join' ? app.render().checkJoin() : app.render().confirmBootstrap(true)
@@ -809,7 +811,7 @@ test('successful bootstrap releases local material without disconnecting the aut
   try {
     app.render(); await settle()
     await app.render().createLocalNetwork('browser', 'test-only-passphrase')
-    app.render().downloadBackup()
+    await app.render().downloadBackup()
     await app.render().confirmBootstrap(true)
     assert.equal(app.render().ready?.entry.device_id, target)
     assert.equal(app.render().ready?.isCurrent(), true)

@@ -1,4 +1,4 @@
-import type { BotRecord } from "./types"
+import type { BotRecord } from "./types.ts"
 
 type Home = { narrow: boolean; conversation?: string; bots: readonly BotRecord[]; current: string }
 

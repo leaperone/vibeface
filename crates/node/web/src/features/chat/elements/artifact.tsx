@@ -2,8 +2,8 @@ import { Paperclip } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
-import { useWorkspace } from '@/features/workspace/context'
-import { formatSize } from '@/features/workspace/model'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { formatSize } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/features/workspace/present'
 
 const signatures: Array<[number[], string]> = [[[0x89, 0x50, 0x4e, 0x47], 'png'], [[0xff, 0xd8, 0xff], 'jpg'], [[0x47, 0x49, 0x46], 'gif'], [[0x25, 0x50, 0x44, 0x46], 'pdf'], [[0x50, 0x4b, 0x03, 0x04], 'zip']]

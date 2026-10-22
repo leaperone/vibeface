@@ -4,8 +4,8 @@ import { cn } from "cn"
 import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { useDevice } from "@/features/identity/context"
-import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderRole, type ProviderStatus } from "@/lib/node"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderRole, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const providerNames: Record<ProviderId, string> = { codex: "Codex", cursor: "Cursor" }
 const icons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }

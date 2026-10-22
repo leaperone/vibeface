@@ -53,6 +53,6 @@ export function replyStatusLabel(status: string | undefined): string {
 }
 export function messageKey(message: TranscriptMessage): string { return message.event_hash }
 
-export function isSubmitKey(event: Pick<KeyboardEvent, 'key' | 'shiftKey' | 'isComposing' | 'keyCode'>): boolean {
+export function isSubmitKey(event: { key: string; shiftKey: boolean; isComposing: boolean; keyCode: number }): boolean {
   return event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229
 }

@@ -1,4 +1,4 @@
-import type { PendingMessage, TranscriptMessage } from "../chat/types"
+import type { PendingMessage, TranscriptMessage } from "../chat/types.ts"
 
 export type NodeInfo = {
   device_id: string

@@ -2,7 +2,7 @@ import { useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent
 import { ArrowUpIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { cn } from 'cn'
-import { isSubmitKey } from '../protocol'
+import { isSubmitKey } from '@vibeface/client/chat/protocol.ts'
 
 import {
   InputGroup,

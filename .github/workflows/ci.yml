@@ -77,7 +77,6 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check crates/node/sdk/codex-manager.mjs
-          node --check crates/node/web/transport.js
           node --check scripts/crypto-client.mjs
           node --check npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs

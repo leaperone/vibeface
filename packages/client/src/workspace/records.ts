@@ -1,5 +1,5 @@
 import { withDeliveries } from "./model.ts"
-import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types"
+import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types.ts"
 
 const delivery = (item: WorkRecord) => item.state === "dispatch_waiting" || item.state === "dispatch_rejected"
 const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")

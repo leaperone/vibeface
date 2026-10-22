@@ -4,8 +4,8 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Re
 import { ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
-import { messageOf } from "@/lib/node"
-import { rawError } from "@/lib/errors"
+import { messageOf } from "@vibeface/client/lib/node.ts"
+import { rawError } from "@vibeface/client/lib/errors.ts"
 
 export type Tone = "neutral" | "success" | "warning" | "danger" | "info"
 

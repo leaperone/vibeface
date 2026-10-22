@@ -5,9 +5,9 @@ import { cn } from 'cn'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { EmptyState, InlineError, toast } from '@/components/app/kit'
-import { useDevice } from '@/features/identity/context'
-import { useWorkspace } from '@/features/workspace/context'
-import type { LogFilter, LogLevel, LogRecord, LogSource } from '@/lib/web-log'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
 
 export const Route = createFileRoute('/_app/settings_/logs')({ component: LogsPage })
 

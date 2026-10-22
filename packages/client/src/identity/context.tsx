@@ -1,30 +1,29 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { connectDevice, initClient, joinTicket, parseJoinLink, replaceClient, signClient, validTarget } from '../../../transport.js'
-import type { DeviceChannel, JoinLink } from '../../../transport.js'
-import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, parseLocalSetup, record, same, text } from '@/lib/node'
-import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PublicIdentity, ReadyConnection } from '@/lib/node'
-import { shouldAutoConnect } from './connection-lane'
-import { localBrowserEntry } from '@/lib/local-access'
-import { parseChanged } from '@/lib/progress'
-import type { ChangedEvent } from '@/lib/progress'
-import type { AuthenticationTrust } from '@/lib/secure'
-import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } from '@/lib/secure'
-import { nextLink } from '@/lib/link'
-import type { Link, LinkEvent } from '@/lib/link'
-import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '@/lib/entrances'
-import type { Entrance, OpenEntrance } from '@/lib/entrances'
-import { joinTabs } from '@/lib/tabs'
-import { connectLogSink, reportLog } from '@/lib/web-log'
+import { joinTicket, validTarget } from '../lib/transport.ts'
+import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
+import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, record, same, text } from '../lib/node.ts'
+import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PublicIdentity, ReadyConnection } from '../lib/node.ts'
+import { shouldAutoConnect } from './connection-lane.ts'
+import { parseChanged } from '../lib/progress.ts'
+import type { ChangedEvent } from '../lib/progress.ts'
+import { secureKit } from '../lib/secure.ts'
+import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
+import { nextLink } from '../lib/link.ts'
+import type { Link, LinkEvent } from '../lib/link.ts'
+import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '../lib/entrances.ts'
+import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
+import type { KeyValue, LocalLaunch, Platform } from '../lib/platform.ts'
+import { connectLogSink, reportLog } from '../lib/web-log.ts'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
-type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
+type Sensitive = { cancel(): void; download?: () => Promise<void>; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
 type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 /**
- * This browser's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
+ * This device's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
  * network, manager and manager nonce seen before the reveal; the short code uses only these.
  */
 export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; reason?: string | null }
@@ -52,81 +51,64 @@ type DeviceContextValue = {
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
   startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>
-  beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry }): Promise<void>
-  reencrypt(input: { file: File; oldPassword: string; password: string }): Promise<void>
-  downloadBackup(): void; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
+  beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }): Promise<void>
+  reencrypt(input: { file: RecoveryFile; oldPassword: string; password: string }): Promise<void>
+  downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 class AuthenticationError extends Error {}
 const INVITE_TTL_MS = 10 * 60 * 1000
 /** Not an error: the entry buttons below it are the way in. */
-export const NOT_JOINED = '这个浏览器还没加入'
+export const notJoined = (self: string) => `${self}还没加入`
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
 const randomHex = () => hex(crypto.getRandomValues(new Uint8Array(32)))
-function load(key: string): unknown { try { const value = localStorage.getItem(`vibeface.${key}`); return value ? JSON.parse(value) : null } catch { return null } }
-function store(key: string, value: unknown) { try { localStorage.setItem(`vibeface.${key}`, JSON.stringify(value)) } catch { throw new Error('浏览器无法保存设备记录。请允许此站点使用本地存储。') } }
-function savedEntries(): ConnectionEntry[] {
-  const value = load('connections')
-  if (!Array.isArray(value)) return []
-  const entries = new Map<string, ConnectionEntry>()
-  for (const item of value) { try { const entry = parseEntry(item); entries.set(entryKey(entry), entry) } catch {} }
-  return [...entries.values()]
-}
-function loadAuthenticated(): AuthenticatedEntry | null {
-  try {
-    const value = load('last-authenticated')
-    if (!value) return null
-    const v = record(value)
-    return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId) }
-  } catch { return null }
-}
-/** The last authenticated target first, then saved ones from most to least recently authenticated. */
-function resumeTargets(): Reconnect[] {
-  if (load('stay-disconnected') === true) return []
-  const last = loadAuthenticated()
-  const targets: Reconnect[] = last && !last.entry.local ? [{ ...last, attempt: 0 }] : []
-  for (const entry of savedEntries().reverse()) {
-    const networkId = load(`network-for.${entry.device_id}`)
-    if (entry.local || typeof networkId !== 'string' || targets.some(item => entryKey(item.entry) === entryKey(entry))) continue
-    try { targets.push({ entry, networkId: validTarget(networkId), attempt: 0 }) } catch {}
+/** Saved connections, pins and pending joins in this device's storage. */
+function deviceStore(storage: KeyValue, self: string) {
+  function load(key: string): unknown { try { const value = storage.getItem(`vibeface.${key}`); return value ? JSON.parse(value) : null } catch { return null } }
+  function store(key: string, value: unknown) { try { storage.setItem(`vibeface.${key}`, JSON.stringify(value)) } catch { throw new Error(`${self}无法保存设备记录。请允许保存本地数据。`) } }
+  function savedEntries(): ConnectionEntry[] {
+    const value = load('connections')
+    if (!Array.isArray(value)) return []
+    const entries = new Map<string, ConnectionEntry>()
+    for (const item of value) { try { const entry = parseEntry(item); entries.set(entryKey(entry), entry) } catch {} }
+    return [...entries.values()]
   }
-  return targets
-}
-function loadJoining(): Joining | null {
-  try {
-    const v = record(load('pending-join'))
-    const pin = v.pinned ? record(v.pinned) : null
-    const pinned = pin ? { network_id: validTarget(pin.network_id), admin_id: validTarget(pin.admin_id), admin_nonce: validTarget(pin.admin_nonce) } : undefined
-    return { entry: parseEntry(v.entry), join_id: String(v.join_id), invite_id: String(v.invite_id), nonce: validTarget(v.nonce), name: deviceName(String(v.name)), status: 'pending', pinned }
-  } catch { return null }
+  function loadAuthenticated(): AuthenticatedEntry | null {
+    try {
+      const value = load('last-authenticated')
+      if (!value) return null
+      const v = record(value)
+      return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId) }
+    } catch { return null }
+  }
+  /** The last authenticated target first, then saved ones from most to least recently authenticated. */
+  function resumeTargets(): Reconnect[] {
+    if (load('stay-disconnected') === true) return []
+    const last = loadAuthenticated()
+    const targets: Reconnect[] = last && !last.entry.local ? [{ ...last, attempt: 0 }] : []
+    for (const entry of savedEntries().reverse()) {
+      const networkId = load(`network-for.${entry.device_id}`)
+      if (entry.local || typeof networkId !== 'string' || targets.some(item => entryKey(item.entry) === entryKey(entry))) continue
+      try { targets.push({ entry, networkId: validTarget(networkId), attempt: 0 }) } catch {}
+    }
+    return targets
+  }
+  function loadJoining(): Joining | null {
+    try {
+      const v = record(load('pending-join'))
+      const pin = v.pinned ? record(v.pinned) : null
+      const pinned = pin ? { network_id: validTarget(pin.network_id), admin_id: validTarget(pin.admin_id), admin_nonce: validTarget(pin.admin_nonce) } : undefined
+      return { entry: parseEntry(v.entry), join_id: String(v.join_id), invite_id: String(v.invite_id), nonce: validTarget(v.nonce), name: deviceName(String(v.name)), status: 'pending', pinned }
+    } catch { return null }
+  }
+  function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
+  const loadEntrances = (networkId: string): Entrance[] => { const value = load(`entrances.${networkId}`); return Array.isArray(value) ? value as Entrance[] : [] }
+  return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances }
 }
 function publicIdentity({ deviceId }: { deviceId: string }): PublicIdentity { return { deviceId } }
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
-function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
-/**
- * The manager's short code (design 3.4): only from its own network, its own nonce and the request it saw before
- * sending that nonce, and only once the revealed nonce opens the commitment it saw. A lying entry gets no code.
- */
-function managerCode(request: JoinRequest, networkId: string, me: string): JoinRequest {
-  const pin = approvalPins()[request.join_id]
-  if (!pin || !request.joiner_nonce || request.admin_id !== me || request.admin_nonce !== pin.nonce || request.device_id !== pin.device_id || request.invite_id !== pin.invite_id || request.commit !== pin.commit) return request
-  if (joinCommit(pin.device_id, request.joiner_nonce) !== pin.commit) return request
-  return { ...request, code: shortCode(networkId, pin.invite_id, pin.device_id, me, pin.nonce, request.joiner_nonce) }
-}
-async function discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | null> {
-  const url = new URL(location.href)
-  if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null
-  let response: Response
-  // The Gateway serving this origin may be down while the shell comes from the service worker.
-  try { response = await fetch('/api/local/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', cache: 'no-store', credentials: 'omit', signal }) }
-  catch (cause) { if (signal.aborted) throw cause; return null }
-  if (response.status === 404) return null
-  if (!response.ok) throw new Error('无法读取这台电脑的本机设置。请检查本机地址并刷新页面。')
-  return parseLocalSetup(await response.json(), url.origin)
-}
 type Vector = Record<string, number>
-const loadEntrances = (networkId: string): Entrance[] => { const value = load(`entrances.${networkId}`); return Array.isArray(value) ? value as Entrance[] : [] }
 /** Whether `seen` holds an event the entry's `vector` does not, so the page shows 同步中. */
 function behind(seen: Vector, vector: unknown): boolean {
   if (!vector || typeof vector !== 'object') return false
@@ -138,7 +120,23 @@ function absorb(seen: Vector, vector: unknown) {
   for (const [author, seq] of Object.entries(vector as Vector)) if (typeof seq === 'number' && !(seen[author] >= seq)) seen[author] = seq
 }
 
-export function DeviceProvider({ children }: { children: ReactNode }) {
+export function DeviceProvider({ platform, children }: { platform: Platform; children: ReactNode }) {
+  const { self, page } = platform
+  const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances } = deviceStore(platform.storage, self)
+  const { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } = secureKit(platform.secure)
+  const { connectDevice, initClient, parseJoinLink, replaceClient, signClient } = platform.transport
+  const discoverLocalSetup = async (signal: AbortSignal) => page ? page.discoverLocalSetup(signal) : null
+  const localEntry = async (me: PublicIdentity, launch: LocalLaunch | null) => page ? page.localEntry(me, launch) : null
+  /**
+   * The manager's short code (design 3.4): only from its own network, its own nonce and the request it saw before
+   * sending that nonce, and only once the revealed nonce opens the commitment it saw. A lying entry gets no code.
+   */
+  function managerCode(request: JoinRequest, networkId: string, me: string): JoinRequest {
+    const pin = approvalPins()[request.join_id]
+    if (!pin || !request.joiner_nonce || request.admin_id !== me || request.admin_nonce !== pin.nonce || request.device_id !== pin.device_id || request.invite_id !== pin.invite_id || request.commit !== pin.commit) return request
+    if (joinCommit(pin.device_id, request.joiner_nonce) !== pin.commit) return request
+    return { ...request, code: shortCode(networkId, pin.invite_id, pin.device_id, me, pin.nonce, request.joiner_nonce) }
+  }
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
   const [ready, setReady] = useState<ReadyConnection | null>(null)
   const [entries, setEntries] = useState<ConnectionEntry[]>([])
@@ -222,12 +220,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接自己的设备。'); return value }
-  function own() { const value = identityRef.current; if (!value) throw new Error('浏览器密钥尚未初始化。'); return value }
+  function own() { const value = identityRef.current; if (!value) throw new Error(`${self}的密钥尚未初始化。`); return value }
   async function callSession(active: Session, method: string, params: Record<string, unknown> = {}) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
     let result: unknown
     try { result = await active.channel.request(method, params) } catch (cause) {
-      if (method !== 'log') reportLog({ level: 'warn', event: 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: location.origin } })
+      if (method !== 'log') reportLog({ level: 'warn', event: 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self } })
       throw cause
     }
     if (session.current !== active || active.generation !== generation.current) throw changed()
@@ -317,7 +315,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {
     if (target.entry.local) {
-      const local = identityRef.current && await localBrowserEntry(identityRef.current, null)
+      const local = identityRef.current && await localEntry(identityRef.current, null)
       if (reconnect.current !== target) return true
       if (!local || entryKey(local) !== entryKey(target.entry)) {
         resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用邀请加入。')
@@ -332,8 +330,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台设备已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (candidate === target.entry && removed(auth, active, target.networkId)) return true
-        if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
-        if (auth.principal === null) throw new Error('这个访问地址还没同步到这个浏览器。')
+        if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? `${self}已被移除。需要时请在管理设备上重新添加。` : `${self}已不在我的设备里。`)
+        if (auth.principal === null) throw new Error(`这个访问地址还没同步到${self}。`)
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
         return true
@@ -416,7 +414,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
     if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return
     if (auth.principal === null) {
-      setError(auth.revoked === true ? '这个浏览器已被移除。请在管理设备上重新添加。' : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : NOT_JOINED)
+      setError(auth.revoked === true ? `${self}已被移除。请在管理设备上重新添加。` : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : notJoined(self))
       return
     }
     await authenticate(auth, active)
@@ -452,8 +450,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。')
     const name = deviceName(nameValue)
     const found = joinTicket(linkText)
-    if (!found) throw new Error('这不是有效的加入链接。')
-    const link = `${found.origin ?? location.origin}/join#${found.ticket}`
+    const origin = found?.origin ?? page?.origin
+    if (!found || !origin) throw new Error('这不是有效的加入链接。')
+    const link = `${origin}/join#${found.ticket}`
     const { capability, entry } = localSetup
     const active = await open(entry)
     setNodeJoining({ status: 'waiting' })
@@ -566,7 +565,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId)
     if (!member) throw new Error('成员不存在。请刷新目录。')
-    if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error('不能移除这个浏览器或当前连接的电脑。')
+    if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error(`不能移除${self}或当前连接的电脑。`)
     // A Node's log counts up to the head this entry holds, along that branch if it forked.
     let cutoff = 0, cutoffHash: string | null = null
     if (member.kind === 'node') {
@@ -589,7 +588,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
     try {
       // This page's own entry first: a scanned code's address is only a hint, the device key is the check.
-      const addresses = [...new Set([location.origin, ...link.origin ? [link.origin] : []])]
+      const addresses = [...new Set([...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
       let active: Session | null = null
       for (const [index, address] of addresses.entries()) {
         try { active = await open({ address, device_id: link.entryId }) }
@@ -608,7 +607,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       let response: ReturnType<typeof parseJoinRequest>
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
-      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入回执与邀请或此浏览器不一致。')
+      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error(`加入回执与邀请或${self}不一致。`)
       if (response.status === 'rejected' || response.status === 'expired') throw new Error('此邀请已失效。请在管理设备上重新邀请。')
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
@@ -627,7 +626,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
     }
     if (joiningRef.current !== mine) return
-    if (status.device_id !== own().deviceId || status.invite_id !== pending.invite_id) throw new Error('加入状态与此浏览器不一致。')
+    if (status.device_id !== own().deviceId || status.invite_id !== pending.invite_id) throw new Error(`加入状态与${self}不一致。`)
     const pin = mine.pinned
     if (pin && status.admin_id && (status.network_id !== pin.network_id || status.admin_id !== pin.admin_id || status.admin_nonce !== pin.admin_nonce)) {
       const failure = new Error('连接的设备改动了加入请求，已停止。请重新生成加入链接。')
@@ -637,7 +636,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (status.status === 'joined') {
       if (pin?.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。请重新生成加入链接。')
       const state = record(await request('join_status', { join_id: pending.join_id })).state
-      verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error('加入结果没有包含此浏览器。') })()
+      verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error(`加入结果没有包含${self}。`) })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
       // The link is single-use; a later visit to the join screen starts empty.
       setInitialInvitation('')
@@ -673,7 +672,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     let downloaded = false, cancelled = false
     const flow: Sensitive = {
       cancel() { cancelled = true; recovery.fill(0) },
-      download() { if (cancelled || session.current !== active) throw changed(); downloadPackage(recovery); downloaded = true },
+      async download() { if (cancelled || session.current !== active) throw changed(); await platform.saveRecovery(recovery); downloaded = true },
       async bootstrap(saved) {
         if (!saved || !downloaded) throw new Error('请先下载恢复文件，并确认已妥善保存。')
         if (cancelled || session.current !== active) throw changed()
@@ -699,12 +698,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!setup.local_launch) throw new Error('本机免确认打开已关闭。请用加入链接或恢复文件。')
     const url = new URL(setup.local_launch.url)
     url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id }).toString()
-    location.assign(url.href)
-    // Same page with only a new hash does not reload, and the launch token is read on mount.
-    if (url.origin === location.origin && url.pathname === location.pathname) location.reload()
+    if (!page) throw new Error('请在这台电脑上打开它的本机页面。')
+    page.open(url.href)
   }
   /** Root recovery keeps every current member by default and adds this browser as a manager. */
-  async function beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry }) {
+  async function beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }) {
     const name = deviceName(input.name)
     const active = await open(input.entry)
     const request = scoped(active)
@@ -755,7 +753,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             if (released) throw new Error('恢复已提交，但这里已取消。请重新连接看一下结果，并保留原恢复文件。')
             opened.payload.recovery_epoch = record(checkpoint).epoch
             const bytes = sealPackage(opened.payload, password)
-            try { downloadPackage(bytes) } finally { bytes.fill(0) }
+            try { await platform.saveRecovery(bytes) } finally { bytes.fill(0) }
             await authenticate(auth, active, { kind: 'root', networkId: opened.networkId, genesis: opened.payload.genesis, checkpoint })
           } finally { if (sensitive.current === flow) releaseSensitive(); else release() }
         },
@@ -764,14 +762,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.device_id })
     } catch (cause) { release(); throw cause }
   }
-  async function reencrypt(input: { file: File; oldPassword: string; password: string }) {
+  async function reencrypt(input: { file: RecoveryFile; oldPassword: string; password: string }) {
     const version = generation.current
     const opened = await openPackage(input.file, input.oldPassword)
     try {
       if (version !== generation.current) throw changed()
       if (ready && opened.networkId !== ready.principal.network_id) throw new Error('恢复文件属于另一组设备。')
       const bytes = sealPackage(opened.payload, input.password)
-      try { downloadPackage(bytes) } finally { bytes.fill(0) }
+      try { await platform.saveRecovery(bytes) } finally { bytes.fill(0) }
     } finally { opened.release(); input.oldPassword = ''; input.password = '' }
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
@@ -781,11 +779,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     let version = generation.current
     const setupController = new AbortController()
     setEntries(savedEntries())
-    const fragment = new URLSearchParams(location.hash.slice(1))
-    const invitation = location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.href : ''
-    const localToken = fragment.get('local')
-    const localLaunch = localToken ? { token: localToken, deviceId: fragment.get('node') ?? '' } : null
-    if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
+    const { invitation, localLaunch } = page?.takeLaunch() ?? { invitation: '', localLaunch: null }
     if (invitation) setInitialInvitation(invitation)
     initClient().then(publicIdentity).then(async me => {
       if (!mounted) return
@@ -795,7 +789,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
       // Only the local launcher's origin serves /api/local/info; a browser learns it is on one from a launch link.
       if (!invitation && (localLaunch || load('local-origin') === true)) {
-        const local = await localBrowserEntry(me, localLaunch)
+        const local = await localEntry(me, localLaunch)
         if (!mounted || version !== generation.current) return
         // Kept while the Node is down, so the next load on this origin still asks it.
         if (local) { store('local-origin', true); const opening = connect(local); version = generation.current; await opening; return }
@@ -835,7 +829,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }, [])
   useEffect(() => {
     // One tab per origin settles the outbox; a follower takes the leader's new entrance right away.
-    if (typeof BroadcastChannel === 'undefined' || !globalThis.navigator?.locks) return
+    const { joinTabs } = platform
+    if (!joinTabs) return
     leaderRef.current = false
     const channel = joinTabs<TabMessage>('vibeface-tabs', {
       lead() { leaderRef.current = true; return () => { leaderRef.current = false } },
@@ -880,7 +875,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,
-    downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },
+    async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可保存的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },
     cancelSensitive,

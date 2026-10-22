@@ -3,10 +3,10 @@ import { Bot, Inbox, Plus, Star, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
 import { EmptyState, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
-import { useWorkspace } from "./context"
-import { byRecent, listTime } from "./home"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
-import { openQuestions } from "./questions"
+import { openQuestions } from "@vibeface/client/workspace/questions.ts"
 import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 
 /** The phone's home: 待处理 first, then every assistant by its newest message. */

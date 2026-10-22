@@ -1,11 +1,12 @@
 import { lazy, Suspense } from 'react'
 import { Navigate, Outlet, createFileRoute, useNavigate, useRouterState } from '@tanstack/react-router'
-import { accessOf } from '@/features/identity/access'
-import { useDevice } from '@/features/identity/context'
+import { accessOf } from '@vibeface/client/identity/access.ts'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useOnboarding } from '@/features/identity/onboarding-flag'
-import { WorkspaceProvider } from '@/features/workspace/context'
-import { SESSIONS_SCOPE } from '@/features/workspace/questions'
+import { WorkspaceProvider } from '@vibeface/client/workspace/context.tsx'
+import { SESSIONS_SCOPE } from '@vibeface/client/workspace/questions.ts'
 import { ShellSkeleton, WorkspaceShell } from '@/features/workspace/workspace-shell'
+import { webPlatform } from '@/lib/platform'
 
 const Onboarding = lazy(() => import('@/features/identity/onboarding').then((module) => ({ default: module.Onboarding })))
 
@@ -19,12 +20,13 @@ function AppLayout() {
   // The page that asked, not the connect page this layout is already leaving for.
   const here = useRouterState({ select: (state) => (state.resolvedLocation ?? state.location).href })
   const home = useRouterState({ select: (state) => state.location.pathname === '/' })
+  const routeBot = useRouterState({ select: (state) => /^\/b\/([^/]+)/.exec(state.location.pathname)?.[1] ?? null })
   const access = accessOf({ ready: Boolean(ready), phase, joining: Boolean(joining), savedEntries: entries.length, invitation: Boolean(initialInvitation), offlineRetryMs: link.kind === 'offline' ? link.retryInMs : null })
   if (access.kind === 'auth') return <Navigate to="/connect" search={here === '/' ? {} : { redirect: here }} replace />
   if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} />
   if (!ready) return <ShellSkeleton home={home} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
-  return <WorkspaceProvider key={key} connection={ready} tabs={tabs} openConversation={(id) => { void (id === SESSIONS_SCOPE ? navigate({ to: '/inbox' }) : navigate({ to: '/', search: { conversation: id } })) }}>
+  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id) => { void (id === SESSIONS_SCOPE ? navigate({ to: '/inbox' }) : navigate({ to: '/', search: { conversation: id } })) }}>
     {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

@@ -14,5 +14,7 @@ pnpm install --frozen-lockfile --filter "vibeface-web..."
 pnpm run generate-routes
 pnpm run test
 pnpm run typecheck
+pnpm --filter @vibeface/client run test
+pnpm --filter @vibeface/client run typecheck
 pnpm run build
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }

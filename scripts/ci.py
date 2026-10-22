@@ -23,7 +23,7 @@ CRATES = dict(zip(("protocol", "bridge", "secure", "node"), PACKAGES))
 PATH_RULES = (
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*", "crates/node/sdk/README.md")),
-    ("web", ("crates/node/web/*", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("web", ("crates/node/web/*", "packages/client/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
@@ -260,6 +260,7 @@ def self_test():
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["crates/node/web/src/content.md"])["web"]
+    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web"]
     docs = make_plan(["README.md", "docs/node.md", "crates/node/sdk/README.md"])
     assert docs["docs_only"] and docs["required_jobs"] == ["quick-check"]
     expected = {

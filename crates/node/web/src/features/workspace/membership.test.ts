@@ -21,11 +21,12 @@ const conversation = {
 const notMember = 'device is not a member of this personal network'
 const settle = () => new Promise(setImmediate)
 const sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
+const clientRoot = fileURLToPath(new URL('../../../../../../packages/client/src/', import.meta.url))
 const nodeRequire = createRequire(import.meta.url)
 
 /** Loads a TypeScript module the way the bundle sees it, with `stubs` for browser-only imports. */
 function loader(globals: Record<string, unknown>, stubs: (specifier: string) => unknown) {
-  const sandbox = createContext({ ...globals, URL, URLSearchParams, TextEncoder, Uint8Array, Error, JSON, Promise, crypto: globalThis.crypto })
+  const sandbox = createContext({ ...globals, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, Error, JSON, Promise, crypto: globalThis.crypto })
   const modules = new Map<string, { exports: Record<string, unknown> }>()
   return function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
@@ -35,6 +36,7 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
     const require = (specifier: string) => {
       const stub = stubs(specifier)
       if (stub) return stub
+      if (specifier.startsWith('@vibeface/client/')) return load(resolve(clientRoot, specifier.slice(17)))
       if (!specifier.startsWith('.') && !specifier.startsWith('@/')) return nodeRequire(specifier)
       const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
       const file = extname(path) ? path : [`${path}.ts`, `${path}.tsx`].find(candidate => { try { readFileSync(candidate); return true } catch { return false } })!
@@ -93,23 +95,24 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   }
   const timers = { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {} }
   const load = loader({
-    window: { ...timers, location: { href: `https://node.example/b/${bot.bot_id}` }, localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) } },
-    document: { hidden: false, addEventListener() {}, removeEventListener() {} },
     location: { pathname: `/b/${bot.bot_id}`, search: '' },
     ...timers,
   }, (specifier) => {
     if (specifier === 'react') return react
     if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
-    if (specifier.endsWith('/transport.js')) return { signClient: async () => 'signature', validTarget: (value: string) => value, validEndpoint: (value: string) => value }
-    if (specifier.endsWith('/vibeface_secure.js')) return { attestationPayload: () => new Uint8Array() }
-    if (specifier === '@/lib/outbox') return { ...load(resolve(sourceRoot, 'lib/outbox.ts')), indexedOutbox: () => outbox }
     return undefined
   })
-  const Provider = load(fileURLToPath(new URL('./context.tsx', import.meta.url))).WorkspaceProvider as (props: Record<string, unknown>) => { value: Record<string, any> }
+  const platform = {
+    secure: { attestationPayload: () => new Uint8Array() }, transport: { signClient: async () => 'signature' },
+    storage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) }, outbox, self: '这个浏览器',
+    notifier: { name: '浏览器提醒', permission: async () => 'default', request: async () => 'default', show() {} },
+    onForeground: () => () => {}, foreground: () => true,
+  }
+  const Provider = load(resolve(clientRoot, 'workspace/context.tsx')).WorkspaceProvider as (props: Record<string, unknown>) => { value: Record<string, any> }
   const tabs = { leader: () => true, post() {}, listen: () => () => {} }
   const render = () => {
     cursor = 0
-    const { value } = Provider({ connection, tabs, openConversation() {}, children: null })
+    const { value } = Provider({ platform, connection, tabs, initialBot: bot.bot_id, openConversation() {}, children: null })
     afterRender.splice(0).forEach(run => run())
     return value
   }

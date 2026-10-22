@@ -1,18 +1,19 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import { dirname, extname, resolve } from "node:path"
+import { dirname, resolve } from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
-import type { ReadyConnection } from "../../lib/node.ts"
-import type { WorkRecord } from "./types.ts"
-import { nodeName } from "./labels.ts"
-import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
-import { placeChanges, routineName, routineTrigger } from "./assistant.ts"
-import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "./questions.ts"
-import { canSend, composerHint } from "../chat/protocol.ts"
-import { primaryLane } from "../identity/connection-lane.ts"
+import { parseEntry, parseInfo } from "@vibeface/client/lib/node.ts"
+import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
+import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "@vibeface/client/workspace/model.ts"
+import { placeChanges, routineName, routineTrigger } from "@vibeface/client/workspace/assistant.ts"
+import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import { canSend, composerHint } from "@vibeface/client/chat/protocol.ts"
+import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
@@ -125,7 +126,8 @@ test("workspace preserves bot and message requests while routing native decision
     history: { replaceState(_state: unknown, _title: string, url: string) { browser.location.href = new URL(url, browser.location.href).href } }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
   }
   const sandbox = createContext({
-    window: browser, URL, TextEncoder, Error, crypto: globalThis.crypto,
+    window: browser, URL, TextEncoder, TextDecoder, Error, crypto: globalThis.crypto,
+    setTimeout: browser.setTimeout, clearTimeout: browser.clearTimeout, setInterval: browser.setInterval, clearInterval: browser.clearInterval,
     structuredClone, navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
@@ -137,7 +139,8 @@ test("workspace preserves bot and message requests while routing native decision
     put: async (item: { key: string }) => { outboxItems.set(item.key, structuredClone(item)) },
     delete: async (key: string) => { outboxItems.delete(key) },
   }
-  const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL("../../", import.meta.url))
+  const modules = new Map<string, { exports: Record<string, unknown> }>()
+  const clientRoot = fileURLToPath(new URL("../../../../../../packages/client/src/", import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
     if (cached) return cached.exports
@@ -148,21 +151,24 @@ test("workspace preserves bot and message requests while routing native decision
     const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
     const require = (specifier: string) => {
       if (specifier === "react") return react
-      if (specifier === "@/lib/node") return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
+      if (specifier.endsWith("/lib/node.ts")) return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
       if (specifier === "react/jsx-runtime") return { jsx: () => null }
-      if (specifier.endsWith("/generated/vibeface_secure.js")) return { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` }
-      if (specifier === "@/lib/outbox") return { ...load(resolve(sourceRoot, "lib/outbox.ts")), indexedOutbox: () => memoryOutbox }
-      if (specifier.endsWith("/transport.js")) return { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } }
-      const path = specifier.startsWith("@/") ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
-      return load(extname(path) ? path : `${path}.ts`)
+      return load(resolve(dirname(filename), specifier))
     }
     new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
     return module.exports
   }
-  type Workspace = ReturnType<typeof import("./context.tsx").useWorkspace>
-  const workspaceModule = load(fileURLToPath(new URL("./context.tsx", import.meta.url)))
+  type Workspace = ReturnType<typeof import("@vibeface/client/workspace/context.tsx").useWorkspace>
+  const workspaceModule = load(resolve(clientRoot, "workspace/context.tsx"))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
-  const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
+  const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
+  const platform = {
+    secure: { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` },
+    transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
+    storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
+    notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
+    onForeground: () => () => {}, foreground: () => true,
+  }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event", last_message: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
@@ -229,7 +235,7 @@ test("workspace preserves bot and message requests while routing native decision
   let activeConnection = connection
   const render = () => {
     cursor = 0
-    const state = useWorkspaceState(activeConnection)
+    const state = useWorkspaceState(platform, activeConnection)
     afterRender.splice(0).forEach((run) => run())
     return state
   }
@@ -491,7 +497,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => 'Mac mini' }, '@vibeface/client/workspace/questions.ts': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
@@ -542,7 +548,7 @@ test("any entrance stops an unfinished task once, even on another device", async
   const data = { local_node: 'worker', works: [] as unknown[] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   try {
     const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
@@ -568,7 +574,7 @@ test("any entrance stops an unfinished task once, even on another device", async
 
 test("bot projects use online manager capabilities and preserve device names", () => {
   const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/Users/me/a/long/path/to/project'] } }
-  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName }, './questions': { projectName } })
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName }, '@vibeface/client/workspace/questions.ts': { projectName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
     assert.equal(projects.length, 1)
@@ -581,7 +587,7 @@ test("bot drafts survive a new connection while old create completion cannot clo
   const closed: boolean[] = []
   const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, nodes: [], pendingBot: null, writable: true, createBot: () => work.promise } }
   let currentWorkspace = workspace()
-  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message } })
   const render = () => app.render('BotForm', { open: true, onOpenChange: (open: boolean) => closed.push(open), restoreFocus() {} })
   try {
     render(); let elements = render()
@@ -610,7 +616,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint }, '@vibeface/client/workspace/assistant.ts': { placeChanges, routineName, routineTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -631,7 +637,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
 test("an old action completion cannot clear a new generation's busy state", async () => {
   let generation = 1
   const old = pendingResult(), fresh = pendingResult()
-  const app = componentHarness('./present.tsx', { './context': { useWorkspace: () => ({ generation }) } })
+  const app = componentHarness('./present.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation }) } })
   const render = (action: () => Promise<unknown>) => app.render('ActionButton', { children: 'check', action }).find(({ type }) => type === 'Button')?.props
   try {
     render(() => old.promise)?.onClick?.()
@@ -653,7 +659,7 @@ test("connection form keeps current errors and busy ownership when an earlier co
     identity: { deviceId: 'browser' }, phase: 'disconnected', error: '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message }, '@/features/workspace/labels': { addressName: (address: string) => address } })
+  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入` }, '@/lib/platform': { webPlatform: { self: '这个浏览器' } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address } })
   const render = () => app.render('ConnectionScreen')
   const connect = () => render().find(({ props }) => props.children === '连接')?.props
   try {
@@ -678,7 +684,7 @@ test("artifact reads retain their offset while old responses cannot append or un
   const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, connectionOnline: true,
     readArtifact: (_hash: string, offset: number) => { offsets.push(offset); return work.promise }, run: async (action: () => Promise<void>) => { try { await action() } catch {} } } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/elements/artifact.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/workspace/model': { formatSize } })
+  const app = componentHarness('../chat/elements/artifact.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/workspace/model.ts': { formatSize } })
   const render = () => app.render('Artifact', { hash: 'result', size: 5 })
   const open = () => render().find(({ props }) => props.children === '打开结果')?.props
   try {
@@ -704,8 +710,8 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
     beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
   const app = componentHarness('../identity/recovery-controls.tsx', {
-    './context': { useDevice: () => device }, '@/lib/node': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
-    '@/lib/secure': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
+    '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
   }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
   const render = () => app.render('RecoveryControls', { only: mode })
   const submit = () => render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {}, currentTarget: form })
@@ -739,7 +745,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint }, '@vibeface/client/workspace/assistant.ts': { placeChanges, routineName, routineTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -760,8 +766,8 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
-    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
-    '@/lib/node': { messageOf: (cause: Error) => cause.message },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+    '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
   }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })
   const render = () => app.render('AddDevice')
   const labelled = (label: string) => render().find(({ props }) => [props.children].flat().includes(label))?.props
@@ -783,12 +789,7 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
 
 test("device id boundaries require the device_id field", () => {
   const id = "ab".repeat(32), other = "cd".repeat(32)
-  const transportSource = readFileSync(new URL("../../../transport.js", import.meta.url), "utf8")
-    .replace(/^import[^\n]+\n/, "").replace(/\bexport /g, "")
-  const transport = new Script(`${transportSource}\n({validEndpoint, validTarget})`).runInNewContext({ TextEncoder, TextDecoder, URL, location: { protocol: "https:" } })
-  const source = readFileSync(new URL("../../lib/node.ts", import.meta.url), "utf8")
-  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
-  const parsers = new Script(`(function(require, exports) { ${compiled}\nreturn exports })`).runInNewContext()(() => transport, {})
+  const parsers = { parseEntry, parseInfo }
   assert.equal(parsers.parseEntry({ address: "https://node.example", device_id: id }).device_id, id)
   for (const relay of [false, true]) {
     const entry = parsers.parseEntry({ address: "https://node.example", device_id: id, relay })
@@ -797,8 +798,8 @@ test("device id boundaries require the device_id field", () => {
   }
   assert.equal(parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, device_id: id }).device_id, id)
   assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, device_id: id }] })[0].device_id, id)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备编号无效/)
-  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备编号无效/)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备编号无效/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备地址无效/)
+  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备地址无效/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备地址无效/)
   assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, node_id: id }] }), /缺少文字/)
 })

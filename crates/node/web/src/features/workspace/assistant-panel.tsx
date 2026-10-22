@@ -4,8 +4,8 @@ import { useRef, useState, type ReactNode } from "react"
 import { BookOpen, Bot, CirclePause, Repeat, ScrollText, Star, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { formatWhen, routineFrequency } from "./assistant"
-import { useWorkspace } from "./context"
+import { formatWhen, routineFrequency } from "@vibeface/client/workspace/assistant.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { ActionButton } from "./present"
 
 /** Header button for the chat route; opens a read-only view of the assistant (docs/design/assistant-config.md section 5). */

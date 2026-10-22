@@ -2,8 +2,8 @@ import { useId, type ReactNode } from 'react'
 import { ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details } from '@/components/app/kit'
-import { formatWhen, lineDiff, routineFrequency, type DiffLine } from '@/features/workspace/assistant'
-import type { AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, RoutineView } from '@/features/workspace/types'
+import { formatWhen, lineDiff, routineFrequency, type DiffLine } from '@vibeface/client/workspace/assistant.ts'
+import type { AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, RoutineView } from '@vibeface/client/workspace/types.ts'
 
 function cardTitle(changes: AssistantChange[]) {
   const kind = changes[0]?.kind

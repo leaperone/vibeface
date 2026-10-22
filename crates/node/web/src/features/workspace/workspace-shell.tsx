@@ -8,19 +8,19 @@ import { Popover } from "radix-ui"
 import { cn } from "cn"
 import { EmptyState, Skeleton, toast } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
-import { useDevice } from "@/features/identity/context"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Button } from "@/components/ui/button"
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupAction, SidebarGroupContent, SidebarGroupLabel, SidebarHeader,
   SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar,
 } from "@/components/ui/sidebar"
-import { useWorkspace } from "./context"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { AssistantPanelButton } from "./assistant-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
-import { backTo } from "./home"
-import { addressName } from "./labels"
+import { backTo } from "@vibeface/client/workspace/home.ts"
+import { addressName } from "@vibeface/client/workspace/labels.ts"
 import { NotJoined } from "./not-joined"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {

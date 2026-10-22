@@ -5,11 +5,11 @@ import { Link, useNavigate } from "@tanstack/react-router"
 import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
-import { useDevice } from "../identity/context"
-import { useWorkspace } from "./context"
-import { nodeName } from "./labels"
-import { agentName, projectName, settledAnswer } from "./questions"
-import type { Question, Severity } from "./types"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import { agentName, projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
 
 const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> = {
   urgent: { icon: TriangleAlert, tone: "warning", label: "紧急" },

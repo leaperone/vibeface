@@ -1,11 +1,11 @@
 import { CircleQuestionMark, Copy, Lock, MessageCircleQuestionMark, MonitorSmartphone, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { useOpenJoins } from "@/features/devices/join"
-import { useDevice } from "@/features/identity/context"
-import type { JoinRequest } from "@/lib/node"
-import { useWorkspace } from "./context"
-import { workChecks } from "./model"
-import { openQuestions } from "./questions"
-import type { PendingCheck, Question } from "./types"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import type { JoinRequest } from "@vibeface/client/lib/node.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { workChecks } from "@vibeface/client/workspace/model.ts"
+import { openQuestions } from "@vibeface/client/workspace/questions.ts"
+import type { PendingCheck, Question } from "@vibeface/client/workspace/types.ts"
 import type { WriteCardKind } from "./write-card"
 
 /** `done`: a question this browser just answered, shown collapsed until the network's list drops it. */

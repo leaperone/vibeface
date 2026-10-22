@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { nextLink, type Link } from './link.ts'
-import { enqueue, settle, type OutboxItem, type OutboxStore } from './outbox.ts'
+import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
+import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
-import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from './entrances.ts'
-import { humanError, rawError } from './errors.ts'
+import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { humanError, rawError } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
   let link: Link = { kind: 'booting' }

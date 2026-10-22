@@ -5,15 +5,18 @@ import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } fro
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { addressName } from '@/features/workspace/labels'
-import { messageOf, parseEntry } from '@/lib/node'
-import { passphrase } from '@/lib/secure'
+import { addressName } from '@vibeface/client/workspace/labels.ts'
+import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { passphrase } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
-import { primaryLane } from './connection-lane'
-import { NOT_JOINED, useDevice } from './context'
+import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
+import { notJoined, useDevice } from '@vibeface/client/identity/context.tsx'
+import { webPlatform } from '@/lib/platform'
+
+const NOT_JOINED = notJoined(webPlatform.self)
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
-import { joinTicket } from '../../../transport.js'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
@@ -336,7 +339,7 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const [downloaded, setDownloaded] = useState(false)
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存恢复文件">
-    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
+    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>

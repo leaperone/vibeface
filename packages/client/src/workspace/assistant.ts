@@ -1,5 +1,5 @@
-import type { TranscriptMessage } from "../chat/types"
-import type { AssistantChangeRecord, AssistantRoutine, AssistantView } from "./types"
+import type { TranscriptMessage } from "../chat/types.ts"
+import type { AssistantChangeRecord, AssistantRoutine, AssistantView } from "./types.ts"
 
 const weekdays = "日一二三四五六"
 const pad = (value: number) => String(value).padStart(2, "0")

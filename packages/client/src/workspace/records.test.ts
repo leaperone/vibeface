@@ -1,9 +1,9 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { parseChanged } from "../../lib/progress.ts"
+import { parseChanged } from "../lib/progress.ts"
 import { confirmReason, parseConversation, parseQuestions, parseRecords, workChecks } from "./model.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
-import type { NodeInfo } from "./types"
+import type { NodeInfo } from "./types.ts"
 
 const rank = (lamport: number) => `${String(lamport).padStart(20, "0")}:${"0".repeat(20)}:h${lamport}`
 const message = (message_id: string, lamport: number) => ({ message_id, role: "user", text: message_id, event_hash: `e-${message_id}`, created_at_ms: lamport, rank: rank(lamport) })

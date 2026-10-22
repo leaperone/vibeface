@@ -1,10 +1,10 @@
-import type { TranscriptMessage } from "../chat/types"
-import type { ReplyStatus } from "../chat/types"
+import type { TranscriptMessage } from "../chat/types.ts"
+import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, AssistantView, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
-} from "./types"
+} from "./types.ts"
 import { answerId } from "./questions.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {

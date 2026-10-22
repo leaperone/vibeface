@@ -1,6 +1,6 @@
-import type { MembershipView } from "@/lib/node"
+import type { MembershipView } from "../lib/node.ts"
 import { confirmReason } from "./model.ts"
-import type { NodeInfo, WorkRecord } from "./types"
+import type { NodeInfo, WorkRecord } from "./types.ts"
 
 export const stateNames: Record<string, string> = {
   accepted: "已接收",

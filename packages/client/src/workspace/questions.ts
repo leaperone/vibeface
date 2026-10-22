@@ -1,5 +1,5 @@
-import type { TranscriptMessage } from "../chat/types"
-import type { Question } from "./types"
+import type { TranscriptMessage } from "../chat/types.ts"
+import type { Question } from "./types.ts"
 
 /** Questions about sessions no assistant started live here, and their answers are signed for it. */
 export const SESSIONS_SCOPE = "sessions"
