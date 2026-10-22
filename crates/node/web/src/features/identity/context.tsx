@@ -59,6 +59,8 @@ type DeviceContextValue = {
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 class AuthenticationError extends Error {}
 const INVITE_TTL_MS = 10 * 60 * 1000
+/** Not an error: the entry buttons below it are the way in. */
+export const NOT_JOINED = '这个浏览器还没加入'
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
 const randomHex = () => hex(crypto.getRandomValues(new Uint8Array(32)))
@@ -414,7 +416,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
     if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return
     if (auth.principal === null) {
-      setError(auth.revoked === true ? '这个浏览器已被移除。请在管理设备上重新添加。' : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : '这个浏览器还没加入。请用加入链接，或用恢复文件找回。')
+      setError(auth.revoked === true ? '这个浏览器已被移除。请在管理设备上重新添加。' : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : NOT_JOINED)
       return
     }
     await authenticate(auth, active)

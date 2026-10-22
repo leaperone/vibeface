@@ -11,7 +11,7 @@ import { passphrase } from '@/lib/secure'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from './connection-lane'
-import { useDevice } from './context'
+import { NOT_JOINED, useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 import { joinTicket } from '../../../transport.js'
 
@@ -191,8 +191,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     })
   }
 
-  const alert = error || device.error && device.phase !== 'reconnecting' ? <InlineError error={error || device.error} />
-    : notice ? <p role="status" className="text-meta text-muted-foreground">{notice}</p> : null
+  const deviceError = device.error === NOT_JOINED ? '' : device.error
+  const quiet = notice || (!error && device.error === NOT_JOINED ? NOT_JOINED : '')
+  const alert = error || deviceError && device.phase !== 'reconnecting' ? <InlineError error={error || deviceError} />
+    : quiet ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground">{quiet === NOT_JOINED ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null

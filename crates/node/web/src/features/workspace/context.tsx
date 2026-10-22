@@ -381,9 +381,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     let ticks = 0
     const timer = window.setInterval(() => {
       ticks += 1
-      if (ticks % 5 === 0) scheduleRefresh()
+      if (ticks % 20 === 0) scheduleRefresh()
       else if (openWorksRef.current.length) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
-    }, 60000)
+    }, 15000)
     const visible = () => { if (!document.hidden) scheduleRefresh() }
     document.addEventListener("visibilitychange", visible)
     return () => {

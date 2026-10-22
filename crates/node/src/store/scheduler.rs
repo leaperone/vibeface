@@ -772,7 +772,7 @@ fn recover_session(
                 session,
                 job,
                 JobOutcome::Interrupted {
-                    detail: "Node 重启，这次回复没有重放".into(),
+                    detail: "设备重启了，没有自动重做".into(),
                     process_unconfirmed: true,
                 },
                 "",

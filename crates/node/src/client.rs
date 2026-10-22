@@ -1259,7 +1259,7 @@ impl JoinLink {
 pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkState> {
     let node = Runtime::open(dir).await?;
     let report = |progress| match progress {
-        NodeJoin::Confirming { code } => println!("短码：{code}。请在管理设备上核对相同后批准。"),
+        NodeJoin::Confirming { code } => println!("安全码：{code}。在管理设备上比对一致后允许。"),
         _ => println!("已提交加入请求，等待管理设备批准。"),
     };
     join_as_node(&node, link, name, report, &tokio::sync::Notify::new()).await
