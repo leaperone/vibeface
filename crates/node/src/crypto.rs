@@ -129,7 +129,8 @@ impl LocalIdentity {
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. }
-            | EventBody::PrimaryAssistantSet { attestation, .. } => *attestation = value,
+            | EventBody::PrimaryAssistantSet { attestation, .. }
+            | EventBody::ScheduleControlled { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -141,6 +142,7 @@ impl LocalIdentity {
             scheduler_node: node.into(),
             epoch: 1,
             attestation: None,
+            cause: None,
         };
         let attestation = self
             .fixture_admin()
@@ -302,13 +304,17 @@ fn validate_attestation(event: &Event) -> Result<()> {
             answers: Some(_),
             ..
         } => UserSignature::Optional,
+        // A bot created in another bot's turn stands on the user's message; see `store::log`.
+        EventBody::ConversationOwner { cause: Some(_), .. }
+        | EventBody::BotCreated { cause: Some(_), .. } => UserSignature::Forbidden,
         EventBody::MessagePosted {
             role: Role::User, ..
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
         | EventBody::NotificationAcked { .. }
-        | EventBody::PrimaryAssistantSet { .. } => UserSignature::Required,
+        | EventBody::PrimaryAssistantSet { .. }
+        | EventBody::ScheduleControlled { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -347,6 +353,17 @@ fn question_id(scope: &str, question: &str) -> Result<()> {
     ensure!(
         question.starts_with(prefix),
         "a question ID in this scope starts with {prefix}"
+    );
+    Ok(())
+}
+
+/// A bot's turn creates another conversation; the cause sits in the creating one.
+fn cause_id(scope: &str, cause: &Cause) -> Result<()> {
+    vibeface_protocol::validate_id(&cause.conversation_id).map_err(anyhow::Error::msg)?;
+    vibeface_protocol::validate_id(&cause.message_id).map_err(anyhow::Error::msg)?;
+    ensure!(
+        cause.conversation_id != scope,
+        "a created bot's cause is in the creating conversation"
     );
     Ok(())
 }
@@ -451,21 +468,33 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         "an assistant reply carries its turn status"
                     );
                     if let Some(answered) = in_reply_to
-                        && crate::scheduling::parse_routine_trigger(answered).is_none()
+                        && crate::scheduling::parse_schedule_trigger(answered).is_none()
                     {
                         id(answered)?;
                     }
                 }
+                Role::Bot => anyhow::bail!("assistants message each other through their own event"),
             }
         }
         EventBody::ConversationOwner {
             scheduler_node,
             epoch,
+            cause,
             ..
         } => {
             decode32(scheduler_node)?;
             ensure!(*epoch > 0, "owner epoch starts at 1");
+            if let Some(cause) = cause {
+                ensure!(
+                    *epoch == 1,
+                    "only a created bot's first owner stands on a cause"
+                );
+                cause_id(&event.scope_id, cause)?;
+            }
         }
+        EventBody::BotCreated {
+            cause: Some(cause), ..
+        } => cause_id(&event.scope_id, cause)?,
         EventBody::WorkDispatched {
             work_id,
             trigger,
@@ -478,10 +507,10 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => {
             id(work_id)?;
             match trigger.split_once(':').unwrap_or_default() {
-                ("message" | "work" | "task", trigger_id) => id(trigger_id)?,
-                ("routine", _) => ensure!(
-                    crate::scheduling::parse_routine_trigger(trigger).is_some(),
-                    "invalid routine trigger"
+                ("message" | "work" | "task" | "bot_message", trigger_id) => id(trigger_id)?,
+                ("schedule", _) => ensure!(
+                    crate::scheduling::parse_schedule_trigger(trigger).is_some(),
+                    "invalid schedule trigger"
                 ),
                 _ => anyhow::bail!("invalid work trigger"),
             }
@@ -574,8 +603,42 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             change,
         } => {
             id(change_id)?;
-            id(cause)?;
+            if let Some(cause) = cause {
+                id(&cause.conversation_id)?;
+                id(&cause.message_id)?;
+            }
             change.validate()?;
+        }
+        EventBody::ScheduleControlled { schedule_id, .. } => id(schedule_id)?,
+        EventBody::BotMessaged {
+            message_id,
+            from,
+            text,
+            hops,
+        } => {
+            id(message_id)?;
+            id(&from.conversation_id)?;
+            ensure!(
+                from.conversation_id != event.scope_id
+                    && event.scope_id != SESSIONS_SCOPE
+                    && event.scope_id != ASSISTANTS_SCOPE,
+                "an assistant messages another assistant's conversation"
+            );
+            ensure!(
+                from.name.chars().count() <= crate::model::MAX_SCHEDULE_NAME_CHARS
+                    && !from.name.contains('\n'),
+                "a sender name is one short line"
+            );
+            ensure!(
+                !text.trim().is_empty() && text.len() <= crate::model::MAX_BOT_MESSAGE_BYTES,
+                "an assistant message is 1-{} bytes",
+                crate::model::MAX_BOT_MESSAGE_BYTES
+            );
+            ensure!(
+                (1..=crate::model::MAX_CHAIN_DEPTH).contains(hops),
+                "an assistant message is at most {} hops deep",
+                crate::model::MAX_CHAIN_DEPTH
+            );
         }
         _ => {}
     }

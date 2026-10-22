@@ -33,6 +33,7 @@ impl Runtime {
                     scheduler_node: owner.clone(),
                     epoch,
                     attestation: Some(attestation(args)?),
+                    cause: None,
                 },
             )
             .await?;

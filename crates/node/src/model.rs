@@ -24,6 +24,8 @@ pub struct BlobRef {
 pub enum Role {
     User,
     Assistant,
+    /// Another bot of this network wrote to this one; only `BotMessaged` makes it.
+    Bot,
 }
 
 /// How a coordination turn ended. Partial text of stopped or interrupted turns is kept.
@@ -129,10 +131,24 @@ pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
 pub const MAX_SKILL_NAME_CHARS: usize = 64;
 pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 512;
 pub const MAX_SKILL_BODY_BYTES: usize = 16 * 1024;
-pub const MAX_ROUTINE_NAME_CHARS: usize = 120;
-pub const MAX_ROUTINE_PROMPT_BYTES: usize = 8 * 1024;
+pub const MAX_SCHEDULE_NAME_CHARS: usize = 120;
+pub const MAX_SCHEDULE_PROMPT_BYTES: usize = 8 * 1024;
 /// Every 5 minutes up to every 4 weeks; a day is 1440 and a week 10080.
-pub const ROUTINE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
+pub const SCHEDULE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
+/// Repeating schedules and one-shot ones still ahead, per assistant.
+pub const MAX_ACTIVE_SCHEDULES: usize = 20;
+/// A one-shot time is set at least this far ahead, and at most `ONCE_MAX_LEAD_MS`.
+pub const ONCE_MIN_LEAD_MS: i64 = 60_000;
+pub const ONCE_MAX_LEAD_MS: i64 = 366 * 24 * 60 * 60_000;
+/// How many automatic wakes (reminders an assistant sets itself, messages between assistants)
+/// may follow one message of the user.
+pub const MAX_CHAIN_DEPTH: u8 = 4;
+pub const MAX_MEMORY_CHARS: usize = 500;
+pub const MAX_MEMORIES: usize = 50;
+pub const MAX_BOT_MESSAGE_BYTES: usize = 4000;
+pub const BOT_MESSAGES_PER_HOUR: usize = 10;
+/// Bots one message of the user may have a bot create.
+pub const BOTS_PER_TURN: usize = 3;
 
 /// One setting's value before and after a change; `before` is what the writer saw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,18 +167,54 @@ pub struct Skill {
     pub body: String,
 }
 
-/// A turn its assistant runs at `first_run_at_ms` and then every `every_minutes`.
+/// A turn its assistant runs at `first_run_at_ms`, then every `every_minutes` when set: a routine
+/// repeats, a reminder runs once.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Routine {
+pub struct Schedule {
     pub name: String,
     pub prompt: String,
     pub first_run_at_ms: i64,
-    pub every_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_minutes: Option<u32>,
     pub enabled: bool,
+    /// Automatic wakes since the user's last message: 0 for what the user asked for, one more
+    /// than the setting turn for a reminder the assistant set itself.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub depth: u8,
 }
 
-/// What a chat turn changed about its assistant. A `None` after removes the skill or routine.
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+/// What the user's web client does to a schedule; it never creates or edits one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleAction {
+    Pause,
+    Resume,
+    Delete,
+}
+
+/// The user's own signed message that started the turn a write stands on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Cause {
+    pub conversation_id: ScopeId,
+    pub message_id: String,
+}
+
+/// The assistant that wrote to another one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Sender {
+    pub conversation_id: ScopeId,
+    pub name: String,
+}
+
+/// What a chat turn changed about its assistant. A `None` after removes the skill, schedule or
+/// note.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AssistantChange {
@@ -177,10 +229,15 @@ pub enum AssistantChange {
         before: Option<Skill>,
         after: Option<Skill>,
     },
-    Routine {
-        routine_id: String,
-        before: Option<Routine>,
-        after: Option<Routine>,
+    Schedule {
+        schedule_id: String,
+        before: Option<Schedule>,
+        after: Option<Schedule>,
+    },
+    Memory {
+        memory_id: String,
+        before: Option<String>,
+        after: Option<String>,
     },
 }
 
@@ -225,25 +282,95 @@ impl Skill {
     }
 }
 
-impl Routine {
+impl Schedule {
     pub fn validate(&self) -> anyhow::Result<()> {
-        validate_line(&self.name, "a routine name", MAX_ROUTINE_NAME_CHARS)?;
+        validate_line(&self.name, "a schedule name", MAX_SCHEDULE_NAME_CHARS)?;
         anyhow::ensure!(
-            !self.prompt.trim().is_empty() && self.prompt.len() <= MAX_ROUTINE_PROMPT_BYTES,
-            "a routine prompt must be 1-{MAX_ROUTINE_PROMPT_BYTES} bytes"
+            !self.prompt.trim().is_empty() && self.prompt.len() <= MAX_SCHEDULE_PROMPT_BYTES,
+            "a schedule prompt must be 1-{MAX_SCHEDULE_PROMPT_BYTES} bytes"
         );
         anyhow::ensure!(
             self.first_run_at_ms >= 0,
             "first_run_at_ms must be a Unix time in milliseconds"
         );
+        if let Some(every) = self.every_minutes {
+            anyhow::ensure!(
+                SCHEDULE_MINUTES.contains(&every),
+                "every_minutes must be between {} and {}",
+                SCHEDULE_MINUTES.start(),
+                SCHEDULE_MINUTES.end()
+            );
+        }
         anyhow::ensure!(
-            ROUTINE_MINUTES.contains(&self.every_minutes),
-            "every_minutes must be between {} and {}",
-            ROUTINE_MINUTES.start(),
-            ROUTINE_MINUTES.end()
+            self.depth <= MAX_CHAIN_DEPTH,
+            "at most {MAX_CHAIN_DEPTH} automatic wakes may follow the user's message"
         );
         Ok(())
     }
+}
+
+/// A note an assistant keeps across turns: short, and never a credential.
+pub fn validate_memory(text: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !text.trim().is_empty() && text.chars().count() <= MAX_MEMORY_CHARS,
+        "a note must be 1-{MAX_MEMORY_CHARS} characters"
+    );
+    anyhow::ensure!(
+        !looks_secret(text),
+        "this looks like a credential; keys, tokens and passwords are never remembered"
+    );
+    Ok(())
+}
+
+/// Obvious credentials: private key blocks, bearer tokens, secret assignments, well-known key
+/// prefixes and long unbroken runs that mix cases and digits as keys do.
+pub fn looks_secret(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "-----begin",
+        "bearer ",
+        "password=",
+        "password:",
+        "passwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "token=",
+    ];
+    const PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xapp-",
+        "akia",
+        "aiza",
+        "glpat-",
+        "hf_",
+        "npm_",
+    ];
+    if MARKERS
+        .iter()
+        .any(|marker| text.to_lowercase().contains(marker))
+    {
+        return true;
+    }
+    text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+        .any(|word| {
+            let lower = word.to_ascii_lowercase();
+            (word.len() >= 20 && PREFIXES.iter().any(|prefix| lower.starts_with(prefix)))
+                || (word.len() >= 32
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && word.chars().any(|c| c.is_ascii_uppercase())
+                    && word.chars().any(|c| c.is_ascii_lowercase()))
+        })
 }
 
 impl AssistantChange {
@@ -280,17 +407,29 @@ impl AssistantChange {
                 );
                 after.as_ref().map(Skill::validate).transpose()?;
             }
-            Self::Routine {
-                routine_id,
+            Self::Schedule {
+                schedule_id,
                 before,
                 after,
             } => {
-                id(routine_id)?;
+                id(schedule_id)?;
                 anyhow::ensure!(
                     (before.is_some() || after.is_some()) && before != after,
-                    "the routine is unchanged"
+                    "the schedule is unchanged"
                 );
-                after.as_ref().map(Routine::validate).transpose()?;
+                after.as_ref().map(Schedule::validate).transpose()?;
+            }
+            Self::Memory {
+                memory_id,
+                before,
+                after,
+            } => {
+                id(memory_id)?;
+                anyhow::ensure!(
+                    (before.is_some() || after.is_some()) && before != after,
+                    "the note is unchanged"
+                );
+                after.as_deref().map(validate_memory).transpose()?;
             }
         }
         Ok(())
@@ -304,12 +443,17 @@ pub enum EventBody {
         title: String,
     },
     /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller hash.
+    /// A bot another bot creates gets its first owner through the user's message `cause`.
     ConversationOwner {
         scheduler_node: DeviceId,
         epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
+    /// Signed by the user on the web, or written in a bot's turn the user's message `cause`
+    /// started, with that message among its parents.
     BotCreated {
         bot_id: String,
         name: String,
@@ -318,6 +462,8 @@ pub enum EventBody {
         project: Option<BotProject>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
     /// `report_results` and `attachments` belong to user messages; `in_reply_to` and `status` to
     /// assistant replies. `attachments` repeats the event's blobs so the user's signature covers them.
@@ -411,11 +557,29 @@ pub enum EventBody {
         attestation: Option<Attestation>,
     },
     /// Written by the owner in a turn the user's message `cause` started; that message is one
-    /// of its parents. `change_id` derives from the turn and the tool's `call_ref`.
+    /// of its parents. A bot may change another bot, so the cause may sit in another
+    /// conversation. Only a new one-shot schedule, a reminder the assistant sets itself in
+    /// another turn, has no `cause`. `change_id` derives from the turn and the tool's `call_ref`.
     AssistantChanged {
         change_id: String,
-        cause: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
         change: AssistantChange,
+    },
+    /// The user pauses, resumes or deletes a schedule of this conversation from the web.
+    ScheduleControlled {
+        schedule_id: String,
+        action: ScheduleAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
+    /// In the receiving assistant's conversation, written by the sender's scheduling Node.
+    /// `message_id` derives from the sending turn and the tool's `call_ref`.
+    BotMessaged {
+        message_id: String,
+        from: Sender,
+        text: String,
+        hops: u8,
     },
     /// Written only by the owner in a read-only closing turn; covered events stay stored.
     ContextCheckpoint {
@@ -436,7 +600,8 @@ impl EventBody {
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
             | Self::NotificationAcked { attestation, .. }
-            | Self::PrimaryAssistantSet { attestation, .. } => attestation.as_ref(),
+            | Self::PrimaryAssistantSet { attestation, .. }
+            | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
@@ -532,7 +697,9 @@ pub struct Bot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeRecord {
     pub change_id: String,
-    pub cause: String,
+    /// The bot it changed; another bot's turn may have made it.
+    pub conversation_id: ScopeId,
+    pub cause: Option<Cause>,
     pub event_hash: EventHash,
     pub created_at_ms: i64,
     pub change: AssistantChange,
@@ -546,14 +713,22 @@ pub struct SkillEntry {
     pub skill: Skill,
 }
 
-/// A routine that is not removed; `changed_at_ms` is when its current definition was written.
+/// A schedule that is not removed, with its current pause state. `changed_at_ms` is when its
+/// definition or its pause state last changed, whichever is later.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct RoutineEntry {
-    pub routine_id: String,
+pub struct ScheduleEntry {
+    pub schedule_id: String,
     pub conversation_id: ScopeId,
     #[serde(flatten)]
-    pub routine: Routine,
+    pub schedule: Schedule,
     pub changed_at_ms: i64,
+}
+
+/// A note one assistant keeps.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub memory_id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -576,6 +751,8 @@ pub struct Message {
     pub report_results: Option<bool>,
     /// The question this user message answers.
     pub answers: Option<String>,
+    /// The assistant a bot message came from.
+    pub sender: Option<Sender>,
     pub blobs: Vec<BlobRef>,
     /// Its place in the conversation's shared order; clients merge pushed messages by it.
     pub rank: String,

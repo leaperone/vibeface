@@ -162,16 +162,18 @@ impl Runtime {
             .into_iter()
             .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name,"description":entry.skill.description}))
             .collect();
-        let routines: Vec<_> = store
-            .routines(network, scope)?
+        let schedules: Vec<_> = store
+            .schedules(network, scope)?
             .into_iter()
+            .filter(|entry| crate::scheduling::ahead(&entry.schedule, now))
             .map(|entry| {
-                let mut value = json!(entry.routine);
-                value["routine_id"] = json!(entry.routine_id);
-                value["next_run_at_ms"] = json!(crate::scheduling::next_run(&entry.routine, now));
+                let mut value = json!(entry.schedule);
+                value["schedule_id"] = json!(entry.schedule_id);
+                value["next_run_at_ms"] = json!(crate::scheduling::next_run(&entry.schedule, now));
                 value
             })
             .collect();
+        let memory = store.memories(network, scope)?;
         drop(store);
         let assistant = self.assistant();
         let manager = assistant.as_ref();
@@ -184,7 +186,7 @@ impl Runtime {
             "changes":changes,
             "questions":questions,
             "sessions":sessions,
-            "assistant":{"skills":skills,"routines":routines},
+            "assistant":{"skills":skills,"schedules":schedules,"memory":memory},
             "checks":checks,
             "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),

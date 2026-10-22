@@ -48,15 +48,15 @@ impl Runtime {
             loop {
                 tick.tick().await;
                 let _work = node.maintenance.enter_when_open().await;
-                if let Err(error) = node.fire_routines().await {
+                if let Err(error) = node.fire_schedules().await {
                     tracing::warn!(%error, "routine runs are pending");
                 }
             }
         });
     }
 
-    /// Queues the routines that are due in conversations this Node schedules.
-    async fn fire_routines(self: &Arc<Self>) -> Result<()> {
+    /// Queues the schedules that are due in conversations this Node schedules.
+    async fn fire_schedules(self: &Arc<Self>) -> Result<()> {
         if self.assistant().is_none() {
             return Ok(());
         }
@@ -67,7 +67,7 @@ impl Runtime {
             self.store
                 .lock()
                 .await
-                .admit_due_routines(&self.identity, &network, now_ms())?;
+                .admit_due_schedules(&self.identity, &network, now_ms())?;
         for (scope, trigger) in admitted {
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
             self.schedule_wakeup.notify_one();

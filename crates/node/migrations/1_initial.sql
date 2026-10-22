@@ -23,23 +23,27 @@ CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missin
 -- Create "conversations" table
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
-CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `blobs` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
+CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `blobs` text NOT NULL, `sender` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
 -- Create index "messages_order" to table: "messages"
 CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `rank`);
 -- Create index "messages_answers" to table: "messages"
 CREATE INDEX `messages_answers` ON `messages` (`network_id`, `answers`);
 -- Create "bots" table
-CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
+CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "assistant_profiles" table
 CREATE TABLE `assistant_profiles` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `field` text NOT NULL, `value` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `field`));
 -- Create "skills" table
 CREATE TABLE `skills` (`network_id` text NOT NULL, `skill_id` text NOT NULL, `skill` text NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `skill_id`));
--- Create "routines" table
-CREATE TABLE `routines` (`network_id` text NOT NULL, `routine_id` text NOT NULL, `conversation_id` text NOT NULL, `routine` text NULL, `rank` text NOT NULL, `changed_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `routine_id`));
--- Create index "routines_conversation" to table: "routines"
-CREATE INDEX `routines_conversation` ON `routines` (`network_id`, `conversation_id`);
+-- Create "schedules" table
+CREATE TABLE `schedules` (`network_id` text NOT NULL, `schedule_id` text NOT NULL, `conversation_id` text NOT NULL, `schedule` text NULL, `rank` text NOT NULL, `changed_at_ms` integer NOT NULL, `enabled` integer NOT NULL, `enabled_rank` text NOT NULL, `enabled_at_ms` integer NOT NULL, `removed` integer NOT NULL, PRIMARY KEY (`network_id`, `schedule_id`));
+-- Create index "schedules_conversation" to table: "schedules"
+CREATE INDEX `schedules_conversation` ON `schedules` (`network_id`, `conversation_id`);
+-- Create "memories" table
+CREATE TABLE `memories` (`network_id` text NOT NULL, `memory_id` text NOT NULL, `conversation_id` text NOT NULL, `text` text NULL, `rank` text NOT NULL, `changed_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `memory_id`));
+-- Create index "memories_conversation" to table: "memories"
+CREATE INDEX `memories_conversation` ON `memories` (`network_id`, `conversation_id`);
 -- Create "assistant_changes" table
-CREATE TABLE `assistant_changes` (`network_id` text NOT NULL, `change_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NOT NULL, `change` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `change_id`));
+CREATE TABLE `assistant_changes` (`network_id` text NOT NULL, `change_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, `change` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `change_id`));
 -- Create index "assistant_changes_order" to table: "assistant_changes"
 CREATE INDEX `assistant_changes_order` ON `assistant_changes` (`network_id`, `conversation_id`, `rank`);
 -- Create "works" table
@@ -88,8 +92,8 @@ CREATE TABLE `scheduler_jobs` (`conversation_id` text NOT NULL, `trigger` text N
 CREATE INDEX `scheduler_jobs_state` ON `scheduler_jobs` (`state`, `conversation_id`);
 -- Create "scheduler_outbox" table
 CREATE TABLE `scheduler_outbox` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, PRIMARY KEY (`conversation_id`, `trigger`));
--- Create "routine_runs" table
-CREATE TABLE `routine_runs` (`conversation_id` text NOT NULL, `routine_id` text NOT NULL, `slot_ms` integer NOT NULL, PRIMARY KEY (`conversation_id`, `routine_id`));
+-- Create "schedule_runs" table
+CREATE TABLE `schedule_runs` (`conversation_id` text NOT NULL, `schedule_id` text NOT NULL, `slot_ms` integer NOT NULL, PRIMARY KEY (`conversation_id`, `schedule_id`));
 -- Create "pending_checks" table
 CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` text NOT NULL, `trigger` text NOT NULL, `detail` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`attempt_id`));
 -- Create "manager_processes" table

@@ -630,6 +630,7 @@ impl Runtime {
             "answer" => self.answer_question(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "set_primary_assistant" => self.set_primary_assistant(&access, &input).await,
+            "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "resolve" => self.resolve_check(&access, &input).await,
             "notifications" => Ok(
