@@ -1705,6 +1705,108 @@ mod tests {
         Ok(())
     }
 
+    /// A fake App Server on the Node's socket that answers every request and passes each on.
+    fn answering_app_server(node: &Runtime) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
+        let (sent, received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            while let Some(Ok(message)) = server.next().await {
+                let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else {
+                    continue;
+                };
+                if request.get("id").is_some() {
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                        _ => json!({}),
+                    };
+                    let reply = json!({"id":request["id"],"result":result});
+                    let _ = server.send(reply.to_string().into()).await;
+                }
+                let _ = sent.send(request);
+            }
+        });
+        Ok(received)
+    }
+
+    /// A stop while the Agent is still starting the work is kept, not dropped: the turn is
+    /// interrupted as soon as it is bound, once.
+    #[tokio::test]
+    async fn a_work_stopped_while_starting_is_interrupted_once_bound() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let mut requests = answering_app_server(&node)?;
+            while node.codex.status().await["connection"]["state"] != "connected" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let spec = crate::work::WorkSpec {
+                work_id: "w-stop".into(),
+                conversation: "c".into(),
+                trigger: "message:m1".into(),
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "r".into(),
+                kind: crate::model::WorkKind::Codex,
+                cwd: "/tmp".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some("t-9".into()),
+            };
+            node.store
+                .lock()
+                .await
+                .accept_work(&node.identity, &network, spec, now_ms())?;
+            let stopped = node.interrupt_work(&network, "w-stop").await?;
+            assert_eq!(stopped["waiting_for_start"], true);
+            let waiting = node.store.lock().await.stop_requests()?;
+            assert!(waiting.iter().any(|request| request.work_id == "w-stop"));
+
+            let epoch = node.codex_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let turn = crate::work::Signal::TurnStarted {
+                turn_id: "u-1".into(),
+                epoch,
+            };
+            let bound = node.signal_work(&network, "w-stop", turn).await?;
+            assert!(matches!(
+                bound.state,
+                crate::work::WorkState::Interrupting { .. }
+            ));
+            let interrupt = loop {
+                let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                    .await?
+                    .context("the App Server closed")?;
+                if request["method"] == "turn/interrupt" {
+                    break request;
+                }
+            };
+            assert_eq!(
+                interrupt["params"],
+                json!({"threadId":"t-9","turnId":"u-1"})
+            );
+            assert!(node.store.lock().await.stop_requests()?.is_empty());
+            node.deliver_work_requests(&network).await?;
+            while let Ok(request) = requests.try_recv() {
+                assert_ne!(request["method"], "turn/interrupt", "the stop is sent once");
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
     #[tokio::test]
     async fn a_held_request_is_answered_by_the_agent_once() -> Result<()> {
         let (node, admin, dir) = node().await?;

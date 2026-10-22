@@ -1698,7 +1698,14 @@ def work_checks(run, workspace, a, network, passed):
     renamed = node_cli(a, "codex", "call", "thread/name/set", json.dumps({"threadId": running["thread_id"], "name": "steered"}),
                        socket=socket_path)
     require(any(row["id"] == running["thread_id"] for row in listed["data"]) and models["data"][0]["id"] == "fixture-model"
-            and renamed.returncode == 0, "codex call passes any App Server method through")
+            and renamed.returncode == 0, "codex call passes reads and thread management through")
+    starts_before = len(rpc("turn/start")) + len(rpc("turn/steer"))
+    refused = [node_cli(a, "codex", "call", method, json.dumps({"threadId": running["thread_id"]}), socket=socket_path, check=False)
+               for method in ("turn/start", "turn/steer", "turn/interrupt")]
+    require(all(result.returncode != 0 and "codex send" in result.stderr for result in refused)
+            and len(rpc("turn/start")) + len(rpc("turn/steer")) == starts_before
+            and in_state(name, work_id, "running"),
+            "codex call refuses turn writes, so every turn stays a registered work")
     def resumes():
         return len([row for row in rpc("thread/resume") if row["message"]["params"].get("threadId") == running["thread_id"]])
 
