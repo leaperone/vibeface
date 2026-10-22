@@ -1835,6 +1835,52 @@ mod tests {
                 codex_sdk_script: dir.join("sidecars/codex-manager.mjs"),
             }),
         };
+        let refused = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await
+        .expect_err("configure_node cannot turn the assistant on");
+        assert!(
+            refused.to_string().contains("configure_provider"),
+            "{refused}"
+        );
+        assert!(Config::load(&dir)?.manager.is_none());
+        let choose_cursor = json!({"provider":"cursor","assistant":true});
+        std::os::unix::fs::symlink(&project, &workspace)?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_provider",
+                choose_cursor.clone()
+            )
+            .await
+            .is_err(),
+            "the default workspace must be a real directory"
+        );
+        std::fs::remove_file(&workspace)?;
+        let chosen = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_provider",
+            choose_cursor,
+        )
+        .await?;
+        assert!(workspace.is_dir());
+        assert_eq!(
+            chosen["settings"]["manager"]["provider"], "cursor_sdk",
+            "choosing the assistant fills in the defaults"
+        );
+        assert_eq!(chosen["settings"]["manager"]["model"], "auto");
+        assert_eq!(
+            chosen["settings"]["manager"]["workspace"],
+            json!(workspace.canonicalize()?)
+        );
+        assert_eq!(chosen["providers"][1]["roles"], json!(["agent"]));
+        assert_eq!(chosen["providers"][0]["roles"], json!(["execution"]));
         let mut missing_workspace = settings.clone();
         missing_workspace.manager.as_mut().unwrap().workspace =
             dir.join("custom-workspace-not-created");
@@ -1849,18 +1895,6 @@ mod tests {
             .is_err()
         );
         assert!(!dir.join("custom-workspace-not-created").exists());
-        std::os::unix::fs::symlink(&project, &workspace)?;
-        assert!(
-            dispatch(
-                &node,
-                &mut manager_session,
-                "configure_node",
-                serde_json::to_value(&settings)?
-            )
-            .await
-            .is_err()
-        );
-        std::fs::remove_file(&workspace)?;
         let saved = dispatch(
             &node,
             &mut manager_session,
@@ -1904,18 +1938,41 @@ mod tests {
         );
         let mut codex_settings = settings.clone();
         codex_settings.manager.as_mut().unwrap().provider = crate::manager::ManagerKind::CodexSdk;
-        dispatch(
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&codex_settings)?,
+            )
+            .await
+            .is_err(),
+            "configure_node cannot move the assistant"
+        );
+        let codex = dispatch(
             &node,
             &mut manager_session,
-            "configure_node",
-            serde_json::to_value(&codex_settings)?,
+            "configure_provider",
+            json!({"provider":"codex","assistant":true}),
         )
         .await?;
+        let mut expected = saved["settings"].clone();
+        expected["manager"]["provider"] = json!("codex_sdk");
+        expected["manager"]["model"] = json!("");
+        assert_eq!(
+            codex["settings"], expected,
+            "only the provider and model move"
+        );
+        assert_eq!(
+            codex["providers"][0]["roles"],
+            json!(["agent", "execution"])
+        );
+        assert_eq!(codex["providers"][1]["state"], "off");
         dispatch(
             &node,
             &mut manager_session,
-            "configure_node",
-            serde_json::to_value(&settings)?,
+            "configure_provider",
+            json!({"provider":"cursor","assistant":true}),
         )
         .await?;
         drop(node);
@@ -1932,7 +1989,8 @@ mod tests {
     /// Provider keys are write-only: they reach the provider's own processes and nothing else,
     /// not the replies, the shared store, the config or the log.
     #[tokio::test]
-    async fn provider_keys_stay_in_the_private_file_and_switches_gate_the_roles() -> Result<()> {
+    async fn provider_keys_stay_in_the_private_file_and_one_call_chooses_what_providers_run()
+    -> Result<()> {
         use crate::config::{self, Config};
         use crate::manager::ManagerKind;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1985,7 +2043,7 @@ mod tests {
             codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
-        let set_codex = json!({"provider":"codex","bin":"/fixture/codex",
+        let set_codex = json!({"provider":"codex","assistant":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":codex_home}});
         let mut member = session(&client)?;
         assert!(
@@ -2013,8 +2071,10 @@ mod tests {
                 "{text}"
             );
         }
+        assert_eq!(read["settings"]["manager"]["provider"], "codex_sdk");
         let codex = &read["providers"][0];
         assert_eq!(codex["provider"], "codex");
+        assert_eq!(codex["roles"], json!(["agent", "execution"]));
         assert_eq!(codex["bin"], "/fixture/codex");
         assert!(codex["env"].as_array().unwrap().contains(
             &json!({"name":"FIXTURE_CODEX_KEY","set":true,"inherited":false,"required":false})
@@ -2034,7 +2094,7 @@ mod tests {
                 read["providers"][1]["state"].clone(),
                 read["providers"][1]["issues"].clone()
             ),
-            (json!("unused"), json!([])),
+            (json!("off"), json!([])),
             "Cursor runs nothing until the assistant uses it"
         );
         assert_eq!(codex["app_server"]["mode"], "system");
@@ -2105,7 +2165,9 @@ mod tests {
         );
 
         for invalid in [
-            json!({"provider":"cursor","roles":["execution"]}),
+            json!({"provider":"cursor","execution":true}),
+            json!({"provider":"codex","roles":["agent"]}),
+            json!({"provider":"codex","enabled":false}),
             json!({"provider":"cursor","bin":"/fixture/cursor"}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
         ] {
@@ -2119,10 +2181,11 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"codex","roles":["agent"],"env":{"FIXTURE_CODEX_KEY":null}}),
+            json!({"provider":"codex","execution":false,"env":{"FIXTURE_CODEX_KEY":null}}),
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
+        assert!(node.providers().codex_target() == crate::providers::CodexTarget::Off);
         assert!(
             off["providers"][0]["env"]
                 .as_array()
@@ -2142,23 +2205,45 @@ mod tests {
             )
             .await?;
         assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
-        let cursor_off = dispatch(
+        let moved = dispatch(
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","enabled":false}),
+            json!({"provider":"cursor","assistant":true}),
         )
         .await?;
-        assert_eq!(cursor_off["providers"][1]["state"], "off");
+        assert_eq!(moved["settings"]["manager"]["provider"], "cursor_sdk");
+        assert_eq!(moved["settings"]["manager"]["model"], "auto");
+        assert_eq!(moved["providers"][0]["roles"], json!([]));
+        assert_eq!(moved["providers"][0]["state"], "off");
+        assert_eq!(moved["providers"][1]["roles"], json!(["agent"]));
+        let unchanged = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"codex","assistant":false}),
+        )
+        .await?;
+        assert_eq!(
+            unchanged["settings"]["manager"]["provider"], "cursor_sdk",
+            "stopping the assistant elsewhere leaves it running"
+        );
+        let stopped = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","assistant":false}),
+        )
+        .await?;
+        assert_eq!(stopped["settings"]["manager"], Value::Null);
+        assert_eq!(stopped["readiness"]["manager"], "disabled");
+        assert_eq!(stopped["providers"][1]["state"], "off");
 
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
-        assert!(!providers.switches.cursor.enabled);
-        assert!(!providers.switches.serves(
-            crate::providers::Provider::Codex,
-            crate::providers::Role::Execution
-        ));
+        assert!(reopened.assistant().is_none());
+        assert!(!providers.switches.execution);
         assert_eq!(
             providers.codex_bin,
             std::path::PathBuf::from("/fixture/codex")

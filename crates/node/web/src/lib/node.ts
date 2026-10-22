@@ -40,16 +40,20 @@ export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 
 export type AppServerMode = 'system' | 'spawn'
 /** `socket` is the owner's choice for the system App Server; `null` finds it. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
-/** One local provider of the connected Node. Variable values never come back, only whether each is set. */
+/**
+ * One local provider of the connected Node. `roles` is what it runs now: `agent` while the assistant
+ * runs on it, `execution` while Codex executes tasks; `off` means it runs nothing.
+ * Variable values never come back, only whether each is set.
+ */
 export type ProviderStatus = {
-  provider: ProviderId; enabled: boolean; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; assistant: boolean; app_server: AppServer | null
+  provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; app_server: AppServer | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
-  state: 'ready' | 'needs_setup' | 'starting' | 'unused' | 'off'; issues: ProviderIssue[]
+  state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
   defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin' | 'node_bin' | 'codex_sdk_script'>
-  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites' | 'provider_off'; missing: string[] }
+  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[] }
   providers: ProviderStatus[]
 }
 
@@ -151,7 +155,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('助手设置格式不对。')
     manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
   }
-  if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites' && readiness.manager !== 'provider_off') throw new Error('程序检查结果格式不对。')
+  if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
     defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
@@ -160,9 +164,9 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   }
 }
 const providerIds: ProviderId[] = ['codex', 'cursor'], providerRoles: ProviderRole[] = ['agent', 'execution']
-const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'unused', 'off']
+const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
-  if (!options.includes(value as T)) throw new Error('AI 服务状态格式不对。')
+  if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
   return value as T
 }
 function parseIssue(value: unknown): ProviderIssue {
@@ -174,7 +178,7 @@ function parseIssue(value: unknown): ProviderIssue {
     case 'config_invalid': return { code: v.code }
     case 'app_server_not_found': return { code: v.code }
     case 'app_server_unreachable': return { code: v.code, detail: text(v.detail) }
-    default: throw new Error('AI 服务状态格式不对。')
+    default: throw new Error('AI 状态格式不对。')
   }
 }
 export function parseAppServerLink(value: unknown): AppServerLink {
@@ -196,7 +200,7 @@ function parseAppServer(value: unknown): AppServer | null {
 function parseProvider(value: unknown): ProviderStatus {
   const v = record(value)
   return {
-    provider: oneOf(v.provider, providerIds), enabled: boolean(v.enabled), assistant: boolean(v.assistant),
+    provider: oneOf(v.provider, providerIds),
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
     bin: v.bin === null ? null : text(v.bin), app_server: parseAppServer(v.app_server),
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),

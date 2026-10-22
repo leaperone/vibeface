@@ -1,12 +1,12 @@
-//! The AI providers this Node runs locally, the roles each may serve, and the variables each
-//! provider's processes get. The switches live in `config.json`; the variables are model keys,
+//! The AI providers this Node runs locally and the variables each provider's processes get. The
+//! assistant's provider and the execution switch live in `config.json`; the variables are model keys,
 //! so they stay in one private file of the data directory and never reach events, logs or the
 //! web, which only learns which names are set.
 use crate::manager::ManagerKind;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
@@ -47,20 +47,12 @@ impl Provider {
             ManagerKind::CursorSdk => Provider::Cursor,
         }
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Switch {
-    pub enabled: bool,
-    pub roles: BTreeSet<Role>,
-}
-
-impl Switch {
-    fn all(provider: Provider) -> Self {
-        Self {
-            enabled: true,
-            roles: provider.supports().iter().copied().collect(),
+    /// The assistant runtime that runs on this provider.
+    pub fn manager_kind(self) -> ManagerKind {
+        match self {
+            Provider::Codex => ManagerKind::CodexSdk,
+            Provider::Cursor => ManagerKind::CursorSdk,
         }
     }
 }
@@ -84,11 +76,13 @@ pub struct AppServer {
     pub socket: Option<PathBuf>,
 }
 
+/// What the providers do besides the assistant, which `Config.manager` chooses. A provider is in
+/// use while the assistant runs on it or, for Codex, while it executes dispatched work.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {
-    pub codex: Switch,
-    pub cursor: Switch,
+    /// Dispatched work runs on the Codex App Server.
+    pub execution: bool,
     #[serde(default)]
     pub codex_app_server: AppServer,
 }
@@ -96,45 +90,19 @@ pub struct Providers {
 impl Default for Providers {
     fn default() -> Self {
         Self {
-            codex: Switch::all(Provider::Codex),
-            cursor: Switch::all(Provider::Cursor),
+            execution: true,
             codex_app_server: AppServer::default(),
         }
     }
 }
 
 impl Providers {
-    pub fn get(&self, provider: Provider) -> &Switch {
-        match provider {
-            Provider::Codex => &self.codex,
-            Provider::Cursor => &self.cursor,
-        }
-    }
-    pub fn get_mut(&mut self, provider: Provider) -> &mut Switch {
-        match provider {
-            Provider::Codex => &mut self.codex,
-            Provider::Cursor => &mut self.cursor,
-        }
-    }
-    pub fn serves(&self, provider: Provider, role: Role) -> bool {
-        let switch = self.get(provider);
-        switch.enabled && switch.roles.contains(&role)
-    }
     pub fn validate(&self) -> Result<()> {
         if let Some(socket) = &self.codex_app_server.socket {
             let text = socket.to_string_lossy();
             ensure!(
                 socket.is_absolute() && text.len() <= 1024 && !text.contains('\0'),
                 "the App Server socket must be an absolute path"
-            );
-        }
-        for provider in Provider::ALL {
-            ensure!(
-                self.get(provider)
-                    .roles
-                    .iter()
-                    .all(|role| provider.supports().contains(role)),
-                "{provider:?} cannot serve that role"
             );
         }
         Ok(())
@@ -257,7 +225,7 @@ pub struct CodexLaunch {
 /// The App Server the Node talks to right now.
 #[derive(Clone, PartialEq)]
 pub enum CodexTarget {
-    /// Codex does not serve the execution layer.
+    /// Codex does not execute work.
     Off,
     /// The App Server already running on this computer; `None` discovers its socket.
     System(Option<PathBuf>),
@@ -273,18 +241,11 @@ pub struct Local {
 }
 
 impl Local {
-    pub fn serves(&self, provider: Provider, role: Role) -> bool {
-        self.switches.serves(provider, role)
-    }
-
-    /// The App Server is used only while Codex serves the execution layer. The variables reach
-    /// only an App Server the Node starts; the system one keeps its own.
+    /// The App Server is used only while Codex executes work. The variables reach only an App
+    /// Server the Node starts; the system one keeps its own.
     pub fn codex_target(&self) -> CodexTarget {
         let app_server = &self.switches.codex_app_server;
-        match (
-            self.serves(Provider::Codex, Role::Execution),
-            app_server.mode,
-        ) {
+        match (self.switches.execution, app_server.mode) {
             (false, _) => CodexTarget::Off,
             (true, AppServerMode::System) => CodexTarget::System(app_server.socket.clone()),
             (true, AppServerMode::Spawn) => CodexTarget::Spawn(CodexLaunch {
@@ -352,29 +313,27 @@ mod tests {
     }
 
     #[test]
-    fn roles_follow_what_each_provider_can_run() {
-        let mut providers = Providers::default();
-        assert!(providers.serves(Provider::Codex, Role::Execution));
-        assert!(providers.validate().is_ok());
-        providers.cursor.roles.insert(Role::Execution);
-        assert!(providers.validate().is_err());
-        providers.cursor.roles.remove(&Role::Execution);
-        providers.codex.enabled = false;
-        assert!(!providers.serves(Provider::Codex, Role::Agent));
-        let local = Local {
-            switches: providers,
+    fn the_execution_switch_decides_whether_codex_runs_work() {
+        let mut local = Local {
+            switches: Providers::default(),
             codex_bin: "codex".into(),
             env: ProviderEnv::default(),
         };
+        assert!(local.switches.execution && local.switches.validate().is_ok());
+        local.switches.execution = false;
         assert!(local.codex_target() == CodexTarget::Off);
+        assert!(
+            serde_json::from_value::<Providers>(serde_json::json!({
+                "execution":true,"codex":{"enabled":true,"roles":["agent"]},
+            }))
+            .is_err(),
+            "per-provider switches are gone"
+        );
     }
 
     #[test]
     fn codex_uses_the_system_app_server_unless_told_to_start_its_own() -> Result<()> {
-        let saved: Providers = serde_json::from_value(serde_json::json!({
-            "codex":{"enabled":true,"roles":["agent","execution"]},
-            "cursor":{"enabled":true,"roles":["agent"]},
-        }))?;
+        let saved: Providers = serde_json::from_value(serde_json::json!({"execution":true}))?;
         let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,

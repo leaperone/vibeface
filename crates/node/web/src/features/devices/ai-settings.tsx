@@ -1,24 +1,34 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@/features/identity/context"
-import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderRole, type ProviderStatus } from "@/lib/node"
+import { terms } from "@/lib/glossary"
+import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@/lib/node"
 
-export const providerNames: Record<ProviderId, string> = { codex: "Codex", cursor: "Cursor" }
+export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
+const providerNames: Record<ProviderId, string> = { codex: "Codex", cursor: "Cursor" }
 const icons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
-const roleLabels: Record<ProviderRole, string> = { agent: "助手", execution: "执行任务" }
 const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
   starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
-  unused: { label: "未使用", tone: "neutral", icon: CircleDashed },
-  off: { label: "已关闭", tone: "neutral", icon: Power },
+  off: { label: "未使用", tone: "neutral", icon: CircleDashed },
+}
+// Names come from runtime/settings.rs readiness.missing.
+const checks: Record<ProviderId, { key: string; label: string; doc: string }[]> = {
+  codex: [
+    { key: "Node.js", label: "缺少 Node.js 18 以上", doc: "node.md#使用-codex-sdk" },
+    { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
+    { key: "Codex SDK sidecar", label: "Vibeface 安装不完整，请重新安装", doc: "install.md" },
+    { key: "Codex SDK dependencies", label: "助手组件还没装好", doc: "install.md#npm-nightly" },
+  ],
+  cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
 }
 
-export function issueText(provider: ProviderId, issue: ProviderIssue): string {
+function issueText(provider: ProviderId, issue: ProviderIssue): string {
   const name = providerNames[provider]
   switch (issue.code) {
     case "bin_missing": return `找不到 ${name} 程序`
@@ -91,79 +101,96 @@ function AppServerSettings({ server, working, busy, save, test }: {
 }
 
 /** Opens a provider's settings on this page and moves focus into them; every fix action lands here. */
-export function openProvider(provider: ProviderId) {
+function openProvider(provider: ProviderId) {
   const card = document.getElementById(`provider-${provider}`)
   if (!(card instanceof HTMLDetailsElement)) return
-  const behavior = matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
-  const toggle = card.parentElement?.querySelector<HTMLInputElement>("[role=switch]")
-  if (toggle && !toggle.checked) {
-    toggle.scrollIntoView({ block: "center", behavior })
-    toggle.focus({ preventScroll: true })
-    return
-  }
   card.open = true
-  card.scrollIntoView({ block: "center", behavior })
+  card.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
   card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
 }
 
-type Change = { provider: ProviderId; enabled?: boolean; roles?: ProviderRole[]; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { provider: ProviderId; assistant?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Failure = { at: ProviderId | "roots" | null; cause: unknown }
 
 /**
- * Codex and Cursor on the device this browser is connected to: on or off, what each is used for,
- * its program and its variables. Values are write-only; the device only says which are set.
+ * The AI on the device this browser is connected to: which provider runs the assistant, whether
+ * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
+ * change saves right away. Variable values are write-only; the device only says which are set.
  */
-export function ProviderSettings({ update, onChange }: { update?: NodeSettingsResponse | null; onChange?(value: NodeSettingsResponse): void }) {
+export function AiSettings({ onboarding = false }: { onboarding?: boolean }) {
   const { ready } = useDevice()
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
   const [busy, setBusy] = useState("")
-  const [error, setError] = useState<{ provider: ProviderId | null; cause: unknown } | null>(null)
+  const [error, setError] = useState<Failure | null>(null)
   const sequence = useRef(0)
 
-  async function call(key: string, change: Change | null) {
+  async function call(key: string, at: Failure["at"], method: string, params?: Change | NodeSettings) {
     if (!ready?.isCurrent()) return false
     const connection = ready, owner = ++sequence.current
     setBusy(key); setError(null)
     try {
-      const parsed = parseNodeSettings(await (change ? connection.request("configure_provider", change) : connection.request("node_settings")))
+      const parsed = parseNodeSettings(await connection.request(method, params))
       if (owner !== sequence.current || !connection.isCurrent()) return false
       setResponse(parsed)
-      if (change) onChange?.(parsed)
       return true
     } catch (cause) {
-      if (owner === sequence.current) setError({ provider: change?.provider ?? null, cause })
+      if (owner === sequence.current && connection.isCurrent()) setError({ at, cause })
       return false
     } finally {
       if (owner === sequence.current) setBusy("")
     }
   }
-  useEffect(() => { setResponse(null); void call("load", null); return () => { sequence.current += 1 } }, [ready])
+  const load = () => call("load", null, "node_settings")
+  useEffect(() => { setResponse(null); void load(); return () => { sequence.current += 1 } }, [ready])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
     try {
       const link = parseAppServerLink(await ready.request("test_codex_app_server"))
-      void call("load", null)
+      void load()
       return link
     } catch (cause) {
-      setError({ provider: "codex", cause })
+      setError({ at: "codex", cause })
       return null
     }
   }
-  useEffect(() => { if (update) setResponse(update) }, [update])
   const starting = response?.providers.some((item) => item.state === "starting")
   useEffect(() => {
     if (!starting) return
-    const timer = setTimeout(() => void call("load", null), 2000)
+    const timer = setTimeout(() => void load(), 2000)
     return () => clearTimeout(timer)
   }, [response])
 
-  if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void call("load", null) }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
-  return <ul className="grid gap-3">
-    {response.providers.map((item) => <ProviderCard key={item.provider} item={item} busy={busy} error={error?.provider === item.provider ? error.cause : null} save={(key, change) => call(`${item.provider}:${key}`, { provider: item.provider, ...change })} test={test} />)}
-  </ul>
+  if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
+  const { roots, manager } = response.settings
+  return <div className="grid gap-5">
+    <ul className="grid gap-3">
+      {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
+        error={error?.at === item.provider ? error.cause : null} test={test}
+        change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
+        saveAssistant={(next) => call(`${item.provider}:assistant_details`, item.provider, "configure_node", { roots, manager: next })} />)}
+    </ul>
+    <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />
+    {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
+  </div>
 }
 
-function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus; busy: string; error: unknown; save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null> }) {
-  const name = providerNames[item.provider], Icon = icons[item.provider], state = states[item.state]
+/** An icon that turns one use of a provider on or off. */
+function RoleToggle({ icon: Icon, label, name, pressed, busy, disabled, onClick }: { icon: LucideIcon; label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
+  return <Button type="button" size="icon" variant={pressed ? "outline" : "ghost"} aria-pressed={pressed} aria-label={`${name} ${label}`} title={label} disabled={disabled}
+    className={cn(pressed ? "shadow-xs" : "text-muted-foreground")} onClick={onClick}>
+    <BusyIcon busy={busy} icon={Icon} />
+  </Button>
+}
+
+function ProviderCard({ item, response, onboarding, busy, error, change, saveAssistant, test }: {
+  item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveAssistant(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
+}) {
+  const name = providerNames[item.provider], Icon = icons[item.provider]
+  const assistant = item.roles.includes("agent"), execution = item.roles.includes("execution")
+  const manager = assistant ? response.settings.manager : null
+  const missing = assistant ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
+  const state = states[item.state === "ready" && missing.length ? "needs_setup" : item.state]
   const [editing, setEditing] = useState<string | null>(null)
   const [value, setValue] = useState("")
   const [newName, setNewName] = useState("")
@@ -171,53 +198,46 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
   const [bin, setBin] = useState(item.bin ?? "")
   useEffect(() => setBin(item.bin ?? ""), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
-  const issue = item.issues[0]
+  const issue = item.state === "needs_setup" ? item.issues[0] : undefined
   const fix = () => {
     if (issue?.code === "env_missing") { setEditing(issue.name); setValue("") }
     openProvider(item.provider)
   }
-  const setVariable = (key: string, name: string, next: string | null) => save(key, { env: { [name]: next } })
+  const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
     .then((ok) => { if (ok) toast(next === null ? `已删除 ${name}` : `已保存 ${name}`, { tone: "success" }); return ok })
   const addName = newName.trim().toUpperCase()
 
   return <li className="overflow-hidden rounded-xl border">
     <div className="flex min-h-14 items-center gap-3 px-3 py-2">
       <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-      <span className="grid min-w-0 flex-1">
-        <span className="truncate font-medium">{name}</span>
-        {item.enabled ? <span className="truncate text-meta text-muted-foreground">{item.roles.map((role) => roleLabels[role]).join("、") || "暂不使用"}{item.assistant && item.roles.includes("agent") ? " · 助手在用" : ""}</span> : null}
-      </span>
+      <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
       <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
-      <input type="checkbox" role="switch" className="switch" aria-label={`启用 ${name}`} checked={item.enabled} disabled={working}
-        onChange={(event) => void save("enabled", { enabled: event.target.checked })} />
+      <div className="flex shrink-0 gap-1">
+        <RoleToggle icon={terms.assistant.icon} label={terms.assistant.label} name={name} pressed={assistant} busy={busy === `${item.provider}:assistant`} disabled={busy !== ""}
+          onClick={() => { if (!(onboarding && assistant)) void change("assistant", { assistant: !assistant }) }} />
+        {item.supports.includes("execution") && !onboarding ? <RoleToggle icon={terms.task.icon} label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
+          onClick={() => void change("execution", { execution: !execution })} /> : null}
+      </div>
     </div>
-    {item.state === "needs_setup" && issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
+    {issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="font-medium text-foreground underline underline-offset-4" disabled={working}
-        onClick={() => void save("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
+        onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
         : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
-    </p> : null}
+    </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
+      <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
+      <span className="min-w-0 truncate">{check.label}</span>
+      <a className="shrink-0 font-medium underline underline-offset-4" href={docs + check.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
+    </li>)}</ul> : null}
     <details id={`provider-${item.provider}`} className="details border-t">
       <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
       <div className="grid gap-4 px-3 pb-3">
-        {item.app_server ? <AppServerSettings server={item.app_server} working={working || !item.enabled} busy={busy} save={save} test={test} /> : null}
-        {item.supports.length > 1 ? <fieldset disabled={working || !item.enabled} className="grid gap-2">
-          <legend className="mb-2 text-meta font-medium text-muted-foreground">用于</legend>
-          <div className="flex flex-wrap gap-2">
-            {item.supports.map((role) => {
-              const on = item.roles.includes(role)
-              return <Button key={role} type="button" variant={on ? "outline" : "ghost"} aria-pressed={on} disabled={on && item.roles.length === 1}
-                className={cn(on && "shadow-xs")} onClick={() => void save("roles", { roles: on ? item.roles.filter((r) => r !== role) : [...item.roles, role] })}>
-                {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}{roleLabels[role]}
-              </Button>
-            })}
-          </div>
-        </fieldset> : null}
+        {item.app_server ? <AppServerSettings server={item.app_server} working={working} busy={busy} save={change} test={test} /> : null}
 
-        {item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void save("bin", { bin: bin.trim() }) }}>
+        {item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
           <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
           <div className="flex min-w-0 gap-2">
             <Input id={`${item.provider}-bin`} className="min-w-0 font-mono" placeholder="codex" value={bin} disabled={working}
@@ -225,6 +245,9 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
             {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
           </div>
         </form> : null}
+
+        {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} fixBin={issue?.code === "bin_missing"} working={working}
+          busy={busy === `${item.provider}:assistant_details`} save={saveAssistant} /> : null}
 
         <div className="grid gap-2">
           <p className="text-meta font-medium text-muted-foreground">环境变量</p>
@@ -267,4 +290,51 @@ function ProviderCard({ item, busy, error, save, test }: { item: ProviderStatus;
     </details>
     {error ? <InlineError error={error} className="px-3 pb-3" /> : null}
   </li>
+}
+
+const assistantFields = ["model", "workspace", "cursor_sdk_bin", "node_bin", "codex_sdk_script"] as const
+
+/** The assistant's model, folder and programs, inside the settings of the provider it runs on. */
+function AssistantDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+  const [draft, setDraft] = useState(manager)
+  const cursor = manager.provider === "cursor_sdk"
+  const dirty = assistantFields.some((key) => draft[key] !== manager[key])
+  const field = (key: (typeof assistantFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) =>
+    <label className="grid gap-1 text-meta">{label}<Input name={key} className={cn(!extra.plain && "font-mono")} value={draft[key]} maxLength={key === "model" ? 256 : undefined} disabled={working}
+      placeholder={extra.placeholder} required={extra.required} data-fix={extra.fix ? "" : undefined} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>
+  return <form className="grid gap-3" onSubmit={(event) => {
+    event.preventDefault()
+    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim(), node_bin: draft.node_bin.trim(), codex_sdk_script: draft.codex_sdk_script.trim() })
+  }}>
+    <p className="text-meta font-medium text-muted-foreground">{terms.assistant.label}</p>
+    {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
+    {field("workspace", "助手工作文件夹")}
+    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : <>{field("node_bin", "Node.js")}{field("codex_sdk_script", "Codex 组件")}</>}
+    {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+  </form>
+}
+
+function Folders({ roots, busy, save }: { roots: string[]; busy: boolean; save(roots: string[]): void }) {
+  const [folder, setFolder] = useState("")
+  const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
+  return <div className="grid gap-2">
+    <p className="text-meta font-medium text-muted-foreground">{terms.folders.label}</p>
+    {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
+      <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      <FolderPath path={root} />
+      <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
+    </li>)}</ul> : null}
+    <div className="flex min-w-0 gap-2">
+      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="/Users/me/project" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
+    </div>
+  </div>
+}
+
+/** A long path gives up its parent folders first, so the folder's own name stays readable. */
+function FolderPath({ path }: { path: string }) {
+  const cut = path.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
+  return <span className="flex min-w-0 flex-1 font-mono text-meta" title={path}>
+    <span className="min-w-0 truncate text-muted-foreground">{path.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{path.slice(cut)}</span>
+  </span>
 }
