@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatWhen, lineDiff, placeChanges, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger } from "./bot-settings.ts"
+import { formatIn, formatWhen, lineDiff, placeChanges, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
 import { parseConversation } from "./model.ts"
 import type { BotChangeRecord } from "./types.ts"
 
@@ -22,6 +22,25 @@ test("dates read relative to today", () => {
   assert.equal(formatWhen(at(21, 9), at(20, 23)), "明天 09:00")
   assert.equal(formatWhen(at(25, 9), at(20, 8)), "10月25日 09:00")
   assert.equal(formatWhen(new Date(2027, 0, 2, 9).getTime(), at(20, 8)), "2027年1月2日 09:00")
+})
+
+test("next runs read as a short time from now", () => {
+  const now = at(20, 8)
+  assert.equal(formatIn(now - 1000, now), "马上")
+  assert.equal(formatIn(now + 30_000, now), "1 分钟后")
+  assert.equal(formatIn(now + 3 * 3_600_000, now), "3 小时后")
+  assert.equal(formatIn(now + 2 * 86_400_000, now), "2 天后")
+})
+
+test("schedules sort by next run with paused ones last", () => {
+  const rows = [
+    { id: "paused", enabled: false, next_run_at_ms: 1 },
+    { id: "later", enabled: true, next_run_at_ms: 300 },
+    { id: "none", enabled: true, next_run_at_ms: null },
+    { id: "soon", enabled: true, next_run_at_ms: 200 },
+    { id: "paused2", enabled: false, next_run_at_ms: null },
+  ]
+  assert.deepEqual(sortSchedules(rows).map((row) => row.id), ["soon", "later", "none", "paused", "paused2"])
 })
 
 test("line diff lists only removed and added lines in order", () => {
