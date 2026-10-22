@@ -40,7 +40,7 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     meta={nodeName(workspace.data?.local_node, lookup)}
     actions={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}>确认已停止</ActionButton>}
   >
-    <p>{checkReason(check)}相关程序还没退出，退出后会自动处理。如果你确认它已经停了，点“确认已停止”。</p>
+    <p>{checkReason(check)}相关程序还没退出，退出后会自动处理。</p>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
   const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }

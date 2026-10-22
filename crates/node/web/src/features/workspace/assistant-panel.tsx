@@ -24,11 +24,10 @@ export function AssistantPanelButton() {
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>
         <SheetHeader className="pr-14">
           <SheetTitle className="break-words">{bot.name}</SheetTitle>
-          <SheetDescription>在聊天里说一声就能改。</SheetDescription>
+          <SheetDescription>在聊天里说一声就能改</SheetDescription>
           {workspace.primary === bot.conversation_id
-            ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Star aria-hidden="true" className="size-3.5 fill-current" />主助手</p>
-            : <ActionButton className="justify-self-start" disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主助手</ActionButton>}
-          <p className="text-meta text-muted-foreground">没有助手负责的 Codex 会话，由主助手分派。</p>
+            ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主助手</p>
+            : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主助手</ActionButton>}
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <Section icon={ScrollText} title="说明">
@@ -58,6 +57,8 @@ export function AssistantPanelButton() {
     </Sheet>
   </>
 }
+
+const primaryHint = "没有助手负责的 Codex 会话，由主助手分派"
 
 function Section({ icon: Icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {
   return <section className="grid gap-3">

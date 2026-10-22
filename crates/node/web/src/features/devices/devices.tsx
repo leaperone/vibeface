@@ -47,9 +47,10 @@ function Tag({ children }: { children: ReactNode }) {
   return <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
 }
 
-function Online({ online }: { online: boolean }) {
-  return <span className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
-    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} />{online ? "在线" : "离线"}
+/** `compact`: the dot alone, for the list where every row would repeat the word. */
+function Online({ online, compact = false }: { online: boolean; compact?: boolean }) {
+  return <span title={compact ? (online ? "在线" : "离线") : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
+    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} /><span className={cn(compact && "sr-only")}>{online ? "在线" : "离线"}</span>
   </span>
 }
 
@@ -82,7 +83,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
           <span className="flex min-w-0 flex-1 items-center gap-2"><span className="truncate font-medium">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
           {row.assistant ? <Hint icon={Bot} label="能运行助手" /> : null}
           {row.admin ? <Hint icon={Crown} label="管理员" /> : null}
-          {row.online !== undefined ? <Online online={row.online} /> : null}
+          {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
@@ -146,9 +147,8 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       </div>}
     </Section> : null}
 
-    {row.kind === "node" && !copied ? <Section icon={ServiceIcon} title={terms.aiService.label}>
-      {row.entry && (canManage || localSession) ? <ProviderSettings update={assistantSaved} onChange={setProvidersSaved} />
-        : <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>}
+    {row.kind === "node" && !copied && row.entry && (canManage || localSession) ? <Section icon={ServiceIcon} title={terms.aiService.label}>
+      <ProviderSettings update={assistantSaved} onChange={setProvidersSaved} />
     </Section> : null}
 
     {row.entry ? <Section icon={Globe} title="访问地址">
@@ -158,7 +158,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <a className="font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
       </p> : null}
       {canManage || localSession ? <label className="flex min-h-11 items-center justify-between gap-3 border-t pt-3">
-        <span className="grid"><span>本机免确认打开</span><span className="text-meta text-muted-foreground">在这台电脑上打开时直接进入</span></span>
+        <span>本机免确认打开</span>
         <input type="checkbox" role="switch" className="switch" checked={device.localAutoAccess === true}
           disabled={action.busy !== null || device.localAutoAccess === null || localSession && !device.localAutoAccess}
           onChange={(event) => { const enabled = event.target.checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存") }} />

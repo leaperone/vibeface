@@ -51,7 +51,6 @@ export function RecoveryReview() {
   const toggle = (list: string[], id: string, on: boolean) => on ? [...list, id] : list.filter((item) => item !== id)
   return <section className="grid gap-4 rounded-xl border bg-card p-5">
     <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />哪台设备丢了？</h2>
-    <p className="text-muted-foreground">勾上丢了的设备，其余的都会保留。</p>
     <fieldset disabled={busy} className="grid gap-2">
       {review.members.map((member) => {
         const required = member.device_id === review.requiredNode
@@ -117,7 +116,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
     </section> : null}
     {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2>
-      <p className="text-meta text-muted-foreground">下载用新密码的恢复文件，旧文件不受影响</p>
+      <p className="text-meta text-muted-foreground">旧文件不受影响</p>
       <form className="grid gap-4" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
