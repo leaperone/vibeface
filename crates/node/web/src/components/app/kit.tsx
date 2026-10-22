@@ -114,11 +114,12 @@ let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
 export function dismissToast(id: number) { toasts = toasts.filter((item) => item.id !== id); emitToasts() }
-export function toast(text: string, options: { tone?: Tone; action?: ToastItem["action"] } = {}) {
+/** `persist`: stays until closed, for a message the person must act on. */
+export function toast(text: string, options: { tone?: Tone; action?: ToastItem["action"]; persist?: boolean } = {}) {
   const item = { id: ++toastId, text, tone: options.tone ?? "neutral", action: options.action }
   toasts = [...toasts, item].slice(-2)
   emitToasts()
-  setTimeout(() => dismissToast(item.id), item.action ? 8000 : 3000)
+  if (!options.persist) setTimeout(() => dismissToast(item.id), item.action ? 8000 : 3000)
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 
@@ -131,7 +132,7 @@ export function Toaster() {
         <Icon aria-hidden="true" className={cn("size-4 shrink-0", toneText[item.tone])} />
         <span className="min-w-0 flex-1 text-meta">{item.text}</span>
         {item.action ? <Button type="button" size="sm" variant="ghost" onClick={() => { item.action?.onClick(); dismissToast(item.id) }}>{item.action.label}</Button> : null}
-        <button type="button" aria-label="关闭" className="text-muted-foreground" onClick={() => dismissToast(item.id)}><X aria-hidden="true" className="size-4" /></button>
+        <button type="button" aria-label="关闭" className="-my-1.5 -me-2 grid size-9 shrink-0 place-items-center rounded-md text-muted-foreground hover:text-foreground" onClick={() => dismissToast(item.id)}><X aria-hidden="true" className="size-4" /></button>
       </div>
     })}
   </div>

@@ -61,9 +61,9 @@ export function RecoveryReview() {
             <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             <span className="min-w-0 flex-1 truncate">{member.name}</span>
             {required ? <span className="text-meta text-muted-foreground">当前连接</span>
-              : <label className="flex items-center gap-1.5 text-meta"><input type="checkbox" checked={lost.includes(member.device_id)} onChange={(event) => setLost(toggle(lost, member.device_id, event.target.checked))} />丢了</label>}
+              : <label className="-me-2 flex min-h-11 items-center gap-2 px-2 text-meta"><input type="checkbox" className="size-4" checked={lost.includes(member.device_id)} onChange={(event) => setLost(toggle(lost, member.device_id, event.target.checked))} />丢了</label>}
           </div>
-          {member.kind === 'client' && !lost.includes(member.device_id) ? <label className="flex items-center gap-1.5 ps-6 text-meta text-muted-foreground"><input type="checkbox" checked={managers.includes(member.device_id)} onChange={(event) => setAdmins(toggle(managers, member.device_id, event.target.checked))} />管理员</label> : null}
+          {member.kind === 'client' && !lost.includes(member.device_id) ? <label className="flex min-h-11 w-fit items-center gap-2 ps-6 pe-2 text-meta text-muted-foreground"><input type="checkbox" className="size-4" checked={managers.includes(member.device_id)} onChange={(event) => setAdmins(toggle(managers, member.device_id, event.target.checked))} />管理员</label> : null}
         </div>
       })}
     </fieldset>
@@ -75,7 +75,7 @@ export function RecoveryReview() {
         await device.confirmRecovery(review.members
           .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
           .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) })))
-        toast('已恢复。旧恢复文件已失效，请保存新文件', { tone: 'success' })
+        toast('已恢复。旧恢复文件已失效，请保存刚下载的新文件', { tone: 'warning', persist: true })
       })}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}

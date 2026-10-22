@@ -47,7 +47,7 @@ function SettingsPage() {
       <Button asChild variant="outline" className="h-auto justify-start gap-3 py-3 max-md:h-auto">
         <Link to="/settings/logs"><ScrollText aria-hidden="true" /><span className="flex-1 text-left">日志</span><ChevronRight aria-hidden="true" className="text-muted-foreground" /></Link>
       </Button>
-      <p className="text-meta text-muted-foreground">诊断包不含密钥和邀请</p>
+      <p className="text-meta text-muted-foreground">诊断包不含登录信息和加入链接</p>
       <div className="flex flex-wrap items-center gap-2">
         <NativeSelect aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))} className="[&_select]:h-9 max-md:[&_select]:h-11">
           {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
