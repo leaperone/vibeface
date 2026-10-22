@@ -152,6 +152,11 @@ impl Runtime {
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
             Tool::BindWork => self.bind_work(network, &scope, &args).await,
+            // The wait holds neither the invocation's admission nor maintenance.
+            Tool::WaitCodex => {
+                drop((_lease, _work));
+                Ok(json!({"connected": self.codex.ready().await}))
+            }
             // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
             Tool::DispatchWork => {
                 let socket = self.codex.socket();
@@ -160,6 +165,9 @@ impl Runtime {
                     &args,
                     |args| async move { self.track_work(access, scope, &args).await },
                     |args| async move { self.bind_work(network, scope, &args).await },
+                    || async {
+                        self.codex.ready().await;
+                    },
                     &socket,
                 )
                 .await

@@ -19,6 +19,7 @@ pub enum Tool {
     ReadSkill,
     TrackWork,
     BindWork,
+    WaitCodex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub enum Effect {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 14] = [
+    pub const ALL: [Tool; 15] = [
         Tool::Nodes,
         Tool::Context,
         Tool::DispatchWork,
@@ -46,6 +47,7 @@ impl Tool {
         Tool::ReadSkill,
         Tool::TrackWork,
         Tool::BindWork,
+        Tool::WaitCodex,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -68,14 +70,18 @@ impl Tool {
             Tool::ReadSkill => "read_skill",
             Tool::TrackWork => "track_work",
             Tool::BindWork => "bind_work",
+            Tool::WaitCodex => "wait_codex",
         }
     }
 
     pub fn effect(self) -> Effect {
         match self {
-            Tool::Nodes | Tool::Context | Tool::WorkStatus | Tool::CallLookup | Tool::ReadSkill => {
-                Effect::Read
-            }
+            Tool::Nodes
+            | Tool::Context
+            | Tool::WorkStatus
+            | Tool::CallLookup
+            | Tool::ReadSkill
+            | Tool::WaitCodex => Effect::Read,
             Tool::DispatchWork | Tool::InterruptWork | Tool::TrackWork | Tool::BindWork => {
                 Effect::Work
             }
@@ -87,8 +93,8 @@ impl Tool {
         }
     }
 
-    /// Description, properties and required fields the agent sees. `track_work` and `bind_work`
-    /// are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
+    /// Description, properties and required fields the agent sees. `track_work`, `bind_work` and
+    /// `wait_codex` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
     pub fn schema(self) -> Option<(&'static str, Value, &'static [&'static str])> {
         let string = || json!({"type":"string","minLength":1});
         Some(match self {
@@ -168,7 +174,7 @@ impl Tool {
                 json!({"skill_id":string()}),
                 &["skill_id"],
             ),
-            Tool::TrackWork | Tool::BindWork => return None,
+            Tool::TrackWork | Tool::BindWork | Tool::WaitCodex => return None,
         })
     }
 

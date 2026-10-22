@@ -104,7 +104,12 @@ impl CodexServer {
 pub(crate) struct CodexServer {
     client: CodexClient,
     inner: Arc<Inner>,
+    /// Wakes sends waiting for the client to connect.
+    connected: tokio::sync::Notify,
 }
+
+/// How long a send waits for the App Server, as right after the Node starts, before it is refused.
+const READY_WAIT: Duration = Duration::from_secs(20);
 
 struct Inner {
     client: CodexClient,
@@ -542,11 +547,34 @@ impl CodexServer {
         Ok(Self {
             client,
             inner: Arc::new(inner),
+            connected: tokio::sync::Notify::new(),
         })
     }
 
     pub(super) fn start(&self) {
         tokio::spawn(self.inner.clone().supervise());
+    }
+
+    pub(super) fn connected(&self) {
+        self.connected.notify_waiters();
+    }
+
+    /// Whether the client is connected, waiting up to `READY_WAIT` while the supervisor and the
+    /// client's backoff bring it up. With Codex turned off it does not wait.
+    pub(crate) async fn ready(&self) -> bool {
+        if *self.inner.target.lock().expect("target lock") == CodexTarget::Off {
+            return false;
+        }
+        let up = async {
+            loop {
+                let connected = self.connected.notified();
+                if self.client.status().await["connection"]["state"] == "connected" {
+                    return;
+                }
+                connected.await;
+            }
+        };
+        tokio::time::timeout(READY_WAIT, up).await.is_ok()
     }
 
     /// The socket the coordination Agent connects to; it follows the App Server in use.

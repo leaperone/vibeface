@@ -847,6 +847,7 @@ impl Runtime {
                         node.on_codex_request(&event["params"]).await;
                         continue;
                     }
+                    Some("bridge.codex_connected") => node.codex.connected(),
                     Some("bridge.codex_disconnected") => node.drop_codex_requests(),
                     _ => {}
                 }

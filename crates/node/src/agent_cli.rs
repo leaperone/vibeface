@@ -10,18 +10,29 @@ use vibeface_protocol::now_ms;
 /// with `clientUserMessageId` = work ID and binds the result. Without `thread` the work starts a
 /// turn in a new thread (or the one it continues); with `thread` it goes into that existing
 /// thread, steering its running turn or starting one, and the thread's directory is read first.
-/// Only the registration that created the work sends, and only inside its window.
-pub async fn dispatch<T, TF, B, BF>(args: &Value, track: T, bind: B, socket: &Path) -> Result<Value>
+/// Only the registration that created the work sends, and only inside its window. Each connect
+/// first waits on `ready` for the Node's own App Server connection, so a send right after the
+/// Node starts is not refused while the App Server comes up.
+pub async fn dispatch<T, TF, B, BF, R, RF>(
+    args: &Value,
+    track: T,
+    bind: B,
+    ready: R,
+    socket: &Path,
+) -> Result<Value>
 where
     T: FnOnce(Value) -> TF,
     TF: Future<Output = Result<Value>>,
     B: Fn(Value) -> BF,
     BF: Future<Output = Result<Value>>,
+    R: Fn() -> RF,
+    RF: Future<Output = ()>,
 {
     let mut args = args.clone();
     let existing = args["thread"].as_str().map(str::to_owned);
     // A send reads its thread before registering, so a missing thread leaves nothing behind.
     if let Some(thread) = &existing {
+        ready().await;
         let mut session = DirectSession::connect(socket)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -53,6 +64,7 @@ where
         .context("the Node returned no work ID")?
         .to_owned();
     let fail = |reason: String| bind(json!({"work_id":work_id,"failed":reason}));
+    ready().await;
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
         Err(error) => return fail(error.message).await,
