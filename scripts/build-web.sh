@@ -10,7 +10,7 @@ if ! command -v pnpm >/dev/null; then
   echo 'pnpm 11.9.0 is required to build the web client.' >&2
   exit 1
 fi
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --filter "vibeface-web..."
 pnpm run generate-routes
 pnpm run test
 pnpm run typecheck
