@@ -21,7 +21,7 @@ import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { backTo } from "./home"
 import { addressName } from "./labels"
-import { NotJoined } from "./not-joined"
+import { LocalSession } from "./local-session"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
@@ -152,7 +152,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label="设置" title="设置"><Settings aria-hidden="true" /></Link></Button>
           </div>}
         </header>
-        {workspace.joined ? null : <NotJoined onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
+        {workspace.joined ? null : <LocalSession onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>

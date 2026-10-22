@@ -571,6 +571,32 @@ test('the launcher fragment is cleared before its token is exchanged for the bro
   } finally { app.close() }
 })
 
+test('a launch link on the localhost page sends an unjoined browser on to the launcher origin', async () => {
+  const app = deviceHarness({ local: 'initialized', fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.calls.includes('local-exchange'), false)
+    assert.equal(app.navigations.length, 1)
+    const opened = new URL(app.navigations[0])
+    assert.equal(opened.origin, localLaunch.url)
+    assert.equal(new URLSearchParams(opened.hash.slice(1)).get('local'), localLaunch.token)
+  } finally { app.close() }
+})
+
+test('a launch link on the localhost page keeps a browser already joined there', async () => {
+  const storage = new Map([['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])
+  const app = deviceHarness({ local: 'initialized', storage, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.location.hash, '')
+    assert.equal(app.calls.includes('local-info'), false)
+    assert.equal(app.calls.includes('local-exchange'), false)
+    assert.equal(app.navigations.length, 0)
+  } finally { app.close() }
+})
+
 test('revoking local access in another tab stops reconnecting the revoked cookie', async () => {
   const app = deviceHarness({ localSession: true })
   try {

@@ -825,9 +825,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (version !== generation.current) return
       // A browser that was in its network resumes it; the join page must not flash in between.
       setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
+      // A launch link opens the localhost page; a browser already joined there keeps that identity instead.
+      const launch = invitation || resumeTargets().length ? null : localLaunch
       // Only the local launcher's origin serves /api/local/info; a browser learns it is on one from a launch link.
-      if (!invitation && (localLaunch || load('local-origin') === true)) {
-        const local = await localBrowserEntry(me, localLaunch)
+      if (!invitation && (launch || load('local-origin') === true)) {
+        const local = await localBrowserEntry(me, launch)
         if (!mounted || version !== generation.current) return
         // Kept while the Node is down, so the next load on this origin still asks it.
         if (local) { store('local-origin', true); const opening = connect(local); version = generation.current; await opening; return }
@@ -845,6 +847,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         catch (cause) { if (mounted && version === generation.current) setError(messageOf(cause)) }
         if (!mounted || version !== generation.current) return
         setLocalSetup(local)
+        if (launch && local?.kind === 'initialized' && local.local_launch) { launchLocal(local); return }
         if (local?.kind === 'uninitialized') { setPhase('disconnected'); return }
         if (local?.kind === 'initialized') {
           const opening = connect(local.entry); version = generation.current

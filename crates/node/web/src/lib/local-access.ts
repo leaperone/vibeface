@@ -15,7 +15,8 @@ export async function localBrowserEntry(own: PublicIdentity, launch: LocalLaunch
     if (launch) throw new Error('连不上这台电脑。请确认 Vibeface 正在运行。')
     return null
   }
-  if (!response.ok && !launch) return null
+  // Only the launcher origin serves this; elsewhere the caller sends a launch on to it.
+  if (response.status === 404 || !response.ok && !launch) return null
   const info = record(await localResponse(response))
   const entry = parseEntry(info.entry)
   if (entry.local !== true || entry.address !== location.origin) throw new Error('本机链接和当前网页对不上。')
