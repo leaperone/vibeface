@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
@@ -11,6 +11,12 @@ import type { ChatMessage, Connection, Conversation, Member, Session, Workspace,
 const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
 const empty = { bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
 const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
+
+type Shared = ReturnType<typeof useShared>
+const SharedContext = createContext<Shared | null>(null)
+
+/** The shared workspace while a member connection is up, for screens that call its actions directly; null before that. */
+export const useLive = () => useContext(SharedContext)
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */
 export function LiveWorkspace({ children }: { children: ReactNode }) {
@@ -130,5 +136,5 @@ function Live({ children }: { children: ReactNode }) {
   const value: Workspace = {
     session, connection, bots: shared.bots, primary: shared.primary, unread, questions, members, conversations, actions,
   }
-  return <WorkspaceProvider value={value}>{children}</WorkspaceProvider>
+  return <SharedContext.Provider value={shared}><WorkspaceProvider value={value}>{children}</WorkspaceProvider></SharedContext.Provider>
 }

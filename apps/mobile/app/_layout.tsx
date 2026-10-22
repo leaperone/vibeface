@@ -39,6 +39,10 @@ function Screens() {
       <Stack.Protected guard={ready}>
         <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true }} />
         <Stack.Screen name="b/[botId]" options={{ title: '' }} />
+        <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
+        <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
+        <Stack.Screen name="new-bot" options={{ title: '新建 bot', presentation: 'modal' }} />
+        <Stack.Screen name="ai" options={{ title: 'AI' }} />
         <Stack.Screen name="inbox" options={{ title: '待处理' }} />
         <Stack.Screen name="settings" options={{ title: '设置' }} />
         <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
