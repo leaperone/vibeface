@@ -1,6 +1,6 @@
 //! Incremental projections. Each event updates its rows once, as it is stored; every rule is
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
-//! Assistant settings, skills and routines keep the last change by rank; a removal is a `NULL`
+//! Assistant settings, skills, schedules and notes keep the last change by rank; a removal is a `NULL`
 //! row, so an older change arriving later cannot bring it back.
 use crate::model::*;
 use anyhow::Result;
@@ -48,13 +48,14 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 12] = [
+pub(crate) const TABLES: [&str; 13] = [
     "conversations",
     "messages",
     "bots",
     "assistant_profiles",
     "skills",
-    "routines",
+    "schedules",
+    "memories",
     "assistant_changes",
     "works",
     "notifications",
@@ -122,11 +123,12 @@ pub(crate) fn apply(
             name,
             instructions,
             project,
+            cause,
             ..
         } => {
             connection.execute(
-                "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,project,event_hash,rank) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET bot_id=excluded.bot_id,name=excluded.name,instructions=excluded.instructions,project=excluded.project,event_hash=excluded.event_hash,rank=excluded.rank WHERE excluded.rank<rank",
-                params![network, scope, bot_id, name, instructions, project.as_ref().map(serde_json::to_string).transpose()?, hash, rank],
+                "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,project,event_hash,rank,cause) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET bot_id=excluded.bot_id,name=excluded.name,instructions=excluded.instructions,project=excluded.project,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause WHERE excluded.rank<rank",
+                params![network, scope, bot_id, name, instructions, project.as_ref().map(serde_json::to_string).transpose()?, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?],
             )?;
         }
         EventBody::MessagePosted {
@@ -290,7 +292,7 @@ pub(crate) fn apply(
         } => {
             connection.execute(
                 "INSERT INTO assistant_changes(network_id,change_id,conversation_id,event_hash,rank,cause,change,created_at_ms) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,change_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause,change=excluded.change,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
-                params![network, change_id, scope, hash, rank, cause, serde_json::to_string(change)?, event.created_at_ms],
+                params![network, change_id, scope, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?, serde_json::to_string(change)?, event.created_at_ms],
             )?;
             match change {
                 AssistantChange::Profile { name, instructions } => {
@@ -310,19 +312,118 @@ pub(crate) fn apply(
                         params![network, skill_id, after.as_ref().map(serde_json::to_string).transpose()?, rank],
                     )?;
                 }
-                AssistantChange::Routine {
-                    routine_id, after, ..
+                AssistantChange::Schedule {
+                    schedule_id,
+                    after: Some(after),
+                    ..
                 } => {
                     connection.execute(
-                        "INSERT INTO routines(network_id,routine_id,conversation_id,routine,rank,changed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,routine_id) DO UPDATE SET conversation_id=excluded.conversation_id,routine=excluded.routine,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE excluded.rank>rank",
-                        params![network, routine_id, scope, after.as_ref().map(serde_json::to_string).transpose()?, rank, event.created_at_ms],
+                        "INSERT INTO schedules(network_id,schedule_id,conversation_id,schedule,rank,changed_at_ms,enabled,enabled_rank,enabled_at_ms,removed) VALUES(?1,?2,?3,?4,?5,?6,?7,?5,?6,0) ON CONFLICT(network_id,schedule_id) DO UPDATE SET schedule=excluded.schedule,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE removed=0 AND conversation_id=excluded.conversation_id AND excluded.rank>rank",
+                        params![network, schedule_id, scope, serde_json::to_string(after)?, rank, event.created_at_ms, after.enabled],
+                    )?;
+                    set_schedule_enabled(
+                        connection,
+                        network,
+                        schedule_id,
+                        scope,
+                        after.enabled,
+                        rank,
+                        event.created_at_ms,
+                    )?;
+                }
+                AssistantChange::Schedule {
+                    schedule_id,
+                    after: None,
+                    ..
+                } => remove_schedule(
+                    connection,
+                    network,
+                    schedule_id,
+                    scope,
+                    rank,
+                    event.created_at_ms,
+                )?,
+                AssistantChange::Memory {
+                    memory_id, after, ..
+                } => {
+                    connection.execute(
+                        "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,memory_id) DO UPDATE SET text=excluded.text,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE conversation_id=excluded.conversation_id AND excluded.rank>rank",
+                        params![network, memory_id, scope, after, rank, event.created_at_ms],
                     )?;
                 }
             }
         }
+        EventBody::ScheduleControlled {
+            schedule_id,
+            action,
+            ..
+        } => match action {
+            ScheduleAction::Pause | ScheduleAction::Resume => set_schedule_enabled(
+                connection,
+                network,
+                schedule_id,
+                scope,
+                *action == ScheduleAction::Resume,
+                rank,
+                event.created_at_ms,
+            )?,
+            ScheduleAction::Delete => remove_schedule(
+                connection,
+                network,
+                schedule_id,
+                scope,
+                rank,
+                event.created_at_ms,
+            )?,
+        },
+        EventBody::BotMessaged {
+            message_id,
+            from,
+            text: body,
+            ..
+        } => {
+            connection.execute(
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,blobs,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
+                params![network, scope, message_id, hash, rank, event.author, text(Role::Bot)?, body, event.created_at_ms, serde_json::to_string(from)?],
+            )?;
+        }
         // Read from the log by rank; see `store::bots::primary_assistant_from`.
         EventBody::ContextCheckpoint { .. } | EventBody::PrimaryAssistantSet { .. } => {}
     }
+    Ok(())
+}
+
+/// A schedule's pause state wins by its own rank, apart from its definition, so a pause and an
+/// edit that crossed converge in any order.
+fn set_schedule_enabled(
+    connection: &Connection,
+    network: &str,
+    schedule_id: &str,
+    scope: &str,
+    enabled: bool,
+    rank: &str,
+    at: i64,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE schedules SET enabled=?,enabled_rank=?,enabled_at_ms=? WHERE network_id=? AND schedule_id=? AND conversation_id=? AND removed=0 AND ?2>enabled_rank",
+        params![enabled, rank, at, network, schedule_id, scope],
+    )?;
+    Ok(())
+}
+
+/// Removal is final: no change of any rank brings a schedule back.
+fn remove_schedule(
+    connection: &Connection,
+    network: &str,
+    schedule_id: &str,
+    scope: &str,
+    rank: &str,
+    at: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO schedules(network_id,schedule_id,conversation_id,schedule,rank,changed_at_ms,enabled,enabled_rank,enabled_at_ms,removed) VALUES(?1,?2,?3,NULL,?4,?5,0,?4,?5,1) ON CONFLICT(network_id,schedule_id) DO UPDATE SET schedule=NULL,removed=1 WHERE conversation_id=excluded.conversation_id",
+        params![network, schedule_id, scope, rank, at],
+    )?;
     Ok(())
 }
 

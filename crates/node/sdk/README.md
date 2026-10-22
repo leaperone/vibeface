@@ -80,8 +80,11 @@ Calls pass every supplied `tool_env` entry to the child and shell, including
 Provider credential variables stay outside the shell list. Cursor SDK receives
 the same tool environment in its actual bridge process and its default host
 toolset.
-The sidecar disables child-agent features, web search, apps, plugins, apply
-patch, and host skill discovery.
+The sidecar turns on live web search (`web_search="live"`, `webSearchMode`
+`live`) and disables child-agent features, apps, plugins, apply patch, and host
+skill discovery. Reading a page goes through the Node's `fetch_url` tool, which
+reaches only public addresses; the Cursor SDK path has `fetch_url` too and keeps
+its own default toolset for search.
 
 `vibeface tool dispatch_work --json '{"prompt":"...","cwd":"..."}' --call-ref REF`
 registers the work with the Node, then the CLI itself starts one Codex turn in

@@ -12,7 +12,7 @@ import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
 import type { AssistantChangeRecord, ManagerJob, SessionHandoff, WorkRecord } from '@/features/workspace/types'
-import { placeChanges, routineName, routineTrigger } from '@/features/workspace/assistant'
+import { placeChanges, scheduleName, scheduleTrigger } from '@/features/workspace/assistant'
 import { pendingChecks } from '@/features/workspace/model'
 import { agentName, foldAnswers, placeByTime, projectName } from '@/features/workspace/questions'
 import { ChangeCard } from './change-card'
@@ -69,7 +69,7 @@ export function ConversationScreen() {
   // What a turn changed in the assistant shows after its reply, or after the message while no reply exists.
   const changes = data?.changes ?? []
   const placedChanges = placeChanges(data?.messages ?? [], changes)
-  const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={data?.assistant?.routines ?? []} /> })
+  const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.assistant?.schedules ?? []} /> })
 
   // Questions and hand-offs sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
@@ -83,10 +83,10 @@ export function ConversationScreen() {
   const entries: ChatEntry[] = []
   for (const message of data?.messages ?? []) {
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
-    const routine = message.role === 'user' ? null : routineTrigger(message.in_reply_to)
-    if (routine) {
-      // A routine run has no message of the person; its reply stands alone and the tasks it started follow it.
-      entries.push({ key: message.message_id, message, routine: routineName(routine, data?.assistant, changes) })
+    const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
+    if (schedule) {
+      // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
+      entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.assistant, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
     const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.error

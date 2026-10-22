@@ -295,6 +295,23 @@ impl Store {
                         state: "not_reported".into(),
                     })
             }
+            Some(("bot_message", message_id)) => {
+                let Some(message) = message_from(&tx, network, conversation, message_id)? else {
+                    return Ok(None);
+                };
+                ensure!(
+                    message.role == Role::Bot,
+                    "only bot messages are delivered as bot message turns"
+                );
+                admit_from(
+                    &tx,
+                    network,
+                    conversation,
+                    trigger,
+                    TriggerKind::BotMessage,
+                    message_id,
+                )?
+            }
             // A routing turn follows its conversation to a new owner.
             Some(("route", question)) => {
                 if super::questions::question_from(&tx, network, question)?.is_none() {
@@ -309,7 +326,9 @@ impl Store {
                     question,
                 )?
             }
-            _ => anyhow::bail!("only user messages, work results and routing turns are delivered"),
+            _ => anyhow::bail!(
+                "only user and assistant messages, work results and routing turns are delivered"
+            ),
         };
         tx.commit()?;
         Ok(Some(receipt))

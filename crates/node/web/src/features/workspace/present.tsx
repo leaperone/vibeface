@@ -30,6 +30,7 @@ export function ActionButton({
   children,
   className,
   title,
+  label,
   variant = "secondary",
   disabled,
   action,
@@ -37,6 +38,8 @@ export function ActionButton({
   children: ReactNode
   className?: string
   title?: string
+  /** Makes it an icon button: `children` is the icon, `label` its accessible name and tooltip. */
+  label?: string
   variant?: "default" | "secondary" | "ghost" | "destructive"
   disabled?: boolean
   action: () => Promise<void>
@@ -51,7 +54,9 @@ export function ActionButton({
       type="button"
       variant={variant}
       className={className}
-      title={title}
+      size={label ? "icon" : undefined}
+      title={title ?? label}
+      aria-label={label}
       disabled={disabled || busy}
       aria-busy={busy}
       onClick={() => {
@@ -63,7 +68,7 @@ export function ActionButton({
       }}
     >
       {busy ? <Spinner /> : null}
-      {children}
+      {busy && label ? null : children}
     </Button>
     <InlineError error={failure} />
     </span>

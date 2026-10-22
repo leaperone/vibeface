@@ -1606,6 +1606,7 @@ mod tests {
                 scheduler_node: local.clone(),
                 epoch: 1,
                 attestation: None,
+                cause: None,
             },
         )?;
         let owner = crate::model::FirstOwner {
@@ -1621,6 +1622,7 @@ mod tests {
                 instructions: String::new(),
                 project: None,
                 attestation: None,
+                cause: None,
             },
         )?;
         let mut store = node.store.lock().await;

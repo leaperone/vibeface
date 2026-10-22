@@ -87,6 +87,30 @@ impl Runtime {
         Ok(json!({"bots":bots,"primary":store.primary_assistant(&access.network_id)?}))
     }
 
+    /// The user pauses, resumes or deletes a schedule; the scheduler reads the projection, so a
+    /// paused one is not queued and a queued run is cancelled when claimed.
+    pub(super) async fn control_schedule(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user pauses or deletes a schedule");
+        let scope = id(input, "conversation_id")?;
+        let schedule_id = id(input, "schedule_id")?;
+        let action: ScheduleAction = serde_json::from_value(input["action"].clone())
+            .context("action is pause, resume or delete")?;
+        let written = self.store.lock().await.control_schedule(
+            &self.identity,
+            &access.network_id,
+            &scope,
+            &schedule_id,
+            action,
+            attestation(input)?,
+            now_ms(),
+        )?;
+        if let Some(hash) = &written {
+            self.publish_changed(&access.network_id, &scope, Changed::Event(hash));
+            self.schedule_wakeup.notify_one();
+        }
+        Ok(json!({"written":written.is_some()}))
+    }
+
     /// The user's choice of the assistant that judges what comes in without an owner.
     pub(super) async fn set_primary_assistant(
         &self,
@@ -125,7 +149,11 @@ impl Runtime {
         Ok(json!({"primary":self.store.lock().await.primary_assistant(&access.network_id)?}))
     }
 
-    async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {
+    pub(super) async fn validate_bot_project(
+        &self,
+        network: &str,
+        project: &BotProject,
+    ) -> Result<()> {
         self.store
             .lock()
             .await

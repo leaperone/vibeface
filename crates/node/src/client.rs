@@ -2597,7 +2597,7 @@ mod tests {
             let conversation = uuid::Uuid::new_v4().to_string();
             let network = node.membership_state().await?.genesis.network_id;
             let owner = browser.attest(&network, &conversation, crate::model::EventBody::ConversationOwner {
-                scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None })?;
+                scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None, cause: None })?;
             let created = local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser",
                 "scheduler_node":node.identity.device_id()?,"owner_attestation":owner.attestation()})).await;
             assert!(created.is_err(), "a local session's key is not a member's signature");

@@ -50,7 +50,7 @@ const patterns: [RegExp, string][] = [
   [/answer every question|answers? (is|are) (missing|required)|answers must be text/i, '请回答每个问题后再提交。'],
   [/message ID reused|work ID reused|conversation ID already exists/i, '这个编号已用于不同的内容，没有重复提交。'],
   [/send window for this work is over/i, '这个任务等得太久，没有开始。需要的话请再发一次。'],
-  [/routine this work runs for is paused|the routine was deleted/i, '这个定时任务已暂停或删除。'],
+  [/schedule this work runs for is paused|the schedule was deleted/i, '这个定时任务已暂停或删除。'],
   [/has no assistant to take the task/i, '那台设备还没设置助手。'],
   [/has not reached this device|not stored on this device|not on this device|not found on this device/i, '内容还没同步到这台设备，稍后再试。'],
   [/not reached the scheduling Node/i, '消息还没送到负责这个对话的设备，送到后会自动排队。'],

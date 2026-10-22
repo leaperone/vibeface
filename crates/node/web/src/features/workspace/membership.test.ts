@@ -16,7 +16,7 @@ const question = {
 }
 const conversation = {
   conversation: { conversation_id: conversationId, title: '', owner: entry, owner_epoch: 1 }, messages: [], works: [], deliveries: [], scheduler: null,
-  checks: [], local_node: entry, changes: [], assistant: { skills: [], routines: [] }, questions: [question], sessions: [],
+  checks: [], local_node: entry, changes: [], assistant: { skills: [], schedules: [], memory: [] }, questions: [question], sessions: [],
 }
 const notMember = 'device is not a member of this personal network'
 const settle = () => new Promise(setImmediate)

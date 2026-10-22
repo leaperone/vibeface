@@ -39,6 +39,27 @@ fn exists(connection: &Connection, table: &str, network: &str, hash: &str) -> Re
         .is_some())
 }
 
+/// A stored event, by hash.
+pub(crate) fn event_from(
+    connection: &Connection,
+    network: &str,
+    hash: &str,
+) -> Result<Option<Event>> {
+    let envelope: Option<String> = connection
+        .query_row(
+            "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+            params![network, hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    envelope
+        .map(|envelope| {
+            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+            Ok(serde_json::from_str(&envelope.canonical_body)?)
+        })
+        .transpose()
+}
+
 pub(crate) fn scope_has_events(
     connection: &Connection,
     network: &str,
@@ -203,7 +224,7 @@ fn place(
             return pending(connection, network, envelope, event, dep);
         }
     }
-    if let Err(error) = authorize_change(connection, network, event) {
+    if let Err(error) = authorize_cause(connection, network, event) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
     let main = match &event.prev {
@@ -218,34 +239,70 @@ fn place(
     })
 }
 
-/// The user's device signature on `cause` is what authorizes an assistant change, so one of its
-/// stored parents must be that signed user message in the same conversation.
-fn authorize_change(connection: &Connection, network: &str, event: &Event) -> Result<()> {
-    let EventBody::AssistantChanged { cause, .. } = &event.body else {
-        return Ok(());
+/// The user's device signature on `cause` is what authorizes a write a bot makes for the user:
+/// an assistant change, or a bot it creates. One of the event's stored parents must be that
+/// signed user message. The one change without a cause is a new one-shot schedule: a reminder
+/// the assistant sets itself.
+fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    let cause = match &event.body {
+        EventBody::AssistantChanged {
+            cause: None,
+            change,
+            ..
+        } => {
+            ensure!(
+                matches!(
+                    change,
+                    AssistantChange::Schedule {
+                        before: None,
+                        after: Some(Schedule {
+                            every_minutes: None,
+                            depth: 1..,
+                            ..
+                        }),
+                        ..
+                    }
+                ),
+                "only a new one-time reminder may change an assistant without the user's message"
+            );
+            return Ok(());
+        }
+        EventBody::AssistantChanged {
+            cause: Some(cause), ..
+        }
+        | EventBody::BotCreated {
+            cause: Some(cause), ..
+        }
+        | EventBody::ConversationOwner {
+            cause: Some(cause), ..
+        } => cause,
+        _ => return Ok(()),
     };
+    // A cause makes only a conversation its author just created, never an existing one.
+    if let EventBody::ConversationOwner { .. } = &event.body {
+        let created = match &event.prev {
+            Some(prev) => event_from(connection, network, prev)?,
+            None => None,
+        };
+        ensure!(
+            created.is_some_and(|created| created.scope_id == event.scope_id
+                && matches!(created.body, EventBody::ConversationCreated { .. })),
+            "a created bot's first owner follows its creation"
+        );
+    }
     for parent in event.prev.iter().chain(&event.deps) {
-        let Some(envelope) = connection
-            .query_row(
-                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
-                params![network, parent],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        else {
+        let Some(parent) = event_from(connection, network, parent)? else {
             continue;
         };
-        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
-        let parent: Event = serde_json::from_str(&envelope.canonical_body)?;
-        if parent.scope_id == event.scope_id
+        if parent.scope_id == cause.conversation_id
             && matches!(&parent.body, EventBody::MessagePosted {
                 message_id, role: Role::User, answers: None, attestation: Some(_), ..
-            } if message_id == cause)
+            } if *message_id == cause.message_id)
         {
             return Ok(());
         }
     }
-    bail!("an assistant change must follow the user's own signed message in this conversation")
+    bail!("a bot's write for the user must follow the user's own signed message")
 }
 
 fn has_forks(connection: &Connection, network: &str, author: &str) -> Result<bool> {
@@ -479,9 +536,23 @@ pub(crate) fn append_from(
         }
     }
     let prev = (max > 0).then_some(head_hash);
-    if let EventBody::AssistantChanged { cause, .. } = &body {
-        let message = super::message_from(connection, network, scope, cause)?
-            .context("the user's message is not stored on this device")?;
+    if let EventBody::AssistantChanged {
+        cause: Some(cause), ..
+    }
+    | EventBody::BotCreated {
+        cause: Some(cause), ..
+    }
+    | EventBody::ConversationOwner {
+        cause: Some(cause), ..
+    } = &body
+    {
+        let message = super::message_from(
+            connection,
+            network,
+            &cause.conversation_id,
+            &cause.message_id,
+        )?
+        .context("the user's message is not stored on this device")?;
         if prev.as_ref() != Some(&message.event_hash) {
             deps.push(message.event_hash);
         }
@@ -499,7 +570,7 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
-    authorize_change(connection, network, &event)?;
+    authorize_cause(connection, network, &event)?;
     ensure!(
         insert_event(connection, &view, &envelope, &event, true)?,
         "this Node's log has forked and it no longer writes"

@@ -12,13 +12,17 @@ import { Message, type ChatMessage } from './message'
 
 /** One row of the conversation: a message bubble, or a task, change, question or hand-off row between them. */
 export type ChatEntry =
-  | { key: string; anchor?: boolean; message: ChatMessage; routine?: string }
+  | { key: string; anchor?: boolean; message: ChatMessage; schedule?: string }
   | { key: string; anchor?: undefined; node: ReactNode }
 
-type Sender = 'user' | 'assistant'
-const sender = (entry: ChatEntry | undefined): Sender | null => entry && 'message' in entry ? (entry.message.role === 'user' ? 'user' : 'assistant') : null
-/** A routine run's reply stands alone, so it always opens a group. The time shows once, at the end of a group. */
-const continues = (entry: ChatEntry, previous: ChatEntry | undefined) => !('routine' in entry && entry.routine) && sender(entry) !== null && sender(entry) === sender(previous)
+/** `user`, `assistant`, or `bot:<conversation_id>` for another bot's message. */
+const sender = (entry: ChatEntry | undefined): string | null => {
+  if (!entry || !('message' in entry)) return null
+  const { role, sender } = entry.message
+  return role === 'user' ? 'user' : role === 'bot' ? `bot:${sender?.conversation_id ?? ''}` : 'assistant'
+}
+/** A schedule run's reply stands alone, so it always opens a group. The time shows once, at the end of a group. */
+const continues = (entry: ChatEntry, previous: ChatEntry | undefined) => !('schedule' in entry && entry.schedule) && sender(entry) !== null && sender(entry) === sender(previous)
 
 export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNode }) {
   // MessageScroller scrolls to the first anchored item it has not aligned yet. Only a user message sent after the
@@ -44,7 +48,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
               const last = !next || !continues(next, entry)
               return (
                 <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={index === 0 ? undefined : 'mt-6'}>
-                  {'message' in entry ? <Message message={entry.message} routine={entry.routine} last={last} /> : entry.node}
+                  {'message' in entry ? <Message message={entry.message} schedule={entry.schedule} last={last} /> : entry.node}
                 </MessageScrollerItem>
               )
             })}

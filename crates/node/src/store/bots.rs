@@ -112,6 +112,19 @@ fn select_bots(
     .collect()
 }
 
+/// The bot ID and conversation one turn's `create_bot` call names, so a retry finds it again.
+pub fn created_bot_id(scope: &str, trigger: &str, call_ref: &str) -> (String, String) {
+    let digest = crate::crypto::digest(
+        &serde_json::to_vec(&("create_bot", scope, trigger, call_ref)).expect("strings"),
+    );
+    (format!("bot-{digest}"), format!("c-{digest}"))
+}
+
+/// Bots with the name and instructions the chat last set.
+pub(crate) fn bots_from(connection: &Connection, network: &str) -> Result<Vec<Bot>> {
+    bots_where(connection, network, "AND ?2=''", "")
+}
+
 pub(crate) fn bot_for_conversation_from(
     connection: &Connection,
     network: &str,
@@ -186,6 +199,7 @@ impl Store {
                 instructions: spec.instructions.clone(),
                 project: spec.project.clone(),
                 attestation: Some(spec.attestation.clone()),
+                cause: None,
             },
             vec![],
             created_at_ms,
@@ -199,7 +213,90 @@ impl Store {
 
     /// Bots with the name and instructions the chat last set.
     pub fn bots(&self, network: &str) -> Result<Vec<Bot>> {
-        bots_where(&self.connection, network, "AND ?2=''", "")
+        bots_from(&self.connection, network)
+    }
+
+    /// A bot another bot creates in a turn the user's own message started. Its conversation is
+    /// scheduled by this Node, which schedules the creating one; the user's signed message
+    /// stands behind every event. The same `call_ref` in the turn returns the same bot, and one
+    /// message of the user creates at most `BOTS_PER_TURN`. Returns whether it is new.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the turn, its tool call and the definition"
+    )]
+    pub fn create_bot_in_turn(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+        call_ref: &str,
+        definition: (&str, &str, Option<BotProject>),
+        created_at_ms: i64,
+    ) -> Result<(Bot, bool)> {
+        let (name, instructions, project) = definition;
+        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cause = super::assistant::user_cause(&tx, network, scope, trigger)?
+            .context(super::assistant::NOT_FROM_USER)?;
+        let (bot_id, conversation) = created_bot_id(scope, trigger, call_ref);
+        validate_definition(&bot_id, &conversation, name, instructions, project.as_ref())?;
+        if let Some(existing) =
+            select_bots(&tx, network, CREATED_COLUMNS, "AND b.bot_id=?2", &bot_id)?.pop()
+        {
+            ensure!(
+                existing.name == name
+                    && existing.instructions == instructions
+                    && existing.project == project,
+                "call_ref {call_ref} already created another bot; use a new call_ref for a new bot"
+            );
+            return Ok((existing, false));
+        }
+        let created: usize = tx.query_row(
+            "SELECT COUNT(*) FROM bots WHERE network_id=? AND cause=?",
+            params![network, serde_json::to_string(&cause)?],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            created < BOTS_PER_TURN,
+            "one message creates at most {BOTS_PER_TURN} bots"
+        );
+        let local = identity.device_id()?;
+        authorize_node_from(&tx, network, &local)?;
+        for body in [
+            EventBody::ConversationCreated { title: name.into() },
+            EventBody::ConversationOwner {
+                scheduler_node: local,
+                epoch: 1,
+                attestation: None,
+                cause: Some(cause.clone()),
+            },
+            EventBody::BotCreated {
+                bot_id: bot_id.clone(),
+                name: name.into(),
+                instructions: instructions.into(),
+                project,
+                attestation: None,
+                cause: Some(cause.clone()),
+            },
+        ] {
+            log::append_from(
+                &tx,
+                &self.blob_dir,
+                identity,
+                network,
+                &conversation,
+                body,
+                vec![],
+                created_at_ms,
+            )?;
+        }
+        let bot = bot_for_conversation_from(&tx, network, &conversation)?
+            .context("created bot could not be projected")?;
+        tx.commit()?;
+        Ok((bot, true))
     }
 
     /// Each assistant conversation's newest message, by conversation; one indexed lookup per assistant.
