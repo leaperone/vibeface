@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { Link } from "@tanstack/react-router"
-import { Copy, Link2, Plus, TriangleAlert } from "lucide-react"
+import { CircleCheck, Copy, Link2, Plus, TriangleAlert } from "lucide-react"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -34,12 +34,14 @@ export function AddDevice() {
   const pending = useRef<number | null>(null)
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
+  // This page allowed the device, so it says so where the link was rather than only in a toast.
+  const [added, setAdded] = useState<string | null>(null)
   // A join request is the next thing to act on, so it takes the only solid button.
   const requests = useOpenJoins().length > 0
   // A link is single-use: once a device has answered it, it is spent.
   const [used, setUsed] = useState(false)
   useEffect(() => { if (requests && result) setUsed(true) }, [requests, result])
-  useEffect(() => { setResult(null); setError(""); setStatus("") }, [ready])
+  useEffect(() => { setResult(null); setError(""); setStatus(""); setAdded(null) }, [ready])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
     if (!result) return
@@ -58,7 +60,7 @@ export function AddDevice() {
     catch (cause) { if (connection?.isCurrent()) setError(messageOf(cause)) }
     finally { if (pending.current === generation) pending.current = null; setBusyGeneration((owner) => owner === generation ? null : owner) }
   }
-  const generate = () => { setResult(null); setUsed(false); void run(async () => {
+  const generate = () => { setResult(null); setUsed(false); setAdded(null); void run(async () => {
     const connection = ready
     const invitation = await device.createInvitation()
     if (connection?.isCurrent()) setResult(share(invitation))
@@ -68,12 +70,15 @@ export function AddDevice() {
 
   return <>
     <Button type="button" variant={requests ? "outline" : "default"} onClick={() => setOpen(true)}><Plus aria-hidden="true" />添加设备</Button>
-    <Sheet open={open} onOpenChange={setOpen}>
+    <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
-          {!result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
-          <JoinRequests issuing={result !== null} />
+          {added && !requests ? <div className="grid gap-3">
+            <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added}>已添加「{added}」</span></p>
+            <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>
+          </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
+          <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
           {result && !used ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在手机上的 Vibeface 里扫码"} /> : null}
             {result.publicEntry ? null : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
