@@ -392,6 +392,8 @@ class Client:
         elif method == "set_primary_assistant":
             body = {"type": "primary_assistant_set", "conversation_id": arguments["conversation_id"]}
             return self.command("attest", network_id=self.network_id, scope_id="assistants", body=body)
+        elif method == "control_schedule":
+            body = {"type": "schedule_controlled", "schedule_id": arguments["schedule_id"], "action": arguments["action"]}
         elif method == "set_owner":
             body = {"type": "conversation_owner", "scheduler_node": arguments["scheduler_node"], "epoch": arguments["epoch"]}
         elif method == "resolve" and arguments["check_id"].startswith("work:"):
@@ -1049,7 +1051,11 @@ def fixture_codex(arguments):
         threading.Thread(target=connection, args=(stream,), daemon=True).start()
 
 
-SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_routine", "remove_routine"}
+READ_TOOLS = {"nodes", "context", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot"}
+WORK_TOOLS = {"dispatch_work", "interrupt_work"}
+WAKE_TOOLS = {"remind", "message_bot"}
+SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
+                  "create_bot", "configure_bot"}
 TRIAGE_WAKE = "New events from the user's local coding agent sessions"
 
 
@@ -1146,9 +1152,11 @@ def fixture_manager(arguments):
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
     schemas = initial.get("custom_tools", {})
-    expected_tools = {"nodes", "context", "work_status", "call_lookup", "read_skill", "dispatch_work", "interrupt_work"}
+    expected_tools = READ_TOOLS | WORK_TOOLS
+    if kind not in ("agent_task", "route"):
+        expected_tools |= WAKE_TOOLS
     if kind == "human":
-        expected_tools.update(SETTINGS_TOOLS)
+        expected_tools |= SETTINGS_TOOLS
     require(set(schemas) == expected_tools, "sidecar receives the authoritative scoped tool catalog")
 
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
@@ -1261,8 +1269,8 @@ def fixture_manager(arguments):
             if send.get("conflict_text") else None
         fixture_record(run, "manager-sends.jsonl", {"trigger": trigger, "label": label, "sent": sent,
                        "conflict": None if conflict is None else {"code": conflict.returncode, "error": conflict.stderr[-500:]}})
-    if kind == "routine":
-        tool("update_profile", {"call_ref": "routine-rename", "name": "forbidden"}, expected=False,
+    if kind in ("schedule", "bot_message"):
+        tool("update_profile", {"call_ref": kind + "-rename", "name": "forbidden"}, expected=False,
              rejection="user's own message")
     rename = re.match(r"^(rename yourself to|改名为|改名叫)\s*(.+)$", body.get("text", "")) if kind == "human" else None
     if rename:
@@ -2098,26 +2106,30 @@ def no_agent_checks(run, a, passed):
 
 
 def assistant_checks(run, a, network, passed):
-    """The user's own message changes the assistant through tools; a routine runs once per time."""
+    """The user's own message changes the bot through tools; a schedule runs once per time."""
     name = "bot-history-alpha"
 
-    def send(message_id, text):
-        receipt = a.client.rpc("message", conversation_id=name, message_id=message_id, text=text)
+    def send(message_id, text, conversation=name):
+        receipt = a.client.rpc("message", conversation_id=conversation, message_id=message_id, text=text)
         wait_for("the settings turn gets its final reply", lambda:
             (scheduler_record(a, network, receipt["trigger"]) or {}).get("state") == "completed")
         return receipt
 
-    def snapshot():
-        return a.client.rpc("conversation", conversation_id=name)
+    def snapshot(conversation=name):
+        return a.client.rpc("conversation", conversation_id=conversation)
 
     def results(trigger, tool_name):
         return [row for row in fixture_records(run, "manager-tools.jsonl")
                 if row["trigger"] == trigger and row["name"] == tool_name]
 
+    def replies_to(prefix, conversation=name):
+        return [message for message in snapshot(conversation)["messages"]
+                if (message.get("in_reply_to") or "").startswith(prefix)]
+
     first_run = int(time.time() * 1000) + 3000
     profile = {"call_ref": "profile", "name": "Nova", "instructions": "assistant-nova-instructions"}
-    routine = {"call_ref": "routine", "name": "Ping", "prompt": "Reply with one line saying the routine ran; "
-               "if nothing is available, say so.", "first_run_at_ms": first_run, "every_minutes": 5}
+    schedule = {"call_ref": "schedule", "name": "Ping", "prompt": "Reply with one line saying the schedule ran; "
+                "if nothing is available, say so.", "first_run_at_ms": first_run, "every_minutes": 5}
     receipt = send("assistant-settings", json.dumps({"chat_agent": True, "tools": [
         {"name": "update_profile", "arguments": profile},
         {"name": "update_profile", "arguments": profile},
@@ -2127,54 +2139,121 @@ def assistant_checks(run, a, network, passed):
          "rejection": "only in Settings"},
         {"name": "save_skill", "arguments": {"call_ref": "skill", "name": "Digest", "description": "Summarize commits",
                                              "body": "List yesterday's commits by author."}},
-        {"name": "save_routine", "arguments": routine},
+        {"name": "save_schedule", "arguments": schedule},
         {"name": "call_lookup", "arguments": {"call_ref": "profile"}},
     ]}))
     first, retry = results(receipt["trigger"], "update_profile")[:2]
     lookup = results(receipt["trigger"], "call_lookup")[0]["result"]
-    require(first["result"] == retry["result"] == lookup and first["result"]["cause"] == "assistant-settings",
+    require(first["result"] == retry["result"] == lookup and first["result"]["cause"]["message_id"] == "assistant-settings",
             "a retried or looked-up call_ref returns the one recorded change")
     view = snapshot()
     changes = view["changes"]
-    require([change["change"]["kind"] for change in changes] == ["profile", "skill", "routine"]
+    require([change["change"]["kind"] for change in changes] == ["profile", "skill", "schedule"]
             and len({change["change_id"] for change in changes}) == 3
-            and all(change["cause"] == "assistant-settings" and change["event_hash"] for change in changes),
+            and all(change["cause"]["message_id"] == "assistant-settings" and change["event_hash"] for change in changes),
             "the conversation lists one change record per applied change, without the retry")
     require(changes[0]["change"]["name"] == {"before": "Alpha", "after": "Nova"}
             and view["bot"]["name"] == "Nova" and view["bot"]["instructions"] == "assistant-nova-instructions"
             and any(bot["name"] == "Nova" for bot in a.client.rpc("bots")["bots"]),
             "the merged profile shows in the conversation and the bots listing")
     skill = next(row for row in view["assistant"]["skills"] if row["name"] == "Digest")
-    saved = next(row for row in view["assistant"]["routines"] if row["name"] == "Ping")
+    saved = next(row for row in view["assistant"]["schedules"] if row["name"] == "Ping")
     require(saved["first_run_at_ms"] == first_run and saved["enabled"] and saved["next_run_at_ms"] is not None,
-            "the conversation lists the shared skill and its routine with the next run")
+            "the conversation lists the shared skill and its schedule with the next run")
 
-    def routine_replies():
-        return [message for message in snapshot()["messages"]
-                if (message.get("in_reply_to") or "").startswith("routine:" + saved["routine_id"] + ":")]
-
-    replies = wait_for("the routine runs at its first time", routine_replies, timeout=60)
+    prefix = "schedule:" + saved["schedule_id"] + ":"
+    replies = wait_for("the schedule runs at its first time", lambda: replies_to(prefix), timeout=60)
     deadline = time.monotonic() + 32
     while time.monotonic() < deadline:
-        require(len(routine_replies()) == 1, "one routine time runs exactly once")
+        require(len(replies_to(prefix)) == 1, "one schedule time runs exactly once")
         time.sleep(1)
     rejected = results(replies[0]["in_reply_to"], "update_profile")
-    require(rejected and not rejected[0]["accepted"], "a routine run cannot change the assistant")
+    require(rejected and not rejected[0]["accepted"], "a schedule run cannot change the bot")
     receipt = send("assistant-cleanup", json.dumps({"chat_agent": True, "tools": [
-        {"name": "remove_routine", "arguments": {"call_ref": "routine-off", "routine_id": saved["routine_id"]}},
+        {"name": "remove_schedule", "arguments": {"call_ref": "schedule-off", "schedule_id": saved["schedule_id"]}},
         {"name": "read_skill", "arguments": {"skill_id": skill["skill_id"]}},
     ]}))
     require(results(receipt["trigger"], "read_skill")[0]["result"]["body"] == "List yesterday's commits by author."
-            and snapshot()["assistant"]["routines"] == [], "a removed routine stops and a shared skill reads back")
+            and snapshot()["assistant"]["schedules"] == [], "a removed schedule stops and a shared skill reads back")
     send("assistant-rename", "rename yourself to Orion")
     require(snapshot()["bot"]["name"] == "Orion" and len(snapshot()["changes"]) == 5,
-            "the user's plain request renames the assistant")
+            "the user's plain request renames the bot")
     autonomous = [row for row in fixture_records(run, "manager-tools.jsonl")
                   if row["name"] == "update_profile" and row["trigger"].startswith("work:")]
     require(autonomous and not any(row["accepted"] for row in autonomous),
-            "a work result turn cannot change the assistant")
-    passed("the user's own message changes the assistant once per call_ref and a routine runs once per time",
-           changes=len(snapshot()["changes"]), routine=saved["routine_id"])
+            "a work result turn cannot change the bot")
+    passed("the user's own message changes the bot once per call_ref and a schedule runs once per time",
+           changes=len(snapshot()["changes"]), schedule=saved["schedule_id"])
+
+    paused_at = int(time.time() * 1000) + 15000
+    receipt = send("agent-capabilities", json.dumps({"chat_agent": True, "tools": [
+        {"name": "remind", "arguments": {"call_ref": "remind", "note": "Check the deploy again.", "in_minutes": 1}},
+        {"name": "remind", "arguments": {"call_ref": "remind", "note": "Check the deploy again.", "in_minutes": 1}},
+        {"name": "save_schedule", "arguments": {"call_ref": "paused", "name": "Paused", "prompt": "Say the paused schedule ran.",
+                                                "first_run_at_ms": paused_at, "every_minutes": 5}},
+        {"name": "remember", "arguments": {"call_ref": "note", "text": "The user prefers short replies."}},
+        {"name": "remember", "arguments": {"call_ref": "secret", "text": "api key sk-" + "a" * 40}, "accepted": False,
+         "rejection": "credential"},
+        {"name": "fetch_url", "arguments": {"url": "http://127.0.0.1:1/"}, "accepted": False,
+         "rejection": "local or private network"},
+        {"name": "fetch_url", "arguments": {"url": "http://192.168.1.1/"}, "accepted": False,
+         "rejection": "local or private network"},
+        {"name": "fetch_url", "arguments": {"url": "http://[::1]/"}, "accepted": False,
+         "rejection": "local or private network"},
+        {"name": "fetch_url", "arguments": {"url": "file:///etc/hosts"}, "accepted": False, "rejection": "only http and https"},
+        {"name": "list_bots", "arguments": {}},
+        {"name": "message_bot", "arguments": {"call_ref": "ask-beta", "bot": "Beta", "text": "Please check the build."}},
+        {"name": "message_bot", "arguments": {"call_ref": "ask-beta", "bot": "Beta", "text": "Please check the build."}},
+    ]}))
+    reminder = results(receipt["trigger"], "remind")
+    require(reminder[0]["result"] == reminder[1]["result"], "a retried reminder returns the one recorded reminder")
+    reminder_id = reminder[0]["result"]["change"]["schedule_id"]
+    paused = next(row for row in snapshot()["assistant"]["schedules"] if row["name"] == "Paused")
+    a.client.rpc("control_schedule", conversation_id=name, schedule_id=paused["schedule_id"], action="pause")
+    require(not next(row for row in snapshot()["assistant"]["schedules"] if row["name"] == "Paused")["enabled"],
+            "the user's signed pause shows on the schedule")
+    a.client.rpc("control_schedule", unsigned=True, conversation_id=name, schedule_id=paused["schedule_id"],
+                 action="resume", status=400)
+    require({"Beta", "Orion"} <= {row["name"] for row in results(receipt["trigger"], "list_bots")[0]["result"]["bots"]},
+            "list_bots lists the user's bots")
+    passed("fetch_url refuses loopback, private and non-web addresses and notes refuse secrets",
+           refusals=len([row for row in fixture_records(run, "manager-tools.jsonl")
+                         if row["trigger"] == receipt["trigger"] and not row["accepted"]]))
+
+    sent = results(receipt["trigger"], "message_bot")
+    require(sent[0]["result"]["message"] == sent[1]["result"]["message"], "a retried bot message is one message")
+    bot_trigger = "bot_message:" + sent[0]["result"]["message"]["message_id"]
+    wait_for("the other bot answers the bot message", lambda:
+             (scheduler_record(a, network, bot_trigger) or {}).get("state") == "completed")
+    woken = [row for row in fixture_records(run) if row["trigger"] == bot_trigger]
+    beta_view = snapshot("bot-history-beta")
+    shown = [message for message in beta_view["messages"] if message["role"] == "bot"]
+    require(len(woken) == 1 and woken[0]["kind"] == "bot_message" and woken[0]["conversation_id"] == "bot-history-beta"
+            and len(shown) == 1 and shown[0]["sender"]["name"] == "Orion",
+            "a bot message wakes the other bot once and shows who sent it")
+    rejected = results(bot_trigger, "update_profile")
+    require(rejected and not rejected[0]["accepted"], "a bot message turn cannot change the bot")
+    passed("message_bot wakes the other bot exactly once per call_ref", trigger=bot_trigger)
+
+    reminder_prefix = "schedule:" + reminder_id + ":"
+    wait_for("the reminder fires once", lambda: replies_to(reminder_prefix), timeout=90)
+    require(not replies_to("schedule:" + paused["schedule_id"] + ":"), "a paused schedule does not run")
+    before = len(fixture_records(run))
+    a.stop()
+    a.start()
+    a.client.connect()
+    a.client.authenticate()
+    require_quiet("a restart never replays a reminder", lambda: len(fixture_records(run)) == before)
+    view = snapshot()
+    require(len(replies_to(reminder_prefix)) == 1 and all(row["schedule_id"] != reminder_id for row in view["assistant"]["schedules"]),
+            "a fired reminder stays fired after restart")
+    require([row["text"] for row in view["assistant"]["memory"]] == ["The user prefers short replies."],
+            "a note survives the restart")
+    a.client.rpc("control_schedule", conversation_id=name, schedule_id=paused["schedule_id"], action="delete")
+    require(all(row["schedule_id"] != paused["schedule_id"] for row in snapshot()["assistant"]["schedules"])
+            and not replies_to("schedule:" + paused["schedule_id"] + ":"), "a deleted schedule is gone without running")
+    passed("a reminder fires once and never again after restart, a paused schedule is honored and notes persist",
+           reminder=reminder_id, paused=paused["schedule_id"])
 
 
 def chat_agent_acceptance(options):

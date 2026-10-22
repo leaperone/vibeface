@@ -207,7 +207,7 @@ function closeInput() {
 function sdkConfig(input) {
   return {
     approval_policy: "never",
-    web_search: "disabled",
+    web_search: "live",
     check_for_update_on_startup: false,
     analytics: { enabled: false },
     feedback: { enabled: false },
@@ -230,8 +230,6 @@ function sdkConfig(input) {
       view_image: false,
       sleep_tool: false,
       request_permissions_tool: false,
-      web_search_request: false,
-      web_search_cached: false,
       standalone_web_search: false,
       code_mode: true,
       code_mode_host: true,
@@ -287,9 +285,13 @@ function childEnvironment(input) {
 function managerPrompt(prompt, toolCli, tools) {
   if (toolCli === undefined) return prompt;
   const executable = `'${toolCli.replaceAll("'", "'\"'\"'")}'`;
+  const withCallRef = Object.entries(tools)
+    .filter(([, spec]) => spec.inputSchema?.required?.includes("call_ref"))
+    .map(([name]) => name)
+    .join(", ");
   const catalog = Object.entries(tools).map(([name, spec]) => `${name}\n${spec.description || ""}\nJSON schema: ${JSON.stringify(spec.inputSchema)}`).join("\n\n");
   const host = "Your shell has full access to this host: you can edit files, run git and gh, and call this device's Codex App Server with `vibeface codex`. When Codex asks something (an approval, a question, a login), `vibeface codex requests` lists the waiting requests and `vibeface codex respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
-  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor dispatch_work, update_profile, save_skill, remove_skill, save_routine and remove_routine, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. ${host}\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
+  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor ${withCallRef}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. ${host}\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
 }
@@ -502,7 +504,7 @@ async function run(input, reader, secrets) {
     skipGitRepoCheck: true,
     approvalPolicy: "never",
     sandboxMode: "danger-full-access",
-    webSearchMode: "disabled",
+    webSearchMode: "live",
   };
   const thread = input.sessionId === null
     ? codex.startThread(threadOptions)

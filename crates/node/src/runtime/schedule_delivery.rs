@@ -49,7 +49,7 @@ impl Runtime {
                 tick.tick().await;
                 let _work = node.maintenance.enter_when_open().await;
                 if let Err(error) = node.fire_schedules().await {
-                    tracing::warn!(%error, "routine runs are pending");
+                    tracing::warn!(%error, "schedule runs are pending");
                 }
             }
         });
