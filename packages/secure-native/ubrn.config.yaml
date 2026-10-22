@@ -1,0 +1,16 @@
+rust:
+  directory: ../..
+  manifestPath: crates/secure-ffi/Cargo.toml
+bindings:
+  cpp: cpp/generated
+  ts: src/generated
+turboModule:
+  ts: src/generated
+  entrypoint: src/generated/index.ts
+ios:
+  frameworkName: build/VibefaceSecureFramework
+android:
+  targets:
+    - arm64-v8a
+    - x86_64
+  useSharedLibrary: false

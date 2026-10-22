@@ -1,0 +1,7 @@
+/build/
+/android/build/
+/android/.cxx/
+/android/src/main/jniLibs/
+*.xcframework
+*.a
+*.so
