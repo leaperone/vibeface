@@ -100,6 +100,16 @@ impl Runtime {
         if receipt.is_some() {
             self.wake_scheduler()?;
         }
+        if !quiet
+            && matches!(record.state, WorkState::Running { .. })
+            && self.waiting_stop(work_id).await?
+        {
+            // Left waiting when unconfirmed; `deliver_work_requests` tries again.
+            match Box::pin(self.stop_bound_work(network, work_id)).await {
+                Ok(stopped) => return Ok(stopped),
+                Err(error) => tracing::warn!(%error, work_id, "stop of a just-bound work waits"),
+            }
+        }
         if matches!(record.state, WorkState::Interrupting { .. }) {
             let node = self.clone();
             let (network, work_id) = (network.to_owned(), work_id.to_owned());
@@ -586,6 +596,26 @@ impl Runtime {
         Ok(())
     }
 
+    /// Whether the user stopped this device's work before its turn was bound.
+    async fn waiting_stop(&self, work_id: &str) -> Result<bool> {
+        let local = self.identity.device_id()?;
+        Ok(self
+            .store
+            .lock()
+            .await
+            .stop_requests()?
+            .iter()
+            .any(|request| request.work_id == work_id && request.target == local))
+    }
+
+    /// Interrupts the turn a waiting stop was for, then drops the request.
+    async fn stop_bound_work(self: &Arc<Self>, network: &str, work_id: &str) -> Result<WorkRecord> {
+        self.interrupt_work(network, work_id).await?;
+        let mut store = self.store.lock().await;
+        store.forget_stop_request(work_id)?;
+        store.work_record(work_id)?.context("work not found")
+    }
+
     pub(super) async fn interrupt_work(
         self: &Arc<Self>,
         network: &str,
@@ -597,6 +627,7 @@ impl Runtime {
             .await
             .work_record(work_id)?
             .context("work not found")?;
+        let mut waiting_for_start = false;
         match &record.state {
             WorkState::Running { handle } => {
                 self.codex
@@ -621,6 +652,20 @@ impl Runtime {
                 }
                 self.publish_changed(network, &record.conversation, Changed::Work(work_id));
             }
+            // No turn to interrupt yet: the request waits here and stops the turn once bound.
+            WorkState::Accepted | WorkState::Starting { .. } if record.kind == WorkKind::Codex => {
+                let at = now_ms();
+                self.store.lock().await.save_stop_request(&StopRequest {
+                    work_id: work_id.into(),
+                    conversation: record.conversation.clone(),
+                    target: self.identity.device_id()?,
+                    requested_at_ms: at,
+                    deadline_ms: at,
+                    timed_out: false,
+                })?;
+                self.publish_changed(network, &record.conversation, Changed::Work(work_id));
+                waiting_for_start = true;
+            }
             _ => {}
         }
         // Stopping a work stops what it delegated.
@@ -641,7 +686,9 @@ impl Runtime {
         for child in children {
             Box::pin(self.interrupt_work(network, &child)).await?;
         }
-        Ok(json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false}))
+        Ok(
+            json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_start":waiting_for_start}),
+        )
     }
 
     /// Stops a work wherever it runs. A target that cannot be reached keeps the request here,
@@ -705,6 +752,7 @@ impl Runtime {
             }
         }
         let requests = self.store.lock().await.stop_requests()?;
+        let local = self.identity.device_id()?;
         for mut request in requests {
             let ended = self
                 .store
@@ -718,6 +766,19 @@ impl Runtime {
                     .lock()
                     .await
                     .forget_stop_request(&request.work_id)?;
+                continue;
+            }
+            // A local request waits for its work's turn, however long starting takes.
+            if request.target == local {
+                let bound = self
+                    .store
+                    .lock()
+                    .await
+                    .work_record(&request.work_id)?
+                    .is_some_and(|record| matches!(record.state, WorkState::Running { .. }));
+                if bound && let Err(error) = self.stop_bound_work(network, &request.work_id).await {
+                    tracing::debug!(%error, work_id = request.work_id, "stop of a bound work waits");
+                }
                 continue;
             }
             if request.timed_out {
