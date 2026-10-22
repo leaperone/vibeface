@@ -73,7 +73,8 @@ function MessageScrollerItem({
       data-slot="message-scroller-item"
       scrollAnchor={scrollAnchor}
       className={cn(
-        "min-w-0 shrink-0 [contain-intrinsic-size:auto_10rem] [content-visibility:auto]",
+        // content-visibility clips paint at the item's edge; the margin keeps focus rings and row hovers that reach past it.
+        "min-w-0 shrink-0 [contain-intrinsic-size:auto_10rem] [content-visibility:auto] [overflow-clip-margin:0.5rem]",
         className
       )}
       {...props}
