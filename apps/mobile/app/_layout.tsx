@@ -28,9 +28,9 @@ function Screens() {
     <Stack screenOptions={{
       headerShadowVisible: false,
       headerBackButtonDisplayMode: 'minimal',
-      headerStyle: { backgroundColor: background },
       headerTintColor: foreground,
-      headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: 16 },
+      headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: 16, color: foreground },
+      headerLargeTitleStyle: { fontFamily: 'Geist', fontWeight: '700', color: foreground },
       contentStyle: { backgroundColor: background },
     }}>
       <Stack.Protected guard={!ready}>

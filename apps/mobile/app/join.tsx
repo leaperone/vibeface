@@ -1,8 +1,8 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
-import { useLocalSearchParams } from 'expo-router'
+import { useLinkingURL } from 'expo-linking'
 import { Camera, ClipboardPaste, Hourglass, QrCode, type LucideIcon } from 'lucide-react-native'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -27,8 +27,13 @@ export default function JoinScreen() {
 
 function JoinForm() {
   const workspace = useWorkspace()
-  const params = useLocalSearchParams<{ link?: string }>()
-  const [invitation, setInvitation] = useState(params.link ?? '')
+  const url = useLinkingURL()
+  const [invitation, setInvitation] = useState('')
+  // The raw URL keeps the ticket after `#`, which router params drop; every new `vibeface://join?link=` refills the field.
+  useEffect(() => {
+    const link = url ? new URL(url).searchParams.get('link') : null
+    if (link) setInvitation(link)
+  }, [url])
   const [name, setName] = useState('我的手机')
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')

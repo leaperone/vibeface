@@ -61,23 +61,25 @@ export default function ChatScreen() {
   const rows = chat ? entries(chat) : []
   return <View className="flex-1 bg-background">
     <Stack.Screen options={{ title: bot.name }} />
-    {rows.length ? <FlatList
+    {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
+    <FlatList
       data={rows}
       inverted
       keyExtractor={(row) => row.key}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
       renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
-      contentContainerClassName="px-4 py-6"
+      contentContainerClassName={rows.length ? 'px-4 py-6' : 'grow'}
       ItemSeparatorComponent={() => <View className="h-6" />}
       renderItem={({ item }) => 'message' in item ? <Message message={item.message} last={item.last} /> : <>{item.node}</>}
-    /> : <View className="flex-1 items-center justify-center gap-4 px-4">
-      <Icon as={Bot} className="size-8 text-muted-foreground" />
-      <Text role="heading" className="text-heading font-semibold">{bot.name}</Text>
-      <View className="flex-row flex-wrap justify-center gap-2">
-        {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
-      </View>
-    </View>}
+      ListEmptyComponent={<View className="flex-1 items-center justify-center gap-4 px-4" style={{ transform: [{ scaleY: -1 }] }}>
+        <Icon as={Bot} className="size-8 text-muted-foreground" />
+        <Text role="heading" className="text-heading font-semibold">{bot.name}</Text>
+        <View className="flex-row flex-wrap justify-center gap-2">
+          {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
+        </View>
+      </View>}
+    />
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
