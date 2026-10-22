@@ -224,6 +224,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     for (const item of items) {
       if (seen.has(item.notification_id)) continue
       seen.add(item.notification_id)
+      if (viewRef.current === "chat" && item.conversation_id === activeId.current && platform.foreground()) continue
       try {
         notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
           if (current()) openConversation(item.conversation_id)

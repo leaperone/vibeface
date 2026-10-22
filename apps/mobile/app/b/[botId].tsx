@@ -78,6 +78,8 @@ export default function ChatScreen() {
   return <View className="flex-1 bg-background">
     <Stack.Screen options={{
       title: bot.name,
+      // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
+      scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild>
         <Button variant="ghost" size="icon" accessibilityLabel="bot 信息"><Icon as={Bot} /></Button>
       </Link>,
