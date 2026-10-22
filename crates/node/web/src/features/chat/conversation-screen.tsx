@@ -19,7 +19,7 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { canSend, composerHint } from '@vibeface/client/chat/protocol.ts'
+import { canSend, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import './chat.css'
 
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
@@ -81,8 +81,13 @@ export function ConversationScreen() {
   ])
 
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
+  // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
+  const replying = jobs.some((job) => ['claimed', 'running', 'cancelling'].includes(job.state))
+  const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued'].includes(job.state)).map((job) => job.message_id) : [])
   const entries: ChatEntry[] = []
-  for (const message of data?.messages ?? []) {
+  const waiting: ChatEntry[] = []
+  for (const message of threadReplies(data?.messages ?? [])) {
+    const start = entries.length
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
     const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
     if (schedule) {
@@ -100,6 +105,7 @@ export function ConversationScreen() {
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
     const turn = placedChanges.after.get(message.message_id)
     if (turn) entries.push(changeRow(turn))
+    if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: 'queued' as const } } : entry))
   }
   entries.push(...asides.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
@@ -113,6 +119,7 @@ export function ConversationScreen() {
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   if (botBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</p> })
+  entries.push(...waiting)
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [

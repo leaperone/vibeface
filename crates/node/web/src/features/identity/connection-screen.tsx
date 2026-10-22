@@ -105,6 +105,15 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   </Panel>
 }
 
+/** The code appears once the device that sent the link shows its own, so until then the next step is over there. */
+function JoinCode({ code }: { code?: string }) {
+  if (!code) return <p role="status" className="flex items-center gap-2 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />在发链接的设备上点“显示安全码”</p>
+  return <>
+    <p className="text-muted-foreground">两边的安全码一致，就在那边点允许</p>
+    <SafetyCode code={code} />
+  </>
+}
+
 /** The Node's own join: it shows the short code the manager compares before approving. */
 function NodeJoin() {
   const device = useDevice()
@@ -112,8 +121,7 @@ function NodeJoin() {
   const [cancelling, setCancelling] = useState(false)
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : '等待批准'}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
-      <p className="text-muted-foreground">在发链接的设备上比对安全码</p>
-      {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
+      <JoinCode code={joining.code} />
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
         {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
       </Button>
@@ -354,8 +362,7 @@ function BrowserJoin() {
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
     {device.info ? <p className="flex items-center gap-2 text-success"><ShieldCheck aria-hidden="true" className="size-4 shrink-0" />已确认是你的设备「{device.info.name}」</p> : null}
-    <p className="text-muted-foreground">在发链接的设备上比对安全码</p>
-    {joining.code ? <SafetyCode code={joining.code} /> : <Skeleton className="h-8 w-40" />}
+    <JoinCode code={joining.code} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details>

@@ -1,10 +1,10 @@
 "use client"
 
 import { useRef, useState, type ReactNode } from "react"
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
+import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { formatWhen, scheduleDetail, scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
+import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { ActionButton } from "./present"
 import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
@@ -19,10 +19,11 @@ export function BotPanelButton() {
   const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
   const [gaps, setGaps] = useState<Gap[]>([])
+  const [confirming, setConfirming] = useState<string | null>(null)
   const bot = workspace.selectedBot
   const view = workspace.data?.bot_settings
   if (!bot) return null
-  const rows = (view?.schedules ?? []).map((schedule) => ({ schedule, deleted: false }))
+  const rows = sortSchedules(view?.schedules ?? []).map((schedule) => ({ schedule, deleted: false }))
   for (const gap of [...gaps].sort((a, b) => a.index - b.index)) {
     if (gap.conversation_id !== bot.conversation_id || rows.some((row) => row.schedule.schedule_id === gap.schedule.schedule_id)) continue
     rows.splice(Math.min(gap.index, rows.length), 0, { schedule: gap.schedule, deleted: true })
@@ -32,13 +33,15 @@ export function BotPanelButton() {
     setGaps((previous) => [...previous, gap])
     const drop = () => setGaps((previous) => previous.filter((item) => item !== gap))
     try { await workspace.controlSchedule(schedule.schedule_id, "delete") } catch (caught) { drop(); throw caught }
+    setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
+  const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   return <>
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
       <Bot aria-hidden="true" />
     </Button>
-    <Sheet open={open && Boolean(view)} onOpenChange={setOpen}>
+    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>
         <SheetHeader className="pr-14">
           <SheetTitle className="break-words">{bot.name}</SheetTitle>
@@ -48,13 +51,12 @@ export function BotPanelButton() {
             : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主 Bot</ActionButton>}
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
-          <Section icon={ScrollText} title="说明">
-            {bot.instructions.trim()
-              ? <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
-              : <Empty>还没有说明</Empty>}
-          </Section>
-          <Section icon={CalendarClock} title="定时任务" count={view.schedules.length}>
-            {rows.length ? <ul className="grid gap-4">{rows.map(({ schedule, deleted }, index) => {
+          {empty ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><Inbox aria-hidden="true" className="size-4 shrink-0" />还没有设置</p> : null}
+          {bot.instructions.trim() ? <Section icon={ScrollText} title="说明">
+            <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
+          </Section> : null}
+          {rows.length ? <Section icon={CalendarClock} title="定时任务" count={view.schedules.length}>
+            <ul className="grid gap-4">{rows.map(({ schedule, deleted }, index) => {
               const Kind = schedule.every_minutes === undefined ? AlarmClock : Repeat
               const detail = scheduleDetail(schedule)
               if (deleted) return <li key={schedule.schedule_id} className="flex min-h-9 items-start gap-3 text-muted-foreground">
@@ -67,32 +69,34 @@ export function BotPanelButton() {
                   <p className={`font-medium [overflow-wrap:anywhere] ${detail ? "" : "line-clamp-3"}`} title={detail ? undefined : schedule.prompt}>{detail ? schedule.name : schedule.prompt}</p>
                   <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
                     {!schedule.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
-                      : schedule.next_run_at_ms !== null ? <span>{formatWhen(schedule.next_run_at_ms)}</span> : null}
+                      : schedule.next_run_at_ms !== null ? <time dateTime={new Date(schedule.next_run_at_ms).toISOString()} title={formatWhen(schedule.next_run_at_ms)}>{formatIn(schedule.next_run_at_ms)}</time> : null}
                     <span>{scheduleFrequency(schedule)}</span>
                   </p>
                   {detail ? <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]" title={detail}>{detail}</p> : null}
                 </div>
-                <div className="flex shrink-0 gap-1">
+                {confirming === schedule.schedule_id ? <div className="flex shrink-0 gap-1">
+                  <Button type="button" variant="ghost" autoFocus onClick={() => setConfirming(null)}>取消</Button>
+                  <ActionButton variant="destructive" disabled={!workspace.writable} action={() => remove(schedule, index)}>确认删除</ActionButton>
+                </div> : <div className="flex shrink-0 gap-1">
                   <ActionButton variant="ghost" label={schedule.enabled ? "暂停" : "恢复"} disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, schedule.enabled ? "pause" : "resume")}>
                     {schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
                   </ActionButton>
-                  <ActionButton variant="ghost" label="删除" disabled={!workspace.writable} action={() => remove(schedule, index)}>
+                  <Button type="button" variant="ghost" size="icon" aria-label="删除" title="删除" disabled={!workspace.writable} onClick={() => setConfirming(schedule.schedule_id)}>
                     <Trash2 aria-hidden="true" />
-                  </ActionButton>
-                </div>
+                  </Button>
+                </div>}
               </li>
-            })}</ul> : <Empty>还没有定时任务</Empty>}
-          </Section>
-          <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
-            {view.memory.length ? <ul className="grid gap-2">{view.memory.map((note) => <li key={note.memory_id} className="line-clamp-2 text-meta [overflow-wrap:anywhere]" title={note.text}>{note.text}</li>)}</ul>
-              : <Empty>还没有笔记</Empty>}
-          </Section>
-          <Section icon={BookOpen} title="共用 skill" count={view.skills.length}>
-            {view.skills.length ? <ul className="grid gap-3">{view.skills.map((skill) => <li key={skill.skill_id} className="grid gap-0.5">
+            })}</ul>
+          </Section> : null}
+          {view.memory.length ? <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
+            <ul className="grid gap-2">{view.memory.map((note) => <li key={note.memory_id} className="line-clamp-2 text-meta [overflow-wrap:anywhere]" title={note.text}>{note.text}</li>)}</ul>
+          </Section> : null}
+          {view.skills.length ? <Section icon={BookOpen} title="共用 skill" count={view.skills.length}>
+            <ul className="grid gap-3">{view.skills.map((skill) => <li key={skill.skill_id} className="grid gap-0.5">
               <p className="font-medium [overflow-wrap:anywhere]">{skill.name}</p>
               {skill.description ? <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{skill.description}</p> : null}
-            </li>)}</ul> : <Empty>还没有 skill</Empty>}
-          </Section>
+            </li>)}</ul>
+          </Section> : null}
         </div> : null}
       </SheetContent>
     </Sheet>
@@ -109,8 +113,4 @@ function Section({ icon: Icon, title, count, children }: { icon: LucideIcon; tit
     </h3>
     {children}
   </section>
-}
-
-function Empty({ children }: { children: ReactNode }) {
-  return <p className="text-meta text-muted-foreground">{children}</p>
 }

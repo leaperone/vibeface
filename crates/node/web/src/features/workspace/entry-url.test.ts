@@ -12,7 +12,7 @@ import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "@vibeface/client/workspace/model.ts"
 import { placeChanges, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
-import { canSend, composerHint } from "@vibeface/client/chat/protocol.ts"
+import { canSend, composerHint, threadReplies } from "@vibeface/client/chat/protocol.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 
 const context = {
@@ -616,7 +616,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -745,7 +745,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()

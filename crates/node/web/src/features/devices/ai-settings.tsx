@@ -174,11 +174,11 @@ export function AiSettings({ onboarding = false }: { onboarding?: boolean }) {
   </div>
 }
 
-/** An icon that turns one use of a provider on or off. */
+/** A chip that turns one use of a provider on or off; filled while on, so a phone without hover still reads it. */
 function RoleToggle({ icon: Icon, label, name, pressed, busy, disabled, onClick }: { icon: LucideIcon; label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
-  return <Button type="button" size="icon" variant={pressed ? "outline" : "ghost"} aria-pressed={pressed} aria-label={`${name} ${label}`} title={label} disabled={disabled}
-    className={cn(pressed ? "shadow-xs" : "text-muted-foreground")} onClick={onClick}>
-    <BusyIcon busy={busy} icon={Icon} />
+  return <Button type="button" size="sm" variant={pressed ? "default" : "outline"} aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
+    className={cn("rounded-full", !pressed && "text-muted-foreground")} onClick={onClick}>
+    <BusyIcon busy={busy} icon={Icon} />{label}
   </Button>
 }
 
@@ -208,12 +208,14 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const addName = newName.trim().toUpperCase()
 
   return <li className="overflow-hidden rounded-xl border">
-    <div className="flex min-h-14 items-center gap-3 px-3 py-2">
-      <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-      <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
-      <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
-      <div className="flex shrink-0 gap-1">
-        <RoleToggle icon={terms.bot.icon} label={terms.bot.label} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
+    <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2">
+      <div className="flex min-w-0 flex-1 basis-44 items-center gap-3">
+        <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 truncate font-medium">{name}</span>
+        <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
+      </div>
+      <div className="ms-auto flex shrink-0 gap-2">
+        <RoleToggle icon={terms.bot.icon} label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => { if (!(onboarding && bot)) void change("bot", { bot: !bot }) }} />
         {item.supports.includes("execution") && !onboarding ? <RoleToggle icon={terms.task.icon} label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => void change("execution", { execution: !execution })} /> : null}

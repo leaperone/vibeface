@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
+import { threadReplies } from '@vibeface/client/chat/protocol.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
@@ -74,7 +75,7 @@ function Live({ children }: { children: ReactNode }) {
     const jobs = data.scheduler?.jobs ?? []
     const live = shared.liveProgress.find((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text
       && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
-    const messages: ChatMessage[] = [...data.messages]
+    const messages: ChatMessage[] = threadReplies(data.messages)
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     const pending = shared.messagePending
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })

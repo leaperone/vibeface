@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel } from './protocol.ts'
+import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, threadReplies } from './protocol.ts'
 
 const ready = { hasConversation: true, loaded: true }
 test('send waits for a loaded conversation', () => {
@@ -56,4 +56,14 @@ test('stopped and interrupted replies are labelled; completed replies are not', 
   assert.equal(replyStatusLabel(undefined), '')
   assert.equal(replyStatusLabel('stopped'), '已中断')
   assert.equal(replyStatusLabel('interrupted'), '已中断')
+})
+test('a reply follows the message it answers when the next message was sent before it finished', () => {
+  const rows = [
+    { message_id: 'a', role: 'user' },
+    { message_id: 'b', role: 'user' },
+    { message_id: 'ra', role: 'assistant', in_reply_to: 'a' },
+    { message_id: 'rb', role: 'assistant', in_reply_to: 'b' },
+    { message_id: 'answer', role: 'assistant', in_reply_to: 'question-1' },
+  ]
+  assert.deepEqual(threadReplies(rows).map((row) => row.message_id), ['a', 'ra', 'b', 'rb', 'answer'])
 })

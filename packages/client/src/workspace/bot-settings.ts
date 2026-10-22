@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotChangeRecord, BotSchedule, BotSettings } from "./types.ts"
+import type { BotChangeRecord, BotSchedule, BotSettings, ScheduleView } from "./types.ts"
 
 const weekdays = "日一二三四五六"
 const pad = (value: number) => String(value).padStart(2, "0")
@@ -30,6 +30,21 @@ export function formatWhen(ms: number, now = Date.now()): string {
   if (days === 1) return `明天 ${clock(date)}`
   const year = date.getFullYear() === today.getFullYear() ? "" : `${date.getFullYear()}年`
   return `${year}${date.getMonth() + 1}月${date.getDate()}日 ${clock(date)}`
+}
+
+/** "1 分钟后", "3 小时后", "2 天后"; a time already due reads "马上". */
+export function formatIn(ms: number, now = Date.now()): string {
+  const minutes = Math.ceil((ms - now) / 60_000)
+  if (minutes <= 0) return "马上"
+  if (minutes < 60) return `${minutes} 分钟后`
+  if (minutes < 1440) return `${Math.round(minutes / 60)} 小时后`
+  return `${Math.round(minutes / 1440)} 天后`
+}
+
+/** Soonest next run first, paused last; ties keep the given order. */
+export function sortSchedules<T extends Pick<ScheduleView, "enabled" | "next_run_at_ms">>(schedules: readonly T[]): T[] {
+  const key = (schedule: T) => schedule.enabled ? schedule.next_run_at_ms ?? Number.MAX_SAFE_INTEGER : Number.MAX_VALUE
+  return [...schedules].sort((a, b) => key(a) - key(b))
 }
 
 export type DiffLine = { kind: "removed" | "added"; text: string }
