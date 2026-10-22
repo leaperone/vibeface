@@ -24,7 +24,7 @@ export function PromptInput({
   children,
 }: {
   value: string
-  hint: string
+  hint: ReactNode
   disabled: boolean
   busy: boolean
   onChange: (value: string) => void

@@ -30,10 +30,12 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const id = question.question_id
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, workspace.answered[id])
-  if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="flex min-h-9 min-w-0 items-center gap-2 px-2 text-meta text-muted-foreground">
-    {settled.elsewhere ? <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0 flex-1 truncate" title={question.text}>{question.text}</span>
-    <span className="max-w-[50%] shrink-0 truncate text-foreground" title={settled.text}>{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
+  if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
+    {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
+    <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
+      <span className="min-w-0 truncate sm:flex-1" title={question.text}>{question.text}</span>
+      <span className="min-w-0 text-foreground [overflow-wrap:anywhere] sm:max-w-[60%]">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
+    </span>
   </p>
 
   const pending = workspace.pendingAnswers.find((item) => item.question_id === id)
