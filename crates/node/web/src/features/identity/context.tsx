@@ -631,6 +631,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const state = record(await request('join_status', { join_id: pending.join_id })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error('加入结果没有包含此浏览器。') })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
+      // The link is single-use; a later visit to the join screen starts empty.
+      setInitialInvitation('')
       return
     }
     if (status.status === 'rejected' || status.status === 'expired') {

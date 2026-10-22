@@ -36,6 +36,9 @@ export function AddDevice() {
   const [status, setStatus] = useState("")
   // A join request is the next thing to act on, so it takes the only solid button.
   const requests = useOpenJoins().length > 0
+  // A link is single-use: once a device has answered it, it is spent.
+  const [used, setUsed] = useState(false)
+  useEffect(() => { if (requests && result) setUsed(true) }, [requests, result])
   useEffect(() => { setResult(null); setError(""); setStatus("") }, [ready])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
@@ -55,7 +58,7 @@ export function AddDevice() {
     catch (cause) { if (connection?.isCurrent()) setError(messageOf(cause)) }
     finally { if (pending.current === generation) pending.current = null; setBusyGeneration((owner) => owner === generation ? null : owner) }
   }
-  const generate = () => { setResult(null); void run(async () => {
+  const generate = () => { setResult(null); setUsed(false); void run(async () => {
     const connection = ready
     const invitation = await device.createInvitation()
     if (connection?.isCurrent()) setResult(share(invitation))
@@ -69,9 +72,9 @@ export function AddDevice() {
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription>在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
-          {!result ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
+          {!result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           <JoinRequests issuing={result !== null} />
-          {result ? <div className="grid gap-3">
+          {result && !used ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt={result.publicEntry ? "用手机相机扫码打开" : "在手机上的 vibeface 里扫码"} /> : null}
             {result.publicEntry ? <p className="text-meta text-muted-foreground">用手机相机扫码</p> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
               <p>在手机上打开 vibeface 的访问地址，点“扫码”扫这里</p>
