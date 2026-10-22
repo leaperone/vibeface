@@ -1242,7 +1242,7 @@ def fixture_manager(arguments):
         require(completed.returncode == 0, "fixture host command exits successfully")
     if autonomous:
         tool("update_profile", {"call_ref": "forbidden-rename", "name": "forbidden"}, expected=False,
-             rejection="user's own message")
+             rejection="is not offered in")
         status = tool("work_status", {"work_id": body["work_id"]})
         fixture_record(run, "manager-results.jsonl", {"trigger": trigger, "work_id": body["work_id"],
                        "outcome": body.get("outcome"), "status_outcome": status["outcome"]})
@@ -1271,7 +1271,7 @@ def fixture_manager(arguments):
                        "conflict": None if conflict is None else {"code": conflict.returncode, "error": conflict.stderr[-500:]}})
     if kind in ("schedule", "bot_message"):
         tool("update_profile", {"call_ref": kind + "-rename", "name": "forbidden"}, expected=False,
-             rejection="user's own message")
+             rejection="is not offered in")
     rename = re.match(r"^(rename yourself to|改名为|改名叫)\s*(.+)$", body.get("text", "")) if kind == "human" else None
     if rename:
         tool("update_profile", {"call_ref": "rename", "name": rename.group(2).strip()})
