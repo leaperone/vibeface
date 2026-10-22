@@ -372,10 +372,6 @@ fn conversation(store: &mut Store, net: &Net) -> Result<()> {
 /// whatever outer hash the retry gets, it never overturns a conflict the original lost.
 #[test]
 fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    let client = net.a.fixture_admin();
     let owner = |node: &LocalIdentity| -> Result<EventBody> {
         Ok(EventBody::ConversationOwner {
             scheduler_node: node.device_id()?,
@@ -383,51 +379,59 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
             attestation: None,
         })
     };
-    let outcome = |store: &Store| -> Result<Option<String>> {
+    let write = |store: &mut Store,
+                 net: &Net,
+                 at: &mut i64,
+                 author: &LocalIdentity,
+                 body: EventBody|
+     -> Result<String> {
+        *at += 1;
+        let signed = net.a.fixture_admin().attest(&net.network, "c", body)?;
+        Ok(store
+            .append_event(author, &net.network, "c", signed, vec![], *at)?
+            .hash)
+    };
+    let outcome = |store: &Store, net: &Net| -> Result<Option<String>> {
         Ok(store
             .conversation(&net.network, "c")?
             .context("conversation")?
             .owner)
     };
-    let mut at = 10;
-    let mut write =
-        |store: &mut Store, author: &LocalIdentity, body: EventBody| -> Result<String> {
-            at += 1;
-            let signed = client.attest(&net.network, "c", body)?;
-            Ok(store
-                .append_event(author, &net.network, "c", signed, vec![], at)?
-                .hash)
-        };
-    let mut originals = vec![];
-    for body in [owner(&net.a)?, owner(&net.b)?] {
-        originals.push(write(&mut store, &net.a, body)?);
-    }
-    let settled = outcome(&store)?;
-    let losing_owner = if settled == Some(net.a.device_id()?) {
-        &net.b
-    } else {
-        &net.a
-    };
-    let winning_owner =
-        originals[usize::from(losing_owner.device_id()? == net.a.device_id()?)].clone();
-    let mut undercut = false;
+    // Hashes are random, so a winner hashed in the upper half is drawn first; each retry then
+    // undercuts it with probability at least one half.
     for _ in 0..64 {
-        let retry = write(&mut store, &net.b, owner(losing_owner)?)?;
-        undercut |= retry < winning_owner;
-        assert_eq!(
-            outcome(&store)?,
-            settled,
-            "a retry changed a settled decision"
-        );
-        if undercut {
-            break;
+        let net = net()?;
+        let mut store = store(&net)?;
+        conversation(&mut store, &net)?;
+        let mut at = 10;
+        let mut originals = vec![];
+        for body in [owner(&net.a)?, owner(&net.b)?] {
+            originals.push(write(&mut store, &net, &mut at, &net.a, body)?);
+        }
+        let settled = outcome(&store, &net)?;
+        let losing_owner = if settled == Some(net.a.device_id()?) {
+            &net.b
+        } else {
+            &net.a
+        };
+        let winning_owner =
+            originals[usize::from(losing_owner.device_id()? == net.a.device_id()?)].clone();
+        if winning_owner.as_str() < "8" {
+            continue;
+        }
+        for _ in 0..64 {
+            let retry = write(&mut store, &net, &mut at, &net.b, owner(losing_owner)?)?;
+            assert_eq!(
+                outcome(&store, &net)?,
+                settled,
+                "a retry changed a settled decision"
+            );
+            if retry < winning_owner {
+                return Ok(());
+            }
         }
     }
-    assert!(
-        undercut,
-        "a retry hashed below the winner, so an outer-hash tie-break would have flipped the owner"
-    );
-    Ok(())
+    panic!("no retry hashed below the winner, so the outer-hash tie-break was never exercised")
 }
 
 #[test]
