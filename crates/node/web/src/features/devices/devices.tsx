@@ -87,7 +87,6 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
-    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>{device.directory.revoked.map((item) => <span key={item.device_id} className="font-mono">{item.device_id}</span>)}</Details> : null}
   </div>
 }
 

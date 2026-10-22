@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, X, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -229,9 +229,11 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
-    <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
-      <span className="min-w-0 flex-1 truncate" title={entry.address}>{addressName(entry.address)}</span>
-      <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
+    <ul className="grid gap-1">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex min-h-11 items-center rounded-lg bg-muted/60">
+      <Button type="button" variant="ghost" className="min-w-0 flex-1 justify-start" title={entry.address} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}><span className="truncate">{addressName(entry.address)}</span></Button>
+      <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${addressName(entry.address)}`} title="移除" disabled={linking} onClick={() => {
+        try { device.removeEntry(entry); if (device.entries.length === 1) setLane(null) } catch (cause) { setError(messageOf(cause)) }
+      }}><X aria-hidden="true" /></Button>
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
