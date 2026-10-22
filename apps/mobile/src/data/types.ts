@@ -35,7 +35,7 @@ export type Conversation = {
 /** A file picked for the next message. */
 export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
 
-export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean; current: boolean }
+export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean; current: boolean; entry: boolean }
 
 export type WorkspaceSnapshot = {
   session: Session

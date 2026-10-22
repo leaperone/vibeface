@@ -18,7 +18,7 @@ export default function DeviceDetail() {
   const { busy, error, run } = useRun()
   const [removing, setRemoving] = useState(false)
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这台设备" />
-  const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current
+  const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: member.name }} />
     <View className="flex-row items-center gap-4">
@@ -30,7 +30,7 @@ export default function DeviceDetail() {
             <View className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
             <Text className={cn('text-meta', member.online ? 'text-success' : 'text-muted-foreground')}>{member.online ? '在线' : '离线'}</Text>
           </View>
-          {member.current ? <Text className="text-meta text-muted-foreground">本机</Text> : null}
+          {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
           {member.admin ? <View className="flex-row items-center gap-1"><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理员</Text></View> : null}
         </View>
       </View>

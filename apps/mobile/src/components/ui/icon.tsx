@@ -8,8 +8,9 @@ type IconProps = LucideProps & {
   as: LucideIcon;
 } & React.RefAttributes<LucideIcon>;
 
-function IconImpl({ as: IconComponent, ...props }: IconProps) {
-  return <IconComponent {...props} />;
+// Without a `fill-*` class the mapping yields `fill: undefined`, which must not override Lucide's `fill="none"`.
+function IconImpl({ as: IconComponent, fill, ...props }: IconProps) {
+  return <IconComponent {...props} {...(fill === undefined ? {} : { fill })} />;
 }
 
 const StyledIcon = withUniwind(IconImpl, {
@@ -20,6 +21,10 @@ const StyledIcon = withUniwind(IconImpl, {
   color: {
     fromClassName: 'className',
     styleProperty: 'color',
+  },
+  fill: {
+    fromClassName: 'className',
+    styleProperty: 'fill',
   },
 });
 

@@ -100,7 +100,7 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
       <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
         <Text numberOfLines={1} className="shrink font-medium">{member.name}</Text>
-        {member.current ? <Text className="text-meta text-muted-foreground">本机</Text> : null}
+        {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
         {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
       </View>
       <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />

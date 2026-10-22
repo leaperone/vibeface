@@ -99,7 +99,7 @@ function Live({ children }: { children: ReactNode }) {
   const members: Member[] = (device.directory?.members ?? []).map((member) => ({
     device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
     online: member.kind === 'node' ? nodes.some((node) => node.device_id === member.device_id && node.online) : member.device_id === me,
-    current: member.device_id === me || member.device_id === device.ready?.entry.device_id,
+    current: member.device_id === me, entry: member.device_id === device.ready?.entry.device_id,
   }))
 
   const actions = useMemo<WorkspaceActions>(() => {
