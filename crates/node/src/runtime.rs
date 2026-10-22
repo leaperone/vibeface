@@ -296,6 +296,26 @@ impl Runtime {
         crate::logging::add_secret(&node.cursor_callback_token);
         Ok(node)
     }
+    /// Opens a data directory this process has just closed. On Linux a child that another test
+    /// thread is spawning keeps a copy of every open descriptor until its exec closes them, so the
+    /// released lock can stay held for a moment.
+    #[cfg(test)]
+    pub(crate) async fn reopen(dir: &Path) -> Result<Self> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match Self::open(dir).await {
+                Err(error)
+                    if matches!(
+                        error.downcast_ref(),
+                        Some(std::fs::TryLockError::WouldBlock)
+                    ) && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                result => return result,
+            }
+        }
+    }
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;

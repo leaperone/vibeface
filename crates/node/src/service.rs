@@ -248,12 +248,30 @@ mod tests {
         drop(running);
         let pending = data.join("update-pending.json");
         std::fs::write(&pending, b"{}").unwrap();
-        let error = command(&root, &data, &binary, Action::Install).unwrap_err();
+        // A child another test thread is spawning may still hold the released lock, as in
+        // `Runtime::reopen`.
+        let install = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match command(&root, &data, &binary, Action::Install) {
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref(),
+                            Some(std::fs::TryLockError::WouldBlock)
+                        ) && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    result => return result,
+                }
+            }
+        };
+        let error = install().unwrap_err();
         assert!(error.to_string().contains("recover the pending update"));
         assert!(command(&root, &data, &binary, Action::Status).is_ok());
         assert_eq!(std::fs::read(&pending).unwrap(), b"{}");
         std::fs::remove_file(pending).unwrap();
-        assert!(command(&root, &data, &binary, Action::Install).is_ok());
+        assert!(install().is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1895,7 +1895,7 @@ mod tests {
         )
         .await?;
         drop(node);
-        let reopened = Runtime::open(&dir).await?;
+        let reopened = Runtime::reopen(&dir).await?;
         assert_eq!(
             serde_json::to_value(reopened.settings_snapshot())?,
             saved["settings"]
@@ -2128,7 +2128,7 @@ mod tests {
         assert_eq!(cursor_off["providers"][1]["state"], "off");
 
         drop(node);
-        let reopened = Runtime::open(&dir).await?;
+        let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
         assert!(!providers.switches.cursor.enabled);
         assert!(!providers.switches.serves(
