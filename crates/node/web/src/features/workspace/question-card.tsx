@@ -33,8 +33,8 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
     {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-      <span className="min-w-0 truncate sm:flex-1" title={question.text}>{question.text}</span>
-      <span className="min-w-0 text-foreground [overflow-wrap:anywhere] sm:max-w-[60%]">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
+      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
+      <span className="min-w-0 flex-1 text-foreground [overflow-wrap:anywhere]">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
     </span>
   </p>
 
