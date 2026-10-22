@@ -36,12 +36,12 @@ pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    for member in bundle
-        .genesis
-        .members()
-        .iter()
-        .chain(bundle.checkpoints.iter().flat_map(|c| &c.members))
-    {
+    for member in bundle.genesis.members().iter().chain(
+        bundle
+            .checkpoints
+            .iter()
+            .flat_map(|c| c.directory.iter().flat_map(|d| &d.members)),
+    ) {
         if member.kind == IdentityKind::Node {
             names.insert(member.device_id.clone(), member.name.clone());
         }
@@ -490,15 +490,12 @@ impl Runtime {
             hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
-    /// What this Node offers its peers right now; a provider that is off is not offered.
+    /// What this Node offers its peers right now; work it does not execute is not offered.
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
         let manager = self.assistant().map(|m| m.provider);
         let mut codex = self.codex.capability().await;
-        codex["enabled"] = json!(self.providers().serves(
-            crate::providers::Provider::Codex,
-            crate::providers::Role::Execution
-        ));
+        codex["enabled"] = json!(self.providers().switches.execution);
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
             "manager_capabilities":manager.map(|kind|kind.capabilities()),

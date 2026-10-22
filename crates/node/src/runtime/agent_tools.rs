@@ -267,10 +267,7 @@ impl Runtime {
             return Ok(dispatch_value(&dispatch));
         }
         ensure!(
-            self.providers().serves(
-                crate::providers::Provider::Codex,
-                crate::providers::Role::Execution
-            ),
+            self.providers().switches.execution,
             "Codex execution is turned off on this device"
         );
         let cwd = spec.cwd.clone();

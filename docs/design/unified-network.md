@@ -106,9 +106,12 @@ Revocation { device_id, cutoff_seq, cutoff_hash: Option<Hash> }
 
 RootCheckpoint {
 	version, network_id, epoch,
-	members: Vec<Member>,
-	retired: Vec<Revocation>,   // 不再保留的设备和它们最终的写入上限
-	signature,              // 根私钥
+	recovery_key: DeviceId,     // 下一把恢复密钥，只有它能签下一个 checkpoint
+	directory: Option<{
+		members: Vec<Member>,
+		retired: Vec<Revocation>,   // 不再保留的设备和它们最终的写入上限
+	}>,                         // 空表示只换恢复密钥，目录沿用上一 epoch
+	signature,              // 当前恢复密钥
 }
 
 NetworkState { genesis, checkpoints: Vec<RootCheckpoint>, events: Vec<GovernanceEvent> }
@@ -123,8 +126,9 @@ NetworkState { genesis, checkpoints: Vec<RootCheckpoint>, events: Vec<Governance
 - `node` 成员不能持有 `manage`。Node 常驻无人值守的机器，不签成员变更。
 - 管理设备可以撤销任何设备，包括其他管理设备和自己。并发的 `Grant` 与 `Revoke` 冲突时撤销优先。
 - 撤销后，该设备只有不超过上限的日志条目计入投影，规则见 5.5 节。超过上限的事件仍可入库，但不计入，所以各副本不论先收到撤销还是先收到事件，结果都一致。同一设备有多条撤销时取序号最大的一条，序号相同时取 hash 较大的一条。
-- 根私钥只用于签 `Genesis` 和 `RootCheckpoint`。`RootCheckpoint.epoch` 严格递增，最多 64 个。新 checkpoint 只追加，不丢弃历史：`NetworkState` 保留所有 checkpoint 和各 epoch 的 `GovernanceEvent`，两份 `NetworkState` 的合并是并集，与合并顺序无关。同一 epoch 的 checkpoint 必须完全相同。每个 epoch 从自己的 checkpoint 成员出发投影，当前目录取最高 epoch。
+- 根私钥只用于签 `Genesis` 和第一个 `RootCheckpoint`。之后每个 checkpoint 由上一个 checkpoint 的 `recovery_key` 签名，所以每次根恢复和每次换恢复密码都换一把恢复密钥，旧恢复文件里的密钥签的东西任何 Node 都不再接受。`RootCheckpoint.epoch` 从 2 起连续递增，最多 64 个。新 checkpoint 只追加，不丢弃历史：`NetworkState` 保留所有 checkpoint 和各 epoch 的 `GovernanceEvent`，两份 `NetworkState` 的合并是并集，与合并顺序无关。同一 epoch 的 checkpoint 必须完全相同。每个 epoch 从自己的 checkpoint 成员出发投影，当前目录取最高 epoch。
 - 根恢复时，没有保留的 Node 连同本机记录的日志头写入新 checkpoint 的 `retired`，此前撤销或退役的设备保留原上限，`retired` 与 `members` 不重叠。旧 epoch 的治理事件以后仍可同步入库，但不能放宽当前的上限。
+- 换恢复密码写一个 `directory` 为空的 checkpoint：只换恢复密钥，新 epoch 从上一 epoch 的完整投影出发，后到的撤销照样计入。
 - 业务事件的 `Attestation` 要求签名设备在任一 epoch 中做过客户端，即 `Genesis.first_client`、各 checkpoint 中的客户端和被授予的客户端。根恢复后，历史请求的签名仍能验证。本机新追加的事件仍要求当前客户端签名。
 - 每台设备的私钥只在本设备生成和保存。Node 不持有根私钥。
 
@@ -198,11 +202,13 @@ code = u32_be(SHA256("vibeface:sas:v1" ‖ network_id ‖ invite_id ‖ J 公钥
 | `join_status` | 新设备或管理设备 | 新设备带 `join_id`，可带 `reveal`；管理设备不带参数时列出待批准请求 | 状态 `pending`、`confirming`、`joined`、`rejected` 或 `expired`，以及当前可见的随机数和公钥 |
 | `approve` | 管理设备 | `join_id`，加 `admin_nonce` 或签名的 `Grant`，拒绝时带 `reject=true` | 新状态 |
 | `revoke` | 管理设备 | 签名的 `Revoke` | 合并后的成员目录 |
-| `recover` | 持有恢复包的客户端，可以不是成员 | 根私钥签名的 `RootCheckpoint`，以及首次建网时的 `Genesis` 和本机一次性 capability | 新的成员目录 |
+| `recover` | 持有恢复包的客户端，可以不是成员 | `Genesis` 和完整 checkpoint 链，最后一个是当前恢复密钥签的新 checkpoint；首次建网或恢复到空 Node 时另带本机一次性 capability | 新的成员目录和恢复密钥 |
 
-建网复用 `recover`。未初始化的 Node 只接受带本机一次性 capability 的 `Genesis`，已初始化的 Node 只接受同一 `network_id` 且 epoch 更高的 `RootCheckpoint`。全部请求都可重试，重复提交同一内容返回原结果，同一 `join_id` 换内容被拒绝。
+建网复用 `recover`。未初始化的 Node 只接受带本机一次性 capability 的 `Genesis` 和链，已初始化的 Node 只接受同一 `network_id`、epoch 恰好加一、由当前恢复密钥签名的 `RootCheckpoint`。全部请求都可重试，重复提交同一内容返回原结果，同一 `join_id` 换内容被拒绝。
 
-根恢复有专用准入，不要求调用方是成员。只读的 `recovery_state` 要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 必须是本通道的设备，有效期最长两分钟。`recover` 先用 `Genesis` 中的根公钥验证 `RootCheckpoint` 的签名并要求 epoch 更高，验证通过之前不产生任何副作用。所以所有管理浏览器都丢失时，持恢复文件的新浏览器仍可在连接页选“用恢复文件找回”，签出的新目录把它列为管理设备。
+根恢复有专用准入，不要求调用方是成员。只读的 `recovery_state` 要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，请求可带恢复文件里的 checkpoint 链，Node 先合并再核对，`device_id` 必须是本通道的设备，有效期最长两分钟。`recover` 先用当前恢复密钥验证新 `RootCheckpoint` 的签名，验证通过之前不产生任何副作用。签名来自已被替换的恢复密钥时，两个方法都回 `this recovery key was replaced by a newer recovery`。网页在提交前先下载装着新恢复密钥和整条链的新恢复文件，结果未知时重发同一个 checkpoint，重复安装不改变任何东西。
+
+已见过新 checkpoint 的 Node 拒绝旧恢复文件。从没见过它的空 Node 仍可能接受旧文件，但这需要那台电脑的本机 capability；它与其他 Node 同步时，同一 epoch 两个不同的 checkpoint 报冲突，不会悄悄覆盖。checkpoint 上限 64 个，所以一组设备最多做 63 次根恢复或换恢复密码。所以所有管理浏览器都丢失时，持恢复文件的新浏览器仍可在连接页选“用恢复文件找回”，签出的新目录把它列为管理设备。
 
 `/api/local/join/request`、`/api/local/join/accept` 和 `/api/local/join/status` 删除。新 Node 的本机网页调用本机 Node，由本机 Node 经 iroh 对入口执行 `join` 和 `join_status`。CLI 为 `vibeface join <ticket> --name <名称>`，在终端显示短码并等待批准。
 

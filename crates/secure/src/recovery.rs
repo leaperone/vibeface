@@ -13,7 +13,8 @@ use crate::Result;
 const MEMORY_KIB: u32 = 19_456;
 const ITERATIONS: u32 = 2;
 const PARALLELISM: u32 = 1;
-const MAX_PAYLOAD: usize = 64 * 1024;
+/// The recovery key, genesis and every checkpoint since.
+const MAX_PAYLOAD: usize = 1024 * 1024;
 const MAX_ENVELOPE: usize = MAX_PAYLOAD * 2 + 4096;
 
 #[derive(Serialize, Deserialize)]

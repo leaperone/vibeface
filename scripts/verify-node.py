@@ -238,9 +238,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         result = { genesis, network_id: key.deviceId() }; break;
       }
       case 'backup': {
-        const key = root('root');
-        const payload = encoder.encode(JSON.stringify({ version: 1, network_id: key.deviceId(), root_secret_key: key.secretHex(), genesis: input.genesis, recovery_epoch: input.recovery_epoch || 1, decryption_keys: [] }));
-        try { result = { version: 1, network_id: key.deviceId(), recovery_epoch: input.recovery_epoch || 1, envelope: JSON.parse(decoder.decode(recoverySeal(payload, input.password))) }; }
+        const key = root(input.key || 'root');
+        const network = input.network_id || key.deviceId();
+        const payload = encoder.encode(JSON.stringify({ version: 1, network_id: network, root_secret_key: key.secretHex(), genesis: input.genesis, checkpoints: input.checkpoints || [] }));
+        try { result = { version: 1, network_id: network, envelope: JSON.parse(decoder.decode(recoverySeal(payload, input.password))) }; }
         finally { payload.fill(0); }
         break;
       }
@@ -250,7 +251,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         try {
           const payload = JSON.parse(decoder.decode(plaintext));
           roots.get('recovered')?.free(); roots.set('recovered', Identity.fromSecretHex(payload.root_secret_key));
-          result = { network_id: root('recovered').deviceId(), recovery_epoch: payload.recovery_epoch, genesis: payload.genesis };
+          result = { network_id: payload.network_id, genesis: payload.genesis, checkpoints: payload.checkpoints };
         } finally { plaintext.fill(0); }
         break;
       }
@@ -262,7 +263,9 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       case 'recovery_checkpoint': {
         const verified = verifyMembership(JSON.stringify(input.state), input.network_id);
-        try { result = JSON.parse(verified.createRecoveryCheckpoint(root('recovered'), JSON.stringify(input.members), JSON.stringify(input.heads), input.epoch)); }
+        roots.get('next')?.free();
+        const next = Identity.generate(); roots.set('next', next);
+        try { result = JSON.parse(verified.createRecoveryCheckpoint(root('recovered'), next.deviceId(), JSON.stringify(input.members), JSON.stringify(input.heads))); }
         finally { verified.free(); }
         break;
       }
@@ -1409,11 +1412,12 @@ def recover_fresh_node(node, backup, password):
     info = node.client.call("info")
     members = [{"device_id": node.client.own_id(), "kind": "client", "name": "Fresh recovery manager", "manage": True},
                {"device_id": node.device_id, "kind": "node", "name": info["name"], "manage": False}]
-    state = {"genesis": material["genesis"], "checkpoints": [], "events": []}
+    state = {"genesis": material["genesis"], "checkpoints": material["checkpoints"], "events": []}
     checkpoint = node.client.command("recovery_checkpoint", state=state, network_id=material["network_id"],
-                                     members=members, heads={}, epoch=material["recovery_epoch"])
-    node.client.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint}, status=400)
-    result = node.client.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint,
+                                     members=members, heads={})
+    chain = [*material["checkpoints"], checkpoint]
+    node.client.call("recover", {"genesis": material["genesis"], "checkpoints": chain}, status=400)
+    result = node.client.call("recover", {"genesis": material["genesis"], "checkpoints": chain,
                                           "capability": node.access["capability"]})
     node.client.network_id = backup["network_id"]
     require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"],
@@ -1438,18 +1442,32 @@ def verify_recovery(node, other, network):
                                              body={"type": "probe"})["signature"]
     response = other.call("recovery_state", stale, status=400)
     require("state" not in response, "a proof not signed by the root reveals no membership")
-    read = other.call("recovery_state", other.command("recovery_read_proof", network_id=network))
+    read = other.call("recovery_state", {**other.command("recovery_read_proof", network_id=network),
+                                         "checkpoints": material["checkpoints"]})
     view = node.client.call("directory")["view"]
     revoked = {item["device_id"] for item in view["revoked"]}
     keep = [member for member in view["members"] if member["device_id"] not in revoked]
     managers = [member["device_id"] for member in keep if member["manage"]]
     keep.append({"device_id": me, "kind": "client", "name": "Recovered management client", "manage": True})
     checkpoint = other.command("recovery_checkpoint", state=read["state"], network_id=network, members=keep,
-                               heads=read["heads"], epoch=material["recovery_epoch"])
-    result = other.call("recover", {"genesis": material["genesis"], "checkpoint": checkpoint})
+                               heads=read["heads"])
+    chain = [*read["state"]["checkpoints"], checkpoint]
+    renewed = other.command("backup", key="next", network_id=network, genesis=material["genesis"], checkpoints=chain,
+                            password=node.backup_password)
+    result = other.call("recover", {"genesis": material["genesis"], "checkpoints": chain})
     other.network_id = network
     require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"] > view["epoch"],
             "root recovery establishes a manager in a higher epoch")
+    retry = other.call("recover", {"genesis": material["genesis"], "checkpoints": chain})
+    require(retry["view"]["epoch"] == checkpoint["epoch"], "retrying the same recovery changes nothing")
+    refused = other.call("recovery_state", {**other.command("recovery_read_proof", network_id=network), "checkpoints": []},
+                         status=400)
+    require("state" not in refused and "replaced by a newer recovery" in json.dumps(refused),
+            "the recovery file used for recovery stops working")
+    other.command("recover_material", backup=renewed, password=node.backup_password)
+    other.call("recovery_state", {**other.command("recovery_read_proof", network_id=network), "checkpoints": chain})
+    node.backup = renewed
+    private_json(node.directory / "recovery-package.json", renewed)
     node.client.connect()
     node.client.authenticate(network)
     require(node.client.principal["can_manage"] and node.client.own_id() in managers,

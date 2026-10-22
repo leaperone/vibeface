@@ -83,6 +83,22 @@ impl LocalIdentity {
             ),
         }
     }
+    /// The recovery key of `sign_network_fixture`'s network in `epoch`.
+    #[cfg(test)]
+    pub(crate) fn fixture_root_at(&self, epoch: u64) -> Self {
+        match epoch {
+            0 | 1 => self.fixture_root(),
+            _ => Self {
+                secret_key_hex: digest(
+                    format!(
+                        "vibeface:network-fixture-root:{epoch}:{}",
+                        self.secret_key_hex
+                    )
+                    .as_bytes(),
+                ),
+            },
+        }
+    }
     #[cfg(test)]
     pub fn fixture_network_id(&self) -> Result<String> {
         self.fixture_root().device_id()
@@ -160,10 +176,21 @@ impl LocalIdentity {
             members.push(Member::new(&node, IdentityKind::Node, &name, false)?);
         }
         let mut state = NetworkState::new(genesis)?;
-        let epoch = revision
-            .checked_add(1)
-            .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create(&root, epoch, members, vec![])?)?;
+        for epoch in 2..=revision {
+            let next = self.fixture_root_at(epoch).device_id()?;
+            let signer = self.fixture_root_at(epoch - 1);
+            state.recover(RootCheckpoint::rotation(&state, &signer, &next)?)?;
+        }
+        let epoch = revision + 1;
+        let next = self.fixture_root_at(epoch).device_id()?;
+        let signer = self.fixture_root_at(epoch - 1);
+        state.recover(RootCheckpoint::recovery(
+            &state,
+            &signer,
+            &next,
+            members,
+            vec![],
+        )?)?;
         Ok(state)
     }
 }
