@@ -36,7 +36,7 @@ export function Onboarding() {
   }
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
     <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
-      <header className="grid gap-3"><span className="text-heading font-semibold tracking-tight">vibeface</span><Dots step={step} /></header>
+      <header className="grid gap-3"><span className="text-heading font-semibold tracking-tight">Vibeface</span><Dots step={step} /></header>
       {step === 3 ? <section className="grid gap-4 rounded-xl border bg-card p-5">
         <h2 className="flex items-center gap-2 text-heading font-semibold"><Bot aria-hidden="true" className="size-5 text-muted-foreground" />让这台电脑运行助手</h2>
         <AssistantSettings onboarding />

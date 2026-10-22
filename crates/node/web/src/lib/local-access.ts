@@ -4,7 +4,7 @@ import type { ConnectionEntry, PublicIdentity } from './node'
 type LocalLaunch = { token: string; deviceId: string }
 
 async function localResponse(response: Response): Promise<unknown> {
-  if (!response.ok) throw new Error('本机链接已过期。请从这台电脑上重新打开 vibeface。')
+  if (!response.ok) throw new Error('本机链接已过期。请从这台电脑上重新打开 Vibeface。')
   return response.json()
 }
 
@@ -12,7 +12,7 @@ export async function localBrowserEntry(own: PublicIdentity, launch: LocalLaunch
   let response: Response
   try { response = await fetch('/api/local/info', { credentials: 'same-origin', cache: 'no-store', redirect: 'error' }) }
   catch {
-    if (launch) throw new Error('连不上这台电脑。请确认 vibeface 正在运行。')
+    if (launch) throw new Error('连不上这台电脑。请确认 Vibeface 正在运行。')
     return null
   }
   if (!response.ok && !launch) return null

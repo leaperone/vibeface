@@ -15,7 +15,7 @@ const patterns: [RegExp, string][] = [
   [/Missing environment variable|CURSOR_API_KEY is (required|missing)/i, 'AI 服务缺少密钥。去设备页的 AI 服务里填上。'],
   [/Codex execution is turned off/i, '这台设备的 Codex 没开执行任务。去设备页的 AI 服务里打开。'],
   [/assistant's provider is turned off/i, '助手用的 AI 服务已关闭。去设备页的 AI 服务里开启。'],
-  [/is set by vibeface/i, '这个变量由 vibeface 自己设置，换个名字。'],
+  [/is set by Vibeface/i, '这个变量由 Vibeface 自己设置，换个名字。'],
   [/variable names use/i, '变量名只能用字母、数字和下划线，且不能以数字开头。'],
   [/variable value must be|variables per provider/i, '变量值不能为空，也不能太长。'],
   [/Cursor SDK bridge did not start within/i, 'Cursor 组件启动超时，这次回复没有开始。请稍后再发一次。'],

@@ -1269,7 +1269,7 @@ impl Runtime {
             .context("set a webhook secret first")?;
         let event_id = format!("test-{}", uuid::Uuid::new_v4().simple());
         let body = json!({"schema_version":triage::SCHEMA_VERSION,"event_id":event_id,"test":true,
-            "summary":"vibeface webhook test","device_id":self.identity.device_id()?})
+            "summary":"Vibeface webhook test","device_id":self.identity.device_id()?})
         .to_string();
         let (status, error) = post_webhook(&url, &secret, &event_id, &body).await;
         Ok(json!({"ok":matches!(status, Some(200..=299)),"status":status,"error":error}))

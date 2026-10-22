@@ -22,9 +22,9 @@ const checks: Record<Exclude<Provider, "disabled">, { key: string; label: string
   codex_sdk: [
     { key: "Node.js", label: "缺少 Node.js 18 以上", doc: "node.md#使用-codex-sdk" },
     { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
-    { key: "Codex SDK sidecar", label: "vibeface 安装不完整，请重新安装", doc: "install.md" },
+    { key: "Codex SDK sidecar", label: "Vibeface 安装不完整，请重新安装", doc: "install.md" },
     { key: "Codex SDK dependencies", label: "助手组件还没装好", doc: "install.md#npm-nightly" },
-    { key: "Codex App Server", label: "Codex 后台服务没启动，重启 vibeface", doc: "node.md#使用-codex-sdk" },
+    { key: "Codex App Server", label: "Codex 后台服务没启动，重启 Vibeface", doc: "node.md#使用-codex-sdk" },
   ],
   cursor_sdk: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
 }

@@ -228,7 +228,7 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     ensure!(
         !name.starts_with("VIBEFACE_")
             && !(provider == Provider::Cursor && name.starts_with("CURSOR_SDK_")),
-        "{name} is set by vibeface"
+        "{name} is set by Vibeface"
     );
     ensure!(
         !value.is_empty() && value.len() <= 4096 && !value.contains('\0'),
