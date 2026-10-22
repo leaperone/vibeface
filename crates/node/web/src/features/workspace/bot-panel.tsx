@@ -1,7 +1,7 @@
 "use client"
 
 import { useRef, useState, type ReactNode } from "react"
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
+import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { formatWhen, scheduleDetail, scheduleFrequency } from "./bot-settings"
@@ -60,6 +60,10 @@ export function BotPanelButton() {
                 </div>
               </li>
             })}</ul> : <Empty>还没有定时任务</Empty>}
+          </Section>
+          <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
+            {view.memory.length ? <ul className="grid gap-2">{view.memory.map((note) => <li key={note.memory_id} className="line-clamp-2 text-meta [overflow-wrap:anywhere]" title={note.text}>{note.text}</li>)}</ul>
+              : <Empty>还没有笔记</Empty>}
           </Section>
           <Section icon={BookOpen} title="共用 skill" count={view.skills.length}>
             {view.skills.length ? <ul className="grid gap-3">{view.skills.map((skill) => <li key={skill.skill_id} className="grid gap-0.5">
