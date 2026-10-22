@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArchiveRestore, KeyRound, Laptop, Monitor } from 'lucide-react'
-import { BusyIcon, Details, DetailRow, FilePicker, InlineError } from '@/components/app/kit'
+import { ArchiveRestore, KeyRound } from 'lucide-react'
+import { BusyIcon, Details, DetailRow, FilePicker, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { Member } from '@/lib/node'
@@ -8,6 +8,7 @@ import { messageOf, parseEntry } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice } from './context'
+import { deviceIcon } from '@/features/devices/devices'
 
 function field(form: HTMLFormElement, name: string) { const element = form.elements.namedItem(name); return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : '' }
 /** A failed try keeps the chosen file and name; only typed passwords leave the page. */
@@ -54,12 +55,12 @@ export function RecoveryReview() {
     <fieldset disabled={busy} className="grid gap-2">
       {review.members.map((member) => {
         const required = member.device_id === review.requiredNode
-        const Icon = member.kind === 'node' ? Laptop : Monitor
+        const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: required })
         return <div key={member.device_id} className="grid gap-1 rounded-lg bg-muted/60 px-3 py-2">
           <div className="flex min-h-9 items-center gap-2">
             <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             <span className="min-w-0 flex-1 truncate">{member.name}</span>
-            {required ? <span className="text-meta text-muted-foreground">正在连接</span>
+            {required ? <span className="text-meta text-muted-foreground">当前连接</span>
               : <label className="flex items-center gap-1.5 text-meta"><input type="checkbox" checked={lost.includes(member.device_id)} onChange={(event) => setLost(toggle(lost, member.device_id, event.target.checked))} />丢了</label>}
           </div>
           {member.kind === 'client' && !lost.includes(member.device_id) ? <label className="flex items-center gap-1.5 ps-6 text-meta text-muted-foreground"><input type="checkbox" checked={managers.includes(member.device_id)} onChange={(event) => setAdmins(toggle(managers, member.device_id, event.target.checked))} />管理员</label> : null}
@@ -70,9 +71,12 @@ export function RecoveryReview() {
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" onClick={device.cancelSensitive}>取消</Button>
-      <Button type="button" disabled={busy} onClick={() => void run(() => device.confirmRecovery(review.members
-        .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
-        .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) }))))}><BusyIcon busy={busy} />恢复</Button>
+      <Button type="button" disabled={busy} onClick={() => void run(async () => {
+        await device.confirmRecovery(review.members
+          .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
+          .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) })))
+        toast('已下载新的恢复文件，用它替换旧文件', { tone: 'success' })
+      })}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}
     <Details><DetailRow label="个人网络" value={review.networkId} mono /></Details>

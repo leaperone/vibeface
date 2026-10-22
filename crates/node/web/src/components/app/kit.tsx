@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, Copy, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
 import { messageOf } from "@/lib/node"
@@ -66,13 +66,9 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, ch
 
 export function SafetyCode({ code, label = "安全码" }: { code: string; label?: string }) {
   const groups = code.match(code.length === 6 ? /.{3}/g : /.{1,4}/g) ?? []
-  const [copied, setCopied] = useState(false)
   return <div className="flex flex-wrap items-center gap-3">
     <span className="sr-only">{label}</span>
     <output aria-label={`${label} ${code.split("").join(" ")}`} className="font-mono text-2xl tracking-[0.1em] tabular-nums">{groups.join(" ")}</output>
-    <Button type="button" variant="ghost" size="icon" aria-label="复制" title="复制" onClick={() => { void navigator.clipboard?.writeText(code).then(() => setCopied(true)) }}>
-      {copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}
-    </Button>
   </div>
 }
 

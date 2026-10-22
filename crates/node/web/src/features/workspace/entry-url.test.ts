@@ -557,16 +557,12 @@ test("any entrance stops an unfinished task once, even on another device", async
     const words = (elements: { props: Record<string, unknown> }[]) => elements.flatMap(({ props }) => [props.children].flat()).filter((child) => typeof child === 'string' || typeof child === 'number').join('')
     const turn = { thread_id: 'th', turn_id: 'tu' }
     data.works = [{ ...work, ...turn }, { ...work, ...turn, work_id: 'steered' }]
-    let elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
-    assert.match(words(elements), /和另外 1 个任务共用一个回合，停止会一起停掉。/)
+    const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.match(words(elements), /会一起停止/, 'a shared turn lists what stops with it')
+    assert.match(words(elements), /一起停止 2 个任务/)
     ;(stop(elements)?.props.onClick as () => void)()
     await settleComponent()
-    assert.deepEqual(stopped, ['work'], 'a shared turn asks once more before stopping')
-    elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
-    assert.match(words(elements), /确认一起停止/)
-    ;(stop(elements)?.props.onClick as () => void)()
-    await settleComponent()
-    assert.deepEqual(stopped, ['work', 'work'])
+    assert.deepEqual(stopped, ['work', 'work'], 'the button already names the count, so one tap stops')
   } finally { app.close() }
 })
 

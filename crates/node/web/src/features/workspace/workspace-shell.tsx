@@ -137,7 +137,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             {chatRoute ? <AssistantPanelButton /> : null}
             <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
           </div>
-          {back ? <Button asChild variant="ghost" size="icon" className="relative -me-3 md:hidden">
+          {back ? pathname === "/inbox" ? null : <Button asChild variant="ghost" size="icon" className="relative -me-3 md:hidden">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
               <Inbox aria-hidden="true" />
               {waiting ? <span className="absolute top-1 right-1 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[11px] leading-4 font-semibold text-background">{waiting}</span> : null}

@@ -3,6 +3,7 @@ import { Markdown, PlainText } from '@/components/app/markdown'
 import { messageKey, replyStatusLabel } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
 import { Artifact } from './artifact'
+import { useWorkspace } from '@/features/workspace/context'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' }
 
@@ -17,6 +18,7 @@ function shortTime(when: Date) {
  * of a run from the same sender, where the time shows. `routine` names the routine whose run produced this reply.
  */
 export function Message({ message, routine, last = true }: { message: ChatMessage; routine?: string; last?: boolean }) {
+  const { connectionOnline } = useWorkspace()
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
   const full = when?.toLocaleString('zh-CN')
@@ -37,7 +39,7 @@ export function Message({ message, routine, last = true }: { message: ChatMessag
       <span className="sr-only">助手：</span>
       <Markdown text={message.text} />
     </div>
-    {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className="size-4 animate-spin text-muted-foreground" /> : null}
+    {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className={`size-4 text-muted-foreground ${connectionOnline ? 'animate-spin' : ''}`} /> : null}
     {ended ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}</span> : null}
     {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
     {time}

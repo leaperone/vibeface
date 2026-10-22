@@ -1,7 +1,8 @@
 "use client"
 
 import { useId, useState } from "react"
-import { CircleQuestionMark, Unplug, WifiOff } from "lucide-react"
+import { Link } from "@tanstack/react-router"
+import { Bot, ChevronRight, CircleQuestionMark, Unplug, WifiOff } from "lucide-react"
 import { ActionCard, Details, toast } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "../identity/context"
@@ -27,7 +28,8 @@ export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device:
 const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
 
 /** "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run. */
-export function ConfirmCard({ check }: { check: PendingCheck }) {
+/** `inbox`: also names the assistant and links to its chat. */
+export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inbox?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
@@ -46,10 +48,12 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = nodeName(check.target_node, lookup)
   const reason = confirmText(check, device)
+  const bot = inbox ? workspace.bots.find((item) => item.conversation_id === check.conversation_id) : undefined
   return <ActionCard
     icon={confirmIcons[check.reason]}
     title={`待确认 · ${check.title || "任务结果"}`}
-    meta={device}
+    meta={bot ? <span className="flex min-w-0 items-center gap-3">{device}<Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
+      <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" /></Link></span> : device}
     actions={<>
       <ActionButton disabled={disabled} action={answer("interrupted")}>没做完</ActionButton>
       <ActionButton variant="default" disabled={disabled} action={answer("completed")}>做完了</ActionButton>
