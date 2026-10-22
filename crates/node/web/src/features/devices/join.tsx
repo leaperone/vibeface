@@ -65,7 +65,7 @@ export function JoinCard({ request, auto = false }: { request: JoinRequest; auto
       : <Button type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", () => device.approveJoin(request.join_id, request.kind === "client" && manage), "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
     </>}
   >
-    <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上的比对" : "等新设备显示安全码"}</p>
+    <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上的安全码比对" : "等新设备显示安全码"}</p>
     {request.code ? <SafetyCode code={request.code} /> : <Skeleton className="h-8 w-40" />}
     {request.kind === "client" ? <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为管理员</label> : null}
     <InlineError error={action.error} />
