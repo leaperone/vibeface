@@ -8,7 +8,7 @@
     "verbatimModuleSyntax": true,
     "paths": {
       "@/*": ["./src/*"],
-      "@vibeface/client/*": ["../../packages/client/src/*", "../../crates/node/web/src/features/*"]
+      "@vibeface/client/*": ["../../packages/client/src/*"]
     }
   },
   "include": ["**/*.ts", "**/*.tsx", "expo-env.d.ts"]
