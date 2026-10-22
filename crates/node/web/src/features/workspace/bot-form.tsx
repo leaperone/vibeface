@@ -38,6 +38,8 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const submitting = useRef(false)
   const wasOpen = useRef(false)
   useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
+  // Folders come only from devices that run a bot, so with none of those the hint points at setting one up.
+  const botDevice = workspace.nodes.some((node) => !node.revoked && node.online && node.capabilities?.manager)
   const projects = workspace.nodes.flatMap((node, index) => {
     if (node.revoked || !node.online || !node.capabilities?.manager) return []
     const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
@@ -107,7 +109,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
                 {projects.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect>
             )}
-            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">还没有可用的文件夹，可在「设备」里添加</FieldDescription>}
+            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">{botDevice ? "还没有可用的文件夹，可在「设备」里添加" : "设备能运行 Bot 后就能选"}</FieldDescription>}
           </Field>
           <InlineError error={error} />
           <div className="flex flex-wrap gap-3">
