@@ -61,6 +61,7 @@ class AuthenticationError extends Error {}
 const INVITE_TTL_MS = 10 * 60 * 1000
 /** Not an error: the entry buttons below it are the way in. */
 export const NOT_JOINED = '这个浏览器还没加入'
+export const BROWSER_REMOVED = '这个浏览器已被移除，请在管理设备上重新添加'
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const superseded = () => new Error('这个恢复文件已作废。请用最近一次下载的恢复文件。')
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
@@ -333,7 +334,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台设备已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (candidate === target.entry && removed(auth, active, target.networkId)) return true
-        if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? '这个浏览器已被移除。需要时请在管理设备上重新添加。' : '这个浏览器已不在我的设备里。')
+        if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? BROWSER_REMOVED : '这个浏览器已不在我的设备里。')
         if (auth.principal === null) throw new Error('这个访问地址还没同步到这个浏览器。')
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
@@ -417,7 +418,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
     if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return
     if (auth.principal === null) {
-      setError(auth.revoked === true ? '这个浏览器已被移除。请在管理设备上重新添加。' : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : NOT_JOINED)
+      setError(auth.revoked === true ? BROWSER_REMOVED : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : NOT_JOINED)
       return
     }
     await authenticate(auth, active)

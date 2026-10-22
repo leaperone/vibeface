@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -11,7 +11,7 @@ import { passphrase } from '@/lib/secure'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from './connection-lane'
-import { NOT_JOINED, useDevice } from './context'
+import { BROWSER_REMOVED, NOT_JOINED, useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 import { joinTicket } from '../../../transport.js'
 
@@ -199,10 +199,12 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     })
   }
 
-  const deviceError = device.error === NOT_JOINED ? '' : device.error
-  const quiet = notice || (!error && device.error === NOT_JOINED ? NOT_JOINED : '')
+  // Not being, or no longer being, one of my devices is a state to explain, not an error.
+  const membership = device.error === NOT_JOINED || device.error === BROWSER_REMOVED ? device.error : ''
+  const deviceError = membership ? '' : device.error
+  const quiet = notice || (!error ? membership : '')
   const alert = error || deviceError && device.phase !== 'reconnecting' ? <InlineError error={error || deviceError} />
-    : quiet ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground">{quiet === NOT_JOINED ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
+    : quiet ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
@@ -344,7 +346,7 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const [downloaded, setDownloaded] = useState(false)
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存恢复文件">
-    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
+    <Button type="button" variant={downloaded ? 'outline' : 'default'} className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : <><Download aria-hidden="true" />下载恢复文件</>}</Button>
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
