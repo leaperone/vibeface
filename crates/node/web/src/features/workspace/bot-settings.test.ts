@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleName, scheduleTrigger } from "./bot-settings.ts"
+import { formatWhen, lineDiff, placeChanges, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger } from "./bot-settings.ts"
 import { parseConversation } from "./model.ts"
 import type { BotChangeRecord } from "./types.ts"
 
@@ -99,4 +99,10 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
   assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
     [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }])
+})
+
+test("a reminder whose note is its name shows the sentence once", () => {
+  assert.equal(scheduleDetail({ name: "看看部署", prompt: " 看看部署\n" }), null)
+  assert.equal(scheduleDetail({ name: "看看部署", prompt: "看看部署\n顺便查日志" }), "看看部署\n顺便查日志")
+  assert.equal(scheduleDetail({ name: "每日巡检", prompt: "检查依赖更新" }), "检查依赖更新")
 })

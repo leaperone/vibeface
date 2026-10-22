@@ -2,7 +2,7 @@ import { useId, type ReactNode } from 'react'
 import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details } from '@/components/app/kit'
-import { formatWhen, lineDiff, scheduleFrequency, type DiffLine } from '@/features/workspace/bot-settings'
+import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@/features/workspace/bot-settings'
 import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView } from '@/features/workspace/types'
 
 function cardTitle(changes: BotChange[]) {
@@ -112,6 +112,7 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
   if (!after) return <Row icon={icon} label={schedule.name} tag={tag} removed />
   const frequency = scheduleFrequency(after), previous = before ? scheduleFrequency(before) : frequency
   const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
+  const detail = scheduleDetail(after)
   return <Row icon={icon} label={after.name} tag={tag}>
     {before && before.name !== after.name ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
     {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
@@ -120,7 +121,7 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
       {!after.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
         : next !== null ? <span>{once ? '' : '下次 '}{formatWhen(next)}</span> : null}
     </p>
-    <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.prompt}</p></Details>
+    {detail ? <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{detail}</p></Details> : null}
   </Row>
 }
 

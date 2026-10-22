@@ -16,6 +16,11 @@ export function scheduleFrequency(schedule: Pick<BotSchedule, "first_run_at_ms" 
   return `每 ${every} 分钟`
 }
 
+/** The prompt when it says more than the name; a reminder's name is the first line of its note. */
+export function scheduleDetail(schedule: Pick<BotSchedule, "name" | "prompt">): string | null {
+  return schedule.prompt.trim() === schedule.name.trim() ? null : schedule.prompt
+}
+
 /** "今天 09:00", "明天 09:00", "10月22日 09:00"; another year adds the year. */
 export function formatWhen(ms: number, now = Date.now()): string {
   const date = new Date(ms), today = new Date(now)
