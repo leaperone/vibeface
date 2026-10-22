@@ -153,7 +153,7 @@ impl Runtime {
             .into_iter()
             .map(|message| message_value(&store, network, message))
             .collect::<Result<Vec<_>>>()?;
-        let changes = store.assistant_changes(network, scope)?;
+        let changes = store.bot_changes(network, scope)?;
         let questions = store.conversation_questions(network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
         let now = now_ms();
@@ -175,8 +175,8 @@ impl Runtime {
             .collect();
         let memory = store.memories(network, scope)?;
         drop(store);
-        let assistant = self.assistant();
-        let manager = assistant.as_ref();
+        let manager = self.manager();
+        let manager = manager.as_ref();
         Ok(json!({
             "conversation":conversation,
             "bot":bot,
@@ -186,7 +186,7 @@ impl Runtime {
             "changes":changes,
             "questions":questions,
             "sessions":sessions,
-            "assistant":{"skills":skills,"schedules":schedules,"memory":memory},
+            "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory},
             "checks":checks,
             "local_node":self.identity.device_id()?,
             "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),

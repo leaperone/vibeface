@@ -327,7 +327,7 @@ impl Store {
                 )?
             }
             _ => anyhow::bail!(
-                "only user and assistant messages, work results and routing turns are delivered"
+                "only user and bot messages, work results and routing turns are delivered"
             ),
         };
         tx.commit()?;

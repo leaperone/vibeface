@@ -95,7 +95,7 @@ enum CodexCommand {
         method: String,
         params: Option<String>,
     },
-    /// Add a message to a thread as a work of this assistant turn: it steers the running turn or
+    /// Add a message to a thread as a work of this bot turn: it steers the running turn or
     /// starts one, and its result comes back like dispatch_work's. Reusing --id only reads back.
     Send {
         thread: String,
@@ -274,7 +274,7 @@ enum TriageAction {
         #[arg(long, value_name = "MS")]
         since: Option<i64>,
     },
-    /// The user should decide: ask in the chat of the assistant that owns the event's session.
+    /// The user should decide: ask in the chat of the bot that owns the event's session.
     Raise {
         #[arg(long)]
         event_id: String,
@@ -294,13 +294,13 @@ enum TriageAction {
         #[arg(long)]
         event_id: String,
     },
-    /// Hand the session a session question is about to an assistant; a repeat returns the owner.
+    /// Hand the session a session question is about to a bot; a repeat returns the owner.
     Assign {
         #[arg(long)]
         question: String,
-        /// The assistant's conversation ID.
+        /// The bot's conversation ID.
         #[arg(long)]
-        assistant: String,
+        bot: String,
     },
 }
 
@@ -475,7 +475,7 @@ async fn main() -> Result<()> {
                 } => {
                     ensure!(
                         std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
-                        "codex send runs inside an assistant turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one use `vibeface codex call turn/start`"
+                        "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one use `vibeface codex call turn/start`"
                     );
                     let args = json!({"thread":thread,"prompt":text,"call_ref":id,
                         "model":model,"effort":effort,"images":image});
@@ -1576,10 +1576,9 @@ async fn triage(options: Triage) -> Result<()> {
                 "request_id":request_id,"choices":choices})
         }
         TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
-        TriageAction::Assign {
-            question,
-            assistant,
-        } => json!({"action":"assign","question_id":question,"conversation_id":assistant}),
+        TriageAction::Assign { question, bot } => {
+            json!({"action":"assign","question_id":question,"conversation_id":bot})
+        }
     };
     let result = post_local(
         &local_node_url(&options.local)?,

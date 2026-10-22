@@ -45,14 +45,14 @@ impl Runtime {
     }
 
     /// Retires the current bridge after its running turns, then starts one for the current
-    /// settings when Cursor is the assistant and its key is set, so the next reply starts warm.
+    /// settings when Cursor is the bot and its key is set, so the next reply starts warm.
     /// A Cursor that is off only retires.
     pub(super) fn refresh_cursor(&self) {
         let Some(bridge) = self.cursor.get().cloned() else {
             return;
         };
         let launch = self
-            .assistant()
+            .manager()
             .filter(|manager| manager.provider == ManagerKind::CursorSdk)
             .and_then(|manager| {
                 let (key, env) =

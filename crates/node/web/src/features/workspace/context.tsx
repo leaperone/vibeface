@@ -104,7 +104,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     return context
   }
   const requireBotContext = (id = activeId.current) => {
-    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("请先选一个助手。")
+    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("请先选一个 Bot。")
     return requireContext(id)
   }
   const showError = (caught: unknown, action?: string, retry?: () => void) => { if (current()) setError({ text: messageOf(caught, action), retry }) }
@@ -318,14 +318,14 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
     if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
     // Every unanswered question is listed, so one missing from the list has its answer.
-    if (item.method === "set_primary_assistant") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
+    if (item.method === "set_primary_bot") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
     if (item.method === "control_schedule") {
       // Only schedules still ahead are listed, so a missing one is deleted or done either way.
-      const schedule = context.assistant.schedules.find((entry) => entry.schedule_id === item.params.schedule_id)
+      const schedule = context.bot_settings.schedules.find((entry) => entry.schedule_id === item.params.schedule_id)
       return !schedule || item.params.action !== "delete" && schedule.enabled === (item.params.action === "resume")
     }
     if (item.method === "set_owner") return (context.conversation?.owner_epoch ?? 0) >= Number(item.params.epoch)
@@ -489,11 +489,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     botCreationRef.current = null; setPendingBot(null)
   }
   const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
-    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.device_id) throw new Error("请回到原来的设备确认助手是否建好，内容已保留。")
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.device_id) throw new Error("请回到原来的设备确认 Bot 是否建好，内容已保留。")
     const known = parseBots(await connection.rpc("bots"))
     requireCurrent()
     const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
-    if (match && (match.bot_id !== pending.bot_id || match.conversation_id !== pending.conversation_id || match.name !== pending.name || match.instructions !== pending.instructions || !sameProject(match.project, pending.project))) throw new Error("找到了这个助手，请先确认它是否已经建好。")
+    if (match && (match.bot_id !== pending.bot_id || match.conversation_id !== pending.conversation_id || match.name !== pending.name || match.instructions !== pending.instructions || !sameProject(match.project, pending.project))) throw new Error("找到了这个 Bot，请先确认它是否已经建好。")
     clearPendingBot()
     if (!match) setNoticeText("确认没建成，可以修改后再试。")
     return match ?? null
@@ -506,7 +506,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     await refreshRef.current()
   }
   const sendMessage = (input: string, files: File[] = []) => withMutation(`message:${activeId.current}`, async () => {
-    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个助手。")
+    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个 Bot。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
     try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
@@ -530,11 +530,11 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
-      const name = inputText(input.name, "助手名称", 512), instructions = input.instructions.trim()
+      const name = inputText(input.name, "Bot 名称", 512), instructions = input.instructions.trim()
       if (new TextEncoder().encode(instructions).length > 8192) throw new Error("职责说明不能超过 8192 字节。")
       if (new TextEncoder().encode(JSON.stringify([name, instructions, input.project ?? null])).length > 12000) throw new Error("内容太长了，请缩短名称或说明。")
       const prior = botCreationRef.current
-      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("助手还没确认建好，内容已保留，请原样重试。")
+      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("Bot 还没确认建好，内容已保留，请原样重试。")
       if (prior?.submission?.state === "rejected") {
         const known = await checkRejectedBot(prior)
         if (known) { await selectBot(known); return known }
@@ -563,7 +563,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       }
       const bot = parseBot(record(response).bot)
       requireCurrent()
-      if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("助手创建结果和填写的内容不一致，请检查。")
+      if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("Bot 创建结果和填写的内容不一致，请检查。")
       clearPendingBot()
       await selectBot(bot)
       return bot
@@ -582,8 +582,8 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       if (activeId.current === id) await refreshRef.current()
     }),
     makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
-      const attestation = await attest("assistants", { type: "primary_assistant_set", conversation_id: id })
-      try { await signedWrite("primary", id, "set_primary_assistant", { conversation_id: id, attestation }) }
+      const attestation = await attest("bots", { type: "primary_bot_set", conversation_id: id })
+      try { await signedWrite("primary", id, "set_primary_bot", { conversation_id: id, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       await refreshRef.current()

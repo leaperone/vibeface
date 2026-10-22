@@ -401,7 +401,7 @@ Attestation {
 | `WorkFinished` | `work_id`、`outcome`、`result_text`、`failure_reason?`，结果正文过长时放入 `blobs` | 目标 Node，`unverified` 的复核由入口 Node 写 | `outcome` 为 `completed`、`failed`、`interrupted` 或 `unverified` |
 | `AutonomySet` | `mode: off \| report \| continue`、`version`、`attestation` | 入口 Node | 会话级自主授权决策，取代 #55 中的 `DecisionRecorded` 编码；直连 PR 已删除 |
 | `NotificationAcked` | `notification_id`、`client_id`、`attestation` | 入口 Node | 通知 ID 即产生通知的事件 hash |
-| `AssistantChanged` | `change_id`、`cause`、`change` | 调度 Node | 本人在聊天里要求修改助手名称、说明、共用 skill 或例行任务，见 [在聊天中修改助手](assistant-config.md) |
+| `BotChanged` | `change_id`、`cause`、`change` | 调度 Node | 本人在聊天里要求修改 Bot 名称、说明、共用 skill 或例行任务，见 [在聊天中修改 Bot](bot-config.md) |
 | `ContextCheckpoint` | `summary`、`covers: VersionVector` | 调度 Node | 保留现有类型，用于长会话的上下文压缩，`covered_heads` 改为版本向量 |
 
 `kind=codex` 表示本机协调 Agent 直连本机 App Server 发出、Node 观察的 Codex 回合，`kind=task` 表示把任务交给目标 Node 的协调 Agent。没有单独的执行层，见 `docs/design/agent-direct-app-server.md`。目标协调 Agent 在执行 `task` 时自己启动的 Codex 工作，记为一条 `parent_work` 指向原任务的新 `WorkDispatched`。
@@ -492,7 +492,7 @@ pending_events(hash TEXT PRIMARY KEY, envelope TEXT, missing TEXT)
 
 请求身份是 `SHA256(Attestation 签名内容 ‖ 签名设备编号)`，签名内容即 5.1 节的 `{network_id, scope_id, body}`。同一份已签名请求无论由哪个入口包装、外层事件 hash 是多少，请求身份都相同，所以换入口重试的副本合并为一份，不改变仲裁结果，外层事件 hash 不参与仲裁。Ed25519 签名是确定的，同一设备对同一内容只有一个签名，请求身份不需要包含签名本身。真正不同的决定才按上表仲裁；本人也可以签一个更高的版本或 epoch 来明确结果。
 
-**重算。** 事件在主分支上且作者没有分叉时，按作者的上限决定是否计入，计入的直接增量执行 reducer。成员目录变化（授予、撤销、checkpoint），或新入库的事件不在主分支上、作者已分叉时，在本批事务结束时重算。重算按有效集合重新计算每个事件的 `effective`，有变化时清空 reducer 写的投影表（会话、消息、Bot、助手配置、技能、例行任务、助手变更、工作、通知及确认、提醒及处理），再按 `(lamport, created_at_ms, hash)` 重放所有 `effective = 1` 的事件。调度队列、工作派发与停止、例行运行、outbox、分诊和邀请是本机账本，不在重算范围内，重算也不重放任何副作用。重算后向浏览器推送一条不带会话的 `changed`，网页整体刷新。
+**重算。** 事件在主分支上且作者没有分叉时，按作者的上限决定是否计入，计入的直接增量执行 reducer。成员目录变化（授予、撤销、checkpoint），或新入库的事件不在主分支上、作者已分叉时，在本批事务结束时重算。重算按有效集合重新计算每个事件的 `effective`，有变化时清空 reducer 写的投影表（会话、消息、Bot、Bot 配置、技能、例行任务、Bot 变更、工作、通知及确认、提醒及处理），再按 `(lamport, created_at_ms, hash)` 重放所有 `effective = 1` 的事件。调度队列、工作派发与停止、例行运行、outbox、分诊和邀请是本机账本，不在重算范围内，重算也不重放任何副作用。重算后向浏览器推送一条不带会话的 `changed`，网页整体刷新。
 
 数据格式变化时不迁移。项目不保留兼容，直接使用新数据目录。
 

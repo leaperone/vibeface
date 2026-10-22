@@ -362,7 +362,7 @@ pub(crate) fn admit_from(
 }
 
 impl Store {
-    /// Queues the turn in which `conversation`'s assistant routes the session `question` is about,
+    /// Queues the turn in which `conversation`'s bot routes the session `question` is about,
     /// once. Only the Node that schedules the conversation admits it; returns whether it is new.
     pub fn admit_route(
         &mut self,
@@ -402,7 +402,7 @@ pub(crate) fn live_schedule(
         return Ok(None);
     };
     Ok(
-        super::assistant::schedule_from(connection, network, schedule_id)?
+        super::bot_settings::schedule_from(connection, network, schedule_id)?
             .filter(|entry| entry.conversation_id == job.conversation_id && entry.schedule.enabled)
             .map(|entry| entry.schedule),
     )
@@ -425,7 +425,7 @@ pub(crate) fn chain_depth(
                 let (schedule_id, _) =
                     parse_schedule_trigger(&trigger).context("invalid schedule trigger")?;
                 return Ok(
-                    super::assistant::schedule_from(connection, network, schedule_id)?
+                    super::bot_settings::schedule_from(connection, network, schedule_id)?
                         .map_or(MAX_CHAIN_DEPTH, |entry| entry.schedule.depth),
                 );
             }
@@ -435,7 +435,7 @@ pub(crate) fn chain_depth(
                 let event = log::event_from(connection, network, &message.event_hash)?
                     .context("the bot message's event is not stored here")?;
                 let EventBody::BotMessaged { hops, .. } = event.body else {
-                    bail!("{message_id} is not a message from another assistant");
+                    bail!("{message_id} is not a message from another bot");
                 };
                 return Ok(hops);
             }
@@ -464,7 +464,7 @@ fn admit_due_schedules_from(
     now: i64,
 ) -> Result<Vec<(String, String)>> {
     let mut admitted = Vec::new();
-    for entry in super::assistant::schedules_from(connection, network, None)? {
+    for entry in super::bot_settings::schedules_from(connection, network, None)? {
         let conversation = entry.conversation_id.as_str();
         let Some(slot) = latest_slot(&entry.schedule, now)
             .filter(|slot| entry.schedule.enabled && *slot >= entry.changed_at_ms - LATE_START_MS)
@@ -671,7 +671,7 @@ fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, String) {
     }
 }
 
-/// Ends the job and writes its assistant reply in one transaction. Partial text of a stopped or
+/// Ends the job and writes its bot reply in one transaction. Partial text of a stopped or
 /// interrupted turn is kept with its status.
 #[expect(
     clippy::too_many_arguments,

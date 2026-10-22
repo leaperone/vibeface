@@ -22,8 +22,8 @@ pub struct NodeSettings {
 #[serde(deny_unknown_fields)]
 pub struct ProviderChange {
     provider: Provider,
-    /// `true` moves the assistant to this provider; `false` stops it if it runs here.
-    assistant: Option<bool>,
+    /// `true` moves the bot to this provider; `false` stops it if it runs here.
+    bot: Option<bool>,
     /// Whether Codex executes dispatched work.
     execution: Option<bool>,
     /// The Codex program; empty restores the default.
@@ -59,12 +59,12 @@ impl Runtime {
             .clone()
     }
 
-    /// The assistant and the provider it runs on, if it is on.
-    pub(crate) fn assistant(&self) -> Option<ManagerSettings> {
+    /// The Manager that runs bots on this Node and its provider, if it is on.
+    pub(crate) fn manager(&self) -> Option<ManagerSettings> {
         self.settings_snapshot().manager
     }
 
-    /// What a newly chosen assistant starts with; the workspace is created when it is chosen.
+    /// What a newly chosen bot starts with; the workspace is created when it is chosen.
     fn default_manager(&self, provider: ManagerKind) -> Result<ManagerSettings> {
         Ok(ManagerSettings {
             provider,
@@ -82,7 +82,7 @@ impl Runtime {
         })
     }
 
-    /// Creates the default assistant workspace when it is missing; it must be a real directory.
+    /// Creates the default bot workspace when it is missing; it must be a real directory.
     fn ensure_default_workspace(&self, workspace: &Path) -> Result<()> {
         if workspace != self.data_dir.canonicalize()?.join("manager-workspace") {
             return Ok(());
@@ -113,19 +113,19 @@ impl Runtime {
     ) -> Value {
         let configured = local.env.get(provider);
         let app_server = &local.switches.codex_app_server;
-        let assistant = settings
+        let bot = settings
             .manager
             .as_ref()
             .is_some_and(|m| Provider::of(m.provider) == provider);
         let execution = provider == Provider::Codex && local.switches.execution;
-        let roles: Vec<Role> = [(assistant, Role::Agent), (execution, Role::Execution)]
+        let roles: Vec<Role> = [(bot, Role::Agent), (execution, Role::Execution)]
             .into_iter()
             .filter_map(|(serves, role)| serves.then_some(role))
             .collect();
-        // The system App Server runs with its own program and variables; the assistant still
+        // The system App Server runs with its own program and variables; the bot still
         // runs the Codex program with them.
         let launches =
-            provider == Provider::Cursor || assistant || app_server.mode == AppServerMode::Spawn;
+            provider == Provider::Cursor || bot || app_server.mode == AppServerMode::Spawn;
         let mut issues = Vec::new();
         let (bin, required) = match provider {
             Provider::Codex => {
@@ -278,7 +278,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Chooses or stops the assistant on a provider, turns Codex execution on or off, sets the
+    /// Chooses or stops the bot on a provider, turns Codex execution on or off, sets the
     /// provider's program and variables, then restarts what runs on it. This is the only place
     /// that decides what each provider is used for. The variables are written only to this
     /// Node's private file.
@@ -296,7 +296,7 @@ impl Runtime {
         let previous_manager = self.settings_snapshot().manager;
         let mut manager = previous_manager.clone();
         let kind = change.provider.manager_kind();
-        match change.assistant {
+        match change.bot {
             Some(true) => {
                 let mut chosen = match manager {
                     Some(current) => current,
@@ -378,7 +378,7 @@ impl Runtime {
         self.node_settings().await
     }
 
-    /// Saves the folders and the current assistant's details. Whether the assistant runs, and on
+    /// Saves the folders and the current bot's details. Whether the bot runs, and on
     /// which provider, is chosen only through `configure_provider`.
     pub(crate) async fn configure_node(
         &self,
@@ -393,7 +393,7 @@ impl Runtime {
         let current = self.settings_snapshot().manager.map(|m| m.provider);
         ensure!(
             settings.manager.as_ref().map(|m| m.provider) == current,
-            "choose the assistant with configure_provider"
+            "choose the bot with configure_provider"
         );
         ensure!(
             settings.roots.len() <= 128,

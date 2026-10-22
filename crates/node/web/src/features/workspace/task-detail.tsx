@@ -60,7 +60,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {["failed", "interrupted", "rejected"].includes(state) ? <div className="grid gap-2">
         <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
           if (await workspace.sendMessage(`再试一次「${work.title || "这个任务"}」`)) close()
-        })}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />让助手再试</Button>
+        })}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />让 Bot 再试</Button>
         <InlineError error={action.error} />
       </div> : null}
       <Details>

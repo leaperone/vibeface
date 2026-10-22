@@ -79,12 +79,12 @@ pub enum Severity {
     Urgent,
 }
 
-/// Scope of the questions about sessions no assistant owns; they show only on the pending page.
+/// Scope of the questions about sessions no bot owns; they show only on the pending page.
 pub const SESSIONS_SCOPE: &str = "sessions";
 
-/// Scope of the user's choice of primary assistant, the one that judges what comes in without an
+/// Scope of the user's choice of primary bot, the one that judges what comes in without an
 /// owner. Its latest event by rank stands; nothing projects it.
-pub const ASSISTANTS_SCOPE: &str = "assistants";
+pub const BOTS_SCOPE: &str = "bots";
 
 /// The device, project and session a question is about.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub struct Subject {
 #[serde(deny_unknown_fields)]
 pub struct Choice {
     pub label: String,
-    /// Session questions only: choosing it attributes the session to this assistant.
+    /// Session questions only: choosing it attributes the session to this bot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ScopeId>,
 }
@@ -135,12 +135,12 @@ pub const MAX_SCHEDULE_NAME_CHARS: usize = 120;
 pub const MAX_SCHEDULE_PROMPT_BYTES: usize = 8 * 1024;
 /// Every 5 minutes up to every 4 weeks; a day is 1440 and a week 10080.
 pub const SCHEDULE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
-/// Repeating schedules and one-shot ones still ahead, per assistant.
+/// Repeating schedules and one-shot ones still ahead, per bot.
 pub const MAX_ACTIVE_SCHEDULES: usize = 20;
 /// A one-shot time is set at least this far ahead, and at most `ONCE_MAX_LEAD_MS`.
 pub const ONCE_MIN_LEAD_MS: i64 = 60_000;
 pub const ONCE_MAX_LEAD_MS: i64 = 366 * 24 * 60 * 60_000;
-/// How many automatic wakes (reminders an assistant sets itself, messages between assistants)
+/// How many automatic wakes (reminders a bot sets itself, messages between bots)
 /// may follow one message of the user.
 pub const MAX_CHAIN_DEPTH: u8 = 4;
 pub const MAX_MEMORY_CHARS: usize = 500;
@@ -158,7 +158,7 @@ pub struct Edit {
     pub after: String,
 }
 
-/// A saved workflow in the library every assistant of the network shares.
+/// A saved workflow in the library every bot of the network shares.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Skill {
@@ -167,7 +167,7 @@ pub struct Skill {
     pub body: String,
 }
 
-/// A turn its assistant runs at `first_run_at_ms`, then every `every_minutes` when set: a routine
+/// A turn its bot runs at `first_run_at_ms`, then every `every_minutes` when set: a routine
 /// repeats, a reminder runs once.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -179,7 +179,7 @@ pub struct Schedule {
     pub every_minutes: Option<u32>,
     pub enabled: bool,
     /// Automatic wakes since the user's last message: 0 for what the user asked for, one more
-    /// than the setting turn for a reminder the assistant set itself.
+    /// than the setting turn for a reminder the bot set itself.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub depth: u8,
 }
@@ -205,7 +205,7 @@ pub struct Cause {
     pub message_id: String,
 }
 
-/// The assistant that wrote to another one.
+/// The bot that wrote to another one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Sender {
@@ -213,11 +213,11 @@ pub struct Sender {
     pub name: String,
 }
 
-/// What a chat turn changed about its assistant. A `None` after removes the skill, schedule or
+/// What a chat turn changed about its bot. A `None` after removes the skill, schedule or
 /// note.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AssistantChange {
+pub enum BotChange {
     Profile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Edit>,
@@ -309,7 +309,7 @@ impl Schedule {
     }
 }
 
-/// A note an assistant keeps across turns: short, and never a credential.
+/// A note a bot keeps across turns: short, and never a credential.
 pub fn validate_memory(text: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !text.trim().is_empty() && text.chars().count() <= MAX_MEMORY_CHARS,
@@ -373,7 +373,7 @@ pub fn looks_secret(text: &str) -> bool {
         })
 }
 
-impl AssistantChange {
+impl BotChange {
     /// Every change sets something new; a removal needs something to remove.
     pub fn validate(&self) -> anyhow::Result<()> {
         let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
@@ -466,7 +466,7 @@ pub enum EventBody {
         cause: Option<Cause>,
     },
     /// `report_results` and `attachments` belong to user messages; `in_reply_to` and `status` to
-    /// assistant replies. `attachments` repeats the event's blobs so the user's signature covers them.
+    /// bot replies. `attachments` repeats the event's blobs so the user's signature covers them.
     MessagePosted {
         message_id: String,
         role: Role,
@@ -530,8 +530,8 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// In the conversation of the assistant that owns the session, or in `SESSIONS_SCOPE` for a
-    /// session no assistant owns. Its one answer is the user message `a-<question_id>`.
+    /// In the conversation of the bot that owns the session, or in `SESSIONS_SCOPE` for a
+    /// session no bot owns. Its one answer is the user message `a-<question_id>`.
     QuestionAsked {
         question_id: String,
         severity: Severity,
@@ -540,7 +540,7 @@ pub enum EventBody {
         choices: Vec<Choice>,
         about: Subject,
     },
-    /// In the chosen assistant's conversation: that assistant owns the session from now on.
+    /// In the chosen bot's conversation: that bot owns the session from now on.
     SessionAttributed {
         node: DeviceId,
         agent: String,
@@ -550,21 +550,21 @@ pub enum EventBody {
         /// The session question that led to it.
         question_id: String,
     },
-    /// In `ASSISTANTS_SCOPE`: the user makes this conversation's assistant the primary one.
-    PrimaryAssistantSet {
+    /// In `BOTS_SCOPE`: the user makes this conversation's bot the primary one.
+    PrimaryBotSet {
         conversation_id: ScopeId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
     /// Written by the owner in a turn the user's message `cause` started; that message is one
     /// of its parents. A bot may change another bot, so the cause may sit in another
-    /// conversation. Only a new one-shot schedule, a reminder the assistant sets itself in
+    /// conversation. Only a new one-shot schedule, a reminder the bot sets itself in
     /// another turn, has no `cause`. `change_id` derives from the turn and the tool's `call_ref`.
-    AssistantChanged {
+    BotChanged {
         change_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<Cause>,
-        change: AssistantChange,
+        change: BotChange,
     },
     /// The user pauses, resumes or deletes a schedule of this conversation from the web.
     ScheduleControlled {
@@ -573,7 +573,7 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// In the receiving assistant's conversation, written by the sender's scheduling Node.
+    /// In the receiving bot's conversation, written by the sender's scheduling Node.
     /// `message_id` derives from the sending turn and the tool's `call_ref`.
     BotMessaged {
         message_id: String,
@@ -600,7 +600,7 @@ impl EventBody {
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
             | Self::NotificationAcked { attestation, .. }
-            | Self::PrimaryAssistantSet { attestation, .. }
+            | Self::PrimaryBotSet { attestation, .. }
             | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
@@ -693,7 +693,7 @@ pub struct Bot {
     pub event_hash: EventHash,
 }
 
-/// The earliest `AssistantChanged` of one `change_id`; the chat shows it as a card.
+/// The earliest `BotChanged` of one `change_id`; the chat shows it as a card.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeRecord {
     pub change_id: String,
@@ -702,7 +702,7 @@ pub struct ChangeRecord {
     pub cause: Option<Cause>,
     pub event_hash: EventHash,
     pub created_at_ms: i64,
-    pub change: AssistantChange,
+    pub change: BotChange,
 }
 
 /// Output only: `flatten` cannot read back a `deny_unknown_fields` struct.
@@ -724,7 +724,7 @@ pub struct ScheduleEntry {
     pub changed_at_ms: i64,
 }
 
-/// A note one assistant keeps.
+/// A note one bot keeps.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryEntry {
     pub memory_id: String,
@@ -751,7 +751,7 @@ pub struct Message {
     pub report_results: Option<bool>,
     /// The question this user message answers.
     pub answers: Option<String>,
-    /// The assistant a bot message came from.
+    /// The bot a bot message came from.
     pub sender: Option<Sender>,
     pub blobs: Vec<BlobRef>,
     /// Its place in the conversation's shared order; clients merge pushed messages by it.

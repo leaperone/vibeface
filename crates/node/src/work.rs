@@ -486,7 +486,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         (Unverified { handle: None, .. }, Signal::ProcessExited) => finish(
             record,
             WorkOutcome::Interrupted,
-            Some("助手进程已退出，任务没有做完".into()),
+            Some("Bot 进程已退出，任务没有做完".into()),
         ),
         (Unverified { .. } | Accepted | Starting { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
@@ -505,7 +505,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 WorkOutcome::Unverified => unverified(
                     record,
                     None,
-                    reason.as_deref().unwrap_or("助手进程没有确认退出"),
+                    reason.as_deref().unwrap_or("Bot 进程没有确认退出"),
                     false,
                 ),
                 outcome => finish(record, outcome, reason),

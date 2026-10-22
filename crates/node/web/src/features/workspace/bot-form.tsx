@@ -85,14 +85,14 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <SheetHeader className="pr-14">
-          <SheetTitle>{pending ? "再试一次" : "新助手"}</SheetTitle>
+          <SheetTitle>{pending ? "再试一次" : "新 Bot"}</SheetTitle>
           <SheetDescription className={pending ? undefined : "sr-only"}>{pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"}</SheetDescription>
         </SheetHeader>
         <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" onSubmit={(event) => { void submit(event) }}>
           {pending && rejected && !busy ? <p role="status" className="rounded-lg bg-muted p-3 text-meta">上次没建成，确认后可以修改。</p> : null}
           <Field>
             <FieldLabel htmlFor="bot-name">名称</FieldLabel>
-            <Input id="bot-name" name="bot-name" className="min-h-11" autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="例如：项目助手" />
+            <Input id="bot-name" name="bot-name" className="min-h-11" autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="例如：项目 Bot" />
           </Field>
           <Field>
             <FieldLabel htmlFor="bot-instructions">它负责什么 <span className="font-normal text-muted-foreground">可选</span></FieldLabel>

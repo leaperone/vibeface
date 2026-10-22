@@ -19,7 +19,7 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 
 impl Runtime {
     fn scheduler_manager_metadata(&self) -> Value {
-        let Some(manager) = &self.assistant() else {
+        let Some(manager) = &self.manager() else {
             return Value::Null;
         };
         let mut capabilities = manager.provider.capabilities();
@@ -57,7 +57,7 @@ impl Runtime {
 
     /// Queues the schedules that are due in conversations this Node schedules.
     async fn fire_schedules(self: &Arc<Self>) -> Result<()> {
-        if self.assistant().is_none() {
+        if self.manager().is_none() {
             return Ok(());
         }
         let Some(network) = self.store.lock().await.network()? else {
@@ -118,7 +118,7 @@ impl Runtime {
             self.finish_manager_attempt(&attempt).await;
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
-        if self.assistant().is_some() {
+        if self.manager().is_some() {
             let scopes = self.store.lock().await.pending_scheduler_conversations()?;
             for scope in scopes {
                 self.start_schedule_consumer(network.clone(), scope).await;

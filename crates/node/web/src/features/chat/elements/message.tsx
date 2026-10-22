@@ -14,7 +14,7 @@ function shortTime(when: Date) {
 }
 
 /**
- * One message: the person's in a bubble, the assistant's as plain text across the full width, another bot's in a
+ * One message: the person's in a bubble, the bot's as plain text across the full width, another bot's in a
  * card under its name. `last` marks the end of a run from the same sender, where the time shows. `schedule` names
  * the schedule whose run produced this reply.
  */
@@ -33,10 +33,10 @@ export function Message({ message, schedule, last = true }: { message: ChatMessa
   if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
     <span className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
       <Bot aria-hidden="true" className="size-4 shrink-0" />
-      <span className="min-w-0 truncate">{message.sender?.name ?? '另一个助手'}</span>
+      <span className="min-w-0 truncate">{message.sender?.name ?? '另一个 Bot'}</span>
     </span>
     <div title={full} className="min-w-0 max-w-[85%] rounded-2xl border bg-muted px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]">
-      <span className="sr-only">{message.sender?.name ?? '另一个助手'}：</span>
+      <span className="sr-only">{message.sender?.name ?? '另一个 Bot'}：</span>
       <Markdown text={message.text} />
     </div>
     {time}
@@ -48,7 +48,7 @@ export function Message({ message, schedule, last = true }: { message: ChatMessa
       <span className="min-w-0 truncate">{schedule}</span>
     </span> : null}
     <div title={full} className="w-full min-w-0">
-      <span className="sr-only">助手：</span>
+      <span className="sr-only">Bot：</span>
       <Markdown text={message.text} />
     </div>
     {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className={`size-4 text-muted-foreground ${connectionOnline ? 'animate-spin' : ''}`} /> : null}

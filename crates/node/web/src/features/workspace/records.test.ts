@@ -11,14 +11,14 @@ const work = (work_id: string, extra: Record<string, unknown> = {}) => ({
   work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", ...extra,
 })
 const question = (question_id: string, conversation_id: string | null, answer: unknown = null) => ({
-  question_id, conversation_id, assistant: null, severity: "info", text: "?", choices: [],
+  question_id, conversation_id, bot: null, severity: "info", text: "?", choices: [],
   about: { node: "n", agent: "codex", session_id: "s", cwd: "/", summary: "" }, author: "n", created_at_ms: 1, answer,
 })
 const shown = parseConversation({
   conversation: { conversation_id: "chat", title: "", owner: "gateway", owner_epoch: 1 },
   messages: [message("m1", 1), message("m3", 3)], works: [work("w1"), work("w2")],
   deliveries: [{ state: "dispatch_waiting", work_id: "w9", target_node: "worker", cwd: "/w" }, { state: "stop_waiting", work_id: "w1", target_node: "worker" }],
-  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], assistant: { skills: [], schedules: [], memory: [] },
+  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] },
   questions: [], sessions: [],
 }, "chat")
 const records = (extra: Record<string, unknown> = {}) => {

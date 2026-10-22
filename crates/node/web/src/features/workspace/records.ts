@@ -3,7 +3,7 @@ import type { BotRecord, ConversationPayload, ConversationRecords, NotificationR
 
 const delivery = (item: WorkRecord) => item.state === "dispatch_waiting" || item.state === "dispatch_rejected"
 const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")
-/** Questions outside any assistant's chat live in the Node's sessions scope. */
+/** Questions outside any bot's chat live in the Node's sessions scope. */
 const scopeOf = (question: Question) => question.conversation_id ?? "sessions"
 
 function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {

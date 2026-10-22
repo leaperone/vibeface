@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     store::{
-        assistant::{ChangeRequest, bot_message_id, change_id},
+        bot_settings::{ChangeRequest, bot_message_id, change_id},
         bots::created_bot_id,
     },
     tools::{Effect, Tool},
@@ -118,8 +118,8 @@ impl Runtime {
                 if let Some(dispatch) = store.dispatch(&id)? {
                     return Ok(dispatch_value(&dispatch));
                 }
-                if let Some(change) = store
-                    .assistant_change(network, &change_id(&scope, &manager.trigger, call_ref))?
+                if let Some(change) =
+                    store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
                 {
                     return Ok(json!(change));
                 }
@@ -295,7 +295,7 @@ impl Runtime {
                 let manager = access
                     .manager
                     .as_ref()
-                    .context("assistant changes require an agent invocation")?;
+                    .context("bot changes require an agent invocation")?;
                 let call_ref = field(&args, "call_ref")?.to_owned();
                 let mut request = args;
                 let fields = request
@@ -306,7 +306,7 @@ impl Runtime {
                 let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
                     anyhow::anyhow!("{error}. Model, provider and folders change only in Settings")
                 })?;
-                let (record, written) = self.store.lock().await.change_assistant(
+                let (record, written) = self.store.lock().await.change_bot(
                     &self.identity,
                     network,
                     &scope,
@@ -379,7 +379,7 @@ impl Runtime {
     }
 
     /// Registers a dispatch before anything is sent. On this device it returns `may_send` only to
-    /// the call that created the work; another device's assistant gets the task instead.
+    /// the call that created the work; another device's bot gets the task instead.
     async fn track_work(
         self: &Arc<Self>,
         access: &Access,

@@ -4,20 +4,20 @@ import { useRef, useState, type ReactNode } from "react"
 import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { formatWhen, scheduleFrequency } from "./assistant"
+import { formatWhen, scheduleFrequency } from "./bot-settings"
 import { useWorkspace } from "./context"
 import { ActionButton } from "./present"
 
-/** Header button for the chat route; opens a view of the assistant where only schedules can be paused, resumed or deleted (docs/design/assistant-config.md section 5). */
-export function AssistantPanelButton() {
+/** Header button for the chat route; opens a view of the bot where only schedules can be paused, resumed or deleted (docs/design/bot-config.md section 5). */
+export function BotPanelButton() {
   const workspace = useWorkspace()
   const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
   const bot = workspace.selectedBot
-  const view = workspace.data?.assistant
+  const view = workspace.data?.bot_settings
   if (!bot) return null
   return <>
-    <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="助手信息" title="助手信息" disabled={!view} onClick={() => setOpen(true)}>
+    <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
       <Bot aria-hidden="true" />
     </Button>
     <Sheet open={open && Boolean(view)} onOpenChange={setOpen}>
@@ -26,8 +26,8 @@ export function AssistantPanelButton() {
           <SheetTitle className="break-words">{bot.name}</SheetTitle>
           <SheetDescription>在聊天里说一声就能改</SheetDescription>
           {workspace.primary === bot.conversation_id
-            ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主助手</p>
-            : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主助手</ActionButton>}
+            ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主 Bot</p>
+            : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主 Bot</ActionButton>}
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <Section icon={ScrollText} title="说明">
@@ -72,7 +72,7 @@ export function AssistantPanelButton() {
   </>
 }
 
-const primaryHint = "没有助手负责的 Codex 会话，由主助手分派"
+const primaryHint = "没有 Bot 负责的 Codex 会话，由主 Bot 分派"
 
 function Section({ icon: Icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {
   return <section className="grid gap-3">

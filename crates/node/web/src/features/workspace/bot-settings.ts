@@ -1,12 +1,12 @@
 import type { TranscriptMessage } from "../chat/types"
-import type { AssistantChangeRecord, AssistantSchedule, AssistantView } from "./types"
+import type { BotChangeRecord, BotSchedule, BotSettings } from "./types"
 
 const weekdays = "日一二三四五六"
 const pad = (value: number) => String(value).padStart(2, "0")
 const clock = (date: Date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`
 
 /** "一次", "每天 09:00", "每周一 09:00", "每 2 小时", "每 30 分钟"; times in the browser's time zone. */
-export function scheduleFrequency(schedule: Pick<AssistantSchedule, "first_run_at_ms" | "every_minutes">): string {
+export function scheduleFrequency(schedule: Pick<BotSchedule, "first_run_at_ms" | "every_minutes">): string {
   const first = new Date(schedule.first_run_at_ms), every = schedule.every_minutes
   if (every === undefined) return "一次"
   if (every === 10080) return `每周${weekdays[first.getDay()]} ${clock(first)}`
@@ -65,8 +65,8 @@ export function scheduleTrigger(inReplyTo: string | undefined): string | null {
 }
 
 /** Current name, else the last name a change gave it (a removed or past schedule), else a generic label. */
-export function scheduleName(scheduleId: string, assistant: AssistantView | undefined, changes: readonly AssistantChangeRecord[] = []): string {
-  const current = assistant?.schedules.find((item) => item.schedule_id === scheduleId)
+export function scheduleName(scheduleId: string, bot: BotSettings | undefined, changes: readonly BotChangeRecord[] = []): string {
+  const current = bot?.schedules.find((item) => item.schedule_id === scheduleId)
   if (current) return current.name
   for (const record of [...changes].reverse()) {
     const change = record.change
@@ -79,19 +79,19 @@ export function scheduleName(scheduleId: string, assistant: AssistantView | unde
  * Where each turn's changes show: after the last reply to the person's message, else after that message.
  * Changes whose message is not on screen come back as `rest`, oldest first.
  */
-export function placeChanges(messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to">[], changes: readonly AssistantChangeRecord[]) {
+export function placeChanges(messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to">[], changes: readonly BotChangeRecord[]) {
   const anchor = new Map<string, string>()
   for (const message of messages) {
     if (message.role === "user") anchor.set(message.message_id, message.message_id)
     else if (message.in_reply_to && anchor.has(message.in_reply_to)) anchor.set(message.in_reply_to, message.message_id)
   }
-  const turns = new Map<string, AssistantChangeRecord[]>()
+  const turns = new Map<string, BotChangeRecord[]>()
   for (const record of changes) {
     const cause = record.cause?.message_id ?? ""
     turns.set(cause, [...turns.get(cause) ?? [], record])
   }
-  const after = new Map<string, AssistantChangeRecord[]>()
-  const rest: AssistantChangeRecord[][] = []
+  const after = new Map<string, BotChangeRecord[]>()
+  const rest: BotChangeRecord[][] = []
   for (const [cause, items] of turns) {
     const at = anchor.get(cause)
     if (at) after.set(at, items)

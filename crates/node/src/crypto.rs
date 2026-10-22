@@ -129,7 +129,7 @@ impl LocalIdentity {
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. }
-            | EventBody::PrimaryAssistantSet { attestation, .. }
+            | EventBody::PrimaryBotSet { attestation, .. }
             | EventBody::ScheduleControlled { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
@@ -313,14 +313,14 @@ fn validate_attestation(event: &Event) -> Result<()> {
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
         | EventBody::NotificationAcked { .. }
-        | EventBody::PrimaryAssistantSet { .. }
+        | EventBody::PrimaryBotSet { .. }
         | EventBody::ScheduleControlled { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
         } => UserSignature::Optional,
         // It stands on the user's signed message among its parents; see `store::log`.
-        EventBody::AssistantChanged { .. } => UserSignature::Forbidden,
+        EventBody::BotChanged { .. } => UserSignature::Forbidden,
         _ => UserSignature::Forbidden,
     };
     match (rule, event.body.attestation()) {
@@ -346,7 +346,7 @@ pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) ->
     .context("the device signature does not match this write")
 }
 
-/// Assistants' questions start with `q-`; questions about sessions no assistant owns with `s-`.
+/// Bots' questions start with `q-`; questions about sessions no bot owns with `s-`.
 fn question_id(scope: &str, question: &str) -> Result<()> {
     vibeface_protocol::validate_id(question).map_err(anyhow::Error::msg)?;
     let prefix = if scope == SESSIONS_SCOPE { "s-" } else { "q-" };
@@ -465,7 +465,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                             && status.is_some()
                             && attachments.is_empty()
                             && answers.is_none(),
-                        "an assistant reply carries its turn status"
+                        "a bot reply carries its turn status"
                     );
                     if let Some(answered) = in_reply_to
                         && crate::scheduling::parse_schedule_trigger(answered).is_none()
@@ -473,7 +473,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         id(answered)?;
                     }
                 }
-                Role::Bot => anyhow::bail!("assistants message each other through their own event"),
+                Role::Bot => anyhow::bail!("bots message each other through their own event"),
             }
         }
         EventBody::ConversationOwner {
@@ -524,15 +524,15 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(work_id)?
         }
         EventBody::ConversationCreated { .. } => ensure!(
-            event.scope_id != SESSIONS_SCOPE && event.scope_id != ASSISTANTS_SCOPE,
-            "the sessions and assistants scopes are not conversations"
+            event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+            "the sessions and bots scopes are not conversations"
         ),
-        EventBody::PrimaryAssistantSet {
+        EventBody::PrimaryBotSet {
             conversation_id, ..
         } => {
             ensure!(
-                event.scope_id == ASSISTANTS_SCOPE,
-                "the primary assistant is set in the assistants scope"
+                event.scope_id == BOTS_SCOPE,
+                "the primary bot is set in the bots scope"
             );
             id(conversation_id)?;
         }
@@ -567,7 +567,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 if let Some(conversation) = &choice.conversation_id {
                     ensure!(
                         event.scope_id == SESSIONS_SCOPE && conversation != SESSIONS_SCOPE,
-                        "only a session question hands a session to an assistant"
+                        "only a session question hands a session to a bot"
                     );
                     id(conversation)?;
                 }
@@ -583,7 +583,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => {
             ensure!(
                 event.scope_id != SESSIONS_SCOPE,
-                "a session is attributed in its assistant's conversation"
+                "a session is attributed in its bot's conversation"
             );
             ensure!(
                 *node == event.author,
@@ -597,7 +597,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 decode32(author)?;
             }
         }
-        EventBody::AssistantChanged {
+        EventBody::BotChanged {
             change_id,
             cause,
             change,
@@ -621,8 +621,8 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ensure!(
                 from.conversation_id != event.scope_id
                     && event.scope_id != SESSIONS_SCOPE
-                    && event.scope_id != ASSISTANTS_SCOPE,
-                "an assistant messages another assistant's conversation"
+                    && event.scope_id != BOTS_SCOPE,
+                "a bot messages another bot's conversation"
             );
             ensure!(
                 from.name.chars().count() <= crate::model::MAX_SCHEDULE_NAME_CHARS
@@ -631,12 +631,12 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             );
             ensure!(
                 !text.trim().is_empty() && text.len() <= crate::model::MAX_BOT_MESSAGE_BYTES,
-                "an assistant message is 1-{} bytes",
+                "a bot message is 1-{} bytes",
                 crate::model::MAX_BOT_MESSAGE_BYTES
             );
             ensure!(
                 (1..=crate::model::MAX_CHAIN_DEPTH).contains(hops),
-                "an assistant message is at most {} hops deep",
+                "a bot message is at most {} hops deep",
                 crate::model::MAX_CHAIN_DEPTH
             );
         }
@@ -754,7 +754,7 @@ mod tests {
                         ..event.clone()
                     })
                     .is_err()),
-            "assistant replies carry no device signature"
+            "bot replies carry no device signature"
         );
         event.body = message(Role::User, None, None);
         assert!(identity.sign_event(event.clone()).is_err());

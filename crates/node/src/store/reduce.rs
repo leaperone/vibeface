@@ -1,6 +1,6 @@
 //! Incremental projections. Each event updates its rows once, as it is stored; every rule is
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
-//! Assistant settings, skills, schedules and notes keep the last change by rank; a removal is a `NULL`
+//! Bot settings, skills, schedules and notes keep the last change by rank; a removal is a `NULL`
 //! row, so an older change arriving later cannot bring it back.
 use crate::model::*;
 use anyhow::Result;
@@ -52,11 +52,11 @@ pub(crate) const TABLES: [&str; 13] = [
     "conversations",
     "messages",
     "bots",
-    "assistant_profiles",
+    "bot_profiles",
     "skills",
     "schedules",
     "memories",
-    "assistant_changes",
+    "bot_changes",
     "works",
     "notifications",
     "notification_acks",
@@ -64,7 +64,7 @@ pub(crate) const TABLES: [&str; 13] = [
     "session_owners",
 ];
 
-/// The first record of a session by rank decides which assistant owns it.
+/// The first record of a session by rank decides which bot owns it.
 #[allow(clippy::too_many_arguments)]
 fn own_session(
     connection: &Connection,
@@ -285,26 +285,26 @@ pub(crate) fn apply(
                 event.created_at_ms,
             )?;
         }
-        EventBody::AssistantChanged {
+        EventBody::BotChanged {
             change_id,
             cause,
             change,
         } => {
             connection.execute(
-                "INSERT INTO assistant_changes(network_id,change_id,conversation_id,event_hash,rank,cause,change,created_at_ms) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,change_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause,change=excluded.change,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
+                "INSERT INTO bot_changes(network_id,change_id,conversation_id,event_hash,rank,cause,change,created_at_ms) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,change_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause,change=excluded.change,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
                 params![network, change_id, scope, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?, serde_json::to_string(change)?, event.created_at_ms],
             )?;
             match change {
-                AssistantChange::Profile { name, instructions } => {
+                BotChange::Profile { name, instructions } => {
                     for (field, edit) in [("name", name), ("instructions", instructions)] {
                         let Some(edit) = edit else { continue };
                         connection.execute(
-                            "INSERT INTO assistant_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
+                            "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
                             params![network, scope, field, edit.after, rank],
                         )?;
                     }
                 }
-                AssistantChange::Skill {
+                BotChange::Skill {
                     skill_id, after, ..
                 } => {
                     connection.execute(
@@ -312,7 +312,7 @@ pub(crate) fn apply(
                         params![network, skill_id, after.as_ref().map(serde_json::to_string).transpose()?, rank],
                     )?;
                 }
-                AssistantChange::Schedule {
+                BotChange::Schedule {
                     schedule_id,
                     after: Some(after),
                     ..
@@ -331,7 +331,7 @@ pub(crate) fn apply(
                         event.created_at_ms,
                     )?;
                 }
-                AssistantChange::Schedule {
+                BotChange::Schedule {
                     schedule_id,
                     after: None,
                     ..
@@ -343,7 +343,7 @@ pub(crate) fn apply(
                     rank,
                     event.created_at_ms,
                 )?,
-                AssistantChange::Memory {
+                BotChange::Memory {
                     memory_id, after, ..
                 } => {
                     connection.execute(
@@ -387,8 +387,8 @@ pub(crate) fn apply(
                 params![network, scope, message_id, hash, rank, event.author, text(Role::Bot)?, body, event.created_at_ms, serde_json::to_string(from)?],
             )?;
         }
-        // Read from the log by rank; see `store::bots::primary_assistant_from`.
-        EventBody::ContextCheckpoint { .. } | EventBody::PrimaryAssistantSet { .. } => {}
+        // Read from the log by rank; see `store::bots::primary_bot_from`.
+        EventBody::ContextCheckpoint { .. } | EventBody::PrimaryBotSet { .. } => {}
     }
     Ok(())
 }

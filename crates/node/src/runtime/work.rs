@@ -235,7 +235,7 @@ impl Runtime {
         }
         ensure!(
             spec.kind == WorkKind::Task || spec.dispatcher == spec.target,
-            "another device takes work only as a task for its assistant"
+            "another device takes work only as a task for its bot"
         );
         if spec.kind == WorkKind::Task {
             ensure!(
@@ -243,15 +243,15 @@ impl Runtime {
                 "an agent task goes to another device"
             );
             ensure!(
-                self.assistant().is_some(),
-                "this device has no assistant to take the task"
+                self.manager().is_some(),
+                "this device has no bot to take the task"
             );
         }
         Ok(())
     }
 
     /// Records the dispatch. A Codex work is then started by the Agent that registered it; an
-    /// agent task is queued for this device's assistant. A retry of the same `work_id` returns the
+    /// agent task is queued for this device's bot. A retry of the same `work_id` returns the
     /// existing record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,

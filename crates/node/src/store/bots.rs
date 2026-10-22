@@ -8,7 +8,7 @@ use std::path::{Component, Path};
 
 const PREVIEW_CHARS: usize = 120;
 
-/// The newest message of an assistant's conversation, cut short for a conversation list.
+/// The newest message of a bot's conversation, cut short for a conversation list.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LastMessage {
     pub text: String,
@@ -38,7 +38,7 @@ fn validate_definition(
     validate_instructions(instructions)?;
     ensure!(
         serde_json::to_vec(&(name, instructions, project))?.len() <= 12000,
-        "Bot definition is too large for the assistant context"
+        "Bot definition is too large for the bot context"
     );
     if let Some(project) = project {
         ensure!(
@@ -99,8 +99,8 @@ fn select_bots(
 ) -> Result<Vec<Bot>> {
     let mut statement = connection.prepare(&format!(
         "SELECT {columns} FROM bots b
-         LEFT JOIN assistant_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
-         LEFT JOIN assistant_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
+         LEFT JOIN bot_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
+         LEFT JOIN bot_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
          WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
     let rows = statement.query_map(params![network, value], bot_row)?;
@@ -239,8 +239,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cause = super::assistant::user_cause(&tx, network, scope, trigger)?
-            .context(super::assistant::NOT_FROM_USER)?;
+        let cause = super::bot_settings::user_cause(&tx, network, scope, trigger)?
+            .context(super::bot_settings::NOT_FROM_USER)?;
         let (bot_id, conversation) = created_bot_id(scope, trigger, call_ref);
         validate_definition(&bot_id, &conversation, name, instructions, project.as_ref())?;
         if let Some(existing) =
@@ -299,7 +299,7 @@ impl Store {
         Ok((bot, true))
     }
 
-    /// Each assistant conversation's newest message, by conversation; one indexed lookup per assistant.
+    /// Each bot conversation's newest message, by conversation; one indexed lookup per bot.
     pub fn last_messages(&self, network: &str) -> Result<BTreeMap<String, LastMessage>> {
         let mut statement = self.connection.prepare(
             "SELECT m.conversation_id,m.text,m.author,m.role,m.created_at_ms FROM bots b
@@ -330,22 +330,19 @@ impl Store {
         bot_for_conversation_from(&self.connection, network, scope)
     }
 
-    pub fn primary_assistant(&self, network: &str) -> Result<Option<ScopeId>> {
-        primary_assistant_from(&self.connection, network)
+    pub fn primary_bot(&self, network: &str) -> Result<Option<ScopeId>> {
+        primary_bot_from(&self.connection, network)
     }
 }
 
-/// The assistant that judges what comes in without an owner: the user's latest choice while it
-/// is an assistant, otherwise the first assistant created.
-pub(crate) fn primary_assistant_from(
-    connection: &Connection,
-    network: &str,
-) -> Result<Option<ScopeId>> {
+/// The bot that judges what comes in without an owner: the user's latest choice while it
+/// is a bot, otherwise the first bot created.
+pub(crate) fn primary_bot_from(connection: &Connection, network: &str) -> Result<Option<ScopeId>> {
     let chosen = connection
         .query_row(
             "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1
              ORDER BY lamport DESC,created_at_ms DESC,hash DESC LIMIT 1",
-            params![network, ASSISTANTS_SCOPE],
+            params![network, BOTS_SCOPE],
             |r| r.get::<_, String>(0),
         )
         .optional()?
@@ -353,7 +350,7 @@ pub(crate) fn primary_assistant_from(
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             Ok(match event.body {
-                EventBody::PrimaryAssistantSet {
+                EventBody::PrimaryBotSet {
                     conversation_id, ..
                 } => Some(conversation_id),
                 _ => None,

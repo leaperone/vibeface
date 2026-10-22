@@ -30,8 +30,8 @@ CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `r
 CREATE INDEX `messages_answers` ON `messages` (`network_id`, `answers`);
 -- Create "bots" table
 CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, PRIMARY KEY (`network_id`, `conversation_id`));
--- Create "assistant_profiles" table
-CREATE TABLE `assistant_profiles` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `field` text NOT NULL, `value` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `field`));
+-- Create "bot_profiles" table
+CREATE TABLE `bot_profiles` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `field` text NOT NULL, `value` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `field`));
 -- Create "skills" table
 CREATE TABLE `skills` (`network_id` text NOT NULL, `skill_id` text NOT NULL, `skill` text NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `skill_id`));
 -- Create "schedules" table
@@ -42,10 +42,10 @@ CREATE INDEX `schedules_conversation` ON `schedules` (`network_id`, `conversatio
 CREATE TABLE `memories` (`network_id` text NOT NULL, `memory_id` text NOT NULL, `conversation_id` text NOT NULL, `text` text NULL, `rank` text NOT NULL, `changed_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `memory_id`));
 -- Create index "memories_conversation" to table: "memories"
 CREATE INDEX `memories_conversation` ON `memories` (`network_id`, `conversation_id`);
--- Create "assistant_changes" table
-CREATE TABLE `assistant_changes` (`network_id` text NOT NULL, `change_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, `change` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `change_id`));
--- Create index "assistant_changes_order" to table: "assistant_changes"
-CREATE INDEX `assistant_changes_order` ON `assistant_changes` (`network_id`, `conversation_id`, `rank`);
+-- Create "bot_changes" table
+CREATE TABLE `bot_changes` (`network_id` text NOT NULL, `change_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, `change` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `change_id`));
+-- Create index "bot_changes_order" to table: "bot_changes"
+CREATE INDEX `bot_changes_order` ON `bot_changes` (`network_id`, `conversation_id`, `rank`);
 -- Create "works" table
 CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NULL, `dispatch` text NULL, `dispatch_rank` text NULL, `progress` text NULL, `progress_rank` text NULL, `thread_id` text NULL, `turn_id` text NULL, `finish` text NULL, `finish_rank` text NULL, PRIMARY KEY (`network_id`, `work_id`));
 -- Create index "works_conversation" to table: "works"

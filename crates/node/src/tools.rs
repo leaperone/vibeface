@@ -1,4 +1,4 @@
-//! The coordination tools of an assistant turn: one table for the schemas the SDK offers, the
+//! The coordination tools of a bot turn: one table for the schemas the SDK offers, the
 //! Node's handler and the `vibeface tool` CLI.
 use crate::{
     model::{MAX_BOT_MESSAGE_BYTES, MAX_MEMORY_CHARS, SCHEDULE_MINUTES},
@@ -165,7 +165,7 @@ impl Tool {
                 &[],
             ),
             Tool::DispatchWork => (
-                "Start work in cwd on target_node (default: this device). On this device the CLI registers the work with the Node, then starts one Codex turn with full access through the App Server; on another device that device's assistant gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up. thread sends the prompt into an existing Codex thread on this device instead, steering its running turn or starting one. model, effort and images (local image paths) pass to the turn.",
+                "Start work in cwd on target_node (default: this device). On this device the CLI registers the work with the Node, then starts one Codex turn with full access through the App Server; on another device that device's bot gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up. thread sends the prompt into an existing Codex thread on this device instead, steering its running turn or starting one. model, effort and images (local image paths) pass to the turn.",
                 json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
                 "prompt":{"type":"string","minLength":1,"description":"The task as Codex should read it: goal, where, limits, what done means; a required result format with a short example. Not a relay of the chat"},
                 "cwd":string(),"call_ref":string(),"target_node":string(),
@@ -187,17 +187,17 @@ impl Tool {
                 &["work_id"],
             ),
             Tool::CallLookup => (
-                "Find what this turn did with call_ref: the work it dispatched, the assistant change it made or the message it sent.",
+                "Find what this turn did with call_ref: the work it dispatched, the bot change it made or the message it sent.",
                 json!({"call_ref":string()}),
                 &["call_ref"],
             ),
             Tool::UpdateProfile => (
-                "Rename this assistant or replace its standing instructions because the user's own message asked. Apply it right away, without asking to confirm; the chat shows the change. instructions replaces the whole text, so keep what should stay. Reuse call_ref only to retry the same change.",
+                "Rename this bot or replace its standing instructions because the user's own message asked. Apply it right away, without asking to confirm; the chat shows the change. instructions replaces the whole text, so keep what should stay. Reuse call_ref only to retry the same change.",
                 json!({"call_ref":string(),"name":string(),"instructions":{"type":"string"}}),
                 &["call_ref"],
             ),
             Tool::SaveSkill => (
-                "Save a reusable skill to the library every assistant in this network shares, because the user's own message asked. Omit skill_id to add one; pass it to replace that skill. Apply it right away, without asking to confirm. body holds the complete steps.",
+                "Save a reusable skill to the library every bot in this network shares, because the user's own message asked. Omit skill_id to add one; pass it to replace that skill. Apply it right away, without asking to confirm. body holds the complete steps.",
                 json!({"call_ref":string(),"skill_id":string(),"name":string(),"description":{"type":"string"},"body":string()}),
                 &["call_ref", "name", "description", "body"],
             ),
@@ -207,7 +207,7 @@ impl Tool {
                 &["call_ref", "skill_id"],
             ),
             Tool::SaveSchedule => (
-                "Create or replace a schedule of this assistant because the user's own message asked: prompt runs as a new turn of this conversation at first_run_at_ms, then every every_minutes when given (a routine); without every_minutes it runs once (a reminder). Missed runs are skipped. Apply it right away, without asking to confirm. Compute first_run_at_ms (Unix ms) from assistant.now_ms in the user's time zone; if they never said it, use this device's local time zone and say which one you used. Write prompt as a standalone instruction: its inputs, the expected result, its boundaries and what to do when a source is missing. In your reply restate the name, the schedule in the user's time zone, the next run and what it will do. Omit schedule_id to add one; pass it to replace that schedule. enabled=false pauses it.",
+                "Create or replace a schedule of this bot because the user's own message asked: prompt runs as a new turn of this conversation at first_run_at_ms, then every every_minutes when given (a routine); without every_minutes it runs once (a reminder). Missed runs are skipped. Apply it right away, without asking to confirm. Compute first_run_at_ms (Unix ms) from bot.now_ms in the user's time zone; if they never said it, use this device's local time zone and say which one you used. Write prompt as a standalone instruction: its inputs, the expected result, its boundaries and what to do when a source is missing. In your reply restate the name, the schedule in the user's time zone, the next run and what it will do. Omit schedule_id to add one; pass it to replace that schedule. enabled=false pauses it.",
                 json!({"call_ref":string(),"schedule_id":string(),"name":string(),"prompt":string(),
                 "first_run_at_ms":{"type":"integer","minimum":0},
                 "every_minutes":{"type":"integer","minimum":*SCHEDULE_MINUTES.start(),"maximum":*SCHEDULE_MINUTES.end()},
@@ -215,7 +215,7 @@ impl Tool {
                 &["call_ref", "name", "prompt", "first_run_at_ms"],
             ),
             Tool::RemoveSchedule => (
-                "Delete a schedule of this assistant because the user's own message asked.",
+                "Delete a schedule of this bot because the user's own message asked.",
                 json!({"call_ref":string(),"schedule_id":string()}),
                 &["call_ref", "schedule_id"],
             ),
@@ -225,18 +225,18 @@ impl Tool {
                 &["skill_id"],
             ),
             Tool::Remember => (
-                "Keep a short note this assistant reads in every later turn (a fact or preference the user wants kept), because the user's own message asked. Omit memory_id to add a note; pass it to rewrite that note. Never store keys, tokens or passwords; they are refused.",
+                "Keep a short note this bot reads in every later turn (a fact or preference the user wants kept), because the user's own message asked. Omit memory_id to add a note; pass it to rewrite that note. Never store keys, tokens or passwords; they are refused.",
                 json!({"call_ref":string(),"memory_id":string(),
                 "text":{"type":"string","minLength":1,"maxLength":MAX_MEMORY_CHARS}}),
                 &["call_ref", "text"],
             ),
             Tool::Forget => (
-                "Delete one of this assistant's notes because the user's own message asked.",
+                "Delete one of this bot's notes because the user's own message asked.",
                 json!({"call_ref":string(),"memory_id":string()}),
                 &["call_ref", "memory_id"],
             ),
             Tool::Recall => (
-                "List this assistant's notes, or those containing query. assistant.memory already holds them unless some were omitted.",
+                "List this bot's notes, or those containing query. bot.memory already holds them unless some were omitted.",
                 json!({"query":string()}),
                 &[],
             ),

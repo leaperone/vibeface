@@ -16,7 +16,7 @@ import { JoinRequests } from "./join"
 export type DeviceRow = {
   id: string; name: string; kind: "node" | "client"; member?: Member; node?: NodeInfo
   /** The device this browser is connected through. */ entry: boolean
-  browser: boolean; online?: boolean; assistant: boolean; admin: boolean
+  browser: boolean; online?: boolean; bot: boolean; admin: boolean
 }
 
 export function useDeviceRows(): DeviceRow[] {
@@ -31,7 +31,7 @@ export function useDeviceRows(): DeviceRow[] {
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
       entry: id === ready?.entry.device_id, browser: id === identity?.deviceId,
-      online: kind === "node" ? node?.online ?? false : undefined, assistant: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
+      online: kind === "node" ? node?.online ?? false : undefined, bot: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
@@ -79,7 +79,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="flex min-h-14 items-center gap-3 px-4 py-2 hover:bg-muted/50">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
           <span className="flex min-w-0 flex-1 items-center gap-2"><span className="truncate font-medium">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
-          {row.assistant ? <Hint icon={Bot} label="能运行助手" /> : null}
+          {row.bot ? <Hint icon={Bot} label="能运行 Bot" /> : null}
           {row.admin ? <Hint icon={Crown} label="管理员" /> : null}
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
@@ -136,7 +136,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     {row.kind === "node" && !copied ? <Section icon={terms.ai.icon} title={terms.ai.label}>
       {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
-        <p>{row.assistant ? "能运行助手" : "还没配置助手"}</p>
+        <p>{row.bot ? "能运行 Bot" : "还没配置 Bot"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>}
@@ -159,7 +159,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     <Details>
       <DetailRow label="设备编号" value={row.id} mono />
-      {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行助手" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
+      {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
     </Details>
 
     {canManage && row.member && !row.admin && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">

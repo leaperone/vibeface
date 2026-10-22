@@ -16,9 +16,9 @@ pub enum TriggerKind {
     AgentTask,
     /// A due time of a schedule of this conversation: a routine, or a reminder.
     Schedule,
-    /// The primary assistant judges who owns a session the user chose to handle.
+    /// The primary bot judges who owns a session the user chose to handle.
     Route,
-    /// Another assistant's message to this one.
+    /// Another bot's message to this one.
     BotMessage,
 }
 
@@ -26,7 +26,7 @@ pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
 }
 
-/// The turn in which the primary assistant routes the session a session question is about.
+/// The turn in which the primary bot routes the session a session question is about.
 pub fn route_trigger(question_id: &str) -> String {
     format!("route:{question_id}")
 }
@@ -39,7 +39,7 @@ pub fn task_trigger(work_id: &str) -> String {
     format!("task:{work_id}")
 }
 
-/// A message another assistant wrote to this conversation.
+/// A message another bot wrote to this conversation.
 pub fn bot_message_trigger(message_id: &str) -> String {
     format!("bot_message:{message_id}")
 }
@@ -86,7 +86,7 @@ pub fn next_run(schedule: &Schedule, now: i64) -> Option<i64> {
 }
 
 /// Whether the schedule still has a time ahead: repeating, or a one-shot not yet due. Only these
-/// count toward an assistant's limit, show in lists and reach the prompt.
+/// count toward a bot's limit, show in lists and reach the prompt.
 pub fn ahead(schedule: &Schedule, now: i64) -> bool {
     schedule.every_minutes.is_some() || schedule.first_run_at_ms >= now
 }
@@ -178,7 +178,7 @@ pub struct SchedulerJob {
     /// The user message this turn ultimately answers, an agent task's own work ID, a peer
     /// message, or a schedule run's trigger.
     pub reply_to: String,
-    /// The assistant reply's message ID, fixed at admission so retries reuse it.
+    /// The bot reply's message ID, fixed at admission so retries reuse it.
     pub message_id: String,
     #[serde(flatten)]
     pub state: JobState,

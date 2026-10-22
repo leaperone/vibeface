@@ -19,7 +19,7 @@ const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> 
 
 /**
  * A question waiting on the person, in its chat and in 待处理: tap a choice or type an answer. Answered, it is one line.
- * `answer`: what the chat already holds for it. `inbox`: also names the assistant and links to its chat.
+ * `answer`: what the chat already holds for it. `inbox`: also names the bot and links to its chat.
  */
 export function QuestionCard({ question, answer, inbox = false }: { question: Question; answer?: string; inbox?: boolean }) {
   const workspace = useWorkspace()
@@ -42,7 +42,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const { icon, tone, label } = looks[question.severity]
   const disabled = !workspace.writable || action.busy !== null
   const session = question.conversation_id === null
-  // 交给 the primary assistant repeats 处理.
+  // 交给 the primary bot repeats 处理.
   const shown = question.choices.filter((choice) => !session || !choice.conversation_id || choice.conversation_id !== workspace.primary)
   const send = (key: string, value: string) => action.run(key, async () => {
     const result = await workspace.answer(question, value)
@@ -54,7 +54,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
     if (session && value === "忽略") return toast("已忽略这个会话", { tone: "success" })
     const chosen = session ? question.choices.find((choice) => choice.label === value)?.conversation_id : question.conversation_id
     const bot = workspace.bots.find((item) => item.conversation_id === (chosen ?? workspace.primary))
-    toast(!session ? "已回答" : chosen ? `已交给 ${bot?.name ?? "助手"}` : "已交给主助手分派", {
+    toast(!session ? "已回答" : chosen ? `已交给 ${bot?.name ?? "Bot"}` : "已交给主 Bot 分派", {
       tone: "success", action: bot ? { label: "查看", onClick: () => { void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) } } : undefined,
     })
   }
@@ -67,8 +67,8 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       {session ? <Meta icon={SquareTerminal} label="会话">{agentName(question.about.agent)}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={Laptop} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
-      {inbox && question.assistant ? <Link to="/b/$botId" params={{ botId: question.assistant.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
-        <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{question.assistant.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" />
+      {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
+        <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" />
       </Link> : null}
     </p>
     {session && question.about.summary ? <p className="line-clamp-2 text-muted-foreground [overflow-wrap:anywhere]" title={question.about.summary}>{question.about.summary}</p> : null}
@@ -89,7 +89,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
           return <button key={choice.label} type="button" className={row} disabled={disabled} aria-busy={action.busy === key || undefined} aria-keyshortcuts={index < 9 ? String(index + 1) : undefined} onClick={() => void send(key, choice.label)}>
             <span aria-hidden="true" className={`${badge} ${suggested ? "bg-primary/10 text-foreground ring-1 ring-primary/25" : "bg-muted text-muted-foreground"}`}>{action.busy === key ? <LoaderCircle className="size-4 animate-spin" /> : index + 1}</span>
             <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{choice.label}</span>
-            {suggested ? <span className="shrink-0 text-meta font-normal text-muted-foreground">主助手分派</span> : null}
+            {suggested ? <span className="shrink-0 text-meta font-normal text-muted-foreground">主 Bot 分派</span> : null}
           </button>
         })}
       </div> : null}

@@ -2,14 +2,14 @@ import { useId, type ReactNode } from 'react'
 import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details } from '@/components/app/kit'
-import { formatWhen, lineDiff, scheduleFrequency, type DiffLine } from '@/features/workspace/assistant'
-import type { AssistantChange, AssistantChangeRecord, AssistantSchedule, AssistantSkill, ScheduleView } from '@/features/workspace/types'
+import { formatWhen, lineDiff, scheduleFrequency, type DiffLine } from '@/features/workspace/bot-settings'
+import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView } from '@/features/workspace/types'
 
-function cardTitle(changes: AssistantChange[]) {
+function cardTitle(changes: BotChange[]) {
   const kind = changes[0]?.kind
   if (changes.some((change) => change.kind !== kind)) return '已更新'
-  if (kind === 'profile') return '已更新助手'
-  const items = changes as Extract<AssistantChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
+  if (kind === 'profile') return '已更新 Bot'
+  const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
   const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
   if (kind === 'skill') return added ? '已存为 skill' : removed ? '已删除 skill' : '已更新 skill'
   if (kind === 'memory') return added ? '已记下' : removed ? '已忘记' : '已更新笔记'
@@ -17,7 +17,7 @@ function cardTitle(changes: AssistantChange[]) {
 }
 
 /** What one turn of the conversation changed, item by item, before → after. `schedules` are the conversation's schedules now. */
-export function ChangeCard({ records, schedules }: { records: AssistantChangeRecord[]; schedules: readonly ScheduleView[] }) {
+export function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
   const id = useId()
   const changes = records.map((record) => record.change)
   return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card p-4">
@@ -31,7 +31,7 @@ export function ChangeCard({ records, schedules }: { records: AssistantChangeRec
   </section>
 }
 
-function ChangeRows({ change, schedules }: { change: AssistantChange; schedules: readonly ScheduleView[] }) {
+function ChangeRows({ change, schedules }: { change: BotChange; schedules: readonly ScheduleView[] }) {
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
@@ -88,7 +88,7 @@ function DiffList({ lines }: { lines: DiffLine[] }) {
   </ul>
 }
 
-function SkillRow({ before, after }: { before: AssistantSkill | null; after: AssistantSkill | null }) {
+function SkillRow({ before, after }: { before: BotSkill | null; after: BotSkill | null }) {
   const skill = after ?? before!
   const renamed = before && after && before.name !== after.name
   const body = !after ? null : !before ? <p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.body}</p>
@@ -104,7 +104,7 @@ function SkillRow({ before, after }: { before: AssistantSkill | null; after: Ass
  * A one-time schedule shows when it runs. A repeating one shows its next run from the schedule as it is now,
  * so a card for a removed, paused or finished one shows none.
  */
-function ScheduleRow({ before, after, current }: { before: AssistantSchedule | null; after: AssistantSchedule | null; current?: ScheduleView }) {
+function ScheduleRow({ before, after, current }: { before: BotSchedule | null; after: BotSchedule | null; current?: ScheduleView }) {
   const schedule = after ?? before!
   const once = schedule.every_minutes === undefined
   const icon = once ? AlarmClock : Repeat
