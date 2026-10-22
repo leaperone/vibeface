@@ -1262,6 +1262,9 @@ async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Resul
         arguments,
         |args| post_tool("track_work", args, call_id),
         |args| post_tool("bind_work", args, call_id),
+        || async {
+            let _ = post_tool("wait_codex", json!({}), call_id).await;
+        },
         socket,
     )
     .await
