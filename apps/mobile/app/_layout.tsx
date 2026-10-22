@@ -41,6 +41,9 @@ function Screens() {
         <Stack.Screen name="b/[botId]" options={{ title: '' }} />
         <Stack.Screen name="inbox" options={{ title: '待处理' }} />
         <Stack.Screen name="settings" options={{ title: '设置' }} />
+        <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
+        <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal' }} />
+        <Stack.Screen name="recovery" options={{ title: '换恢复密码' }} />
       </Stack.Protected>
     </Stack>
   </>

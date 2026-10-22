@@ -1,22 +1,30 @@
-import { Crown, Globe, Laptop, LogOut, MonitorSmartphone, Palette, Smartphone, type LucideIcon } from 'lucide-react-native'
-import { useState, type ReactNode } from 'react'
-import { ScrollView, View } from 'react-native'
+import { Link } from 'expo-router'
+import { Bell, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, Smartphone, type LucideIcon } from 'lucide-react-native'
+import { useEffect, useState, type ReactNode } from 'react'
+import { Pressable, ScrollView, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ConnectionPill } from '@/components/connection-pill'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
+import { JoinRequests, useOpenJoins } from '@/features/devices/join-requests'
 import { cn } from '@/lib/utils'
+import { useRun } from '@/lib/use-run'
 
 const themes = [['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']] as const
 
 export default function Settings() {
   const workspace = useWorkspace()
+  const device = useDevice()
   const { theme, hasAdaptiveThemes } = useUniwind()
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
+  const requests = useOpenJoins().length > 0
+  useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
       <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-lg bg-muted p-1">
@@ -27,10 +35,19 @@ export default function Settings() {
     <Section icon={Globe} title="连接">
       <ConnectionPill connection={workspace.connection} />
     </Section>
-    <Section icon={MonitorSmartphone} title="我的设备">
+    <Section icon={MonitorSmartphone} title="我的设备" action={device.ready?.principal.can_manage ? <Link href="/add-device" asChild>
+      <Button variant={requests ? 'outline' : 'default'} className="h-11"><Icon as={Plus} /><Text>添加设备</Text></Button>
+    </Link> : null}>
+      <JoinRequests />
       <View className="overflow-hidden rounded-xl border border-border">
         {workspace.members.map((member, index) => <MemberRow key={member.device_id} member={member} first={index === 0} />)}
       </View>
+    </Section>
+    {device.ready ? <Notifications /> : null}
+    <Section icon={FileKey} title="恢复文件">
+      <Link href="/recovery" asChild>
+        <Button variant="outline" className="h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text></Button>
+      </Link>
     </Section>
     <View className="border-t border-border pt-6">
       {leaving ? <View className="gap-3">
@@ -46,11 +63,25 @@ export default function Settings() {
   </ScrollView>
 }
 
-function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
+/** Rendered only while connected: the shared workspace exists exactly then. */
+function Notifications() {
+  const shared = useShared()
+  const { busy, error, run } = useRun()
+  const button = shared.notificationButton
+  return <Section icon={Bell} title="通知">
+    <Button variant="outline" className="h-11 self-start" disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}>
+      <Text>{button.label}</Text>
+    </Button>
+    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+  </Section>
+}
+
+function Section({ icon, title, action, children }: { icon: LucideIcon; title: string; action?: ReactNode; children: ReactNode }) {
   return <View className="gap-3">
-    <View className="flex-row items-center gap-2">
+    <View className="min-h-11 flex-row items-center gap-2">
       <Icon as={icon} />
-      <Text role="heading" className="text-heading font-semibold">{title}</Text>
+      <Text role="heading" className="flex-1 text-heading font-semibold">{title}</Text>
+      {action}
     </View>
     {children}
   </View>
@@ -59,13 +90,16 @@ function Section({ icon, title, children }: { icon: LucideIcon; title: string; c
 const kindIcon = (member: Member) => member.kind === 'client' ? Smartphone : Laptop
 
 function MemberRow({ member, first }: { member: Member; first: boolean }) {
-  return <View className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2', !first && 'border-t border-border')}>
-    <Icon as={kindIcon(member)} className="text-muted-foreground" />
-    <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
-      <Text numberOfLines={1} className="shrink font-medium">{member.name}</Text>
-      {member.current ? <Text className="text-meta text-muted-foreground">本机</Text> : null}
-      {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
-    </View>
-    <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
-  </View>
+  return <Link href={`/device/${member.device_id}`} asChild>
+    <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
+      <Icon as={kindIcon(member)} className="text-muted-foreground" />
+      <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
+        <Text numberOfLines={1} className="shrink font-medium">{member.name}</Text>
+        {member.current ? <Text className="text-meta text-muted-foreground">本机</Text> : null}
+        {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
+      </View>
+      <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
+      <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+    </Pressable>
+  </Link>
 }

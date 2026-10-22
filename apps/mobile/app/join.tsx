@@ -1,11 +1,12 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
-import { Camera, ClipboardPaste, Hourglass, QrCode, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, QrCode, ShieldAlert, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { SafeAreaView } from 'react-native-safe-area-context'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { SafetyCode } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -13,16 +14,41 @@ import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
+import { RecoveryRestore, RecoveryReview } from '@/features/recovery/recovery'
+import { useRun } from '@/lib/use-run'
 
 export default function JoinScreen() {
   const workspace = useWorkspace()
+  const device = useDevice()
   const session = workspace.session
+  const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
+  const choosing = device.phase !== 'key_lost' && !device.review && session.phase !== 'joining'
   return <SafeAreaView className="flex-1 bg-background">
     <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow justify-center gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
       <Text role="heading" className="text-title font-semibold tracking-tight">Vibeface</Text>
-      {session.phase === 'joining' ? <Waiting code={session.code} name={session.deviceName} onCancel={workspace.actions.cancelJoin} /> : <JoinForm />}
+      {device.phase === 'key_lost' ? <LostKey />
+        : device.review?.kind === 'recovery' ? <RecoveryReview />
+        : session.phase === 'joining' ? <Waiting code={session.code} name={session.deviceName} onCancel={workspace.actions.cancelJoin} />
+        : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore /></Panel>
+        : <JoinForm />}
+      {choosing ? <View className="border-t border-border pt-4">
+        {lane === 'recovery'
+          ? <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>用加入链接</Text></Button>
+          : <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
+      </View> : null}
     </KeyboardAwareScrollView>
   </SafeAreaView>
+}
+
+/** The phone's device key is gone; starting over makes a new one, then it joins again by link or recovery file. */
+function LostKey() {
+  const device = useDevice()
+  const { busy, error, run } = useRun()
+  return <Panel icon={ShieldAlert} title="需要重新加入">
+    <Text className="text-muted-foreground">这台手机保存的登录信息不见了。</Text>
+    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+    <Button className="h-11 self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
+  </Panel>
 }
 
 function JoinForm() {
