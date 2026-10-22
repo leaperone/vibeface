@@ -1948,7 +1948,7 @@ def triage_checks(run, workspace, a, network, passed):
                 "a text answer reaches the session once as the assistant's work; a retry reads it back")
         told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
                         if row["event_id"].startswith("answered-" + question_id + "-") and row["status"] == 200] or None, timeout=60)
-        require(told[-1]["body"] == {"schema_version": 2, "type": "answered", "event_id": told[-1]["event_id"],
+        require(told[-1]["body"] == {"schema_version": 1, "type": "answered", "event_id": told[-1]["event_id"],
                                      "question_id": question_id, "text": "继续，先跑测试"}, "the webhook learns the answer given in the web")
 
         tokens = a.client.call("create_decision_token", {"label": "grok"})
@@ -2295,7 +2295,7 @@ def phase1_acceptance(options):
         require(receipt["accepted"] is True and receipt["message_id"] == label
                 and receipt["trigger"] == "message:" + label, "acceptance pins the message trigger")
         proof = receipt["receipt"]
-        require(proof["version"] == 2 and proof["network_id"] == network
+        require(proof["network_id"] == network
                 and proof["conversation_id"] == name and proof["trigger"] == receipt["trigger"],
                 "durable receipt has the exact accepted identity")
         return receipt, text

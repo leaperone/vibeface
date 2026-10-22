@@ -4,10 +4,6 @@ table "networks" {
     null = true
     type = text
   }
-  column "revision" {
-    null = false
-    type = integer
-  }
   column "bundle" {
     null = false
     type = text
@@ -56,10 +52,6 @@ table "events" {
   }
   column "effective" {
     null = false
-    type = integer
-  }
-  column "detected_at_ms" {
-    null = true
     type = integer
   }
   primary_key {
@@ -159,10 +151,6 @@ table "pending_events" {
   column "missing" {
     null = false
     type = text
-  }
-  column "received_at_ms" {
-    null = false
-    type = integer
   }
   primary_key {
     columns = [column.network_id, column.hash]
@@ -799,10 +787,6 @@ table "invites" {
     type = text
   }
   column "invite_hash" {
-    null = false
-    type = text
-  }
-  column "issuer" {
     null = false
     type = text
   }

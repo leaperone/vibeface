@@ -7,7 +7,9 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 11;
+pub const DATA_EPOCH: u32 = 1;
+/// Bumped whenever a release package stops being installable by the previous updater.
+pub const UPDATE_PROTOCOL: u32 = 1;
 /// The name a removed Node had, which its fresh data directory offers when it joins again.
 pub const FORMER_NAME_FILE: &str = "former-name";
 

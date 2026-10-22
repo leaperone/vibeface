@@ -27,7 +27,7 @@ pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
 mod tests;
 pub(crate) mod work;
 
-const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
+const INITIAL_SCHEMA: &str = include_str!("../migrations/1_initial.sql");
 pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;
 
 /// Whether this Node may append to its own log (design 5.7 and 5.8).
@@ -87,7 +87,7 @@ pub(crate) fn install_trust_bundle_in(
     if previous.as_ref() == Some(&encoded) {
         return Ok(false);
     }
-    connection.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
+    connection.execute("INSERT INTO networks(network_id,bundle) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET bundle=excluded.bundle",params![network_id,encoded])?;
     log::recompute(connection, &merged.project()?)
 }
 
@@ -260,12 +260,11 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = crate::runtime::now_ms();
         let view = membership_from(&tx, network_id)?;
         let mut stale = false;
         let statuses = envelopes
             .iter()
-            .map(|envelope| log::ingest_from(&tx, &view, envelope, now, &mut stale))
+            .map(|envelope| log::ingest_from(&tx, &view, envelope, &mut stale))
             .collect::<Result<Vec<_>>>()?;
         let rebuilt = stale && log::recompute(&tx, &view)?;
         tx.commit()?;

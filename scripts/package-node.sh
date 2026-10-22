@@ -66,8 +66,9 @@ package="$staging/$name"
 mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface"
 data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
-[[ -n "$data_epoch" ]] || { echo 'DATA_EPOCH not found in crates/node/src/config.rs' >&2; exit 1; }
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":%s}\n' "$version" "$target" "$source_commit" "$data_epoch" > "$package/BUILD-INFO.json"
+update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
+[[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in crates/node/src/config.rs' >&2; exit 1; }
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":%s,"data_epoch":%s}\n' "$version" "$target" "$source_commit" "$update_protocol" "$data_epoch" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"

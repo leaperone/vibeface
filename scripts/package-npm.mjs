@@ -52,7 +52,7 @@ function nativePackage(directory, version, target, sourceCommit) {
   assert(!fs.existsSync(path.join(directory, 'sidecars/node_modules')), 'SDK dependencies must not be bundled');
   const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json'), 'utf8'));
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol],
-    [version, target, sourceCommit, 2], 'native package identity mismatch');
+    [version, target, sourceCommit, 1], 'native package identity mismatch');
   assert(Number.isSafeInteger(info.data_epoch) && info.data_epoch > 0 && info.data_epoch <= 0xffffffff, 'invalid data epoch');
   assert(fs.statSync(path.join(directory, 'vibeface')).mode & 0o111, 'native binary must be executable');
   assert(fs.readFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm')).subarray(0, 4).equals(Buffer.from([0, 97, 115, 109])), 'invalid WebAssembly module');
@@ -146,7 +146,7 @@ async function selfTest() {
         fs.mkdirSync(path.dirname(path.join(directory, entry)), { recursive: true });
         fs.writeFileSync(path.join(directory, entry), 'fixture\n');
       }
-      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target, source_commit: commit, update_protocol: 2, data_epoch: 3 }));
+      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target, source_commit: commit, update_protocol: 1, data_epoch: 1 }));
       fs.writeFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm'), Buffer.from([0, 97, 115, 109]));
       fs.writeFileSync(path.join(directory, 'vibeface'), '#!/usr/bin/env node\nif (process.argv[2] === "exit") process.exit(23);\nif (process.argv[2] === "wait") { process.on("SIGTERM", () => process.exit(42)); console.log("ready"); setInterval(() => {}, 1000); }\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
       fs.chmodSync(path.join(directory, 'vibeface'), 0o755);
@@ -178,19 +178,19 @@ async function selfTest() {
     assert.throws(() => pack(input, path.join(scratch, 'wrong-source'), version, 'b'.repeat(40)), /identity mismatch/);
     const manifest = path.join(sources.get(target), 'BUILD-INFO.json');
     const original = fs.readFileSync(manifest);
-    fs.writeFileSync(manifest, JSON.stringify({ version, target, source_commit: commit, update_protocol: 1, data_epoch: 3 }));
+    fs.writeFileSync(manifest, JSON.stringify({ version, target, source_commit: commit, update_protocol: 2, data_epoch: 1 }));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'bad-protocol'), version, commit), /identity mismatch/);
-    fs.writeFileSync(manifest, JSON.stringify({ version, target, source_commit: commit, update_protocol: 2, data_epoch: 4 }));
+    fs.writeFileSync(manifest, JSON.stringify({ version, target, source_commit: commit, update_protocol: 1, data_epoch: 2 }));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'mixed-epochs'), version, commit), /same data epoch/);
     for (const [platform, directory] of sources) {
-      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target: platform, source_commit: commit, update_protocol: 2, data_epoch: 4 }));
+      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target: platform, source_commit: commit, update_protocol: 1, data_epoch: 2 }));
       repack(platform);
     }
-    pack(input, path.join(scratch, 'epoch-four'), version, commit);
+    pack(input, path.join(scratch, 'other-epoch'), version, commit);
     for (const [platform, directory] of sources) {
-      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target: platform, source_commit: commit, update_protocol: 2, data_epoch: 3 }));
+      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target: platform, source_commit: commit, update_protocol: 1, data_epoch: 1 }));
       repack(platform);
     }
     fs.writeFileSync(manifest, original);
@@ -199,7 +199,7 @@ async function selfTest() {
     assert.throws(() => pack(input, path.join(scratch, 'unsafe-archive'), version, commit), /links or special files/);
     assert.throws(() => nightly('1.2.3'), /Nightly versions/);
     assert.throws(() => nightly('1.2.3-nightly.20260229.1'), /invalid Nightly date/);
-    console.log('npm self-test passed: complete packages, consistent epochs 3 and 4, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
+    console.log('npm self-test passed: complete packages, consistent epochs 1 and 2, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

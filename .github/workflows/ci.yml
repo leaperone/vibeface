@@ -282,9 +282,10 @@ jobs:
           python3 - "$package/BUILD-INFO.json" <<'PY'
           import json, os, pathlib, re, subprocess, sys
           info = json.load(open(sys.argv[1]))
-          epoch = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$", pathlib.Path("crates/node/src/config.rs").read_text(), re.M)[1])
+          config = pathlib.Path("crates/node/src/config.rs").read_text()
+          protocol, epoch = (int(re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1]) for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
           assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
-          assert info["update_protocol"] == 2 and info["data_epoch"] == epoch
+          assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
           binary = pathlib.Path(sys.argv[1]).parent / "vibeface"

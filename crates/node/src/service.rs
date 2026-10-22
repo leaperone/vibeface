@@ -105,10 +105,10 @@ pub async fn run(options: Service) -> Result<()> {
         Some(root) => root.clone(),
         None => update::managed_install_root(&data)?,
     };
-    let _migration_lock = if npm_root.is_some() && matches!(options.action, Action::Install) {
+    let _update_lock = if npm_root.is_some() && matches!(options.action, Action::Install) {
         Some(
             update::update_lock(&data)
-                .context("wait for the updater before migrating its service")?,
+                .context("wait for the updater before installing the npm service")?,
         )
     } else {
         None
@@ -211,7 +211,8 @@ mod tests {
         std::fs::write(
             package.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"1.2.3-nightly.20261019.1","update_protocol":2,"data_epoch":{}}}"#,
+                r#"{{"version":"1.2.3-nightly.20261019.1","update_protocol":{},"data_epoch":{}}}"#,
+                crate::config::UPDATE_PROTOCOL,
                 crate::config::DATA_EPOCH
             ),
         )

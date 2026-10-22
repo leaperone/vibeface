@@ -346,9 +346,10 @@ fn manifest(package: &Path) -> Result<Manifest> {
         "invalid package manifest"
     );
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
-        .context("this package needs a manual bootstrap to the updater-enabled release")?;
+        .context("invalid package manifest")?;
     ensure!(
-        manifest.update_protocol == 2 && manifest.data_epoch == crate::config::DATA_EPOCH,
+        manifest.update_protocol == crate::config::UPDATE_PROTOCOL
+            && manifest.data_epoch == crate::config::DATA_EPOCH,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
@@ -944,7 +945,8 @@ mod tests {
         fs::write(
             directory.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"{version}","update_protocol":2,"data_epoch":{}}}"#,
+                r#"{{"version":"{version}","update_protocol":{},"data_epoch":{}}}"#,
+                crate::config::UPDATE_PROTOCOL,
                 crate::config::DATA_EPOCH
             ),
         )
@@ -1010,14 +1012,19 @@ mod tests {
         assert_eq!(installed(&root).unwrap(), new);
         fs::write(
             old.join("BUILD-INFO.json"),
-            r#"{"version":"1.0.0","update_protocol":2,"data_epoch":4}"#,
+            format!(
+                r#"{{"version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
+                crate::config::UPDATE_PROTOCOL,
+                crate::config::DATA_EPOCH + 1
+            ),
         )
         .unwrap();
         assert!(manifest(&old).is_err());
         fs::write(
             old.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"1.0.0","update_protocol":1,"data_epoch":{}}}"#,
+                r#"{{"version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
+                crate::config::UPDATE_PROTOCOL + 1,
                 crate::config::DATA_EPOCH
             ),
         )

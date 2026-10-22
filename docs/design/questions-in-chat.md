@@ -1,6 +1,6 @@
 # 聊天里的提问与回答
 
-状态为实施中。本文取代分诊卡片（`attention` 范围的 `AttentionRaised`/`AttentionResolved`、`send_decision` 直写 Codex 线程）。项目尚未发布正式版，事件、表和 RPC 直接改成最终形态，`DATA_EPOCH` 升到 10。
+状态为实施中。本文取代分诊卡片（`attention` 范围的 `AttentionRaised`/`AttentionResolved`、`send_decision` 直写 Codex 线程）。项目尚未发布正式版，事件、表和 RPC 直接改成最终形态。
 
 ## 1. 行为
 

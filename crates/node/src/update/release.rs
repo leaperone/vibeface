@@ -610,7 +610,8 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
         "package build identity does not match the official release tag"
     );
     ensure!(
-        build.update_protocol == 2 && build.data_epoch == crate::config::DATA_EPOCH,
+        build.update_protocol == crate::config::UPDATE_PROTOCOL
+            && build.data_epoch == crate::config::DATA_EPOCH,
         "package requires an unsupported update protocol or data epoch"
     );
     for file in [
@@ -934,7 +935,7 @@ mod tests {
             checksum_url: String::new(),
             archive_size: 1,
         };
-        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": 2, "data_epoch": crate::config::DATA_EPOCH});
+        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": crate::config::UPDATE_PROTOCOL, "data_epoch": crate::config::DATA_EPOCH});
         for dir in [&package, &copy] {
             for file in [
                 "README.md",
@@ -984,15 +985,18 @@ mod tests {
         assert!(tree(&package).unwrap() != tree(&copy).unwrap());
         symlink(package.join("README.md"), copy.join("unexpected-link")).unwrap();
         assert!(tree(&copy).is_err());
-        let mut old_build = build.clone();
-        old_build.as_object_mut().unwrap().remove("update_protocol");
+        let mut undeclared_build = build.clone();
+        undeclared_build
+            .as_object_mut()
+            .unwrap()
+            .remove("update_protocol");
         fs::write(
             package.join("BUILD-INFO.json"),
-            serde_json::to_vec(&old_build).unwrap(),
+            serde_json::to_vec(&undeclared_build).unwrap(),
         )
         .unwrap();
         assert!(verify_build(&package, &release).is_err());
-        for unsupported_protocol in [1, 3] {
+        for unsupported_protocol in [0, crate::config::UPDATE_PROTOCOL + 1] {
             let mut unsupported_build = build.clone();
             unsupported_build["update_protocol"] = serde_json::json!(unsupported_protocol);
             fs::write(
@@ -1003,7 +1007,7 @@ mod tests {
             assert!(verify_build(&package, &release).is_err());
         }
         for unsupported_epoch in
-            (1..=crate::config::DATA_EPOCH + 1).filter(|epoch| *epoch != crate::config::DATA_EPOCH)
+            (0..=crate::config::DATA_EPOCH + 1).filter(|epoch| *epoch != crate::config::DATA_EPOCH)
         {
             let mut unsupported_build = build.clone();
             unsupported_build["data_epoch"] = serde_json::json!(unsupported_epoch);

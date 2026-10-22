@@ -77,7 +77,6 @@ pub(crate) fn ingest_from(
     connection: &Connection,
     view: &AuthorizationView,
     envelope: &SignedEvent,
-    now: i64,
     stale: &mut bool,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
@@ -104,9 +103,9 @@ pub(crate) fn ingest_from(
     if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
-    let status = place(connection, view, envelope, &event, now, stale)?;
+    let status = place(connection, view, envelope, &event, stale)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
-        cascade(connection, view, &envelope.hash, now, stale)?;
+        cascade(connection, view, &envelope.hash, stale)?;
     }
     Ok(status)
 }
@@ -115,7 +114,6 @@ fn cascade(
     connection: &Connection,
     view: &AuthorizationView,
     hash: &str,
-    now: i64,
     stale: &mut bool,
 ) -> Result<()> {
     let mut ready = vec![hash.to_owned()];
@@ -130,7 +128,7 @@ fn cascade(
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             if matches!(
-                place(connection, view, &envelope, &event, now, stale)?,
+                place(connection, view, &envelope, &event, stale)?,
                 IngestStatus::Accepted | IngestStatus::Conflict
             ) {
                 ready.push(envelope.hash);
@@ -146,7 +144,6 @@ fn pending(
     envelope: &SignedEvent,
     event: &Event,
     missing: &str,
-    now: i64,
 ) -> Result<IngestStatus> {
     let count: i64 = connection.query_row(
         "SELECT count(*) FROM pending_events WHERE network_id=?",
@@ -157,8 +154,8 @@ fn pending(
         return Ok(IngestStatus::Rejected("too many pending events".into()));
     }
     connection.execute(
-        "INSERT INTO pending_events(network_id,hash,author,seq,envelope,missing,received_at_ms) VALUES(?,?,?,?,?,?,?)",
-        params![network, envelope.hash, event.author, event.seq, serde_json::to_string(envelope)?, missing, now],
+        "INSERT INTO pending_events(network_id,hash,author,seq,envelope,missing) VALUES(?,?,?,?,?,?)",
+        params![network, envelope.hash, event.author, event.seq, serde_json::to_string(envelope)?, missing],
     )?;
     Ok(IngestStatus::Pending)
 }
@@ -168,7 +165,6 @@ fn place(
     view: &AuthorizationView,
     envelope: &SignedEvent,
     event: &Event,
-    now: i64,
     stale: &mut bool,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
@@ -185,7 +181,7 @@ fn place(
             None if event.seq <= max + 1
                 || exists(connection, "pending_events", network, prev)? =>
             {
-                return pending(connection, network, envelope, event, prev, now);
+                return pending(connection, network, envelope, event, prev);
             }
             None => {
                 return Ok(IngestStatus::Rejected(format!(
@@ -204,7 +200,7 @@ fn place(
     }
     for dep in &event.deps {
         if !exists(connection, "events", network, dep)? {
-            return pending(connection, network, envelope, event, dep, now);
+            return pending(connection, network, envelope, event, dep);
         }
     }
     if let Err(error) = authorize_change(connection, network, event) {
@@ -214,7 +210,7 @@ fn place(
         Some(prev) => *prev == head_hash,
         None => max == 0,
     };
-    *stale |= !insert_event(connection, view, envelope, event, main, now)?;
+    *stale |= !insert_event(connection, view, envelope, event, main)?;
     Ok(if main {
         IngestStatus::Accepted
     } else {
@@ -271,7 +267,6 @@ fn insert_event(
     envelope: &SignedEvent,
     event: &Event,
     main: bool,
-    now: i64,
 ) -> Result<bool> {
     let network = view.network_id.as_str();
     let settled = main && !has_forks(connection, network, &event.author)?;
@@ -294,8 +289,8 @@ fn insert_event(
     }
     lamport += 1;
     connection.execute(
-        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope,main,effective,detected_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?, main, effective, (!main).then_some(now)],
+        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope,main,effective) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?, main, effective],
     )?;
     for blob in &event.blobs {
         connection.execute(
@@ -506,7 +501,7 @@ pub(crate) fn append_from(
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     authorize_change(connection, network, &event)?;
     ensure!(
-        insert_event(connection, &view, &envelope, &event, true, created_at_ms)?,
+        insert_event(connection, &view, &envelope, &event, true)?,
         "this Node's log has forked and it no longer writes"
     );
     Ok(envelope)

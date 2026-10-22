@@ -1,7 +1,7 @@
 -- Create "networks" table
-CREATE TABLE `networks` (`network_id` text NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
+CREATE TABLE `networks` (`network_id` text NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
 -- Create "events" table
-CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, `detected_at_ms` integer NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 -- Create index "events_main" to table: "events"
 CREATE UNIQUE INDEX `events_main` ON `events` (`network_id`, `author`, `seq`) WHERE main = 1;
 -- Create index "events_forks" to table: "events"
@@ -17,7 +17,7 @@ CREATE INDEX `event_blobs_blob` ON `event_blobs` (`network_id`, `blob`);
 -- Create "log_heads" table
 CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `max_seq` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`network_id`, `author`));
 -- Create "pending_events" table
-CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `envelope` text NOT NULL, `missing` text NOT NULL, `received_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`));
+CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `envelope` text NOT NULL, `missing` text NOT NULL, PRIMARY KEY (`network_id`, `hash`));
 -- Create index "pending_events_missing" to table: "pending_events"
 CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missing`);
 -- Create "conversations" table
@@ -76,9 +76,8 @@ CREATE TABLE `addresses` (`device_id` text NOT NULL, `record` text NOT NULL, PRI
 CREATE TABLE `blob_offsets` (`hash` text NOT NULL, `committed` integer NOT NULL, PRIMARY KEY (`hash`));
 -- Create "identity_meta" table
 CREATE TABLE `identity_meta` (`key` text NULL, `value` text NOT NULL, PRIMARY KEY (`key`));
-
 -- Create "invites" table
-CREATE TABLE `invites` (`join_id` text NOT NULL, `invite_hash` text NOT NULL, `issuer` text NOT NULL, `epoch` integer NOT NULL, `expires_at_ms` integer NOT NULL, `record` text NOT NULL, `device_id` text NULL, `kind` text NULL, `name` text NULL, `commit_hash` text NULL, `status` text NULL, `admin_id` text NULL, `admin_nonce` text NULL, `joiner_nonce` text NULL, `reason` text NULL, `grant_hash` text NULL, PRIMARY KEY (`join_id`));
+CREATE TABLE `invites` (`join_id` text NOT NULL, `invite_hash` text NOT NULL, `epoch` integer NOT NULL, `expires_at_ms` integer NOT NULL, `record` text NOT NULL, `device_id` text NULL, `kind` text NULL, `name` text NULL, `commit_hash` text NULL, `status` text NULL, `admin_id` text NULL, `admin_nonce` text NULL, `joiner_nonce` text NULL, `reason` text NULL, `grant_hash` text NULL, PRIMARY KEY (`join_id`));
 -- Create index "invites_invite_hash" to table: "invites"
 CREATE UNIQUE INDEX `invites_invite_hash` ON `invites` (`invite_hash`);
 -- Create "scheduler_sessions" table
@@ -102,4 +101,4 @@ CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `conversation_id` text 
 -- Create "work_stops" table
 CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));
 
-PRAGMA user_version = 11;
+PRAGMA user_version = 1;

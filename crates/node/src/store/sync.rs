@@ -7,7 +7,7 @@ use super::{
 use crate::{
     model::*,
     net::{AddressRecord, SignedAddress},
-    scheduling::{AdmissionReceipt, SCHEDULING_VERSION, TriggerKind},
+    scheduling::{AdmissionReceipt, TriggerKind},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -289,7 +289,6 @@ impl Store {
                 // A result the user asked not to report is delivered all the same.
                 admit_work_result_from(&tx, network, local, conversation, work_id, outcome)?
                     .unwrap_or(AdmissionReceipt {
-                        version: SCHEDULING_VERSION,
                         network_id: network.into(),
                         conversation_id: conversation.into(),
                         trigger: trigger.into(),

@@ -681,7 +681,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 
 第二期实施记录（PR #63）。分两步：第一步为后端、传输与密码学和不依赖页面的前端状态模块；第二步在 UX PR #64 合入后接入页面并完成浏览器端到端验收。与上文的差异和推迟项如下：
 
-- `DeviceId` 即 Ed25519 公钥，成员目录只有 `device_id`、`kind`、`name` 和 `manage`。Node 的角色只在本机 `config.json` 声明。`data_epoch` 保持 6。
+- `DeviceId` 即 Ed25519 公钥，成员目录只有 `device_id`、`kind`、`name` 和 `manage`。Node 的角色只在本机 `config.json` 声明。
 - 身份 RPC 为 `invite`、`join`、`join_status`、`approve`、`revoke` 和 `recover`，另有只读的 `recovery_state` 供根身份读取目录。建网也经 `recover`（带 `genesis` 和一次性 capability）。
 - `Attestation` 落在 `MessagePosted(user)`、`BotCreated`、`ApprovalAnswered`、`AutonomySet` 和 `NotificationAcked`。`WorkFinished` 的本人结清和 `ConversationOwner` 的本人签名推迟到第四期，与跨设备工作和调度切换一起做。
 - `/api/client` 只接通本 Node；目标是其他设备时回文本错误帧。跨入口转发随 iroh 在第三期实现，`verify-node.py --auto-route` 中的跨入口用例同期恢复。`network.rs` 和 `peer.rs` 保留到第三期。
@@ -747,7 +747,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 核对方式：`verify-node.py --phase4` 用夹具 Cursor/Codex 管理 Agent 和 Codex App Server，启动四台 Node（A、B 带两种夹具，P 是运行 relay 的公网角色，C 只有夹具 App Server），覆盖跨入口加入、经入口重试建机器人、跨入口续聊同一 thread、`executor=agent` 在目标上执行且只出现 Work 事件、协调 Agent 回答审批与越权派发被拒、离线停止与撤销、待核对三选一、换负责人不重放副作用，以及 64 MiB 附件上传与下载的进程级重启续传。真实浏览器从 P 入口完成加入、聊天、附件、离线停止、撤销与待核对，1280 与 375 宽截图。
 - 转入第五期：网页换负责人入口；`nodes` 探测离线设备不阻塞同一连接上的其他请求；附件跟随消息同步到新入口，并支持二进制下载；同一工作只保留一条待核对；检查点改为增量读取或由模型生成摘要；`--phase4` 加入扩展 CI。这些都在第五期完成，检查点选了增量读取。
 
-**第五期：写入保护、文档与扩展验收。** 实现 `aligning`、`writable` 和 `forked` 三个状态、本人手动解除只读的确认和冲突处理界面，重写 `docs/node.md`、`docs/node-protocol.md` 和 README 中的相关章节。删除 `docs/peer-id-migration.md`，`data_epoch` 加一。验收标准如下：
+**第五期：写入保护、文档与扩展验收。** 实现 `aligning`、`writable` 和 `forked` 三个状态、本人手动解除只读的确认和冲突处理界面，重写 `docs/node.md`、`docs/node-protocol.md` 和 README 中的相关章节。验收标准如下：
 
 - 从备份恢复的 Node 在对齐前拒绝写入，对齐后无分叉。
 - 其他 Node 全部离线时保持只读，本人确认后可以写入。
@@ -761,7 +761,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 写入状态为 `aligning`、`read_only`、`writable` 和 `forked`，把 5.8 节“其他 Node 都不可达时保持只读”单独列为 `read_only`。闸门放在 `log::append_from`，这是本机追加事件的唯一入口：Node 的存储连接上有一张 TEMP 表 `write_gate`，状态变化在存储锁内写入它，状态不是 `writable` 时追加失败，错误说明对齐中、只读或已分叉。调度和执行在进入 `writable` 后才启动；读取、同步和入库其他作者的事件不受影响。
 - 启动时成员目录里还有其他 Node 则进入 `aligning`，已记录本机作者冲突的直接进入 `forked`。每次与对端 Hello 时比较对方记录的本机作者 `max_seq` 和 `head_hash`：对方不多于本机且同序号 hash 相同时进入 `writable`；对方更多时照常拉回自己的日志，下一次 Hello 再判断；同序号 hash 不同时拉回对方那一条，写入 `log_conflicts` 后进入 `forked`，并在 `node.log` 记一条警告。对齐中所有其他 Node 都同步失败时进入 `read_only`。
 - 与 5.8 节的差异：对齐期间本人发的消息直接被拒绝并提示稍后再试，没有先放进入口 outbox 再写；“没有从备份恢复”的确认由管理设备的加密会话或本机会话调用 `confirm_writable`，不另带 `Attestation`，只写本机 `identity_meta`，不进入 DAG，对 `forked` 无效。分叉设备按第 9 节决定 9 处理：网页列出两份内容，引导到设备页移除后用新数据目录重新加入。
-- 网页：不能写时连接胶囊显示“只读”，弹出框和输入框旁说明是在对齐、等待确认还是已分叉；待处理里出现“这个设备的数据是从备份恢复的吗？”卡片（“是，先同步”和“不是，继续使用”），以及“这台设备的数据有两份副本”或“X 的数据有两份副本”的冲突卡片，两份内容放在详细信息里。`data_epoch` 改为 7，数据库 `user_version` 仍为 6；安装器和更新器只接受 epoch 7 的包。
+- 网页：不能写时连接胶囊显示“只读”，弹出框和输入框旁说明是在对齐、等待确认还是已分叉；待处理里出现“这个设备的数据是从备份恢复的吗？”卡片（“是，先同步”和“不是，继续使用”），以及“这台设备的数据有两份副本”或“X 的数据有两份副本”的冲突卡片，两份内容放在详细信息里。
 - 日志：默认过滤为 `warn,vibeface=info,vibeface_bridge=info`，`RUST_LOG` 可覆盖。`serve` 把日志追加到数据目录的 `node.log`（0600），启动时超过 16 MiB 轮转为 `node.log.1`（后来改为每行一条 JSON 记录、运行中 8 MiB 轮转并保留 5 个，见 `docs/troubleshooting.md`）；只有标准错误是终端时才同时输出，所以服务的 stderr 文件只剩崩溃信息。日志不写邀请、secret、入口令牌和本机启动 token。`status` 输出 `Writes` 和每台其他成员 Node 的 `Peer` 行（最近一次同步是否连上、完成于多久之前），`--json` 带 `write_state` 和 `peers`。
 - 排障：设置页“排障”只有一个“导出诊断包”，管理设备或本机会话可用。诊断包含版本、平台、设备编号、`config.json`、写入状态、冲突数、对端连通、`node.log` 最后 400 行和 `service.stderr.log` 最后 50 行，邀请链接片段替换为 `[invite]`，入口令牌替换为 `[redacted]`。排障说明在 `docs/troubleshooting.md`。
 - 执行层：本期一度把 App Server 改为 stdio 子进程，按用户的产品决定撤回，保留 `codex app-server --listen unix://<socket>`。socket 仍在 0700 的 `/tmp/vibeface-<identity>/` 目录，ExecutorHost 继续管理进程组、pidfile 和遗留进程清理，`codex_socket` 保留为外部自管实例的配置；不加会阻止本机 Agent 直连 socket 的令牌机制。用户决定让调度 Agent 直接连接本机 App Server 的 Unix socket 发任务（`thread/start`、`turn/start`），并默认以最高权限运行（`approvalPolicy=never` 加完全访问，等同 Codex 的 bypass permissions）。直连与默认完全访问将在后续 PR 实施；第五期仍按 6.1 节固定 `on-request`、`approvalsReviewer=user` 和限于 `cwd` 的沙箱。工作改动 `cwd` 之外的文件时只在 `node.log` 记一行 info，不拦截，也不在网页告警；原计划的“核对 `thread/start` 返回的策略、拒绝更宽松的策略”没有做，避免把以后的完全访问当作异常。
@@ -769,7 +769,7 @@ SDK 原生会话只是本机缓存，按 `(conversation_id, 本机 DeviceId)` �
 - 公共入口网页：首页提供“扫码”，用相机读取“添加设备”里的二维码，只取出 ticket，经页面自己的 origin 加入；信任仍来自 ticket 中的设备编号和 6 位安全码。“添加设备”总是显示二维码，入口回复带公共入口时二维码用入口地址。刷新或重新打开页面时先恢复最近认证过的设备，再试其他已保存的设备；不再答复的目标被丢弃，不停在连接页。其他已保存的设备列在连接菜单里。
 - 第四期转入项：会话负责人离线、当前设备能运行管理 Agent 时，聊天里出现“X 离线了，这个对话在等它”和“交给这台设备处理”，签下一个 epoch 的 `ConversationOwner` 经 outbox 写入，outbox 把更高 epoch 视为已记录。`nodes` 对同步正在失败的 Node 直接返回离线，不再等 3 秒探测。附件随引用它的消息同步到其他 Node；`read_artifact` 增加 `binary`，每页 512 KiB，只读请求的区间，浏览器拼好后用 SHA-256 核对再保存。`executor=agent` 的工作结果未知时只显示该工作的一条待核对，结清它时一并结清目标那一轮管理进程的记录。写检查点时先找最新检查点，只读取它的 `covers` 没有覆盖的事件，结果与读取整个会话相同，没有改成模型写的摘要。`--phase4` 加入扩展 CI。
 - UX：`dispatch_work` 必须带 `title`（最长 120 字符），写进 `WorkDispatched` 和工作投影，任务卡片和抽屉以它为名，执行器的 `prompt` 放进“详细信息”。附件大小显示为 KB 或 MB；375 宽下任务结束原因单独换行；没有名字的设备显示“另一台设备”，不再显示截断的设备编号；回答失败的原因显示中文，原文放在悬停提示里。
-- 文档：重写 `docs/node-protocol.md`，README、`docs/install.md`、`docs/node.md`、`docs/releasing.md` 和 `docs/ci.md` 按实现更新，新增 `docs/troubleshooting.md`。`docs/peer-id-migration.md` 在此前已删除。整理文档时发现 `install.sh` 仍只接受 epoch 6 的包，一并改为 7。
+- 文档：重写 `docs/node-protocol.md`，README、`docs/install.md`、`docs/node.md`、`docs/releasing.md` 和 `docs/ci.md` 按实现更新，新增 `docs/troubleshooting.md`。
 - 核对方式：`verify-node.py --phase5` 用两台真实 Node 进程（A，以及运行 relay 的 B）覆盖：从备份恢复的 A 在对齐前拒绝写入，对齐后拉回自己的日志且没有分叉；B 离线时 A 保持只读，本人确认后才写；复制 A 的数据目录并运行后，副本在 B 处分叉，只有副本停写并列出冲突，原 A 与 B 继续写；`status` 的对端行；`node.log` 的权限与内容；日志和诊断包中没有 capability、恢复口令和邀请。`--public-entry` 覆盖浏览器经入口加入和对话、入口重启后重连、错误令牌被 relay 拒绝，以及入口不存事件和附件。`--phase4` 增加经新入口按二进制下载 64 MiB 附件并核对哈希。扩展 CI 中 Linux x64 运行默认、`--phase1`、`--phase4` 和 `--public-entry`，macOS ARM64 运行 `--chat-agent` 和 `--phase5`。
 - 未按原标准核对的项：“三平台制品通过多进程验收”中 Linux ARM64 只启动网页进程，多进程业务验收在 Linux x64 和 macOS ARM64 各跑一部分。备份恢复用停机复制数据目录模拟，没有用文件系统快照工具。
 - 验收中修复的网页问题：会话负责人尚未接收的消息（入口回执 `pending_delivery`）让会话页报“设备返回的内容缺少文字”，原因是调度列表的解析器要求 job 带 `kind` 和 `sequence`，这两个字段网页并不使用，已删除；返回会话时视图停在最早的消息，原因是 `MessageScroller` 对齐第一个尚未对齐的锚点，现在只有最新一条本人消息是锚点。任务停止后抽屉的“结果”显示最后一条进度“正在停止”，审批答完后抽屉仍写“等你处理”，两者都来自过时的进度，现在结果只取结果文字或失败原因，没有待答审批时不显示“等你处理”。

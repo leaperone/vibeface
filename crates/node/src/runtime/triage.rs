@@ -2282,7 +2282,7 @@ mod tests {
             let answered: Value = serde_json::from_str(&received[1].1)?;
             let network = node.network_id().await?;
             let hash = node.store.lock().await.message(&network, "c", &format!("a-{question}"))?.context("answer")?.event_hash;
-            assert_eq!(answered, json!({"schema_version":2,"type":"answered","event_id":format!("answered-{question}-{}", &hash[..16]),
+            assert_eq!(answered, json!({"schema_version":1,"type":"answered","event_id":format!("answered-{question}-{}", &hash[..16]),
                 "question_id":question,"text":"修"}));
             assert_eq!(node.triage_settings().await?["outbox"]["delivered"], 2);
 
