@@ -659,7 +659,7 @@ test("connection form keeps current errors and busy ownership when an earlier co
     identity: { deviceId: 'browser' }, phase: 'disconnected', error: '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入` }, '@/lib/platform': { webPlatform: { self: '这个浏览器' } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address } })
+  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address } })
   const render = () => app.render('ConnectionScreen')
   const connect = () => render().find(({ props }) => props.children === '连接')?.props
   try {

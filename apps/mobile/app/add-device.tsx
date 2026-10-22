@@ -1,5 +1,5 @@
 import * as Clipboard from 'expo-clipboard'
-import { Copy, Link2, Share2, ShieldAlert } from 'lucide-react-native'
+import { CircleCheck, Copy, Link2, Plus, Share2, ShieldAlert } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
 import { ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
@@ -17,11 +17,12 @@ export default function AddDevice() {
   const { ready } = device
   const { busy, error, status, run } = useRun()
   const [result, setResult] = useState<Invitation | null>(null)
+  const [added, setAdded] = useState<string | null>(null)
   const requests = useOpenJoins().length > 0
   // A link is single-use: once a device has answered it, it is spent.
   const [used, setUsed] = useState(false)
   useEffect(() => { if (requests && result) setUsed(true) }, [requests, result])
-  useEffect(() => { setResult(null) }, [ready])
+  useEffect(() => { setResult(null); setAdded(null) }, [ready])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
     if (!result) return
@@ -31,7 +32,7 @@ export default function AddDevice() {
   if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理员能添加设备" />
 
   const generate = () => {
-    setResult(null); setUsed(false)
+    setResult(null); setUsed(false); setAdded(null)
     const connection = ready
     void run('create', async () => {
       const invitation = await device.createInvitation()
@@ -39,10 +40,13 @@ export default function AddDevice() {
     })
   }
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-5 p-4 pb-10">
-    {!result || used && !requests ? <Button variant={requests ? 'outline' : 'default'} className="h-11 self-start" disabled={busy !== null} onPress={generate}>
+    {added && !requests ? <View className="gap-3">
+      <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">已添加「{added}」</Text></View>
+      <Button variant="outline" className="h-11 self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>
+    </View> : !result || used && !requests ? <Button variant={requests ? 'outline' : 'default'} className="h-11 self-start" disabled={busy !== null} onPress={generate}>
       <Icon as={Link2} /><Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
     </Button> : null}
-    <JoinRequests issuing={result !== null} />
+    <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
     {result && !used ? <View className="gap-4">
       <QrCode value={result.publicEntry ? result.link : result.ticket} label={result.publicEntry ? '用手机相机扫码打开' : '在新设备的 Vibeface 里扫码'} />
       {result.publicEntry ? null : <Text className="text-center text-meta text-muted-foreground">在新设备的 Vibeface 里点“扫码”</Text>}

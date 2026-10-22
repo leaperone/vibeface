@@ -1,20 +1,22 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName } from '@vibeface/client/workspace/labels.ts'
-import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { messageOf, parseEntry, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
-import { notJoined, useDevice } from '@vibeface/client/identity/context.tsx'
+import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
 import { webPlatform } from '@/lib/platform'
 
 const NOT_JOINED = notJoined(webPlatform.self)
+const BROWSER_REMOVED = removedText(webPlatform.self)
+const { connectDevice } = webPlatform.transport
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
@@ -147,6 +149,21 @@ function usePublicEntry() {
   return publicEntry
 }
 
+/** A computer not set up yet answers with its host name, so two computers don't both default to the same name. */
+function useComputerName(entry: ConnectionEntry | undefined) {
+  const [name, setName] = useState<string>()
+  useEffect(() => {
+    if (!entry) return
+    const controller = new AbortController()
+    connectDevice(entry, { signal: controller.signal, timeoutMs: 5000 })
+      .then(channel => channel.request('info').finally(() => channel.close()))
+      .then(info => { const value = (info as { name?: unknown } | null)?.name; if (!controller.signal.aborted && typeof value === 'string' && value) setName(value) })
+      .catch(() => {})
+    return () => controller.abort()
+  }, [entry?.address, entry?.device_id])
+  return name
+}
+
 /** Opened from the Home Screen: iOS keeps such an app's storage apart from Safari's. */
 const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true)
 
@@ -167,6 +184,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const scannable = canScan()
   // A removed computer that started over keeps its old name, and joining again is its next step.
   const formerName = device.localSetup?.kind === 'uninitialized' ? device.localSetup.name : undefined
+  const hostName = useComputerName(device.localSetup?.kind === 'uninitialized' && !formerName ? device.localSetup.entry : undefined)
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName) })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
@@ -202,10 +220,12 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     })
   }
 
-  const deviceError = device.error === NOT_JOINED ? '' : device.error
-  const quiet = notice || (!error && device.error === NOT_JOINED ? NOT_JOINED : '')
+  // Not being, or no longer being, one of my devices is a state to explain, not an error.
+  const membership = device.error === NOT_JOINED || device.error === BROWSER_REMOVED ? device.error : ''
+  const deviceError = membership ? '' : device.error
+  const quiet = notice || (!error ? membership : '')
   const alert = error || deviceError && device.phase !== 'reconnecting' ? <InlineError error={error || deviceError} />
-    : quiet ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground">{quiet === NOT_JOINED ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
+    : quiet ? <p role="status" className="flex items-center gap-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining)
   const setup = device.localSetup?.kind === 'uninitialized'
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
@@ -232,7 +252,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />
-  else if (active === 'local' && setup && !names) body = <NamesStep onNext={setNames} />
+  else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} onNext={setNames} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => setNames(null)} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title="这台电脑">
     {device.localSetup.kind === 'initialized'
@@ -259,7 +279,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
         </p>}
         {thisComputer
-          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={formerName || defaultComputerName()} /></Field>
+          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" key={hostName} defaultValue={formerName || hostName || defaultComputerName()} /></Field>
           : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName(device.identity?.deviceId)} /></Field>}
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
@@ -295,10 +315,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </main>
 }
 
-function NamesStep({ onNext }: { onNext(names: { computer: string; browser: string }): void }) {
+function NamesStep({ computer, onNext }: { computer?: string; onNext(names: { computer: string; browser: string }): void }) {
   return <Panel icon={Laptop} title="给设备起名">
     <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() }) }}>
-      <Field label="这台电脑叫什么？"><Input name="computer" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
+      <Field label="这台电脑叫什么？"><Input key={computer} name="computer" required maxLength={128} autoComplete="off" defaultValue={computer || defaultComputerName()} /></Field>
       <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
       <Button type="submit" className="w-fit justify-self-end">下一步</Button>
     </form>
@@ -347,7 +367,7 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const [downloaded, setDownloaded] = useState(false)
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存恢复文件">
-    <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : '下载恢复文件'}</Button>
+    <Button type="button" variant={downloaded ? 'outline' : 'default'} className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : <><Download aria-hidden="true" />下载恢复文件</>}</Button>
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>

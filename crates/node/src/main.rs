@@ -881,9 +881,16 @@ fn initialize_announced(
     entry_token: Option<String>,
 ) -> Result<()> {
     let public_entry = configuration.public_entry;
-    let peer = initialize(dir, configuration, entry_token)?;
-    println!("Initialized device with Peer ID {peer}");
-    println!("Configuration: {}", dir.join("config.json").display());
+    let local = !public_entry
+        && (configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified());
+    let open = if local {
+        format!("http://localhost:{}", configuration.listen.port())
+    } else {
+        configuration.public_url.clone()
+    };
+    initialize(dir, configuration, entry_token)?;
+    println!("Vibeface 已就绪：{}", config::hostname());
+    println!("打开 {open}");
     if public_entry {
         println!(
             "Relay token: {} (copy it to your Node and pass --relay-token-file)",
@@ -893,8 +900,8 @@ fn initialize_announced(
     Ok(())
 }
 
-/// Writes a fresh data directory and returns its Peer ID.
-fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<String> {
+/// Writes a fresh data directory.
+fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
         "node already initialized; existing identity and configuration were preserved"
@@ -932,8 +939,7 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
     create_private(
         &dir.join("data-epoch.json"),
         &crate::config::data_epoch_marker(),
-    )?;
-    identity.device_id()
+    )
 }
 
 /// Restarts this removed Node fresh. Replacing the process image keeps its PID, so a service

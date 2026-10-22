@@ -21,7 +21,31 @@ pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
 /// This machine's name, the default device name shown when creating or joining a network.
+/// On macOS it is the name set in System Settings, which people recognize better than the host name.
 pub fn hostname() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| computer_name().unwrap_or_else(host_name))
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn computer_name() -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let name = String::from_utf8(output.stdout).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.chars().take(128).collect())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn computer_name() -> Option<String> {
+    None
+}
+
+fn host_name() -> String {
     let mut buffer = [0u8; 256];
     // SAFETY: the buffer is writable for its full length and gethostname NUL-terminates within it.
     let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;

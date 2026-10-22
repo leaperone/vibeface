@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router"
-import { Bot, Inbox, Plus, Star, type LucideIcon } from "lucide-react"
+import { Bot, Inbox, Plus, Star, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
 import { EmptyState, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -29,6 +29,7 @@ export function ConversationList() {
     </li>
   })}</ul>
   else if (!workspace.joined) list = <EmptyState icon={Bot} title="还没有 Bot" />
+  else if (!workspace.connectionOnline) list = <EmptyState icon={WifiOff} title="正在重连" />
   else if (!workspace.writable) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新建 Bot</Button>} />
   return <div className="mx-auto grid w-full max-w-3xl gap-2 max-md:-mx-3 max-md:w-auto">

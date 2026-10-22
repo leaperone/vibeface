@@ -23,7 +23,8 @@ export function useDeviceRows(): DeviceRow[] {
   const { directory, ready, identity } = useDevice()
   const { nodes } = useWorkspace()
   const members = directory?.members ?? []
-  const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])]
+  const removed = new Set(directory?.revoked.map((item) => item.device_id))
+  const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])].filter((id) => !removed.has(id))
   const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : 3
   return ids.map((id): DeviceRow => {
     const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
@@ -66,6 +67,7 @@ function Hint({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
 export function DevicesPage({ actions }: { actions?: ReactNode }) {
   const device = useDevice()
   const rows = useDeviceRows()
+  const { nodes } = useWorkspace()
   const entryLabel = useEntryLabel()
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
@@ -85,7 +87,12 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
-    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>{device.directory.revoked.map((item) => <span key={item.device_id} className="font-mono">{item.device_id}</span>)}</Details> : null}
+    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>
+      <ul className="grid gap-1">{device.directory.revoked.map((item) => <li key={item.device_id} title={item.device_id} className="flex min-h-8 items-center gap-2">
+        <terms.remove.icon aria-hidden="true" className="size-4 shrink-0" />
+        <span className="min-w-0 truncate">{nodes.find((node) => node.device_id === item.device_id)?.name || `设备 ${item.device_id.slice(0, 4).toUpperCase()}`}</span>
+      </li>)}</ul>
+    </Details> : null}
   </div>
 }
 

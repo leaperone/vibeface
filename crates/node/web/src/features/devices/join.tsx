@@ -16,8 +16,11 @@ let cardsOnScreen = 0
 export const joinsOnScreen = () => cardsOnScreen > 0
 
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
-/** `issuing`: this page just handed out a link, so it starts the comparison without a click. */
-export function JoinRequests({ issuing = false }: { issuing?: boolean }) {
+/**
+ * `issuing`: this page just handed out a link, so it starts the comparison without a click.
+ * `onAllowed`: the page shows the added device itself instead of a toast.
+ */
+export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean; onAllowed?(name: string): void }) {
   const device = useDevice()
   const joins = useOpenJoins()
   useEffect(() => { cardsOnScreen++; return () => { cardsOnScreen-- } }, [])
@@ -30,7 +33,7 @@ export function JoinRequests({ issuing = false }: { issuing?: boolean }) {
   }, [waiting, device.ready])
   if (!joins.length) return null
   return <section className="grid gap-3" aria-label="等待加入">
-    {joins.map((request) => <JoinCard key={request.join_id} request={request} auto={issuing} />)}
+    {joins.map((request) => <JoinCard key={request.join_id} request={request} auto={issuing} onAllowed={onAllowed} />)}
   </section>
 }
 
@@ -41,7 +44,7 @@ const started = new Set<string>()
  * Starting the comparison claims the request for this admin, so only the page that issued the link does it
  * on its own; every other admin page asks first.
  */
-export function JoinCard({ request, auto = false }: { request: JoinRequest; auto?: boolean }) {
+export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRequest; auto?: boolean; onAllowed?(name: string): void }) {
   const device = useDevice()
   const action = useAction()
   const [manage, setManage] = useState(false)
@@ -62,12 +65,12 @@ export function JoinCard({ request, auto = false }: { request: JoinRequest; auto
     actions={<>
       <Button type="button" variant="ghost" disabled={busy} onClick={() => void action.run("reject", () => device.rejectJoin(request.join_id), "已拒绝")}>拒绝</Button>
       {request.status === "pending" && !auto ? <Button type="button" disabled={busy} onClick={() => void action.run("start", () => device.startApproval(request.join_id))}>{action.busy === "start" ? "处理中" : "显示安全码"}</Button>
-      : <Button type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", () => device.approveJoin(request.join_id, request.kind === "client" && manage), "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
+      : <Button type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", async () => { await device.approveJoin(request.join_id, request.kind === "client" && manage); onAllowed?.(request.name || "新设备") }, onAllowed ? undefined : "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
     </>}
   >
     <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上的安全码比对" : "等新设备显示安全码"}</p>
     {request.code ? <SafetyCode code={request.code} /> : <Skeleton className="h-8 w-40" />}
-    {request.kind === "client" ? <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为管理员</label> : null}
+    {request.kind === "client" ? <label className="flex min-h-11 w-fit items-center gap-2 text-meta"><input type="checkbox" className="size-4" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为管理员</label> : null}
     <InlineError error={action.error} />
     <Details>
       <DetailRow label="设备编号" value={request.device_id} mono />
