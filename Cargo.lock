@@ -4615,7 +4615,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-secure-ffi"
-version = "0.0.1-nightly.20261022.4"
+version = "0.0.1-nightly.20261023.1"
 dependencies = [
  "thiserror 2.0.21",
  "uniffi",
