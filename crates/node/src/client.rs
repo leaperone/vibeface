@@ -1842,13 +1842,13 @@ mod tests {
             serde_json::to_value(&settings)?,
         )
         .await
-        .expect_err("configure_node cannot turn the assistant on");
+        .expect_err("configure_node cannot turn the bot on");
         assert!(
             refused.to_string().contains("configure_provider"),
             "{refused}"
         );
         assert!(Config::load(&dir)?.manager.is_none());
-        let choose_cursor = json!({"provider":"cursor","assistant":true});
+        let choose_cursor = json!({"provider":"cursor","bot":true});
         std::os::unix::fs::symlink(&project, &workspace)?;
         assert!(
             dispatch(
@@ -1872,7 +1872,7 @@ mod tests {
         assert!(workspace.is_dir());
         assert_eq!(
             chosen["settings"]["manager"]["provider"], "cursor_sdk",
-            "choosing the assistant fills in the defaults"
+            "choosing the bot fills in the defaults"
         );
         assert_eq!(chosen["settings"]["manager"]["model"], "auto");
         assert_eq!(
@@ -1947,13 +1947,13 @@ mod tests {
             )
             .await
             .is_err(),
-            "configure_node cannot move the assistant"
+            "configure_node cannot move the bot"
         );
         let codex = dispatch(
             &node,
             &mut manager_session,
             "configure_provider",
-            json!({"provider":"codex","assistant":true}),
+            json!({"provider":"codex","bot":true}),
         )
         .await?;
         let mut expected = saved["settings"].clone();
@@ -1972,7 +1972,7 @@ mod tests {
             &node,
             &mut manager_session,
             "configure_provider",
-            json!({"provider":"cursor","assistant":true}),
+            json!({"provider":"cursor","bot":true}),
         )
         .await?;
         drop(node);
@@ -2043,7 +2043,7 @@ mod tests {
             codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
-        let set_codex = json!({"provider":"codex","assistant":true,"bin":"/fixture/codex",
+        let set_codex = json!({"provider":"codex","bot":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":codex_home}});
         let mut member = session(&client)?;
         assert!(
@@ -2095,7 +2095,7 @@ mod tests {
                 read["providers"][1]["issues"].clone()
             ),
             (json!("off"), json!([])),
-            "Cursor runs nothing until the assistant uses it"
+            "Cursor runs nothing until the bot uses it"
         );
         assert_eq!(codex["app_server"]["mode"], "system");
         assert_eq!(read["providers"][1]["app_server"], Value::Null);
@@ -2209,7 +2209,7 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","assistant":true}),
+            json!({"provider":"cursor","bot":true}),
         )
         .await?;
         assert_eq!(moved["settings"]["manager"]["provider"], "cursor_sdk");
@@ -2221,18 +2221,18 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"codex","assistant":false}),
+            json!({"provider":"codex","bot":false}),
         )
         .await?;
         assert_eq!(
             unchanged["settings"]["manager"]["provider"], "cursor_sdk",
-            "stopping the assistant elsewhere leaves it running"
+            "stopping the bot elsewhere leaves it running"
         );
         let stopped = dispatch(
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","assistant":false}),
+            json!({"provider":"cursor","bot":false}),
         )
         .await?;
         assert_eq!(stopped["settings"]["manager"], Value::Null);
@@ -2242,7 +2242,7 @@ mod tests {
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
-        assert!(reopened.assistant().is_none());
+        assert!(reopened.manager().is_none());
         assert!(!providers.switches.execution);
         assert_eq!(
             providers.codex_bin,
@@ -2597,7 +2597,7 @@ mod tests {
             let conversation = uuid::Uuid::new_v4().to_string();
             let network = node.membership_state().await?.genesis.network_id;
             let owner = browser.attest(&network, &conversation, crate::model::EventBody::ConversationOwner {
-                scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None })?;
+                scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None, cause: None })?;
             let created = local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser",
                 "scheduler_node":node.identity.device_id()?,"owner_attestation":owner.attestation()})).await;
             assert!(created.is_err(), "a local session's key is not a member's signature");

@@ -3,7 +3,7 @@ import { renderMarkdown } from "@/lib/markdown"
 import { cn } from "cn"
 import { toast } from "./kit"
 
-/** Assistant replies. Raw HTML is never rendered. */
+/** Bot replies. Raw HTML is never rendered. */
 export function Markdown({ text, className }: { text: string; className?: string }) {
   const html = useMemo(() => renderMarkdown(text), [text])
   return <div

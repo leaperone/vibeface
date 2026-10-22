@@ -8,12 +8,21 @@ use std::path::{Component, Path};
 
 const PREVIEW_CHARS: usize = 120;
 
-/// The newest message of an assistant's conversation, cut short for a conversation list.
+/// The newest message of a bot's conversation, cut short for a conversation list.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LastMessage {
     pub text: String,
     pub author: String,
     pub role: String,
+    pub created_at_ms: i64,
+}
+
+/// A message this bot sent another one; it is stored in the receiver's conversation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SentBotMessage {
+    pub message_id: String,
+    pub to: String,
+    pub text: String,
     pub created_at_ms: i64,
 }
 
@@ -38,7 +47,7 @@ fn validate_definition(
     validate_instructions(instructions)?;
     ensure!(
         serde_json::to_vec(&(name, instructions, project))?.len() <= 12000,
-        "Bot definition is too large for the assistant context"
+        "Bot definition is too large for the bot context"
     );
     if let Some(project) = project {
         ensure!(
@@ -99,8 +108,8 @@ fn select_bots(
 ) -> Result<Vec<Bot>> {
     let mut statement = connection.prepare(&format!(
         "SELECT {columns} FROM bots b
-         LEFT JOIN assistant_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
-         LEFT JOIN assistant_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
+         LEFT JOIN bot_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
+         LEFT JOIN bot_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
          WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
     let rows = statement.query_map(params![network, value], bot_row)?;
@@ -110,6 +119,19 @@ fn select_bots(
         Ok(bot)
     })
     .collect()
+}
+
+/// The bot ID and conversation one turn's `create_bot` call names, so a retry finds it again.
+pub fn created_bot_id(scope: &str, trigger: &str, call_ref: &str) -> (String, String) {
+    let digest = crate::crypto::digest(
+        &serde_json::to_vec(&("create_bot", scope, trigger, call_ref)).expect("strings"),
+    );
+    (format!("bot-{digest}"), format!("c-{digest}"))
+}
+
+/// Bots with the name and instructions the chat last set.
+pub(crate) fn bots_from(connection: &Connection, network: &str) -> Result<Vec<Bot>> {
+    bots_where(connection, network, "AND ?2=''", "")
 }
 
 pub(crate) fn bot_for_conversation_from(
@@ -186,6 +208,7 @@ impl Store {
                 instructions: spec.instructions.clone(),
                 project: spec.project.clone(),
                 attestation: Some(spec.attestation.clone()),
+                cause: None,
             },
             vec![],
             created_at_ms,
@@ -199,10 +222,93 @@ impl Store {
 
     /// Bots with the name and instructions the chat last set.
     pub fn bots(&self, network: &str) -> Result<Vec<Bot>> {
-        bots_where(&self.connection, network, "AND ?2=''", "")
+        bots_from(&self.connection, network)
     }
 
-    /// Each assistant conversation's newest message, by conversation; one indexed lookup per assistant.
+    /// A bot another bot creates in a turn the user's own message started. Its conversation is
+    /// scheduled by this Node, which schedules the creating one; the user's signed message
+    /// stands behind every event. The same `call_ref` in the turn returns the same bot, and one
+    /// message of the user creates at most `BOTS_PER_TURN`. Returns whether it is new.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the turn, its tool call and the definition"
+    )]
+    pub fn create_bot_in_turn(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+        call_ref: &str,
+        definition: (&str, &str, Option<BotProject>),
+        created_at_ms: i64,
+    ) -> Result<(Bot, bool)> {
+        let (name, instructions, project) = definition;
+        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cause = super::bot_settings::user_cause(&tx, network, scope, trigger)?
+            .context(super::bot_settings::NOT_FROM_USER)?;
+        let (bot_id, conversation) = created_bot_id(scope, trigger, call_ref);
+        validate_definition(&bot_id, &conversation, name, instructions, project.as_ref())?;
+        if let Some(existing) =
+            select_bots(&tx, network, CREATED_COLUMNS, "AND b.bot_id=?2", &bot_id)?.pop()
+        {
+            ensure!(
+                existing.name == name
+                    && existing.instructions == instructions
+                    && existing.project == project,
+                "call_ref {call_ref} already created another bot; use a new call_ref for a new bot"
+            );
+            return Ok((existing, false));
+        }
+        let created: usize = tx.query_row(
+            "SELECT COUNT(*) FROM bots WHERE network_id=? AND cause=?",
+            params![network, serde_json::to_string(&cause)?],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            created < BOTS_PER_TURN,
+            "one message creates at most {BOTS_PER_TURN} bots"
+        );
+        let local = identity.device_id()?;
+        authorize_node_from(&tx, network, &local)?;
+        for body in [
+            EventBody::ConversationCreated { title: name.into() },
+            EventBody::ConversationOwner {
+                scheduler_node: local,
+                epoch: 1,
+                attestation: None,
+                cause: Some(cause.clone()),
+            },
+            EventBody::BotCreated {
+                bot_id: bot_id.clone(),
+                name: name.into(),
+                instructions: instructions.into(),
+                project,
+                attestation: None,
+                cause: Some(cause.clone()),
+            },
+        ] {
+            log::append_from(
+                &tx,
+                &self.blob_dir,
+                identity,
+                network,
+                &conversation,
+                body,
+                vec![],
+                created_at_ms,
+            )?;
+        }
+        let bot = bot_for_conversation_from(&tx, network, &conversation)?
+            .context("created bot could not be projected")?;
+        tx.commit()?;
+        Ok((bot, true))
+    }
+
+    /// Each bot conversation's newest message, by conversation; one indexed lookup per bot.
     pub fn last_messages(&self, network: &str) -> Result<BTreeMap<String, LastMessage>> {
         let mut statement = self.connection.prepare(
             "SELECT m.conversation_id,m.text,m.author,m.role,m.created_at_ms FROM bots b
@@ -229,26 +335,45 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// What the bot of `conversation` wrote to other bots, oldest first.
+    pub fn sent_bot_messages(
+        &self,
+        network: &str,
+        conversation: &str,
+    ) -> Result<Vec<SentBotMessage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id,conversation_id,text,created_at_ms FROM messages
+             WHERE network_id=?1 AND role='bot' AND json_extract(sender,'$.conversation_id')=?2
+             ORDER BY created_at_ms,rank",
+        )?;
+        let rows = statement.query_map(params![network, conversation], |r| {
+            Ok(SentBotMessage {
+                message_id: r.get(0)?,
+                to: r.get(1)?,
+                text: r.get(2)?,
+                created_at_ms: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn bot_for_conversation(&self, network: &str, scope: &str) -> Result<Option<Bot>> {
         bot_for_conversation_from(&self.connection, network, scope)
     }
 
-    pub fn primary_assistant(&self, network: &str) -> Result<Option<ScopeId>> {
-        primary_assistant_from(&self.connection, network)
+    pub fn primary_bot(&self, network: &str) -> Result<Option<ScopeId>> {
+        primary_bot_from(&self.connection, network)
     }
 }
 
-/// The assistant that judges what comes in without an owner: the user's latest choice while it
-/// is an assistant, otherwise the first assistant created.
-pub(crate) fn primary_assistant_from(
-    connection: &Connection,
-    network: &str,
-) -> Result<Option<ScopeId>> {
+/// The bot that judges what comes in without an owner: the user's latest choice while it
+/// is a bot, otherwise the first bot created.
+pub(crate) fn primary_bot_from(connection: &Connection, network: &str) -> Result<Option<ScopeId>> {
     let chosen = connection
         .query_row(
             "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1
              ORDER BY lamport DESC,created_at_ms DESC,hash DESC LIMIT 1",
-            params![network, ASSISTANTS_SCOPE],
+            params![network, BOTS_SCOPE],
             |r| r.get::<_, String>(0),
         )
         .optional()?
@@ -256,7 +381,7 @@ pub(crate) fn primary_assistant_from(
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             Ok(match event.body {
-                EventBody::PrimaryAssistantSet {
+                EventBody::PrimaryBotSet {
                     conversation_id, ..
                 } => Some(conversation_id),
                 _ => None,

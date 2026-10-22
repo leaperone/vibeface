@@ -1,7 +1,7 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import type { Question } from "./types.ts"
 
-/** Questions about sessions no assistant started live here, and their answers are signed for it. */
+/** Questions about sessions no bot started live here, and their answers are signed for it. */
 export const SESSIONS_SCOPE = "sessions"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */

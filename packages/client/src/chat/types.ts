@@ -12,6 +12,8 @@ export type TranscriptMessage = {
   answers?: string
   /** Its place in the conversation's shared order. */
   rank?: string
+  /** On a `bot` message: the other bot that wrote it. */
+  sender?: { conversation_id: string; name: string }
 }
 export type PendingMessage = {
   message_id: string

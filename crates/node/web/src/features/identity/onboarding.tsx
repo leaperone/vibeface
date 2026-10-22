@@ -20,7 +20,7 @@ export function Onboarding() {
   const workspace = useWorkspace()
   const navigate = useNavigate()
   const step = useOnboarding() ?? 3
-  const [name, setName] = useState("我的助手")
+  const [name, setName] = useState("我的 Bot")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>(null)
   const done = () => { finishOnboarding(); void navigate({ to: "/" }) }
@@ -38,14 +38,14 @@ export function Onboarding() {
     <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
       <header className="grid gap-3"><span className="text-heading font-semibold tracking-tight">Vibeface</span><Dots step={step} /></header>
       {step === 3 ? <section className="grid gap-4 rounded-xl border bg-card p-5">
-        <h2 className="flex items-center gap-2 text-heading font-semibold"><Bot aria-hidden="true" className="size-5 text-muted-foreground" />让这台电脑运行助手</h2>
+        <h2 className="flex items-center gap-2 text-heading font-semibold"><Bot aria-hidden="true" className="size-5 text-muted-foreground" />让这台电脑运行 Bot</h2>
         <AiSettings onboarding />
         <div className="flex justify-between gap-2 border-t pt-4">
           <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(4)}>稍后设置</Button>
           <Button type="button" onClick={() => setOnboardingStep(4)}>下一步</Button>
         </div>
       </section> : <section className="grid gap-4 rounded-xl border bg-card p-5">
-        <h2 className="flex items-center gap-2 text-heading font-semibold"><MessageSquarePlus aria-hidden="true" className="size-5 text-muted-foreground" />创建第一个助手</h2>
+        <h2 className="flex items-center gap-2 text-heading font-semibold"><MessageSquarePlus aria-hidden="true" className="size-5 text-muted-foreground" />创建第一个 Bot</h2>
         <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void create() }}>
           <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
           <InlineError error={error} />

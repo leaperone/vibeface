@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) mod assistant;
+pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod log;
 pub(crate) mod questions;
@@ -655,6 +655,7 @@ pub(crate) fn create_conversation_from(
             scheduler_node: owner.scheduler_node,
             epoch: 1,
             attestation: Some(owner.attestation),
+            cause: None,
         },
         vec![],
         created_at_ms,
@@ -696,7 +697,7 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers,rank";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers,rank,sender";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
@@ -711,6 +712,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let report_results: Option<bool> = r.get(8)?;
     let answers: Option<String> = r.get(10)?;
     let rank: String = r.get(11)?;
+    let sender: Option<String> = r.get(12)?;
     Ok((|| {
         Ok(Message {
             message_id,
@@ -725,6 +727,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
                 .transpose()?,
             report_results,
             answers,
+            sender: optional_json(sender)?,
             blobs: serde_json::from_str(&blobs)?,
             rank,
         })

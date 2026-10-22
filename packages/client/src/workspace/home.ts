@@ -3,7 +3,7 @@ import type { BotRecord } from "./types.ts"
 type Home = { narrow: boolean; conversation?: string; bots: readonly BotRecord[]; current: string }
 
 /**
- * The assistant `/` opens, or null to show the conversation list. A notification's conversation always opens; a
+ * The bot `/` opens, or null to show the conversation list. A notification's conversation always opens; a
  * phone otherwise lands on the list, and a wide screen, whose sidebar is the list, opens the last one used.
  */
 export function homeBot({ narrow, conversation, bots, current }: Home): BotRecord | null {
@@ -13,7 +13,7 @@ export function homeBot({ narrow, conversation, bots, current }: Home): BotRecor
   return bots.find((bot) => bot.conversation_id === current) ?? bots[0] ?? null
 }
 
-/** Assistants by their newest message, newest first; ones without messages keep their order at the end. */
+/** Bots by their newest message, newest first; ones without messages keep their order at the end. */
 export function byRecent(bots: readonly BotRecord[]): BotRecord[] {
   return [...bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
 }

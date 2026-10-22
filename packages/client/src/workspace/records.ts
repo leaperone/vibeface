@@ -3,7 +3,7 @@ import type { BotRecord, ConversationPayload, ConversationRecords, NotificationR
 
 const delivery = (item: WorkRecord) => item.state === "dispatch_waiting" || item.state === "dispatch_rejected"
 const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")
-/** Questions outside any assistant's chat live in the Node's sessions scope. */
+/** Questions outside any bot's chat live in the Node's sessions scope. */
 const scopeOf = (question: Question) => question.conversation_id ?? "sessions"
 
 function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {
@@ -17,7 +17,7 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   if (messages.every((item) => item.rank)) messages.sort((a, b) => (a.rank! < b.rank! ? -1 : a.rank! > b.rank! ? 1 : 0))
   const works = upsert(shown.works.filter((item) => !delivery(item)).map(({ stop: _, ...item }) => item), records.works, (item) => item.work_id)
   return {
-    ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions,
+    ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions, sent: records.sent,
     scheduler: shown.scheduler && { ...shown.scheduler, jobs: records.jobs },
   }
 }

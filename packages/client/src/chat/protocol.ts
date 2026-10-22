@@ -9,7 +9,7 @@ export type SendGate = {
 }
 export function roleLabel(role: string): string {
   if (role === 'user') return '你'
-  if (role === 'assistant') return '助手'
+  if (role === 'assistant') return 'Bot'
   return role
 }
 export function canSend(input: SendGate): boolean {

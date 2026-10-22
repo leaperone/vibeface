@@ -253,6 +253,10 @@ table "messages" {
     null = false
     type = text
   }
+  column "sender" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }
@@ -297,11 +301,15 @@ table "bots" {
     null = false
     type = text
   }
+  column "cause" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "assistant_profiles" {
+table "bot_profiles" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -349,13 +357,13 @@ table "skills" {
     columns = [column.network_id, column.skill_id]
   }
 }
-table "routines" {
+table "schedules" {
   schema = schema.main
   column "network_id" {
     null = false
     type = text
   }
-  column "routine_id" {
+  column "schedule_id" {
     null = false
     type = text
   }
@@ -363,7 +371,56 @@ table "routines" {
     null = false
     type = text
   }
-  column "routine" {
+  column "schedule" {
+    null = true
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "changed_at_ms" {
+    null = false
+    type = integer
+  }
+  column "enabled" {
+    null = false
+    type = integer
+  }
+  column "enabled_rank" {
+    null = false
+    type = text
+  }
+  column "enabled_at_ms" {
+    null = false
+    type = integer
+  }
+  column "removed" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.schedule_id]
+  }
+  index "schedules_conversation" {
+    columns = [column.network_id, column.conversation_id]
+  }
+}
+table "memories" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "memory_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "text" {
     null = true
     type = text
   }
@@ -376,13 +433,13 @@ table "routines" {
     type = integer
   }
   primary_key {
-    columns = [column.network_id, column.routine_id]
+    columns = [column.network_id, column.memory_id]
   }
-  index "routines_conversation" {
+  index "memories_conversation" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "assistant_changes" {
+table "bot_changes" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -405,7 +462,7 @@ table "assistant_changes" {
     type = text
   }
   column "cause" {
-    null = false
+    null = true
     type = text
   }
   column "change" {
@@ -419,7 +476,7 @@ table "assistant_changes" {
   primary_key {
     columns = [column.network_id, column.change_id]
   }
-  index "assistant_changes_order" {
+  index "bot_changes_order" {
     columns = [column.network_id, column.conversation_id, column.rank]
   }
 }
@@ -959,13 +1016,13 @@ table "scheduler_outbox" {
     columns = [column.conversation_id, column.trigger]
   }
 }
-table "routine_runs" {
+table "schedule_runs" {
   schema = schema.main
   column "conversation_id" {
     null = false
     type = text
   }
-  column "routine_id" {
+  column "schedule_id" {
     null = false
     type = text
   }
@@ -974,7 +1031,7 @@ table "routine_runs" {
     type = integer
   }
   primary_key {
-    columns = [column.conversation_id, column.routine_id]
+    columns = [column.conversation_id, column.schedule_id]
   }
 }
 table "pending_checks" {

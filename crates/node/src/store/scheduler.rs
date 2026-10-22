@@ -362,7 +362,7 @@ pub(crate) fn admit_from(
 }
 
 impl Store {
-    /// Queues the turn in which `conversation`'s assistant routes the session `question` is about,
+    /// Queues the turn in which `conversation`'s bot routes the session `question` is about,
     /// once. Only the Node that schedules the conversation admits it; returns whether it is new.
     pub fn admit_route(
         &mut self,
@@ -392,48 +392,90 @@ impl Store {
     }
 }
 
-/// The enabled routine a routine job runs, if it still belongs to the job's conversation.
-pub(crate) fn live_routine(
+/// The enabled schedule a schedule job runs, if it still belongs to the job's conversation.
+pub(crate) fn live_schedule(
     connection: &Connection,
     network: &str,
     job: &SchedulerJob,
-) -> Result<Option<Routine>> {
-    let Some((routine_id, _)) = parse_routine_trigger(&job.trigger) else {
+) -> Result<Option<Schedule>> {
+    let Some((schedule_id, _)) = parse_schedule_trigger(&job.trigger) else {
         return Ok(None);
     };
     Ok(
-        super::assistant::routine_from(connection, network, routine_id)?
-            .filter(|entry| entry.conversation_id == job.conversation_id && entry.routine.enabled)
-            .map(|entry| entry.routine),
+        super::bot_settings::schedule_from(connection, network, schedule_id)?
+            .filter(|entry| entry.conversation_id == job.conversation_id && entry.schedule.enabled)
+            .map(|entry| entry.schedule),
     )
 }
 
-/// A time this long before a routine's last change still runs, so "starting now" runs now;
+/// How many automatic wakes led to the turn of `trigger`: none for the user's own message, an
+/// answer or a routing turn; a schedule's own depth; a bot message's hops; and for a work, the
+/// depth of the turn that dispatched it.
+pub(crate) fn chain_depth(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+) -> Result<u8> {
+    let (mut conversation, mut trigger) = (conversation.to_owned(), trigger.to_owned());
+    for _ in 0..64 {
+        match trigger.split_once(':') {
+            Some(("message" | "route", _)) => return Ok(0),
+            Some(("schedule", _)) => {
+                let (schedule_id, _) =
+                    parse_schedule_trigger(&trigger).context("invalid schedule trigger")?;
+                return Ok(
+                    super::bot_settings::schedule_from(connection, network, schedule_id)?
+                        .map_or(MAX_CHAIN_DEPTH, |entry| entry.schedule.depth),
+                );
+            }
+            Some(("bot_message", message_id)) => {
+                let message = message_from(connection, network, &conversation, message_id)?
+                    .context("the bot message is not stored here")?;
+                let event = log::event_from(connection, network, &message.event_hash)?
+                    .context("the bot message's event is not stored here")?;
+                let EventBody::BotMessaged { hops, .. } = event.body else {
+                    bail!("{message_id} is not a message from another bot");
+                };
+                return Ok(hops);
+            }
+            Some(("work" | "task", work_id)) => {
+                let work = super::reduce::work_from(connection, network, work_id)?
+                    .context("the work is not stored here")?;
+                (conversation, trigger) = (work.conversation_id, work.trigger);
+            }
+            _ => bail!("unknown trigger {trigger}"),
+        }
+    }
+    Ok(MAX_CHAIN_DEPTH)
+}
+
+/// A time this long before a schedule's last change still runs, so "starting now" runs now;
 /// anything older waits for the next time, so resuming never runs a missed one.
 const LATE_START_MS: i64 = 5 * 60_000;
 
-/// Queues the latest due time of each routine in conversations this Node schedules. Earlier
-/// missed times are never run, a time any owner already answered is skipped, and a routine
+/// Queues the latest due time of each schedule in conversations this Node schedules. Earlier
+/// missed times are never run, a time any owner already answered is skipped, and a schedule
 /// waits while its previous run is still queued. Returns `(conversation, trigger)` per job.
-fn admit_due_routines_from(
+fn admit_due_schedules_from(
     connection: &Connection,
     network: &str,
     local: &str,
     now: i64,
 ) -> Result<Vec<(String, String)>> {
     let mut admitted = Vec::new();
-    for entry in super::assistant::routines_from(connection, network, None)? {
+    for entry in super::bot_settings::schedules_from(connection, network, None)? {
         let conversation = entry.conversation_id.as_str();
-        let Some(slot) = latest_slot(&entry.routine, now)
-            .filter(|slot| entry.routine.enabled && *slot >= entry.changed_at_ms - LATE_START_MS)
+        let Some(slot) = latest_slot(&entry.schedule, now)
+            .filter(|slot| entry.schedule.enabled && *slot >= entry.changed_at_ms - LATE_START_MS)
         else {
             continue;
         };
         let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
         let fired: Option<i64> = connection
             .query_row(
-                "SELECT slot_ms FROM routine_runs WHERE conversation_id=? AND routine_id=?",
-                params![conversation, entry.routine_id],
+                "SELECT slot_ms FROM schedule_runs WHERE conversation_id=? AND schedule_id=?",
+                params![conversation, entry.schedule_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -443,16 +485,16 @@ fn admit_due_routines_from(
         let queued = queued_jobs(connection, conversation)?;
         if queued.len() >= MAX_PENDING_JOBS
             || queued.iter().any(|job| {
-                parse_routine_trigger(&job.trigger).is_some_and(|(id, _)| id == entry.routine_id)
+                parse_schedule_trigger(&job.trigger).is_some_and(|(id, _)| id == entry.schedule_id)
             })
         {
             continue;
         }
         connection.execute(
-            "INSERT OR REPLACE INTO routine_runs(conversation_id,routine_id,slot_ms) VALUES(?,?,?)",
-            params![conversation, entry.routine_id, slot],
+            "INSERT OR REPLACE INTO schedule_runs(conversation_id,schedule_id,slot_ms) VALUES(?,?,?)",
+            params![conversation, entry.schedule_id, slot],
         )?;
-        let trigger = routine_trigger(&entry.routine_id, slot);
+        let trigger = schedule_trigger(&entry.schedule_id, slot);
         // Another owner already ran this time before the conversation moved here.
         if message_from(
             connection,
@@ -469,7 +511,7 @@ fn admit_due_routines_from(
             network,
             conversation,
             &trigger,
-            TriggerKind::Routine,
+            TriggerKind::Schedule,
             &trigger,
         )?;
         admitted.push((conversation.to_owned(), trigger));
@@ -504,10 +546,10 @@ fn origin_message(connection: &Connection, network: &str, work_id: &str) -> Resu
             return Ok(None);
         };
         match work.trigger.split_once(':') {
-            Some(("message", message)) => return Ok(Some(message.into())),
+            Some(("message" | "bot_message", message)) => return Ok(Some(message.into())),
             Some(("work" | "task", parent)) => work_id = parent.into(),
-            // A routine run has no message; its result answers the run.
-            Some(("routine", _)) => return Ok(Some(work.trigger)),
+            // A schedule run has no message; its result answers the run.
+            Some(("schedule", _)) => return Ok(Some(work.trigger)),
             _ => return Ok(None),
         }
     }
@@ -629,7 +671,7 @@ fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, String) {
     }
 }
 
-/// Ends the job and writes its assistant reply in one transaction. Partial text of a stopped or
+/// Ends the job and writes its bot reply in one transaction. Partial text of a stopped or
 /// interrupted turn is kept with its status.
 #[expect(
     clippy::too_many_arguments,
@@ -864,7 +906,7 @@ impl Store {
         Ok((message, receipt))
     }
 
-    pub fn admit_due_routines(
+    pub fn admit_due_schedules(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
@@ -873,7 +915,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let admitted = admit_due_routines_from(&tx, network, &identity.device_id()?, now)?;
+        let admitted = admit_due_schedules_from(&tx, network, &identity.device_id()?, now)?;
         tx.commit()?;
         Ok(admitted)
     }
@@ -972,13 +1014,13 @@ impl Store {
         let mut queued = Vec::new();
         for job in queued_jobs(&tx, conversation)? {
             // The user moved the conversation: what never started goes to the new owner, which
-            // runs routines on its own schedule.
+            // runs schedules by its own clock.
             if !owned && job.kind != TriggerKind::AgentTask {
                 tx.execute(
                     "DELETE FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
                     params![conversation, job.trigger],
                 )?;
-                if job.kind != TriggerKind::Routine {
+                if job.kind != TriggerKind::Schedule {
                     queue_delivery_from(&tx, network, conversation, &job.trigger)?;
                 }
                 continue;
@@ -994,8 +1036,8 @@ impl Store {
         let mut selected = None;
         for mut job in queued {
             let evidence = match job.kind {
-                TriggerKind::Routine if live_routine(&tx, network, &job)?.is_none() => {
-                    Some("例行任务已暂停或删除")
+                TriggerKind::Schedule if live_schedule(&tx, network, &job)?.is_none() => {
+                    Some("定时任务已暂停或删除")
                 }
                 TriggerKind::AgentTask if super::work::run_finished(&tx, &job.reply_to)? => {
                     Some("任务结果已由你确认")

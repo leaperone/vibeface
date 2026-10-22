@@ -19,7 +19,7 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 
 impl Runtime {
     fn scheduler_manager_metadata(&self) -> Value {
-        let Some(manager) = &self.assistant() else {
+        let Some(manager) = &self.manager() else {
             return Value::Null;
         };
         let mut capabilities = manager.provider.capabilities();
@@ -48,16 +48,16 @@ impl Runtime {
             loop {
                 tick.tick().await;
                 let _work = node.maintenance.enter_when_open().await;
-                if let Err(error) = node.fire_routines().await {
-                    tracing::warn!(%error, "routine runs are pending");
+                if let Err(error) = node.fire_schedules().await {
+                    tracing::warn!(%error, "schedule runs are pending");
                 }
             }
         });
     }
 
-    /// Queues the routines that are due in conversations this Node schedules.
-    async fn fire_routines(self: &Arc<Self>) -> Result<()> {
-        if self.assistant().is_none() {
+    /// Queues the schedules that are due in conversations this Node schedules.
+    async fn fire_schedules(self: &Arc<Self>) -> Result<()> {
+        if self.manager().is_none() {
             return Ok(());
         }
         let Some(network) = self.store.lock().await.network()? else {
@@ -67,7 +67,7 @@ impl Runtime {
             self.store
                 .lock()
                 .await
-                .admit_due_routines(&self.identity, &network, now_ms())?;
+                .admit_due_schedules(&self.identity, &network, now_ms())?;
         for (scope, trigger) in admitted {
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
             self.schedule_wakeup.notify_one();
@@ -118,7 +118,7 @@ impl Runtime {
             self.finish_manager_attempt(&attempt).await;
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
-        if self.assistant().is_some() {
+        if self.manager().is_some() {
             let scopes = self.store.lock().await.pending_scheduler_conversations()?;
             for scope in scopes {
                 self.start_schedule_consumer(network.clone(), scope).await;

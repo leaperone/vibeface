@@ -1,22 +1,23 @@
 import { useId, type ReactNode } from 'react'
-import { ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
+import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details } from '@/components/app/kit'
-import { formatWhen, lineDiff, routineFrequency, type DiffLine } from '@vibeface/client/workspace/assistant.ts'
-import type { AssistantChange, AssistantChangeRecord, AssistantRoutine, AssistantSkill, RoutineView } from '@vibeface/client/workspace/types.ts'
+import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
+import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView } from '@vibeface/client/workspace/types.ts'
 
-function cardTitle(changes: AssistantChange[]) {
+function cardTitle(changes: BotChange[]) {
   const kind = changes[0]?.kind
   if (changes.some((change) => change.kind !== kind)) return '已更新'
-  if (kind === 'profile') return '已更新助手'
-  const items = changes as Extract<AssistantChange, { kind: 'skill' | 'routine' }>[]
+  if (kind === 'profile') return '已更新 Bot'
+  const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
   const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
   if (kind === 'skill') return added ? '已存为 skill' : removed ? '已删除 skill' : '已更新 skill'
-  return added ? '已设定例行任务' : removed ? '已删除例行任务' : '已更新例行任务'
+  if (kind === 'memory') return added ? '已记下' : removed ? '已忘记' : '已更新笔记'
+  return added ? '已设定定时任务' : removed ? '已删除定时任务' : '已更新定时任务'
 }
 
-/** What one turn of the conversation changed, item by item, before → after. `routines` are the conversation's routines now. */
-export function ChangeCard({ records, routines }: { records: AssistantChangeRecord[]; routines: readonly RoutineView[] }) {
+/** What one turn of the conversation changed, item by item, before → after. `schedules` are the conversation's schedules now. */
+export function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
   const id = useId()
   const changes = records.map((record) => record.change)
   return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card p-4">
@@ -25,18 +26,19 @@ export function ChangeCard({ records, routines }: { records: AssistantChangeReco
       <h3 id={id} className="text-meta font-medium text-muted-foreground">{cardTitle(changes)}</h3>
     </header>
     <ul className="grid gap-4">
-      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} routines={routines} />)}
+      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} schedules={schedules} />)}
     </ul>
   </section>
 }
 
-function ChangeRows({ change, routines }: { change: AssistantChange; routines: readonly RoutineView[] }) {
+function ChangeRows({ change, schedules }: { change: BotChange; schedules: readonly ScheduleView[] }) {
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
-  return <RoutineRow before={change.before} after={change.after} current={routines.find((routine) => routine.routine_id === change.routine_id)} />
+  if (change.kind === 'memory') return <MemoryRow before={change.before} after={change.after} />
+  return <ScheduleRow before={change.before} after={change.after} current={schedules.find((schedule) => schedule.schedule_id === change.schedule_id)} />
 }
 
 function Row({ icon: Icon, label, tag, removed, children }: { icon: LucideIcon; label: ReactNode; tag?: string; removed?: boolean; children?: ReactNode }) {
@@ -86,7 +88,7 @@ function DiffList({ lines }: { lines: DiffLine[] }) {
   </ul>
 }
 
-function SkillRow({ before, after }: { before: AssistantSkill | null; after: AssistantSkill | null }) {
+function SkillRow({ before, after }: { before: BotSkill | null; after: BotSkill | null }) {
   const skill = after ?? before!
   const renamed = before && after && before.name !== after.name
   const body = !after ? null : !before ? <p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.body}</p>
@@ -98,21 +100,33 @@ function SkillRow({ before, after }: { before: AssistantSkill | null; after: Ass
   </Row>
 }
 
-/** The next run comes from the routine as it is now, so a card for a removed or paused routine shows none. */
-function RoutineRow({ before, after, current }: { before: AssistantRoutine | null; after: AssistantRoutine | null; current?: RoutineView }) {
-  const routine = after ?? before!
-  const tag = !before ? '新例行任务' : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
-  if (!after) return <Row icon={Repeat} label={routine.name} tag={tag} removed />
-  const frequency = routineFrequency(after), previous = before ? routineFrequency(before) : frequency
-  const next = current?.enabled ? current.next_run_at_ms : null
-  return <Row icon={Repeat} label={after.name} tag={tag}>
+/**
+ * A one-time schedule shows when it runs. A repeating one shows its next run from the schedule as it is now,
+ * so a card for a removed, paused or finished one shows none.
+ */
+function ScheduleRow({ before, after, current }: { before: BotSchedule | null; after: BotSchedule | null; current?: ScheduleView }) {
+  const schedule = after ?? before!
+  const once = schedule.every_minutes === undefined
+  const icon = once ? AlarmClock : Repeat
+  const tag = !before ? (once ? '新提醒' : '新定时任务') : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
+  if (!after) return <Row icon={icon} label={schedule.name} tag={tag} removed />
+  const frequency = scheduleFrequency(after), previous = before ? scheduleFrequency(before) : frequency
+  const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
+  const detail = scheduleDetail(after)
+  return <Row icon={icon} label={after.name} tag={tag}>
     {before && before.name !== after.name ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
     {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
-    {previous === frequency || !after.enabled || next !== null ? <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
+    <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
       {previous === frequency ? <span>{frequency}</span> : null}
       {!after.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
-        : next !== null ? <span>下次 {formatWhen(next)}</span> : null}
-    </p> : null}
-    <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.prompt}</p></Details>
+        : next !== null ? <span>{once ? '' : '下次 '}{formatWhen(next)}</span> : null}
+    </p>
+    {detail ? <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{detail}</p></Details> : null}
   </Row>
+}
+
+function MemoryRow({ before, after }: { before: string | null; after: string | null }) {
+  if (!after) return <Row icon={NotebookPen} label={before} tag="已忘记" removed />
+  if (!before) return <Row icon={NotebookPen} label={after} tag="新笔记" />
+  return <Row icon={NotebookPen} label="笔记" tag="已更新"><BeforeAfter before={before} after={after} /></Row>
 }

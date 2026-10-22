@@ -1,6 +1,6 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
 //! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
-use crate::model::{Routine, VersionVector};
+use crate::model::{Schedule, VersionVector};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_PENDING_JOBS: usize = 256;
@@ -14,17 +14,19 @@ pub enum TriggerKind {
     WorkResult,
     /// A `task` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
     AgentTask,
-    /// A scheduled run of a routine the user set up in this conversation.
-    Routine,
-    /// The primary assistant judges who owns a session the user chose to handle.
+    /// A due time of a schedule of this conversation: a routine, or a reminder.
+    Schedule,
+    /// The primary bot judges who owns a session the user chose to handle.
     Route,
+    /// Another bot's message to this one.
+    BotMessage,
 }
 
 pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
 }
 
-/// The turn in which the primary assistant routes the session a session question is about.
+/// The turn in which the primary bot routes the session a session question is about.
 pub fn route_trigger(question_id: &str) -> String {
     format!("route:{question_id}")
 }
@@ -37,44 +39,56 @@ pub fn task_trigger(work_id: &str) -> String {
     format!("task:{work_id}")
 }
 
-/// One scheduled time of a routine. It also keys the job and is the reply's `in_reply_to`.
-pub fn routine_trigger(routine_id: &str, slot_ms: i64) -> String {
-    format!("routine:{routine_id}:{slot_ms}")
+/// A message another bot wrote to this conversation.
+pub fn bot_message_trigger(message_id: &str) -> String {
+    format!("bot_message:{message_id}")
 }
 
-/// `(routine_id, slot_ms)` of a routine trigger in its single canonical spelling.
-pub fn parse_routine_trigger(trigger: &str) -> Option<(&str, i64)> {
-    let (routine_id, slot) = trigger.strip_prefix("routine:")?.split_once(':')?;
-    vibeface_protocol::validate_id(routine_id).ok()?;
+/// One due time of a schedule. It also keys the job and is the reply's `in_reply_to`.
+pub fn schedule_trigger(schedule_id: &str, slot_ms: i64) -> String {
+    format!("schedule:{schedule_id}:{slot_ms}")
+}
+
+/// `(schedule_id, slot_ms)` of a schedule trigger in its single canonical spelling.
+pub fn parse_schedule_trigger(trigger: &str) -> Option<(&str, i64)> {
+    let (schedule_id, slot) = trigger.strip_prefix("schedule:")?.split_once(':')?;
+    vibeface_protocol::validate_id(schedule_id).ok()?;
     let slot_ms: i64 = slot.parse().ok().filter(|slot| *slot >= 0)?;
-    (slot_ms.to_string() == slot).then_some((routine_id, slot_ms))
+    (slot_ms.to_string() == slot).then_some((schedule_id, slot_ms))
 }
 
-fn interval_ms(routine: &Routine) -> i64 {
-    i64::from(routine.every_minutes.max(1)) * 60_000
-}
-
-/// The newest scheduled time at or before `now`; earlier missed times are never run.
-pub fn latest_slot(routine: &Routine, now: i64) -> Option<i64> {
+/// The newest due time at or before `now`; earlier missed times are never run. A one-shot
+/// schedule has a single time.
+pub fn latest_slot(schedule: &Schedule, now: i64) -> Option<i64> {
     let since = now
-        .checked_sub(routine.first_run_at_ms)
+        .checked_sub(schedule.first_run_at_ms)
         .filter(|since| *since >= 0)?;
-    Some(routine.first_run_at_ms + since / interval_ms(routine) * interval_ms(routine))
+    let Some(every) = schedule.every_minutes else {
+        return Some(schedule.first_run_at_ms);
+    };
+    let interval = i64::from(every.max(1)) * 60_000;
+    Some(schedule.first_run_at_ms + since / interval * interval)
 }
 
-/// The first scheduled time at or after `now`, or `None` while paused.
-pub fn next_run(routine: &Routine, now: i64) -> Option<i64> {
-    if !routine.enabled {
+/// The first due time at or after `now`; `None` while paused or once a one-shot time passed.
+pub fn next_run(schedule: &Schedule, now: i64) -> Option<i64> {
+    if !schedule.enabled {
         return None;
     }
-    let Some(latest) = latest_slot(routine, now) else {
-        return Some(routine.first_run_at_ms);
+    let Some(latest) = latest_slot(schedule, now) else {
+        return Some(schedule.first_run_at_ms);
     };
-    Some(if latest == now {
-        latest
-    } else {
-        latest.saturating_add(interval_ms(routine))
-    })
+    if latest == now {
+        return Some(latest);
+    }
+    let every = schedule.every_minutes?;
+    Some(latest.saturating_add(i64::from(every) * 60_000))
+}
+
+/// Whether the schedule still has a time ahead: repeating, or a one-shot not yet due. Only these
+/// count toward a bot's limit, show in lists and reach the prompt.
+pub fn ahead(schedule: &Schedule, now: i64) -> bool {
+    schedule.every_minutes.is_some() || schedule.first_run_at_ms >= now
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,16 +168,17 @@ impl JobState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerJob {
     pub conversation_id: String,
-    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>` or `routine:<routine_id>:<slot_ms>`.
+    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`, `route:<question_id>`,
+    /// `bot_message:<message_id>` or `schedule:<schedule_id>:<slot_ms>`.
     pub trigger: String,
     pub kind: TriggerKind,
     pub sequence: u64,
     /// The version vector the turn reads; later events are not part of its prompt.
     pub basis: VersionVector,
-    /// The user message this turn ultimately answers, an agent task's own work ID, or a
-    /// routine run's trigger.
+    /// The user message this turn ultimately answers, an agent task's own work ID, a peer
+    /// message, or a schedule run's trigger.
     pub reply_to: String,
-    /// The assistant reply's message ID, fixed at admission so retries reuse it.
+    /// The bot reply's message ID, fixed at admission so retries reuse it.
     pub message_id: String,
     #[serde(flatten)]
     pub state: JobState,

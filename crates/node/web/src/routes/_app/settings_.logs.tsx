@@ -15,7 +15,7 @@ const levelChoices: Array<[LogLevel | undefined, string, LucideIcon]> = [
   [undefined, '全部', Layers], ['info', '信息', Info], ['warn', '警告', TriangleAlert], ['error', '错误', CircleX],
 ]
 const sourceChoices: Array<[LogSource, string, LucideIcon]> = [
-  ['node', '设备', Server], ['web', '网页', Globe], ['agent', '助手', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code], ['cursor', 'Cursor', MousePointerClick],
+  ['node', '设备', Server], ['web', '网页', Globe], ['agent', 'Bot', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code], ['cursor', 'Cursor', MousePointerClick],
 ]
 const sourceLabel = Object.fromEntries(sourceChoices.map(([value, label]) => [value, label])) as Record<LogSource, string>
 const levelLook: Record<LogLevel, { icon: LucideIcon; tone: string; label: string }> = {
@@ -102,7 +102,7 @@ function time(ms: number) {
   return today ? clock : `${date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${clock}`
 }
 
-/** `chat`: the assistant whose chat the record belongs to, shown instead of its ID. */
+/** `chat`: the bot whose chat the record belongs to, shown instead of its ID. */
 function LogRow({ record, chat, open, onToggle, onCopyAll }: { record: LogRecord; chat?: string; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
   const look = levelLook[record.level]
   const ids: Array<[string, string | undefined]> = [['对话', chat ?? record.conversation_id], ['任务', record.work_id], ['Codex 会话', record.thread_id]]

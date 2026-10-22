@@ -84,16 +84,36 @@ impl Runtime {
                 value
             })
             .collect();
-        Ok(json!({"bots":bots,"primary":store.primary_assistant(&access.network_id)?}))
+        Ok(json!({"bots":bots,"primary":store.primary_bot(&access.network_id)?}))
     }
 
-    /// The user's choice of the assistant that judges what comes in without an owner.
-    pub(super) async fn set_primary_assistant(
-        &self,
-        access: &Access,
-        input: &Value,
-    ) -> Result<Value> {
-        ensure!(access.human, "only the user picks the primary assistant");
+    /// The user pauses, resumes or deletes a schedule; the scheduler reads the projection, so a
+    /// paused one is not queued and a queued run is cancelled when claimed.
+    pub(super) async fn control_schedule(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user pauses or deletes a schedule");
+        let scope = id(input, "conversation_id")?;
+        let schedule_id = id(input, "schedule_id")?;
+        let action: ScheduleAction = serde_json::from_value(input["action"].clone())
+            .context("action is pause, resume or delete")?;
+        let written = self.store.lock().await.control_schedule(
+            &self.identity,
+            &access.network_id,
+            &scope,
+            &schedule_id,
+            action,
+            attestation(input)?,
+            now_ms(),
+        )?;
+        if let Some(hash) = &written {
+            self.publish_changed(&access.network_id, &scope, Changed::Event(hash));
+            self.schedule_wakeup.notify_one();
+        }
+        Ok(json!({"written":written.is_some()}))
+    }
+
+    /// The user's choice of the bot that judges what comes in without an owner.
+    pub(super) async fn set_primary_bot(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user picks the primary bot");
         let scope = id(input, "conversation_id")?;
         if let Some(allowed) = &access.conversation_id {
             ensure!(allowed == &scope, "outside this client's conversation");
@@ -104,28 +124,28 @@ impl Runtime {
                 .await
                 .bot_for_conversation(&access.network_id, &scope)?
                 .is_some(),
-            "no such assistant"
+            "no such bot"
         );
         let event = self
             .append(
                 &access.network_id,
-                ASSISTANTS_SCOPE,
-                EventBody::PrimaryAssistantSet {
+                BOTS_SCOPE,
+                EventBody::PrimaryBotSet {
                     conversation_id: scope,
                     attestation: Some(attestation(input)?),
                 },
             )
             .await?;
-        tracing::info!(event = "assistant.primary", "primary assistant set");
-        self.publish_changed(
-            &access.network_id,
-            ASSISTANTS_SCOPE,
-            Changed::Event(&event.hash),
-        );
-        Ok(json!({"primary":self.store.lock().await.primary_assistant(&access.network_id)?}))
+        tracing::info!(event = "bot.primary", "primary bot set");
+        self.publish_changed(&access.network_id, BOTS_SCOPE, Changed::Event(&event.hash));
+        Ok(json!({"primary":self.store.lock().await.primary_bot(&access.network_id)?}))
     }
 
-    async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {
+    pub(super) async fn validate_bot_project(
+        &self,
+        network: &str,
+        project: &BotProject,
+    ) -> Result<()> {
         self.store
             .lock()
             .await
@@ -143,7 +163,7 @@ impl Runtime {
         );
         if project.target_node == self.identity.device_id()? {
             ensure!(
-                self.assistant().is_some(),
+                self.manager().is_some(),
                 "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;

@@ -1,8 +1,9 @@
-use super::{assistant::ChangeRequest, *};
+use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
     scheduling::{
-        JobOutcome, JobState, TriggerKind, message_trigger, routine_trigger, work_trigger,
+        JobOutcome, JobState, TriggerKind, bot_message_trigger, message_trigger, schedule_trigger,
+        work_trigger,
     },
     work::{Signal, WorkSpec},
 };
@@ -377,6 +378,7 @@ fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
             scheduler_node: node.device_id()?,
             epoch: 2,
             attestation: None,
+            cause: None,
         })
     };
     let write = |store: &mut Store,
@@ -962,6 +964,7 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
             scheduler_node: net.b.device_id()?,
             epoch: 2,
             attestation: None,
+            cause: None,
         },
     )?;
     store.append_event(&net.a, &net.network, "c", moved, vec![], 3)?;
@@ -990,11 +993,12 @@ fn bot(net: &Net, name: &str) -> Result<EventBody> {
             instructions: "be brief".into(),
             project: None,
             attestation: None,
+            cause: None,
         },
     )
 }
 
-fn assistant_reply(id: &str, to: &str) -> EventBody {
+fn bot_reply(id: &str, to: &str) -> EventBody {
     EventBody::MessagePosted {
         message_id: id.into(),
         role: Role::Assistant,
@@ -1017,13 +1021,13 @@ fn save_skill(skill_id: Option<&str>, name: &str, body: &str) -> ChangeRequest {
     }
 }
 
-fn save_routine(routine_id: Option<&str>, name: &str, every_minutes: u32) -> ChangeRequest {
-    ChangeRequest::SaveRoutine {
-        routine_id: routine_id.map(Into::into),
+fn save_schedule(schedule_id: Option<&str>, name: &str, every_minutes: u32) -> ChangeRequest {
+    ChangeRequest::SaveSchedule {
+        schedule_id: schedule_id.map(Into::into),
         name: name.into(),
         prompt: "Summarize yesterday's commits; say so if there are none.".into(),
         first_run_at_ms: 1_000,
-        every_minutes,
+        every_minutes: Some(every_minutes),
         enabled: None,
     }
 }
@@ -1035,36 +1039,29 @@ fn rename(name: &str) -> ChangeRequest {
     }
 }
 
-fn assistant_projection(store: &Store, net: &Net) -> Result<Value> {
+fn bot_projection(store: &Store, net: &Net) -> Result<Value> {
     let changes: Vec<_> = store
-        .assistant_changes(&net.network, "c")?
+        .bot_changes(&net.network, "c")?
         .into_iter()
         .map(|change| (change.change_id, change.event_hash, change.change))
         .collect();
     Ok(serde_json::json!({
         "bots": store.bots(&net.network)?,
         "skills": store.skills(&net.network)?,
-        "routines": store.routines(&net.network, "c")?,
+        "schedules": store.schedules(&net.network, "c")?,
         "changes": changes,
     }))
 }
 
 /// Only the user's own signed message in the same conversation can be the cause a change follows.
 #[test]
-fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
+fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
     conversation(&mut origin, &net)?;
     origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
     let m1 = origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
-    let a1 = origin.append_event(
-        &net.a,
-        &net.network,
-        "c",
-        assistant_reply("a1", "m1"),
-        vec![],
-        4,
-    )?;
+    let a1 = origin.append_event(&net.a, &net.network, "c", bot_reply("a1", "m1"), vec![], 4)?;
     let mut target = store(&net)?;
     let a_events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
     assert!(
@@ -1084,10 +1081,13 @@ fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
             deps,
             scope_id: "c".into(),
             created_at_ms: 5,
-            body: EventBody::AssistantChanged {
+            body: EventBody::BotChanged {
                 change_id: "change-1".into(),
-                cause: cause.into(),
-                change: AssistantChange::Profile {
+                cause: Some(Cause {
+                    conversation_id: "c".into(),
+                    message_id: cause.into(),
+                }),
+                change: BotChange::Profile {
                     name: Some(Edit {
                         before: "Helper".into(),
                         after: "Nova".into(),
@@ -1117,38 +1117,38 @@ fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
         vec![IngestStatus::Accepted]
     );
     assert_eq!(target.bots(&net.network)?[0].name, "Nova");
-    assert_eq!(target.assistant_changes(&net.network, "c")?.len(), 1);
+    assert_eq!(target.bot_changes(&net.network, "c")?.len(), 1);
 
     // The local writer takes the cause from the trigger and refuses anything but a user message.
     for trigger in ["work:w1", "message:a1"] {
         let error = origin
-            .change_assistant(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
+            .change_bot(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
             .unwrap_err();
         assert!(
-            error.to_string().contains(assistant::NOT_FROM_USER),
+            error.to_string().contains(bot_settings::NOT_FROM_USER),
             "{trigger}: {error}"
         );
     }
     Ok(())
 }
 
-/// Chat changes from two devices converge to the same assistant in any arrival order, and a
+/// Chat changes from two devices converge to the same bot in any arrival order, and a
 /// retried tool call writes nothing new.
 #[test]
-fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
+fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
     conversation(&mut origin, &net)?;
     origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
     origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
     let change = |store: &mut Store, identity, trigger, call_ref, request, at| {
-        store.change_assistant(identity, &net.network, "c", trigger, call_ref, request, at)
+        store.change_bot(identity, &net.network, "c", trigger, call_ref, request, at)
     };
     let (renamed, written) = change(&mut origin, &net.a, "message:m1", "r1", rename("Nova"), 4)?;
     assert!(written);
     assert_eq!(
         renamed.change,
-        AssistantChange::Profile {
+        BotChange::Profile {
             name: Some(Edit {
                 before: "Helper".into(),
                 after: "Nova".into()
@@ -1175,7 +1175,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         save_skill(None, "Digest", "List the commits."),
         6,
     )?;
-    let AssistantChange::Skill { skill_id, .. } = saved.change else {
+    let BotChange::Skill { skill_id, .. } = saved.change else {
         panic!("skill change")
     };
     let duplicate = change(
@@ -1188,16 +1188,16 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
     )
     .unwrap_err();
     assert!(duplicate.to_string().contains(&skill_id), "{duplicate}");
-    let (routine, _) = change(
+    let (schedule, _) = change(
         &mut origin,
         &net.a,
         "message:m1",
         "r5",
-        save_routine(None, "Morning", 1440),
+        save_schedule(None, "Morning", 1440),
         7,
     )?;
-    let AssistantChange::Routine { routine_id, .. } = routine.change else {
-        panic!("routine change")
+    let BotChange::Schedule { schedule_id, .. } = schedule.change else {
+        panic!("schedule change")
     };
 
     // Device b answers a later message concurrently with a's next edits.
@@ -1226,7 +1226,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         &net.a,
         "message:m1",
         "r7",
-        save_routine(Some(&routine_id), "Morning", 60),
+        save_schedule(Some(&schedule_id), "Morning", 60),
         12,
     )?;
     change(
@@ -1234,15 +1234,15 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         &net.b,
         "message:m2",
         "r3",
-        ChangeRequest::RemoveRoutine {
-            routine_id: routine_id.clone(),
+        ChangeRequest::RemoveSchedule {
+            schedule_id: schedule_id.clone(),
         },
         13,
     )?;
-    let expected = assistant_projection(&origin, &net)?;
+    let expected = bot_projection(&origin, &net)?;
     assert_eq!(expected["bots"][0]["name"], "Orion");
     assert_eq!(expected["skills"], serde_json::json!([]));
-    assert_eq!(expected["routines"], serde_json::json!([]));
+    assert_eq!(expected["schedules"], serde_json::json!([]));
     assert_eq!(expected["changes"].as_array().map(Vec::len), Some(8));
 
     let a_events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
@@ -1255,58 +1255,58 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
     b_first.ingest_events(&net.network, &a_events)?;
     // Events rejected for a gap are fetched again by sync.
     b_first.ingest_events(&net.network, &b_events)?;
-    assert_eq!(assistant_projection(&a_first, &net)?, expected);
-    assert_eq!(assistant_projection(&b_first, &net)?, expected);
+    assert_eq!(bot_projection(&a_first, &net)?, expected);
+    assert_eq!(bot_projection(&b_first, &net)?, expected);
     Ok(())
 }
 
-/// The owner runs a routine's latest due time once, skips the times it missed and drops a
-/// queued run once the routine is paused.
+/// The owner runs a schedule's latest due time once, skips the times it missed and drops a
+/// queued run once the schedule is paused.
 #[test]
-fn a_routine_runs_its_latest_time_once() -> Result<()> {
+fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
     store.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
-    let (saved, _) = store.change_assistant(
+    let (saved, _) = store.change_bot(
         &net.a,
         &net.network,
         "c",
         "message:m1",
         "r1",
-        save_routine(None, "Digest", 5),
+        save_schedule(None, "Digest", 5),
         3,
     )?;
-    let AssistantChange::Routine { routine_id, .. } = saved.change else {
-        panic!("routine change")
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule change")
     };
     let every = 5 * 60_000;
     assert!(
         store
-            .admit_due_routines(&net.a, &net.network, 999)?
+            .admit_due_schedules(&net.a, &net.network, 999)?
             .is_empty()
     );
-    let due = store.admit_due_routines(&net.a, &net.network, 1_000 + 3 * every + 10)?;
-    let trigger = routine_trigger(&routine_id, 1_000 + 3 * every);
+    let due = store.admit_due_schedules(&net.a, &net.network, 1_000 + 3 * every + 10)?;
+    let trigger = schedule_trigger(&schedule_id, 1_000 + 3 * every);
     assert_eq!(due, vec![("c".to_owned(), trigger.clone())]);
     assert!(
         store
-            .admit_due_routines(&net.a, &net.network, 1_000 + 3 * every + 20)?
+            .admit_due_schedules(&net.a, &net.network, 1_000 + 3 * every + 20)?
             .is_empty()
     );
     // The next time waits while this run is still queued.
     assert!(
         store
-            .admit_due_routines(&net.a, &net.network, 1_000 + 4 * every)?
+            .admit_due_schedules(&net.a, &net.network, 1_000 + 4 * every)?
             .is_empty()
     );
 
     let claimed = store
         .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("routine job")?;
+        .context("schedule job")?;
     assert_eq!(
         (claimed.job.kind, claimed.job.trigger.as_str()),
-        (TriggerKind::Routine, trigger.as_str())
+        (TriggerKind::Schedule, trigger.as_str())
     );
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.finish_job(
@@ -1324,20 +1324,20 @@ fn a_routine_runs_its_latest_time_once() -> Result<()> {
         .context("reply")?;
     assert_eq!(reply.in_reply_to.as_deref(), Some(trigger.as_str()));
 
-    let next = store.admit_due_routines(&net.a, &net.network, 1_000 + 5 * every)?;
+    let next = store.admit_due_schedules(&net.a, &net.network, 1_000 + 5 * every)?;
     assert_eq!(next.len(), 1);
-    store.change_assistant(
+    store.change_bot(
         &net.a,
         &net.network,
         "c",
         "message:m1",
         "r2",
-        ChangeRequest::SaveRoutine {
-            routine_id: Some(routine_id),
+        ChangeRequest::SaveSchedule {
+            schedule_id: Some(schedule_id),
             name: "Digest".into(),
             prompt: "Summarize yesterday's commits; say so if there are none.".into(),
             first_run_at_ms: 1_000,
-            every_minutes: 5,
+            every_minutes: Some(5),
             enabled: Some(false),
         },
         5,
@@ -1353,9 +1353,595 @@ fn a_routine_runs_its_latest_time_once() -> Result<()> {
     ));
     assert!(
         store
-            .admit_due_routines(&net.a, &net.network, 1_000 + 9 * every)?
+            .admit_due_schedules(&net.a, &net.network, 1_000 + 9 * every)?
             .is_empty()
     );
+    Ok(())
+}
+
+/// Conversation `c` with its bot and the user's message `m1`.
+fn bot_with_message(net: &Net) -> Result<(Store, String)> {
+    let mut store = store(net)?;
+    conversation(&mut store, net)?;
+    store.append_event(&net.a, &net.network, "c", bot(net, "Helper")?, vec![], 2)?;
+    let m1 = store.append_event(&net.a, &net.network, "c", user(net, "m1", "x"), vec![], 3)?;
+    Ok((store, m1.hash))
+}
+
+/// A second bot, in conversation `d`, scheduled by device a.
+fn second_bot(store: &mut Store, net: &Net, name: &str) -> Result<()> {
+    let owner = net
+        .a
+        .owner_fixture(&net.network, "d", &net.a.device_id()?)?;
+    store.create_conversation(&net.a, &net.network, "d", "t", owner, 1)?;
+    let created = net.a.fixture_admin().attest(
+        &net.network,
+        "d",
+        EventBody::BotCreated {
+            bot_id: "bot-d".into(),
+            name: name.into(),
+            instructions: String::new(),
+            project: None,
+            attestation: None,
+            cause: None,
+        },
+    )?;
+    store.append_event(&net.a, &net.network, "d", created, vec![], 2)?;
+    Ok(())
+}
+
+fn all_accepted(target: &mut Store, net: &Net, source: &Store) -> Result<()> {
+    for author in [&net.a, &net.b] {
+        let events = source.events_from(&net.network, &author.device_id()?, 1, 500)?;
+        let statuses = target.ingest_events(&net.network, &events)?.0;
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == IngestStatus::Accepted),
+            "{statuses:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A reminder runs at its time once; neither a restart nor a device that syncs the history
+/// runs it again.
+#[test]
+fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let now = 10_000;
+    let (saved, _) = origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        ChangeRequest::Remind {
+            note: "Check the deploy".into(),
+            in_minutes: Some(1),
+            at_ms: None,
+        },
+        now,
+    )?;
+    let BotChange::Schedule {
+        schedule_id,
+        after: Some(reminder),
+        ..
+    } = saved.change
+    else {
+        panic!("reminder")
+    };
+    assert_eq!((reminder.every_minutes, reminder.depth), (None, 1));
+    let at = now + 60_000;
+    assert!(
+        origin
+            .admit_due_schedules(&net.a, &net.network, at - 1)?
+            .is_empty()
+    );
+    let trigger = schedule_trigger(&schedule_id, at);
+    assert_eq!(
+        origin.admit_due_schedules(&net.a, &net.network, at + 5)?,
+        vec![("c".to_owned(), trigger.clone())]
+    );
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("reminder job")?;
+    assert_eq!(claimed.job.kind, TriggerKind::Schedule);
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        at + 10,
+    )?;
+    for later in [at + 60_000, at + 86_400_000] {
+        assert!(
+            origin
+                .admit_due_schedules(&net.a, &net.network, later)?
+                .is_empty()
+        );
+    }
+    // A fresh store keeps no run records; the reply in the history stops a second run.
+    let mut restored = store(&net)?;
+    all_accepted(&mut restored, &net, &origin)?;
+    assert!(
+        restored
+            .admit_due_schedules(&net.a, &net.network, at + 120_000)?
+            .is_empty()
+    );
+    assert!(restored.scheduler_jobs("c")?.is_empty());
+    assert!(
+        restored
+            .schedules(&net.network, "c")?
+            .iter()
+            .all(|entry| !crate::scheduling::ahead(&entry.schedule, at + 1))
+    );
+    Ok(())
+}
+
+/// Reminders a bot sets itself chain at most `MAX_CHAIN_DEPTH` deep after the user's message,
+/// and a change without the user's message is accepted only as a new one-time reminder.
+#[test]
+fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let remind = |note: String| ChangeRequest::Remind {
+        note,
+        in_minutes: Some(5),
+        at_ms: None,
+    };
+    let mut trigger = message_trigger("m1");
+    let mut now = 10_000;
+    for depth in 1..=MAX_CHAIN_DEPTH {
+        let (saved, _) = origin.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            "r",
+            remind(format!("step {depth}")),
+            now,
+        )?;
+        assert_eq!(saved.cause.is_some(), depth == 1);
+        let BotChange::Schedule {
+            schedule_id,
+            after: Some(reminder),
+            ..
+        } = saved.change
+        else {
+            panic!("reminder")
+        };
+        assert_eq!(reminder.depth, depth);
+        now = reminder.first_run_at_ms;
+        trigger = schedule_trigger(&schedule_id, now);
+    }
+    let error = origin
+        .change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            "r",
+            remind("again".into()),
+            now,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("automatic wakes"), "{error}");
+    let error = origin
+        .change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            "r2",
+            rename("Nova"),
+            now,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains(bot_settings::NOT_FROM_USER));
+
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    let forged = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![],
+        scope_id: "c".into(),
+        created_at_ms: now,
+        body: EventBody::BotChanged {
+            change_id: "change-x".into(),
+            cause: None,
+            change: BotChange::Profile {
+                name: Some(Edit {
+                    before: "Helper".into(),
+                    after: "Nova".into(),
+                }),
+                instructions: None,
+            },
+        },
+        blobs: vec![],
+    })?;
+    assert!(matches!(
+        &other.ingest_events(&net.network, &[forged])?.0[0],
+        IngestStatus::Rejected(error) if error.contains("one-time reminder")
+    ));
+    Ok(())
+}
+
+/// The user's signed pause holds on every device until a resume; a deletion is final.
+#[test]
+fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let (saved, _) = origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_schedule(None, "Digest", 5),
+        3,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule change")
+    };
+    let signed = |action| -> Result<Attestation> {
+        net.a
+            .fixture_admin()
+            .attest(
+                &net.network,
+                "c",
+                EventBody::ScheduleControlled {
+                    schedule_id: schedule_id.clone(),
+                    action,
+                    attestation: None,
+                },
+            )?
+            .attestation()
+            .cloned()
+            .context("signed")
+    };
+    let control = |store: &mut Store, action, at| {
+        store.control_schedule(
+            &net.a,
+            &net.network,
+            "c",
+            &schedule_id,
+            action,
+            signed(action)?,
+            at,
+        )
+    };
+    let every = 5 * 60_000;
+    assert!(control(&mut origin, ScheduleAction::Pause, 4)?.is_some());
+    assert!(control(&mut origin, ScheduleAction::Pause, 5)?.is_none());
+    assert!(
+        origin
+            .admit_due_schedules(&net.a, &net.network, 1_000 + 3 * every)?
+            .is_empty()
+    );
+    let forged = origin.control_schedule(
+        &net.a,
+        &net.network,
+        "c",
+        &schedule_id,
+        ScheduleAction::Resume,
+        signed(ScheduleAction::Pause)?,
+        6,
+    );
+    assert!(forged.is_err(), "a signature for another action");
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert!(
+        !other
+            .schedule(&net.network, &schedule_id)?
+            .context("paused schedule")?
+            .schedule
+            .enabled
+    );
+    assert!(control(&mut origin, ScheduleAction::Resume, 6)?.is_some());
+    assert_eq!(
+        origin
+            .admit_due_schedules(&net.a, &net.network, 1_000 + 3 * every)?
+            .len(),
+        1
+    );
+    assert!(control(&mut origin, ScheduleAction::Delete, 7)?.is_some());
+    assert!(control(&mut origin, ScheduleAction::Delete, 8)?.is_none());
+    assert!(origin.schedule(&net.network, &schedule_id)?.is_none());
+    assert!(
+        origin
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert!(other.schedule(&net.network, &schedule_id)?.is_none());
+    Ok(())
+}
+
+/// A bot's message lands in the other bot's chat with its sender and wakes it once; retries
+/// write nothing, replies count hops and each bot sends a bounded number per hour.
+#[test]
+fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    let send = |store: &mut Store, call_ref: &str, to: &str, text: &str, at| {
+        store.message_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            to,
+            text,
+            at,
+        )
+    };
+    let (message, receipt, written) = send(&mut origin, "s1", "ops", "Check the backups", 10)?;
+    assert!(written);
+    assert_eq!(message.role, Role::Bot);
+    assert_eq!(
+        message.sender.as_ref().map(|s| s.name.as_str()),
+        Some("Helper")
+    );
+    let trigger = bot_message_trigger(&message.message_id);
+    assert_eq!(
+        (receipt.conversation_id.as_str(), receipt.trigger.as_str()),
+        ("d", trigger.as_str())
+    );
+    let (again, _, written) = send(&mut origin, "s1", "Ops", "Check the backups", 11)?;
+    assert!(!written && again.message_id == message.message_id);
+    let changed = send(&mut origin, "s1", "d", "Other", 11).unwrap_err();
+    assert!(changed.to_string().contains("another message"), "{changed}");
+    assert!(send(&mut origin, "s2", "c", "To myself", 11).is_err());
+    assert_eq!(origin.scheduler_jobs("d")?.len(), 1);
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "d", "boot", "cfg")?
+        .context("bot message job")?;
+    assert_eq!(
+        (claimed.job.kind, claimed.job.trigger.as_str()),
+        (TriggerKind::BotMessage, trigger.as_str())
+    );
+
+    let (reply, _, _) = origin.message_bot(
+        &net.a,
+        &net.network,
+        "d",
+        &trigger,
+        "s1",
+        "Helper",
+        "Done",
+        12,
+    )?;
+    let hops = origin
+        .context(&net.network, "c", None)?
+        .events
+        .into_iter()
+        .find_map(|event| match event.event.body {
+            EventBody::BotMessaged {
+                message_id, hops, ..
+            } if message_id == reply.message_id => Some(hops),
+            _ => None,
+        });
+    assert_eq!(hops, Some(2));
+    let sent = origin.sent_bot_messages(&net.network, "d")?;
+    assert_eq!(
+        sent.iter()
+            .map(|row| (row.message_id.as_str(), row.to.as_str(), row.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(reply.message_id.as_str(), "c", "Done")],
+        "the sender's chat lists what it wrote to another bot"
+    );
+
+    for index in 2..=BOT_MESSAGES_PER_HOUR {
+        send(
+            &mut origin,
+            &format!("s{index}"),
+            "d",
+            &format!("note {index}"),
+            20,
+        )?;
+    }
+    let limited = send(&mut origin, "s99", "d", "one more", 21).unwrap_err();
+    assert!(limited.to_string().contains("last hour"), "{limited}");
+    assert!(send(&mut origin, "s99", "d", "one more", 3_600_020).is_ok());
+
+    // Another device stores the messages and queues nothing from them.
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert!(other.scheduler_jobs("d")?.is_empty() && other.scheduler_jobs("c")?.is_empty());
+    let forged = net.a.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![],
+        scope_id: "c".into(),
+        created_at_ms: 30,
+        body: EventBody::BotMessaged {
+            message_id: "bot-message-x".into(),
+            from: Sender {
+                conversation_id: "d".into(),
+                name: "Ops".into(),
+            },
+            text: "deep".into(),
+            hops: MAX_CHAIN_DEPTH + 1,
+        },
+        blobs: vec![],
+    });
+    assert!(
+        forged.is_err(),
+        "hops beyond the limit are not a valid event"
+    );
+    Ok(())
+}
+
+/// A bot creates and configures other bots only in a turn the user's message started; every
+/// device accepts them because that signed message stands behind each event.
+#[test]
+fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
+    let net = net()?;
+    let (mut origin, m1) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    let create = |store: &mut Store, trigger: &str, call_ref: &str, name: &str| {
+        store.create_bot_in_turn(
+            &net.a,
+            &net.network,
+            "c",
+            trigger,
+            call_ref,
+            (name, "Watch the logs.", None),
+            10,
+        )
+    };
+    let (created, new) = create(&mut origin, "message:m1", "b1", "Watcher")?;
+    assert!(new);
+    assert_eq!(
+        create(&mut origin, "message:m1", "b1", "Watcher")?,
+        (created.clone(), false)
+    );
+    assert!(create(&mut origin, "message:m1", "b1", "Other").is_err());
+    let refused = create(&mut origin, "work:w1", "b2", "Other").unwrap_err();
+    assert!(
+        refused.to_string().contains(bot_settings::NOT_FROM_USER),
+        "{refused}"
+    );
+    create(&mut origin, "message:m1", "b2", "Second")?;
+    create(&mut origin, "message:m1", "b3", "Third")?;
+    let capped = create(&mut origin, "message:m1", "b4", "Fourth").unwrap_err();
+    assert!(capped.to_string().contains("at most"), "{capped}");
+    let (changed, _) = origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "k1",
+        ChangeRequest::ConfigureBot {
+            bot: "Ops".into(),
+            name: Some("Backup".into()),
+            instructions: None,
+        },
+        11,
+    )?;
+    assert_eq!(changed.conversation_id, "d");
+
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    let mut names: Vec<_> = other
+        .bots(&net.network)?
+        .into_iter()
+        .map(|bot| bot.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Backup", "Helper", "Second", "Third", "Watcher"]);
+    assert_eq!(
+        other
+            .conversation(&net.network, &created.conversation_id)?
+            .and_then(|c| c.owner),
+        Some(net.a.device_id()?)
+    );
+
+    // The user's message cannot hand an existing conversation a new first owner.
+    let hijack = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![m1],
+        scope_id: "d".into(),
+        created_at_ms: 12,
+        body: EventBody::ConversationOwner {
+            scheduler_node: net.b.device_id()?,
+            epoch: 1,
+            attestation: None,
+            cause: Some(Cause {
+                conversation_id: "c".into(),
+                message_id: "m1".into(),
+            }),
+        },
+        blobs: vec![],
+    })?;
+    assert!(matches!(
+        &other.ingest_events(&net.network, &[hijack])?.0[0],
+        IngestStatus::Rejected(error) if error.contains("follows its creation")
+    ));
+    Ok(())
+}
+
+/// Notes refuse credentials and over-long text, change only for the user's message and sync.
+#[test]
+fn notes_refuse_secrets_and_sync() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let remember = |store: &mut Store, trigger: &str, call_ref: &str, text: &str| {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            trigger,
+            call_ref,
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: text.into(),
+            },
+            10,
+        )
+    };
+    for (index, refused) in [
+        "my key is sk-proj-abcdefghijklmnopqrstuvwxyz123456".to_owned(),
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz".to_owned(),
+        "-----BEGIN OPENSSH PRIVATE KEY-----".to_owned(),
+        "x".repeat(MAX_MEMORY_CHARS + 1),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            remember(&mut origin, "message:m1", &format!("n{index}"), refused).is_err(),
+            "{refused}"
+        );
+    }
+    let (kept, _) = remember(
+        &mut origin,
+        "message:m1",
+        "k1",
+        "Prefers short replies in Chinese",
+    )?;
+    let BotChange::Memory { memory_id, .. } = kept.change else {
+        panic!("note")
+    };
+    let error = remember(&mut origin, "work:w1", "k2", "Something else").unwrap_err();
+    assert!(error.to_string().contains(bot_settings::NOT_FROM_USER));
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert_eq!(
+        other.memories(&net.network, "c")?,
+        origin.memories(&net.network, "c")?
+    );
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "k3",
+        ChangeRequest::Forget { memory_id },
+        11,
+    )?;
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert!(other.memories(&net.network, "c")?.is_empty());
     Ok(())
 }
 
@@ -2205,9 +2791,9 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
     Ok(())
 }
 
-/// The conversation list shows each assistant's newest message, cut to a short preview.
+/// The conversation list shows each bot's newest message, cut to a short preview.
 #[test]
-fn last_messages_preview_each_assistants_newest_message() -> Result<()> {
+fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
@@ -2222,14 +2808,7 @@ fn last_messages_preview_each_assistants_newest_message() -> Result<()> {
         vec![],
         3,
     )?;
-    store.append_event(
-        &net.a,
-        &net.network,
-        "c",
-        assistant_reply("a1", "m1"),
-        vec![],
-        4,
-    )?;
+    store.append_event(&net.a, &net.network, "c", bot_reply("a1", "m1"), vec![], 4)?;
     let last = store
         .last_messages(&net.network)?
         .remove("c")

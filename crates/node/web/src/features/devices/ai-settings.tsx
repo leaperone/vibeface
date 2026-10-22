@@ -23,7 +23,7 @@ const checks: Record<ProviderId, { key: string; label: string; doc: string }[]> 
     { key: "Node.js", label: "缺少 Node.js 18 以上", doc: "node.md#使用-codex-sdk" },
     { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
     { key: "Codex SDK sidecar", label: "Vibeface 安装不完整，请重新安装", doc: "install.md" },
-    { key: "Codex SDK dependencies", label: "助手组件还没装好", doc: "install.md#npm-nightly" },
+    { key: "Codex SDK dependencies", label: "Bot 组件还没装好", doc: "install.md#npm-nightly" },
   ],
   cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
 }
@@ -109,11 +109,11 @@ function openProvider(provider: ProviderId) {
   card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
 }
 
-type Change = { provider: ProviderId; assistant?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 type Failure = { at: ProviderId | "roots" | null; cause: unknown }
 
 /**
- * The AI on the device this browser is connected to: which provider runs the assistant, whether
+ * The AI on the device this browser is connected to: which provider runs the bot, whether
  * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
  * change saves right away. Variable values are write-only; the device only says which are set.
  */
@@ -167,7 +167,7 @@ export function AiSettings({ onboarding = false }: { onboarding?: boolean }) {
       {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
         error={error?.at === item.provider ? error.cause : null} test={test}
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
-        saveAssistant={(next) => call(`${item.provider}:assistant_details`, item.provider, "configure_node", { roots, manager: next })} />)}
+        saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
     <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
@@ -182,14 +182,14 @@ function RoleToggle({ icon: Icon, label, name, pressed, busy, disabled, onClick 
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, error, change, saveAssistant, test }: {
+function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test }: {
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
-  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveAssistant(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
   const name = providerNames[item.provider], Icon = icons[item.provider]
-  const assistant = item.roles.includes("agent"), execution = item.roles.includes("execution")
-  const manager = assistant ? response.settings.manager : null
-  const missing = assistant ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
+  const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
+  const manager = bot ? response.settings.manager : null
+  const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
   const state = states[item.state === "ready" && missing.length ? "needs_setup" : item.state]
   const [editing, setEditing] = useState<string | null>(null)
   const [value, setValue] = useState("")
@@ -213,8 +213,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveAss
       <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
       <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
       <div className="flex shrink-0 gap-1">
-        <RoleToggle icon={terms.assistant.icon} label={terms.assistant.label} name={name} pressed={assistant} busy={busy === `${item.provider}:assistant`} disabled={busy !== ""}
-          onClick={() => { if (!(onboarding && assistant)) void change("assistant", { assistant: !assistant }) }} />
+        <RoleToggle icon={terms.bot.icon} label={terms.bot.label} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
+          onClick={() => { if (!(onboarding && bot)) void change("bot", { bot: !bot }) }} />
         {item.supports.includes("execution") && !onboarding ? <RoleToggle icon={terms.task.icon} label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => void change("execution", { execution: !execution })} /> : null}
       </div>
@@ -246,8 +246,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveAss
           </div>
         </form> : null}
 
-        {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} fixBin={issue?.code === "bin_missing"} working={working}
-          busy={busy === `${item.provider}:assistant_details`} save={saveAssistant} /> : null}
+        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} fixBin={issue?.code === "bin_missing"} working={working}
+          busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
           <p className="text-meta font-medium text-muted-foreground">环境变量</p>
@@ -292,23 +292,23 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveAss
   </li>
 }
 
-const assistantFields = ["model", "workspace", "cursor_sdk_bin", "node_bin", "codex_sdk_script"] as const
+const botFields = ["model", "workspace", "cursor_sdk_bin", "node_bin", "codex_sdk_script"] as const
 
-/** The assistant's model, folder and programs, inside the settings of the provider it runs on. */
-function AssistantDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+/** The bot's model, folder and programs, inside the settings of the provider it runs on. */
+function BotDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
   const cursor = manager.provider === "cursor_sdk"
-  const dirty = assistantFields.some((key) => draft[key] !== manager[key])
-  const field = (key: (typeof assistantFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) =>
+  const dirty = botFields.some((key) => draft[key] !== manager[key])
+  const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) =>
     <label className="grid gap-1 text-meta">{label}<Input name={key} className={cn(!extra.plain && "font-mono")} value={draft[key]} maxLength={key === "model" ? 256 : undefined} disabled={working}
       placeholder={extra.placeholder} required={extra.required} data-fix={extra.fix ? "" : undefined} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
     void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim(), node_bin: draft.node_bin.trim(), codex_sdk_script: draft.codex_sdk_script.trim() })
   }}>
-    <p className="text-meta font-medium text-muted-foreground">{terms.assistant.label}</p>
+    <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
     {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
-    {field("workspace", "助手工作文件夹")}
+    {field("workspace", "Bot 工作文件夹")}
     {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : <>{field("node_bin", "Node.js")}{field("codex_sdk_script", "Codex 组件")}</>}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>

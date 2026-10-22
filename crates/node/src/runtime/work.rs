@@ -181,18 +181,31 @@ impl Runtime {
                     "the result this work follows has not reached this device"
                 );
             }
-            Some(("routine", _)) => {
+            Some(("schedule", _)) => {
                 ensure!(
                     from_owner,
                     "only the conversation's scheduling device dispatches its work"
                 );
-                let (routine_id, _) = crate::scheduling::parse_routine_trigger(&spec.trigger)
+                let (schedule_id, _) = crate::scheduling::parse_schedule_trigger(&spec.trigger)
                     .context("invalid work trigger")?;
                 ensure!(
-                    store.routine(network, routine_id)?.is_some_and(|entry| {
-                        entry.conversation_id == spec.conversation && entry.routine.enabled
+                    store.schedule(network, schedule_id)?.is_some_and(|entry| {
+                        entry.conversation_id == spec.conversation && entry.schedule.enabled
                     }),
-                    "the routine this work runs for is paused, deleted or has not reached this device"
+                    "the schedule this work runs for is paused, deleted or has not reached this device"
+                );
+            }
+            Some(("bot_message", message_id)) => {
+                ensure!(
+                    from_owner,
+                    "only the conversation's scheduling device dispatches its work"
+                );
+                let message = store
+                    .message(network, &spec.conversation, message_id)?
+                    .context("the bot's message has not reached this device")?;
+                ensure!(
+                    message.role == Role::Bot,
+                    "work must follow a message in this conversation"
                 );
             }
             Some(("task", task)) => {
@@ -222,7 +235,7 @@ impl Runtime {
         }
         ensure!(
             spec.kind == WorkKind::Task || spec.dispatcher == spec.target,
-            "another device takes work only as a task for its assistant"
+            "another device takes work only as a task for its bot"
         );
         if spec.kind == WorkKind::Task {
             ensure!(
@@ -230,15 +243,15 @@ impl Runtime {
                 "an agent task goes to another device"
             );
             ensure!(
-                self.assistant().is_some(),
-                "this device has no assistant to take the task"
+                self.manager().is_some(),
+                "this device has no bot to take the task"
             );
         }
         Ok(())
     }
 
     /// Records the dispatch. A Codex work is then started by the Agent that registered it; an
-    /// agent task is queued for this device's assistant. A retry of the same `work_id` returns the
+    /// agent task is queued for this device's bot. A retry of the same `work_id` returns the
     /// existing record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,

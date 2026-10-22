@@ -16,7 +16,7 @@ import {
   SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar,
 } from "@/components/ui/sidebar"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { AssistantPanelButton } from "./assistant-panel"
+import { BotPanelButton } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { backTo } from "@vibeface/client/workspace/home.ts"
@@ -35,7 +35,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
 }
 
 const CreateBot = createContext<() => void>(() => {})
-/** Opens the new-assistant form from anywhere inside the workspace. */
+/** Opens the new-bot form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
 
 const titles: Record<string, string> = { "/": "消息", "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
@@ -99,8 +99,8 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
-            <SidebarGroupLabel>助手</SidebarGroupLabel>
-            <SidebarGroupAction title="新助手" aria-label="新助手" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus /></SidebarGroupAction>
+            <SidebarGroupLabel>Bot</SidebarGroupLabel>
+            <SidebarGroupAction title="新 Bot" aria-label="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus /></SidebarGroupAction>
             <SidebarGroupContent>
               <SidebarMenu>
                 {workspace.bots.map((bot) => {
@@ -110,7 +110,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
-                        {workspace.primary === bot.conversation_id ? <span title="主助手" className="inline-flex shrink-0"><Star aria-label="主助手" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
+                        {workspace.primary === bot.conversation_id ? <span title="主 Bot" className="inline-flex shrink-0"><Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
                         {marked ? <span aria-label="有新进展" className="size-2 shrink-0 rounded-full bg-warning" /> : null}
                       </Link>
                     </SidebarMenuButton>
@@ -134,7 +134,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
           <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", !nested && "-ms-2.5")} />
           <div className="flex min-w-0 flex-1 items-center gap-2">
-            {chatRoute ? <AssistantPanelButton /> : null}
+            {chatRoute ? <BotPanelButton /> : null}
             <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
           </div>
           {back ? pathname === "/inbox" ? null : <Button asChild variant="ghost" size="icon" className="relative -me-3 md:hidden">

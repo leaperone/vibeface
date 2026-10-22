@@ -14,9 +14,9 @@ export default function Inbox() {
   const open = workspace.questions.filter((question) => question.answer === null).sort((a, b) => b.created_at_ms - a.created_at_ms)
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentContainerClassName="gap-4 p-4">
     {open.length ? open.map((question) => <View key={question.question_id} className="gap-2">
-      {question.assistant ? <Link href={`/b/${question.assistant.bot_id}`} asChild>
+      {question.bot ? <Link href={`/b/${question.bot.bot_id}`} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
-          <Icon as={Bot} className="size-4" /><Text className="font-medium">{question.assistant.name}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+          <Icon as={Bot} className="size-4" /><Text className="font-medium">{question.bot.name}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" />
         </Pressable>
       </Link> : null}
       <QuestionCard question={question} />

@@ -5,22 +5,22 @@ import { answerBody, answerScope, foldAnswers, openQuestions, placeByTime, proje
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/Users/me/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
-  question_id, conversation_id: "chat", assistant: { bot_id: "bot", name: "助手" }, severity: "attention", text: "要不要继续",
+  question_id, conversation_id: "chat", bot: { bot_id: "bot", name: "Bot" }, severity: "attention", text: "要不要继续",
   choices: [{ label: "继续" }, { label: "看看", conversation_id: "other" }], about, author: "gateway", created_at_ms, answer: null, ...extra,
 })
 const snapshot = (extra: Record<string, unknown>) => ({
-  conversation: { conversation_id: "chat", title: "助手", owner: "gateway", owner_epoch: 1 }, messages: [], works: [], deliveries: [],
-  checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] }, questions: [], sessions: [], ...extra,
+  conversation: { conversation_id: "chat", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [], works: [], deliveries: [],
+  checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [], ...extra,
 })
 
 test("questions parse from the list and the chat snapshot, and fail closed on shapes the web cannot show", () => {
-  const session = row("s1", 2, { conversation_id: null, assistant: null, about: { ...about, request_id: "r" } })
+  const session = row("s1", 2, { conversation_id: null, bot: null, about: { ...about, request_id: "r" } })
   const [question, parsedSession] = parseQuestions({ questions: [row("q1", 1), session] })
   assert.equal(question.choices[1].conversation_id, "other")
-  assert.equal(parsedSession.conversation_id, null, "a session nobody's assistant started has no chat")
+  assert.equal(parsedSession.conversation_id, null, "a session nobody's bot started has no chat")
   const { choices: _, ...open } = row("q2", 3)
   assert.deepEqual(parseQuestions({ questions: [open] })[0].choices, [], "a question the node sent without choices is free text only")
-  assert.equal(parsedSession.assistant, null)
+  assert.equal(parsedSession.bot, null)
   assert.equal(parsedSession.about.request_id, "r")
   const answered = row("q2", 3, { answer: { message_id: "a-q2", text: "继续", author: "client", created_at_ms: 4 } })
   const chat = parseConversation(snapshot({
@@ -37,7 +37,7 @@ test("questions parse from the list and the chat snapshot, and fail closed on sh
   assert.throws(() => parseConversation(snapshot({ sessions: [{ node: "worker" }] })))
 })
 
-test("the primary assistant comes with the assistant list, and none before any exists", () => {
+test("the primary bot comes with the bot list, and none before any exists", () => {
   assert.equal(parsePrimary({ bots: [], primary: "chat" }), "chat")
   assert.equal(parsePrimary({ bots: [], primary: null }), null)
   assert.throws(() => parsePrimary({ bots: [], primary: 1 }))

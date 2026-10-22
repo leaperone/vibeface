@@ -28,8 +28,8 @@ export function useInbox(): InboxItem[] {
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
   for (const question of openQuestions(workspace.questions)) items.push({
-    key: `question:${question.question_id}`, icon: MessageCircleQuestionMark, title: question.text, meta: question.assistant?.name,
-    to: question.assistant ? `/b/${question.assistant.bot_id}` : "/inbox", kind: "question", question, done: question.question_id in workspace.answered,
+    key: `question:${question.question_id}`, icon: MessageCircleQuestionMark, title: question.text, meta: question.bot?.name,
+    to: question.bot ? `/b/${question.bot.bot_id}` : "/inbox", kind: "question", question, done: question.question_id in workspace.answered,
   })
   for (const check of workChecks(workspace.openWorks, workspace.nodes)) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", meta: check.title || undefined, to: "/inbox", kind: "confirm", check })
   const checks = data?.checks.length ?? 0
@@ -39,8 +39,8 @@ export function useInbox(): InboxItem[] {
   for (const note of workspace.notifications) {
     if (note.kind !== "manager_attention") continue
     const owner = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
-    if (owner) items.push({ key: `attention:${note.notification_id}`, icon: MessageSquareWarning, title: note.text.trim() || "助手需要你看看", meta: owner.name, to: `/b/${owner.bot_id}`, kind: "attention" })
+    if (owner) items.push({ key: `attention:${note.notification_id}`, icon: MessageSquareWarning, title: note.text.trim() || "Bot 需要你看看", meta: owner.name, to: `/b/${owner.bot_id}`, kind: "attention" })
   }
-  if (workspace.nodes.length && !workspace.nodes.some((node) => !node.revoked && node.capabilities?.manager)) items.push({ key: "setup", icon: Sparkles, title: "还没设置助手", to: device.ready ? `/devices/${device.ready.entry.device_id}` : "/devices", kind: "setup" })
+  if (workspace.nodes.length && !workspace.nodes.some((node) => !node.revoked && node.capabilities?.manager)) items.push({ key: "setup", icon: Sparkles, title: "还没设置 Bot", to: device.ready ? `/devices/${device.ready.entry.device_id}` : "/devices", kind: "setup" })
   return items
 }

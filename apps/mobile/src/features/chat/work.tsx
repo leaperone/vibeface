@@ -1,13 +1,13 @@
 import { Link } from 'expo-router'
-import { ArrowRight, ArrowRightLeft, Ban, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, Repeat, ScrollText, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowRight, ArrowRightLeft, Ban, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
-import { formatWhen, lineDiff, placeChanges, routineFrequency, routineTrigger } from '@vibeface/client/workspace/assistant.ts'
+import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
-import type { AssistantChange, AssistantChangeRecord, PendingCheck, RoutineView, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { BotChange, BotChangeRecord, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { ActionButton } from '@/components/action'
 import { ActionCard } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -50,14 +50,14 @@ export function useChatExtras(conversationId: string, botId: string) {
     const state = shownState(work, shared.nodes)
     const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
     const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
-    const routineReply = data.messages.find((message) => message.role !== 'user' && routineTrigger(message.in_reply_to) && message.in_reply_to === work.trigger)
-    const cause = routineReply?.message_id ?? jobs.find((job) => job.trigger === work.trigger)?.message_id
+    const scheduledReply = data.messages.find((message) => message.role !== 'user' && scheduleTrigger(message.in_reply_to) && message.in_reply_to === work.trigger)
+    const cause = scheduledReply?.message_id ?? jobs.find((job) => job.trigger === work.trigger)?.message_id
     add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} /> })
   })
   const changes = placeChanges(data.messages, data.changes)
-  const routines = data.assistant?.routines ?? []
-  for (const [at, records] of changes.after) add(at, { key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={routines} /> })
-  for (const records of changes.rest) rest.push({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={routines} /> })
+  const schedules = data.bot_settings.schedules
+  for (const [at, records] of changes.after) add(at, { key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
+  for (const records of changes.rest) rest.push({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
 
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
@@ -134,28 +134,29 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   </ActionCard>
 }
 
-function changeTitle(changes: AssistantChange[]) {
+function changeTitle(changes: BotChange[]) {
   const kind = changes[0]?.kind
   if (changes.some((change) => change.kind !== kind)) return '已更新'
   if (kind === 'profile') return '已更新 bot'
-  const items = changes as Extract<AssistantChange, { kind: 'skill' | 'routine' }>[]
+  const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
   const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
   if (kind === 'skill') return added ? '已存为 skill' : removed ? '已删除 skill' : '已更新 skill'
-  return added ? '已设定例行任务' : removed ? '已删除例行任务' : '已更新例行任务'
+  if (kind === 'memory') return added ? '已记下' : removed ? '已忘记' : '已更新笔记'
+  return added ? '已设定定时任务' : removed ? '已删除定时任务' : '已更新定时任务'
 }
 
 /** What one turn changed in the bot, item by item. */
-function ChangeCard({ records, routines }: { records: AssistantChangeRecord[]; routines: readonly RoutineView[] }) {
+function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
   return <View className="gap-3 rounded-xl border border-border bg-card p-4">
     <View className="flex-row items-center gap-2">
       <Icon as={CircleCheck} className="size-4 text-success" />
       <Text role="heading" className="text-meta font-medium text-muted-foreground">{changeTitle(records.map((record) => record.change))}</Text>
     </View>
-    {records.map((record) => <ChangeRows key={record.change_id} change={record.change} routines={routines} />)}
+    {records.map((record) => <ChangeRows key={record.change_id} change={record.change} schedules={schedules} />)}
   </View>
 }
 
-function ChangeRows({ change, routines }: { change: AssistantChange; routines: readonly RoutineView[] }) {
+function ChangeRows({ change, schedules }: { change: BotChange; schedules: readonly ScheduleView[] }) {
   if (change.kind === 'profile') return <>
     {change.name ? <ChangeRow icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></ChangeRow> : null}
     {change.instructions ? <ChangeRow icon={ScrollText} label="说明">
@@ -169,13 +170,22 @@ function ChangeRows({ change, routines }: { change: AssistantChange; routines: r
       {change.after?.description ? <Text className="text-meta text-muted-foreground">{change.after.description}</Text> : null}
     </ChangeRow>
   }
+  if (change.kind === 'memory') {
+    const { before, after } = change
+    if (!after) return <ChangeRow icon={NotebookPen} label={before!} tag="已忘记" removed />
+    if (!before) return <ChangeRow icon={NotebookPen} label={after} tag="新笔记" />
+    return <ChangeRow icon={NotebookPen} label="笔记" tag="已更新"><BeforeAfter before={before} after={after} /></ChangeRow>
+  }
   const { before, after: next } = change
-  const tag = !before ? '新例行任务' : !next ? '已删除' : before.enabled !== next.enabled ? (next.enabled ? '已恢复' : '已暂停') : '已更新'
-  if (!next) return <ChangeRow icon={Repeat} label={before!.name} tag={tag} removed />
-  const current = routines.find((routine) => routine.routine_id === change.routine_id)
-  const when = current?.enabled && current.next_run_at_ms !== null ? `下次 ${formatWhen(current.next_run_at_ms)}` : ''
-  return <ChangeRow icon={Repeat} label={next.name} tag={tag}>
-    <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[routineFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
+  const once = (next ?? before!).every_minutes === undefined
+  const icon = once ? AlarmClock : Repeat
+  const tag = !before ? (once ? '新提醒' : '新定时任务') : !next ? '已删除' : before.enabled !== next.enabled ? (next.enabled ? '已恢复' : '已暂停') : '已更新'
+  if (!next) return <ChangeRow icon={icon} label={before!.name} tag={tag} removed />
+  const current = schedules.find((schedule) => schedule.schedule_id === change.schedule_id)
+  const at = once ? next.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
+  const when = at !== null ? `${once ? '' : '下次 '}${formatWhen(at)}` : ''
+  return <ChangeRow icon={icon} label={next.name} tag={tag}>
+    <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
     <Text numberOfLines={2} className="text-meta text-muted-foreground">{next.prompt}</Text>
   </ChangeRow>
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning, Send } from 'lucide-react'
 import { ActionCard, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -11,8 +11,8 @@ import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
-import type { AssistantChangeRecord, ManagerJob, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
-import { placeChanges, routineName, routineTrigger } from '@vibeface/client/workspace/assistant.ts'
+import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, foldAnswers, placeByTime, projectName } from '@vibeface/client/workspace/questions.ts'
 import { ChangeCard } from './change-card'
@@ -43,7 +43,7 @@ export function ConversationScreen() {
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
-  const assistantBusy = activeJobs.length > 0
+  const botBusy = activeJobs.length > 0
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
@@ -66,27 +66,28 @@ export function ConversationScreen() {
     return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
   }
 
-  // What a turn changed in the assistant shows after its reply, or after the message while no reply exists.
+  // What a turn changed in the bot shows after its reply, or after the message while no reply exists.
   const changes = data?.changes ?? []
   const placedChanges = placeChanges(data?.messages ?? [], changes)
-  const changeRow = (records: AssistantChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} routines={data?.assistant?.routines ?? []} /> })
+  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.bot_settings?.schedules ?? []} /> })
 
-  // Questions and hand-offs sit where they happened as rows, not bubbles; an answer shows inside its question.
+  // Questions, hand-offs and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <QuestionCard question={question} answer={folded.answers.get(question.question_id)} /> })),
-    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id) ?? { name: '另一个助手' }} /> })),
+    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id) ?? { name: '另一个 Bot' }} /> })),
+    ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
 
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   const entries: ChatEntry[] = []
   for (const message of data?.messages ?? []) {
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
-    const routine = message.role === 'user' ? null : routineTrigger(message.in_reply_to)
-    if (routine) {
-      // A routine run has no message of the person; its reply stands alone and the tasks it started follow it.
-      entries.push({ key: message.message_id, message, routine: routineName(routine, data?.assistant, changes) })
+    const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
+    if (schedule) {
+      // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
+      entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
     const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.error
@@ -111,7 +112,7 @@ export function ConversationScreen() {
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
-  if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</p> })
+  if (botBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</p> })
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
@@ -135,7 +136,7 @@ export function ConversationScreen() {
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? '上一条消息还没确认送达' : ''
   const toCards = () => document.getElementById('chat-waiting')?.scrollIntoView({ block: 'end', behavior: 'smooth' })
-  const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行助手的设备离线了' : '暂时没有能运行助手的设备')
+  const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
 
@@ -235,7 +236,7 @@ function TaskMeta({ device, state, className = '' }: { device: string; state: st
   </span>
 }
 
-/** A session handed to this assistant, or by this primary assistant to another one. */
+/** A session handed to this bot, or by this primary bot to another one. */
 function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name: string; bot_id?: string } | null }) {
   const Icon = owner ? Forward : ArrowDownToLine
   return <p className="flex min-h-9 min-w-0 items-center gap-2 text-meta text-muted-foreground">
@@ -247,6 +248,18 @@ function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name
     <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
     {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
   </p>
+}
+
+function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot_id?: string } }) {
+  return <div className="grid min-w-0 gap-1 rounded-lg border px-3 py-2 text-meta">
+    <p className="flex min-w-0 items-center gap-2 text-muted-foreground">
+      <Send aria-hidden="true" className="size-4 shrink-0" />
+      <span className="shrink-0">发给</span>
+      {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">{to.name}</Link>
+        : <span className="min-w-0 truncate font-medium text-foreground">{to.name}</span>}
+    </p>
+    <p className="line-clamp-3 whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]" title={sent.text}>{sent.text}</p>
+  </div>
 }
 
 /** The provider's own words behind a failed reply, folded under it. */

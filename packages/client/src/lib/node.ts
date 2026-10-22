@@ -41,7 +41,7 @@ export type AppServerMode = 'system' | 'spawn'
 /** `socket` is the owner's choice for the system App Server; `null` finds it. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 /**
- * One local provider of the connected Node. `roles` is what it runs now: `agent` while the assistant
+ * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
  * runs on it, `execution` while Codex executes tasks; `off` means it runs nothing.
  * Variable values never come back, only whether each is set.
  */
@@ -152,7 +152,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   let manager: ManagerSettings | null = null
   if (settings.manager !== null) {
     const m = record(settings.manager)
-    if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('助手设置格式不对。')
+    if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('Bot 设置格式不对。')
     manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
   }
   if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
