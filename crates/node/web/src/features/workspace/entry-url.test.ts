@@ -11,7 +11,7 @@ import { nodeName } from "./labels.ts"
 import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
 import { placeChanges, scheduleName, scheduleTrigger } from "./bot-settings.ts"
 import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "./questions.ts"
-import { canSend, composerHint } from "../chat/protocol.ts"
+import { canSend, composerHint, threadReplies } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
@@ -610,7 +610,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint, threadReplies }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -739,7 +739,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint, threadReplies }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()

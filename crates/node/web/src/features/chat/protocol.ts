@@ -56,3 +56,15 @@ export function messageKey(message: TranscriptMessage): string { return message.
 export function isSubmitKey(event: Pick<KeyboardEvent, 'key' | 'shiftKey' | 'isComposing' | 'keyCode'>): boolean {
   return event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229
 }
+
+/** Each reply follows the message it answers, even when the person wrote again before that reply finished. */
+export function threadReplies<T extends Pick<TranscriptMessage, 'message_id' | 'role' | 'in_reply_to'>>(messages: T[]): T[] {
+  const ids = new Set(messages.map((message) => message.message_id))
+  const answers = (message: T) => message.role === 'assistant' && message.in_reply_to !== undefined && ids.has(message.in_reply_to) ? message.in_reply_to : null
+  const replies = new Map<string, T[]>()
+  for (const message of messages) {
+    const to = answers(message)
+    if (to) replies.set(to, [...replies.get(to) ?? [], message])
+  }
+  return messages.flatMap((message) => answers(message) ? [] : [message, ...replies.get(message.message_id) ?? []])
+}

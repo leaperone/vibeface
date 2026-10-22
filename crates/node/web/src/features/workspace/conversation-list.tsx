@@ -13,7 +13,7 @@ import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
-  const waiting = useInbox().filter((item) => !item.done).length
+  const open = useInbox().filter((item) => !item.done)
   const questions = openQuestions(workspace.questions)
   const now = Date.now()
   const bots = byRecent(workspace.bots)
@@ -32,7 +32,7 @@ export function ConversationList() {
   else if (!workspace.writable) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新建 Bot</Button>} />
   return <div className="mx-auto grid w-full max-w-3xl gap-2 max-md:-mx-3 max-md:w-auto">
-    <Row to="/inbox" icon={Inbox} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : "没有要你决定的事"} />
+    <Row to="/inbox" icon={Inbox} name="待处理" unread={open.length} preview={open[0]?.title ?? "没有要你处理的事"} />
     <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
