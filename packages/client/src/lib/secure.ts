@@ -1,5 +1,5 @@
 import type { SecureApi, SecureIdentity } from '../secure-api.ts'
-import { array, integer, parsePrincipal, parseView, record, same, text } from './node.ts'
+import { array, parsePrincipal, parseView, record, same, text } from './node.ts'
 import type { ClientPrincipal, MembershipView, PublicIdentity } from './node.ts'
 
 const encoder = new TextEncoder()
@@ -9,6 +9,8 @@ export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kin
 /** A recovery file as the platform hands it over: a browser `File` or a phone's picked document. */
 export type RecoveryFile = { size: number; text(): Promise<string> }
 export type SecureKit = ReturnType<typeof secureKit>
+/** What a recovery file carries besides its key: the whole checkpoint chain, so an empty Node can check it. */
+export type RecoveryMaterial = { networkId: string; genesis: unknown; checkpoints: unknown[] }
 
 /** The membership and recovery checks built on `crates/secure`, for whichever build of it the platform loaded. */
 export function secureKit(secure: SecureApi) {
@@ -48,18 +50,20 @@ export function secureKit(secure: SecureApi) {
     if (!verifiedView(auth.state, text(auth.network_id)).revoked.some(item => item.device_id === nodeId)) throw new Error('设备说它已被移出，但记录没通过校验。')
     return true
   }
-  function sealPackage(payload: Record<string, unknown>, password: string): Uint8Array {
+  /** Seals `root`, the current recovery key, with the material it belongs to. */
+  function sealPackage(material: RecoveryMaterial, root: SecureIdentity, password: string): Uint8Array {
+    const payload = { version: 1, network_id: material.networkId, root_secret_key: root.secretHex(), genesis: material.genesis, checkpoints: material.checkpoints }
     const cleartext = encoder.encode(JSON.stringify(payload))
+    payload.root_secret_key = ''
     try {
       const envelope: unknown = JSON.parse(decoder.decode(secure.recoverySeal(cleartext, password)))
-      return encoder.encode(JSON.stringify({ version: 1, network_id: payload.network_id, recovery_epoch: payload.recovery_epoch, envelope }))
+      return encoder.encode(JSON.stringify({ version: 1, network_id: material.networkId, envelope }))
     } finally { cleartext.fill(0) }
   }
   async function openPackage(file: RecoveryFile, password: string) {
-    if (!file.size || file.size > 256 * 1024) throw new Error('恢复文件不能超过 256 KiB。')
+    if (!file.size || file.size > 4 * 1024 * 1024) throw new Error('恢复文件不能超过 4 MiB。')
     const bundle = record(JSON.parse(await file.text()), '恢复文件')
     if (bundle.version !== 1) throw new Error('恢复文件版本不对。')
-    const epoch = integer(bundle.recovery_epoch)
     const networkId = text(bundle.network_id)
     let cleartext: Uint8Array
     try { cleartext = secure.recoveryOpen(encoder.encode(JSON.stringify(record(bundle.envelope))), password) }
@@ -69,11 +73,13 @@ export function secureKit(secure: SecureApi) {
     let root: SecureIdentity | undefined
     try {
       root = Identity.fromSecretHex(text(payload.root_secret_key))
-      if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.deviceId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复文件内容对不上。')
-      verifyState({ genesis: record(payload.genesis), checkpoints: [], events: [] }, networkId).free()
+      payload.root_secret_key = ''
+      const material: RecoveryMaterial = { networkId, genesis: record(payload.genesis), checkpoints: array(payload.checkpoints) }
+      if (payload.version !== 1 || payload.network_id !== networkId) throw new Error('恢复文件内容对不上。')
+      if (verifiedView({ genesis: material.genesis, checkpoints: material.checkpoints, events: [] }, networkId).recovery_key !== root.deviceId()) throw new Error('恢复文件内容对不上。')
       const openedRoot = root
       let released = false
-      return { payload, root: openedRoot, networkId, epoch, release() { if (!released) { released = true; openedRoot.free(); payload.root_secret_key = '' } } }
+      return { material, root: openedRoot, networkId, release() { if (!released) { released = true; openedRoot.free() } } }
     } catch (error) { root?.free(); payload.root_secret_key = ''; throw error }
   }
   return {

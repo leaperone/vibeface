@@ -669,7 +669,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{AppServerMode, Local, Provider, ProviderEnv, Role};
+    use crate::providers::{AppServerMode, Local, Provider, ProviderEnv};
     use futures_util::{SinkExt as _, StreamExt as _};
     use std::os::unix::fs::PermissionsExt;
 
@@ -820,10 +820,13 @@ mod tests {
         assert!(second[1].ends_with(" fixture-replaced-key none"));
         assert!(ended(pid.parse()?).await, "the old App Server ends");
 
-        local.switches.codex.roles.remove(&Role::Execution);
+        local.switches.execution = false;
         server.retarget(local.codex_target());
         let second_group: i32 = second[1].split_once(' ').unwrap().0.parse()?;
-        assert!(ended(second_group).await, "Codex off stops the App Server");
+        assert!(
+            ended(second_group).await,
+            "turning execution off stops the App Server"
+        );
         link_becomes(&server, |link| *link == Link::Off).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(

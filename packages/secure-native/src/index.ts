@@ -132,8 +132,12 @@ class Membership implements SecureMembership {
     this.native.uniffiDestroy()
   }
 
-  createRecoveryCheckpoint(root: SecureIdentity, membersJson: string, headsJson: string, backupEpoch: number): string {
-    return call(() => this.native.createRecoveryCheckpoint(unwrap(root), membersJson, headsJson, backupEpoch))
+  createRecoveryCheckpoint(root: SecureIdentity, next: string, membersJson: string, headsJson: string): string {
+    return call(() => this.native.createRecoveryCheckpoint(unwrap(root), next, membersJson, headsJson))
+  }
+
+  createKeyRotation(root: SecureIdentity, next: string): string {
+    return call(() => this.native.createKeyRotation(unwrap(root), next))
   }
 
   governanceTemplate(issuer: string, actionJson: string): string {

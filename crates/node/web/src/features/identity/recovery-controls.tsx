@@ -67,7 +67,7 @@ export function RecoveryReview() {
         </div>
       })}
     </fieldset>
-    <p className="text-meta text-muted-foreground">这个浏览器会成为管理员，完成后下载新的恢复文件</p>
+    <p className="text-meta text-muted-foreground">这个浏览器会成为管理员，并下载新的恢复文件</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" onClick={device.cancelSensitive}>取消</Button>
@@ -75,7 +75,7 @@ export function RecoveryReview() {
         await device.confirmRecovery(review.members
           .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
           .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) })))
-        toast('已下载新的恢复文件，用它替换旧文件', { tone: 'success' })
+        toast('已恢复。旧恢复文件已失效，请保存新文件', { tone: 'success' })
       })}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}
@@ -120,15 +120,15 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
     </section> : null}
     {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2>
-      <p className="text-meta text-muted-foreground">旧文件不受影响</p>
+      <p className="text-meta text-muted-foreground">换完后旧文件失效</p>
       <form className="grid gap-4" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           let work: Promise<void>
-          try { work = device.reencrypt({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password'), field(form, 'confirmation')) }) }
+          try { work = device.replaceRecoveryFile({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password'), field(form, 'confirmation')) }) }
           finally { clearPasswords(form) }
           await work
-        }, '新的恢复文件已下载')
+        }, '已下载新文件，旧恢复文件已失效')
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>

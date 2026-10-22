@@ -14,7 +14,7 @@ Existing installations must use vibeface update apply instead.
 USAGE
 }
 
-fail() { printf 'vibeface installer: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'Vibeface installer: %s\n' "$*" >&2; exit 1; }
 
 # Parse only named fields; remote JSON is never evaluated as shell code.
 json_fields() {

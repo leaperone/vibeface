@@ -21,7 +21,7 @@ import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName } from "@vibeface/client/workspace/labels.ts"
-import { NotJoined } from "./not-joined"
+import { LocalSession } from "./local-session"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
@@ -89,7 +89,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       <Sidebar aria-label="导航">
         <SidebarHeader className="shrink-0 px-4 pt-4 pb-2">
           <div className="flex h-8 items-center">
-            <Link to="/" className="text-heading font-semibold tracking-tight">vibeface</Link>
+            <Link to="/" className="text-heading font-semibold tracking-tight">Vibeface</Link>
           </div>
         </SidebarHeader>
         <SidebarContent className="gap-1 pb-3">
@@ -152,7 +152,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label="设置" title="设置"><Settings aria-hidden="true" /></Link></Button>
           </div>}
         </header>
-        {workspace.joined ? null : <NotJoined onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
+        {workspace.joined ? null : <LocalSession onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
@@ -249,7 +249,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
     : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
   return <div className="flex h-dvh" aria-busy={retry === null}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
-      <span className="text-heading font-semibold">vibeface</span>
+      <span className="text-heading font-semibold">Vibeface</span>
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
       <div className={cn("mt-auto flex items-center gap-2 px-2 text-meta", retry === null ? "text-info" : "text-muted-foreground")} role="status">{status}</div>
     </div>

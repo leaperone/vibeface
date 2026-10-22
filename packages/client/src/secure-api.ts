@@ -27,7 +27,8 @@ export interface SecureIdentity {
 
 export interface SecureMembership {
   free(): void
-  createRecoveryCheckpoint(root: SecureIdentity, membersJson: string, headsJson: string, backupEpoch: number): string
+  createRecoveryCheckpoint(root: SecureIdentity, next: string, membersJson: string, headsJson: string): string
+  createKeyRotation(root: SecureIdentity, next: string): string
   governanceTemplate(issuer: string, actionJson: string): string
   stateJson(): string
   viewJson(): string

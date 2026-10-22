@@ -1138,6 +1138,12 @@ async fn access(entry: LocalEntry) -> Result<()> {
             entry["device_id"] == launcher.node_id && entry["url"] == launcher.origin,
             "local browser entry does not match this node"
         );
+        // The link opens the localhost page, which keeps a browser already joined there and
+        // sends only an unjoined one on to the launcher origin's temporary session.
+        let listen = configuration.listen.ip();
+        if listen.is_loopback() || listen.is_unspecified() {
+            url = origin(&format!("http://localhost:{}", configuration.listen.port()))?;
+        }
         url.set_fragment(Some(&format!("local={token}&node={}", launcher.node_id)));
         if options.json {
             println!(

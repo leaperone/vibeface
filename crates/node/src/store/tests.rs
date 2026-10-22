@@ -1721,9 +1721,10 @@ fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
     }
     let z_write = write(&mut origin, net, &z, "z1", 20)?;
     let mut recovered = net.state.clone();
-    recovered.recover(RootCheckpoint::create(
-        &net.a.fixture_root(),
-        3,
+    recovered.recover(RootCheckpoint::recovery(
+        &net.state,
+        &net.a.fixture_root_at(2),
+        &net.a.fixture_root_at(3).device_id()?,
         vec![
             Member::client(&fleet.admin, "fixture-admin", true)?,
             Member::node(&net.a, "a")?,
@@ -1831,9 +1832,10 @@ fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result
     }
     let replacement = LocalIdentity::generate();
     let mut recovered = net.state.clone();
-    recovered.recover(RootCheckpoint::create(
-        &net.a.fixture_root(),
-        3,
+    recovered.recover(RootCheckpoint::recovery(
+        &net.state,
+        &net.a.fixture_root_at(2),
+        &net.a.fixture_root_at(3).device_id()?,
         vec![
             Member::client(&replacement, "replacement", true)?,
             Member::node(&net.a, "a")?,
@@ -2194,7 +2196,7 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
             .message(&net.network, "c", &claimed.job.message_id)?
             .context("reply")?;
         assert!(!reply.text.contains("CURSOR_API_KEY"), "{}", reply.text);
-        assert!(reply.text.contains("设备 → AI 服务"), "{}", reply.text);
+        assert!(reply.text.contains("设备 → AI"), "{}", reply.text);
         assert!(
             matches!(&job.state, JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } if detail == raw),
             "the raw cause stays on the local job"

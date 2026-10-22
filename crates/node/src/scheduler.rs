@@ -135,12 +135,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         "conversation access denied"
     );
     let local_settings = node.settings_snapshot();
-    let settings = match node.assistant() {
-        Some(settings) => settings,
-        None if local_settings.manager.is_some() => {
-            bail!("the assistant's provider is turned off on this Node")
-        }
-        None => bail!("this Node has no configured management SDK"),
+    let Some(settings) = local_settings.manager.clone() else {
+        bail!("this Node has no configured management SDK")
     };
     let kind = settings.provider;
     let sdk_config = digest(&serde_json::to_vec(&settings)?);

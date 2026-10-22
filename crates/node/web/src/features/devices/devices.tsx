@@ -8,11 +8,9 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
-import { docs } from "./assistant-settings"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
-import type { Member, NodeSettingsResponse } from "@vibeface/client/lib/node.ts"
-import { AssistantSettings } from "./assistant-settings"
-import { ProviderSettings } from "./provider-settings"
+import type { Member } from "@vibeface/client/lib/node.ts"
+import { AiSettings, docs } from "./ai-settings"
 import { JoinRequests } from "./join"
 
 export type DeviceRow = {
@@ -107,12 +105,9 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const navigate = useNavigate()
   const action = useAction()
   const [removing, setRemoving] = useState(false)
-  // Both sections show the same settings reply, so a change in one shows in the other.
-  const [assistantSaved, setAssistantSaved] = useState<NodeSettingsResponse | null>(null)
-  const [providersSaved, setProvidersSaved] = useState<NodeSettingsResponse | null>(null)
   const row = rows.find((item) => item.id === deviceId)
   const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
-  const RemoveIcon = terms.remove.icon, ServiceIcon = terms.aiService.icon
+  const RemoveIcon = terms.remove.icon
   const canManage = ready?.principal.can_manage === true
   const localSession = ready?.principal.source === "local_session"
   if (!row) return device.directory ? <EmptyState icon={MonitorSmartphone} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-3xl gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
@@ -139,16 +134,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。请用管理设备移除它，再重新加入。"}</span>
     </p> : null}
 
-    {row.kind === "node" && !copied ? <Section icon={Bot} title="助手">
-      {row.entry && (canManage || localSession) ? <AssistantSettings update={providersSaved} onChange={setAssistantSaved} /> : <div className="grid gap-1">
+    {row.kind === "node" && !copied ? <Section icon={terms.ai.icon} title={terms.ai.label}>
+      {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
         <p>{row.assistant ? "能运行助手" : "还没配置助手"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>}
-    </Section> : null}
-
-    {row.kind === "node" && !copied && row.entry && (canManage || localSession) ? <Section icon={ServiceIcon} title={terms.aiService.label}>
-      <ProviderSettings update={assistantSaved} onChange={setProvidersSaved} />
     </Section> : null}
 
     {row.entry ? <Section icon={Globe} title="访问地址">

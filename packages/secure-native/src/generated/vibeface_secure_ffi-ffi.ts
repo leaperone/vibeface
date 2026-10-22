@@ -104,7 +104,8 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_fn_method_identity_secret_hex(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_identity_sign(uniffiSelf: bigint, domain: Uint8Array, payload: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_identity_sign_message(uniffiSelf: bigint, message: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
-    ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(uniffiSelf: bigint, root: bigint, membersJson: Uint8Array, headsJson: Uint8Array, backupEpoch: number, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(uniffiSelf: bigint, root: bigint, next: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(uniffiSelf: bigint, root: bigint, next: Uint8Array, membersJson: Uint8Array, headsJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_governance_template(uniffiSelf: bigint, issuer: Uint8Array, actionJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_state_json(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_view_json(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -138,6 +139,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_secret_hex(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_sign(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_governance_template(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_state_json(): number;

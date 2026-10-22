@@ -234,12 +234,18 @@ extern "C" {
         /*handle*/ uint64_t handle, 
         RustCallStatus *uniffi_out_err
     );
+    RustBuffer uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(
+        /*handle*/ uint64_t ptr, 
+        /*handle*/ uint64_t root, 
+        RustBuffer next, 
+        RustCallStatus *uniffi_out_err
+    );
     RustBuffer uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(
         /*handle*/ uint64_t ptr, 
         /*handle*/ uint64_t root, 
+        RustBuffer next, 
         RustBuffer members_json, 
         RustBuffer heads_json, 
-        double backup_epoch, 
         RustCallStatus *uniffi_out_err
     );
     RustBuffer uniffi_vibeface_secure_ffi_fn_method_membership_governance_template(
@@ -576,6 +582,8 @@ extern "C" {
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_identity_sign(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(
+    );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint(
     );
@@ -2283,6 +2291,14 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
             return this->cpp_uniffi_vibeface_secure_ffi_fn_free_membership(rt, thisVal, args, count);
         }
     );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(rt, thisVal, args, count);
+        }
+    );
     props["ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint"),
@@ -2625,6 +2641,14 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
         0,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint"] = jsi::Function::createFromHostFunction(
@@ -3154,9 +3178,19 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_free_membe
         
         return jsi::Value::undefined();
 }
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, value);
+}
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[3]), uniffi_jsi::Bridging<double>::fromJs(rt, callInvoker, args[4]), 
+        auto value = uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[3]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[4]), 
             &status
         );
         uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
@@ -3501,6 +3535,13 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_meth
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(
         );
 
         

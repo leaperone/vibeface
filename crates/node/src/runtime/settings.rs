@@ -22,8 +22,10 @@ pub struct NodeSettings {
 #[serde(deny_unknown_fields)]
 pub struct ProviderChange {
     provider: Provider,
-    enabled: Option<bool>,
-    roles: Option<BTreeSet<Role>>,
+    /// `true` moves the assistant to this provider; `false` stops it if it runs here.
+    assistant: Option<bool>,
+    /// Whether Codex executes dispatched work.
+    execution: Option<bool>,
     /// The Codex program; empty restores the default.
     bin: Option<PathBuf>,
     /// Which Codex App Server to use.
@@ -57,12 +59,45 @@ impl Runtime {
             .clone()
     }
 
-    /// The assistant, while its provider is on and serves as the Agent.
+    /// The assistant and the provider it runs on, if it is on.
     pub(crate) fn assistant(&self) -> Option<ManagerSettings> {
-        let providers = self.providers();
-        self.settings_snapshot()
-            .manager
-            .filter(|manager| providers.serves(Provider::of(manager.provider), Role::Agent))
+        self.settings_snapshot().manager
+    }
+
+    /// What a newly chosen assistant starts with; the workspace is created when it is chosen.
+    fn default_manager(&self, provider: ManagerKind) -> Result<ManagerSettings> {
+        Ok(ManagerSettings {
+            provider,
+            workspace: self.data_dir.canonicalize()?.join("manager-workspace"),
+            model: match provider {
+                ManagerKind::CursorSdk => "auto".into(),
+                ManagerKind::CodexSdk => String::new(),
+            },
+            cursor_sdk_bin: DEFAULT_CURSOR_BIN.into(),
+            node_bin: "node".into(),
+            codex_sdk_script: std::env::current_exe()?
+                .parent()
+                .context("Node executable has no directory")?
+                .join("sidecars/codex-manager.mjs"),
+        })
+    }
+
+    /// Creates the default assistant workspace when it is missing; it must be a real directory.
+    fn ensure_default_workspace(&self, workspace: &Path) -> Result<()> {
+        if workspace != self.data_dir.canonicalize()?.join("manager-workspace") {
+            return Ok(());
+        }
+        match std::fs::symlink_metadata(workspace) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "default manager workspace must be a real directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::config::private_dir(workspace)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     /// The variables this Node sets for the provider behind `kind`, and only that provider.
@@ -76,21 +111,21 @@ impl Runtime {
         local: &providers::Local,
         settings: &NodeSettings,
     ) -> Value {
-        let switch = local.switches.get(provider);
         let configured = local.env.get(provider);
         let app_server = &local.switches.codex_app_server;
-        // The system App Server runs with its own program and variables; the assistant still
-        // runs the Codex program with them.
-        let launches = provider == Provider::Cursor
-            || switch.roles.contains(&Role::Agent)
-            || app_server.mode == AppServerMode::Spawn;
         let assistant = settings
             .manager
             .as_ref()
             .is_some_and(|m| Provider::of(m.provider) == provider);
-        // A provider nothing runs on yet has nothing to set up; its checks start once it is chosen.
-        let in_use =
-            assistant || provider == Provider::Codex && switch.roles.contains(&Role::Execution);
+        let execution = provider == Provider::Codex && local.switches.execution;
+        let roles: Vec<Role> = [(assistant, Role::Agent), (execution, Role::Execution)]
+            .into_iter()
+            .filter_map(|(serves, role)| serves.then_some(role))
+            .collect();
+        // The system App Server runs with its own program and variables; the assistant still
+        // runs the Codex program with them.
+        let launches =
+            provider == Provider::Cursor || assistant || app_server.mode == AppServerMode::Spawn;
         let mut issues = Vec::new();
         let (bin, required) = match provider {
             Provider::Codex => {
@@ -120,7 +155,8 @@ impl Runtime {
             .collect();
         let mut starting = false;
         let link = (provider == Provider::Codex).then_some(self.codex.link().await);
-        if switch.enabled && in_use {
+        // A provider nothing runs on has nothing to set up; its checks start once it is used.
+        if !roles.is_empty() {
             if launches && !executable(&bin) {
                 issues.push(json!({"code":"bin_missing","path":bin}));
             }
@@ -129,7 +165,7 @@ impl Runtime {
                     issues.push(json!({"code":"env_missing","name":name}));
                 }
             }
-            if provider == Provider::Codex && switch.roles.contains(&Role::Execution) {
+            if execution {
                 match &link {
                     Some(Link::LaunchFailed { reason }) if issues.is_empty() => {
                         issues.push(json!({"code":"launch_failed","detail":reason}))
@@ -145,10 +181,8 @@ impl Runtime {
                 }
             }
         }
-        let state = if !switch.enabled {
+        let state = if roles.is_empty() {
             "off"
-        } else if !in_use {
-            "unused"
         } else if !issues.is_empty() {
             "needs_setup"
         } else if starting {
@@ -157,12 +191,10 @@ impl Runtime {
             "ready"
         };
         json!({
-            "provider":provider, "enabled":switch.enabled, "roles":switch.roles,
-            "supports":provider.supports(),
+            "provider":provider, "roles":roles, "supports":provider.supports(),
             "bin":(provider == Provider::Codex).then_some(&local.codex_bin),
             "app_server":(provider == Provider::Codex).then(|| json!({"mode":app_server.mode,
                 "socket":app_server.socket,"link":link})),
-            "assistant":assistant,
             "env":env, "state":state, "issues":issues,
         })
     }
@@ -176,11 +208,10 @@ impl Runtime {
 
     pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
+        let default = self.default_manager(ManagerKind::CodexSdk)?;
         let defaults = json!({
-            "workspace":self.data_dir.canonicalize()?.join("manager-workspace"),
-            "cursor_sdk_bin":"cursor-sdk-bridge",
-            "node_bin":"node",
-            "codex_sdk_script":std::env::current_exe()?.parent().context("Node executable has no directory")?.join("sidecars/codex-manager.mjs"),
+            "workspace":default.workspace, "cursor_sdk_bin":default.cursor_sdk_bin,
+            "node_bin":default.node_bin, "codex_sdk_script":default.codex_sdk_script,
         });
         let local = self.providers();
         let mut missing = Vec::new();
@@ -208,8 +239,6 @@ impl Runtime {
         }
         let readiness = if settings.manager.is_none() {
             "disabled"
-        } else if self.assistant().is_none() {
-            "provider_off"
         } else if missing.is_empty() {
             "authentication_unverified"
         } else {
@@ -249,8 +278,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// Turns a provider on or off, sets its roles, program and variables, then restarts what
-    /// runs on it. The variables are written only to this Node's private file.
+    /// Chooses or stops the assistant on a provider, turns Codex execution on or off, sets the
+    /// provider's program and variables, then restarts what runs on it. This is the only place
+    /// that decides what each provider is used for. The variables are written only to this
+    /// Node's private file.
     pub(crate) async fn configure_provider(
         &self,
         change: ProviderChange,
@@ -262,14 +293,37 @@ impl Runtime {
         self.authorize_settings_write(subject, local_cookie).await?;
         let previous = self.providers();
         let mut next = previous.clone();
-        let switch = next.switches.get_mut(change.provider);
-        if let Some(enabled) = change.enabled {
-            switch.enabled = enabled;
+        let previous_manager = self.settings_snapshot().manager;
+        let mut manager = previous_manager.clone();
+        let kind = change.provider.manager_kind();
+        match change.assistant {
+            Some(true) => {
+                let mut chosen = match manager {
+                    Some(current) => current,
+                    None => self.default_manager(kind)?,
+                };
+                chosen.provider = kind;
+                // Cursor needs a model; Codex reads "auto" as a model name, so it gets its default.
+                match kind {
+                    ManagerKind::CursorSdk if chosen.model.trim().is_empty() => {
+                        chosen.model = "auto".into()
+                    }
+                    ManagerKind::CodexSdk if chosen.model == "auto" => chosen.model.clear(),
+                    _ => {}
+                }
+                self.ensure_default_workspace(&chosen.workspace)?;
+                manager = Some(chosen);
+            }
+            Some(false) if manager.as_ref().is_some_and(|m| m.provider == kind) => manager = None,
+            _ => {}
         }
-        if let Some(roles) = change.roles {
-            switch.roles = roles;
+        if let Some(execution) = change.execution {
+            ensure!(
+                change.provider == Provider::Codex,
+                "only Codex executes dispatched work"
+            );
+            next.switches.execution = execution;
         }
-        next.switches.validate()?;
         if let Some(bin) = change.bin {
             ensure!(
                 change.provider == Provider::Codex,
@@ -294,8 +348,13 @@ impl Runtime {
             next.switches.validate()?;
         }
         next.env.apply(change.provider, change.env)?;
-        if next.switches != previous.switches || next.codex_bin != previous.codex_bin {
+        let manager_changed = manager != previous_manager;
+        if manager_changed
+            || next.switches != previous.switches
+            || next.codex_bin != previous.codex_bin
+        {
             let mut configuration = Config::load(&self.data_dir)?;
+            configuration.manager = manager.clone();
             configuration.providers = next.switches.clone();
             configuration.codex_bin = next.codex_bin.clone();
             configuration.save(&self.data_dir)?;
@@ -303,20 +362,24 @@ impl Runtime {
         if next.env != previous.env {
             next.env.save(&self.data_dir)?;
         }
+        self.settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .manager = manager;
         *self
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
         self.codex.retarget(next.codex_target());
-        if next.switches.cursor != previous.switches.cursor
-            || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor)
-        {
+        if manager_changed || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor) {
             self.refresh_cursor();
         }
         self.schedule_wakeup.notify_one();
         self.node_settings().await
     }
 
+    /// Saves the folders and the current assistant's details. Whether the assistant runs, and on
+    /// which provider, is chosen only through `configure_provider`.
     pub(crate) async fn configure_node(
         &self,
         mut settings: NodeSettings,
@@ -327,7 +390,11 @@ impl Runtime {
         let _work = self.maintenance.enter()?;
         self.authorize_settings_write(subject, local_cookie).await?;
         let directory = &self.data_dir;
-        let default_workspace = directory.canonicalize()?.join("manager-workspace");
+        let current = self.settings_snapshot().manager.map(|m| m.provider);
+        ensure!(
+            settings.manager.as_ref().map(|m| m.provider) == current,
+            "choose the assistant with configure_provider"
+        );
         ensure!(
             settings.roots.len() <= 128,
             "at most 128 project roots are allowed"
@@ -365,18 +432,7 @@ impl Runtime {
                     "manager program paths must not be empty"
                 );
             }
-            if manager.workspace == default_workspace {
-                match std::fs::symlink_metadata(&default_workspace) {
-                    Ok(metadata) => ensure!(
-                        metadata.is_dir() && !metadata.file_type().is_symlink(),
-                        "default manager workspace must be a real directory"
-                    ),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        crate::config::private_dir(&default_workspace)?
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
+            self.ensure_default_workspace(&manager.workspace)?;
             manager.workspace = manager
                 .workspace
                 .canonicalize()

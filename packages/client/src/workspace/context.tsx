@@ -113,7 +113,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const showRefreshError = (caught: unknown) => showError(caught, "读取最新内容", () => { void refreshRef.current().catch(showRefreshError) })
   const requireWritable = () => {
     requireCurrent()
-    if (!joined) throw new Error(`${platform.self}还没加入，加入后才能操作。`)
+    if (!joined) throw new Error("本机管理不能发送。用加入链接加入后再操作。")
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
     if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])

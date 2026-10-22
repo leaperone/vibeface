@@ -46,6 +46,7 @@ class NativeVibefaceSecureFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_method_identity_sign_message(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_clone_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_free_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_method_membership_governance_template(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_method_membership_state_json(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -89,6 +90,7 @@ class NativeVibefaceSecureFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_identity_secret_hex(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_identity_sign(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_governance_template(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_state_json(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);

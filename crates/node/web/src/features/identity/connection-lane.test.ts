@@ -29,7 +29,7 @@ const localCapability = 'f'.repeat(64)
 const localInvitation = { url: localEntry.address, device_id: target, capability: localCapability }
 const localLaunch = { url: 'http://127.0.0.1:49781', device_id: target, token: 'e'.repeat(64) }
 const genesis = { version: 1, network_id: network, first_client: { device_id: subject, kind: 'client', name: 'browser', manage: true }, first_node: { device_id: target, kind: 'node', name: 'node', manage: false }, signature: 's' }
-const membership = { network_id: network, members: [], revoked: [], heads: [], epoch: 1, attesters: [] }
+const membership = { network_id: network, recovery_key: network, members: [], revoked: [], heads: [], epoch: 1, attesters: [] }
 const inviteId = '1'.repeat(32), joinNonce = '9'.repeat(64)
 const joinRequest = (status: string, extra: Record<string, unknown> = {}) => ({ join_id: 'join', status, network_id: network, invite_id: inviteId, device_id: subject, kind: 'client', name: 'browser', commit: 'd'.repeat(64), admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 60000, ...extra })
 const deferred = () => {
@@ -111,7 +111,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
         if (method === 'directory') return { state: { genesis }, view: secure.verifiedView() }
         if (method === 'join_status') return params.reveal ? { ...joinStatus.value, joiner_nonce: params.reveal } : joinStatus.value.status === 'joined' ? { ...joinStatus.value, state: { genesis } } : joinStatus.value
-        if (method === 'recovery_state' || method === 'directory') return { state: { genesis }, view: membership, heads: {} }
+        if (method === 'recovery_state' || method === 'directory') return { state: { genesis, checkpoints: [] }, view: membership, heads: {} }
         return {}
       } }
     },
@@ -121,12 +121,12 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: localSession && !management ? 'local_session' : 'membership', network_id: network, device_id: subject, epoch: 1, can_manage: management }, view: membership } },
     verifyRemoval: () => false,
     verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] }),
-    openPackage: async () => ({ networkId: network, epoch: 1, payload: { genesis }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
+    openPackage: async () => ({ networkId: network, material: { genesis, checkpoints: [] }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
     governancePayload: () => new Uint8Array(), inviteSigningPayload: () => new Uint8Array(),
     sealPackage: () => new Uint8Array([1, 2, 3]),
-    verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: () => '{}', createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }) }),
+    verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: () => '{}', createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
@@ -491,8 +491,8 @@ test('recovering onto a fresh localhost Node uses its local capability and keeps
     await app.render().confirmRecovery(review?.kind === 'recovery' ? review.members : [])
     const recover = app.requests.find(request => request.method === 'recover')
     assert.equal(recover?.params.capability, localCapability)
-    assert.deepEqual(plain(recover?.params.checkpoint), { epoch: 2 })
-    assert.equal(app.released(), 1)
+    assert.deepEqual(plain(recover?.params.checkpoints), [{ epoch: 2 }])
+    assert.equal(app.released(), 2, 'the recovery key and the one-time next key are both freed')
   } finally { app.close() }
 })
 
@@ -512,6 +512,7 @@ test('recovering an initialized network reads its state with a short-lived root 
     app.render(); await settle()
     await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
     const read = app.requests.find(request => request.method === 'recovery_state')
+    assert.deepEqual(plain(read?.params.checkpoints), [])
     assert.equal(read?.params.signature, 'signature')
     assert.ok(Number(read?.params.expires_at_ms) > Date.now())
     const review = app.render().review
@@ -569,6 +570,32 @@ test('the launcher fragment is cleared before its token is exchanged for the bro
     assert.equal(app.render().ready?.principal.source, 'local_session')
     assert.equal(app.calls.filter(method => method === 'local-exchange').length, 1)
     assert.equal([...app.stored.values()].some(value => value.includes('f'.repeat(64))), false)
+  } finally { app.close() }
+})
+
+test('a launch link on the localhost page sends an unjoined browser on to the launcher origin', async () => {
+  const app = deviceHarness({ local: 'initialized', fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.calls.includes('local-exchange'), false)
+    assert.equal(app.navigations.length, 1)
+    const opened = new URL(app.navigations[0])
+    assert.equal(opened.origin, localLaunch.url)
+    assert.equal(new URLSearchParams(opened.hash.slice(1)).get('local'), localLaunch.token)
+  } finally { app.close() }
+})
+
+test('a launch link on the localhost page keeps a browser already joined there', async () => {
+  const storage = new Map([['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])
+  const app = deviceHarness({ local: 'initialized', storage, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.location.hash, '')
+    assert.equal(app.calls.includes('local-info'), false)
+    assert.equal(app.calls.includes('local-exchange'), false)
+    assert.equal(app.navigations.length, 0)
   } finally { app.close() }
 })
 

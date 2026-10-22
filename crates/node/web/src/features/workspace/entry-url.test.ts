@@ -30,7 +30,7 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
 test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
   assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false }] }), "Mac Studio")
-  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [], attesters: [] } }), "工作机")
+  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, recovery_key: "n", heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [], attesters: [] } }), "工作机")
   assert.equal(nodeName(id), "另一台设备")
 })
 
@@ -708,7 +708,7 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
   const passwords = ['password', 'old_password', 'confirmation'].map(name => fields.get(name))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
-    beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
+    beginRecovery: () => { generation++; return work.promise }, replaceRecoveryFile: () => work.promise }
   const app = componentHarness('../identity/recovery-controls.tsx', {
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
     '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },

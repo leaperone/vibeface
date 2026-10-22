@@ -873,8 +873,10 @@ async fn dispatch(
         }
         "recovery_state" => {
             // The recovery root may not be a member any more, so it proves itself
-            // with a two-minute signature bound to this channel's device.
-            let state = node.membership_state().await?;
+            // with a two-minute signature bound to this channel's device. The checkpoints its
+            // file carries count too, so a Node that missed the last recovery still knows the key.
+            let current = node.membership_state().await?;
+            let state = current.merge(&carried(params.get("checkpoints"), &current)?)?;
             let expires = params["expires_at_ms"]
                 .as_i64()
                 .context("expires_at_ms must be an integer")?;
@@ -887,13 +889,18 @@ async fn dispatch(
                 r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{}"}}"#,
                 session.device_id, state.genesis.network_id
             );
-            vibeface_secure::verify(
-                &state.genesis.network_id,
-                RECOVERY_READ_DOMAIN,
-                payload.as_bytes(),
-                text(&params, "signature")?,
-            )
-            .context("recovery key does not own this personal network")?;
+            let signature = text(&params, "signature")?;
+            let signed_by = |key: &str| {
+                vibeface_secure::verify(key, RECOVERY_READ_DOMAIN, payload.as_bytes(), signature)
+                    .is_ok()
+            };
+            if !signed_by(state.recovery_key()) {
+                ensure!(
+                    !state.superseded_keys().any(signed_by),
+                    vibeface_secure::membership::SUPERSEDED
+                );
+                bail!("recovery key does not own this personal network");
+            }
             let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
             Ok(json!({"state":state,"heads":heads}))
         }
@@ -914,41 +921,58 @@ async fn dispatch(
     }
 }
 
-/// Creates the network on an empty Node, or installs a higher root checkpoint.
+/// The checkpoint chain a recovery file carries, on top of `state`'s genesis.
+fn carried(checkpoints: Option<&Value>, state: &NetworkState) -> Result<NetworkState> {
+    let checkpoints: Vec<RootCheckpoint> = checkpoints
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .context("invalid recovery checkpoints")?
+        .unwrap_or_default();
+    Ok(NetworkState {
+        genesis: state.genesis.clone(),
+        checkpoints,
+        events: vec![],
+    })
+}
+
+/// Creates the network on an empty Node, or installs the recovery file's next checkpoint.
 ///
-/// A root signature authorizes this; a fresh Node also needs its one-time capability.
+/// The recovery key's signatures authorize this; a fresh Node also needs its one-time
+/// capability. A retry of an installed recovery changes nothing.
 async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()> {
-    let genesis: Option<Genesis> = params
-        .get("genesis")
-        .map(|_| from_field(params, "genesis"))
-        .transpose()?;
-    let checkpoint: Option<RootCheckpoint> = params
-        .get("checkpoint")
-        .map(|_| from_field(params, "checkpoint"))
-        .transpose()?;
+    let genesis: Genesis = from_field(params, "genesis")?;
+    let mut checkpoints: Vec<RootCheckpoint> = params
+        .get("checkpoints")
+        .map(|_| from_field(params, "checkpoints"))
+        .transpose()?
+        .unwrap_or_default();
+    let next = checkpoints.pop();
+    let mut incoming = NetworkState::new(genesis)?;
+    incoming.checkpoints = checkpoints;
+    incoming.project()?;
     if !node.has_membership().await? {
-        let mut state = NetworkState::new(genesis.context("genesis is required")?)?;
-        if let Some(checkpoint) = checkpoint {
-            state.recover(checkpoint)?;
+        if let Some(next) = next {
+            incoming.recover(next)?;
         }
-        state.project()?.node(&node.identity.device_id()?)?;
+        incoming.project()?.node(&node.identity.device_id()?)?;
         node.store.lock().await.bootstrap_network(
-            state.clone(),
+            incoming.clone(),
             text(params, "capability")?,
             &session.device_id,
         )?;
-        node.install_membership(state).await?;
+        node.install_membership(incoming).await?;
         return Ok(());
     }
-    let mut state = node.membership_state().await?;
+    let current = node.membership_state().await?;
     ensure!(
-        genesis.is_none_or(|genesis| genesis == state.genesis),
+        incoming.genesis == current.genesis,
         "personal network already initialized"
     );
-    let Some(checkpoint) = checkpoint else {
+    let mut state = current.merge(&incoming)?;
+    let Some(next) = next else {
         return Ok(());
     };
-    if state.recover(checkpoint)? {
+    if state.recover(next)? || state != current {
         state
             .project()?
             .node(&node.identity.device_id()?)
@@ -1811,6 +1835,52 @@ mod tests {
                 codex_sdk_script: dir.join("sidecars/codex-manager.mjs"),
             }),
         };
+        let refused = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await
+        .expect_err("configure_node cannot turn the assistant on");
+        assert!(
+            refused.to_string().contains("configure_provider"),
+            "{refused}"
+        );
+        assert!(Config::load(&dir)?.manager.is_none());
+        let choose_cursor = json!({"provider":"cursor","assistant":true});
+        std::os::unix::fs::symlink(&project, &workspace)?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_provider",
+                choose_cursor.clone()
+            )
+            .await
+            .is_err(),
+            "the default workspace must be a real directory"
+        );
+        std::fs::remove_file(&workspace)?;
+        let chosen = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_provider",
+            choose_cursor,
+        )
+        .await?;
+        assert!(workspace.is_dir());
+        assert_eq!(
+            chosen["settings"]["manager"]["provider"], "cursor_sdk",
+            "choosing the assistant fills in the defaults"
+        );
+        assert_eq!(chosen["settings"]["manager"]["model"], "auto");
+        assert_eq!(
+            chosen["settings"]["manager"]["workspace"],
+            json!(workspace.canonicalize()?)
+        );
+        assert_eq!(chosen["providers"][1]["roles"], json!(["agent"]));
+        assert_eq!(chosen["providers"][0]["roles"], json!(["execution"]));
         let mut missing_workspace = settings.clone();
         missing_workspace.manager.as_mut().unwrap().workspace =
             dir.join("custom-workspace-not-created");
@@ -1825,18 +1895,6 @@ mod tests {
             .is_err()
         );
         assert!(!dir.join("custom-workspace-not-created").exists());
-        std::os::unix::fs::symlink(&project, &workspace)?;
-        assert!(
-            dispatch(
-                &node,
-                &mut manager_session,
-                "configure_node",
-                serde_json::to_value(&settings)?
-            )
-            .await
-            .is_err()
-        );
-        std::fs::remove_file(&workspace)?;
         let saved = dispatch(
             &node,
             &mut manager_session,
@@ -1880,18 +1938,41 @@ mod tests {
         );
         let mut codex_settings = settings.clone();
         codex_settings.manager.as_mut().unwrap().provider = crate::manager::ManagerKind::CodexSdk;
-        dispatch(
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&codex_settings)?,
+            )
+            .await
+            .is_err(),
+            "configure_node cannot move the assistant"
+        );
+        let codex = dispatch(
             &node,
             &mut manager_session,
-            "configure_node",
-            serde_json::to_value(&codex_settings)?,
+            "configure_provider",
+            json!({"provider":"codex","assistant":true}),
         )
         .await?;
+        let mut expected = saved["settings"].clone();
+        expected["manager"]["provider"] = json!("codex_sdk");
+        expected["manager"]["model"] = json!("");
+        assert_eq!(
+            codex["settings"], expected,
+            "only the provider and model move"
+        );
+        assert_eq!(
+            codex["providers"][0]["roles"],
+            json!(["agent", "execution"])
+        );
+        assert_eq!(codex["providers"][1]["state"], "off");
         dispatch(
             &node,
             &mut manager_session,
-            "configure_node",
-            serde_json::to_value(&settings)?,
+            "configure_provider",
+            json!({"provider":"cursor","assistant":true}),
         )
         .await?;
         drop(node);
@@ -1908,7 +1989,8 @@ mod tests {
     /// Provider keys are write-only: they reach the provider's own processes and nothing else,
     /// not the replies, the shared store, the config or the log.
     #[tokio::test]
-    async fn provider_keys_stay_in_the_private_file_and_switches_gate_the_roles() -> Result<()> {
+    async fn provider_keys_stay_in_the_private_file_and_one_call_chooses_what_providers_run()
+    -> Result<()> {
         use crate::config::{self, Config};
         use crate::manager::ManagerKind;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1961,7 +2043,7 @@ mod tests {
             codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
-        let set_codex = json!({"provider":"codex","bin":"/fixture/codex",
+        let set_codex = json!({"provider":"codex","assistant":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":codex_home}});
         let mut member = session(&client)?;
         assert!(
@@ -1989,8 +2071,10 @@ mod tests {
                 "{text}"
             );
         }
+        assert_eq!(read["settings"]["manager"]["provider"], "codex_sdk");
         let codex = &read["providers"][0];
         assert_eq!(codex["provider"], "codex");
+        assert_eq!(codex["roles"], json!(["agent", "execution"]));
         assert_eq!(codex["bin"], "/fixture/codex");
         assert!(codex["env"].as_array().unwrap().contains(
             &json!({"name":"FIXTURE_CODEX_KEY","set":true,"inherited":false,"required":false})
@@ -2010,7 +2094,7 @@ mod tests {
                 read["providers"][1]["state"].clone(),
                 read["providers"][1]["issues"].clone()
             ),
-            (json!("unused"), json!([])),
+            (json!("off"), json!([])),
             "Cursor runs nothing until the assistant uses it"
         );
         assert_eq!(codex["app_server"]["mode"], "system");
@@ -2081,7 +2165,9 @@ mod tests {
         );
 
         for invalid in [
-            json!({"provider":"cursor","roles":["execution"]}),
+            json!({"provider":"cursor","execution":true}),
+            json!({"provider":"codex","roles":["agent"]}),
+            json!({"provider":"codex","enabled":false}),
             json!({"provider":"cursor","bin":"/fixture/cursor"}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
         ] {
@@ -2095,10 +2181,11 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"codex","roles":["agent"],"env":{"FIXTURE_CODEX_KEY":null}}),
+            json!({"provider":"codex","execution":false,"env":{"FIXTURE_CODEX_KEY":null}}),
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
+        assert!(node.providers().codex_target() == crate::providers::CodexTarget::Off);
         assert!(
             off["providers"][0]["env"]
                 .as_array()
@@ -2118,23 +2205,45 @@ mod tests {
             )
             .await?;
         assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
-        let cursor_off = dispatch(
+        let moved = dispatch(
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","enabled":false}),
+            json!({"provider":"cursor","assistant":true}),
         )
         .await?;
-        assert_eq!(cursor_off["providers"][1]["state"], "off");
+        assert_eq!(moved["settings"]["manager"]["provider"], "cursor_sdk");
+        assert_eq!(moved["settings"]["manager"]["model"], "auto");
+        assert_eq!(moved["providers"][0]["roles"], json!([]));
+        assert_eq!(moved["providers"][0]["state"], "off");
+        assert_eq!(moved["providers"][1]["roles"], json!(["agent"]));
+        let unchanged = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"codex","assistant":false}),
+        )
+        .await?;
+        assert_eq!(
+            unchanged["settings"]["manager"]["provider"], "cursor_sdk",
+            "stopping the assistant elsewhere leaves it running"
+        );
+        let stopped = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","assistant":false}),
+        )
+        .await?;
+        assert_eq!(stopped["settings"]["manager"], Value::Null);
+        assert_eq!(stopped["readiness"]["manager"], "disabled");
+        assert_eq!(stopped["providers"][1]["state"], "off");
 
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
-        assert!(!providers.switches.cursor.enabled);
-        assert!(!providers.switches.serves(
-            crate::providers::Provider::Codex,
-            crate::providers::Role::Execution
-        ));
+        assert!(reopened.assistant().is_none());
+        assert!(!providers.switches.execution);
         assert_eq!(
             providers.codex_bin,
             std::path::PathBuf::from("/fixture/codex")
@@ -2533,7 +2642,7 @@ mod tests {
             assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
             let replacement_manager = LocalIdentity::generate();
             let mut state = node.membership_state().await?;
-            let checkpoint = RootCheckpoint::create(&root, state.epoch() + 1, vec![
+            let checkpoint = RootCheckpoint::recovery(&state, &root, &LocalIdentity::generate().device_id()?, vec![
                 Member::node(&node.identity, "local device")?,
                 Member::client(&replacement_manager, "replacement manager", true)?,
             ], vec![])?;
@@ -2704,25 +2813,45 @@ mod tests {
 
             // Root recovery from a device that holds only the recovery key.
             let replacement = LocalIdentity::generate();
-            let epoch = node.membership_state().await?.epoch() + 1;
-            let checkpoint = RootCheckpoint::create(&root, epoch, vec![
+            let before = node.membership_state().await?;
+            let epoch = before.epoch() + 1;
+            let next = LocalIdentity::generate();
+            let checkpoint = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![
                 Member::client(&admin, "admin", true)?,
                 Member::client(&replacement, "new laptop", true)?,
                 Member::node(&node.identity, "node")?,
             ], vec![])?;
-            let dropped = RootCheckpoint::create(&root, epoch, vec![Member::client(&replacement, "new laptop", true)?], vec![])?;
+            let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![])?;
             let mut recovering = connect(replacement.clone()).await?;
             let expires = crate::runtime::now_ms() + 60_000;
-            let read = |signer: &LocalIdentity| -> Result<Value> {
+            let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
                 let payload = format!(r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{network}"}}"#, replacement.device_id()?);
-                Ok(json!({"expires_at_ms":expires,"signature":signer.sign_payload(RECOVERY_READ_DOMAIN, payload.as_bytes())?}))
+                Ok(json!({"expires_at_ms":expires,"signature":signer.sign_payload(RECOVERY_READ_DOMAIN, payload.as_bytes())?,"checkpoints":checkpoints}))
             };
+            let read = |signer: &LocalIdentity| read_with(signer, &[]);
             assert!(recovering.call("recovery_state", read(&admin)?).await.is_err(), "only the root may read");
             assert_eq!(recovering.call("recovery_state", read(&root)?).await?["state"]["genesis"]["network_id"], network);
-            assert!(recovering.call("recover", json!({"checkpoint":dropped})).await.is_err());
-            let recovered = recovering.call("recover", json!({"checkpoint":checkpoint})).await?;
+            let submit = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints});
+            assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err());
+            let recovered = recovering.call("recover", submit(vec![&checkpoint])).await?;
             assert_eq!(recovered["principal"]["can_manage"], true);
+            assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["principal"], recovered["principal"], "a retry changes nothing");
             assert_eq!(manager.call("authenticate", json!({})).await?["principal"]["epoch"], epoch);
+
+            // The old recovery file is refused from now on; the new one reads and recovers.
+            let refused = recovering.call("recovery_state", read(&root)?).await.unwrap_err();
+            assert!(format!("{refused:#}").contains(vibeface_secure::membership::SUPERSEDED), "{refused:#}");
+            let after = node.membership_state().await?;
+            let stale = RootCheckpoint::rotation(&after, &root, &LocalIdentity::generate().device_id()?)?;
+            let refused = recovering.call("recover", submit(vec![&checkpoint, &stale])).await.unwrap_err();
+            assert!(format!("{refused:#}").contains(vibeface_secure::membership::SUPERSEDED), "{refused:#}");
+            assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err(), "a rival of the installed recovery conflicts");
+            let read_next = recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await?;
+            assert_eq!(read_next["state"]["checkpoints"][0], serde_json::to_value(&checkpoint)?);
+            let rotated = RootCheckpoint::rotation(&after, &next, &LocalIdentity::generate().device_id()?)?;
+            recovering.call("recover", submit(vec![&checkpoint, &rotated])).await?;
+            assert_eq!(node.membership_state().await?.recovery_key(), rotated.recovery_key);
+            assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
             // A target outside the personal network is refused.
             assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());

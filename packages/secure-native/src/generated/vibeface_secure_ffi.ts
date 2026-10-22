@@ -6,7 +6,7 @@
 import nativeModule from "./vibeface_secure_ffi-ffi";
 import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct,
 } from "./vibeface_secure_ffi-ffi";
-import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterFloat64, FfiConverterObject, FfiConverterOptional, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiError, UniffiInternalError, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiTypeNameSymbol, variantOrdinalSymbol,
+import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterObject, FfiConverterOptional, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiError, UniffiInternalError, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiTypeNameSymbol, variantOrdinalSymbol,
 } from "@ubjs/core";
 const uniffiCaller = new UniffiRustCaller(() => ({ code: 0 }));
 
@@ -942,7 +942,8 @@ const FfiConverterTypeIdentity = new FfiConverterObject(uniffiTypeIdentityObject
 
 export interface MembershipLike {
     
-    createRecoveryCheckpoint(root: IdentityLike, membersJson: string, headsJson: string, backupEpoch: number) /*throws*/: string;
+    createKeyRotation(root: IdentityLike, next: string) /*throws*/: string;
+    createRecoveryCheckpoint(root: IdentityLike, next: string, membersJson: string, headsJson: string) /*throws*/: string;
     governanceTemplate(issuer: string, actionJson: string) /*throws*/: string;
     stateJson() /*throws*/: string;
     viewJson() /*throws*/: string;
@@ -968,16 +969,35 @@ private constructor(pointer: UniffiHandle) {
     
 
     
-    createRecoveryCheckpoint(root: IdentityLike, membersJson: string, headsJson: string, backupEpoch: number): string /*throws*/ {
+    createKeyRotation(root: IdentityLike, next: string): string /*throws*/ {
+    const __rb: Uint8Array = uniffiCaller.rustCallWithError(
+            /*liftError:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError),
+            /*caller:*/ (callStatus) => {
+                return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(
+                uniffiTypeMembershipObjectFactory.clonePointer(this),
+        FfiConverterTypeIdentity.lower(root, nativeModule().rustbuffer_alloc),
+        FfiConverterString.lower(next, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    );
+    try {
+        return FfiConverterString.lift(__rb);
+    } finally {
+        nativeModule().rustbuffer_free(__rb);
+    }
+    }
+    
+    createRecoveryCheckpoint(root: IdentityLike, next: string, membersJson: string, headsJson: string): string /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError),
             /*caller:*/ (callStatus) => {
                 return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(
                 uniffiTypeMembershipObjectFactory.clonePointer(this),
         FfiConverterTypeIdentity.lower(root, nativeModule().rustbuffer_alloc),
+        FfiConverterString.lower(next, nativeModule().rustbuffer_alloc),
         FfiConverterString.lower(membersJson, nativeModule().rustbuffer_alloc),
         FfiConverterString.lower(headsJson, nativeModule().rustbuffer_alloc),
-        FfiConverterFloat64.lower(backupEpoch, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -1230,7 +1250,10 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message() !== 62757) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message");
     }
-    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint() !== 34094) {
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation() !== 27762) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation");
+    }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint() !== 40536) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_governance_template() !== 65114) {

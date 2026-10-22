@@ -139,13 +139,17 @@ impl Membership {
     pub fn create_recovery_checkpoint(
         &self,
         root: Arc<Identity>,
+        next: String,
         members_json: String,
         heads_json: String,
-        backup_epoch: f64,
     ) -> Result<String> {
         Ok(self
             .0
-            .create_recovery_checkpoint(&root.0, &members_json, &heads_json, backup_epoch)?)
+            .create_recovery_checkpoint(&root.0, &next, &members_json, &heads_json)?)
+    }
+
+    pub fn create_key_rotation(&self, root: Arc<Identity>, next: String) -> Result<String> {
+        Ok(self.0.create_key_rotation(&root.0, &next)?)
     }
 }
 
