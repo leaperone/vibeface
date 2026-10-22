@@ -3,7 +3,6 @@
 use crate::model::{Routine, VersionVector};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEDULING_VERSION: u32 = 2;
 pub const MAX_PENDING_JOBS: usize = 256;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,7 +172,6 @@ pub struct SchedulerJob {
 impl SchedulerJob {
     pub fn receipt(&self, network: &str) -> AdmissionReceipt {
         AdmissionReceipt {
-            version: SCHEDULING_VERSION,
             network_id: network.into(),
             conversation_id: self.conversation_id.clone(),
             trigger: self.trigger.clone(),
@@ -185,7 +183,6 @@ impl SchedulerJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionReceipt {
-    pub version: u32,
     pub network_id: String,
     pub conversation_id: String,
     pub trigger: String,
@@ -203,7 +200,6 @@ pub struct OutboxEntry {
 impl OutboxEntry {
     pub fn receipt(&self, network: &str) -> AdmissionReceipt {
         AdmissionReceipt {
-            version: SCHEDULING_VERSION,
             network_id: network.into(),
             conversation_id: self.conversation_id.clone(),
             trigger: self.trigger.clone(),

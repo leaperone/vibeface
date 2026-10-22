@@ -207,8 +207,8 @@ impl Store {
             )?;
             ensure!(pending < MAX_PENDING_INVITES, "too many pending invites");
             tx.execute(
-                "INSERT INTO invites(join_id,invite_hash,issuer,epoch,expires_at_ms,record) VALUES(?,?,?,?,?,?)",
-                params![join_id, record.invite_hash, issuer, view.epoch, record.expires_at_ms, encoded],
+                "INSERT INTO invites(join_id,invite_hash,epoch,expires_at_ms,record) VALUES(?,?,?,?,?)",
+                params![join_id, record.invite_hash, view.epoch, record.expires_at_ms, encoded],
             )?;
             Ok(())
         })?;

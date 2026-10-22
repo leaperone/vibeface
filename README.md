@@ -23,7 +23,7 @@ flowchart LR
 
 Rust 核心负责认证、路由、签名日志同步、写入保护、SQLite 存储、任务调度、去重和通知。Cursor SDK 聊天 Agent 通过原生自定义工具回调协调 Node，不需要 MCP。宿主命令和文件操作直接使用 SDK 工具；Codex 使用薄原生客户端访问 App Server，不经过独立执行适配层。机器人定义和共享聊天历史独立于本机 SDK 缓存，创建机器人不会启动模型。
 
-本版本使用新的机器人和数据库结构，部署时使用全新的数据目录重新初始化。旧数据库不自动升级，个人网络中的节点使用同一新版本。
+数据目录带有数据格式 epoch，程序只打开同一 epoch 的目录，不升级数据库。个人网络中的节点使用同一版本。
 
 ## 安装与开始
 
@@ -61,7 +61,7 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 11，数据库 `user_version` 为 11。运行时日志写在同一目录的 `node.log`。不注册网站账号，也不保存个人根私钥。`serve` 和 `join` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 1，数据库 `user_version` 为 1。运行时日志写在同一目录的 `node.log`。不注册网站账号，也不保存个人根私钥。`serve` 和 `join` 用目录锁独占该目录。
 
 在本机可信浏览器打开 `http://localhost:4790`，填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络。初始化材料由本机页面自动取得，无需运行 `access` 或复制邀请。已有网络的节点不会因浏览器未授权而另建网络；新浏览器可使用本机自动访问，永久成员授权仍需成员邀请或恢复包。`vibeface access --data-dir "$HOME/.vibeface"` 保留为备用入口。
 

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_MESSAGE: usize = 4000;
 pub const MAX_DETAIL: usize = 2000;
 pub const MAX_ATTEMPTS: u32 = 8;

@@ -391,7 +391,11 @@ def self_test():
                 ["rustup", "toolchain", "install", "1.89", "--profile", "minimal"],
                 ["cargo", "+1.89", "check", "--locked", "-p", "vibeface"],
             ] if check_msrv else [])
-    print("CI selector, event, test partition, check commands, rename/delete and gate self-tests passed")
+    root = Path(__file__).resolve().parent.parent
+    config = (root / "crates/node/src/config.rs").read_text()
+    protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
+    assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
+    print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
 
 
 def expect_failure(check):
