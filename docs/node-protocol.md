@@ -6,11 +6,11 @@
 
 `network_id` 是个人网络根 Ed25519 公钥，`device_id` 是设备 Ed25519 公钥本身，均编码为 64 个小写十六进制字符。Node 的 `device_id` 同时是它的 iroh `EndpointId`。地址不参与身份计算。
 
-个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态的合并是并集。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。个人根私钥留在可信客户端和加密恢复包，Node 不持有根私钥。
+个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态的合并是并集。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。每个 `RootCheckpoint` 带下一把恢复密钥 `recovery_key`，由上一把签名，第一把是根密钥。恢复私钥只在加密恢复文件里，Node 不持有。
 
 `Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 单独决定是否运行 relay；`public_entry` 是不入网的公共入口。
 
-管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。根恢复由根签名的更高 epoch checkpoint 建立新授权；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。`attestation` 的签名设备须在任一 epoch 做过客户端。
+管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。根恢复由当前恢复密钥签名、epoch 加一的 checkpoint 建立新授权并换恢复密钥；`directory` 为空的 checkpoint 只换恢复密钥，目录沿用上一 epoch；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。`attestation` 的签名设备须在任一 epoch 做过客户端。
 
 一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。地址、成员关系、项目和会话都不发布到公共目录。
 
@@ -138,16 +138,16 @@
 | `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
 | `approve` | `join_id` 加 `admin_nonce`、`event` 或 `reject: true` | 管理设备推进或拒绝加入，请求在其他入口时转发过去 |
 | `revoke` | `event` | 管理设备签名撤销成员 |
-| `recovery_state` | `expires_at_ms`、`signature` | 根身份以绑定本通道设备的两分钟签名读取当前目录 `state` 和本机各作者主分支的头 `heads`，新 checkpoint 据此为没有保留的 Node 写 `retired` |
-| `recover` | `genesis`、`checkpoint`、`capability` | 空 Node 安装根签目录，已建网 Node 安装更高 epoch checkpoint |
+| `recovery_state` | `expires_at_ms`、`signature`、`checkpoints` | 当前恢复密钥以绑定本通道设备的两分钟签名读取当前目录 `state` 和本机各作者主分支的头 `heads`；先合并恢复文件带来的 `checkpoints`；新 checkpoint 据此为没有保留的 Node 写 `retired` |
+| `recover` | `genesis`、`checkpoints`、`capability` | `checkpoints` 是完整链，最后一个是新 checkpoint。空 Node 凭 `capability` 安装整条链，已建网 Node 合并后安装新 checkpoint；重复提交同一个返回原结果 |
 
-未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求根私钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证 `RootCheckpoint` 的根签名并要求 epoch 更高，验证前没有副作用。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
+未加入的设备只能调用 `info`、`authenticate`、`join`、`join_status`、`recovery_state` 和 `recover`，其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回管理权限。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings` 和 `configure_node` 另要求管理设备或本机会话，`invite`、`approve` 和 `revoke` 要求管理设备。
 
 加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
 浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、本人结清的 `WorkFinished` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`；回答提问的 `MessagePosted(user, answers)` 签名可选，Grok 经 decision token 的回答由 Node 无签名写入。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。除回答外，Node 和协调 Agent 不能代写这些事件。
 
-恢复包外层为 `{ version, network_id, recovery_epoch, envelope }`，加密正文包含根私钥、`genesis`、`recovery_epoch` 和解密材料，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文根私钥不发给 Node。根恢复默认保留现有管理设备。业务正文和项目文件不在恢复包中。
+恢复包外层为 `{ version, network_id, envelope }`，加密正文为 `{ version, network_id, root_secret_key, genesis, checkpoints }`，`root_secret_key` 是当前恢复私钥，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文恢复私钥不发给 Node。根恢复默认保留现有管理设备。根恢复和换恢复密码都先下载新恢复文件再提交，完成后旧文件失效。业务正文和项目文件不在恢复包中。
 
 协调工具入口只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话，不能添加或撤销设备或修改后续授权。
 

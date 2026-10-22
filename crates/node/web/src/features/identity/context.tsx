@@ -53,7 +53,7 @@ type DeviceContextValue = {
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
   startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>
   beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry }): Promise<void>
-  reencrypt(input: { file: File; oldPassword: string; password: string }): Promise<void>
+  replaceRecoveryFile(input: { file: File; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): void; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
@@ -62,6 +62,7 @@ const INVITE_TTL_MS = 10 * 60 * 1000
 /** Not an error: the entry buttons below it are the way in. */
 export const NOT_JOINED = '这个浏览器还没加入'
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
+const superseded = () => new Error('这个恢复文件已作废。请用最近一次下载的恢复文件。')
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
 const randomHex = () => hex(crypto.getRandomValues(new Uint8Array(32)))
 function load(key: string): unknown { try { const value = localStorage.getItem(`vibeface.${key}`); return value ? JSON.parse(value) : null } catch { return null } }
@@ -666,8 +667,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     try {
       networkId = root.deviceId()
       genesis = JSON.parse(createGenesis(root, JSON.stringify({ device_id: own().deviceId, kind: 'client', name, manage: true }), JSON.stringify({ device_id: active.info.device_id, kind: 'node', name: nodeName ? deviceName(nodeName) : active.info.name, manage: false })))
-      const payload = { version: 1, network_id: networkId, root_secret_key: root.secretHex(), genesis, recovery_epoch: 1, decryption_keys: [] }
-      try { recovery = sealPackage(payload, password) } finally { payload.root_secret_key = '' }
+      recovery = sealPackage({ networkId, genesis, checkpoints: [] }, root, password)
     } finally { root.free(); password = '' }
     if (session.current !== active) { recovery.fill(0); throw changed() }
     let downloaded = false, cancelled = false
@@ -703,7 +703,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     // Same page with only a new hash does not reload, and the launch token is read on mount.
     if (url.origin === location.origin && url.pathname === location.pathname) location.reload()
   }
-  /** Root recovery keeps every current member by default and adds this browser as a manager. */
+  /**
+   * Root recovery keeps every current member by default, adds this browser as a manager and hands recovery to a new
+   * file, so the file used here stops working. The new file is saved before the Node hears of it; a retry after an
+   * unknown result sends the same checkpoint again.
+   */
   async function beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry }) {
     const name = deviceName(input.name)
     const active = await open(input.entry)
@@ -721,58 +725,86 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const capability = fresh && localSetup?.kind === 'uninitialized' && entryKey(localSetup.entry) === entryKey(active.entry) ? localSetup.capability : ''
       if (fresh && !capability) throw new Error('恢复到新电脑需要在那台电脑的本机页面进行。')
       if (!fresh && active.info.network_id !== opened.networkId) throw new Error('这台电脑属于另一组设备。')
-      let state: unknown = { genesis: opened.payload.genesis, checkpoints: [], events: [] }
+      const { genesis } = opened.material
+      let state: unknown = { genesis, checkpoints: opened.material.checkpoints, events: [] }
       let heads: unknown = {}
       if (!fresh) {
         const expires = Date.now() + 60_000
         const proof = `{"device_id":"${me}","expires_at_ms":${expires},"network_id":"${opened.networkId}"}`
         const signature = opened.root.sign('identity-recovery-read', new TextEncoder().encode(proof))
-        const read = record(await request('recovery_state', { expires_at_ms: expires, signature }))
+        const read = record(await request('recovery_state', { expires_at_ms: expires, signature, checkpoints: opened.material.checkpoints }))
         state = read.state; heads = read.heads
       }
       if (session.current !== active || active.generation !== generation.current) throw changed()
       verified = verifyState(state, opened.networkId)
       const view = verifiedView(state, opened.networkId)
+      if (view.recovery_key !== opened.root.deviceId()) throw superseded()
+      const chain = array(record(state).checkpoints)
       const revoked = new Set(view.revoked.map(item => item.device_id))
       const members = view.members.filter(member => !revoked.has(member.device_id) && member.device_id !== me)
       if (!members.some(member => member.device_id === active.entry.device_id)) members.push({ device_id: active.entry.device_id, kind: 'node', name: active.info.name, manage: false })
       const newManager: Member = { device_id: me, kind: 'client', name, manage: true }
       const allowed = new Map(members.map(member => [member.device_id, member]))
+      let prepared: { checkpoints: unknown[]; checkpoint: unknown } | null = null
       const flow: Sensitive = {
         cancel: release,
         async recover(selectedInput) {
           if (released || !verified || session.current !== active) throw new Error('恢复材料已清除。请重新导入。')
-          const selected = selectedInput.map(member => {
-            const original = allowed.get(member.device_id)
-            if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('所选成员与已验证目录不一致。')
-            return member
-          })
-          if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
-          selected.push(newManager)
-          try {
-            const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, JSON.stringify(selected), JSON.stringify(heads), opened.epoch))
-            const auth = await request('recover', { genesis: opened.payload.genesis, checkpoint, ...(fresh ? { capability } : {}) })
-            if (released) throw new Error('恢复已提交，但这里已取消。请重新连接看一下结果，并保留原恢复文件。')
-            opened.payload.recovery_epoch = record(checkpoint).epoch
-            const bytes = sealPackage(opened.payload, password)
-            try { downloadPackage(bytes) } finally { bytes.fill(0) }
-            await authenticate(auth, active, { kind: 'root', networkId: opened.networkId, genesis: opened.payload.genesis, checkpoint })
-          } finally { if (sensitive.current === flow) releaseSensitive(); else release() }
+          if (!prepared) {
+            const selected = selectedInput.map(member => {
+              const original = allowed.get(member.device_id)
+              if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('所选成员与已验证目录不一致。')
+              return member
+            })
+            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
+            selected.push(newManager)
+            const next = Identity.generate()
+            try {
+              const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, next.deviceId(), JSON.stringify(selected), JSON.stringify(heads)))
+              const checkpoints = [...chain, checkpoint]
+              const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints }, next, password)
+              try { downloadPackage(bytes) } finally { bytes.fill(0) }
+              prepared = { checkpoints, checkpoint }
+            } finally { next.free() }
+            password = ''
+          }
+          let auth: unknown
+          try { auth = await request('recover', { genesis, checkpoints: prepared.checkpoints, ...(fresh ? { capability } : {}) }) }
+          catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“恢复”会重试同一次恢复，不会再下载文件。`) }
+          if (released) throw new Error('恢复已提交，但这里已取消。请重新连接看一下结果，并用刚下载的恢复文件。')
+          try { await authenticate(auth, active, { kind: 'root', networkId: opened.networkId, genesis, checkpoint: prepared.checkpoint }) }
+          finally { if (sensitive.current === flow) releaseSensitive(); else release() }
         },
       }
       sensitive.current = flow
       setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.device_id })
     } catch (cause) { release(); throw cause }
   }
-  async function reencrypt(input: { file: File; oldPassword: string; password: string }) {
-    const version = generation.current
+  /** A new recovery file under a new password. Recovery moves to its key, so every older file stops working. */
+  async function replaceRecoveryFile(input: { file: File; oldPassword: string; password: string }) {
+    const connection = ready
+    if (!connection?.isCurrent()) throw new Error('先连接到自己的设备，再换恢复文件。')
+    let password = input.password
+    input.password = ''
     const opened = await openPackage(input.file, input.oldPassword)
+    input.oldPassword = ''
+    let verified: ReturnType<typeof verifyState> | null = null
     try {
-      if (version !== generation.current) throw changed()
-      if (ready && opened.networkId !== ready.principal.network_id) throw new Error('恢复文件属于另一组设备。')
-      const bytes = sealPackage(opened.payload, input.password)
-      try { downloadPackage(bytes) } finally { bytes.fill(0) }
-    } finally { opened.release(); input.oldPassword = ''; input.password = '' }
+      if (opened.networkId !== connection.principal.network_id) throw new Error('恢复文件属于另一组设备。')
+      const state = record(record(await connection.request('directory')).state)
+      verified = verifyState(state, opened.networkId)
+      if (verifiedView(state, opened.networkId).recovery_key !== opened.root.deviceId()) throw superseded()
+      const next = Identity.generate()
+      let checkpoints: unknown[]
+      try {
+        const checkpoint: unknown = JSON.parse(verified.createKeyRotation(opened.root, next.deviceId()))
+        checkpoints = [...array(state.checkpoints), checkpoint]
+        const bytes = sealPackage({ networkId: opened.networkId, genesis: state.genesis, checkpoints }, next, password)
+        try { downloadPackage(bytes) } finally { bytes.fill(0) }
+      } finally { next.free(); password = '' }
+      await connection.request('recover', { genesis: state.genesis, checkpoints })
+      await refreshDirectory()
+    } finally { opened.release(); verified?.free() }
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
   useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
@@ -879,7 +911,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
-    startApproval, approveJoin, rejectJoin, revoke, beginRecovery, reencrypt,
+    startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },

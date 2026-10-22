@@ -39,6 +39,8 @@ const patterns: [RegExp, string][] = [
   [/only the manager that started the confirmation/i, '请在发出加入链接的那台设备上批准。'],
   [/join request (not found|vanished|can no longer|is not waiting|belongs to another)|join completed with another grant|different nonce/i, '这个加入请求已处理或已过期。请重新生成加入链接。'],
   [/this recovery removes this Node/i, '这次找回会移除你正连着的设备。请换一台要保留的设备打开。'],
+  [/replaced by a newer recovery/i, '这个恢复文件已作废。请用最近一次下载的恢复文件。'],
+  [/conflicting recovery checkpoint|recovery epoch rollback/i, '这组设备已经用另一份恢复文件恢复过。请用最近一次下载的恢复文件。'],
   [/write needs the signature|signed by another device|client_id differs/i, '这个浏览器的身份校验没通过。请刷新页面后重试。'],
   [/conversation moved meanwhile/i, '这个对话刚换过负责的设备，已刷新。请确认后再试。'],
   [/management reply changed/i, '回复状态已变化，请刷新后再停止。'],

@@ -36,12 +36,12 @@ pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    for member in bundle
-        .genesis
-        .members()
-        .iter()
-        .chain(bundle.checkpoints.iter().flat_map(|c| &c.members))
-    {
+    for member in bundle.genesis.members().iter().chain(
+        bundle
+            .checkpoints
+            .iter()
+            .flat_map(|c| c.directory.iter().flat_map(|d| &d.members)),
+    ) {
         if member.kind == IdentityKind::Node {
             names.insert(member.device_id.clone(), member.name.clone());
         }

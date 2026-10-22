@@ -1721,9 +1721,10 @@ fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
     }
     let z_write = write(&mut origin, net, &z, "z1", 20)?;
     let mut recovered = net.state.clone();
-    recovered.recover(RootCheckpoint::create(
-        &net.a.fixture_root(),
-        3,
+    recovered.recover(RootCheckpoint::recovery(
+        &net.state,
+        &net.a.fixture_root_at(2),
+        &net.a.fixture_root_at(3).device_id()?,
         vec![
             Member::client(&fleet.admin, "fixture-admin", true)?,
             Member::node(&net.a, "a")?,
@@ -1831,9 +1832,10 @@ fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result
     }
     let replacement = LocalIdentity::generate();
     let mut recovered = net.state.clone();
-    recovered.recover(RootCheckpoint::create(
-        &net.a.fixture_root(),
-        3,
+    recovered.recover(RootCheckpoint::recovery(
+        &net.state,
+        &net.a.fixture_root_at(2),
+        &net.a.fixture_root_at(3).device_id()?,
         vec![
             Member::client(&replacement, "replacement", true)?,
             Member::node(&net.a, "a")?,
