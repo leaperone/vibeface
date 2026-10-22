@@ -1,5 +1,5 @@
 import { Link } from 'expo-router'
-import { Bell, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, Smartphone, type LucideIcon } from 'lucide-react-native'
+import { Bell, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
@@ -44,6 +44,11 @@ export default function Settings() {
       </View>
     </Section>
     {device.ready ? <Notifications /> : null}
+    {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
+      <Link href="/ai" asChild>
+        <Button variant="outline" className="h-11 self-start"><Text>AI 设置</Text><Icon as={ChevronRight} /></Button>
+      </Link>
+    </Section> : null}
     <Section icon={FileKey} title="恢复文件">
       <Link href="/recovery" asChild>
         <Button variant="outline" className="h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text></Button>
