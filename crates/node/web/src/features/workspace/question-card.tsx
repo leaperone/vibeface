@@ -30,7 +30,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const id = question.question_id
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, workspace.answered[id])
-  if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
+  if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="-mx-2 flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
     {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
       <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
@@ -93,7 +93,14 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
           </button>
         })}
       </div> : null}
-      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-background ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => { event.preventDefault(); if (!disabled && text.trim()) void send("text", text) }}>
+      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-background ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => {
+        event.preventDefault()
+        if (disabled || !text.trim()) return
+        // A typed option number picks that option, as tapping its row would.
+        const typed = text.trim().replace(/^[１-９]$/, (digit) => String(digit.charCodeAt(0) - 0xff10))
+        const numbered = /^[1-9]$/.test(typed) ? shown[Number(typed) - 1] : undefined
+        void (numbered ? send(`choice:${numbered.label}`, numbered.label) : send("text", text))
+      }}>
         <span aria-hidden="true" className={`${badge} bg-muted text-muted-foreground`}><PencilLine className="size-4" /></span>
         <input aria-label="其他回答" placeholder={shown.length ? "其他回答" : "输入回答"} className="h-11 min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed md:text-sm" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
         <Button type="submit" variant="ghost" size="icon" className="size-10 max-md:size-10" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>

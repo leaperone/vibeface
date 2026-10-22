@@ -158,7 +158,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     const sequence = ++readSequence.current
     const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
-    if (activeId.current !== id || sequence !== readSequence.current) throw new Error("对话有更新，请再查一次。")
+    if (activeId.current !== id) throw new Error("对话有更新，请再查一次。")
+    // A newer read of this conversation shows its own result; this one is still a fresh read for the caller.
+    if (sequence !== readSequence.current) return next
     return showConversation(id, next)
   }
   const showConversation = async (id: string, next: ConversationPayload) => {

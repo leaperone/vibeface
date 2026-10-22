@@ -7,7 +7,7 @@ import {
   MessageScrollerViewport,
 } from '@/components/ui/message-scroller'
 
-import type { ReactNode } from 'react'
+import { useRef, type ReactNode } from 'react'
 import { Message, type ChatMessage } from './message'
 
 /** One row of the conversation: a message bubble, or a task, change, question or hand-off row between them. */
@@ -21,13 +21,17 @@ const sender = (entry: ChatEntry | undefined): Sender | null => entry && 'messag
 const continues = (entry: ChatEntry, previous: ChatEntry | undefined) => !('routine' in entry && entry.routine) && sender(entry) !== null && sender(entry) === sender(previous)
 
 export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNode }) {
+  // MessageScroller scrolls to the first anchored item it has not aligned yet. Only a user message sent after the
+  // chat opened is an anchor, so opening a chat stays at its newest entry and a send still lands at the bottom.
+  const newest = entries.map((entry) => entry.anchor === true).lastIndexOf(true)
+  const opened = useRef<string | null | undefined>(undefined)
+  const newestKey = newest >= 0 ? entries[newest].key : null
+  if (opened.current === undefined && entries.length > 0) opened.current = newestKey
+  const anchor = opened.current !== undefined && newestKey !== opened.current ? newest : -1
+
   if (entries.length === 0) {
     return <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{empty}</div>
   }
-
-  // MessageScroller scrolls to the first anchored item it has not aligned yet, which after a remount is the oldest
-  // message. Only the newest user message is an anchor so a send keeps the view at the bottom.
-  const anchor = entries.map((entry) => entry.anchor === true).lastIndexOf(true)
 
   return (
     // The button shows only once the last line has scrolled out of view, so it never covers it.

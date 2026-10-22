@@ -47,7 +47,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
       {device ? <p className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</p> : null}
-      {progress?.status && taskActive(state) && progress.status !== "awaiting_input" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
+      {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
       {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">结果</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}

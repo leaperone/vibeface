@@ -2,7 +2,7 @@
 
 import { useId, useState } from "react"
 import { CircleQuestionMark, Unplug, WifiOff } from "lucide-react"
-import { ActionCard, Details } from "@/components/app/kit"
+import { ActionCard, Details, toast } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
@@ -43,7 +43,7 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     <p>{checkReason(check)}相关程序还没退出，退出后会自动处理。如果你确认它已经停了，点“确认已停止”。</p>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
-  const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note) }
+  const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = nodeName(check.target_node, lookup)
   const reason = confirmText(check, device)
   return <ActionCard
