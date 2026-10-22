@@ -40,13 +40,14 @@ export function PromptInput({
   const [open, setOpen] = useState(false)
   // Buttons keep the focus on the text, so a tap acts instead of collapsing the box under the finger.
   const keepFocus = (event: MouseEvent) => event.preventDefault()
+  // A written message is always sendable; Stop takes the button only while the box is empty.
+  const stop = value.trim() || files.length ? undefined : onStop
   return (
     <form
       ref={formRef}
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false) }}
       onSubmit={(event) => {
         event.preventDefault()
-        if (onStop) return
         if (disabled || busy || !value.trim()) return
         onSubmit()
       }}
@@ -87,18 +88,18 @@ export function PromptInput({
             </span>)}
           </> : null}
           <InputGroupButton
-            type={onStop ? 'button' : 'submit'}
-            variant={onStop ? 'outline' : 'default'}
+            type={stop ? 'button' : 'submit'}
+            variant={stop ? 'outline' : 'default'}
             size="icon-sm"
-            disabled={!onStop && (disabled || busy || !value.trim())}
+            disabled={!stop && (disabled || busy || !value.trim())}
             aria-busy={busy || undefined}
-            aria-label={onStop ? '停止' : '发送'}
-            title={onStop ? '停止' : '发送'}
+            aria-label={stop ? '停止' : '发送'}
+            title={stop ? '停止' : '发送'}
             className="ms-auto size-11 rounded-full"
             onMouseDown={keepFocus}
-            onClick={onStop}
+            onClick={stop}
           >
-            {onStop ? <SquareIcon aria-hidden="true" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
+            {stop ? <SquareIcon aria-hidden="true" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
