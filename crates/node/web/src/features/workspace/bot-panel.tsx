@@ -7,15 +7,33 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { formatWhen, scheduleDetail, scheduleFrequency } from "./bot-settings"
 import { useWorkspace } from "./context"
 import { ActionButton } from "./present"
+import type { ScheduleView } from "./types"
+
+/** A deleted schedule keeps its place for a moment, so a second click does not land on the next row. */
+type Gap = { conversation_id: string; schedule: ScheduleView; index: number }
+const GAP_MS = 4000
 
 /** Header button for the chat route; opens a view of the bot where only schedules can be paused, resumed or deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
   const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
+  const [gaps, setGaps] = useState<Gap[]>([])
   const bot = workspace.selectedBot
   const view = workspace.data?.bot_settings
   if (!bot) return null
+  const rows = (view?.schedules ?? []).map((schedule) => ({ schedule, deleted: false }))
+  for (const gap of [...gaps].sort((a, b) => a.index - b.index)) {
+    if (gap.conversation_id !== bot.conversation_id || rows.some((row) => row.schedule.schedule_id === gap.schedule.schedule_id)) continue
+    rows.splice(Math.min(gap.index, rows.length), 0, { schedule: gap.schedule, deleted: true })
+  }
+  const remove = async (schedule: ScheduleView, index: number) => {
+    const gap = { conversation_id: bot.conversation_id, schedule, index }
+    setGaps((previous) => [...previous, gap])
+    const drop = () => setGaps((previous) => previous.filter((item) => item !== gap))
+    try { await workspace.controlSchedule(schedule.schedule_id, "delete") } catch (caught) { drop(); throw caught }
+    window.setTimeout(drop, GAP_MS)
+  }
   return <>
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
       <Bot aria-hidden="true" />
@@ -36,9 +54,13 @@ export function BotPanelButton() {
               : <Empty>还没有说明</Empty>}
           </Section>
           <Section icon={CalendarClock} title="定时任务" count={view.schedules.length}>
-            {view.schedules.length ? <ul className="grid gap-4">{view.schedules.map((schedule) => {
+            {rows.length ? <ul className="grid gap-4">{rows.map(({ schedule, deleted }, index) => {
               const Kind = schedule.every_minutes === undefined ? AlarmClock : Repeat
               const detail = scheduleDetail(schedule)
+              if (deleted) return <li key={schedule.schedule_id} className="flex min-h-9 items-start gap-3 text-muted-foreground">
+                <Trash2 aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                <p role="status" className="min-w-0 flex-1 [overflow-wrap:anywhere]"><span className="line-through">{schedule.name}</span> 已删除</p>
+              </li>
               return <li key={schedule.schedule_id} className="flex items-start gap-3">
                 <Kind aria-label={schedule.every_minutes === undefined ? "一次" : "重复"} className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                 <div className="grid min-w-0 flex-1 gap-0.5">
@@ -54,7 +76,7 @@ export function BotPanelButton() {
                   <ActionButton variant="ghost" label={schedule.enabled ? "暂停" : "恢复"} disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, schedule.enabled ? "pause" : "resume")}>
                     {schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
                   </ActionButton>
-                  <ActionButton variant="ghost" label="删除" disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, "delete")}>
+                  <ActionButton variant="ghost" label="删除" disabled={!workspace.writable} action={() => remove(schedule, index)}>
                     <Trash2 aria-hidden="true" />
                   </ActionButton>
                 </div>
