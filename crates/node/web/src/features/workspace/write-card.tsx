@@ -30,13 +30,14 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const lookup = { nodes: workspace.nodes, directory: device.directory }
   const entry = device.ready?.entry.device_id
   const here = entry ? nodeName(entry, lookup) : "这台设备"
-  if (kind === "read_only") return <ActionCard icon={Lock} title={`${here} 暂时只读`} actions={waiting
+  const canManage = device.ready?.principal.can_manage === true
+  if (kind === "read_only") return <ActionCard icon={Lock} title={`${here} 暂时只读`} actions={!canManage ? undefined : waiting
     ? <Button type="button" variant="ghost" onClick={() => setWaiting(false)}>返回</Button>
     : <>
       <Button type="button" variant="ghost" onClick={() => setWaiting(true)}>是，等其他设备</Button>
       <ActionButton variant="default" action={() => workspace.confirmWritable()}>不是，继续使用</ActionButton>
     </>}>
-    <p className="text-muted-foreground">{waiting ? "打开你的其他设备，连上后会自动同步，然后就能用。" : "其他设备都连不上，没法确认数据是最新的。它是从备份恢复的吗？"}</p>
+    <p className="text-muted-foreground">{!canManage ? "其他设备都连不上，没法确认数据是最新的。打开其他设备，或在管理设备上确认。" : waiting ? "打开你的其他设备，连上后会自动同步，然后就能用。" : "其他设备都连不上，没法确认数据是最新的。它是从备份恢复的吗？"}</p>
   </ActionCard>
   const conflicts = workspace.writeState.conflicts
   const authors = [...new Set(conflicts.map((item) => item.author))]
@@ -45,7 +46,6 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
     <Steps items={["在另一台设备上移除它", "在这台电脑上重新加入"]} />
   </ActionCard>
   const RemoveIcon = terms.remove.icon
-  const canManage = device.ready?.principal.can_manage === true
   return <ActionCard icon={Copy} title={`${authors.map((id) => nodeName(id, lookup)).join("、")} 的数据被复制过`}
     actions={authors[0] && canManage ? <Button asChild variant="default"><Link to="/devices/$deviceId" params={{ deviceId: authors[0] }}><RemoveIcon aria-hidden="true" />去移除</Link></Button> : undefined}>
     <p className="text-muted-foreground">两份记了不同的内容，这部分先不算，其他内容照常。</p>
