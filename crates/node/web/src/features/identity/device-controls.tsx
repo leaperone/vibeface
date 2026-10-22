@@ -25,6 +25,7 @@ export function ConnectionSettings() {
       <Globe aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate" title={ready.entry.address}>{device.entryName(ready.entry) || addressName(ready.entry.address)}<span className="ms-2 text-meta text-muted-foreground">{hostOf(ready.entry.address)}</span></span>
       <span title={connectionOnline ? '在线' : '离线'} className={cn('flex shrink-0', connectionOnline ? 'text-success' : 'text-muted-foreground')}>{connectionOnline ? <Wifi aria-hidden="true" className="size-4" /> : <WifiOff aria-hidden="true" className="size-4" />}<span className="sr-only">{connectionOnline ? '在线' : '离线'}</span></span>
+      <Button type="button" variant="ghost" size="icon" aria-label="移除" title="断开并移除" onClick={() => { const entry = ready.entry; device.disconnect(); try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
     </p> : null}
     {others.length ? <ul className="grid gap-1">{others.map((entry) => <li key={keyOf(entry)} className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <span className="min-w-0 flex-1 truncate" title={entry.address}>{device.entryName(entry) || addressName(entry.address)}<span className="ms-2 text-meta text-muted-foreground">{hostOf(entry.address)}</span></span>
