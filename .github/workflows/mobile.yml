@@ -76,7 +76,9 @@ jobs:
           npx expo prebuild --platform ios
           xcodebuild -workspace ios/Vibeface.xcworkspace -scheme Vibeface -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
-            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build
+          # Ad-hoc signing writes the simulator entitlements into the binary; without them the Keychain refuses SecureStore.
+          otool -l build/Build/Products/Release-iphonesimulator/Vibeface.app/Vibeface | grep -q "sectname __entitlements"
           cd build/Build/Products/Release-iphonesimulator && zip -qry "$GITHUB_WORKSPACE/vibeface-ios-simulator.zip" Vibeface.app
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
