@@ -49,7 +49,9 @@ Notifications.addNotificationResponseReceivedListener((response) => {
   const tag = response.notification.request.content.data?.tag
   if (typeof tag === 'string') opens.get(tag)?.()
 })
-const permission = ({ status }: { status: string }): Permission => status === 'undetermined' ? 'default' : status as Permission
+// Android 13+ reports a never-asked permission as denied; canAskAgain tells it apart from a real refusal.
+const permission = ({ status, canAskAgain }: { status: string; canAskAgain: boolean }): Permission =>
+  status === 'undetermined' || (status === 'denied' && canAskAgain) ? 'default' : status as Permission
 
 const notifier: Notifier = {
   name: '系统通知',
