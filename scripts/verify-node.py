@@ -829,6 +829,11 @@ def fixture_codex(arguments):
     state_path = run / "fixture-codex-state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
     state_lock = threading.Lock()
+    slow_start = run / "fixture-codex-slow-start"
+    if slow_start.exists():
+        delay = float(slow_start.read_text())
+        slow_start.unlink()
+        time.sleep(delay)
     if socket_path.exists():
         socket_path.unlink()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1830,10 +1835,20 @@ def work_checks(run, workspace, a, network, passed):
     require(alive(server), "the restarted App Server is running")
     a.stop()
     require(not alive(server), "SIGTERM stops the managed App Server group")
+    (run / "fixture-codex-slow-start").write_text("8")
     a.start()
     a.client.connect()
     a.client.authenticate()
     passed("a clean stop leaves no App Server behind")
+
+    name = "chat-work-cold-start"
+    directory, receipt, work_id = start(name, gate_open=True)
+    finished = wait_for("the cold-start work finishes", lambda: in_state(name, work_id, "finished", "failed", "dispatch_rejected"), timeout=90)
+    starts = [row for row in rpc("turn/start") if row["message"]["params"].get("clientUserMessageId") == work_id]
+    require(finished["state"] == "finished" and finished["outcome"] == "completed" and len(starts) == 1,
+            f"a dispatch before the App Server is up waits for it and sends once: {finished}")
+    wait_for("the cold-start work reports its result", lambda: result_job(work_id))
+    passed("a dispatch right after the Node starts waits for its App Server and starts one turn", work_id=work_id)
 
 
 class WebhookReceiver:
