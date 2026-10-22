@@ -166,7 +166,7 @@
 | `control_schedule` | `conversation_id`、`schedule_id`、`action`（`pause`、`resume` 或 `delete`）、`attestation` | 本人暂停、恢复或删除一个 schedule，写 `ScheduleControlled`；已是该状态时不写，返回 `{ written }` |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |
-| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`checks`、`questions`（本会话的提问及回答）、`sessions`（交给本 Bot 的外来会话）、`local_node` 和调度队列 |
+| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`sent`（本 bot 发给其他 bot 的消息 `{message_id, to, text, created_at_ms}`，`to` 是对方会话）、`checks`、`questions`（本会话的提问及回答）、`sessions`（交给本 Bot 的外来会话）、`local_node` 和调度队列 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作 |

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning, Send } from 'lucide-react'
 import { ActionCard, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -11,7 +11,7 @@ import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@/features/workspace/labels'
-import type { BotChangeRecord, ManagerJob, SessionHandoff, WorkRecord } from '@/features/workspace/types'
+import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@/features/workspace/types'
 import { placeChanges, scheduleName, scheduleTrigger } from '@/features/workspace/bot-settings'
 import { pendingChecks } from '@/features/workspace/model'
 import { agentName, foldAnswers, placeByTime, projectName } from '@/features/workspace/questions'
@@ -71,12 +71,13 @@ export function ConversationScreen() {
   const placedChanges = placeChanges(data?.messages ?? [], changes)
   const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.bot_settings?.schedules ?? []} /> })
 
-  // Questions and hand-offs sit where they happened as rows, not bubbles; an answer shows inside its question.
+  // Questions, hand-offs and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <QuestionCard question={question} answer={folded.answers.get(question.question_id)} /> })),
     ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id) ?? { name: '另一个 Bot' }} /> })),
+    ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
 
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
@@ -247,6 +248,18 @@ function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name
     <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
     {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
   </p>
+}
+
+function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot_id?: string } }) {
+  return <div className="grid min-w-0 gap-1 rounded-lg border px-3 py-2 text-meta">
+    <p className="flex min-w-0 items-center gap-2 text-muted-foreground">
+      <Send aria-hidden="true" className="size-4 shrink-0" />
+      <span className="shrink-0">发给</span>
+      {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">{to.name}</Link>
+        : <span className="min-w-0 truncate font-medium text-foreground">{to.name}</span>}
+    </p>
+    <p className="line-clamp-3 whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]" title={sent.text}>{sent.text}</p>
+  </div>
 }
 
 /** The provider's own words behind a failed reply, folded under it. */

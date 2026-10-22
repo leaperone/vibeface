@@ -17,6 +17,15 @@ pub struct LastMessage {
     pub created_at_ms: i64,
 }
 
+/// A message this bot sent another one; it is stored in the receiver's conversation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SentBotMessage {
+    pub message_id: String,
+    pub to: String,
+    pub text: String,
+    pub created_at_ms: i64,
+}
+
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -322,6 +331,28 @@ impl Store {
                     created_at_ms: r.get(4)?,
                 },
             ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What the bot of `conversation` wrote to other bots, oldest first.
+    pub fn sent_bot_messages(
+        &self,
+        network: &str,
+        conversation: &str,
+    ) -> Result<Vec<SentBotMessage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id,conversation_id,text,created_at_ms FROM messages
+             WHERE network_id=?1 AND role='bot' AND json_extract(sender,'$.conversation_id')=?2
+             ORDER BY created_at_ms,rank",
+        )?;
+        let rows = statement.query_map(params![network, conversation], |r| {
+            Ok(SentBotMessage {
+                message_id: r.get(0)?,
+                to: r.get(1)?,
+                text: r.get(2)?,
+                created_at_ms: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }

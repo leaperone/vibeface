@@ -1055,7 +1055,7 @@ fn bot_projection(store: &Store, net: &Net) -> Result<Value> {
 
 /// Only the user's own signed message in the same conversation can be the cause a change follows.
 #[test]
-fn an_bot_change_must_follow_the_users_signed_message() -> Result<()> {
+fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
     conversation(&mut origin, &net)?;
@@ -1734,6 +1734,14 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
             _ => None,
         });
     assert_eq!(hops, Some(2));
+    let sent = origin.sent_bot_messages(&net.network, "d")?;
+    assert_eq!(
+        sent.iter()
+            .map(|row| (row.message_id.as_str(), row.to.as_str(), row.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(reply.message_id.as_str(), "c", "Done")],
+        "the sender's chat lists what it wrote to another bot"
+    );
 
     for index in 2..=BOT_MESSAGES_PER_HOUR {
         send(

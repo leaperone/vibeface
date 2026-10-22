@@ -81,6 +81,7 @@ export type ConversationRecords = {
   deliveries: unknown[]
   checks: CoordinationCheck[]
   jobs: ManagerJob[]
+  sent: SentBotMessage[]
 }
 /**
  * What only the person can settle; nothing is resent.
@@ -123,7 +124,10 @@ export type ConversationPayload = {
   /** This chat's questions, answered ones included. */
   questions: Question[]
   sessions: SessionHandoff[]
+  /** What this bot wrote to other bots; `to` is the receiver's conversation. */
+  sent: SentBotMessage[]
 }
+export type SentBotMessage = { message_id: string; to: string; text: string; created_at_ms: number }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
 export type WorkspaceView = "chat" | "other"
 /** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */

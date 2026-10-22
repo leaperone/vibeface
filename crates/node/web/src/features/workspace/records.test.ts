@@ -18,13 +18,13 @@ const shown = parseConversation({
   conversation: { conversation_id: "chat", title: "", owner: "gateway", owner_epoch: 1 },
   messages: [message("m1", 1), message("m3", 3)], works: [work("w1"), work("w2")],
   deliveries: [{ state: "dispatch_waiting", work_id: "w9", target_node: "worker", cwd: "/w" }, { state: "stop_waiting", work_id: "w1", target_node: "worker" }],
-  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] },
+  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [],
   questions: [], sessions: [],
 }, "chat")
 const records = (extra: Record<string, unknown> = {}) => {
   const event = parseChanged({
     type: "records", conversation_id: "chat", messages: [], works: [], last_message: null, questions: [], notifications: [],
-    deliveries: [], checks: [], jobs: [], ...extra,
+    deliveries: [], checks: [], jobs: [], sent: [], ...extra,
   })
   assert.equal(event.type, "records")
   return parseRecords(event.type === "records" ? event.value : null)

@@ -154,6 +154,7 @@ impl Runtime {
             .map(|message| message_value(&store, network, message))
             .collect::<Result<Vec<_>>>()?;
         let changes = store.bot_changes(network, scope)?;
+        let sent = store.sent_bot_messages(network, scope)?;
         let questions = store.conversation_questions(network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
         let now = now_ms();
@@ -184,6 +185,7 @@ impl Runtime {
             "works":works,
             "deliveries":deliveries,
             "changes":changes,
+            "sent":sent,
             "questions":questions,
             "sessions":sessions,
             "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory},
@@ -256,6 +258,7 @@ impl Runtime {
             "works":changed,
             "last_message":last_message,
             "questions":store.conversation_questions(network, scope)?,
+            "sent":store.sent_bot_messages(network, scope)?,
             "notifications":notifications,
             "deliveries":deliveries(&store, scope, &works)?,
             "checks":without_work_checks(checks, &works),

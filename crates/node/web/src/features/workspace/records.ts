@@ -17,7 +17,7 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   if (messages.every((item) => item.rank)) messages.sort((a, b) => (a.rank! < b.rank! ? -1 : a.rank! > b.rank! ? 1 : 0))
   const works = upsert(shown.works.filter((item) => !delivery(item)).map(({ stop: _, ...item }) => item), records.works, (item) => item.work_id)
   return {
-    ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions,
+    ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions, sent: records.sent,
     scheduler: shown.scheduler && { ...shown.scheduler, jobs: records.jobs },
   }
 }

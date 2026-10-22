@@ -16,7 +16,7 @@ import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, questions: [], sessions: [],
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
 })

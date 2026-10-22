@@ -64,6 +64,7 @@ test("conversation snapshots parse bot changes strictly", () => {
   const base = {
     conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
     works: [], deliveries: [], checks: [], local_node: "n", questions: [], sessions: [],
+    sent: [],
     bot_settings: {
       skills: [{ skill_id: "s", name: "发布", description: "发版步骤" }],
       schedules: [
@@ -96,4 +97,6 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile" } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "model" } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
+  assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
+    [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }])
 })

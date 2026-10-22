@@ -3,7 +3,7 @@ import type { ReplyStatus } from "../chat/types"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
+  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
 } from "./types"
 import { answerId } from "./questions.ts"
 
@@ -163,6 +163,7 @@ export function parseRecords(value: unknown): ConversationRecords {
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: schedulerSnapshot({ jobs: data.jobs })?.jobs ?? [],
+    sent: list(data.sent).map(sentBotMessage),
   }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
@@ -179,6 +180,7 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     bot_settings: botSettings(data.bot_settings),
     questions: list(data.questions).map(question),
     sessions: list(data.sessions).map(sessionHandoff),
+    sent: list(data.sent).map(sentBotMessage),
   }
 }
 function edit(value: unknown): FieldEdit | undefined {
@@ -320,6 +322,10 @@ function question(value: unknown): Question {
     about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
     answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },
   }
+}
+function sentBotMessage(value: unknown): SentBotMessage {
+  const data = record(value)
+  return { message_id: text(data.message_id), to: text(data.to), text: text(data.text), created_at_ms: number(data.created_at_ms) }
 }
 function sessionHandoff(value: unknown): SessionHandoff {
   const data = record(value)
