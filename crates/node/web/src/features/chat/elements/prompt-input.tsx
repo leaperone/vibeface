@@ -61,7 +61,7 @@ export function PromptInput({
           value={value}
           placeholder="发消息"
           disabled={disabled || busy}
-          aria-label="给助手发消息"
+          aria-label="给 Bot 发消息"
           aria-describedby={hint ? 'manager-hint' : undefined}
           title="Enter 发送，Shift+Enter 换行"
           rows={1}

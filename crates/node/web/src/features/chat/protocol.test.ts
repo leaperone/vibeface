@@ -5,7 +5,7 @@ import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, reply
 const ready = { hasConversation: true, loaded: true }
 test('send waits for a loaded conversation', () => {
   assert.equal(roleLabel('user'), '你')
-  assert.equal(roleLabel('assistant'), '助手')
+  assert.equal(roleLabel('assistant'), 'Bot')
   assert.equal(canSend({ ...ready, busy: false }), true)
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
   assert.equal(composerHint(ready), '')

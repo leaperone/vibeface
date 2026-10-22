@@ -365,7 +365,7 @@ impl Runtime {
         node_display_names(&self.membership_state().await.ok()?).remove(&device)
     }
     pub fn info(&self) -> Value {
-        let manager_available = self.assistant().is_some();
+        let manager_available = self.manager().is_some();
         json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
@@ -493,7 +493,7 @@ impl Runtime {
     /// What this Node offers its peers right now; work it does not execute is not offered.
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
-        let manager = self.assistant().map(|m| m.provider);
+        let manager = self.manager().map(|m| m.provider);
         let mut codex = self.codex.capability().await;
         codex["enabled"] = json!(self.providers().switches.execution);
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
@@ -629,7 +629,7 @@ impl Runtime {
             "questions" => self.questions(&access).await,
             "answer" => self.answer_question(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
-            "set_primary_assistant" => self.set_primary_assistant(&access, &input).await,
+            "set_primary_bot" => self.set_primary_bot(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "resolve" => self.resolve_check(&access, &input).await,

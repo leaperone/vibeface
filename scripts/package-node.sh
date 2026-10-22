@@ -81,7 +81,7 @@ done < <(find "$repo/crates/node/sdk" -maxdepth 1 -type f \( -name '*.mjs' -o -n
 cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 # Runtime requirements
 
-The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the assistant.
+The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the bot.
 
 - Codex SDK work and native App Server access need the `codex` CLI and its authenticated account.
 - The Codex SDK sidecar needs Node.js 18 or newer. Run `npm ci --omit=dev` in `sidecars/` before using it.

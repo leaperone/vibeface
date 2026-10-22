@@ -1,5 +1,5 @@
 //! The AI providers this Node runs locally and the variables each provider's processes get. The
-//! assistant's provider and the execution switch live in `config.json`; the variables are model keys,
+//! bot's provider and the execution switch live in `config.json`; the variables are model keys,
 //! so they stay in one private file of the data directory and never reach events, logs or the
 //! web, which only learns which names are set.
 use crate::manager::ManagerKind;
@@ -21,7 +21,7 @@ pub enum Provider {
     Cursor,
 }
 
-/// The coordination Agent (the assistant) or the execution layer that runs dispatched work.
+/// The coordination Agent (the bot) or the execution layer that runs dispatched work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -33,7 +33,7 @@ impl Provider {
     pub const ALL: [Provider; 2] = [Provider::Codex, Provider::Cursor];
 
     /// What the runtime can run on each provider: dispatched work runs only on the Codex
-    /// App Server, so Cursor serves only as the assistant.
+    /// App Server, so Cursor serves only as the bot.
     pub fn supports(self) -> &'static [Role] {
         match self {
             Provider::Codex => &[Role::Agent, Role::Execution],
@@ -48,7 +48,7 @@ impl Provider {
         }
     }
 
-    /// The assistant runtime that runs on this provider.
+    /// The bot runtime that runs on this provider.
     pub fn manager_kind(self) -> ManagerKind {
         match self {
             Provider::Codex => ManagerKind::CodexSdk,
@@ -76,8 +76,8 @@ pub struct AppServer {
     pub socket: Option<PathBuf>,
 }
 
-/// What the providers do besides the assistant, which `Config.manager` chooses. A provider is in
-/// use while the assistant runs on it or, for Codex, while it executes dispatched work.
+/// What the providers do besides the bot, which `Config.manager` chooses. A provider is in
+/// use while the bot runs on it or, for Codex, while it executes dispatched work.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {

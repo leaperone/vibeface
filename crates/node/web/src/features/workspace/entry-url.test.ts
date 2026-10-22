@@ -9,14 +9,14 @@ import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
 import { nodeName } from "./labels.ts"
 import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
-import { placeChanges, scheduleName, scheduleTrigger } from "./assistant.ts"
+import { placeChanges, scheduleName, scheduleTrigger } from "./bot-settings.ts"
 import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "./questions.ts"
 import { canSend, composerHint } from "../chat/protocol.ts"
 import { primaryLane } from "../identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], assistant: { skills: [], schedules: [], memory: [] }, questions: [], sessions: [],
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
 })
@@ -163,7 +163,7 @@ test("workspace preserves bot and message requests while routing native decision
   const workspaceModule = load(fileURLToPath(new URL("./context.tsx", import.meta.url)))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
-  const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event", last_message: null }
+  const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", event_hash: "bot-event", last_message: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
@@ -178,8 +178,8 @@ test("workspace preserves bot and message requests while routing native decision
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
   let failControl = false, failBotCheck = false, failMessage = false
-  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, assistant: { bot_id: "bot", name: "助手" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
-  const sessionRow = { ...questionRow, question_id: "s1", conversation_id: null, assistant: null }
+  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
+  const sessionRow = { ...questionRow, question_id: "s1", conversation_id: null, bot: null }
   let questionRows: Record<string, unknown>[] = [questionRow, sessionRow]
   const answers: Record<string, unknown>[] = []
   let answerOutcome: "answered" | "already_answered" | "lost" = "lost"
@@ -321,7 +321,7 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().pendingBot, null)
     await assert.rejects(render().createBot({ name: "n".repeat(512), instructions: "a".repeat(8192), project: { target_node: "executor", cwd: "/" + "p".repeat(4095) } }), /太长/)
     assert.equal(render().pendingBot, null)
-    await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /connection lost/)
+    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /connection lost/)
     const originalCreation = creations[0]
     assert.equal(typeof originalCreation.bot_id, "string")
     assert.notEqual(originalCreation.bot_id, originalCreation.conversation_id)
@@ -330,11 +330,11 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
     await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /内容已保留/)
     createMode = "rejected"
-    await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
+    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
     assert.equal(render().pendingBot?.submission?.state, "unconfirmed")
     createMode = "success"
-    await render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
+    await render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
     assert.deepEqual(creations.slice(1), [originalCreation, originalCreation, originalCreation], "the reload resubmits the unconfirmed creation from the outbox")
     assert.equal(render().pendingBot, null)
     createMode = "rejected"
@@ -486,13 +486,13 @@ const settleComponent = () => new Promise(setImmediate)
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
-    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目助手' }, { bot_id: 'main-bot', conversation_id: 'main', name: '主助手甲' }], primary: 'main',
+    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }, { bot_id: 'main-bot', conversation_id: 'main', name: '主 Bot 甲' }], primary: 'main',
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
   const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
-  const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
+  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
   const labelled = (elements: Element[], label: string) => elements.find(({ props }) => props.onClick && text(props.children).includes(label))
@@ -527,11 +527,11 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
     assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
-    const session = { ...question, question_id: 'q2', conversation_id: null, assistant: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目助手', conversation_id: 'chat' }] }
+    const session = { ...question, question_id: 'q2', conversation_id: null, bot: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目 Bot', conversation_id: 'chat' }] }
     assert.ok(app.render('QuestionCard', { question: session }).some(({ props }) => props['aria-label'] === '其他回答'), 'a session question takes a typed answer too')
-    for (const label of ['处理', '交给 项目助手', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
+    for (const label of ['处理', '交给 项目 Bot', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
     await settleComponent()
-    assert.deepEqual(toasts.map(({ text }) => text), ['已交给主助手分派', '已交给 项目助手', '已忽略这个会话'], '待处理 says where each session went')
+    assert.deepEqual(toasts.map(({ text }) => text), ['已交给主 Bot 分派', '已交给 项目 Bot', '已忽略这个会话'], '待处理 says where each session went')
     toasts[0].action?.onClick()
     assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'main-bot' } }], 'and leads to the chat that took it')
   } finally { app.close() }
@@ -610,7 +610,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -739,12 +739,12 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
     assert.equal(composer()?.disabled, true)
-    assert.match(String(composer()?.hint), /运行助手/)
+    assert.match(String(composer()?.hint), /运行 Bot/)
     assert.equal(sent, 0)
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }])
     assert.equal(composer()?.disabled, false)

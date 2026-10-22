@@ -9,14 +9,14 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 
 const network = 'b'.repeat(64), browser = 'c'.repeat(64), entry = 'a'.repeat(64)
 const conversationId = 'conversation-1'
-const bot = { bot_id: 'bot-1', conversation_id: conversationId, name: '助手一', instructions: '', event_hash: 'h' }
+const bot = { bot_id: 'bot-1', conversation_id: conversationId, name: 'Bot 一', instructions: '', event_hash: 'h' }
 const question = {
-  question_id: 'q-1', conversation_id: conversationId, assistant: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }],
+  question_id: 'q-1', conversation_id: conversationId, bot: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }],
   about: { node: entry, agent: 'codex', session_id: 's', cwd: '/p', summary: '' }, author: entry, created_at_ms: 1, answer: null,
 }
 const conversation = {
   conversation: { conversation_id: conversationId, title: '', owner: entry, owner_epoch: 1 }, messages: [], works: [], deliveries: [], scheduler: null,
-  checks: [], local_node: entry, changes: [], assistant: { skills: [], schedules: [], memory: [] }, questions: [question], sessions: [],
+  checks: [], local_node: entry, changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [question], sessions: [],
 }
 const notMember = 'device is not a member of this personal network'
 const settle = () => new Promise(setImmediate)

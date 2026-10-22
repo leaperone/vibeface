@@ -309,7 +309,7 @@ table "bots" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "assistant_profiles" {
+table "bot_profiles" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -439,7 +439,7 @@ table "memories" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "assistant_changes" {
+table "bot_changes" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -476,7 +476,7 @@ table "assistant_changes" {
   primary_key {
     columns = [column.network_id, column.change_id]
   }
-  index "assistant_changes_order" {
+  index "bot_changes_order" {
     columns = [column.network_id, column.conversation_id, column.rank]
   }
 }

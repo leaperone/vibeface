@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleName, scheduleTrigger } from "./assistant.ts"
+import { formatWhen, lineDiff, placeChanges, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger } from "./bot-settings.ts"
 import { parseConversation } from "./model.ts"
-import type { AssistantChangeRecord } from "./types.ts"
+import type { BotChangeRecord } from "./types.ts"
 
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).getTime()
 
@@ -40,7 +40,7 @@ test("schedule replies carry their schedule id", () => {
   assert.equal(scheduleTrigger(undefined), null)
 })
 
-const scheduleChange = (cause: string | null, name: string): AssistantChangeRecord => ({
+const scheduleChange = (cause: string | null, name: string): BotChangeRecord => ({
   change_id: `c-${cause}-${name}`, conversation_id: "chat", cause: cause === null ? null : { conversation_id: "chat", message_id: cause }, event_hash: `h-${cause}-${name}`, created_at_ms: 1,
   change: { kind: "schedule", schedule_id: "r", before: null, after: { name, prompt: "p", first_run_at_ms: 0, every_minutes: 60, enabled: true } },
 })
@@ -60,11 +60,12 @@ test("changes sit after the reply to their message, else after the message", () 
   assert.equal(scheduleName("other", undefined), "定时任务")
 })
 
-test("conversation snapshots parse assistant changes strictly", () => {
+test("conversation snapshots parse bot changes strictly", () => {
   const base = {
     conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
     works: [], deliveries: [], checks: [], local_node: "n", questions: [], sessions: [],
-    assistant: {
+    sent: [],
+    bot_settings: {
       skills: [{ skill_id: "s", name: "发布", description: "发版步骤" }],
       schedules: [
         { schedule_id: "r", name: "看依赖", prompt: "p", first_run_at_ms: 1, every_minutes: 1440, enabled: false, next_run_at_ms: null },
@@ -84,16 +85,24 @@ test("conversation snapshots parse assistant changes strictly", () => {
   assert.deepEqual(parsed.changes[2], { change_id: "c3", conversation_id: "chat", cause: null, event_hash: "h3", created_at_ms: 2, change: { kind: "memory", memory_id: "m", before: null, after: "用中文" } })
   assert.deepEqual(parsed.changes[3]?.cause, { conversation_id: "other", message_id: "u9" })
   assert.deepEqual(parsed.changes[3]?.change, { kind: "schedule", schedule_id: "o", before: null, after: { name: "提醒", prompt: "p", first_run_at_ms: 5, enabled: true, depth: 1 } })
-  assert.equal(parsed.assistant.schedules[0]?.next_run_at_ms, null)
-  assert.equal(parsed.assistant.schedules[0]?.every_minutes, 1440)
-  assert.equal("every_minutes" in parsed.assistant.schedules[1]!, false)
-  assert.equal(scheduleFrequency(parsed.assistant.schedules[1]!), "一次")
-  assert.deepEqual(parsed.assistant.memory, [{ memory_id: "m", text: "用中文" }])
+  assert.equal(parsed.bot_settings.schedules[0]?.next_run_at_ms, null)
+  assert.equal(parsed.bot_settings.schedules[0]?.every_minutes, 1440)
+  assert.equal("every_minutes" in parsed.bot_settings.schedules[1]!, false)
+  assert.equal(scheduleFrequency(parsed.bot_settings.schedules[1]!), "一次")
+  assert.deepEqual(parsed.bot_settings.memory, [{ memory_id: "m", text: "用中文" }])
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[2], change: { kind: "memory", memory_id: "m", before: null, after: null } }] }, "chat"))
-  assert.throws(() => parseConversation({ ...base, assistant: { ...base.assistant, schedules: [{ ...base.assistant.schedules[0], every_minutes: 0 }] } }, "chat"))
+  assert.throws(() => parseConversation({ ...base, bot_settings: { ...base.bot_settings, schedules: [{ ...base.bot_settings.schedules[0], every_minutes: 0 }] } }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: undefined }, "chat"))
-  assert.throws(() => parseConversation({ ...base, assistant: undefined }, "chat"))
+  assert.throws(() => parseConversation({ ...base, bot_settings: undefined }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile" } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "model" } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
+  assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
+    [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }])
+})
+
+test("a reminder whose note is its name shows the sentence once", () => {
+  assert.equal(scheduleDetail({ name: "看看部署", prompt: " 看看部署\n" }), null)
+  assert.equal(scheduleDetail({ name: "看看部署", prompt: "看看部署\n顺便查日志" }), "看看部署\n顺便查日志")
+  assert.equal(scheduleDetail({ name: "每日巡检", prompt: "检查依赖更新" }), "检查依赖更新")
 })

@@ -14,8 +14,8 @@ import type { PendingCheck } from "./types"
 
 /** Plain-language reason; the original text stays in the details. */
 export function checkReason(check: Pick<PendingCheck, "detail">): string {
-  if (/restart/i.test(check.detail)) return "设备在助手工作时重启了，系统不会自动重做。"
-  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和助手的连接断了，系统不会自动重做。"
+  if (/restart/i.test(check.detail)) return "设备在 Bot 工作时重启了，系统不会自动重做。"
+  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和 Bot 的连接断了，系统不会自动重做。"
   return "这次的结果没法自动确认，系统不会自动重做。"
 }
 
@@ -28,7 +28,7 @@ export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device:
 const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
 
 /** "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run. */
-/** `inbox`: also names the assistant and links to its chat. */
+/** `inbox`: also names the bot and links to its chat. */
 export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inbox?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()

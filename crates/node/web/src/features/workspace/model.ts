@@ -3,7 +3,7 @@ import type { ReplyStatus } from "../chat/types"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  AssistantChange, AssistantChangeRecord, AssistantSchedule, AssistantSkill, AssistantView, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
+  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ConfirmReason, ConversationRecords, OpenWork,
 } from "./types"
 import { answerId } from "./questions.ts"
 
@@ -125,7 +125,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
 /**
  * Why a work waits for the person, or null when its device can still report it. An unfinished work waits only once
  * its device is known to be offline, or its App Server disconnected for a Codex turn; an unknown device is not judged.
- * A task runs in its device's assistant, which reports without the App Server, so only offline applies to it.
+ * A task runs in its device's bot, which reports without the App Server, so only offline applies to it.
  */
 export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
@@ -163,6 +163,7 @@ export function parseRecords(value: unknown): ConversationRecords {
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: schedulerSnapshot({ jobs: data.jobs })?.jobs ?? [],
+    sent: list(data.sent).map(sentBotMessage),
   }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
@@ -176,9 +177,10 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     checks: list(data.checks).map(coordinationCheck),
     local_node: text(data.local_node),
     changes: list(data.changes).map(changeRecord),
-    assistant: assistantView(data.assistant),
+    bot_settings: botSettings(data.bot_settings),
     questions: list(data.questions).map(question),
     sessions: list(data.sessions).map(sessionHandoff),
+    sent: list(data.sent).map(sentBotMessage),
   }
 }
 function edit(value: unknown): FieldEdit | undefined {
@@ -186,11 +188,11 @@ function edit(value: unknown): FieldEdit | undefined {
   const data = record(value)
   return { before: text(data.before), after: text(data.after) }
 }
-function skill(value: unknown): AssistantSkill {
+function skill(value: unknown): BotSkill {
   const data = record(value)
   return { name: text(data.name), description: text(data.description), body: text(data.body) }
 }
-function schedule(value: unknown): AssistantSchedule {
+function schedule(value: unknown): BotSchedule {
   const data = record(value)
   const every = data.every_minutes == null ? undefined : number(data.every_minutes)
   if (every === 0) throw new Error("定时任务的间隔不对。")
@@ -199,28 +201,28 @@ function schedule(value: unknown): AssistantSchedule {
     ...(every === undefined ? {} : { every_minutes: every }), ...(data.depth == null ? {} : { depth: number(data.depth) }),
   }
 }
-function assistantChange(value: unknown): AssistantChange {
+function botChange(value: unknown): BotChange {
   const data = record(value)
   if (data.kind === "profile") {
     const name = edit(data.name), instructions = edit(data.instructions)
-    if (!name && !instructions) throw new Error("助手修改记录是空的。")
+    if (!name && !instructions) throw new Error("Bot 修改记录是空的。")
     return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}) }
   }
-  if (data.before == null && data.after == null) throw new Error("助手修改记录是空的。")
+  if (data.before == null && data.after == null) throw new Error("Bot 修改记录是空的。")
   switch (data.kind) {
     case "skill": return { kind: "skill", skill_id: text(data.skill_id), before: side(skill, data.before), after: side(skill, data.after) }
     case "schedule": return { kind: "schedule", schedule_id: text(data.schedule_id), before: side(schedule, data.before), after: side(schedule, data.after) }
     case "memory": return { kind: "memory", memory_id: text(data.memory_id), before: side(text, data.before), after: side(text, data.after) }
-    default: throw new Error("助手修改记录无法识别。")
+    default: throw new Error("Bot 修改记录无法识别。")
   }
 }
 function side<T>(read: (value: unknown) => T, value: unknown): T | null { return value == null ? null : read(value) }
-function changeRecord(value: unknown): AssistantChangeRecord {
+function changeRecord(value: unknown): BotChangeRecord {
   const data = record(value)
   const cause = data.cause == null ? null : record(data.cause)
-  return { change_id: text(data.change_id), conversation_id: text(data.conversation_id), cause: cause && { conversation_id: text(cause.conversation_id), message_id: text(cause.message_id) }, event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), change: assistantChange(data.change) }
+  return { change_id: text(data.change_id), conversation_id: text(data.conversation_id), cause: cause && { conversation_id: text(cause.conversation_id), message_id: text(cause.message_id) }, event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), change: botChange(data.change) }
 }
-function assistantView(value: unknown): AssistantView {
+function botSettings(value: unknown): BotSettings {
   const data = record(value)
   return {
     skills: list(data.skills).map((item) => { const skill = record(item); return { skill_id: text(skill.skill_id), name: text(skill.name), description: text(skill.description) } }),
@@ -269,7 +271,7 @@ export function parseBot(value: unknown): BotRecord {
 export function parseBots(value: unknown): BotRecord[] {
   return list(record(value).bots).map(parseBot)
 }
-/** The primary assistant's conversation: sessions no assistant started go there first. */
+/** The primary bot's conversation: sessions no bot started go there first. */
 export function parsePrimary(value: unknown): string | null {
   const primary = record(value).primary
   return primary == null ? null : text(primary)
@@ -308,10 +310,10 @@ function subject(value: unknown): QuestionSubject {
 }
 function question(value: unknown): Question {
   const data = record(value)
-  const assistant = data.assistant == null ? null : record(data.assistant), answer = data.answer == null ? null : record(data.answer)
+  const bot = data.bot == null ? null : record(data.bot), answer = data.answer == null ? null : record(data.answer)
   return {
     question_id: text(data.question_id), conversation_id: data.conversation_id == null ? null : text(data.conversation_id),
-    assistant: assistant && { bot_id: text(assistant.bot_id), name: text(assistant.name) },
+    bot: bot && { bot_id: text(bot.bot_id), name: text(bot.name) },
     severity: severity(data.severity), text: text(data.text),
     choices: list(data.choices ?? []).map((item) => {
       const choice = record(item)
@@ -320,6 +322,10 @@ function question(value: unknown): Question {
     about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
     answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },
   }
+}
+function sentBotMessage(value: unknown): SentBotMessage {
+  const data = record(value)
+  return { message_id: text(data.message_id), to: text(data.to), text: text(data.text), created_at_ms: number(data.created_at_ms) }
 }
 function sessionHandoff(value: unknown): SessionHandoff {
   const data = record(value)

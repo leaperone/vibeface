@@ -1,4 +1,4 @@
-use super::{assistant::ChangeRequest, *};
+use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
     scheduling::{
@@ -998,7 +998,7 @@ fn bot(net: &Net, name: &str) -> Result<EventBody> {
     )
 }
 
-fn assistant_reply(id: &str, to: &str) -> EventBody {
+fn bot_reply(id: &str, to: &str) -> EventBody {
     EventBody::MessagePosted {
         message_id: id.into(),
         role: Role::Assistant,
@@ -1039,9 +1039,9 @@ fn rename(name: &str) -> ChangeRequest {
     }
 }
 
-fn assistant_projection(store: &Store, net: &Net) -> Result<Value> {
+fn bot_projection(store: &Store, net: &Net) -> Result<Value> {
     let changes: Vec<_> = store
-        .assistant_changes(&net.network, "c")?
+        .bot_changes(&net.network, "c")?
         .into_iter()
         .map(|change| (change.change_id, change.event_hash, change.change))
         .collect();
@@ -1055,20 +1055,13 @@ fn assistant_projection(store: &Store, net: &Net) -> Result<Value> {
 
 /// Only the user's own signed message in the same conversation can be the cause a change follows.
 #[test]
-fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
+fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
     conversation(&mut origin, &net)?;
     origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
     let m1 = origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
-    let a1 = origin.append_event(
-        &net.a,
-        &net.network,
-        "c",
-        assistant_reply("a1", "m1"),
-        vec![],
-        4,
-    )?;
+    let a1 = origin.append_event(&net.a, &net.network, "c", bot_reply("a1", "m1"), vec![], 4)?;
     let mut target = store(&net)?;
     let a_events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
     assert!(
@@ -1088,13 +1081,13 @@ fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
             deps,
             scope_id: "c".into(),
             created_at_ms: 5,
-            body: EventBody::AssistantChanged {
+            body: EventBody::BotChanged {
                 change_id: "change-1".into(),
                 cause: Some(Cause {
                     conversation_id: "c".into(),
                     message_id: cause.into(),
                 }),
-                change: AssistantChange::Profile {
+                change: BotChange::Profile {
                     name: Some(Edit {
                         before: "Helper".into(),
                         after: "Nova".into(),
@@ -1124,38 +1117,38 @@ fn an_assistant_change_must_follow_the_users_signed_message() -> Result<()> {
         vec![IngestStatus::Accepted]
     );
     assert_eq!(target.bots(&net.network)?[0].name, "Nova");
-    assert_eq!(target.assistant_changes(&net.network, "c")?.len(), 1);
+    assert_eq!(target.bot_changes(&net.network, "c")?.len(), 1);
 
     // The local writer takes the cause from the trigger and refuses anything but a user message.
     for trigger in ["work:w1", "message:a1"] {
         let error = origin
-            .change_assistant(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
+            .change_bot(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
             .unwrap_err();
         assert!(
-            error.to_string().contains(assistant::NOT_FROM_USER),
+            error.to_string().contains(bot_settings::NOT_FROM_USER),
             "{trigger}: {error}"
         );
     }
     Ok(())
 }
 
-/// Chat changes from two devices converge to the same assistant in any arrival order, and a
+/// Chat changes from two devices converge to the same bot in any arrival order, and a
 /// retried tool call writes nothing new.
 #[test]
-fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
+fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
     conversation(&mut origin, &net)?;
     origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
     origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
     let change = |store: &mut Store, identity, trigger, call_ref, request, at| {
-        store.change_assistant(identity, &net.network, "c", trigger, call_ref, request, at)
+        store.change_bot(identity, &net.network, "c", trigger, call_ref, request, at)
     };
     let (renamed, written) = change(&mut origin, &net.a, "message:m1", "r1", rename("Nova"), 4)?;
     assert!(written);
     assert_eq!(
         renamed.change,
-        AssistantChange::Profile {
+        BotChange::Profile {
             name: Some(Edit {
                 before: "Helper".into(),
                 after: "Nova".into()
@@ -1182,7 +1175,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         save_skill(None, "Digest", "List the commits."),
         6,
     )?;
-    let AssistantChange::Skill { skill_id, .. } = saved.change else {
+    let BotChange::Skill { skill_id, .. } = saved.change else {
         panic!("skill change")
     };
     let duplicate = change(
@@ -1203,7 +1196,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         save_schedule(None, "Morning", 1440),
         7,
     )?;
-    let AssistantChange::Schedule { schedule_id, .. } = schedule.change else {
+    let BotChange::Schedule { schedule_id, .. } = schedule.change else {
         panic!("schedule change")
     };
 
@@ -1246,7 +1239,7 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
         },
         13,
     )?;
-    let expected = assistant_projection(&origin, &net)?;
+    let expected = bot_projection(&origin, &net)?;
     assert_eq!(expected["bots"][0]["name"], "Orion");
     assert_eq!(expected["skills"], serde_json::json!([]));
     assert_eq!(expected["schedules"], serde_json::json!([]));
@@ -1262,8 +1255,8 @@ fn assistant_changes_converge_and_retries_write_once() -> Result<()> {
     b_first.ingest_events(&net.network, &a_events)?;
     // Events rejected for a gap are fetched again by sync.
     b_first.ingest_events(&net.network, &b_events)?;
-    assert_eq!(assistant_projection(&a_first, &net)?, expected);
-    assert_eq!(assistant_projection(&b_first, &net)?, expected);
+    assert_eq!(bot_projection(&a_first, &net)?, expected);
+    assert_eq!(bot_projection(&b_first, &net)?, expected);
     Ok(())
 }
 
@@ -1275,7 +1268,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
     store.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
-    let (saved, _) = store.change_assistant(
+    let (saved, _) = store.change_bot(
         &net.a,
         &net.network,
         "c",
@@ -1284,7 +1277,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
         save_schedule(None, "Digest", 5),
         3,
     )?;
-    let AssistantChange::Schedule { schedule_id, .. } = saved.change else {
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
         panic!("schedule change")
     };
     let every = 5 * 60_000;
@@ -1333,7 +1326,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
 
     let next = store.admit_due_schedules(&net.a, &net.network, 1_000 + 5 * every)?;
     assert_eq!(next.len(), 1);
-    store.change_assistant(
+    store.change_bot(
         &net.a,
         &net.network,
         "c",
@@ -1418,7 +1411,7 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
     let now = 10_000;
-    let (saved, _) = origin.change_assistant(
+    let (saved, _) = origin.change_bot(
         &net.a,
         &net.network,
         "c",
@@ -1431,7 +1424,7 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
         },
         now,
     )?;
-    let AssistantChange::Schedule {
+    let BotChange::Schedule {
         schedule_id,
         after: Some(reminder),
         ..
@@ -1505,7 +1498,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
     let mut trigger = message_trigger("m1");
     let mut now = 10_000;
     for depth in 1..=MAX_CHAIN_DEPTH {
-        let (saved, _) = origin.change_assistant(
+        let (saved, _) = origin.change_bot(
             &net.a,
             &net.network,
             "c",
@@ -1515,7 +1508,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             now,
         )?;
         assert_eq!(saved.cause.is_some(), depth == 1);
-        let AssistantChange::Schedule {
+        let BotChange::Schedule {
             schedule_id,
             after: Some(reminder),
             ..
@@ -1528,7 +1521,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
         trigger = schedule_trigger(&schedule_id, now);
     }
     let error = origin
-        .change_assistant(
+        .change_bot(
             &net.a,
             &net.network,
             "c",
@@ -1540,7 +1533,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
         .unwrap_err();
     assert!(error.to_string().contains("automatic wakes"), "{error}");
     let error = origin
-        .change_assistant(
+        .change_bot(
             &net.a,
             &net.network,
             "c",
@@ -1550,7 +1543,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             now,
         )
         .unwrap_err();
-    assert!(error.to_string().contains(assistant::NOT_FROM_USER));
+    assert!(error.to_string().contains(bot_settings::NOT_FROM_USER));
 
     let mut other = store(&net)?;
     all_accepted(&mut other, &net, &origin)?;
@@ -1563,10 +1556,10 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
         deps: vec![],
         scope_id: "c".into(),
         created_at_ms: now,
-        body: EventBody::AssistantChanged {
+        body: EventBody::BotChanged {
             change_id: "change-x".into(),
             cause: None,
-            change: AssistantChange::Profile {
+            change: BotChange::Profile {
                 name: Some(Edit {
                     before: "Helper".into(),
                     after: "Nova".into(),
@@ -1588,7 +1581,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
 fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
-    let (saved, _) = origin.change_assistant(
+    let (saved, _) = origin.change_bot(
         &net.a,
         &net.network,
         "c",
@@ -1597,7 +1590,7 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
         save_schedule(None, "Digest", 5),
         3,
     )?;
-    let AssistantChange::Schedule { schedule_id, .. } = saved.change else {
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
         panic!("schedule change")
     };
     let signed = |action| -> Result<Attestation> {
@@ -1741,6 +1734,14 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
             _ => None,
         });
     assert_eq!(hops, Some(2));
+    let sent = origin.sent_bot_messages(&net.network, "d")?;
+    assert_eq!(
+        sent.iter()
+            .map(|row| (row.message_id.as_str(), row.to.as_str(), row.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(reply.message_id.as_str(), "c", "Done")],
+        "the sender's chat lists what it wrote to another bot"
+    );
 
     for index in 2..=BOT_MESSAGES_PER_HOUR {
         send(
@@ -1813,14 +1814,14 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
     assert!(create(&mut origin, "message:m1", "b1", "Other").is_err());
     let refused = create(&mut origin, "work:w1", "b2", "Other").unwrap_err();
     assert!(
-        refused.to_string().contains(assistant::NOT_FROM_USER),
+        refused.to_string().contains(bot_settings::NOT_FROM_USER),
         "{refused}"
     );
     create(&mut origin, "message:m1", "b2", "Second")?;
     create(&mut origin, "message:m1", "b3", "Third")?;
     let capped = create(&mut origin, "message:m1", "b4", "Fourth").unwrap_err();
     assert!(capped.to_string().contains("at most"), "{capped}");
-    let (changed, _) = origin.change_assistant(
+    let (changed, _) = origin.change_bot(
         &net.a,
         &net.network,
         "c",
@@ -1885,7 +1886,7 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
     let remember = |store: &mut Store, trigger: &str, call_ref: &str, text: &str| {
-        store.change_assistant(
+        store.change_bot(
             &net.a,
             &net.network,
             "c",
@@ -1918,18 +1919,18 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
         "k1",
         "Prefers short replies in Chinese",
     )?;
-    let AssistantChange::Memory { memory_id, .. } = kept.change else {
+    let BotChange::Memory { memory_id, .. } = kept.change else {
         panic!("note")
     };
     let error = remember(&mut origin, "work:w1", "k2", "Something else").unwrap_err();
-    assert!(error.to_string().contains(assistant::NOT_FROM_USER));
+    assert!(error.to_string().contains(bot_settings::NOT_FROM_USER));
     let mut other = store(&net)?;
     all_accepted(&mut other, &net, &origin)?;
     assert_eq!(
         other.memories(&net.network, "c")?,
         origin.memories(&net.network, "c")?
     );
-    origin.change_assistant(
+    origin.change_bot(
         &net.a,
         &net.network,
         "c",
@@ -2790,9 +2791,9 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
     Ok(())
 }
 
-/// The conversation list shows each assistant's newest message, cut to a short preview.
+/// The conversation list shows each bot's newest message, cut to a short preview.
 #[test]
-fn last_messages_preview_each_assistants_newest_message() -> Result<()> {
+fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
@@ -2807,14 +2808,7 @@ fn last_messages_preview_each_assistants_newest_message() -> Result<()> {
         vec![],
         3,
     )?;
-    store.append_event(
-        &net.a,
-        &net.network,
-        "c",
-        assistant_reply("a1", "m1"),
-        vec![],
-        4,
-    )?;
+    store.append_event(&net.a, &net.network, "c", bot_reply("a1", "m1"), vec![], 4)?;
     let last = store
         .last_messages(&net.network)?
         .remove("c")

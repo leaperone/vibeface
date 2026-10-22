@@ -1,5 +1,5 @@
-//! Questions live in the chat of the assistant that owns their session, or in `SESSIONS_SCOPE`
-//! for a session no assistant owns. A question's one answer is the user message
+//! Questions live in the chat of the bot that owns their session, or in `SESSIONS_SCOPE`
+//! for a session no bot owns. A question's one answer is the user message
 //! `a-<question_id>`; a question is unanswered while no such message exists.
 use super::{
     Store, authorize_node_from,
@@ -37,7 +37,7 @@ type Row = (
     Option<i64>,
 );
 
-/// Questions as clients read them, with the assistant they belong to and their answer.
+/// Questions as clients read them, with the bot they belong to and their answer.
 fn questions_from(
     connection: &Connection,
     network: &str,
@@ -67,13 +67,13 @@ fn questions_from(
                     object.remove("type");
                 }
                 let conversation = (scope != SESSIONS_SCOPE).then_some(scope);
-                let assistant = match &conversation {
+                let bot = match &conversation {
                     Some(scope) => bot_for_conversation_from(connection, network, scope)?
                         .map(|bot| json!({"bot_id":bot.bot_id,"name":bot.name})),
                     None => None,
                 };
                 question["conversation_id"] = json!(conversation);
-                question["assistant"] = json!(assistant);
+                question["bot"] = json!(bot);
                 question["author"] = json!(author);
                 question["created_at_ms"] = json!(created_at_ms);
                 question["answer"] = match answer {
@@ -151,7 +151,7 @@ impl Store {
         )
     }
 
-    /// Sessions handed to this conversation's assistant, and those its routing turns handed to
+    /// Sessions handed to this conversation's bot, and those its routing turns handed to
     /// another, for the handoff lines in its chat.
     pub fn attributed_sessions(&self, network: &str, scope: &str) -> Result<Vec<Value>> {
         let mut statement = self.connection.prepare(
@@ -255,7 +255,7 @@ impl Store {
         }
         ensure!(
             conversation_from(&tx, network, conversation)?.is_some(),
-            "no such assistant conversation"
+            "no such bot conversation"
         );
         let event = log::append_from(
             &tx,

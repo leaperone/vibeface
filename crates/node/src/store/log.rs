@@ -240,12 +240,12 @@ fn place(
 }
 
 /// The user's device signature on `cause` is what authorizes a write a bot makes for the user:
-/// an assistant change, or a bot it creates. One of the event's stored parents must be that
+/// a bot change, or a bot it creates. One of the event's stored parents must be that
 /// signed user message. The one change without a cause is a new one-shot schedule: a reminder
-/// the assistant sets itself.
+/// the bot sets itself.
 fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Result<()> {
     let cause = match &event.body {
-        EventBody::AssistantChanged {
+        EventBody::BotChanged {
             cause: None,
             change,
             ..
@@ -253,7 +253,7 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
             ensure!(
                 matches!(
                     change,
-                    AssistantChange::Schedule {
+                    BotChange::Schedule {
                         before: None,
                         after: Some(Schedule {
                             every_minutes: None,
@@ -263,11 +263,11 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
                         ..
                     }
                 ),
-                "only a new one-time reminder may change an assistant without the user's message"
+                "only a new one-time reminder may change a bot without the user's message"
             );
             return Ok(());
         }
-        EventBody::AssistantChanged {
+        EventBody::BotChanged {
             cause: Some(cause), ..
         }
         | EventBody::BotCreated {
@@ -483,7 +483,7 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
 
 /// Appends to this device's log. `deps` name every other author's latest event in the
 /// conversation, so the new event follows everything this Node has seen there, and an
-/// assistant change also names the user message that caused it.
+/// bot change also names the user message that caused it.
 #[expect(clippy::too_many_arguments, reason = "an event's fields")]
 pub(crate) fn append_from(
     connection: &Connection,
@@ -536,7 +536,7 @@ pub(crate) fn append_from(
         }
     }
     let prev = (max > 0).then_some(head_hash);
-    if let EventBody::AssistantChanged {
+    if let EventBody::BotChanged {
         cause: Some(cause), ..
     }
     | EventBody::BotCreated {

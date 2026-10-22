@@ -81,6 +81,7 @@ export type ConversationRecords = {
   deliveries: unknown[]
   checks: CoordinationCheck[]
   jobs: ManagerJob[]
+  sent: SentBotMessage[]
 }
 /**
  * What only the person can settle; nothing is resent.
@@ -91,25 +92,25 @@ export type PendingCheck =
   | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type FieldEdit = { before: string; after: string }
-export type AssistantSkill = { name: string; description: string; body: string }
+export type BotSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
-export type AssistantSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
+export type BotSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
 export type MemoryEntry = { memory_id: string; text: string }
-/** `before` null is a new item, `after` null a removed one (docs/design/assistant-config.md section 2). */
-export type AssistantChange =
+/** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
+export type BotChange =
   | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit }
-  | { kind: "skill"; skill_id: string; before: AssistantSkill | null; after: AssistantSkill | null }
-  | { kind: "schedule"; schedule_id: string; before: AssistantSchedule | null; after: AssistantSchedule | null }
+  | { kind: "skill"; skill_id: string; before: BotSkill | null; after: BotSkill | null }
+  | { kind: "schedule"; schedule_id: string; before: BotSchedule | null; after: BotSchedule | null }
   | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
 /** The person's signed message a turn stood on; it may be in another bot's chat. */
 export type ChangeCause = { conversation_id: string; message_id: string }
 /** A change to the bot of `conversation_id`, applied from `cause`; null when the bot's own turn made it with no message behind it. */
-export type AssistantChangeRecord = { change_id: string; conversation_id: string; cause: ChangeCause | null; event_hash: string; created_at_ms: number; change: AssistantChange }
+export type BotChangeRecord = { change_id: string; conversation_id: string; cause: ChangeCause | null; event_hash: string; created_at_ms: number; change: BotChange }
 export type SkillSummary = { skill_id: string; name: string; description: string }
-export type ScheduleView = AssistantSchedule & { schedule_id: string; next_run_at_ms: number | null }
+export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type AssistantView = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[] }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[] }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
@@ -118,12 +119,15 @@ export type ConversationPayload = {
   checks: CoordinationCheck[]
   local_node: string
   /** Oldest first. */
-  changes: AssistantChangeRecord[]
-  assistant: AssistantView
+  changes: BotChangeRecord[]
+  bot_settings: BotSettings
   /** This chat's questions, answered ones included. */
   questions: Question[]
   sessions: SessionHandoff[]
+  /** What this bot wrote to other bots; `to` is the receiver's conversation. */
+  sent: SentBotMessage[]
 }
+export type SentBotMessage = { message_id: string; to: string; text: string; created_at_ms: number }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
 export type WorkspaceView = "chat" | "other"
 /** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */
@@ -135,7 +139,7 @@ export type { PendingMessage }
 
 export type BotProject = { target_node: string; cwd: string }
 export type CreateBotRequest = { bot_id: string; conversation_id: string; name: string; instructions: string; project?: BotProject }
-/** An assistant conversation's newest message, cut short by the Node for the conversation list. */
+/** A bot conversation's newest message, cut short by the Node for the conversation list. */
 export type LastMessage = { text: string; role: string; created_at_ms: number }
 export type BotRecord = CreateBotRequest & { event_hash: string; last_message: LastMessage | null }
 
@@ -146,17 +150,17 @@ export type PendingBot = CreateBotRequest & {
 export type Severity = "info" | "attention" | "urgent"
 /** The device, project and session a question is about. `agent` is "codex" or "claude". */
 export type QuestionSubject = { node: string; agent: string; session_id: string; cwd: string; summary: string; request_id?: string }
-/** `conversation_id` only on a session question: choosing it hands the session to that assistant. */
+/** `conversation_id` only on a session question: choosing it hands the session to that bot. */
 export type QuestionChoice = { label: string; conversation_id?: string }
 export type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
 /**
- * Something only the person can settle, asked in an assistant's chat. `conversation_id` null: a session no assistant
+ * Something only the person can settle, asked in a bot's chat. `conversation_id` null: a session no bot
  * started, shown in 待处理 only. Text answers are always allowed; a choice answers with its label.
  */
 export type Question = {
   question_id: string
   conversation_id: string | null
-  assistant: { bot_id: string; name: string } | null
+  bot: { bot_id: string; name: string } | null
   severity: Severity
   text: string
   choices: QuestionChoice[]
@@ -169,7 +173,7 @@ export type Question = {
 export type AnswerResult = { status: "answered" | "already_answered"; text: string }
 /** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
 export type PendingAnswer = { question_id: string; text: string }
-/** A session handed to this assistant, shown where it happened. */
+/** A session handed to this bot, shown where it happened. */
 export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; question_id: string; conversation_id: string; created_at_ms: number }
 /** Where questions go besides the web: "both" also sends them to Grok Bot. */
 export type Outlet = "record" | "both"

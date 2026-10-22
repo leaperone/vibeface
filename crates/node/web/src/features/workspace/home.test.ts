@@ -22,7 +22,7 @@ test('a wide screen opens the last conversation, else the first', () => {
   assert.equal(homeBot({ narrow: false, bots: [], current: '' }), null)
 })
 
-test('the list puts the newest message first and silent assistants last', () => {
+test('the list puts the newest message first and silent bots last', () => {
   assert.deepEqual(byRecent(bots).map((item) => item.bot_id), ['b', 'a', 'c'])
 })
 

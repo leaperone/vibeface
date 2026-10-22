@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) mod assistant;
+pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod log;
 pub(crate) mod questions;

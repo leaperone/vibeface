@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react"
 
-// The onboarding step (3 or 4) after a new network is created here; cleared once the assistant step is done or skipped.
+// The onboarding step (3 or 4) after a new network is created here; cleared once the bot step is done or skipped.
 const key = "vibeface.onboarding"
 const listeners = new Set<() => void>()
 type Step = 3 | 4

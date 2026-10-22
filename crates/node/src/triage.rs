@@ -82,12 +82,12 @@ fn hex32(parts: &[&str]) -> String {
     hex::encode(hash.finalize())[..32].to_owned()
 }
 
-/// An assistant's question about an event: one per event wherever it is raised.
+/// A bot's question about an event: one per event wherever it is raised.
 pub fn question_id(node: &str, event_id: &str) -> String {
     format!("q-{}", hex32(&[node, event_id]))
 }
 
-/// The one question about a session no assistant owns, so its answer holds for the session.
+/// The one question about a session no bot owns, so its answer holds for the session.
 pub fn session_question_id(node: &str, session: &str) -> String {
     format!("s-{}", hex32(&[node, session]))
 }
@@ -158,7 +158,7 @@ pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         session_id: s(input, "session_id"),
         turn_id: s(input, "turn_id"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_assistant_message"),
+        last_message: s(input, "last_bot_message"),
         detail,
         ..Default::default()
     })
@@ -195,7 +195,7 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
         session_id: s(input, "session_id"),
         turn_id: format!("tx:{transcript_bytes}"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_assistant_message"),
+        last_message: s(input, "last_bot_message"),
         detail,
         ..Default::default()
     })
@@ -252,7 +252,7 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
 pub use crate::model::Severity;
 
 /// The coordination Agent's turn when new events wait: it decides, then answers through
-/// `vibeface triage raise|dismiss`. Each event comes with the assistant whose chat owns its session.
+/// `vibeface triage raise|dismiss`. Each event comes with the bot whose chat owns its session.
 pub fn wake_prompt(
     events: &[(AgentEvent, Value)],
     cli: &str,
@@ -260,11 +260,11 @@ pub fn wake_prompt(
 ) -> Result<String> {
     let items: Vec<Value> = events
         .iter()
-        .map(|(e, assistant)| {
+        .map(|(e, bot)| {
             json!({"event_id":e.event_id,"agent":e.agent,"event":e.event,"status":e.status,
             "session_id":e.session_id,"turn_id":e.turn_id,"cwd":e.cwd,"repo":e.repo,
             "git_branch":e.git_branch,"last_message":clip(&e.last_message, 1500),
-            "detail":clip(&e.detail, 500),"request_id":e.request_id,"assistant":assistant})
+            "detail":clip(&e.detail, 500),"request_id":e.request_id,"bot":bot})
         })
         .collect();
     Ok(format!(
@@ -272,16 +272,16 @@ pub fn wake_prompt(
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
 - Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]...`. \
-It asks in the chat of the event's assistant. Write TEXT in the user's language and plain words: what is happening and what \
+It asks in the chat of the event's bot. Write TEXT in the user's language and plain words: what is happening and what \
 they need to decide, in one or two sentences, never a shell command, code or raw output. Each --choice is one short action \
 the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the likely answer first and never a destructive \
 one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
-The answer comes back to that assistant as a new turn, and it acts on it.\n\
+The answer comes back to that bot as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \
 shows its full params. Answer it yourself with `{cli} codex respond REQUEST_ID 'RESULT_JSON'` \
 (the thread already runs with full access). Only when the user must decide, add `--request-id REQUEST_ID` \
-to the raise: the request then waits for the answer, and the assistant has {answer_within_secs} seconds \
+to the raise: the request then waits for the answer, and the bot has {answer_within_secs} seconds \
 after it to respond. A request neither answered nor raised is declined after {answer_within_secs} seconds \
 or when this turn ends.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn every_source_of_one_turn_gets_one_event_id() {
         let node = "n".repeat(64);
-        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_assistant_message":"done"}))
+        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_bot_message":"done"}))
             .unwrap()
             .seal(&node, "h", 1)
             .unwrap();

@@ -1,6 +1,6 @@
-//! What the chat changes about assistants: a profile's name and instructions, the skill library
-//! every assistant shares, each assistant's schedules and notes. Every change is one
-//! `AssistantChanged` the owner writes in a turn; all but a reminder the assistant sets itself
+//! What the chat changes about bots: a profile's name and instructions, the skill library
+//! every bot shares, each bot's schedules and notes. Every change is one
+//! `BotChanged` the owner writes in a turn; all but a reminder the bot sets itself
 //! need a turn the user's own signed message started.
 use super::{Store, bots::bot_for_conversation_from, log, message_from};
 use crate::{
@@ -11,14 +11,10 @@ use crate::{
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
-pub const NOT_FROM_USER: &str =
-    "assistant settings change only when the user's own message asks for it";
+pub const NOT_FROM_USER: &str = "bot settings change only when the user's own message asks for it";
 
 fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
-    digest(
-        &serde_json::to_vec(&("assistant_change", conversation, trigger, call_ref))
-            .expect("strings"),
-    )
+    digest(&serde_json::to_vec(&("bot_change", conversation, trigger, call_ref)).expect("strings"))
 }
 
 /// One turn's tool call names one change, so a retried call finds it again.
@@ -68,7 +64,7 @@ pub enum ChangeRequest {
     Forget {
         memory_id: String,
     },
-    /// A one-shot schedule the assistant sets for its own follow-up, in any turn it may wake in.
+    /// A one-shot schedule the bot sets for its own follow-up, in any turn it may wake in.
     Remind {
         note: String,
         in_minutes: Option<u32>,
@@ -84,12 +80,12 @@ impl ChangeRequest {
 
     /// Whether `change` already sets what this request asks for. A retry compares this, because
     /// the first write changed the values a new `before` would read.
-    fn matches(&self, change: &AssistantChange) -> bool {
+    fn matches(&self, change: &BotChange) -> bool {
         let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
         match (self, change) {
             (
                 Self::UpdateProfile { name, instructions },
-                AssistantChange::Profile {
+                BotChange::Profile {
                     name: changed_name,
                     instructions: changed_instructions,
                 },
@@ -101,7 +97,7 @@ impl ChangeRequest {
                     description,
                     body,
                 },
-                AssistantChange::Skill {
+                BotChange::Skill {
                     skill_id: id,
                     after: Some(saved),
                     ..
@@ -114,7 +110,7 @@ impl ChangeRequest {
             }
             (
                 Self::RemoveSkill { skill_id },
-                AssistantChange::Skill {
+                BotChange::Skill {
                     skill_id: id,
                     after: None,
                     ..
@@ -129,7 +125,7 @@ impl ChangeRequest {
                     every_minutes,
                     enabled,
                 },
-                AssistantChange::Schedule {
+                BotChange::Schedule {
                     schedule_id: id,
                     after: Some(saved),
                     ..
@@ -144,7 +140,7 @@ impl ChangeRequest {
             }
             (
                 Self::RemoveSchedule { schedule_id },
-                AssistantChange::Schedule {
+                BotChange::Schedule {
                     schedule_id: id,
                     after: None,
                     ..
@@ -153,7 +149,7 @@ impl ChangeRequest {
             // A retry computes a new time from `in_minutes`; the note names the reminder.
             (
                 Self::Remind { note, .. },
-                AssistantChange::Schedule {
+                BotChange::Schedule {
                     before: None,
                     after: Some(saved),
                     ..
@@ -161,7 +157,7 @@ impl ChangeRequest {
             ) => *note == saved.prompt && saved.every_minutes.is_none(),
             (
                 Self::Remember { memory_id, text },
-                AssistantChange::Memory {
+                BotChange::Memory {
                     memory_id: id,
                     after: Some(saved),
                     ..
@@ -169,7 +165,7 @@ impl ChangeRequest {
             ) => memory_id.as_ref().is_none_or(|wanted| wanted == id) && text == saved,
             (
                 Self::Forget { memory_id },
-                AssistantChange::Memory {
+                BotChange::Memory {
                     memory_id: id,
                     after: None,
                     ..
@@ -293,7 +289,7 @@ pub(crate) fn schedule_from(
         .transpose()
 }
 
-/// One assistant's notes, oldest first.
+/// One bot's notes, oldest first.
 pub(crate) fn memories_from(
     connection: &Connection,
     network: &str,
@@ -323,7 +319,7 @@ fn change_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
             cause: None,
             event_hash: r.get(2)?,
             created_at_ms: r.get(3)?,
-            change: AssistantChange::Profile {
+            change: BotChange::Profile {
                 name: None,
                 instructions: None,
             },
@@ -346,9 +342,7 @@ pub(crate) fn change_from(
 ) -> Result<Option<ChangeRecord>> {
     connection
         .query_row(
-            &format!(
-                "SELECT {CHANGE_COLUMNS} FROM assistant_changes WHERE network_id=? AND change_id=?"
-            ),
+            &format!("SELECT {CHANGE_COLUMNS} FROM bot_changes WHERE network_id=? AND change_id=?"),
             params![network, change_id],
             change_row,
         )
@@ -405,15 +399,15 @@ pub(crate) fn find_bot(connection: &Connection, network: &str, wanted: &str) -> 
     }
 }
 
-/// A schedule belongs to the assistant that created it; others cannot change it.
+/// A schedule belongs to the bot that created it; others cannot change it.
 fn own_schedule(connection: &Connection, network: &str, scope: &str, id: &str) -> Result<Schedule> {
     Ok(schedule_from(connection, network, id)?
         .filter(|entry| entry.conversation_id == scope)
-        .with_context(|| format!("schedule {id} not found for this assistant"))?
+        .with_context(|| format!("schedule {id} not found for this bot"))?
         .schedule)
 }
 
-/// A new time ahead must fit under the assistant's limit; replacing one keeps its place.
+/// A new time ahead must fit under the bot's limit; replacing one keeps its place.
 fn room_for_schedule(
     connection: &Connection,
     network: &str,
@@ -428,7 +422,7 @@ fn room_for_schedule(
         .count();
     ensure!(
         active < MAX_ACTIVE_SCHEDULES,
-        "this assistant already has {MAX_ACTIVE_SCHEDULES} schedules; remove one first"
+        "this bot already has {MAX_ACTIVE_SCHEDULES} schedules; remove one first"
     );
     Ok(())
 }
@@ -462,7 +456,7 @@ fn resolve(
     digest: &str,
     request: ChangeRequest,
     now: i64,
-) -> Result<AssistantChange> {
+) -> Result<BotChange> {
     let change = match request {
         ChangeRequest::UpdateProfile { name, instructions } => {
             ensure!(
@@ -470,12 +464,12 @@ fn resolve(
                 "name or instructions is required"
             );
             let bot = bot_for_conversation_from(connection, network, scope)?
-                .context("this conversation has no assistant profile to change")?;
+                .context("this conversation has no bot profile to change")?;
             if let Some(name) = &name {
                 validate_bot_name(name)?;
                 ensure!(
                     *name != bot.name,
-                    "the assistant is already named {name}; nothing to change"
+                    "the bot is already named {name}; nothing to change"
                 );
             }
             if let Some(instructions) = &instructions {
@@ -485,7 +479,7 @@ fn resolve(
                     "the instructions already read like this; nothing to change"
                 );
             }
-            AssistantChange::Profile {
+            BotChange::Profile {
                 name: name.map(|after| Edit {
                     before: bot.name,
                     after,
@@ -534,7 +528,7 @@ fn resolve(
                 before.as_ref() != Some(&skill),
                 "the skill already reads like this; nothing to change"
             );
-            AssistantChange::Skill {
+            BotChange::Skill {
                 skill_id,
                 before,
                 after: Some(skill),
@@ -543,7 +537,7 @@ fn resolve(
         ChangeRequest::RemoveSkill { skill_id } => {
             let before = skill_from(connection, network, &skill_id)?
                 .with_context(|| format!("skill {skill_id} not found"))?;
-            AssistantChange::Skill {
+            BotChange::Skill {
                 skill_id,
                 before: Some(before),
                 after: None,
@@ -588,7 +582,7 @@ fn resolve(
                 before.as_ref() != Some(&after),
                 "the schedule already has these settings; nothing to change"
             );
-            AssistantChange::Schedule {
+            BotChange::Schedule {
                 schedule_id,
                 before,
                 after: Some(after),
@@ -596,7 +590,7 @@ fn resolve(
         }
         ChangeRequest::RemoveSchedule { schedule_id } => {
             let before = own_schedule(connection, network, scope, &schedule_id)?;
-            AssistantChange::Schedule {
+            BotChange::Schedule {
                 schedule_id,
                 before: Some(before),
                 after: None,
@@ -634,7 +628,7 @@ fn resolve(
             };
             after.validate()?;
             room_for_schedule(connection, network, scope, None, now)?;
-            AssistantChange::Schedule {
+            BotChange::Schedule {
                 schedule_id: format!("schedule-{digest}"),
                 before: None,
                 after: Some(after),
@@ -651,18 +645,18 @@ fn resolve(
                     let before = notes
                         .into_iter()
                         .find(|note| note.memory_id == id)
-                        .with_context(|| format!("note {id} not found for this assistant"))?;
+                        .with_context(|| format!("note {id} not found for this bot"))?;
                     (id, Some(before.text))
                 }
                 None => {
                     ensure!(
                         notes.len() < MAX_MEMORIES,
-                        "this assistant already keeps {MAX_MEMORIES} notes; forget one first"
+                        "this bot already keeps {MAX_MEMORIES} notes; forget one first"
                     );
                     (format!("memory-{digest}"), None)
                 }
             };
-            AssistantChange::Memory {
+            BotChange::Memory {
                 memory_id,
                 before,
                 after: Some(text),
@@ -672,8 +666,8 @@ fn resolve(
             let before = memories_from(connection, network, scope)?
                 .into_iter()
                 .find(|note| note.memory_id == memory_id)
-                .with_context(|| format!("note {memory_id} not found for this assistant"))?;
-            AssistantChange::Memory {
+                .with_context(|| format!("note {memory_id} not found for this bot"))?;
+            BotChange::Memory {
                 memory_id,
                 before: Some(before.text),
                 after: None,
@@ -692,7 +686,7 @@ impl Store {
         clippy::too_many_arguments,
         reason = "the turn, its tool call and the change"
     )]
-    pub fn change_assistant(
+    pub fn change_bot(
         &mut self,
         identity: &crate::crypto::LocalIdentity,
         network: &str,
@@ -735,7 +729,7 @@ impl Store {
             identity,
             network,
             &target,
-            EventBody::AssistantChanged {
+            EventBody::BotChanged {
                 change_id: change_id.clone(),
                 cause,
                 change,
@@ -748,14 +742,14 @@ impl Store {
         Ok((record, true))
     }
 
-    pub fn assistant_change(&self, network: &str, change_id: &str) -> Result<Option<ChangeRecord>> {
+    pub fn bot_change(&self, network: &str, change_id: &str) -> Result<Option<ChangeRecord>> {
         change_from(&self.connection, network, change_id)
     }
 
     /// One conversation's changes in shared order, each at its earliest copy.
-    pub fn assistant_changes(&self, network: &str, scope: &str) -> Result<Vec<ChangeRecord>> {
+    pub fn bot_changes(&self, network: &str, scope: &str) -> Result<Vec<ChangeRecord>> {
         let mut statement = self.connection.prepare(&format!(
-            "SELECT {CHANGE_COLUMNS} FROM assistant_changes WHERE network_id=? AND conversation_id=? ORDER BY rank"
+            "SELECT {CHANGE_COLUMNS} FROM bot_changes WHERE network_id=? AND conversation_id=? ORDER BY rank"
         ))?;
         let rows = statement.query_map(params![network, scope], change_row)?;
         rows.map(|row| with_change(row?)).collect()

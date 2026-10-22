@@ -1,8 +1,8 @@
 # 提醒、联网、记忆、bot 互发消息与 bot 管理
 
-状态为实施中。本文在 [在聊天中修改助手](assistant-config.md) 的事件模型上给协调 Agent 增加六项能力：一次性提醒（与例行任务合并为 schedule）、联网搜索与读取网页、每个 bot 的长期记忆、bot 之间互发消息、bot 创建与配置其他 bot，以及网页上的 schedule 列表。项目尚未发布正式版，事件、表、工具和 RPC 直接改成最终形态，`routine` 一词在代码里全部换成 `schedule`。
+状态为实施中。本文在 [在聊天中修改 Bot](bot-config.md) 的事件模型上给协调 Agent 增加六项能力：一次性提醒（与例行任务合并为 schedule）、联网搜索与读取网页、每个 bot 的长期记忆、bot 之间互发消息、bot 创建与配置其他 bot，以及网页上的 schedule 列表。项目尚未发布正式版，事件、表、工具和 RPC 直接改成最终形态，`routine` 一词在代码里全部换成 `schedule`。
 
-命名：这一层的“助手”统一叫 bot。本文新增的工具、触发类型、事件和字段都用 bot（`message_bot`、`TriggerKind::BotMessage`、`BotMessaged`、`Role::Bot`）。已有的 `AssistantChanged`、`assistant` 提示词键等存量名称留给单独的改名 PR。
+命名：这一层原来的“助手”已统一改叫 bot，代码、事件、表、RPC、提示词和界面文案都用 bot（`message_bot`、`TriggerKind::BotMessage`、`BotMessaged`、`BotChanged`、`Role::Bot`）。聊天消息自己的回复仍用 `Role::Assistant`（`role: "assistant"`），沿用模型对话的 user/assistant 角色，`Role::Bot` 专指另一个 bot 发来的消息。运行 bot 的进程仍叫 Manager。
 
 ## 1. Schedule
 
@@ -45,10 +45,10 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 
 ## 3. 记忆
 
-每个 bot 有自己的短笔记，存成 `AssistantChanged`，随 DAG 在本人的各台 Node 间同步：
+每个 bot 有自己的短笔记，存成 `BotChanged`，随 DAG 在本人的各台 Node 间同步：
 
 ```text
-AssistantChange::Memory { memory_id, before: Option<String>, after: Option<String> }  // after 为空表示忘记
+BotChange::Memory { memory_id, before: Option<String>, after: Option<String> }  // after 为空表示忘记
 ```
 
 | 工具 | 作用 |
@@ -57,7 +57,7 @@ AssistantChange::Memory { memory_id, before: Option<String>, after: Option<Strin
 | `forget {call_ref, memory_id}` | 删除一条 |
 | `recall {query?}` | 列出这个 bot 的笔记，`query` 按子串过滤 |
 
-- 每条最多 500 字符，一行到几行的事实或偏好；每个 bot 最多 50 条。提示词里 `assistant.memory` 带全部笔记，超过 3000 字节的部分省略并给出条数，用 `recall` 取。
+- 每条最多 500 字符，一行到几行的事实或偏好；每个 bot 最多 50 条。提示词里 `bot.memory` 带全部笔记，超过 3000 字节的部分省略并给出条数，用 `recall` 取。
 - 疑似凭证的内容直接拒绝：私钥头、`sk-`、`ghp_`、`github_pat_`、`xox`、`AKIA`、`AIza` 等前缀、`Bearer` 令牌、`password=` 一类赋值，以及 32 个字符以上的连续高熵串。模型密钥从不进入记忆。
 - `remember` 和 `forget` 是设置类：只在本人消息的轮次提供，`cause` 指向那条签名消息，入库时核对，与改名、改说明相同。理由是记忆注入之后每一轮的提示词，作用等同于说明；工作结果、网页和工具输出里的文字不能写进去。`recall` 所有轮次都可用。
 - 投影 `memories` 按 `memory_id` 后写者胜，删除保留墓碑。
@@ -73,7 +73,7 @@ BotMessaged {
 }
 ```
 
-- 工具 `message_bot {call_ref, bot, text}`：`bot` 是对方的会话 ID、bot ID 或名称（不区分大小写，须唯一），不能是自己。提示词的 `assistant.bots` 列出其他 bot 的会话 ID 和名称。
+- 工具 `message_bot {call_ref, bot, text}`：`bot` 是对方的会话 ID、bot ID 或名称（不区分大小写，须唯一），不能是自己。提示词的 `bot.bots` 列出其他 bot 的会话 ID 和名称。
 - 发送方会话的调度 Node 把事件写进对方会话。对方的调度 Node 是自己时直接排 `bot_message:<message_id>`，否则进发件箱，按用户消息的投递路径交给对方的调度 Node，以回执结束。`admit_delivery` 认 `bot_message:` 前缀。同步只存消息，不排任务，所以同步和恢复不会重放唤醒。
 - 重试幂等：同一轮同一 `call_ref` 得到同一个 `message_id`；已存在且内容相同时返回原消息，不同就拒绝。触发器只排一次，所以对方只被唤醒一次。
 - 对方的轮次是 `TriggerKind::BotMessage`，提示词标明发送者，内容是另一个 bot 的请求，不是本人的授权；能派发工作，不能改设置。回复写在对方自己的聊天里，`in_reply_to` 是这条消息。
@@ -90,8 +90,8 @@ BotMessaged {
 
 - 现有可配项只有名称、说明和创建时的项目目录。模型与 provider 是每台 Node 的设置，不属于 bot；skill 是全网共用的库，没有按 bot 绑定；项目目录建后不可改。这三项没有工具，仍在设置页改。
 - 不提供删除 bot：现有网页也没有删除，删除需要另行设计会话、工作和 schedule 的去向。也不提供改本人或设备权限的工具。
-- 授权：网页建 bot 时 `BotCreated` 和首个 `ConversationOwner` 带本人设备签名。bot 在本人消息的轮次里建 bot 时，这两条事件不带签名，改带 `cause: Cause { conversation_id, message_id }`，指向发起轮次那条本人签名消息，并把它列为父事件；入库时与 `AssistantChanged` 一样核对。带 `cause` 的 `ConversationOwner` 只能是 epoch 1，且紧跟同一作者在同一会话写的 `ConversationCreated`，所以不能借本人消息改已有会话的调度 Node。新会话由发起轮次的调度 Node 调度。
-- `configure_bot` 写一条 `AssistantChanged::Profile` 到目标 bot 的会话，`cause` 指向发起会话里的本人消息，所以 `cause` 是带会话 ID 的 `Cause`。变更卡片出现在被改的 bot 的聊天里，`ChangeRecord.conversation_id` 标明它。
+- 授权：网页建 bot 时 `BotCreated` 和首个 `ConversationOwner` 带本人设备签名。bot 在本人消息的轮次里建 bot 时，这两条事件不带签名，改带 `cause: Cause { conversation_id, message_id }`，指向发起轮次那条本人签名消息，并把它列为父事件；入库时与 `BotChanged` 一样核对。带 `cause` 的 `ConversationOwner` 只能是 epoch 1，且紧跟同一作者在同一会话写的 `ConversationCreated`，所以不能借本人消息改已有会话的调度 Node。新会话由发起轮次的调度 Node 调度。
+- `configure_bot` 写一条 `BotChanged::Profile` 到目标 bot 的会话，`cause` 指向发起会话里的本人消息，所以 `cause` 是带会话 ID 的 `Cause`。变更卡片出现在被改的 bot 的聊天里，`ChangeRecord.conversation_id` 标明它。
 - 幂等：`bot_id` 和会话 ID 由（发起会话、trigger、call_ref）的摘要得出，重试返回同一个 bot，定义不同则拒绝。一条本人消息最多建 3 个 bot（`bots.cause` 计数）。
 
 ## 6. 轮次与门控
@@ -117,7 +117,7 @@ BotMessaged {
 
 ## 7. 提示词
 
-`assistant` 增加：
+`bot` 增加：
 
 - `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的；
 - `memory`：`{memory_id, text}`，以及 `memory_omitted`；
