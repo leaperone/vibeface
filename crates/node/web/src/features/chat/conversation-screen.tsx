@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, ArrowUp, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning } from 'lucide-react'
 import { ActionCard, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -110,7 +110,6 @@ export function ConversationScreen() {
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
-  const needsConfirm = checks.length > 0 || Boolean(messagePending && !messageBusy && !assistantBusy)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   if (assistantBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</p> })
 
@@ -136,10 +135,7 @@ export function ConversationScreen() {
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? '上一条消息还没确认送达' : ''
   const toCards = () => document.getElementById('chat-waiting')?.scrollIntoView({ block: 'end', behavior: 'smooth' })
-  // On a short phone the hint is also the way back to the card: one line, not a hint and a link.
-  const confirmFirst = !notice && needsConfirm
-  const hint = notice || (confirmFirst ? <button type="button" className="flex w-fit items-center gap-1 font-medium text-foreground underline underline-offset-4" onClick={toCards}><ArrowUp aria-hidden="true" className="size-4 shrink-0" />先处理上面这件事</button>
-    : bot && !agentReady ? (managerOffline ? '能运行助手的设备离线了' : '暂时没有能运行助手的设备')
+  const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行助手的设备离线了' : '暂时没有能运行助手的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
 
@@ -198,7 +194,7 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} />
-        {cards.length && !confirmFirst ? <button type="button" className="w-fit font-medium text-foreground underline underline-offset-4" onClick={toCards}>去处理</button> : null}
+        {cards.length ? <button type="button" className="w-fit font-medium text-foreground underline underline-offset-4" onClick={toCards}>去处理</button> : null}
         {needsSetup ? <Link to={managerOffline || !ready ? '/devices' : '/devices/$deviceId'} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
       </PromptInput>
     </section>
