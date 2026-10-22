@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { connectDevice, initClient, joinTicket, parseJoinLink, signClient, validTarget } from '../../../transport.js'
+import { connectDevice, initClient, joinTicket, parseJoinLink, replaceClient, signClient, validTarget } from '../../../transport.js'
 import type { DeviceChannel, JoinLink } from '../../../transport.js'
 import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, parseLocalSetup, record, same, text } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PublicIdentity, ReadyConnection } from '@/lib/node'
@@ -595,6 +595,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (active) break
       }
       if (!active) throw new Error('连不上这台设备。')
+      // A browser removed from this network joins again as a new device; its old key stays revoked.
+      if (record(await scoped(active)('authenticate')).revoked === true) {
+        const fresh = publicIdentity(await replaceClient())
+        identityRef.current = fresh; setIdentity(fresh)
+        active = await open(active.entry)
+      }
       const me = own().deviceId
       const nonce = randomHex()
       let response: ReturnType<typeof parseJoinRequest>
@@ -604,7 +610,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (response.status === 'rejected' || response.status === 'expired') throw new Error('此邀请已失效。请在管理设备上重新邀请。')
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
-    } catch (cause) { setError(messageOf(cause)); throw cause }
+    } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
   }
   async function checkJoin() {
     const pending = joiningRef.current

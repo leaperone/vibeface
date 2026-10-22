@@ -46,10 +46,11 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
 }
 
 /** The workspace state of one connected browser; React hooks are replayed by hand, one render per call. */
-function workspace(source: 'membership' | 'local_session') {
+function workspace(source: 'membership' | 'local_session', readBefore: string[] | null) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = []
   const rpcs: string[] = [], stored = new Map<string, string>()
+  if (readBefore) stored.set(`vibeface.read-before.${browser}.${network}`, JSON.stringify(readBefore))
   let cursor = 0
   const react = {
     createContext: () => ({ Provider: 'provider' }), useContext: () => null,
@@ -112,11 +113,11 @@ function workspace(source: 'membership' | 'local_session') {
     afterRender.splice(0).forEach(run => run())
     return value
   }
-  return { render, rpcs, writes, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, rpcs, writes, stored, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
-async function open(source: 'membership' | 'local_session') {
-  const app = workspace(source)
+async function open(source: 'membership' | 'local_session', readBefore: string[] | null = []) {
+  const app = workspace(source, readBefore)
   for (let i = 0; i < 6; i++) { app.render(); await settle() }
   app.render().setView('chat')
   for (let i = 0; i < 3; i++) { app.render(); await settle() }
@@ -159,5 +160,15 @@ test('a member reads its notifications and can answer', async () => {
     assert.equal(app.rpcs.filter(method => method === 'ack').length, 1, 'read once, then the notification is gone')
     assert.equal((await app.render().answer(question, '继续')).status, 'answered')
     assert.equal(app.render().joined, true)
+  } finally { app.close() }
+})
+
+test('a new device starts with the history read and sends no read receipts for it', async () => {
+  const app = await open('membership', null)
+  try {
+    for (let tick = 0; tick < 3; tick++) { await app.render().refresh(); await settle() }
+    assert.deepEqual(app.render().notifications, [])
+    assert.equal(app.rpcs.filter(method => method === 'ack').length, 0)
+    assert.equal(app.stored.get(`vibeface.read-before.${browser}.${network}`), JSON.stringify(['n-1']))
   } finally { app.close() }
 })
