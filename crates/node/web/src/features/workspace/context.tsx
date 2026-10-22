@@ -233,6 +233,13 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     }
     writeStorage(networkKey("seen", networkId), [...seen].slice(-1000))
   }
+  /** A device starts with the history it found read: what waited on its first full read never counts as unread here. */
+  const unreadSince = (items: NotificationRecord[], first = false) => {
+    const key = networkKey(`read-before.${clientId}`, networkId)
+    const before = readStorage<string[] | null>(key, null)
+    if (!before && first) { writeStorage(key, items.map((item) => item.notification_id)); return [] }
+    return before ? items.filter((item) => !before.includes(item.notification_id)) : items
+  }
   const scheduleRefresh = () => {
     if (!current() || refreshTimer.current !== null) return
     refreshTimer.current = window.setTimeout(() => {
@@ -251,7 +258,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
         connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("questions"), connection.rpc("open_works"),
       ])
       requireCurrent()
-      const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
+      const nextNodes = parseNodes(rawNodes), nextNotifications = unreadSince(parseNotifications(rawNotifications), true)
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
       openWorksRef.current = parseOpenWorks(rawWorks)
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
@@ -279,7 +286,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   refreshRef.current = refresh
   /** One pushed change merged in place; a full read only when a read races it or it does not parse. */
   const applyRecords = async (value: Record<string, unknown>) => {
-    const records = parseRecords(value), id = records.conversation_id
+    const parsed = parseRecords(value), records = { ...parsed, notifications: unreadSince(parsed.notifications) }, id = records.conversation_id
     if (refreshingRef.current) scheduleRefresh()
     setQuestions((previous) => mergeQuestions(previous, records))
     setBots((previous) => mergeBots(previous, records))

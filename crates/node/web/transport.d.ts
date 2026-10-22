@@ -5,6 +5,7 @@ export type DeviceChannel = {
 }
 export type JoinLink = { origin: string | null; entryId: string; inviteId: string; inviteHash: string; secret: string }
 export function initClient(options?: { replaceLostKey?: boolean }): Promise<{ deviceId: string }>
+export function replaceClient(): Promise<{ deviceId: string }>
 export function connectDevice(entry: { address: string; device_id: string; local?: boolean }, options?: {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void

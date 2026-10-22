@@ -22,7 +22,7 @@ function SettingsPage() {
   const [theme, setThemeState] = useState(readTheme)
   const [leaving, setLeaving] = useState(false)
   const [range, setRange] = useState(86_400_000)
-  return <div className="mx-auto grid max-w-2xl gap-6">
+  return <div className="mx-auto grid w-full max-w-3xl gap-6">
     <section className="grid gap-3">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><Bell aria-hidden="true" className="size-5" />提醒</h2>
       <Button type="button" variant="secondary" className="w-fit" disabled={workspace.notificationButton.disabled} onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>

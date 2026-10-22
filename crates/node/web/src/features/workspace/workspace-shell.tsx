@@ -6,7 +6,7 @@ import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Pl
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { Skeleton, toast } from "@/components/app/kit"
+import { EmptyState, Skeleton, toast } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
@@ -255,12 +255,14 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
-      {onLeave ? <div className="flex flex-wrap justify-center gap-2 px-4 pt-6">
-        {retry !== null && onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
-        <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button>
-      </div> : null}
-      {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}
-      <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>
+      {retry !== null ? <EmptyState icon={WifiOff} title="连不上设备" className="my-auto" action={<div className="flex flex-wrap justify-center gap-2">
+        {onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
+        {onLeave ? <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button> : null}
+      </div>} /> : <>
+        {onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
+        {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}
+        <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>
+      </>}
     </div>
   </div>
 }

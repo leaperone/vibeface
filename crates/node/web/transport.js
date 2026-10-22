@@ -80,6 +80,14 @@ export async function initClient({ replaceLostKey = false } = {}) {
   return initializing;
 }
 
+/** A new device key for a browser removed from its network; the old key stays revoked there and is dropped here. */
+export async function replaceClient() {
+  await initClient();
+  await keys("readwrite", (store) => store.delete("device"));
+  device = undefined; initializing = undefined;
+  return initClient({ replaceLostKey: true });
+}
+
 /** The device key is a non-extractable Ed25519 CryptoKey; page scripts can only ask it to sign. */
 async function loadDevice(replaceLostKey) {
   await init();

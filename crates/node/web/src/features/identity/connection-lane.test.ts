@@ -47,8 +47,8 @@ const until = async (ready: () => boolean) => {
   }
 }
 
-const remote = '6'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>() } = {}) {
+const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -83,9 +83,11 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   // A cookie-bound local session only exists after a launch on this origin, which the browser remembers.
   if (localSession) stored.set('vibeface.local-origin', 'true')
+  let key = subject
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
-    initClient: async () => ({ deviceId: subject }), signClient: async () => 'signature',
+    initClient: async () => ({ deviceId: key }), signClient: async () => 'signature',
+    replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
     parseJoinLink: async () => ({ origin: entry.address, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
     async connectDevice(candidate: ConnectionEntry, options: { onClose(cause: Error): void; signal: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
@@ -102,8 +104,9 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         const initialized = !bootstrap && local !== 'fresh' && candidate.device_id !== remote
         if (method === 'info') return { device_id: candidate.device_id, name: 'node', version: 'test', initialized, network_id: initialized ? network : null }
         if (method === 'authenticate' && localSession) return { principal: { network_id: network } }
+        if (method === 'authenticate' && removed && key === subject) return { principal: null, initialized: true, network_id: network, revoked: true }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
-        if (method === 'join') return joinRequest('pending')
+        if (method === 'join') return joinRequest('pending', { device_id: params.public_key })
         if (method === 'join_status' && !params.join_id) return { requests: managed.value }
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
         if (method === 'directory') return { state: { genesis }, view: secure.verifiedView() }
@@ -392,6 +395,19 @@ test('joining commits first, reveals only after the manager nonce, then shows th
     assert.equal(app.render().joining, null)
     assert.equal(app.stored.get('vibeface.pending-join'), 'null')
     assert.equal(app.requests.filter(request => request.method === 'join').length, 1)
+    assert.equal(app.calls.includes('replace-key'), false)
+  } finally { app.close() }
+})
+
+test('a removed browser joins again as a new device and never offers its revoked key', async () => {
+  const app = deviceHarness({ removed: true })
+  try {
+    app.render(); await settle()
+    app.joinStatus.value = joinRequest('pending', { device_id: freshKey })
+    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    assert.deepEqual(app.requests.filter(request => request.method === 'join').map(request => request.params.public_key), [freshKey])
+    assert.equal(app.render().identity?.deviceId, freshKey)
+    assert.equal(app.render().joining?.status, 'pending')
   } finally { app.close() }
 })
 

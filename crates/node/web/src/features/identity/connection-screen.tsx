@@ -300,11 +300,14 @@ type Run = (action: () => Promise<void>) => Promise<void>
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: { computer: string; browser: string }; onBack(): void; run: Run }) {
   const device = useDevice()
   const [show, setShow] = useState(false)
+  const [short, setShort] = useState(false)
   return <Panel icon={FileKey} title="设置恢复">
     <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
-    <form className="grid gap-4" onSubmit={(event) => {
+    <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
+      const input = form.elements.namedItem('password') as HTMLInputElement
+      if ([...input.value].length < 12) { setShort(true); input.focus(); return }
       void run(async () => {
         try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password'), value(form, 'password')), names.computer) }
         finally { form.reset() }
@@ -313,10 +316,10 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <Field label="恢复密码">
           <span className="flex gap-2">
-            <Input type={show ? 'text' : 'password'} name="password" autoComplete="new-password" minLength={12} required />
+            <Input type={show ? 'text' : 'password'} name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
             <Button type="button" variant="ghost" size="icon" aria-label={show ? '隐藏密码' : '显示密码'} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
           </span>
-          <span className="font-normal text-muted-foreground">至少 12 个字符，忘了就无法找回</span>
+          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 12 个字符，忘了就无法找回</span>
         </Field>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
