@@ -10,11 +10,13 @@ if ! command -v pnpm >/dev/null; then
   echo 'pnpm 11.9.0 is required to build the web client.' >&2
   exit 1
 fi
-pnpm install --frozen-lockfile --filter "vibeface-web..."
+pnpm install --frozen-lockfile --filter "vibeface-web..." --filter "vibeface-mobile..."
 pnpm run generate-routes
 pnpm run test
 pnpm run typecheck
 pnpm --filter @vibeface/client run test
 pnpm --filter @vibeface/client run typecheck
+pnpm --filter @vibeface/secure-native run typecheck
+pnpm --filter vibeface-mobile run typecheck
 pnpm run build
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }
