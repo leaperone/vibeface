@@ -424,7 +424,9 @@ fn steerable_text(
     }
     Ok(
         message_from(connection, network, &job.conversation_id, &job.reply_to)?
-            .filter(|message| message.blobs.is_empty() && message.report_results != Some(false))
+            .filter(|message| {
+                message.attachments.is_empty() && message.report_results != Some(false)
+            })
             .map(|message| message.text),
     )
 }
