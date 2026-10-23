@@ -193,6 +193,26 @@ fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Resu
         .optional()?)
 }
 
+/// A turn this device's coordination Agent or a bot's reply runs: it answers in its own chat,
+/// so its events are not news for the Agent. A request a bot's reply thread holds still goes
+/// to the Agent, the only one who can answer it.
+fn own_turn(store: &crate::store::Store, event: &AgentEvent) -> Result<bool> {
+    let coordination = store
+        .connection
+        .query_row(
+            "SELECT 1 FROM coordination_threads WHERE thread_id=?",
+            [&event.session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(coordination
+        || (event.request_id.is_none()
+            && store
+                .native_thread_conversation(&event.session_id)?
+                .is_some()))
+}
+
 fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
     connection.execute(
         "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
@@ -276,6 +296,9 @@ impl Runtime {
             return Ok(json!({"status":"dropped","event_id":event.event_id}));
         }
         let mut store = self.store.lock().await;
+        if own_turn(&store, &event)? {
+            return Ok(json!({"status":"own","event_id":event.event_id}));
+        }
         if owner(&store, &network, &event)?.is_none() {
             let question = self.ask_about_session(&mut store, &network, &event)?;
             drop(store);
@@ -623,14 +646,18 @@ impl Runtime {
             ..self.manager_config(settings)
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
-        manager::run_manager(
-            &config,
-            &prompt(&cli)?,
-            None,
-            |_| async { Ok(()) },
-            cancel,
-            |_| async { Ok(()) },
-        )
+        // Kept before the turn starts, so its hooks, scans and App Server events are known.
+        let record = |thread: String| async move {
+            self.store.lock().await.connection.execute(
+                "INSERT INTO coordination_threads(thread_id,created_ms) VALUES(?,?)
+                 ON CONFLICT(thread_id) DO NOTHING",
+                params![thread, now_ms()],
+            )?;
+            Ok(())
+        };
+        manager::run_manager(&config, &prompt(&cli)?, None, record, cancel, |_| async {
+            Ok(())
+        })
         .await
         .map(|_| ())
     }
@@ -1136,6 +1163,10 @@ impl Runtime {
             store
                 .connection
                 .execute("DELETE FROM triage_handled WHERE ts_ms<?", [cutoff])?;
+            store.connection.execute(
+                "DELETE FROM coordination_threads WHERE created_ms<?",
+                [cutoff],
+            )?;
         }
         if !self.triage.config().scan_codex_sessions {
             return Ok(());
@@ -2170,11 +2201,20 @@ mod tests {
             let event = node
                 .ingest_agent_event(turn("bot-thread", "t1", "/w"))
                 .await?;
-            assert_eq!(event["status"], "accepted");
+            assert_eq!(event["status"], "own");
             assert!(
                 unanswered(&node).await?.is_empty(),
                 "no question about a bot's own thread"
             );
+            assert!(
+                node.pending_events().await?.is_empty(),
+                "a bot's own turn does not wake the Agent"
+            );
+            let held = AgentEvent {
+                request_id: Some("r1".into()),
+                ..turn("bot-thread", "request:r1", "/w")
+            };
+            assert_eq!(node.queue_event(held).await?["status"], "accepted");
 
             let access = Access {
                 network_id: network.clone(),
@@ -2199,6 +2239,69 @@ mod tests {
                 refused.to_string().contains("own reply thread"),
                 "{refused:#}"
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// The coordination Agent's own Codex thread is known before its turn starts: its hook,
+    /// scan and App Server events, requests included, neither ask the user nor wake the Agent.
+    #[tokio::test]
+    async fn the_coordination_agents_thread_is_not_triaged() -> Result<()> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        while let Some(Ok(message)) = server.next().await {
+                            let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                            else {
+                                continue;
+                            };
+                            if request.get("id").is_none() {
+                                continue;
+                            }
+                            let result = match request["method"].as_str() {
+                                Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                                Some("thread/start") => json!({"thread":{"id":"coord-thread"}}),
+                                Some("turn/start") => json!({"turn":{"id":"coord-turn"}}),
+                                _ => json!({}),
+                            };
+                            let mut replies = vec![json!({"id":request["id"],"result":result})];
+                            if request["method"] == "turn/start" {
+                                replies.push(json!({"method":"turn/completed","params":{
+                                    "threadId":"coord-thread",
+                                    "turn":{"id":"coord-turn","status":"completed"}}}));
+                            }
+                            for reply in replies {
+                                let _ = server.send(reply.to_string().into()).await;
+                            }
+                        }
+                    });
+                }
+            });
+            node.coordination_turn(|_| Ok("triage".into())).await?;
+
+            let ended = node
+                .ingest_agent_event(turn("coord-thread", "coord-turn", "/tmp"))
+                .await?;
+            assert_eq!(ended["status"], "own");
+            let held = AgentEvent {
+                request_id: Some("r1".into()),
+                ..turn("coord-thread", "request:r1", "/tmp")
+            };
+            assert_eq!(node.queue_event(held).await?["status"], "own");
+            assert!(unanswered(&node).await?.is_empty(), "no question about it");
+            assert!(node.pending_events().await?.is_empty(), "nothing queued");
             Ok::<_, anyhow::Error>(())
         }
         .await;
