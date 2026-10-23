@@ -100,7 +100,7 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
       <View className="min-w-0 flex-1 flex-row flex-wrap items-center gap-x-1.5">
         {/* The crown sits inside the name's text, so it follows the last word however the name wraps. */}
-        <Text numberOfLines={2} className="shrink font-medium">{member.name}{member.admin ? <>{' '}<Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /></> : null}</Text>
+        <Text numberOfLines={2} className="shrink font-medium">{member.name}{member.admin ? <>{' '}<Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: -1.5 }] }} /></> : null}</Text>
         {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
       </View>
       <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
