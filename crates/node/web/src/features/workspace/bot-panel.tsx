@@ -103,12 +103,12 @@ export function BotPanelButton() {
           </Section> : null}
           <section className="grid gap-3 rounded-xl border border-danger-border p-4">
             {deleting ? <>
-              <p>删除后这个 bot 不再回复，定时任务停止，聊天记录保留。</p>
+              <p>删除后这个 Bot 不再回复，定时任务停止，聊天记录保留。</p>
               <div className="flex flex-wrap justify-end gap-2">
                 <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
-                <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); setOpen(false); void navigate({ to: "/" }) }}><Trash2 aria-hidden="true" />删除 bot</ActionButton>
+                <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); setOpen(false); void navigate({ to: "/" }) }}><Trash2 aria-hidden="true" />删除 Bot</ActionButton>
               </div>
-            </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" disabled={!workspace.writable} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除 bot</Button>}
+            </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" disabled={!workspace.writable} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除 Bot</Button>}
           </section>
         </div> : null}
       </SheetContent>

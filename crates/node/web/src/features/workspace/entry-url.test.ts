@@ -699,7 +699,7 @@ test("artifact reads retain their offset while old responses cannot append or un
   let currentWorkspace = workspace()
   const app = componentHarness('../chat/elements/artifact.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/workspace/model': { formatSize } })
   const render = () => app.render('Artifact', { file: { hash: 'result', size: 5, name: 'notes.txt' } })
-  const open = () => render().find(({ props }) => props.children === '打开')?.props
+  const open = () => render().find(({ props }) => props.label === '打开')?.props
   try {
     open()?.action?.(); assert.equal(open()?.disabled, true)
     const old = work

@@ -114,12 +114,13 @@ let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
 export function dismissToast(id: number) { toasts = toasts.filter((item) => item.id !== id); emitToasts() }
-/** `persist`: stays until closed, for a message the person must act on. */
+/** `persist`: stays until closed, for a message the person must act on. Returns the id for `dismissToast`. */
 export function toast(text: string, options: { tone?: Tone; action?: ToastItem["action"]; persist?: boolean } = {}) {
   const item = { id: ++toastId, text, tone: options.tone ?? "neutral", action: options.action }
   toasts = [...toasts, item].slice(-2)
   emitToasts()
   if (!options.persist) setTimeout(() => dismissToast(item.id), item.action ? 8000 : 3000)
+  return item.id
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 

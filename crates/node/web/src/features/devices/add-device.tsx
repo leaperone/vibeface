@@ -36,6 +36,13 @@ export function AddDevice() {
   const [status, setStatus] = useState("")
   // This page allowed the device, so it says so where the link was rather than only in a toast.
   const [added, setAdded] = useState<string | null>(null)
+  // "已复制" shows on the button itself for a moment.
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
   // A join request is the next thing to act on, so it takes the only solid button.
   const requests = useOpenJoins().length > 0
   // A link is single-use: once a device has answered it, it is spent.
@@ -65,11 +72,11 @@ export function AddDevice() {
     const invitation = await device.createInvitation()
     if (connection?.isCurrent()) setResult(share(invitation))
   }, "") }
-  const copy = (value: string) => void run(() => navigator.clipboard.writeText(value), "已复制")
+  const copy = (value: string) => void run(async () => { await navigator.clipboard.writeText(value); if (ready?.isCurrent()) setCopied(true) }, "")
   const local = result ? isLoopback(result.link) : false
 
   return <>
-    <Button type="button" variant={requests ? "outline" : "default"} onClick={() => setOpen(true)}><Plus aria-hidden="true" />添加设备</Button>
+    <Button type="button" variant={requests ? "outline" : "default"} onClick={() => { setOpen(true); if (!result && !requests) generate() }}><Plus aria-hidden="true" />添加设备</Button>
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
@@ -86,7 +93,7 @@ export function AddDevice() {
               <p className="flex items-center gap-1.5 text-muted-foreground"><TriangleAlert aria-hidden="true" className="size-4 shrink-0" />{local ? "手机相机打不开本机地址" : "还没设置访问地址，手机相机打不开"}</p>
               <Button asChild variant="outline" className="w-fit"><Link to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>设置访问地址</Link></Button>
             </div>}
-            <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}><Copy aria-hidden="true" />复制链接</Button>
+            <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? "已复制" : "复制链接"}</Button>
             <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</p>
             <Details label="链接原文">
               <Textarea readOnly className="min-h-24 font-mono text-meta" value={result.link} onFocus={(event) => event.target.select()} />
