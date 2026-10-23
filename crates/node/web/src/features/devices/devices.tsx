@@ -170,17 +170,15 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
     </Details>
 
-    {canManage && row.member && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
-      {removing ? <>
-        <p>移除后这台设备无法再连接，已有的对话记录会保留。</p>
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button type="button" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
-          <Button type="button" variant="destructive" disabled={action.busy !== null} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
-            <RemoveIcon aria-hidden="true" />{action.busy === "remove" ? "移除中" : "移除设备"}
-          </Button>
-        </div>
-        {action.errorKey === "remove" ? <InlineError error={action.error} /> : null}
-      </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button>}
-    </section> : null}
+    {canManage && row.member && !row.entry && !row.browser ? removing ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
+      <p>移除后这台设备无法再连接，已有的对话记录会保留。</p>
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button type="button" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
+        <Button type="button" variant="destructive" disabled={action.busy !== null} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
+          <RemoveIcon aria-hidden="true" />{action.busy === "remove" ? "移除中" : "移除设备"}
+        </Button>
+      </div>
+      {action.errorKey === "remove" ? <InlineError error={action.error} /> : null}
+    </section> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button> : null}
   </div>
 }

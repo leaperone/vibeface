@@ -169,6 +169,7 @@
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作 |
 | `reply_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，为其中仍未回复的消息排队回复，返回 `{receipts}`；重试不会再排 |
+| `dismiss_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，把其中仍未回复的消息记为开始前已取消，不再列出也不执行，返回 `{receipts}`；重试不会再记 |
 | `interrupt_work` | `conversation_id`、`work_id` | 中断工作及它委派出的工作；目标在其他 Node 时由入口转发和重试 |
 | `codex` | `method`、可选 `params`、`node` | 调用 App Server 名单里非 `hidden` 的方法，结果经 `sanitize`；`node` 为其他设备时经成员连接转发 |
 | `codex_state` | 可选 `node` | App Server 状态摘要 `{connection, threads: [{thread_id, name, status, cwd, plan, reasoning, token_usage}], rate_limits}`；网页不调用 App Server 方法 |
@@ -205,7 +206,7 @@
 
 回合以 `owner_epoch` 为 fence。领取 job 时记下当时的 `owner_epoch`，之后工具调用的权限检查要求本机仍是负责人且 epoch 未变，换走再换回也算失效。旧负责人收到更高 epoch 的 `conversation_owner` 后立即拒绝该回合的后续工具写入，并走停止回复的取消路径结束它：取消得到确认时回复状态为已停止，未确认时记为中断并留待核对，不重做也不交给新负责人重放。Agent 任务在工作所在设备运行，不受负责人 fence。
 
-新负责人从共享记录推导旧负责人留下的未回复消息，列在 `conversation` 调度队列的 `unanswered` 里，按会话顺序给出。未回复指本会话的本人消息没有 `status = completed` 的回复，没有 `message_steered` 记录，本机也没有它的 job 或 outbox 条目。只有本机是负责人且 bot 未删除时才列出。网页显示“N 条未回复，在这台设备回复？”，本人确认后经 `reply_unanswered` 在本机排队，不会自动重放。排队按 trigger 去重，重试不会再排，结果未知时重读会话即可对账。回复 ID 由 `(会话, trigger, owner_epoch)` 派生，所以新负责人的回复不会和旧负责人已写的停止或中断回复冲突。
+新负责人从共享记录推导旧负责人留下的未回复消息，列在 `conversation` 调度队列的 `unanswered` 里，按会话顺序给出。未回复指本会话的本人消息没有 `status = completed` 的回复，没有 `message_steered` 记录，本机也没有它的 job 或 outbox 条目。只有本机是负责人且 bot 未删除时才列出。网页显示“N 条消息没等到回复”，本人选择回复后经 `reply_unanswered` 在本机排队，不会自动重放；选择“不回复”则经 `dismiss_unanswered` 在本机把它们记为开始前已取消，不执行任何操作。这条记录和队列一样只在本机：会话再换到第三台设备时，那里会重新列出，仍需本人决定。排队按 trigger 去重，重试不会再排，结果未知时重读会话即可对账。回复 ID 由 `(会话, trigger, owner_epoch)` 派生，所以新负责人的回复不会和旧负责人已写的停止或中断回复冲突。
 
 每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果、schedule 和 bot 消息。每轮按领取时固定的版本向量 `basis` 准备上下文。排在后面的消息因此能读到前一条的回复。提示总长不超过 50000 字节，bot 指令和 schedule prompt 各以 8 KB 封顶并计入总长。Codex 线程在 `thread/start` 和 `thread/resume` 的 `developerInstructions` 里收到 CLI 说明、全部工具目录和固定规则，回合消息只带本轮角色和数据：续接的线程只收到新消息、变化过的工作（`works_unchanged` 计其余条数）和变化过的 bot（未变时为 `{"unchanged":true}`），`trigger.unavailable_tools` 列出本轮不提供的工具。线程看过的 bot 和工作摘要随 `covers` 存在本机会话里。会话键含线程指令的摘要，指令变化就开新线程；模型不在 Codex 会话键里，按回合经 `turn/start` 传。Cursor 每轮提示仍带全部规则和上下文，模型变化开新会话。超出时依次收缩工作列表、检查点和较早的消息，不让这一轮失败。工作列表、记忆和消息都从新到旧取到各自预算为止，再按时间顺序给出，并附省略条数。
 

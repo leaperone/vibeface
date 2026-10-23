@@ -578,11 +578,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
     }),
-    /** Queuing is keyed by message, so an unknown outcome is settled by reading the conversation again. */
-    replyUnanswered: (messageIds: string[]) => withMutation(`unanswered:${activeId.current}`, async () => {
+    /** Replying or declining is keyed by message, so an unknown outcome is settled by reading the conversation again. */
+    settleUnanswered: (messageIds: string[], choice: "reply" | "dismiss") => withMutation(`unanswered:${activeId.current}`, async () => {
       const id = activeId.current
       requireBotContext(id)
-      try { await connection.rpc("reply_unanswered", { conversation_id: id, message_ids: messageIds }) }
+      try { await connection.rpc(`${choice}_unanswered`, { conversation_id: id, message_ids: messageIds }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()

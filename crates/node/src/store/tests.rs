@@ -4250,6 +4250,70 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     Ok(())
 }
 
+/// Declining replies to what a former owner left ends them here before they start: they are
+/// no longer listed, never run, and neither a retry nor a later reply request queues them.
+#[test]
+fn a_new_owner_declines_what_the_old_one_left_unanswered_once() -> Result<()> {
+    let net = net()?;
+    let mut a_side = store(&net)?;
+    conversation(&mut a_side, &net)?;
+    a_side.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+    a_side.append_event(&net.a, &net.network, "c", user(&net, "m2", "y"), vec![], 3)?;
+    let mut b_side = store(&net)?;
+    sync(&a_side, &mut b_side, &net)?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        4,
+    )?;
+    let b = net.b.device_id()?;
+    assert_eq!(
+        b_side.unanswered_messages(&net.network, &b, "c")?,
+        ["m1", "m2"]
+    );
+
+    let declined = ["m1".to_owned()];
+    let receipts = b_side.dismiss_unanswered(&net.network, &b, "c", &declined)?;
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.trigger.as_str(), r.state.as_str()))
+            .collect::<Vec<_>>(),
+        [(message_trigger("m1").as_str(), "cancelled")]
+    );
+    assert!(
+        b_side
+            .dismiss_unanswered(&net.network, &b, "c", &declined)?
+            .is_empty()
+    );
+    assert_eq!(b_side.unanswered_messages(&net.network, &b, "c")?, ["m2"]);
+
+    let both = ["m1".to_owned(), "m2".to_owned()];
+    let queued = b_side.reply_unanswered(&net.network, &b, "c", &both)?;
+    assert_eq!(
+        queued
+            .iter()
+            .map(|r| r.trigger.as_str())
+            .collect::<Vec<_>>(),
+        [message_trigger("m2").as_str()]
+    );
+    let claimed = b_side
+        .claim_next(&net.b, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    assert_eq!(claimed.job.trigger, message_trigger("m2"));
+    assert!(matches!(
+        b_side
+            .scheduler_job("c", &message_trigger("m1"))?
+            .context("declined job")?
+            .state,
+        JobState::Cancelled { attempt: None, .. }
+    ));
+    Ok(())
+}
+
 /// A resumed Codex turn carries its role, the new messages, the works that changed and the bot
 /// only when it changed; the shared rules live in the thread's instructions. Cursor still
 /// reads everything in each prompt.

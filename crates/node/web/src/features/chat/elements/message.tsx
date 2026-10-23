@@ -1,10 +1,11 @@
-import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, LoaderCircle, Merge } from 'lucide-react'
+import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, LoaderCircle, Merge, RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { Markdown, PlainText } from '@/components/app/markdown'
 import { messageKey, replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import { Artifact } from './artifact'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { ActionButton } from '@/features/workspace/present'
 import type { SteerOutcome } from '@vibeface/client/workspace/types.ts'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
@@ -40,9 +41,9 @@ export function FoldedText({ text }: { text: string }) {
 /**
  * One message: the person's in a bubble, the bot's as plain text across the full width, another bot's in a
  * card under its name. `last` marks the end of a run from the same sender, where the time shows. `schedule` names
- * the schedule whose run produced this reply.
+ * the schedule whose run produced this reply. `retry` sends the person's message again after this reply failed.
  */
-export function Message({ message, schedule, last = true }: { message: ChatMessage; schedule?: string; last?: boolean }) {
+export function Message({ message, schedule, last = true, retry }: { message: ChatMessage; schedule?: string; last?: boolean; retry?: () => Promise<void> }) {
   const { connectionOnline } = useWorkspace()
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
@@ -78,7 +79,10 @@ export function Message({ message, schedule, last = true }: { message: ChatMessa
       <Markdown text={message.text} />
     </div>
     {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className={`size-4 text-muted-foreground ${connectionOnline ? 'animate-spin' : ''}`} /> : null}
-    {ended === '失败' ? <span className="flex items-center gap-1 text-meta text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
+    {ended === '失败' ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta">
+      <span className="flex items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
+      {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : null}
+    </span>
       : ended ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}</span> : null}
     {time}
   </div>
