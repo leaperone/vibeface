@@ -2,7 +2,7 @@ use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
     scheduling::{
-        JobOutcome, JobState, SchedulerJob, SteerOutcome, TriggerKind, bot_message_trigger,
+        JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, bot_message_trigger,
         message_trigger, schedule_trigger, work_trigger,
     },
     work::{Signal, WorkSpec},
@@ -613,9 +613,15 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     say(&mut store, &net, "quiet", false)?;
     let candidates = |store: &Store| store.steer_candidates(&net.network, &local, "boot");
     assert!(candidates(&store)?.is_empty());
-    store.record_manager_turn(&attempt, "system", "thread", None)?;
+    store.record_manager_turn(&attempt, "system", "thread", None, &Default::default())?;
     assert!(candidates(&store)?.is_empty());
-    store.record_manager_turn(&attempt, "system", "thread", Some("turn"))?;
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn"),
+        &Default::default(),
+    )?;
     // A reply left running by an earlier process is never a target.
     assert!(
         store
@@ -694,7 +700,13 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     // Stopping a steered message stops the reply it went into.
     let attempt = next.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &next.job.trigger, &attempt)?;
-    store.record_manager_turn(&attempt, "system", "thread", Some("turn-2"))?;
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn-2"),
+        &Default::default(),
+    )?;
     say(&mut store, &net, "m3", true)?;
     let found = candidates(&store)?;
     assert_eq!(found.len(), 1);
@@ -3714,7 +3726,8 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         state: JobState::Queued,
     };
     let materialize = |bot: Value| {
-        crate::scheduler::materialize(&context, &job, &works, bot, None, None, &[], None)
+        crate::scheduler::materialize(&context, &job, &works, bot, None, None, &[], None, None)
+            .map(|(prompt, _)| prompt)
     };
     let newest = json!(
         context
@@ -3913,9 +3926,15 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
             let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
             store.mark_started("c", &trigger, &attempt)?;
             store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
-            store.record_manager_turn(&attempt, "system", "thread", None)?;
+            store.record_manager_turn(&attempt, "system", "thread", None, &Default::default())?;
             let outcome = if started {
-                store.record_manager_turn(&attempt, "system", "thread", Some("turn"))?;
+                store.record_manager_turn(
+                    &attempt,
+                    "system",
+                    "thread",
+                    Some("turn"),
+                    &Default::default(),
+                )?;
                 JobOutcome::Completed
             } else {
                 JobOutcome::Failed("the model is unknown".into())
@@ -3990,5 +4009,163 @@ fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
     );
     store.fence_moved_turns(&net.network, &local)?;
     assert_eq!(handed(&store)?, [trigger]);
+    Ok(())
+}
+
+/// A resumed Codex turn carries its role, the new messages, the works that changed and the bot
+/// only when it changed; the shared rules live in the thread's instructions. Cursor still
+/// reads everything in each prompt.
+#[test]
+fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let work = |i: u64| -> Result<WorkSpec> {
+        Ok(WorkSpec {
+            work_id: format!("w{i}"),
+            conversation: "c".into(),
+            trigger: message_trigger("m1"),
+            target: net.a.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: format!("call-{i}"),
+            kind: WorkKind::Codex,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            prompt: "p".repeat(300),
+            continues: None,
+            parent: None,
+            thread: None,
+        })
+    };
+    for i in 0..3 {
+        store.accept_work(&net.a, &net.network, work(i)?, 10 + i as i64)?;
+    }
+    let render = |store: &Store, trigger: &str, resumed, thread| {
+        let context = store.context(&net.network, "c", None)?;
+        let job = SchedulerJob {
+            conversation_id: "c".into(),
+            trigger: message_trigger(trigger),
+            kind: TriggerKind::Human,
+            sequence: 0,
+            basis: context.basis.clone(),
+            reply_to: trigger.into(),
+            message_id: "reply".into(),
+            state: JobState::Queued,
+        };
+        let works = store.works(&net.network, "c")?;
+        let bot = crate::scheduler::bot_value(store, &net.network, "c", 100)?;
+        let rendered = crate::scheduler::materialize(
+            &context,
+            &job,
+            &works,
+            bot,
+            None,
+            None,
+            &[],
+            resumed,
+            thread,
+        )?;
+        Ok::<_, anyhow::Error>((rendered, context.basis))
+    };
+    let rule = "Operate only inside this personal network";
+
+    let ((cursor, _), _) = render(&store, "m1", None, None)?;
+    assert!(
+        cursor.contains(rule),
+        "Cursor reads the rules in each prompt"
+    );
+    let fresh = Shown::default();
+    let ((first, shown), covers) = render(&store, "m1", None, Some(&fresh))?;
+    assert!(!first.contains(rule), "the rules are thread instructions");
+    let data = prompt_data(&first)?;
+    assert_eq!(data["bot"]["configured_bot"]["name"], "Helper");
+    assert_eq!(listed(&data, "/works", "work_id").len(), 3);
+    assert_eq!(data["trigger"]["unavailable_tools"], json!([]));
+
+    store.accept_work(&net.a, &net.network, work(3)?, 20)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m2", "next"),
+        vec![],
+        21,
+    )?;
+    let ((resumed, shown), covers) = render(&store, "m2", Some(&covers), Some(&shown))?;
+    let data = prompt_data(&resumed)?;
+    assert_eq!(data["bot"], json!({"unchanged":true,"now_ms":100}));
+    assert_eq!(listed(&data, "/works", "work_id"), [json!("w3")]);
+    assert_eq!(data["works_unchanged"], 3);
+    assert_eq!(
+        listed(&data, "/conversation/messages", "text"),
+        [json!("next")]
+    );
+
+    store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m2",
+        "note",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "prefers short replies".into(),
+        },
+        22,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m3", "again"),
+        vec![],
+        23,
+    )?;
+    let ((changed, _), _) = render(&store, "m3", Some(&covers), Some(&shown))?;
+    let data = prompt_data(&changed)?;
+    assert_eq!(data["bot"]["memory"][0]["text"], "prefers short replies");
+    assert_eq!(data["works"], json!([]));
+    Ok(())
+}
+
+/// A Codex thread keeps what its turns were shown while the session key holds; a new key, such
+/// as changed thread instructions, opens a new thread that is shown everything again.
+#[test]
+fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let shown = Shown {
+        bot: Some("bot-digest".into()),
+        works: [("w1".to_owned(), "work-digest".to_owned())].into(),
+    };
+    let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
+        say(&mut store, &net, id, true)?;
+        let claimed = store
+            .claim_next(&net.a, &net.network, "c", "boot", key)?
+            .context("job")?;
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started("c", &trigger, &attempt)?;
+        store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
+        store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &shown)?;
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            JobOutcome::Completed,
+            "",
+            3,
+        )?;
+        Ok(claimed)
+    };
+    assert_eq!(turn("m1", "cfg")?.shown, Shown::default());
+    let resumed = turn("m2", "cfg")?;
+    assert_eq!(resumed.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(resumed.shown, shown);
+    let fresh = turn("m3", "cfg-new-instructions")?;
+    assert_eq!(fresh.previous_native_id, None);
+    assert_eq!(fresh.shown, Shown::default());
     Ok(())
 }

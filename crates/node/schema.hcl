@@ -967,6 +967,10 @@ table "scheduler_sessions" {
     null = false
     type = integer
   }
+  column "shown" {
+    null = false
+    type = text
+  }
   primary_key {
     columns = [column.conversation_id]
   }

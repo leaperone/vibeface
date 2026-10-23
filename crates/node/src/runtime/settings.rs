@@ -115,6 +115,7 @@ impl Runtime {
             timeout_secs: self.config.timeout_secs,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
+            instructions: String::new(),
             tool_env: self.agent_env(),
             tool_token: None,
             provider_env: self.provider_env(settings.provider),

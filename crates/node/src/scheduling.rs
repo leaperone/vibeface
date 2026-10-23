@@ -5,6 +5,7 @@ use crate::{
     work::Signal,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -335,6 +336,16 @@ pub struct ClaimedJob {
     pub previous_token: Option<String>,
     /// What the resumed native session has already seen; the prompt carries only the rest.
     pub covers: Option<VersionVector>,
+    /// The bot and works the resumed native session was last shown; empty with no `covers`.
+    pub shown: Shown,
+}
+
+/// Digests of the bot and of each work a Codex thread was last shown, kept on this Node with
+/// the session, so a resumed turn sends only what changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shown {
+    pub bot: Option<String>,
+    pub works: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,6 +373,8 @@ pub(crate) struct SchedulerSession {
     /// keeps the environment it was loaded with, so every turn of it presents this token.
     pub native_token: Option<String>,
     pub covers: VersionVector,
+    /// Moves with `covers`: what the native session's turns were shown of the bot and works.
+    pub shown: Shown,
     pub owner_epoch: u64,
     pub sdk_config: Option<String>,
     pub permission_version: u64,
@@ -376,6 +389,7 @@ impl SchedulerSession {
             native_id: None,
             native_token: None,
             covers: VersionVector::new(),
+            shown: Shown::default(),
             owner_epoch: 0,
             sdk_config: None,
             permission_version: 1,

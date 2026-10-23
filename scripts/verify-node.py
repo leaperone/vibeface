@@ -847,8 +847,9 @@ def fixture_codex(arguments):
         return {"id": "user-" + uuid.uuid4().hex, "type": "userMessage", "clientId": params.get("clientUserMessageId"),
                 "content": params.get("input", [])}
 
-    # A bot thread's Shell environment holds its tool token, so it stays in memory only.
-    bot_env, bot_stops = {}, {}
+    # A bot thread's Shell environment holds its tool token, so it stays in memory only, as do
+    # the developer instructions it was started or resumed with.
+    bot_env, bot_guide, bot_stops = {}, {}, {}
 
     class BotTurn:
         """One bot turn: progress and its end go to the connection that started it."""
@@ -882,9 +883,12 @@ def fixture_codex(arguments):
 
     def bot_turn(stream, thread, turn, params, resumed):
         prompt = params["input"][0]["text"]
-        cli = re.search(r"Run:\n'(.*?)' tool TOOL_NAME", prompt)
-        catalog = prompt[prompt.find("Available tools for this invocation:\n"):]
-        initial = {"prompt": prompt, "tool_env": bot_env.get(thread["id"], {}), "cwd": thread["cwd"],
+        guide = bot_guide.get(thread["id"], "")
+        cli = re.search(r"Run:\n'(.*?)' tool TOOL_NAME", guide)
+        catalog = guide[guide.find("Available tools:\n"):] if cli else ""
+        history = "\n".join(part.get("text", "") for past in thread["turns"] for item in past["items"]
+                            if item["type"] == "userMessage" for part in item["content"])
+        initial = {"prompt": prompt, "history": history, "tool_env": bot_env.get(thread["id"], {}), "cwd": thread["cwd"],
                    "session_id": thread["id"] if resumed else None, "tool_cli": cli and cli.group(1),
                    "custom_tools": re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ", catalog)}
         bot = BotTurn(stream, thread, turn)
@@ -1018,6 +1022,7 @@ def fixture_codex(arguments):
                         if params.get("threadSource") == "vibeface-bot":
                             thread["bot"] = True
                             bot_env[thread_id] = params["config"]["shell_environment_policy.set"]
+                            bot_guide[thread_id] = params.get("developerInstructions") or ""
                         state["threads"][thread_id] = thread
                         result = {"thread": thread}
                         subscribed.add(thread_id)
@@ -1101,6 +1106,7 @@ def fixture_codex(arguments):
                             subscribed.add(thread_id)
                             if thread.get("bot"):
                                 bot_env[thread_id] = params["config"]["shell_environment_policy.set"]
+                                bot_guide[thread_id] = params.get("developerInstructions") or ""
                     if error:
                         websocket_send(stream, {"id": message["id"], "error": error})
                         continue
@@ -1203,16 +1209,16 @@ def fixture_manager(run, initial, bot):
               "messages": [row["text"][:200] for row in context["conversation"]["messages"]],
               "works": [row["work_id"] for row in context["works"]] if isinstance(context["works"], list) else None,
               "bot": context["bot"].get("configured_bot"), "bot_prompt_markers": [marker for marker in
-                  ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in prompt],
+                  ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in initial["history"]],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
-    schemas = initial["custom_tools"]
+    schemas = set(initial["custom_tools"]) - set(context["trigger"].get("unavailable_tools", []))
     expected_tools = READ_TOOLS | WORK_TOOLS
     if kind not in ("agent_task", "route"):
         expected_tools |= WAKE_TOOLS
     if kind == "human":
         expected_tools |= SETTINGS_TOOLS
-    require(set(schemas) == expected_tools, "the turn receives the authoritative scoped tool catalog")
+    require(schemas == expected_tools, "the turn receives the authoritative scoped tool catalog")
 
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
         environment = initial["tool_env"]
