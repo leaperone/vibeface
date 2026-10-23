@@ -374,8 +374,8 @@ class Client:
             body = {"type": "message_posted", "message_id": arguments["message_id"], "role": "user",
                     "text": arguments["text"], "report_results": arguments["report_results"]}
             if arguments.get("attachments"):
-                arguments["attachments"] = sorted({(blob["hash"], blob["size"]) for blob in arguments["attachments"]})
-                arguments["attachments"] = [{"hash": hash_, "size": size} for hash_, size in arguments["attachments"]]
+                arguments["attachments"] = sorted({blob["hash"]: blob for blob in arguments["attachments"]}.values(),
+                                                  key=lambda blob: blob["hash"])
                 body = {**{key: body[key] for key in ("type", "message_id", "role", "text")},
                         "attachments": arguments["attachments"], "report_results": body["report_results"]}
         elif method == "create_bot":
@@ -3198,7 +3198,7 @@ def phase4_acceptance(options):
                     restarted_at, offset = offset, 0
         require(restarted_at and sent_after <= size - restarted_at + 1024 * 1024, "the upload resumes after a restart")
         b.stop()
-        receipt = send(a.client, "p4-attachment", "请看附件", attachments=[{"hash": digest, "size": size}], report_results=False)
+        receipt = send(a.client, "p4-attachment", "请看附件", attachments=[{"hash": digest, "size": size, "name": "p4 附件.bin"}], report_results=False)
         partial = b.directory / "blobs" / "partial" / (digest + ".part")
         b.start()
         wait_for("B starts downloading", lambda: partial.exists() and partial.stat().st_size >= 4 * 1024 * 1024
@@ -3212,7 +3212,8 @@ def phase4_acceptance(options):
         at_b.connect(b.device_id)
         wait_for("the browser reconnects to the restarted B", lambda: at_b.authenticate())
         shown = next(row for row in at_b.rpc("conversation", conversation_id=conversation)["messages"] if row["message_id"] == "p4-attachment")
-        require(shown["blobs"] == [{"hash": digest, "size": size}], "the message carries its attachment on every entrance")
+        require(shown["attachments"] == [{"hash": digest, "size": size, "name": "p4 附件.bin"}],
+                "the message carries its named attachment on every entrance")
         download, offset, pages = hashlib.sha256(), 0, 0
         while offset is not None:
             page = at_b.rpc("read_artifact", conversation_id=conversation, blob_hash=digest, offset=offset, binary=True)

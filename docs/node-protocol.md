@@ -290,7 +290,7 @@ Event {
 
 入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者；工作状态只前进。负责人同级再相同时取请求身份较小者，请求身份为 `SHA256(attestation 签名输入 ‖ 签名设备)`。同一份已签名请求经不同入口重试时请求身份相同，外层事件 hash 不参与仲裁，重试不会改变结果。
 
-事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限 64 MiB，正文是 `blobs/sha256/<前两位>/<hash>` 文件，按网络和会话引用授权读取。
+事件上限为 1 MiB。事件的 `blobs` 使用 `BlobRef { hash, size }`；本人消息的 `attachments` 为 `{ hash, size, name }`，按哈希升序、每个文件一次，与事件 `blobs` 一一对应，`name` 为 1 至 255 字节、不含路径分隔符和控制字符的文件名。附件单件上限 64 MiB，正文是 `blobs/sha256/<前两位>/<hash>` 文件，按网络和会话引用授权读取。
 
 ## 写入保护
 

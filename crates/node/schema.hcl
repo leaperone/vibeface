@@ -249,7 +249,7 @@ table "messages" {
     null = true
     type = text
   }
-  column "blobs" {
+  column "attachments" {
     null = false
     type = text
   }

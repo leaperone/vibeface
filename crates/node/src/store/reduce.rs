@@ -141,10 +141,11 @@ pub(crate) fn apply(
             in_reply_to,
             status,
             answers,
+            attachments,
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,blobs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,blobs=excluded.blobs WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments WHERE excluded.rank<rank",
                 params![
                     network,
                     scope,
@@ -159,7 +160,7 @@ pub(crate) fn apply(
                     status.map(text).transpose()?,
                     report_results,
                     answers,
-                    serde_json::to_string(&event.blobs)?
+                    serde_json::to_string(attachments)?
                 ],
             )?;
             if *role == Role::Assistant {
@@ -419,7 +420,7 @@ pub(crate) fn apply(
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,blobs,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
                 params![network, scope, message_id, hash, rank, event.author, text(Role::Bot)?, body, event.created_at_ms, serde_json::to_string(from)?],
             )?;
         }

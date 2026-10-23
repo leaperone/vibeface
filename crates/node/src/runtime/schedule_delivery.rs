@@ -205,7 +205,7 @@ impl Runtime {
         self.require_scope(access, &scope).await?;
         let message_id = id(input, "message_id")?;
         let report_results = input["report_results"].as_bool().unwrap_or(true);
-        let attachments: Vec<BlobRef> = match input.get("attachments") {
+        let attachments: Vec<Attachment> = match input.get("attachments") {
             Some(value) => serde_json::from_value(value.clone()).context("invalid attachments")?,
             None => vec![],
         };

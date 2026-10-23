@@ -13,14 +13,15 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder,
 } from "./model"
+import type { Attachment } from "../chat/types"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records"
 import { answerBody, answerId, answerScope } from "./questions"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus, OpenWork, ScheduleAction,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction,
 } from "./types"
 
 /** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
@@ -425,7 +426,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   }
   /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
   /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
-  const uploadAttachment = async (id: string, file: File): Promise<BlobRef> => {
+  const uploadAttachment = async (id: string, file: File): Promise<Attachment> => {
     const bytes = new Uint8Array(await file.arrayBuffer())
     if (!bytes.length || bytes.length > 64 * 1024 * 1024) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
     const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
@@ -436,7 +437,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       let binary = ""
       for (let index = 0; index < chunk.length; index += 0x8000) binary += String.fromCharCode(...chunk.subarray(index, index + 0x8000))
       const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash, size: bytes.length, offset, data: btoa(binary) }))
-      if (reply.complete === true) return { hash, size: bytes.length }
+      if (reply.complete === true) return { hash, size: bytes.length, name: attachmentName(file.name) }
       offset = Number(reply.offset)
     }
   }
@@ -450,11 +451,9 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     let item = prior ? (await outbox.all()).find((entry) => entry.key === key) : undefined
     if (!item) {
       const { body } = prepared
-      const uploaded: BlobRef[] = []
+      const uploaded: Attachment[] = []
       for (const file of files) uploaded.push(await uploadAttachment(id, file))
-      // Signed in the Node's order: by hash then size, without duplicates.
-      const attachments = uploaded.sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : a.size - b.size)
-        .filter((blob, index, all) => index === 0 || blob.hash !== all[index - 1].hash || blob.size !== all[index - 1].size)
+      const attachments = signedOrder(uploaded)
       const extra = attachments.length ? { attachments } : {}
       const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, ...extra, report_results: body.report_results })
       item = await enqueue(outbox, { key, method: "message", params: { ...body, ...extra, attestation }, created_at_ms: Date.now() })
