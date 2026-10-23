@@ -232,6 +232,21 @@ pub enum CodexTarget {
     Spawn(CodexLaunch),
 }
 
+impl CodexTarget {
+    /// Which App Server keeps the threads: the system one wherever its socket moves, or the
+    /// Node's own by the Codex home it stores them in. A thread or turn belongs to one of them.
+    pub fn server(&self) -> String {
+        match self {
+            CodexTarget::Off => "off".into(),
+            CodexTarget::System(_) => "system".into(),
+            CodexTarget::Spawn(launch) => format!(
+                "own:{}",
+                launch.env.get("CODEX_HOME").map_or("", String::as_str)
+            ),
+        }
+    }
+}
+
 /// Everything about the providers that only this machine knows.
 #[derive(Clone)]
 pub struct Local {
@@ -259,6 +274,28 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The system App Server stays one server wherever its socket is; the Node's own is another,
+    /// told apart by the Codex home that keeps its threads.
+    #[test]
+    fn threads_belong_to_the_app_server_that_keeps_them() {
+        let own = |home: Option<&str>| {
+            CodexTarget::Spawn(CodexLaunch {
+                bin: "codex".into(),
+                env: home
+                    .map(|home| ("CODEX_HOME".to_owned(), home.to_owned()))
+                    .into_iter()
+                    .collect(),
+            })
+            .server()
+        };
+        assert_eq!(
+            CodexTarget::System(None).server(),
+            CodexTarget::System(Some("/tmp/a.sock".into())).server()
+        );
+        assert_ne!(CodexTarget::System(None).server(), own(None));
+        assert_ne!(own(None), own(Some("/tmp/home")));
+    }
 
     #[test]
     fn variables_are_validated_and_stay_with_their_provider() -> Result<()> {

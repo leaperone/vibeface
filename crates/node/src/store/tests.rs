@@ -613,9 +613,9 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     say(&mut store, &net, "quiet", false)?;
     let candidates = |store: &Store| store.steer_candidates(&net.network, &local, "boot");
     assert!(candidates(&store)?.is_empty());
-    store.record_manager_turn(&attempt, "thread", None)?;
+    store.record_manager_turn(&attempt, "system", "thread", None)?;
     assert!(candidates(&store)?.is_empty());
-    store.record_manager_turn(&attempt, "thread", Some("turn"))?;
+    store.record_manager_turn(&attempt, "system", "thread", Some("turn"))?;
     // A reply left running by an earlier process is never a target.
     assert!(
         store
@@ -694,7 +694,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     // Stopping a steered message stops the reply it went into.
     let attempt = next.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &next.job.trigger, &attempt)?;
-    store.record_manager_turn(&attempt, "thread", Some("turn-2"))?;
+    store.record_manager_turn(&attempt, "system", "thread", Some("turn-2"))?;
     say(&mut store, &net, "m3", true)?;
     let found = candidates(&store)?;
     assert_eq!(found.len(), 1);
@@ -3893,5 +3893,102 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
         second.job.basis,
         "the claimed basis is stored"
     );
+    Ok(())
+}
+
+/// A thread has seen a reply's messages only once its turn started: a refused `turn/start`
+/// leaves them for the next turn on that thread, a started one does not repeat them.
+#[test]
+fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let turn =
+        |store: &mut Store, id: &str, started: bool| -> Result<crate::scheduling::ClaimedJob> {
+            say(store, &net, id, true)?;
+            let claimed = store
+                .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+                .context("job")?;
+            let trigger = claimed.job.trigger.clone();
+            let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+            store.mark_started("c", &trigger, &attempt)?;
+            store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
+            store.record_manager_turn(&attempt, "system", "thread", None)?;
+            let outcome = if started {
+                store.record_manager_turn(&attempt, "system", "thread", Some("turn"))?;
+                JobOutcome::Completed
+            } else {
+                JobOutcome::Failed("the model is unknown".into())
+            };
+            store.finish_job(
+                &net.a,
+                &net.network,
+                "c",
+                &trigger,
+                &attempt,
+                outcome,
+                "",
+                3,
+            )?;
+            Ok(claimed)
+        };
+    turn(&mut store, "m1", false)?;
+    let second = turn(&mut store, "m2", true)?;
+    assert_eq!(second.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(
+        second.covers, None,
+        "the refused turn's message is sent again"
+    );
+    say(&mut store, &net, "m3", true)?;
+    let third = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    assert_eq!(third.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(
+        third.covers.as_ref(),
+        Some(&second.job.basis),
+        "the started turn's messages are not repeated"
+    );
+    Ok(())
+}
+
+/// The scheduling tick hands a moved conversation's queue on even when no bot runs here to
+/// claim it, and the later claim finds nothing left to hand on twice.
+#[test]
+fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut store, &net, "m1", true)?;
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    let trigger = message_trigger("m1");
+    assert!(store.scheduler_job("c", &trigger)?.is_some());
+    assert!(store.scheduler_outbox()?.is_empty());
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        3,
+    )?;
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    assert!(store.scheduler_job("c", &trigger)?.is_none());
+    let handed = |store: &Store| -> Result<Vec<String>> {
+        Ok(store
+            .scheduler_outbox()?
+            .into_iter()
+            .map(|e| e.trigger)
+            .collect())
+    };
+    assert_eq!(handed(&store)?, std::slice::from_ref(&trigger));
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    store.fence_moved_turns(&net.network, &local)?;
+    assert_eq!(handed(&store)?, [trigger]);
     Ok(())
 }

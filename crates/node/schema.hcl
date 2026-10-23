@@ -1118,6 +1118,10 @@ table "manager_turns" {
     null = false
     type = text
   }
+  column "server" {
+    null = false
+    type = text
+  }
   column "thread_id" {
     null = false
     type = text

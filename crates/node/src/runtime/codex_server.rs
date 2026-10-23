@@ -578,6 +578,11 @@ impl CodexServer {
         tokio::time::timeout(READY_WAIT, up).await.is_ok()
     }
 
+    /// The App Server the current target uses, as `CodexTarget::server` names it.
+    pub(crate) fn server(&self) -> String {
+        self.inner.target.lock().expect("target lock").server()
+    }
+
     /// The socket the coordination Agent connects to; it follows the App Server in use.
     pub(crate) fn socket(&self) -> PathBuf {
         self.inner.agent_socket.clone()

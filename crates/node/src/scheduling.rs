@@ -394,9 +394,17 @@ pub struct PendingCheck {
     pub attempt_id: String,
     pub detail: String,
     pub process_groups: Vec<u32>,
-    /// `(thread, turn)` of a reply that ran on the App Server; the turn may be unknown.
-    pub codex_turn: Option<(String, Option<String>)>,
+    pub codex_turn: Option<ReplyTurn>,
     pub created_at_ms: i64,
+}
+
+/// Where a reply ran on an App Server: `server` as `CodexTarget::server` names it, the thread,
+/// and the turn once it is known.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyTurn {
+    pub server: String,
+    pub thread: String,
+    pub turn: Option<String>,
 }
 
 impl PendingCheck {

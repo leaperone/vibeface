@@ -442,6 +442,14 @@ impl Runtime {
                 args["continues"].is_null(),
                 "thread and continues are exclusive"
             );
+            ensure!(
+                self.store
+                    .lock()
+                    .await
+                    .native_thread_conversation(thread)?
+                    .is_none(),
+                "this thread is a bot's own reply thread; message that bot with message_bot instead"
+            );
         }
         let spec = WorkSpec {
             work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
