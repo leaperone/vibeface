@@ -133,8 +133,8 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
 }
 
 fn validate_password(password: &str) -> Result<()> {
-    if !(12..=1024).contains(&password.len()) {
-        return Err("recovery password must contain 12 to 1024 UTF-8 bytes".into());
+    if !(8..=1024).contains(&password.len()) {
+        return Err("recovery password must contain 8 to 1024 UTF-8 bytes".into());
     }
     Ok(())
 }
@@ -170,6 +170,14 @@ mod tests {
                 .to_string()
                 .contains("KDF")
         );
+    }
+
+    #[test]
+    fn recovery_password_length_bounds() {
+        assert!(validate_password("1234567").is_err());
+        assert!(validate_password("12345678").is_ok());
+        assert!(validate_password(&"a".repeat(1024)).is_ok());
+        assert!(validate_password(&"a".repeat(1025)).is_err());
     }
 
     #[test]

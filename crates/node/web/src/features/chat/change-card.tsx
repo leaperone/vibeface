@@ -112,7 +112,7 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
   const schedule = after ?? before!
   const once = schedule.every_minutes === undefined
   const icon = once ? AlarmClock : Repeat
-  const tag = !before ? (once ? '新提醒' : '新定时任务') : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
+  const tag = !before ? '新定时任务' : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
   if (!after) return <Row icon={icon} label={schedule.name} tag={tag} removed />
   const frequency = scheduleFrequency(after), previous = before ? scheduleFrequency(before) : frequency
   const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null

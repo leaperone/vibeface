@@ -145,6 +145,10 @@ impl Store {
         Ok(state)
     }
 
+    pub fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
+        crate::store::recovery_since_ms(&self.connection, recovery_key)
+    }
+
     pub fn has_network(&self) -> Result<bool> {
         has_network_in(&self.connection)
     }

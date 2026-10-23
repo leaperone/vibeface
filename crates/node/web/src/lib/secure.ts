@@ -43,7 +43,7 @@ export function verifyRemoval(value: unknown, nodeId: string, networkId: string)
   return true
 }
 export function passphrase(password: string, confirmation: string): string {
-  if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 12 个字符。')
+  if ([...password].length < 8 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 8 个字符。')
   if (password !== confirmation) throw new Error('两次密码不一样。')
   return password
 }
@@ -81,13 +81,17 @@ export async function openPackage(file: File, password: string) {
     return { material, root: openedRoot, networkId, release() { if (!released) { released = true; openedRoot.free() } } }
   } catch (error) { root?.free(); payload.root_secret_key = ''; throw error }
 }
-export function downloadPackage(bytes: Uint8Array) {
+/** The code a person matches between the settings page and a file name; never the key itself. */
+export async function recoveryCode(recoveryKey: string): Promise<string> {
+  const key = Uint8Array.from(recoveryKey.match(/../g) ?? [], (pair) => parseInt(pair, 16))
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', key)).slice(0, 4)].map((byte) => byte.toString(16).padStart(2, '0')).join('').toUpperCase()
+}
+export function downloadPackage(bytes: Uint8Array, code: string) {
   const copy = new Uint8Array(bytes)
   const url = URL.createObjectURL(new Blob([copy.buffer], { type: 'application/json' }))
   const link = document.createElement('a')
   link.href = url
-  // Minutes in the name: a replaced file must not share its name with the newer one that still works.
-  link.download = `vibeface-recovery-${new Date().toLocaleString("sv").slice(0, 16).replace(" ", "-").replace(":", "")}.json`
+  link.download = `vibeface-recovery-${code}-${new Date().toLocaleDateString('sv')}.json`
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

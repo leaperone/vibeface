@@ -617,7 +617,9 @@ async fn dispatch(
         }
         "directory" => {
             let state = node.membership_state().await?;
-            Ok(json!({"view":state.project()?,"state":state}))
+            let view = state.project()?;
+            let since = node.recovery_since_ms(&view.recovery_key).await?;
+            Ok(json!({"view":view,"state":state,"recovery_since_ms":since}))
         }
         "write_state" => {
             let principal = principal(node, session).await?;
@@ -1129,7 +1131,7 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
     let view = state.project()?;
     match principal(node, session).await {
         Ok(principal) => Ok(
-            json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"local_auto_access":node.local_access.enabled()}),
+            json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"recovery_since_ms":node.recovery_since_ms(&view.recovery_key).await?,"local_auto_access":node.local_access.enabled()}),
         ),
         // This Node's own browsers get the signed history that removed it, to check themselves.
         Err(_)
@@ -2835,9 +2837,15 @@ mod tests {
             assert_eq!(recovering.call("recovery_state", read(&root)?).await?["state"]["genesis"]["network_id"], network);
             let submit = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints});
             assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err());
+            let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].as_i64().context("genesis key has a date")?;
+            let started = crate::runtime::now_ms();
             let recovered = recovering.call("recover", submit(vec![&checkpoint])).await?;
             assert_eq!(recovered["principal"]["can_manage"], true);
-            assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["principal"], recovered["principal"], "a retry changes nothing");
+            let since = recovered["recovery_since_ms"].as_i64().context("new key has a date")?;
+            assert!(first_since <= started && since >= started, "a new recovery key restarts the date");
+            let retried = recovering.call("recover", submit(vec![&checkpoint])).await?;
+            assert_eq!(retried["principal"], recovered["principal"], "a retry changes nothing");
+            assert_eq!(retried["recovery_since_ms"], since, "a retry keeps the date");
             assert_eq!(manager.call("authenticate", json!({})).await?["principal"]["epoch"], epoch);
 
             // The old recovery file is refused from now on; the new one reads and recovers.
@@ -2851,7 +2859,9 @@ mod tests {
             let read_next = recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await?;
             assert_eq!(read_next["state"]["checkpoints"][0], serde_json::to_value(&checkpoint)?);
             let rotated = RootCheckpoint::rotation(&after, &next, &LocalIdentity::generate().device_id()?)?;
+            let started = crate::runtime::now_ms();
             recovering.call("recover", submit(vec![&checkpoint, &rotated])).await?;
+            assert!(recovering.call("directory", json!({})).await?["recovery_since_ms"].as_i64() >= Some(started), "a rotation restarts the date");
             assert_eq!(node.membership_state().await?.recovery_key(), rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 

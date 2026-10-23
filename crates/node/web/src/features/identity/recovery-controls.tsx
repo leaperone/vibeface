@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArchiveRestore, KeyRound } from 'lucide-react'
+import { ArchiveRestore, CalendarDays, Hash, KeyRound, TriangleAlert } from 'lucide-react'
 import { BusyIcon, Details, DetailRow, FilePicker, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { Member } from '@/lib/node'
 import { messageOf, parseEntry } from '@/lib/node'
-import { passphrase } from '@/lib/secure'
+import { passphrase, recoveryCode } from '@/lib/secure'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice } from './context'
 import { deviceIcon } from '@/features/devices/devices'
@@ -38,6 +38,25 @@ function useGenerationRun() {
     finally { if (pending.current === owner) pending.current = null; setBusyGeneration((active) => active === owner ? null : active) }
   }
   return { busy: busyGeneration === generation, error, status, run }
+}
+
+/** The file that still works: the code in its name and the day it was made. */
+export function CurrentRecoveryFile() {
+  const { directory, recoverySince } = useDevice()
+  const key = directory?.recovery_key
+  const [code, setCode] = useState<{ key: string; value: string } | null>(null)
+  useEffect(() => {
+    if (!key) return
+    let live = true
+    void recoveryCode(key).then((value) => { if (live) setCode({ key, value }) })
+    return () => { live = false }
+  }, [key])
+  if (!key || code?.key !== key) return null
+  return <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-meta">
+    <span className="flex items-center gap-1.5"><Hash aria-hidden="true" className="size-4 text-muted-foreground" /><span className="sr-only">文件编号</span><span className="font-mono font-medium tracking-wider">{code.value}</span></span>
+    {recoverySince ? <span className="flex items-center gap-1.5 text-muted-foreground"><CalendarDays aria-hidden="true" className="size-4" /><span className="sr-only">创建于</span><time dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time></span> : null}
+    <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />丢了无法重新生成</span>
+  </div>
 }
 
 /** After unlocking a recovery file: keep every device except the lost ones. */
@@ -133,8 +152,8 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>
-        <Label label="新密码（至少 12 个字符）"><Input type="password" name="password" minLength={12} autoComplete="new-password" required /></Label>
-        <Label label="再输一次"><Input type="password" name="confirmation" minLength={12} autoComplete="new-password" required /></Label>
+        <Label label="新密码（至少 8 个字符）"><Input type="password" name="password" minLength={8} autoComplete="new-password" required /></Label>
+        <Label label="再输一次"><Input type="password" name="confirmation" minLength={8} autoComplete="new-password" required /></Label>
         <InlineError error={error || null} />
         <div className="flex flex-wrap gap-2"><Button type="submit" variant="outline"><BusyIcon busy={busy} />下载新文件</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
