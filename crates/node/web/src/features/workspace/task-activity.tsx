@@ -38,7 +38,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const lookup = { nodes: workspace.nodes, directory }
   if (check.kind === "process") return <ActionCard
     icon={CircleQuestionMark}
-    title="需要确认 · 上次回复的程序还在运行"
+    title="待确认 · 上次回复的程序还在运行"
     meta={nodeName(workspace.data?.local_node, lookup)}
     actions={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}>确认已停止</ActionButton>}
   >

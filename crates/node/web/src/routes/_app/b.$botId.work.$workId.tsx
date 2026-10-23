@@ -5,5 +5,5 @@ export const Route = createFileRoute('/_app/b/$botId/work/$workId')({ component:
 
 function WorkRoute() {
   const { botId, workId } = Route.useParams()
-  return <TaskDetail botId={botId} workId={workId} />
+  return <TaskDetail key={workId} botId={botId} workId={workId} />
 }

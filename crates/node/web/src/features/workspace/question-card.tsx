@@ -2,8 +2,9 @@
 
 import { useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
+import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
@@ -39,7 +40,11 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   </p>
 
   const pending = workspace.pendingAnswers.find((item) => item.question_id === id)
-  const { icon, tone, label } = looks[question.severity]
+  const { tone, label, icon: severityIcon } = looks[question.severity]
+  // A held App Server request reads as 需要你同意 wherever it shows, and names the task it holds.
+  const approval = Boolean(question.about.request_id)
+  const icon = approval ? terms.approval.icon : severityIcon
+  const task = approval ? workspace.openWorks.find((work) => work.thread_id === question.about.session_id && !work.outcome) : undefined
   const disabled = !workspace.writable || action.busy !== null
   const session = question.conversation_id === null
   // 交给 the primary bot repeats 处理.
@@ -64,6 +69,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{question.text}</span></>}
   >
     <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-meta text-muted-foreground">
+      {task ? <Meta icon={ListChecks} label="任务">{task.title || "任务"}</Meta> : null}
       {session ? <Meta icon={SquareTerminal} label="会话">{agentName(question.about.agent)}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={Laptop} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
@@ -103,7 +109,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       }}>
         <span aria-hidden="true" className={`${badge} bg-muted text-muted-foreground`}><PencilLine className="size-4" /></span>
         <input aria-label="其他回答" placeholder={shown.length ? "其他回答" : "输入回答"} className="h-11 min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed md:text-sm" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
-        <Button type="submit" variant="ghost" size="icon" className="size-10 max-md:size-10" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
+        <Button type="submit" variant="ghost" size="icon" className="size-10 max-md:size-11" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
       </form>
     </div>}
     <InlineError error={pending ? null : action.error} />
